@@ -1,22 +1,26 @@
+use ankurah_model_derive::Model;
 use model::node::Node;
 
 #[tokio::main]
 async fn main() {
-    let server = Node::new();
+    // Gradually uncomment this example as we add functionality
+
+    // let server = Node::new();
     let client = Node::new();
 
-    client.local_connect(&server);
+    // client.local_connect(&server);
 
     let client_albums = client.collection::<Album>("album");
-    let server_albums = server.collection::<Album>("album");
+    // let server_albums = server.collection::<Album>("album");
 
-    tokio::spawn(server_albums.signal().for_each(|changeset| {
-        println!("Album recordset changed on server: {}", changeset.operation);
-    }));
+    // Lets get signals working after we have the basics
+    // tokio::spawn(server_albums.signal().for_each(|changeset| {
+    //     println!("Album recordset changed on server: {}", changeset.operation);
+    // }));
 
-    tokio::spawn(client_albums.signal().for_each(|changeset| {
-        println!("Album recordset changed on client: {}", changeset.operation);
-    }));
+    // tokio::spawn(client_albums.signal().for_each(|changeset| {
+    //     println!("Album recordset changed on client: {}", changeset.operation);
+    // }));
 
     let album = create_album! {
         client,
@@ -37,8 +41,7 @@ async fn main() {
 
 use std::sync::mpsc;
 
-// TODO: We need to implement a proc macro to generate the Model implementation
-// #[derive(Model)]
+#[derive(Model)] // This line now uses the Model derive macro
 pub struct Album {
     id: ID,
     name: String,

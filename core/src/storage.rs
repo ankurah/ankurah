@@ -1,16 +1,23 @@
 use anyhow::{anyhow, Result};
 use sled::{Config, Db}; // Import Result and anyhow from the anyhow crate
 
-pub struct StorageEngine {
+pub trait StorageEngine: Sized {
+    type StorageBucket: StorageBucket;
+    fn collection(&self, name: &str) -> Result<Self::StorageBucket>;
+}
+
+pub trait StorageBucket: Clone {}
+
+pub struct SledStorageEngine {
     pub db: Db,
 }
 
-impl StorageEngine {
+impl SledStorageEngine {
     // Open the storage engine without any specific column families
     pub fn new() -> Result<Self> {
         let dir = dirs::home_dir()
             .ok_or_else(|| anyhow!("Failed to get home directory"))?
-            .join(".hydra");
+            .join(".ankurah");
 
         std::fs::create_dir_all(&dir)?;
 
@@ -29,10 +36,25 @@ impl StorageEngine {
 
         Ok(Self { db })
     }
+}
 
-    // Automatically creates a tree if it does not exist and returns a handle
-    pub fn subtree(&self, name: &str) -> Result<sled::Tree> {
+#[derive(Clone)]
+pub struct SledStorageBucket {
+    pub tree: sled::Tree,
+}
+
+impl StorageEngine for SledStorageEngine {
+    type StorageBucket = SledStorageBucket;
+    fn collection(&self, name: &str) -> Result<SledStorageBucket> {
         let tree = self.db.open_tree(name)?;
-        Ok(tree)
+        Ok(SledStorageBucket { tree })
     }
 }
+
+impl SledStorageBucket {
+    pub fn new(tree: sled::Tree) -> Self {
+        Self { tree }
+    }
+}
+
+impl StorageBucket for SledStorageBucket {}
