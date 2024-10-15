@@ -1,0 +1,2 @@
+struct Memo {}
+struct Basis {}

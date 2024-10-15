@@ -1,0 +1,12 @@
+[package]
+name = "ankurah-core"
+description = "Core state management functionality for Ankurah"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4.38"
+futures-signals = "0.3.34"
+serde = "1.0.210"
+tokio = "1.40.0"
+ulid = "1.1.3"

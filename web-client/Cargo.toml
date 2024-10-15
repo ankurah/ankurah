@@ -1,0 +1,37 @@
+[package]
+name = "ankurah-web-client"
+version = "0.1.0"
+authors = ["Daniel Norman <daniel@danielnorman.net>"]
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["console_error_panic_hook"]
+start = []
+react = ["start"]
+
+[dependencies]
+hydra-proto = { path = "../proto" }
+wasm-bindgen = "0.2.84"
+console_error_panic_hook = { version = "0.1.7", optional = true }
+futures = "0.3.30"
+js-sys = "0.3.69"
+log = "0.4.22"
+wasm-bindgen-futures = "0.4.42"
+wasm-logger = "0.2.0"
+web-sys = { version = "0.3.69", features = ["WebSocket", "Event", "ErrorEvent", "CloseEvent", "MessageEvent"] }
+futures-signals = "0.3.34"
+gloo-timers = { version = "0.3.0", features = ["futures"] }
+bincode = "1.3.3"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.34"
+
+[profile.release]
+# Tell `rustc` to optimize for small code size.
+#opt-level = "s"
+
+[package.metadata.wasm-pack.profile.dev.wasm-bindgen]
+dwarf-debug-info = true
