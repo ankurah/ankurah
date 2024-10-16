@@ -36,6 +36,7 @@ dependencies = [
 name = "ankurah-core"
 version = "0.1.0"
 dependencies = [
+ "ankurah-derive",
  "anyhow",
  "chrono",
  "dirs",
@@ -47,8 +48,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "ankurah-model-derive"
+name = "ankurah-derive"
 version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "anyhow"

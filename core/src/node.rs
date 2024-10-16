@@ -3,7 +3,6 @@ use crate::{
     event::Operation,
     model::Model,
     storage::StorageEngine,
-    types::ID,
 };
 use std::{
     collections::BTreeMap,
@@ -35,7 +34,8 @@ impl Node {
         // });
     }
     pub fn collection<M: Model>(&self, name: &str) -> &CollectionHandle<M> {
-        self.collections.get(name).unwrap()
+        unimplemented!()
+        // self.collections.get(name).unwrap()
     }
 }
 

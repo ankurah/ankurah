@@ -1,12 +1,19 @@
-use ankurah_model_derive::Model;
-use model::node::Node;
+use ankurah_core::node::Node;
+use ankurah_core::storage::SledStorageEngine;
+use ankurah_core::Model;
+use ankurah_derive::Model;
+use serde::{Deserialize, Serialize};
+
+#[derive(Model, Serialize, Deserialize)] // This line now uses the Model derive macro
+pub struct Album {
+    name: String,
+}
 
 #[tokio::main]
 async fn main() {
     // Gradually uncomment this example as we add functionality
-
     // let server = Node::new();
-    let client = Node::new();
+    let client = Node::new(SledStorageEngine::new().unwrap());
 
     // client.local_connect(&server);
 
@@ -22,11 +29,16 @@ async fn main() {
     //     println!("Album recordset changed on client: {}", changeset.operation);
     // }));
 
-    let album = create_album! {
+    // let album = create_album! {
+    //     client,
+    //     name: "The Dark Sid of the Moon",
+    // };
+    let album = AlbumRecord::new(
         client,
-        name: "The Dark Sid of the Moon",
-        status: Status::OnSale,
-    };
+        Album {
+            name: "The Dark Sid of the Moon".to_string(),
+        },
+    );
 
     album.name.insert(12, "e"); // Whoops typo
     assert_eq!(album.name.value(), "The Dark Side of the Moon");
@@ -37,12 +49,4 @@ async fn main() {
     assert_eq!(client_albums.record_count(), 1);
 
     // Both client and server signals should trigger
-}
-
-use std::sync::mpsc;
-
-#[derive(Model)] // This line now uses the Model derive macro
-pub struct Album {
-    id: ID,
-    name: String,
 }

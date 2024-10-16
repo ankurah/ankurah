@@ -1,4 +1,6 @@
-use crate::{model::Model, storage::StorageBucket};
+use std::marker::PhantomData;
+
+use crate::model::Model;
 
 // WIP
 
@@ -6,18 +8,20 @@ use crate::{model::Model, storage::StorageBucket};
 #[derive(Clone)]
 pub struct RawCollection {
     pub name: String,
-    pub bucket: Box<dyn StorageBucket>,
+    // pub bucket: Box<dyn StorageBucket>,
 }
 
 /// API surface for a collection
 pub struct CollectionHandle<M: Model> {
     pub name: String,
     pub raw: RawCollection,
+    _marker: PhantomData<M>,
 }
 
 impl RawCollection {
-    pub fn new(name: String, bucket: Box<dyn StorageBucket>) -> Self {
-        Self { name, bucket }
+    pub fn new(name: String /*bucket: Box<dyn StorageBucket>*/) -> Self {
+        unimplemented!()
+        // Self { name, bucket }
     }
 }
 
@@ -26,6 +30,7 @@ impl<M: Model> CollectionHandle<M> {
         Self {
             name,
             raw: raw.clone(),
+            _marker: PhantomData,
         }
     }
 }
