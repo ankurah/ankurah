@@ -30,6 +30,7 @@ async fn main() {
     //     println!("Album recordset changed on client: {}", changeset.operation);
     // }));
 
+    // TODO add macro for this
     // let album = create_album! {
     //     client,
     //     name: "The Dark Sid of the Moon",
@@ -42,7 +43,8 @@ async fn main() {
     );
 
     info!("Album created: {:?}", album);
-    // album.name.insert(12, "e"); // Whoops typo
+    // LEFT OFF HERE - need to get derive(Model) working again
+    album.name.insert(12, "e");
     // assert_eq!(album.name.value(), "The Dark Side of the Moon");
 
     // should immediately have two operations - one for the initial insert, and one for the edit

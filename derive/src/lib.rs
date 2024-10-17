@@ -1,6 +1,21 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use std::collections::HashMap;
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+
+/// Map model field types to their corresponding value types
+fn get_value_type(ty: &Type) -> proc_macro2::TokenStream {
+    let type_str = quote!(#ty).to_string();
+    let value_type = match type_str.as_str() {
+        "String" => quote!(ankurah_core::types::value::StringValue),
+        "i32" => quote!(ankurah_core::types::value::IntValue),
+        "f64" => quote!(ankurah_core::types::value::FloatValue),
+        "bool" => quote!(ankurah_core::types::value::BoolValue),
+        // Add more mappings as needed
+        _ => quote!(ankurah_core::types::value::Value<#ty>), // Default to a generic Value type
+    };
+    quote!(ankurah_core::types::value::#value_type).into()
+}
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
 #[proc_macro_derive(Model, attributes(serde))]
@@ -20,34 +35,16 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let field_names = fields.iter().map(|f| &f.ident);
     let field_types = fields.iter().map(|f| &f.ty);
 
-    let getter_methods = field_names
-        .clone()
-        .zip(field_types.clone())
-        .map(|(name, ty)| {
-            quote! {
-                pub fn #name(&self) -> &#ty {
-                    &self.current.#name
-                }
-            }
-        });
+    // Update this to use the get_value_type function
+    let field_value_types = fields.iter().map(|f| get_value_type(&f.ty));
 
-    // These need to be type specific. Each type will have one or more setters with different signatures.
-    // For example string will have insert(offset, value), delete(offset, count), etc.
-    // let setter_methods = field_names.clone().map(|name| {
-    //     quote! {
-    //         pub fn #name(&mut self, value: impl Into<String>) {
-    //             // TODO emit operation and update current
-    //         }
-    //     }
-    // });
-
-    let expanded = quote! {
+    let expanded: proc_macro::TokenStream = quote! {
         impl ankurah_core::model::Model for #name {}
 
         #[derive(Debug)]
         pub struct #record_name {
             id: ankurah_core::types::ID,
-            current: #name,
+            #(#field_names: #field_value_types,)*
             // TODO: Add fields for tracking changes and operation count
         }
 
@@ -58,24 +55,25 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                 self.id
             }
 
-            fn current(&self) -> &Self::Model {
-                &self.current
-            }
         }
 
         impl #record_name {
             pub fn new(node: &Node, model: #name) -> Self {
                 Self {
                     id: node.next_id(),
-                    current: model,
+                    #(#field_names: <#field_value_types>::new(model.#field_names),)*
                     // TODO: Initialize fields for tracking changes and operation count
                 }
             }
 
-            #(#getter_methods)*
-            // #(#setter_methods)*
+            #(
+                pub fn #field_names(&self) -> &#field_value_types {
+                    &self.#field_names
+                }
+            )*
         }
-    };
+    }
+    .into();
 
     TokenStream::from(expanded)
 }
