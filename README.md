@@ -8,8 +8,9 @@
   - Rust structs for data modeling
   - Signals pattern for notifications
   - WASM Bindings for client-side use
+  - Websockets server and client
   - React Bindings
-  - Basic included data-types: including CRDT text and primative types
+  - Basic included data-types: including CRDT text(yrs crate) and primitive types
   - Very basic embedded KV backing store (Sled DB)
   - Basic, single field queries (auto indexed?)
 

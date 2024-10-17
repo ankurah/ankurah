@@ -1,8 +1,10 @@
+use ulid::Ulid;
+
 use crate::{
     collection::{CollectionHandle, RawCollection},
     event::Operation,
     model::Model,
-    storage::StorageEngine,
+    storage::StorageEngine, types::ID,
 };
 use std::{
     collections::BTreeMap,
@@ -36,6 +38,9 @@ impl Node {
     pub fn collection<M: Model>(&self, name: &str) -> &CollectionHandle<M> {
         unimplemented!()
         // self.collections.get(name).unwrap()
+    }
+    pub fn next_id(&self) -> ID {
+        ID(Ulid::new())
     }
 }
 

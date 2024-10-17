@@ -19,7 +19,7 @@ pub struct CollectionHandle<M: Model> {
 }
 
 impl RawCollection {
-    pub fn new(name: String /*bucket: Box<dyn StorageBucket>*/) -> Self {
+    pub fn new(_name: String /*bucket: Box<dyn StorageBucket>*/) -> Self {
         unimplemented!()
         // Self { name, bucket }
     }
