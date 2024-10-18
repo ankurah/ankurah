@@ -41,10 +41,28 @@ async fn main() {
             name: "The Dark Sid of the Moon".to_string(),
         },
     );
+    // This should create the materialized storage-record with the TypeModuleStates and the intial storage-event with the initial TypeModuleOps
+
+    // traits we need
+    // TypeValue -- we need an concrete type accessor for the impl of this each field on the "instance object"
+    // TypeModule
+    // TypeModuleState -- maybe could just be a method of TypeModule
+    // TypeModuleOp -- maybe could just be a method of TypeModule
 
     info!("Album created: {:?}", album);
     // LEFT OFF HERE - need to get derive(Model) working again
-    album.name.insert(12, "e");
+    // This is an "edit", that issues an "operation" for the underlying TypeModule that the type is associated
+    // with. And the "event" contains a serialized vec of all (1) operations that occurred during that transaction.
+    // and the "state" of the materialized record is updated to include ALL TypeModuleStates for all fields in the model.
+    // for now 1 edit = 1 operation = 1 transaction aka EVENT. Later we'll batch them up
+    // ALSO - for now, lets assume that we can instantiate one TypeModule instance per each field, but later we will likely
+    // want to update them to support multiple fields per modules
+
+    // I don't particularly care if `album` is Record<Album> or AlbumRecord
+    // as long as the field accesors (album.name, or album.name()) return a concrete TypeValue impl
+    // and we can access the id property for the instance.
+    album.name().insert(12, "e");
+    album.tags.insert("blues");
     // assert_eq!(album.name.value(), "The Dark Side of the Moon");
 
     // should immediately have two operations - one for the initial insert, and one for the edit
