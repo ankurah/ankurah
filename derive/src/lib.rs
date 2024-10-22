@@ -62,7 +62,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 
         impl #record_name {
             pub fn new(node: &Node, model: #name) -> Self {
-                use ankurah_core::types::value::InitializeWith;
+                use ankurah_core::types::traits::InitializeWith;
                 Self {
                     id: node.next_id(),
                     #(#field_names: <#field_value_types>::initialize_with(model.#field_names),)*

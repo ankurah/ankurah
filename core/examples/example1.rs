@@ -45,9 +45,7 @@ fn main() {
 
     // traits we need
     // TypeValue -- we need an concrete type accessor for the impl of this each field on the "instance object"
-    // TypeModule
-    // TypeModuleState -- maybe could just be a method of TypeModule
-    // TypeModuleOp -- maybe could just be a method of TypeModule
+    // TypeEngine -- implement the state management for one or more property TypeValues of the same record
 
     info!("Album created: {:?}", album);
     // LEFT OFF HERE - need to get derive(Model) working again
@@ -65,7 +63,7 @@ fn main() {
 
     assert_eq!(album.name.value(), "The Dark Side of the Moon");
 
-    use ankurah_core::types::value::StateSync;
+    use ankurah_core::types::traits::StateSync;
     let update = album.name().get_pending_update();
     println!("Update length: {}", update.unwrap().len());
 
