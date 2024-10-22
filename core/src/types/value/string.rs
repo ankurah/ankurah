@@ -7,9 +7,11 @@ pub struct StringValue {
     // TODO consolidate
     // engine: crate::types::engine::yrs::Yrs,
     doc: yrs::Doc,
-    // ideally we'd store the yrs::TransactionMut and call encode_update_v2 on it when we're ready to commit
+    // ideally we'd store the yrs::TransactionMut in the Transaction as an ExtendableOp or something like that
+    // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
     pub previous_state: Arc<Mutex<StateVector>>,
+    pub record_inner: Arc<RecordInner>,
 }
 
 use yrs::{
@@ -17,7 +19,10 @@ use yrs::{
     Doc, GetString, ReadTxn, StateVector, Text, Transact, Update,
 };
 
-use crate::types::traits::{InitializeWith, StateSync};
+use crate::{
+    model::RecordInner,
+    types::traits::{InitializeWith, StateSync},
+};
 
 // Starting with basic string type operations
 impl StringValue {
@@ -26,19 +31,29 @@ impl StringValue {
         text.get_string(&self.doc.transact())
     }
     pub fn insert(&self, index: u32, value: &str) {
+        let trx = self.record_inner.transaction_manager.handle();
+
         let text = self.doc.get_or_insert_text(""); // We only have one field in the yrs doc
-        let mut txn = self.doc.transact_mut();
-        text.insert(&mut txn, index, value);
+        let mut ytx = self.doc.transact_mut();
+        text.insert(&mut ytx, index, value);
+
+        trx.add_operation(
+            "yrs",
+            self.record_inner.collection,
+            self.record_inner.id,
+            ytx.encode_update_v2(),
+        );
     }
     pub fn delete(&self, index: u32, length: u32) {
         let text = self.doc.get_or_insert_text(""); // We only have one field in the yrs doc
-        let mut txn = self.doc.transact_mut();
-        text.remove_range(&mut txn, index, length);
+        let mut ytx = self.doc.transact_mut();
+        text.remove_range(&mut ytx, index, length);
     }
 }
 
 impl InitializeWith<String> for StringValue {
-    fn initialize_with(value: String) -> Self {
+    fn initialize_with(inner: Arc<RecordInner>, value: String) -> Self {
+        let trx = inner.transaction_manager.handle();
         let doc = yrs::Doc::new();
         // prob an empty vec - hack until transaction mut lifetime is figured out
         let starting_state = doc.transact().state_vector();
@@ -50,7 +65,14 @@ impl InitializeWith<String> for StringValue {
             let mut txn = doc.transact_mut();
             text.insert(&mut txn, 0, value.as_str());
         }
+        trx.add_operation(
+            "yrs",
+            inner.collection,
+            inner.id,
+            doc.transact().state_vector().encode_v2(),
+        );
         Self {
+            record_inner: inner,
             previous_state: Arc::new(Mutex::new(starting_state)),
             doc,
         }

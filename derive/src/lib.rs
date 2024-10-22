@@ -22,6 +22,7 @@ fn get_value_type(ty: &Type) -> proc_macro2::TokenStream {
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident;
+    let name_str = name.to_string().to_lowercase();
     let record_name = format_ident!("{}Record", name);
 
     let fields = match input.data {
@@ -47,6 +48,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         #[derive(Debug)]
         pub struct #record_name {
             id: ankurah_core::types::ID,
+            inner: std::sync::Arc<ankurah_core::model::RecordInner>,
             #(#field_names: #field_value_types,)*
             // TODO: Add fields for tracking changes and operation count
         }
@@ -63,9 +65,16 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         impl #record_name {
             pub fn new(node: &Node, model: #name) -> Self {
                 use ankurah_core::types::traits::InitializeWith;
+                let id = node.next_id();
+                let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
+                    collection: #name_str,
+                    id,
+                    transaction_manager: node.transaction_manager.clone(),
+                });
                 Self {
-                    id: node.next_id(),
-                    #(#field_names: <#field_value_types>::initialize_with(model.#field_names),)*
+                    id,
+                    #(#field_names: <#field_value_types>::initialize_with(inner.clone(), model.#field_names),)*
+                    inner,
                 }
             }
             #(

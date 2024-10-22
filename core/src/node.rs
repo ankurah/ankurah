@@ -4,8 +4,11 @@ use crate::{
     collection::{CollectionHandle, RawCollection},
     event::Operation,
     model::Model,
-    storage::StorageEngine, types::ID,
+    storage::StorageEngine,
+    transaction::{TransactionGuard, TransactionManager},
+    types::ID,
 };
+use anyhow::Result;
 use std::{
     collections::BTreeMap,
     sync::{mpsc, Arc},
@@ -14,6 +17,7 @@ use std::{
 pub struct Node {
     // We don't know the collection type at compile time except via usage of the .collection() method
     collections: BTreeMap<String, RawCollection>,
+    pub transaction_manager: Arc<TransactionManager>,
     // peer_connections: Vec<PeerConnection>,
 }
 
@@ -21,6 +25,7 @@ impl Node {
     pub fn new(storage: impl StorageEngine) -> Arc<Self> {
         Arc::new(Self {
             collections: BTreeMap::new(),
+            transaction_manager: Arc::new(TransactionManager::new()),
             // peer_connections: Vec::new(),
         })
     }
@@ -41,6 +46,9 @@ impl Node {
     }
     pub fn next_id(&self) -> ID {
         ID(Ulid::new())
+    }
+    pub fn begin(&self) -> Result<TransactionGuard> {
+        self.transaction_manager.begin()
     }
 }
 
