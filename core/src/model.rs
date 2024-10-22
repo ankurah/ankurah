@@ -10,5 +10,4 @@ pub trait Model {}
 pub trait Record {
     type Model: Model;
     fn id(&self) -> ID;
-    fn current(&self) -> &Self::Model;
 }

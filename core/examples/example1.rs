@@ -9,8 +9,8 @@ pub struct Album {
     name: String,
 }
 
-#[tokio::main]
-async fn main() {
+// #[tokio::main]
+fn main() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
@@ -62,8 +62,12 @@ async fn main() {
     // as long as the field accesors (album.name, or album.name()) return a concrete TypeValue impl
     // and we can access the id property for the instance.
     album.name().insert(12, "e");
-    album.tags.insert("blues");
-    // assert_eq!(album.name.value(), "The Dark Side of the Moon");
+
+    assert_eq!(album.name.value(), "The Dark Side of the Moon");
+
+    use ankurah_core::types::value::StateSync;
+    let update = album.name().get_pending_update();
+    println!("Update length: {}", update.unwrap().len());
 
     // should immediately have two operations - one for the initial insert, and one for the edit
     // assert_eq!(album.operation_count(), 2);

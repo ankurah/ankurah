@@ -7,10 +7,10 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
 fn get_value_type(ty: &Type) -> proc_macro2::TokenStream {
     let type_str = quote!(#ty).to_string();
     let value_type = match type_str.as_str() {
-        "String" => quote!(ankurah_core::types::value::StringValue),
-        "i32" => quote!(ankurah_core::types::value::IntValue),
-        "f64" => quote!(ankurah_core::types::value::FloatValue),
-        "bool" => quote!(ankurah_core::types::value::BoolValue),
+        "String" => quote!(StringValue),
+        "i32" => quote!(IntValue),
+        "f64" => quote!(FloatValue),
+        "bool" => quote!(BoolValue),
         // Add more mappings as needed
         _ => quote!(ankurah_core::types::value::Value<#ty>), // Default to a generic Value type
     };
@@ -32,11 +32,14 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         _ => panic!("Only structs are supported"),
     };
 
-    let field_names = fields.iter().map(|f| &f.ident);
-    let field_types = fields.iter().map(|f| &f.ty);
+    let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
+    let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
 
     // Update this to use the get_value_type function
-    let field_value_types = fields.iter().map(|f| get_value_type(&f.ty));
+    let field_value_types = fields
+        .iter()
+        .map(|f| get_value_type(&f.ty))
+        .collect::<Vec<_>>();
 
     let expanded: proc_macro::TokenStream = quote! {
         impl ankurah_core::model::Model for #name {}
@@ -59,13 +62,12 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 
         impl #record_name {
             pub fn new(node: &Node, model: #name) -> Self {
+                use ankurah_core::types::value::InitializeWith;
                 Self {
                     id: node.next_id(),
-                    #(#field_names: <#field_value_types>::new(model.#field_names),)*
-                    // TODO: Initialize fields for tracking changes and operation count
+                    #(#field_names: <#field_value_types>::initialize_with(model.#field_names),)*
                 }
             }
-
             #(
                 pub fn #field_names(&self) -> &#field_value_types {
                     &self.#field_names
