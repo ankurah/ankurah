@@ -17,7 +17,7 @@ pub struct StringValue {
 
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
-    Doc, GetString, ReadTxn, StateVector, Text, Transact, Update,
+    GetString, ReadTxn, StateVector, Text, Transact, Update,
 };
 
 use crate::{

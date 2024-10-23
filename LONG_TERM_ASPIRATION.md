@@ -6,7 +6,7 @@ Intended features:
 
 - Recording and querying time-series data for a given topic
 - Representing and querying event-sourced state for a given topic
-- Representing (hyper)edges which define relatinoships between topics (and embeddings)
+- Representing (hyper)edges which define relationships between topics (and embeddings)
   - Hybrid hypergraph/vector paradigm
 - Declarative + recursive live-querying
 - Multi-homed users which are able to roam between servers or self-host without

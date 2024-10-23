@@ -59,18 +59,32 @@ impl Deref for TransactionHandle {
         }
     }
 }
+
+#[must_use]
 pub struct TransactionGuard {
     trx: Arc<Transaction>,
+    consumed: bool,
 }
+
 impl TransactionGuard {
     pub fn new(trx: Arc<Transaction>) -> Self {
-        Self { trx }
+        Self { trx, consumed: false }
+    }
+
+    pub fn commit(mut self) {
+        self.trx.commit();
+        self.consumed = true;
+    }
+
+    pub fn release(mut self) {
+        // drop doing nothing
+        self.consumed = true;
     }
 }
 
 impl Drop for TransactionGuard {
     fn drop(&mut self) {
-        self.trx.commit();
+        assert!(self.consumed, "`commit` or `release` need to be used on the `TransactionGuard`.");
     }
 }
 

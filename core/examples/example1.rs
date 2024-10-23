@@ -63,7 +63,8 @@ async fn main() -> Result<()> {
         // as long as the field accesors (album.name, or album.name()) return a concrete TypeValue impl
         // and we can access the id property for the instance.
         album.name().insert(12, "e");
-        // trxguard commits the transaction on drop
+        trx.commit();
+
         album
     };
 
