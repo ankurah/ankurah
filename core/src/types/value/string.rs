@@ -12,6 +12,7 @@ pub struct StringValue {
     // but its got a lifetime of 'doc and that requires some refactoring
     pub previous_state: Arc<Mutex<StateVector>>,
     pub record_inner: Arc<RecordInner>,
+    pub property_name: &'static str,
 }
 
 use yrs::{
@@ -27,13 +28,13 @@ use crate::{
 // Starting with basic string type operations
 impl StringValue {
     pub fn value(&self) -> String {
-        let text = self.doc.get_or_insert_text(""); // We only have one field in the yrs doc
+        let text = self.doc.get_or_insert_text(self.property_name); // We only have one field in the yrs doc
         text.get_string(&self.doc.transact())
     }
     pub fn insert(&self, index: u32, value: &str) {
         let trx = self.record_inner.transaction_manager.handle();
 
-        let text = self.doc.get_or_insert_text(""); // We only have one field in the yrs doc
+        let text = self.doc.get_or_insert_text(self.property_name); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.insert(&mut ytx, index, value);
 
@@ -45,21 +46,25 @@ impl StringValue {
         );
     }
     pub fn delete(&self, index: u32, length: u32) {
-        let text = self.doc.get_or_insert_text(""); // We only have one field in the yrs doc
+        let text = self.doc.get_or_insert_text(self.property_name); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
     }
 }
 
 impl InitializeWith<String> for StringValue {
-    fn initialize_with(inner: Arc<RecordInner>, value: String) -> Self {
+    fn initialize_with(
+        inner: Arc<RecordInner>,
+        property_name: &'static str,
+        value: String,
+    ) -> Self {
         let trx = inner.transaction_manager.handle();
         let doc = yrs::Doc::new();
         // prob an empty vec - hack until transaction mut lifetime is figured out
         let starting_state = doc.transact().state_vector();
 
-        let text = doc.get_or_insert_text(""); // We only have one field in the yrs doc
-                                               // every operation in Yrs happens in scope of a transaction
+        let text = doc.get_or_insert_text(property_name); // We only have one field in the yrs doc
+                                                          // every operation in Yrs happens in scope of a transaction
 
         {
             let mut txn = doc.transact_mut();
@@ -73,6 +78,7 @@ impl InitializeWith<String> for StringValue {
         );
         Self {
             record_inner: inner,
+            property_name,
             previous_state: Arc::new(Mutex::new(starting_state)),
             doc,
         }

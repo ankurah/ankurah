@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::model::RecordInner;
 
 pub trait InitializeWith<T> {
-    fn initialize_with(inner: Arc<RecordInner>, value: T) -> Self;
+    fn initialize_with(inner: Arc<RecordInner>, property_name: &'static str, value: T) -> Self;
 }
 
 pub trait StateSync {

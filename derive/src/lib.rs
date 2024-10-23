@@ -34,6 +34,10 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     };
 
     let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
+    let field_name_strs = fields
+        .iter()
+        .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
+        .collect::<Vec<_>>();
     let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
 
     // Update this to use the get_value_type function
@@ -73,7 +77,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                 });
                 Self {
                     id,
-                    #(#field_names: <#field_value_types>::initialize_with(inner.clone(), model.#field_names),)*
+                    #(#field_names: <#field_value_types>::initialize_with(inner.clone(), #field_name_strs, model.#field_names),)*
                     inner,
                 }
             }
