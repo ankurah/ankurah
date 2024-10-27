@@ -1,2 +1,0 @@
-struct Memo {}
-struct Basis {}

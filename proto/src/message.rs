@@ -1,4 +1,3 @@
-use crate::event::ingress::{FetchIngressLogsRequest, FetchIngressLogsResponse};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -15,7 +14,9 @@ pub struct Request {
 
 #[derive(Serialize, Deserialize)]
 pub enum RequestPayload {
-    FetchIngressLogs(FetchIngressLogsRequest),
+    // put request types here
+    // I dunno, maybe
+    // Query(something)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -26,6 +27,5 @@ pub struct Response {
 
 #[derive(Serialize, Deserialize)]
 pub enum ResponsePayload {
-    FetchIngressLogs(FetchIngressLogsResponse),
     Error(String),
 }
