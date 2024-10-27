@@ -1,41 +1,63 @@
-# Getting started
+# Getting Started
 
-Note that this is very early in development, but if you want to see what exists so far you can run the following:
+This project is in early development. To explore the current features, follow these steps:
 
-1. Install rust:
-   https://rustup.rs/
+## Prerequisites
 
-2. Install cargo watch (useful for dev workflow)
+- **Install Rust:**
 
-   ```
-   cargo install cargo-watch
-   ```
+  - [rustup.rs](https://rustup.rs/)
 
-3. Start the server (leave this running):
+- **Install Cargo Watch** (useful for development workflow):
 
-   ```
-   # from the root directory of the repo
-   cargo watch -x 'run --bin ankurah-server'
-   ```
+  ```bash
+  cargo install cargo-watch
+  ```
 
-4. Install wasm-pack
-   https://rustwasm.github.io/wasm-pack/installer/
+- **Install wasm-pack:**
+  - [wasm-pack installer](https://rustwasm.github.io/wasm-pack/installer/)
 
-5. In a new tab, compile the wasm bindings for the example app (leave this running):
-   If you use react, your application will need a crate like this to use your models
+## Server Setup
 
-   ```
+- **Start the Server** (keep this running):
+  ```bash
+  # From the root directory of the repository
+  cargo watch -x 'run --bin ankurah-server'
+  ```
+
+## React Example App
+
+1. **Compile the Wasm Bindings** (keep this running):
+
+   - Navigate to the `wasm-bindings` example directory:
+
+   ```bash
    cd examples/wasm-bindings
    cargo watch -s 'wasm-pack build --target web --debug'
    ```
 
-6. install `bun` (npm/node might work, but I haven't tested it, and bun is way faster)
+2. **Install Bun** (npm/node might work, but Bun is faster):
 
-   https://bun.sh/docs/installation
+   - [Bun installation guide](https://bun.sh/docs/installation)
 
-7. In a new tab, run the example react app (leave this running):
-   ```
+3. **Run the React Example App** (keep this running):
+   ```bash
    cd examples/react-app
    bun install
    bun dev
    ```
+
+## Leptos Example App
+
+1. **Install Trunk** (build tool used by Leptos):
+
+   ```bash
+   cargo install trunk
+   ```
+
+2. **Run the Leptos Example App** (keep this running):
+   ```bash
+   trunk serve --open
+   ```
+
+> **Note:** For the Leptos app, there is no need to build the Wasm bindings crate separately.

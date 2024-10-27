@@ -1,9 +1,15 @@
-use ankurah_web::client::Client;
+use ankurah_web_client::Client;
+use example_model::*;
 use leptos::logging::*;
 use leptos::*;
 
 fn main() {
     console_error_panic_hook::set_once();
+
+    // TODO: use the model in the app
+    let _album = Album {
+        name: "test".to_string(),
+    };
 
     let client = Client::new().unwrap();
     leptos::mount_to_body(|| view! { <App client=client/> })
