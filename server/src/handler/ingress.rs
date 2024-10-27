@@ -1,3 +1,4 @@
+use ankurah_proto as proto;
 use anyhow::anyhow;
 use axum::{
     extract::{ws::WebSocket, Host, Path, Query, State},
@@ -7,7 +8,6 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::stream::SplitSink;
-use hydra_proto as proto;
 use proto::IngressLog;
 use serde::{Deserialize, Serialize};
 use sled::IVec;

@@ -1,16 +1,16 @@
 mod appstate;
 mod error;
-mod handler;
-mod query;
+mod hello;
+// mod handler;
+// mod query;
 mod signal;
-mod storage;
+// mod storage;
 
 use axum::extract::ws::CloseFrame;
 use axum::extract::{connect_info::ConnectInfo, State};
 use core::panic;
 use error::AppError;
 use futures_util::stream::SplitSink;
-use handler::ingress::fetch_ingress_logs;
 use std::{borrow::Cow, net::SocketAddr, ops::ControlFlow};
 
 use appstate::AppState;
@@ -24,10 +24,10 @@ use axum::{
     Router,
 };
 
+use ankurah_proto as proto;
 use axum_extra::{headers, TypedHeader};
 use bincode::{deserialize, serialize};
 use futures_util::{SinkExt, StreamExt};
-use hydra_proto as proto;
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::{info, Level};
@@ -40,8 +40,7 @@ async fn main() -> Result<()> {
 
     // build our application with a route and middleware
     let app = Router::new()
-        .route("/", get(root))
-        .route("/ingress", post(handler::ingress::capture))
+        .route("/", get(hello::hello))
         .route("/ws", get(ws_handler))
         .with_state(state)
         .layer(
@@ -57,7 +56,7 @@ async fn main() -> Result<()> {
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9797").await.unwrap();
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
 
     // axum::serve(listener, app).await.unwrap();
     axum::serve(
@@ -68,10 +67,6 @@ async fn main() -> Result<()> {
     .unwrap();
 
     Ok(())
-}
-
-pub async fn root() -> Result<String, StatusCode> {
-    Ok("Hello, world!".to_string())
 }
 
 async fn ws_handler(
@@ -139,7 +134,8 @@ async fn process_message(
             if let Ok(message) = deserialize::<proto::Message>(&d) {
                 match message {
                     proto::Message::Request(request) => {
-                        handle_request(request, sender, state);
+                        println!("Received request");
+                        // handle_request(request, sender, state);
                     }
                     proto::Message::Response(_) => {
                         println!("Unexpected response message from client");
@@ -174,30 +170,30 @@ async fn process_message(
     ControlFlow::Continue(())
 }
 
-async fn handle_request(
-    request: proto::Request,
-    sender: &SplitSink<WebSocket, Message>,
-    state: &AppState,
-) -> proto::Response {
-    let response_payload = match request.payload {
-        proto::RequestPayload::FetchIngressLogs(fetch_request) => {
-            match fetch_ingress_logs(fetch_request, state, sender) {
-                Ok(fetch_response) => proto::ResponsePayload::FetchIngressLogs(fetch_response),
-                Err(e) => {
-                    println!("Error fetching ingress logs: {:?}", e);
-                    // You might want to define an error variant for ResponsePayload
-                    // to handle this case more gracefully
-                    return proto::Response {
-                        request_id: request.id,
-                        payload: proto::ResponsePayload::Error(format!("{:?}", e)),
-                    };
-                }
-            }
-        }
-    };
+// async fn handle_request(
+//     request: proto::Request,
+//     sender: &SplitSink<WebSocket, Message>,
+//     state: &AppState,
+// ) -> proto::Response {
+//     let response_payload = match request.payload {
+//         proto::RequestPayload::FetchIngressLogs(fetch_request) => {
+//             match fetch_ingress_logs(fetch_request, state, sender) {
+//                 Ok(fetch_response) => proto::ResponsePayload::FetchIngressLogs(fetch_response),
+//                 Err(e) => {
+//                     println!("Error fetching ingress logs: {:?}", e);
+//                     // You might want to define an error variant for ResponsePayload
+//                     // to handle this case more gracefully
+//                     return proto::Response {
+//                         request_id: request.id,
+//                         payload: proto::ResponsePayload::Error(format!("{:?}", e)),
+//                     };
+//                 }
+//             }
+//         }
+//     };
 
-    proto::Response {
-        request_id: request.id,
-        payload: response_payload,
-    }
-}
+//     proto::Response {
+//         request_id: request.id,
+//         payload: response_payload,
+//     }
+// }

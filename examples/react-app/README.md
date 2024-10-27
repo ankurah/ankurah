@@ -1,4 +1,4 @@
-# Example application using hydra
+# Example application using ankurah
 
 Getting started:
 

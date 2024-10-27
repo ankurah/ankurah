@@ -1,6 +1,6 @@
+use ankurah_proto as proto;
 use anyhow::anyhow;
 use axum::extract::State;
-use hydra_proto as proto;
 use sled::IVec;
 use ulid::Ulid;
 

@@ -8,7 +8,7 @@ export default defineConfig({
     fs: {
       allow: [
         '.',
-        '../../web/pkg',
+        '../wasm-bindings/pkg',
       ],
     },
   },

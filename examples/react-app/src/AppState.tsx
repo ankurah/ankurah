@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useMemo, useState } from 'react';
-import init_hydra, * as hydra from 'hydra-web';
+import init_bindings, * as bindings from 'example-wasm-bindings';
 
 interface AppState {
-  client: hydra.Client | null;
+  client: bindings.Client | null;
 }
 
 const AppState = createContext<AppState | null>(null);
@@ -18,9 +18,9 @@ export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     //   return;
     // }
     // initializing = true;
-    init_hydra().then(async () => {
+    init_bindings().then(async () => {
       console.log('init done');
-      const newClient = hydra.Client.new();
+      const newClient = bindings.Client.new();
       await newClient.ready();
       setAppState({ client: newClient });
     });
