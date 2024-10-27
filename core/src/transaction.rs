@@ -12,6 +12,12 @@ pub struct TransactionManager {
     active_transaction: Mutex<Option<Arc<Transaction>>>,
 }
 
+impl Default for TransactionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransactionManager {
     pub fn new() -> Self {
         Self {
@@ -55,7 +61,7 @@ impl Deref for TransactionHandle {
     fn deref(&self) -> &Self::Target {
         match self {
             TransactionHandle::AutoCommit(trx) => trx,
-            TransactionHandle::Standard(trx) => &*trx,
+            TransactionHandle::Standard(trx) => trx,
         }
     }
 }
@@ -93,6 +99,12 @@ pub struct Transaction {
     updates: Mutex<BTreeMap<(&'static str, ID), Vec<Operation>>>,
 }
 
+impl Default for Transaction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Transaction {
     pub fn new() -> Self {
         Self {
@@ -109,7 +121,7 @@ impl Transaction {
         let mut updates = self.updates.lock().unwrap();
         updates
             .entry((collection, id))
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Operation { engine, payload });
     }
     pub fn commit(&self) {

@@ -1,6 +1,5 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
 
 /// Map model field types to their corresponding value types
@@ -14,7 +13,7 @@ fn get_value_type(ty: &Type) -> proc_macro2::TokenStream {
         // Add more mappings as needed
         _ => quote!(ankurah_core::types::value::Value<#ty>), // Default to a generic Value type
     };
-    quote!(ankurah_core::types::value::#value_type).into()
+    quote!(ankurah_core::types::value::#value_type)
 }
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
@@ -90,5 +89,5 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     }
     .into();
 
-    TokenStream::from(expanded)
+    expanded
 }

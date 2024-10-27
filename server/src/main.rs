@@ -6,27 +6,23 @@ mod hello;
 mod signal;
 // mod storage;
 
-use axum::extract::ws::CloseFrame;
 use axum::extract::{connect_info::ConnectInfo, State};
-use core::panic;
-use error::AppError;
 use futures_util::stream::SplitSink;
-use std::{borrow::Cow, net::SocketAddr, ops::ControlFlow};
+use std::{net::SocketAddr, ops::ControlFlow};
 
 use appstate::AppState;
 
 use anyhow::Result;
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Router,
 };
 
 use ankurah_proto as proto;
 use axum_extra::{headers, TypedHeader};
-use bincode::{deserialize, serialize};
+use bincode::deserialize;
 use futures_util::{SinkExt, StreamExt};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
@@ -99,7 +95,7 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: AppState) 
         return;
     }
 
-    let (mut sender, mut receiver) = socket.split();
+    let (sender, mut receiver) = socket.split();
 
     // Process each incoming message
     while let Some(msg) = receiver.next().await {

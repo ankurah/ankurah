@@ -2,7 +2,6 @@ use std::{collections::HashMap, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use wasm_bindgen::prelude::*;
 // use crate::query::Record;
 use bytes::Bytes;
 

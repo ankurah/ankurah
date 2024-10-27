@@ -1,10 +1,7 @@
-use futures::future::{select, Either, FutureExt};
-use futures::io::Read;
-use futures::select;
 use futures_signals::signal::{Mutable, SignalExt};
-use futures_signals::signal::{MutableSignal, ReadOnlyMutable};
+use futures_signals::signal::ReadOnlyMutable;
 use gloo_timers::future::sleep;
-use log::{error, info, warn};
+use log::info;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -70,7 +67,7 @@ impl ClientInner {
         self.connection.borrow_mut().replace(connection);
 
         self.state.set(ConnectionState::Connecting);
-        let client_inner = Rc::clone(&self);
+        let client_inner = Rc::clone(self);
 
         info!("Connecting to websocket");
         let self2 = self.clone();

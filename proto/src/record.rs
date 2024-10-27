@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::prelude::*;
 
 pub trait Record: serde::de::DeserializeOwned {
     type ID: Clone;
