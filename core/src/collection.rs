@@ -1,35 +1,50 @@
-use std::marker::PhantomData;
+use std::{borrow::Cow, marker::PhantomData};
 
-use crate::model::Model;
+use crate::{model::Model, storage::StorageBucket};
 
 // WIP
 
 /// Manages the storage and state of the collection without any knowledge of the model type
-#[derive(Clone)]
 pub struct RawCollection {
     pub name: String,
-    // pub bucket: Box<dyn StorageBucket>,
-}
-
-/// API surface for a collection
-pub struct CollectionHandle<M: Model> {
-    pub name: String,
-    pub raw: RawCollection,
-    _marker: PhantomData<M>,
+    pub bucket: Box<dyn StorageBucket>,
 }
 
 impl RawCollection {
-    pub fn new(_name: String /*bucket: Box<dyn StorageBucket>*/) -> Self {
-        unimplemented!()
-        // Self { name, bucket }
+    pub fn new(name: String, bucket: Box<dyn StorageBucket>) -> Self {
+        Self { name, bucket }
     }
 }
 
-impl<M: Model> CollectionHandle<M> {
-    pub fn new(name: String, raw: &RawCollection) -> Self {
+/// Immutable API surface for a collection
+pub struct Collection<'a, M: Model> {
+    pub name: String,
+    pub raw: &'a RawCollection,
+    _marker: PhantomData<M>,
+}
+
+impl<'a, M: Model> Collection<'a, M> {
+    pub fn new(name: &str, raw: &'a RawCollection) -> Self {
         Self {
-            name,
-            raw: raw.clone(),
+            name: name.to_owned(),
+            raw: raw,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Mutable API surface for a collection
+pub struct CollectionMut<'a, M: Model> {
+    pub name: String,
+    pub raw: &'a mut RawCollection,
+    _marker: PhantomData<M>,
+}
+
+impl<'a, M: Model> CollectionMut<'a, M> {
+    pub fn new(name: &str, raw: &'a mut RawCollection) -> Self {
+        Self {
+            name: name.to_owned(),
+            raw: raw,
             _marker: PhantomData,
         }
     }

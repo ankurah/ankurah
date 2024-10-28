@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::{transaction::TransactionManager, types::ID};
+use crate::{storage::RecordState, transaction::TransactionManager, types::ID};
 
 /// A model is a struct that represents the present values for a given record
 /// Schema is defined primarily by the Model object, and the Record is derived from that via macro.
@@ -12,6 +12,7 @@ pub trait Model {}
 pub trait Record {
     type Model: Model;
     fn id(&self) -> ID;
+    fn record_state(&self) -> RecordState;
 }
 
 #[derive(Debug)]

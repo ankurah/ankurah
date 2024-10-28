@@ -1,5 +1,5 @@
-use futures_signals::signal::{Mutable, SignalExt};
 use futures_signals::signal::ReadOnlyMutable;
+use futures_signals::signal::{Mutable, SignalExt};
 use gloo_timers::future::sleep;
 use log::info;
 use std::cell::RefCell;

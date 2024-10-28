@@ -21,8 +21,7 @@ use yrs::{
 };
 
 use crate::{
-    model::RecordInner,
-    types::traits::{InitializeWith, StateSync},
+    model::RecordInner, storage::FieldValue, types::traits::{InitializeWith, StateSync}
 };
 
 // Starting with basic string type operations
@@ -86,6 +85,9 @@ impl InitializeWith<String> for StringValue {
 }
 
 impl StateSync for StringValue {
+    fn field_value(&self) -> FieldValue {
+        FieldValue::StringValue
+    }
     /// Apply an update to the field from an event/operation
     fn apply_update(&self, update: &[u8]) -> Result<()> {
         let mut txn = self.doc.transact_mut();

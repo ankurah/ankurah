@@ -1,4 +1,5 @@
-use ankurah_core::node::Node;
+use ankurah_core::model::Record;
+use ankurah_core::{node::Node, types::ID};
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_derive::Model;
 use anyhow::Result;
@@ -19,7 +20,7 @@ async fn main() -> Result<()> {
 
     // client.local_connect(&server);
 
-    // let client_albums = client.collection::<Album>("album");
+    let client_albums = client.collection::<Album>("album");
     // let server_albums = server.collection::<Album>("album");
 
     // Lets get signals working after we have the basics
@@ -64,6 +65,15 @@ async fn main() -> Result<()> {
         // and we can access the id property for the instance.
         album.name().insert(12, "e");
         trx.commit();
+
+        {
+            let id = ID(ulid::Ulid::new());
+            // TODO: mutability management
+            // let mut client_albums = client.collection_mut::<Album>("album");
+            // client_albums.raw.bucket.set_state(id, album.record_state());
+            // let record_state = client_albums.raw.bucket.get(id);
+            // let updated_album = AlbumRecord::from_record_state(record_state);
+        }
 
         album
     };

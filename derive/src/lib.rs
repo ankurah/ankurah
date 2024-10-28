@@ -64,16 +64,17 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
             }
 
             fn record_state(&self) -> ankurah_core::storage::RecordState {
+                use ankurah_core::types::traits::StateSync;
                 let mut states = Vec::new();
                 #(
                     let field_state = ankurah_core::storage::FieldState {
-                        field_value: ankurah_core::storage::FieldValue::#field_value_types,
-                        state: self.#field_names.value(),
+                        field_value: self.#field_names.field_value(),
+                        state: self.#field_names.state(),
                     };
                     states.push(field_state);
                 )*
-                RecordState {
-                    states,
+                ankurah_core::storage::RecordState {
+                    field_states: states,
                 }
             }
         }

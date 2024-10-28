@@ -74,7 +74,10 @@ pub struct TransactionGuard {
 
 impl TransactionGuard {
     pub fn new(trx: Arc<Transaction>) -> Self {
-        Self { trx, consumed: false }
+        Self {
+            trx,
+            consumed: false,
+        }
     }
 
     pub fn commit(mut self) {
@@ -90,7 +93,10 @@ impl TransactionGuard {
 
 impl Drop for TransactionGuard {
     fn drop(&mut self) {
-        assert!(self.consumed, "`commit` or `release` need to be used on the `TransactionGuard`.");
+        assert!(
+            self.consumed,
+            "`commit` or `release` need to be used on the `TransactionGuard`."
+        );
     }
 }
 
