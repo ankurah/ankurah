@@ -12,21 +12,21 @@ pub trait StorageEngine {
 
 pub trait StorageBucket {
     fn set_state(&self, id: ID, state: RecordState) -> Result<()>;
-    // fn get(&self, id: ID) -> Result<RecordState> {}
+    fn get(&self, id: ID) -> Result<RecordState>;
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordState {
     pub field_states: Vec<FieldState>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldState {
     pub field_value: FieldValue, // is this even necessary given we know the type in the code?
     pub state: Vec<u8>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FieldValue {
     StringValue,
 }
@@ -89,5 +89,17 @@ impl StorageBucket for SledStorageBucket {
         self.tree.insert(id.0.to_bytes(), binary_state)?;
         Ok(())
     }
-    // fn get(&self, id: ID) -> Result<RecordState> {}
+    fn get(&self, id: ID) -> Result<RecordState> {
+        match self.tree.get(id.0.to_bytes())? {
+            Some(ivec) => {
+                let record_state = bincode::deserialize(&*ivec)?;
+                Ok(record_state)
+            }
+            None => {
+                //Ok(RecordState { field_states: Vec::new() });
+                //Err(format!("Missing Ivec for id"))
+                panic!("need to figure out anyhow");
+            }
+        }
+    }
 }

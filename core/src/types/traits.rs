@@ -9,7 +9,7 @@ pub trait InitializeWith<T> {
 
 pub trait StateSync {
     /// Meta information on what kind of field this is for back retrieval.
-    fn field_value(&self) -> FieldValue;
+    fn field_value(&self) -> FieldValue; // Maybe unnecessary
 
     /// Apply an update to the field from an event/operation
     fn apply_update(&self, update: &[u8]) -> Result<()>;

@@ -2,6 +2,15 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
+use yrs::{
+    updates::{decoder::Decode, encoder::Encode},
+    GetString, ReadTxn, StateVector, Text, Transact, Update,
+};
+
+use crate::{
+    model::RecordInner, storage::FieldValue, types::traits::{InitializeWith, StateSync}
+};
+
 #[derive(Debug)]
 pub struct StringValue {
     // TODO consolidate
@@ -15,17 +24,24 @@ pub struct StringValue {
     pub property_name: &'static str,
 }
 
-use yrs::{
-    updates::{decoder::Decode, encoder::Encode},
-    GetString, ReadTxn, StateVector, Text, Transact, Update,
-};
-
-use crate::{
-    model::RecordInner, storage::FieldValue, types::traits::{InitializeWith, StateSync}
-};
-
 // Starting with basic string type operations
 impl StringValue {
+    pub fn from_property_state(inner: Arc<RecordInner>, property_name: &'static str, property_state: Vec<u8>) -> Result<Self> {
+        let doc = yrs::Doc::new();
+        let mut txn = doc.transact_mut();
+        let update = Update::decode_v2(&property_state)?;
+        txn.apply_update(update)?;
+    
+        let current_state = txn.state_vector();
+        txn.commit();
+        drop(txn);
+        Ok(Self {
+            doc: doc,
+            previous_state: Arc::new(Mutex::new(current_state)),
+            record_inner: inner,
+            property_name: property_name
+        })
+    }
     pub fn value(&self) -> String {
         let text = self.doc.get_or_insert_text(self.property_name); // We only have one field in the yrs doc
         text.get_string(&self.doc.transact())

@@ -38,6 +38,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
         .collect::<Vec<_>>();
     let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
+    let field_indices = fields.iter().enumerate().map(|(index, _)| index).collect::<Vec<_>>();
 
     // Update this to use the get_value_type function
     let field_value_types = fields
@@ -98,6 +99,16 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                     inner,
                 }
             }
+
+            pub fn from_record_state(record_state: &RecordState) -> Result<Self> {
+                record_state
+                Self {
+                #(
+                    #field_names: #field_value_types::from_field_state(record_state.field_states[#field_indices]);
+                )*
+                }
+            }
+
             #(
                 pub fn #field_names(&self) -> &#field_value_types {
                     &self.#field_names

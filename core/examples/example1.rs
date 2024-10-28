@@ -70,9 +70,10 @@ async fn main() -> Result<()> {
         {
             let id = ID(ulid::Ulid::new());
             //let mut client_albums = client.collection_mut::<Album>("album");
-            client_albums.raw.bucket.set_state(id, album.record_state());
-            // let record_state = client_albums.raw.bucket.get(id);
-            // let updated_album = AlbumRecord::from_record_state(record_state);
+            client_albums.raw.bucket.set_state(id, album.record_state())?;
+            let record_state = client_albums.raw.bucket.get(id);
+            info!("record_state: {:?}", record_state);
+            let updated_album = AlbumRecord::from_record_state(record_state);
         }
 
         album
