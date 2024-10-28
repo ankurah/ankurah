@@ -4,13 +4,14 @@ use sled::{Config, Db};
 
 use crate::types::ID;
 
-pub trait StorageEngine: Sized {
+pub trait StorageEngine {
     type StorageBucket: StorageBucket;
+    // Opens and/or creates a storage bucket.
     fn bucket(&self, name: &str) -> Result<Self::StorageBucket>;
 }
 
 pub trait StorageBucket {
-    fn set_state(&mut self, id: ID, state: RecordState) -> Result<()>;
+    fn set_state(&self, id: ID, state: RecordState) -> Result<()>;
     // fn get(&self, id: ID) -> Result<RecordState> {}
 }
 
@@ -83,7 +84,7 @@ impl SledStorageBucket {
 }
 
 impl StorageBucket for SledStorageBucket {
-    fn set_state(&mut self, id: ID, state: RecordState) -> Result<()> {
+    fn set_state(&self, id: ID, state: RecordState) -> Result<()> {
         let binary_state = bincode::serialize(&state)?;
         self.tree.insert(id.0.to_bytes(), binary_state)?;
         Ok(())

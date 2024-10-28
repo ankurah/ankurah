@@ -80,7 +80,11 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         }
 
         impl #record_name {
-            pub fn new(node: &Node, model: #name) -> Self {
+            pub fn new<E>(node: &Node<E>, model: #name) -> Self
+            where
+                E: ankurah_core::storage::StorageEngine,
+                E::StorageBucket: 'static,
+            {
                 use ankurah_core::types::traits::InitializeWith;
                 let id = node.next_id();
                 let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {

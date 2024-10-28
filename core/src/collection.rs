@@ -1,33 +1,35 @@
-use std::{borrow::Cow, marker::PhantomData};
+use std::{marker::PhantomData, sync::Arc};
+
+use tokio::sync::Mutex;
 
 use crate::{model::Model, storage::StorageBucket};
 
 // WIP
 
 /// Manages the storage and state of the collection without any knowledge of the model type
+#[derive(Clone)]
 pub struct RawCollection {
-    pub name: String,
-    pub bucket: Box<dyn StorageBucket>,
+    pub bucket: Arc<Box<dyn StorageBucket>>,
 }
 
 impl RawCollection {
-    pub fn new(name: String, bucket: Box<dyn StorageBucket>) -> Self {
-        Self { name, bucket }
+    pub fn new(bucket: Box<dyn StorageBucket>) -> Self {
+        Self { bucket: Arc::new(bucket) }
     }
 }
 
 /// Immutable API surface for a collection
-pub struct Collection<'a, M: Model> {
+pub struct Collection<M: Model> {
     pub name: String,
-    pub raw: &'a RawCollection,
+    pub raw: RawCollection,
     _marker: PhantomData<M>,
 }
 
-impl<'a, M: Model> Collection<'a, M> {
-    pub fn new(name: &str, raw: &'a RawCollection) -> Self {
+impl<'a, M: Model> Collection<M> {
+    pub fn new(name: &str, raw: &RawCollection) -> Self {
         Self {
             name: name.to_owned(),
-            raw: raw,
+            raw: raw.clone(),
             _marker: PhantomData,
         }
     }

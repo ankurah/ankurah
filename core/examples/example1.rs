@@ -16,7 +16,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
-    let client = Node::new(SledStorageEngine::new().unwrap());
+    let mut client = Node::new(SledStorageEngine::new().unwrap());
+    client.register_model::<Album>("album")?;
 
     // client.local_connect(&server);
 
@@ -68,9 +69,8 @@ async fn main() -> Result<()> {
 
         {
             let id = ID(ulid::Ulid::new());
-            // TODO: mutability management
-            // let mut client_albums = client.collection_mut::<Album>("album");
-            // client_albums.raw.bucket.set_state(id, album.record_state());
+            //let mut client_albums = client.collection_mut::<Album>("album");
+            client_albums.raw.bucket.set_state(id, album.record_state());
             // let record_state = client_albums.raw.bucket.get(id);
             // let updated_album = AlbumRecord::from_record_state(record_state);
         }

@@ -14,22 +14,37 @@ use std::{
     sync::{mpsc, Arc},
 };
 
-pub struct Node {
+pub struct Node<E: StorageEngine> {
+    storage_engine: E,
     // We don't know the collection type at compile time except via usage of the .collection() method
     collections: BTreeMap<String, RawCollection>,
     pub transaction_manager: Arc<TransactionManager>,
     // peer_connections: Vec<PeerConnection>,
 }
 
-impl Node {
-    pub fn new(storage: impl StorageEngine) -> Arc<Self> {
-        Arc::new(Self {
+impl<E> Node<E>
+where 
+    E: StorageEngine,
+    E::StorageBucket: 'static,
+{
+    pub fn new(engine: E) -> Self {
+        Self {
+            storage_engine: engine,
             collections: BTreeMap::new(),
             transaction_manager: Arc::new(TransactionManager::new()),
             // peer_connections: Vec::new(),
-        })
+        }
     }
-    pub fn local_connect(&self, _peer: &Arc<Node>) {
+
+    pub fn register_model<M>(&mut self, name: &str) -> Result<()>
+    where 
+        M: Model,
+    {
+        let bucket = self.storage_engine.bucket(name)?;
+        self.collections.insert(name.to_owned(), RawCollection::new(Box::new(bucket)));
+        Ok(())
+    }
+    pub fn local_connect(&self, _peer: &Arc<Node<E>>) {
         unimplemented!()
         // let (tx, rx) = mpsc::channel();
         // self.peer_connections.push(PeerConnection { channel: tx });
@@ -40,34 +55,19 @@ impl Node {
         //     }
         // });
     }
-    pub fn get_collection<'a, M: Model>(
-        &'a self,
+    pub fn get_collection<M: Model>(
+        &self,
         name: &str,
-    ) -> Option<Collection<'a, M>> {
+    ) -> Option<Collection<M>> {
         let raw = self.collections.get(name)?;
-        Some(Collection::<'a, M>::new(name, raw))
+        Some(Collection::<M>::new(name, raw))
     }
-    pub fn collection<'a, M: Model>(&'a self, name: &str) -> Collection<'a, M> {
+    pub fn collection<M: Model>(&self, name: &str) -> Collection<M> {
         let raw = self
             .collections
             .get(name)
             .expect(&format!("Collection {} expected to exist", name));
-        Collection::<'a, M>::new(name, raw)
-    }
-    // TODO: Make it so you can get a bunch of collections separately and mutably.
-    pub fn get_collection_mut<'a, M: Model>(
-        &'a mut self,
-        name: &str,
-    ) -> Option<CollectionMut<'a, M>> {
-        let raw = self.collections.get_mut(name)?;
-        Some(CollectionMut::<'a, M>::new(name, raw))
-    }
-    pub fn collection_mut<'a, M: Model>(&'a mut self, name: &str) -> CollectionMut<'a, M> {
-        let raw = self
-            .collections
-            .get_mut(name)
-            .expect(&format!("Collection {} expected to exist", name));
-        CollectionMut::<'a, M>::new(name, raw)
+        Collection::<M>::new(name, raw)
     }
     pub fn next_id(&self) -> ID {
         ID(Ulid::new())
