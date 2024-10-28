@@ -1,12 +1,34 @@
 use anyhow::{anyhow, Result};
-use sled::{Config, Db}; // Import Result and anyhow from the anyhow crate
+use serde::{Serialize, Deserialize};
+use sled::{Config, Db};
+
+use crate::types::ID;
 
 pub trait StorageEngine: Sized {
     type StorageBucket: StorageBucket;
     fn collection(&self, name: &str) -> Result<Self::StorageBucket>;
 }
 
-pub trait StorageBucket: Clone {}
+pub trait StorageBucket: Clone {
+    fn insert(&mut self, id: ID, state: RecordState) -> Result<()>;
+    // fn get(&self, id: ID) -> Result<RecordState> {}
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RecordState {
+   pub state: Vec<FieldState>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FieldState {
+   pub field_value: FieldValue, // is this even necessary given we know the type in the code?
+   pub state: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum FieldValue {
+   StringValue,
+}
 
 pub struct SledStorageEngine {
     pub db: Db,
@@ -57,4 +79,11 @@ impl SledStorageBucket {
     }
 }
 
-impl StorageBucket for SledStorageBucket {}
+impl StorageBucket for SledStorageBucket {
+    fn insert(&mut self, id: ID, state: RecordState) -> Result<()> {
+        let binary_state = bincode::serialize(&state)?;
+        self.tree.insert(id.0.to_bytes(), binary_state)?;
+        Ok(())
+    }
+    // fn get(&self, id: ID) -> Result<RecordState> {}
+}

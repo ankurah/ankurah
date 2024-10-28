@@ -63,6 +63,19 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                 self.id
             }
 
+            fn record_state(&self) -> ankurah_core::storage::RecordState {
+                let mut states = Vec::new();
+                #(
+                    let field_state = ankurah_core::storage::FieldState {
+                        field_value: ankurah_core::storage::FieldValue::#field_value_types,
+                        state: self.#field_names.value(),
+                    };
+                    states.push(field_state);
+                )*
+                RecordState {
+                    states,
+                }
+            }
         }
 
         impl #record_name {
