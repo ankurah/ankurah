@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::types::ID;
+use crate::model::ID;
 use anyhow::Result;
 
 #[derive(Debug)]

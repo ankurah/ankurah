@@ -4,7 +4,7 @@ pub mod model;
 pub mod node;
 pub mod storage;
 pub mod transaction;
-pub mod types;
+pub mod property;
 
 pub use model::Model;
 #[cfg(feature = "derive")]

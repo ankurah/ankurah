@@ -3,10 +3,9 @@ use ulid::Ulid;
 use crate::{
     collection::{Collection, CollectionMut, RawCollection},
     event::Operation,
-    model::Model,
+    model::{ID, Model},
     storage::StorageEngine,
     transaction::{TransactionGuard, TransactionManager},
-    types::ID,
 };
 use anyhow::Result;
 use std::{

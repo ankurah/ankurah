@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
 
-use crate::types::ID;
+use crate::model::ID;
 
 pub trait StorageEngine {
     type StorageBucket: StorageBucket;

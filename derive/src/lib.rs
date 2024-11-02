@@ -11,9 +11,9 @@ fn get_value_type(ty: &Type) -> proc_macro2::TokenStream {
         "f64" => quote!(FloatValue),
         "bool" => quote!(BoolValue),
         // Add more mappings as needed
-        _ => quote!(ankurah_core::types::value::Value<#ty>), // Default to a generic Value type
+        _ => quote!(ankurah_core::property::value::Value<#ty>), // Default to a generic Value type
     };
-    quote!(ankurah_core::types::value::#value_type)
+    quote!(ankurah_core::property::value::#value_type)
 }
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
@@ -51,8 +51,10 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 
         #[derive(Debug)]
         pub struct #record_name {
-            id: ankurah_core::types::ID,
+            id: ankurah_core::model::ID,
+            // Contains property backends, transactions, etc.
             inner: std::sync::Arc<ankurah_core::model::RecordInner>,
+            // Field projections
             #(#field_names: #field_value_types,)*
             // TODO: Add fields for tracking changes and operation count
         }
@@ -60,12 +62,12 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         impl ankurah_core::model::Record for #record_name {
             type Model = #name;
 
-            fn id(&self) -> ankurah_core::types::ID {
+            fn id(&self) -> ankurah_core::model::ID {
                 self.id
             }
 
             fn record_state(&self) -> ankurah_core::storage::RecordState {
-                use ankurah_core::types::traits::StateSync;
+                use ankurah_core::property::traits::StateSync;
                 let mut states = Vec::new();
                 #(
                     let field_state = ankurah_core::storage::FieldState {
@@ -86,7 +88,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                 E: ankurah_core::storage::StorageEngine,
                 E::StorageBucket: 'static,
             {
-                use ankurah_core::types::traits::InitializeWith;
+                use ankurah_core::property::traits::InitializeWith;
                 let id = node.next_id();
                 let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
                     collection: #name_str,
@@ -100,13 +102,12 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                 }
             }
 
-            pub fn from_record_state(record_state: &RecordState) -> Result<Self> {
-                record_state
-                Self {
-                #(
-                    #field_names: #field_value_types::from_field_state(record_state.field_states[#field_indices]);
-                )*
-                }
+            pub fn from_record_state(record_state: &ankurah_core::storage::RecordState) -> Result<Self> {
+                Ok(Self {
+                    #(
+                        #field_names: #field_value_types::from_field_state(record_state.field_states[#field_indices])?;
+                    )*
+                })
             }
 
             #(

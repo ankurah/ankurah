@@ -1,5 +1,5 @@
 use ankurah_core::model::Record;
-use ankurah_core::{node::Node, types::ID};
+use ankurah_core::{node::Node, model::ID};
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_derive::Model;
 use anyhow::Result;
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
 
     assert_eq!(album.name.value(), "The Dark Side of the Moon");
 
-    use ankurah_core::types::traits::StateSync;
+    use ankurah_core::property::traits::StateSync;
     let update = album.name().get_pending_update();
     println!("Update length: {}", update.unwrap().len());
 
