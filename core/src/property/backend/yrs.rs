@@ -59,6 +59,13 @@ impl Yrs {
         let text = self.doc.get_or_insert_text(property_name); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
-        // todo add `Transaction::add_operation`
+
+        let trx = self.record_inner.transaction_manager.handle();
+        trx.add_operation(
+            "yrs",
+            self.record_inner.collection,
+            self.record_inner.id,
+            ytx.encode_update_v2(),
+        );
     }
 }
