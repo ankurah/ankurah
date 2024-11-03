@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use yrs::{updates::decoder::Decode, GetString, Text, Transact};
 use anyhow::*;
@@ -7,21 +7,40 @@ use crate::model::RecordInner;
 
 /// Stores one or more properties of a record
 #[derive(Debug)]
-pub struct Yrs {
+pub struct YrsBackend {
     // TODO consolidate
     pub(crate) doc: yrs::Doc,
-    record_inner: Arc<RecordInner>,
+    record_inner: Weak<RecordInner>,
 }
 
-impl Yrs {
-    pub fn new(record_inner: Arc<RecordInner>) -> Self {
+impl YrsBackend {
+    /// Create a [`YrsBackend`] without a [`RecordInner`].
+    pub(crate) fn inactive() -> Self {
+        Self {
+            doc: yrs::Doc::new(),
+            record_inner: Weak::default(),
+        }
+    }
+
+    pub fn new(record_inner: Weak<RecordInner>) -> Self {
         Self {
             doc: yrs::Doc::new(),
             record_inner,
         }
     }
 
-    pub fn from_backend_state_buffer(record_inner: Arc<RecordInner>, state_buffer: Vec<u8>) -> Result<Self> {
+    pub fn get_record_inner(&self) -> Option<Arc<RecordInner>> {
+        self.record_inner.upgrade()
+    }
+
+    /// Gets a reference to the inner record.
+    /// 
+    /// # Panics if the inner record doesn't exist or was de-allocated.
+    pub fn record_inner(&self) -> Arc<RecordInner> {
+        self.get_record_inner().expect("Expected `RecordInner` to exist for `YrsBackend`")
+    }
+
+    pub fn from_backend_state_buffer(record_inner: Weak<RecordInner>, state_buffer: Vec<u8>) -> Result<Self> {
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
         let update = yrs::Update::decode_v2(&state_buffer)?;
@@ -41,7 +60,7 @@ impl Yrs {
     }
 
     pub fn insert(&self, property_name: &'static str, index: u32, value: &str) {
-        let trx = self.record_inner.transaction_manager.handle();
+        let trx = self.record_inner().transaction_manager.handle();
 
         let text = self.doc.get_or_insert_text(property_name); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
@@ -49,8 +68,8 @@ impl Yrs {
 
         trx.add_operation(
             "yrs",
-            self.record_inner.collection,
-            self.record_inner.id,
+            self.record_inner().collection,
+            self.record_inner().id,
             ytx.encode_update_v2(),
         );
     }
@@ -60,11 +79,11 @@ impl Yrs {
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
 
-        let trx = self.record_inner.transaction_manager.handle();
+        let trx = self.record_inner().transaction_manager.handle();
         trx.add_operation(
             "yrs",
-            self.record_inner.collection,
-            self.record_inner.id,
+            self.record_inner().collection,
+            self.record_inner().id,
             ytx.encode_update_v2(),
         );
     }

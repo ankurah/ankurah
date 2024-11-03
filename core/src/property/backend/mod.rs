@@ -1,3 +1,2 @@
-
 pub mod yrs;
-pub use yrs::Yrs;
+pub use yrs::YrsBackend;

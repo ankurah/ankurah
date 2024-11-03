@@ -1,6 +1,6 @@
 use ankurah_core::model::Record;
-use ankurah_core::{node::Node, model::ID};
 use ankurah_core::storage::SledStorageEngine;
+use ankurah_core::{model::ID, node::Node};
 use ankurah_derive::Model;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -16,12 +16,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
-    let mut client = Node::new(SledStorageEngine::new().unwrap());
+    let mut client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
     client.register_model::<Album>("album")?;
 
     // client.local_connect(&server);
 
-    let client_albums = client.collection::<Album>("album");
+    // let client_albums = client.collection::<Album>("album");
     // let server_albums = server.collection::<Album>("album");
 
     // Lets get signals working after we have the basics
@@ -69,11 +69,14 @@ async fn main() -> Result<()> {
 
         {
             let id = ID(ulid::Ulid::new());
-            //let mut client_albums = client.collection_mut::<Album>("album");
-            client_albums.raw.bucket.set_state(id, album.record_state())?;
-            let record_state = client_albums.raw.bucket.get(id);
+            let mut client_albums = client.raw_bucket("album");
+            client_albums
+                .bucket
+                .set_state(id, album.record_state())?;
+            let record_state = client_albums.bucket.get(id)?;
             info!("record_state: {:?}", record_state);
-            let updated_album = AlbumRecord::from_record_state(record_state);
+            let updated_album = AlbumRecord::from_record_state(&client, id, &record_state)?;
+            println!("updated: {:?}", updated_album);
         }
 
         album

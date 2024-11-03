@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
@@ -5,9 +7,8 @@ use sled::{Config, Db};
 use crate::model::ID;
 
 pub trait StorageEngine {
-    type StorageBucket: StorageBucket;
     // Opens and/or creates a storage bucket.
-    fn bucket(&self, name: &str) -> Result<Self::StorageBucket>;
+    fn bucket(&self, name: &str) -> Result<Box<dyn StorageBucket>>;
 }
 
 pub trait StorageBucket {
@@ -70,10 +71,9 @@ pub struct SledStorageBucket {
 }
 
 impl StorageEngine for SledStorageEngine {
-    type StorageBucket = SledStorageBucket;
-    fn bucket(&self, name: &str) -> Result<SledStorageBucket> {
+    fn bucket(&self, name: &str) -> Result<Box<dyn StorageBucket>> {
         let tree = self.db.open_tree(name)?;
-        Ok(SledStorageBucket { tree })
+        Ok(Box::new(SledStorageBucket { tree }))
     }
 }
 
@@ -100,6 +100,21 @@ impl StorageBucket for SledStorageBucket {
                 //Err(format!("Missing Ivec for id"))
                 panic!("need to figure out anyhow");
             }
+        }
+    }
+}
+
+
+/// Manages the storage and state of the collection without any knowledge of the model type
+#[derive(Clone)]
+pub struct RawBucket {
+    pub bucket: Arc<Box<dyn StorageBucket>>,
+}
+
+impl RawBucket {
+    pub fn new(bucket: Box<dyn StorageBucket>) -> Self {
+        Self {
+            bucket: Arc::new(bucket),
         }
     }
 }

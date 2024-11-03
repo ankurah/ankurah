@@ -1,10 +1,9 @@
 use ulid::Ulid;
 
 use crate::{
-    collection::{Collection, CollectionMut, RawCollection},
     event::Operation,
-    model::{ID, Model},
-    storage::StorageEngine,
+    model::{Model, ID},
+    storage::{StorageEngine, RawBucket},
     transaction::{TransactionGuard, TransactionManager},
 };
 use anyhow::Result;
@@ -13,37 +12,38 @@ use std::{
     sync::{mpsc, Arc},
 };
 
-pub struct Node<E: StorageEngine> {
-    storage_engine: E,
-    // We don't know the collection type at compile time except via usage of the .collection() method
-    collections: BTreeMap<String, RawCollection>,
+/// Manager for all records and their properties on this client.
+pub struct Node {
+    /// Ground truth local state for records.
+    /// 
+    /// Things like `postgres`, `sled`, `TKiV`.
+    storage_engine: Box<dyn StorageEngine>,
+    // Modified, potentially uncommitted changes to records.
+    storage_buckets: BTreeMap<String, RawBucket>,
     pub transaction_manager: Arc<TransactionManager>,
     // peer_connections: Vec<PeerConnection>,
 }
 
-impl<E> Node<E>
-where 
-    E: StorageEngine,
-    E::StorageBucket: 'static,
-{
-    pub fn new(engine: E) -> Self {
+impl Node {
+    pub fn new(engine: Box<dyn StorageEngine>) -> Self {
         Self {
             storage_engine: engine,
-            collections: BTreeMap::new(),
+            storage_buckets: BTreeMap::new(),
             transaction_manager: Arc::new(TransactionManager::new()),
             // peer_connections: Vec::new(),
         }
     }
 
     pub fn register_model<M>(&mut self, name: &str) -> Result<()>
-    where 
+    where
         M: Model,
     {
         let bucket = self.storage_engine.bucket(name)?;
-        self.collections.insert(name.to_owned(), RawCollection::new(Box::new(bucket)));
+        self.storage_buckets
+            .insert(name.to_owned(), RawBucket::new(bucket));
         Ok(())
     }
-    pub fn local_connect(&self, _peer: &Arc<Node<E>>) {
+    pub fn local_connect(&self, _peer: &Arc<Node>) {
         unimplemented!()
         // let (tx, rx) = mpsc::channel();
         // self.peer_connections.push(PeerConnection { channel: tx });
@@ -54,19 +54,12 @@ where
         //     }
         // });
     }
-    pub fn get_collection<M: Model>(
-        &self,
-        name: &str,
-    ) -> Option<Collection<M>> {
-        let raw = self.collections.get(name)?;
-        Some(Collection::<M>::new(name, raw))
-    }
-    pub fn collection<M: Model>(&self, name: &str) -> Collection<M> {
+    pub fn raw_bucket(&self, name: &str) -> &RawBucket {
         let raw = self
-            .collections
+            .storage_buckets
             .get(name)
             .expect(&format!("Collection {} expected to exist", name));
-        Collection::<M>::new(name, raw)
+        raw
     }
     pub fn next_id(&self) -> ID {
         ID(Ulid::new())

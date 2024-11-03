@@ -38,7 +38,11 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
         .collect::<Vec<_>>();
     let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
-    let field_indices = fields.iter().enumerate().map(|(index, _)| index).collect::<Vec<_>>();
+    let field_indices = fields
+        .iter()
+        .enumerate()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
 
     // Update this to use the get_value_type function
     let field_value_types = fields
@@ -52,8 +56,9 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         #[derive(Debug)]
         pub struct #record_name {
             id: ankurah_core::model::ID,
-            // Contains property backends, transactions, etc.
             inner: std::sync::Arc<ankurah_core::model::RecordInner>,
+            yrs: ankurah_core::property::backend::Yrs,
+
             // Field projections
             #(#field_names: #field_value_types,)*
             // TODO: Add fields for tracking changes and operation count
@@ -83,29 +88,41 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         }
 
         impl #record_name {
-            pub fn new<E>(node: &Node<E>, model: #name) -> Self
+            pub fn new(node: &ankurah_core::Node, model: #name) -> Self {
+                use ankurah_core::property::traits::InitializeWith;
+                let id = node.next_id();
+
+                let inner = ankurah_core::model::RecordInner {
+                    collection: #name_str,
+                    id: id,
+                    transaction_manager: node.transaction_manager.clone(),
+                };
+
+                let yrs = Arc::new(Yrs::new(inner)),
+                Self {
+                    id: id,
+                    inner: inner,
+                    yrs: yrs,
+                    #(#field_names: <#field_value_types>::initialize_with(inner.clone(), #field_name_strs, model.#field_names),)*
+                }
+            }
+
+            pub fn from_record_state<E>(node: &ankurah_core::Node<E>, id: ankurah_core::model::ID, record_state: &ankurah_core::storage::RecordState) -> Result<Self>
             where
                 E: ankurah_core::storage::StorageEngine,
                 E::StorageBucket: 'static,
             {
-                use ankurah_core::property::traits::InitializeWith;
-                let id = node.next_id();
                 let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
                     collection: #name_str,
-                    id,
+                    id: id,
                     transaction_manager: node.transaction_manager.clone(),
+                    yrs: YrsBackend::new(),
                 });
-                Self {
-                    id,
-                    #(#field_names: <#field_value_types>::initialize_with(inner.clone(), #field_name_strs, model.#field_names),)*
-                    inner,
-                }
-            }
-
-            pub fn from_record_state(record_state: &ankurah_core::storage::RecordState) -> Result<Self> {
                 Ok(Self {
+                    id: id,
+                    inner: inner,
                     #(
-                        #field_names: #field_value_types::from_field_state(record_state.field_states[#field_indices])?;
+                        #field_names: #field_value_types::from_field_state(record_state.field_states[#field_indices])?,
                     )*
                 })
             }
