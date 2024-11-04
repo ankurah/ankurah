@@ -1,139 +1,20 @@
 use std::{
+    any::Any,
     collections::BTreeMap,
+    marker::PhantomData,
+    mem::MaybeUninit,
     ops::Deref,
     sync::{Arc, Mutex},
 };
 
-use crate::model::ID;
+use crate::{
+    model::{Record, RecordInner, ID},
+    Node,
+};
 use anyhow::Result;
+use append_only_vec::AppendOnlyVec;
 
-#[derive(Debug)]
-pub struct TransactionManager {
-    active_transaction: Mutex<Option<Arc<Transaction>>>,
-}
-
-impl Default for TransactionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TransactionManager {
-    pub fn new() -> Self {
-        Self {
-            active_transaction: Mutex::new(None),
-        }
-    }
-    pub fn handle(&self) -> TransactionHandle {
-        let active = self.active_transaction.lock().unwrap();
-        if let Some(trx) = active.as_ref() {
-            TransactionHandle::Standard(trx.clone())
-        } else {
-            TransactionHandle::AutoCommit(Transaction::new())
-        }
-    }
-    pub fn begin(&self) -> Result<TransactionGuard> {
-        // return error if we're already in a transaction
-        if self.active_transaction.lock().unwrap().is_some() {
-            return Err(anyhow::anyhow!("Already in a transaction"));
-        }
-        let trx = Arc::new(Transaction::new());
-        self.active_transaction.lock().unwrap().replace(trx.clone());
-        Ok(TransactionGuard::new(trx))
-    }
-}
-
-pub enum TransactionHandle {
-    AutoCommit(Transaction),
-    Standard(Arc<Transaction>),
-}
-
-impl Drop for TransactionHandle {
-    fn drop(&mut self) {
-        if let TransactionHandle::AutoCommit(trx) = self {
-            trx.commit();
-        }
-    }
-}
-
-impl Deref for TransactionHandle {
-    type Target = Transaction;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            TransactionHandle::AutoCommit(trx) => trx,
-            TransactionHandle::Standard(trx) => trx,
-        }
-    }
-}
-
-#[must_use]
-pub struct TransactionGuard {
-    trx: Arc<Transaction>,
-    consumed: bool,
-}
-
-impl TransactionGuard {
-    pub fn new(trx: Arc<Transaction>) -> Self {
-        Self {
-            trx,
-            consumed: false,
-        }
-    }
-
-    pub fn commit(mut self) {
-        self.trx.commit();
-        self.consumed = true;
-    }
-
-    pub fn release(mut self) {
-        // drop doing nothing
-        self.consumed = true;
-    }
-}
-
-impl Drop for TransactionGuard {
-    fn drop(&mut self) {
-        assert!(
-            self.consumed,
-            "`commit` or `release` need to be used on the `TransactionGuard`."
-        );
-    }
-}
-
-#[derive(Debug)]
-pub struct Transaction {
-    updates: Mutex<BTreeMap<(&'static str, ID), Vec<Operation>>>,
-}
-
-impl Default for Transaction {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Transaction {
-    pub fn new() -> Self {
-        Self {
-            updates: Mutex::new(BTreeMap::new()),
-        }
-    }
-    pub fn add_operation(
-        &self,
-        engine: &'static str,
-        collection: &'static str,
-        id: ID,
-        payload: Vec<u8>,
-    ) {
-        let mut updates = self.updates.lock().unwrap();
-        updates
-            .entry((collection, id))
-            .or_default()
-            .push(Operation { engine, payload });
-    }
-    pub fn commit(&self) {
-        eprintln!("STUB: Committing transaction {:?}", self);
-    }
-}
+pub const PAGE_SIZE: usize = 16;
 
 // Q. When do we want unified vs individual property storage for TypeEngine operations?
 // A. When we start to care about differentiating possible recipients for different properties.
@@ -142,4 +23,73 @@ impl Transaction {
 pub struct Operation {
     engine: &'static str,
     payload: Vec<u8>,
+}
+
+pub struct Transaction {
+    pub(crate) node: Arc<Node>, // only here for committing records to storage engine
+
+    active_records: AppendOnlyVec<Box<dyn Record>>,
+
+    // markers
+    implicit: bool,
+    consumed: bool,
+}
+
+pub struct RecordAccessor<'trx, A> {
+    pub transaction: &'trx Transaction,
+    pub record: A,
+}
+
+impl Transaction {
+    pub fn new(node: Arc<Node>) -> Self {
+        Self {
+            node: node,
+            active_records: AppendOnlyVec::new(),
+            implicit: true,
+            consumed: false,
+        }
+    }
+
+    pub fn get<A: Record>(&self, bucket: &'static str, id: ID) -> Result<&A> {
+        let raw_bucket = self.node.raw_bucket(bucket);
+        let record_state = raw_bucket.bucket.get(id)?;
+        let record_inner = RecordInner {
+            id: id,
+            collection: bucket,
+        };
+        let base_record = A::from_record_state(id, &record_state)?;
+        let index = self.active_records.push(Box::new(base_record));
+        let upcast = self.active_records[index].as_dyn_any();
+        Ok(upcast
+            .downcast_ref::<A>()
+            .expect("Expected correct downcast"))
+    }
+
+    #[must_use]
+    pub fn commit(mut self) -> Result<()> {
+        self.commit_mut_ref()
+    }
+
+    #[must_use]
+    // only because Drop is &mut self not mut self
+    pub(crate) fn commit_mut_ref(&mut self) -> Result<()> {
+        self.consumed = true;
+        // this should probably be done in parallel, but microoptimizations
+        for record in self.active_records.iter() {
+            record.commit_record(self.node.clone());
+        }
+        Ok(())
+    }
+
+    pub fn rollback(mut self) {
+        self.consumed = true; // just do nothing on drop
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.implicit && !self.consumed {
+            self.commit_mut_ref();
+        }
+    }
 }

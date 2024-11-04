@@ -1,14 +1,16 @@
 use std::sync::{Arc, Weak};
 
 use anyhow::*;
-use yrs::{updates::{decoder::Decode, encoder::Encode}, GetString, ReadTxn, Text, Transact};
+use yrs::{
+    updates::{decoder::Decode, encoder::Encode},
+    GetString, ReadTxn, Text, Transact,
+};
 
 use crate::model::RecordInner;
 
 /// Stores one or more properties of a record
 #[derive(Debug)]
 pub struct YrsBackend {
-    // TODO consolidate
     pub(crate) doc: yrs::Doc,
     record_inner: Weak<RecordInner>,
 }
@@ -48,7 +50,7 @@ impl YrsBackend {
 
     pub fn from_state_buffer(
         record_inner: Arc<RecordInner>,
-        state_buffer: Vec<u8>,
+        state_buffer: &Vec<u8>,
     ) -> Result<Self> {
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
@@ -69,18 +71,18 @@ impl YrsBackend {
     }
 
     pub fn insert(&self, property_name: &'static str, index: u32, value: &str) {
-        let trx = self.record_inner().transaction_manager.handle();
-
         let text = self.doc.get_or_insert_text(property_name); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.insert(&mut ytx, index, value);
 
+        // TODO: Figure out how we want to add operations.
+        /*let trx = self.record_inner().transaction.handle();
         trx.add_operation(
             "yrs",
             self.record_inner().collection,
             self.record_inner().id,
             ytx.encode_update_v2(),
-        );
+        );*/
     }
 
     pub fn delete(&self, property_name: &'static str, index: u32, length: u32) {
@@ -88,12 +90,12 @@ impl YrsBackend {
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
 
-        let trx = self.record_inner().transaction_manager.handle();
+        /*let trx = self.record_inner().transaction_manager.handle();
         trx.add_operation(
             "yrs",
             self.record_inner().collection,
             self.record_inner().id,
             ytx.encode_update_v2(),
-        );
+        );*/
     }
 }

@@ -18,22 +18,7 @@ pub trait StorageBucket {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordState {
-    pub field_states: Vec<FieldState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldState {
-    pub field_value: FieldValue, // is this even necessary given we know the type in the code?
-    pub state: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FieldValue {
-    StringValue,
-}
-
-pub trait TypeValue {
-    fn field_value() -> FieldValue;
+    pub yrs_state_buffer: Vec<u8>,
 }
 
 pub struct SledStorageEngine {

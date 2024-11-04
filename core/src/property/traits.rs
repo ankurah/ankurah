@@ -1,15 +1,12 @@
 use anyhow::Result;
 
-use crate::{property::backend::Backends, storage::FieldValue};
+use crate::property::backend::Backends;
 
 pub trait InitializeWith<T> {
     fn initialize_with(backends: &Backends, property_name: &'static str, value: T) -> Self;
 }
 
 pub trait StateSync {
-    /// Meta information on what kind of field this is for back retrieval.
-    fn field_value(&self) -> FieldValue; // Maybe unnecessary
-
     /// Apply an update to the field from an event/operation
     fn apply_update(&self, update: &[u8]) -> Result<()>;
 

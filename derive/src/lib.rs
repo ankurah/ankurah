@@ -66,37 +66,55 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         }
 
         impl ankurah_core::model::Record for #record_name {
-            type Model = #name;
+            fn as_dyn_any(&self) -> &dyn std::any::Any {
+                self as &dyn std::any::Any
+            }
 
             fn id(&self) -> ankurah_core::model::ID {
                 self.id
             }
 
             fn record_state(&self) -> ankurah_core::storage::RecordState {
-                use ankurah_core::property::traits::StateSync;
-                let mut states = Vec::new();
-                #(
-                    let field_state = ankurah_core::storage::FieldState {
-                        field_value: self.#field_names.field_value(),
-                        state: self.#field_names.state(),
-                    };
-                    states.push(field_state);
-                )*
                 ankurah_core::storage::RecordState {
-                    field_states: states,
+                    yrs_state_buffer: self.yrs.to_state_buffer(),
                 }
+            }
+
+            fn from_record_state(id: ankurah_core::model::ID, record_state: &ankurah_core::storage::RecordState) -> Result<Self>
+            where
+                Self: Sized,
+            {
+                let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
+                    collection: #name_str,
+                    id: id,
+                });
+
+                let yrs_backend = std::sync::Arc::new(ankurah_core::property::backend::YrsBackend::from_state_buffer(inner.clone(), &record_state.yrs_state_buffer)?);
+                Ok(Self {
+                    id: id,
+                    inner: inner,
+                    yrs: yrs_backend.clone(),
+                    // TODO: Support other backends than Yrs, right now its just hardcoded YrsBackend.
+                    #(
+                        #field_names: #field_value_types::new(#field_name_strs, yrs_backend.clone()),
+                    )*
+                })
+            }
+
+            fn commit_record(&self, node: std::sync::Arc<ankurah_core::Node>) -> Result<()> {
+                // TODO, throw this shit in the storage bucket it belongs to.
+                Ok(())
             }
         }
 
         impl #record_name {
-            pub fn new(node: &ankurah_core::Node, model: #name) -> Self {
+            pub fn new(node: std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
                 use ankurah_core::property::traits::InitializeWith;
                 let id = node.next_id();
 
                 let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
                     collection: #name_str,
                     id: id,
-                    transaction_manager: node.transaction_manager.clone(),
                 });
 
                 let yrs = std::sync::Arc::new(ankurah_core::property::backend::YrsBackend::new(inner.clone()));
@@ -110,26 +128,6 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                     #(#field_names: <#field_value_types>::initialize_with(&backends, #field_name_strs, model.#field_names),)*
                 }
             }
-
-            /*
-            pub fn from_record_state(node: &ankurah_core::Node, id: ankurah_core::model::ID) -> Result<Self> {
-                let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
-                    collection: #name_str,
-                    id: id,
-                    transaction_manager: node.transaction_manager.clone(),
-                });
-
-                let yrs_backend = std::sync::Arc::new(ankurah_core::property::backend::YrsBackend::from_backend_state_buffer(inner, ));
-                Ok(Self {
-                    id: id,
-                    inner: inner,
-                    yrs: yrs_backend,
-                    #(
-                        #field_names: #field_value_types::from_field_state(record_state.field_states[#field_indices])?,
-                    )*
-                })
-            }
-            */
 
             #(
                 pub fn #field_names(&self) -> &#field_value_types {

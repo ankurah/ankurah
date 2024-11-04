@@ -4,7 +4,7 @@ use crate::{
     event::Operation,
     model::{Model, ID},
     storage::{RawBucket, StorageEngine},
-    transaction::{TransactionGuard, TransactionManager},
+    transaction::Transaction,
 };
 use anyhow::Result;
 use std::{
@@ -18,9 +18,8 @@ pub struct Node {
     ///
     /// Things like `postgres`, `sled`, `TKiV`.
     storage_engine: Box<dyn StorageEngine>,
-    // Modified, potentially uncommitted changes to records.
+    // Separated storage buckets by name, still belongs to the above `StorageEngine`.
     storage_buckets: BTreeMap<String, RawBucket>,
-    pub transaction_manager: Arc<TransactionManager>,
     // peer_connections: Vec<PeerConnection>,
 }
 
@@ -29,7 +28,6 @@ impl Node {
         Self {
             storage_engine: engine,
             storage_buckets: BTreeMap::new(),
-            transaction_manager: Arc::new(TransactionManager::new()),
             // peer_connections: Vec::new(),
         }
     }
@@ -54,6 +52,7 @@ impl Node {
         //     }
         // });
     }
+
     pub fn raw_bucket(&self, name: &str) -> &RawBucket {
         let raw = self
             .storage_buckets
@@ -64,8 +63,8 @@ impl Node {
     pub fn next_id(&self) -> ID {
         ID(Ulid::new())
     }
-    pub fn begin(&self) -> Result<TransactionGuard> {
-        self.transaction_manager.begin()
+    pub fn begin(self: &Arc<Self>) -> Transaction {
+        Transaction::new(self.clone())
     }
 }
 

@@ -7,12 +7,9 @@ use yrs::{
     ReadTxn, StateVector, Transact, Update,
 };
 
-use crate::{
-    property::{
-        backend::{Backends, YrsBackend},
-        traits::{InitializeWith, StateSync},
-    },
-    storage::FieldValue,
+use crate::property::{
+    backend::{Backends, YrsBackend},
+    traits::{InitializeWith, StateSync},
 };
 
 #[derive(Debug)]
@@ -62,9 +59,6 @@ impl InitializeWith<String> for StringValue {
 }
 
 impl StateSync for StringValue {
-    fn field_value(&self) -> FieldValue {
-        FieldValue::StringValue
-    }
     // These should really be on the YrsBackend I think
     /// Apply an update to the field from an event/operation
     fn apply_update(&self, update: &[u8]) -> Result<()> {

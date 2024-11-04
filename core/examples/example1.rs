@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ankurah_core::model::Record;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ID, node::Node};
@@ -18,6 +20,7 @@ async fn main() -> Result<()> {
     // let server = Node::new();
     let mut client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
     client.register_model::<Album>("album")?;
+    let client = Arc::new(client);
 
     // client.local_connect(&server);
 
@@ -39,9 +42,9 @@ async fn main() -> Result<()> {
     //     name: "The Dark Sid of the Moon",
     // };
     let album = {
-        let trx = client.begin()?;
+        let trx = client.begin();
         let album = AlbumRecord::new(
-            &client,
+            client.clone(),
             Album {
                 name: "The Dark Sid of the Moon".to_string(),
             },

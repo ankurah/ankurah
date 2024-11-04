@@ -1,11 +1,10 @@
 // use futures_signals::signal::Signal;
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex, Weak},
-};
+use std::{any::Any, sync::Arc};
 
-use crate::{property::backend::YrsBackend, storage::RecordState, transaction::TransactionManager};
+use crate::{storage::RecordState, Node};
+
+use anyhow::Result;
 
 use ulid::Ulid;
 
@@ -17,21 +16,19 @@ pub struct ID(pub Ulid);
 pub trait Model {}
 
 /// A specific instance of a record in the collection
-pub trait Record {
-    type Model: Model;
+pub trait Record: Any + Send + Sync + 'static {
     fn id(&self) -> ID;
     fn record_state(&self) -> RecordState;
+    fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self>
+    where
+        Self: Sized;
+    fn commit_record(&self, node: Arc<Node>) -> Result<()>;
+
+    fn as_dyn_any(&self) -> &dyn Any;
 }
 
 #[derive(Debug)]
 pub struct RecordInner {
     pub collection: &'static str,
     pub id: ID,
-    pub transaction_manager: Arc<TransactionManager>,
 }
-
-pub struct TrxHandle {
-    transaction: Mutex<Option<Transaction>>,
-}
-
-pub struct Transaction {}

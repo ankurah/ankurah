@@ -22,6 +22,8 @@ tracing = "0.1.40"
 yrs = "0.21.2"
 bincode = "1.3.3"
 
+append-only-vec = "0.1.7"
+
 
 [dev-dependencies]
 ankurah-derive = { path = "../derive" }
