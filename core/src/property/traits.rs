@@ -1,10 +1,9 @@
 use anyhow::Result;
-use std::sync::Arc;
 
-use crate::{model::RecordInner, storage::FieldValue};
+use crate::{property::backend::Backends, storage::FieldValue};
 
 pub trait InitializeWith<T> {
-    fn initialize_with(inner: Arc<RecordInner>, property_name: &'static str, value: T) -> Self;
+    fn initialize_with(backends: &Backends, property_name: &'static str, value: T) -> Self;
 }
 
 pub trait StateSync {

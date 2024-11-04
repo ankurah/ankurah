@@ -4,13 +4,12 @@ use anyhow::Result;
 
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
-    ReadTxn, StateVector, Text, Transact, Update,
+    ReadTxn, StateVector, Transact, Update,
 };
 
 use crate::{
-    model::RecordInner,
     property::{
-        backend::YrsBackend,
+        backend::{Backends, YrsBackend},
         traits::{InitializeWith, StateSync},
     },
     storage::FieldValue,
@@ -24,29 +23,23 @@ pub struct StringValue {
     pub property_name: &'static str,
     previous_state: Arc<Mutex<StateVector>>,
 
-    pub record_inner: Weak<RecordInner>,
     pub backend: Weak<YrsBackend>,
 }
 
 // Starting with basic string type operations
 impl StringValue {
-    pub fn new(property_name: &'static str, record_inner: Arc<RecordInner>, backend: Arc<YrsBackend>) -> Self {
+    pub fn new(property_name: &'static str, backend: Arc<YrsBackend>) -> Self {
         let starting_state = backend.doc.transact().state_vector();
         Self {
             property_name,
             previous_state: Arc::new(Mutex::new(starting_state)),
 
-            record_inner: Arc::downgrade(&record_inner),
             backend: Arc::downgrade(&backend),
         }
     }
-    pub fn record_inner(&self) -> Arc<RecordInner> {
-        self.record_inner
-            .upgrade()
-            .expect("Expected `RecordInner` to exist")
-    }
     pub fn backend(&self) -> Arc<YrsBackend> {
-        self.backend.upgrade()
+        self.backend
+            .upgrade()
             .expect("Expected `Yrs` property backend to exist in `RecordInner`")
     }
     pub fn value(&self) -> String {
@@ -61,12 +54,8 @@ impl StringValue {
 }
 
 impl InitializeWith<String> for StringValue {
-    fn initialize_with(
-        inner: Arc<RecordInner>,
-        property_name: &'static str,
-        value: String,
-    ) -> Self {
-        let new_string = Self::new(property_name, inner);
+    fn initialize_with(backends: &Backends, property_name: &'static str, value: String) -> Self {
+        let new_string = Self::new(property_name, backends.yrs.clone());
         new_string.insert(0, &value);
         new_string
     }

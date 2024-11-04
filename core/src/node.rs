@@ -3,7 +3,7 @@ use ulid::Ulid;
 use crate::{
     event::Operation,
     model::{Model, ID},
-    storage::{StorageEngine, RawBucket},
+    storage::{RawBucket, StorageEngine},
     transaction::{TransactionGuard, TransactionManager},
 };
 use anyhow::Result;
@@ -15,7 +15,7 @@ use std::{
 /// Manager for all records and their properties on this client.
 pub struct Node {
     /// Ground truth local state for records.
-    /// 
+    ///
     /// Things like `postgres`, `sled`, `TKiV`.
     storage_engine: Box<dyn StorageEngine>,
     // Modified, potentially uncommitted changes to records.

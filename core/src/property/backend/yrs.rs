@@ -1,7 +1,7 @@
 use std::sync::{Arc, Weak};
 
-use yrs::{updates::decoder::Decode, GetString, Text, Transact};
 use anyhow::*;
+use yrs::{updates::{decoder::Decode, encoder::Encode}, GetString, ReadTxn, Text, Transact};
 
 use crate::model::RecordInner;
 
@@ -22,10 +22,10 @@ impl YrsBackend {
         }
     }
 
-    pub fn new(record_inner: Weak<RecordInner>) -> Self {
+    pub fn new(record_inner: Arc<RecordInner>) -> Self {
         Self {
             doc: yrs::Doc::new(),
-            record_inner,
+            record_inner: Arc::downgrade(&record_inner),
         }
     }
 
@@ -34,13 +34,22 @@ impl YrsBackend {
     }
 
     /// Gets a reference to the inner record.
-    /// 
+    ///
     /// # Panics if the inner record doesn't exist or was de-allocated.
     pub fn record_inner(&self) -> Arc<RecordInner> {
-        self.get_record_inner().expect("Expected `RecordInner` to exist for `YrsBackend`")
+        self.get_record_inner()
+            .expect("Expected `RecordInner` to exist for `YrsBackend`")
     }
 
-    pub fn from_backend_state_buffer(record_inner: Weak<RecordInner>, state_buffer: Vec<u8>) -> Result<Self> {
+    pub fn to_state_buffer(&self) -> Vec<u8> {
+        let txn = self.doc.transact();
+        txn.state_vector().encode_v2()
+    }
+
+    pub fn from_state_buffer(
+        record_inner: Arc<RecordInner>,
+        state_buffer: Vec<u8>,
+    ) -> Result<Self> {
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
         let update = yrs::Update::decode_v2(&state_buffer)?;
@@ -50,7 +59,7 @@ impl YrsBackend {
         drop(txn);
         Ok(Self {
             doc: doc,
-            record_inner,
+            record_inner: Arc::downgrade(&record_inner),
         })
     }
 

@@ -104,7 +104,6 @@ impl StorageBucket for SledStorageBucket {
     }
 }
 
-
 /// Manages the storage and state of the collection without any knowledge of the model type
 #[derive(Clone)]
 pub struct RawBucket {
