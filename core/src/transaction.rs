@@ -51,15 +51,19 @@ impl Transaction {
     }
 
     pub fn get<A: Record>(&self, bucket: &'static str, id: ID) -> Result<&A> {
+        println!("mark 1");
         let raw_bucket = self.node.raw_bucket(bucket);
         let record_state = raw_bucket.bucket.get(id)?;
         let record_inner = RecordInner {
             id: id,
             collection: bucket,
         };
+        println!("mark 2");
         let base_record = A::from_record_state(id, &record_state)?;
+        println!("mark 3");
         let index = self.active_records.push(Box::new(base_record));
         let upcast = self.active_records[index].as_dyn_any();
+        println!("mark 4");
         Ok(upcast
             .downcast_ref::<A>()
             .expect("Expected correct downcast"))

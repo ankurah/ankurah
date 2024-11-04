@@ -89,7 +89,9 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                     id: id,
                 });
 
+                println!("yrs decode");
                 let yrs_backend = std::sync::Arc::new(ankurah_core::property::backend::YrsBackend::from_state_buffer(inner.clone(), &record_state.yrs_state_buffer)?);
+                println!("yrs worked");
                 Ok(Self {
                     id: id,
                     inner: inner,

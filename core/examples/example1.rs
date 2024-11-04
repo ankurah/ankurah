@@ -68,16 +68,16 @@ async fn main() -> Result<()> {
         // as long as the field accesors (album.name, or album.name()) return a concrete TypeValue impl
         // and we can access the id property for the instance.
         album.name().insert(12, "e");
-        trx.commit();
+        trx.commit().unwrap();
 
+        let client_albums = client.raw_bucket("album");
+        client_albums.bucket.set_state(album.id(), album.record_state())?;
         {
-            let id = ID(ulid::Ulid::new());
-            let mut client_albums = client.raw_bucket("album");
-            client_albums.bucket.set_state(id, album.record_state())?;
-            let record_state = client_albums.bucket.get(id)?;
-            info!("record_state: {:?}", record_state);
-            //let updated_album = AlbumRecord::from_record_state(&client, id, &record_state)?;
-            //println!("updated: {:?}", updated_album);
+            info!("ababa");
+            let trx = client.begin();
+            let test = trx.get::<AlbumRecord>("album", album.id())?;
+            info!("test: {:?}", test);
+            info!("ababa");
         }
 
         album

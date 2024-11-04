@@ -52,12 +52,17 @@ impl YrsBackend {
         record_inner: Arc<RecordInner>,
         state_buffer: &Vec<u8>,
     ) -> Result<Self> {
+        println!("state_buffer: {:?}", state_buffer);
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
+        println!("decoding");
         let update = yrs::Update::decode_v2(&state_buffer)?;
+        println!("applying");
         txn.apply_update(update)?;
         //let current_state = txn.state_vector();
+        println!("commit");
         txn.commit(); // I just don't trust `Drop` too much
+        println!("dropping");
         drop(txn);
         Ok(Self {
             doc: doc,
