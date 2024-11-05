@@ -74,6 +74,11 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                 self.id
             }
 
+            // I think we might not need inner.collection or ID. Might need new to return Arc<Self> though. Not sure.
+            fn bucket_name(&self) -> &'static str {
+                #name_str
+            }
+
             fn record_state(&self) -> ankurah_core::storage::RecordState {
                 ankurah_core::storage::RecordState {
                     yrs_state_buffer: self.yrs.to_state_buffer(),

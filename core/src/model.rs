@@ -18,6 +18,7 @@ pub trait Model {}
 /// A specific instance of a record in the collection
 pub trait Record: Any + Send + Sync + 'static {
     fn id(&self) -> ID;
+    fn bucket_name(&self) -> &'static str;
     fn record_state(&self) -> RecordState;
     fn from_record_state(
         id: ID,
