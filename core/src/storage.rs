@@ -5,12 +5,12 @@ use sled::{Config, Db};
 
 use crate::model::ID;
 
-pub trait StorageEngine {
+pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
     fn bucket(&self, name: &str) -> anyhow::Result<Box<dyn StorageBucket>>;
 }
 
-pub trait StorageBucket {
+pub trait StorageBucket: Send + Sync {
     fn set_state(&self, id: ID, state: RecordState) -> anyhow::Result<()>;
     fn get(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError>;
 }

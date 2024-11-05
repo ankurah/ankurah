@@ -15,7 +15,7 @@ impl AppState {
     pub fn new() -> Result<Self> {
         // let storage = storage::StorageEngine::new()?;
         Ok(Self(Arc::new(AppStateInner {
-            node: Node::new(SledStorageEngine::new().unwrap()),
+            node: Arc::new(Node::new(Box::new(SledStorageEngine::new().unwrap()))),
         })))
     }
 }
