@@ -19,7 +19,10 @@ pub trait Model {}
 pub trait Record: Any + Send + Sync + 'static {
     fn id(&self) -> ID;
     fn record_state(&self) -> RecordState;
-    fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self>
+    fn from_record_state(
+        id: ID,
+        record_state: &RecordState,
+    ) -> Result<Self, crate::error::RetrievalError>
     where
         Self: Sized;
     fn commit_record(&self, node: Arc<Node>) -> Result<()>;

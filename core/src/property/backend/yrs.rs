@@ -1,6 +1,5 @@
 use std::sync::{Arc, Weak};
 
-use anyhow::*;
 use yrs::{
     updates::{decoder::Decode, encoder::Encode},
     GetString, ReadTxn, Text, Transact,
@@ -45,25 +44,32 @@ impl YrsBackend {
 
     pub fn to_state_buffer(&self) -> Vec<u8> {
         let txn = self.doc.transact();
-        txn.state_vector().encode_v2()
+        // The yrs docs aren't great about how to encode all state as an update.
+        // the state vector is just a clock reading. It doesn't contain all updates
+        let state_buffer = txn.encode_state_as_update_v2(&yrs::StateVector::default());
+        println!("state_buffer: {:?}", state_buffer);
+        state_buffer
     }
 
     pub fn from_state_buffer(
         record_inner: Arc<RecordInner>,
         state_buffer: &Vec<u8>,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, crate::error::RetrievalError> {
         println!("state_buffer: {:?}", state_buffer);
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
         println!("decoding");
-        let update = yrs::Update::decode_v2(&state_buffer)?;
+        let update = yrs::Update::decode_v2(&state_buffer)
+            .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
         println!("applying");
-        txn.apply_update(update)?;
+        txn.apply_update(update)
+            .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
         //let current_state = txn.state_vector();
         println!("commit");
         txn.commit(); // I just don't trust `Drop` too much
         println!("dropping");
         drop(txn);
+
         Ok(Self {
             doc: doc,
             record_inner: Arc::downgrade(&record_inner),

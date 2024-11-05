@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
 
@@ -8,12 +7,12 @@ use crate::model::ID;
 
 pub trait StorageEngine {
     // Opens and/or creates a storage bucket.
-    fn bucket(&self, name: &str) -> Result<Box<dyn StorageBucket>>;
+    fn bucket(&self, name: &str) -> anyhow::Result<Box<dyn StorageBucket>>;
 }
 
 pub trait StorageBucket {
-    fn set_state(&self, id: ID, state: RecordState) -> Result<()>;
-    fn get(&self, id: ID) -> Result<RecordState>;
+    fn set_state(&self, id: ID, state: RecordState) -> anyhow::Result<()>;
+    fn get(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,9 +26,9 @@ pub struct SledStorageEngine {
 
 impl SledStorageEngine {
     // Open the storage engine without any specific column families
-    pub fn new() -> Result<Self> {
+    pub fn new() -> anyhow::Result<Self> {
         let dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("Failed to get home directory"))?
+            .ok_or_else(|| anyhow::anyhow!("Failed to get home directory"))?
             .join(".ankurah");
 
         std::fs::create_dir_all(&dir)?;
@@ -40,7 +39,7 @@ impl SledStorageEngine {
 
         Ok(Self { db })
     }
-    pub fn new_test() -> Result<Self> {
+    pub fn new_test() -> anyhow::Result<Self> {
         let db = Config::new()
             .temporary(true)
             .flush_every_ms(None)
@@ -56,7 +55,7 @@ pub struct SledStorageBucket {
 }
 
 impl StorageEngine for SledStorageEngine {
-    fn bucket(&self, name: &str) -> Result<Box<dyn StorageBucket>> {
+    fn bucket(&self, name: &str) -> anyhow::Result<Box<dyn StorageBucket>> {
         let tree = self.db.open_tree(name)?;
         Ok(Box::new(SledStorageBucket { tree }))
     }
@@ -69,13 +68,17 @@ impl SledStorageBucket {
 }
 
 impl StorageBucket for SledStorageBucket {
-    fn set_state(&self, id: ID, state: RecordState) -> Result<()> {
+    fn set_state(&self, id: ID, state: RecordState) -> anyhow::Result<()> {
         let binary_state = bincode::serialize(&state)?;
         self.tree.insert(id.0.to_bytes(), binary_state)?;
         Ok(())
     }
-    fn get(&self, id: ID) -> Result<RecordState> {
-        match self.tree.get(id.0.to_bytes())? {
+    fn get(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
+        match self
+            .tree
+            .get(id.0.to_bytes())
+            .map_err(|e| crate::error::RetrievalError::StorageError(Box::new(e)))?
+        {
             Some(ivec) => {
                 let record_state = bincode::deserialize(&*ivec)?;
                 Ok(record_state)
@@ -83,7 +86,7 @@ impl StorageBucket for SledStorageBucket {
             None => {
                 //Ok(RecordState { field_states: Vec::new() });
                 //Err(format!("Missing Ivec for id"))
-                panic!("need to figure out anyhow");
+                Err(crate::error::RetrievalError::NotFound(id))
             }
         }
     }
@@ -91,14 +94,18 @@ impl StorageBucket for SledStorageBucket {
 
 /// Manages the storage and state of the collection without any knowledge of the model type
 #[derive(Clone)]
-pub struct RawBucket {
-    pub bucket: Arc<Box<dyn StorageBucket>>,
+pub struct Bucket(pub(crate) Arc<Box<dyn StorageBucket>>);
+
+/// Storage interface for a collection
+impl Bucket {
+    pub fn new(bucket: Box<dyn StorageBucket>) -> Self {
+        Self(Arc::new(bucket))
+    }
 }
 
-impl RawBucket {
-    pub fn new(bucket: Box<dyn StorageBucket>) -> Self {
-        Self {
-            bucket: Arc::new(bucket),
-        }
+impl std::ops::Deref for Bucket {
+    type Target = Arc<Box<dyn StorageBucket>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

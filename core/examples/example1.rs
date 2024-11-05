@@ -19,7 +19,6 @@ async fn main() -> Result<()> {
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
     let mut client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
-    client.register_model::<Album>("album")?;
     let client = Arc::new(client);
 
     // client.local_connect(&server);
@@ -54,16 +53,16 @@ async fn main() -> Result<()> {
         album.name().insert(12, "e");
         trx.commit().unwrap();
 
-        let client_albums = client.raw_bucket("album");
-        client_albums
-            .bucket
+        client
+            .bucket("album")
             .set_state(album.id(), album.record_state())?;
         {
-            info!("ababa");
+            // info!("ababa");
             let trx = client.begin();
             let test = trx.get::<AlbumRecord>("album", album.id())?;
-            info!("test: {:?}", test);
-            info!("ababa");
+            assert_eq!(test.name().value(), "The Dark Side of the Moon");
+            println!("test: {:?}", test.name().value());
+            // info!("ababa");
         }
 
         album

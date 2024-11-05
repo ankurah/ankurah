@@ -80,7 +80,10 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                 }
             }
 
-            fn from_record_state(id: ankurah_core::model::ID, record_state: &ankurah_core::storage::RecordState) -> Result<Self>
+            fn from_record_state(
+                id: ankurah_core::model::ID,
+                record_state: &ankurah_core::storage::RecordState,
+            ) -> std::result::Result<Self, ankurah_core::error::RetrievalError>
             where
                 Self: Sized,
             {

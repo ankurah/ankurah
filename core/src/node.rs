@@ -2,14 +2,14 @@ use ulid::Ulid;
 
 use crate::{
     event::Operation,
-    model::{Model, ID},
-    storage::{RawBucket, StorageEngine},
+    model::{Model, Record, ID},
+    storage::{Bucket, StorageEngine},
     transaction::Transaction,
 };
 use anyhow::Result;
 use std::{
     collections::BTreeMap,
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, RwLock},
 };
 
 /// Manager for all records and their properties on this client.
@@ -18,8 +18,8 @@ pub struct Node {
     ///
     /// Things like `postgres`, `sled`, `TKiV`.
     storage_engine: Box<dyn StorageEngine>,
-    // Separated storage buckets by name, still belongs to the above `StorageEngine`.
-    storage_buckets: BTreeMap<String, RawBucket>,
+    // Storage for each collection
+    collections: RwLock<BTreeMap<&'static str, Bucket>>,
     // peer_connections: Vec<PeerConnection>,
 }
 
@@ -27,20 +27,11 @@ impl Node {
     pub fn new(engine: Box<dyn StorageEngine>) -> Self {
         Self {
             storage_engine: engine,
-            storage_buckets: BTreeMap::new(),
+            collections: RwLock::new(BTreeMap::new()),
             // peer_connections: Vec::new(),
         }
     }
 
-    pub fn register_model<M>(&mut self, name: &str) -> Result<()>
-    where
-        M: Model,
-    {
-        let bucket = self.storage_engine.bucket(name)?;
-        self.storage_buckets
-            .insert(name.to_owned(), RawBucket::new(bucket));
-        Ok(())
-    }
     pub fn local_connect(&self, _peer: &Arc<Node>) {
         unimplemented!()
         // let (tx, rx) = mpsc::channel();
@@ -52,13 +43,25 @@ impl Node {
         //     }
         // });
     }
+    pub fn collection<T: Record>(&self, name: &'static str) -> Collection<T> {
+        Collection {
+            bucket: self.bucket(name),
+            phantom: std::marker::PhantomData,
+        }
+    }
+    pub fn bucket(&self, name: &'static str) -> Bucket {
+        let collections = self.collections.read().unwrap();
+        if let Some(store) = collections.get(name) {
+            return store.clone();
+        }
+        drop(collections);
 
-    pub fn raw_bucket(&self, name: &str) -> &RawBucket {
-        let raw = self
-            .storage_buckets
-            .get(name)
-            .expect(&format!("Collection {} expected to exist", name));
-        raw
+        let mut collections = self.collections.write().unwrap();
+        let collection = Bucket::new(self.storage_engine.bucket(name).unwrap());
+
+        assert!(collections.insert(name, collection.clone()).is_none());
+
+        collection
     }
     pub fn next_id(&self) -> ID {
         ID(Ulid::new())
@@ -66,6 +69,13 @@ impl Node {
     pub fn begin(self: &Arc<Self>) -> Transaction {
         Transaction::new(self.clone())
     }
+}
+
+/// Handle to a collection of records of the same type
+/// Able to construct records of type `T`
+pub struct Collection<T: Record> {
+    bucket: Bucket,
+    phantom: std::marker::PhantomData<T>,
 }
 
 pub struct PeerConnection {

@@ -8,10 +8,11 @@ use std::{
 };
 
 use crate::{
+    error::RetrievalError,
     model::{Record, RecordInner, ID},
     Node,
 };
-use anyhow::Result;
+
 use append_only_vec::AppendOnlyVec;
 
 pub const PAGE_SIZE: usize = 16;
@@ -50,10 +51,14 @@ impl Transaction {
         }
     }
 
-    pub fn get<A: Record>(&self, bucket: &'static str, id: ID) -> Result<&A> {
+    pub fn get<A: Record>(
+        &self,
+        bucket: &'static str,
+        id: ID,
+    ) -> Result<&A, crate::error::RetrievalError> {
         println!("mark 1");
-        let raw_bucket = self.node.raw_bucket(bucket);
-        let record_state = raw_bucket.bucket.get(id)?;
+        let raw_bucket = self.node.bucket(bucket);
+        let record_state = raw_bucket.0.get(id)?;
         let record_inner = RecordInner {
             id: id,
             collection: bucket,
@@ -70,13 +75,13 @@ impl Transaction {
     }
 
     #[must_use]
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(mut self) -> anyhow::Result<()> {
         self.commit_mut_ref()
     }
 
     #[must_use]
     // only because Drop is &mut self not mut self
-    pub(crate) fn commit_mut_ref(&mut self) -> Result<()> {
+    pub(crate) fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
         for record in self.active_records.iter() {
