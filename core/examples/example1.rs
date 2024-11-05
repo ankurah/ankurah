@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     let album = {
         let trx = client.begin();
         let album = AlbumRecord::new(
-            client.clone(),
+            &client,
             Album {
                 name: "The Dark Sid of the Moon".to_string(),
             },

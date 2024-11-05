@@ -110,7 +110,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         }
 
         impl #record_name {
-            pub fn new(node: std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
+            pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
                 use ankurah_core::property::traits::InitializeWith;
                 let id = node.next_id();
 
