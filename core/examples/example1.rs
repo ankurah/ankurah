@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use ankurah_core::model::Record;
+use ankurah_core::property::value::StringValue;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ID, node::Node};
 use ankurah_derive::Model;
@@ -10,12 +11,44 @@ use tracing::{info, Level};
 
 #[derive(Model, Debug, Serialize, Deserialize)] // This line now uses the Model derive macro
 pub struct Album {
+    // DECISION: The model always contains projected types, which will initally be just the native types.
+    // We will leave the door open to backend specific projected newtypes in the future, but we will not have the active value types in the model.
+    // Implication: we will still need to have a native type to active type lookup in the Model macro for now.
+    // We have the option of adding override attributes to switch backends in the future.
+    // We will initially only use Model structs for initial construction of the record (or a property group thereof) but we may later consider
+    // using them for per-propertygroup retrieival binding, but preferably only via an immutable borrow.
     name: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    // POINT 2 - registration? - agreed. not needed.
+    // POINT 3 - rollbacks?
+    // let rec = fetch(...);
+
+    // <Button onClick={
+    //     let trx = asdfasdfasdf;
+    //     rec.name.set("new name");
+    //     rec.edit(trx).set(whatever)
+    // } />
+
+    // let album : ReadRecord = fetch(...);
+    // let album2 = album.clone();
+    // query(track).subscribe(move || {
+    //     let trx = client.begin();
+    //     // Either: find a way to bind the edit of the existing record to the new trx
+    //     // OR: get a new editable form of the record that is bound to the new trx ()
+    //     let w : WritableRecord = album2.edit(trx);
+    //     w.status.set("new name");
+    // })
+    
+
+    // POINT 4 - explicit transactions for write/read? (how does this affect subscribers?)
+    // POINT 5 - trx record vs UOW registration?
+    // POINT 6 - backend instantiation and setup - who has a copy of what and how is it instantiated from a wayfinding perspective?
+    // POINT 7 - State and Event DAG construction and happens before determination (operation id/precursor in state and event data)
+ 
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
     let mut client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
@@ -45,9 +78,33 @@ async fn main() -> Result<()> {
         let album = AlbumRecord::new(
             &client,
             Album {
-                name: "The Dark Sid of the Moon".to_string(),
+                name: "The Dark Sid of the Moon".into(),
             },
         );
+
+        // let album = AlbumRecord::build(&client).with(Album {
+        //     name: "The Dark Sid of the Moon".to_string(),
+        // }).insert();
+
+
+        // Conducive to macro syntax like create_album! { name: "", other: "" }
+        // AND conducive to property graph usage in the future 
+        // let record = AlbumRecord::build().add<StringValue>("name","The Dark Sid of the Moon").add<StringValue>("other", "whatever").insert(&client);
+        // record.name()
+
+        // let model : &Artist = record.getcolumnfamily::<Artist>();
+        // We should do this, but it's not a priority short term
+        // record.get<StringValue>("name")
+
+        // let record = fetchwhatever()? // if missing a field, but record is otherwise found, it probably shouldn't fail here
+        // record.name.get()?; // it should fail here
+
+        // What does this buy us?
+        // * Plays nice with the future column family idea
+        // * Decouples models from records a little bit more (which is a good thing for property graph future stuff)
+        // * allows for individual field construction in the event that we want to direclyt construct value objects without injecting the record inner after the fact
+        // Downsides:
+        // * 
 
         info!("Album created: {:?}", album);
         album.name().insert(12, "e");
