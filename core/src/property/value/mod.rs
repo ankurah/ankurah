@@ -1,2 +1,2 @@
-pub mod string;
-pub use string::StringValue;
+pub mod yrs;
+pub use yrs::YrsString;

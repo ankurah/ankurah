@@ -1,23 +1,8 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
-
-/// Map model field types to their corresponding value types
-fn get_value_type(ty: &Type) -> proc_macro2::TokenStream {
-    let type_str = quote!(#ty).to_string();
-    let value_type = match type_str.as_str() {
-        "String" => quote!(StringValue),
-        "i32" => quote!(IntValue),
-        "f64" => quote!(FloatValue),
-        "bool" => quote!(BoolValue),
-        // Add more mappings as needed
-        _ => quote!(ankurah_core::property::value::Value<#ty>), // Default to a generic Value type
-    };
-    quote!(ankurah_core::property::value::#value_type)
-}
+use syn::{parse_macro_input, Data, DeriveInput, Fields};
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
-
 pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident;
@@ -32,6 +17,23 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         _ => panic!("Only structs are supported"),
     };
 
+    let active_value_ident = format_ident!("active_value");
+    let field_active_values = fields
+        .iter()
+        .map(|f| {
+            let active_value = f.attrs.iter()
+                .find(|attr| attr.path().get_ident() == Some(&active_value_ident));
+            match active_value {
+                Some(active_value) => {
+                    active_value.parse_args::<syn::Ident>()
+                        .unwrap()
+                },
+                // TODO: Better error, should include which field ident and an example on how to use.
+                None => panic!("All fields need an active value attribute"),
+            }
+        })
+        .collect::<Vec<_>>();
+
     let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
     let field_name_strs = fields
         .iter()
@@ -44,24 +46,19 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
 
-    // Update this to use the get_value_type function
-    let field_value_types = fields
-        .iter()
-        .map(|f| get_value_type(&f.ty))
-        .collect::<Vec<_>>();
-
     let expanded: proc_macro::TokenStream = quote! {
-        impl ankurah_core::model::Model for #name {}
+        impl ankurah_core::model::Model for #name {
+            type Active = #record_name;
+        }
 
         #[derive(Debug)]
         pub struct #record_name {
             id: ankurah_core::model::ID,
             inner: std::sync::Arc<ankurah_core::model::RecordInner>,
-
-            yrs: std::sync::Arc<ankurah_core::property::backend::YrsBackend>,
+            backends: ankurah_core::property::Backends,
 
             // Field projections
-            #(#field_names: #field_value_types,)*
+            #(#field_names: #field_active_values,)*
             // TODO: Add fields for tracking changes and operation count
         }
 
@@ -106,7 +103,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                     yrs: yrs_backend.clone(),
                     // TODO: Support other backends than Yrs, right now its just hardcoded YrsBackend.
                     #(
-                        #field_names: #field_value_types::new(#field_name_strs, yrs_backend.clone()),
+                        #field_names: #field_active_values::new(#field_name_strs, yrs_backend.clone()),
                     )*
                 })
             }
@@ -135,12 +132,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                     id: id,
                     inner: inner,
                     yrs: yrs,
-                    #(#field_names: <#field_value_types>::initialize_with(&backends, #field_name_strs, model.#field_names),)*
+                    #(#field_names: <#field_active_values>::initialize_with(&backends, #field_name_strs, model.#field_names),)*
                 }
             }
 
             #(
-                pub fn #field_names(&self) -> &#field_value_types {
+                pub fn #field_names(&self) -> &#field_active_values {
                     &self.#field_names
                 }
             )*

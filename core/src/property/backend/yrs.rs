@@ -11,6 +11,11 @@ use crate::model::RecordInner;
 #[derive(Debug)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
+    // unnecessary? we probably shouldn't care about this here.
+    //
+    // The main usecase before was for recording operations, BUT
+    // I think this might be better to do on a per case basis and then
+    // accumulated later on.
     record_inner: Weak<RecordInner>,
 }
 
@@ -55,19 +60,14 @@ impl YrsBackend {
         record_inner: Arc<RecordInner>,
         state_buffer: &Vec<u8>,
     ) -> std::result::Result<Self, crate::error::RetrievalError> {
-        println!("state_buffer: {:?}", state_buffer);
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
-        println!("decoding");
         let update = yrs::Update::decode_v2(&state_buffer)
             .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
-        println!("applying");
         txn.apply_update(update)
             .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
         //let current_state = txn.state_vector();
-        println!("commit");
         txn.commit(); // I just don't trust `Drop` too much
-        println!("dropping");
         drop(txn);
 
         Ok(Self {

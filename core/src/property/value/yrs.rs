@@ -13,7 +13,7 @@ use crate::property::{
 };
 
 #[derive(Debug)]
-pub struct StringValue {
+pub struct YrsString {
     // ideally we'd store the yrs::TransactionMut in the Transaction as an ExtendableOp or something like that
     // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
@@ -24,7 +24,7 @@ pub struct StringValue {
 }
 
 // Starting with basic string type operations
-impl StringValue {
+impl YrsString {
     pub fn new(property_name: &'static str, backend: Arc<YrsBackend>) -> Self {
         let starting_state = backend.doc.transact().state_vector();
         Self {
@@ -50,7 +50,7 @@ impl StringValue {
     }
 }
 
-impl InitializeWith<String> for StringValue {
+impl InitializeWith<String> for YrsString {
     fn initialize_with(backends: &Backends, property_name: &'static str, value: String) -> Self {
         let new_string = Self::new(property_name, backends.yrs.clone());
         new_string.insert(0, &value);
@@ -58,7 +58,8 @@ impl InitializeWith<String> for StringValue {
     }
 }
 
-impl StateSync for StringValue {
+// TODO: Figure out whether to remove this
+impl StateSync for YrsString {
     // These should really be on the YrsBackend I think
     /// Apply an update to the field from an event/operation
     fn apply_update(&self, update: &[u8]) -> Result<()> {
