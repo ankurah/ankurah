@@ -1,13 +1,23 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import reactLogo from './assets/react.svg'
 import viteLogo from '/vite.svg'
 import './App.css'
 import { useAppState } from './AppState'
+import * as bindings from 'example-wasm-bindings';
 
 function App() {
-  const [count, setCount] = useState(0)
   const appState = useAppState()
   console.log('appState', appState);
+
+  const [connectionState, setConnectionState] = useState<bindings.ConnectionState | null>(null);
+
+  useEffect(() => {
+    if (appState?.client) {
+      appState.client.connection_state.for_each((state: bindings.ConnectionState) => {
+        setConnectionState(state);
+      });
+    }
+  }, [appState?.client]);
 
   const handleSendMessage = () => {
     if (appState?.client) {
@@ -30,19 +40,13 @@ function App() {
       </div>
       <h1>Vite + React</h1>
       <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
+        <div className="connection-status">
+          Connection State: {connectionState ? bindings.ConnectionState[connectionState] : 'Not Connected'}
+        </div>
         <button onClick={handleSendMessage} disabled={!appState?.client}>
           Send Message
         </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
       </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
     </>
   )
 }

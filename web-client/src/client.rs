@@ -1,3 +1,4 @@
+use ankurah_wasm_signal::WasmSignal;
 use futures_signals::signal::ReadOnlyMutable;
 use futures_signals::signal::{Mutable, SignalExt};
 use gloo_timers::future::sleep;
@@ -7,18 +8,62 @@ use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
 
 const MAX_RECONNECT_DELAY: u64 = 10000;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[wasm_bindgen]
+#[derive(Clone, Copy, PartialEq, Debug /* , WasmSignal*/)]
 pub enum ConnectionState {
     None,
     Connecting,
     Open,
     Closed,
     Error,
+}
+
+// #[wasm_bindgen]
+// impl ConnectionState {
+//     pub fn display(&self) -> String {
+//         format!("{:?}", self)
+//     }
+// }
+
+#[wasm_bindgen]
+pub struct ConnectionStateSignal(::futures_signals::signal::MutableSignal<ConnectionState>);
+
+#[wasm_bindgen]
+impl ConnectionStateSignal {
+    fn new(signal: ::futures_signals::signal::MutableSignal<ConnectionState>) -> Self {
+        Self(signal)
+    }
+
+    pub fn for_each(
+        self,
+        // #[ typescript_type = "(state: ConnectionState) => void")]
+        callback: ::js_sys::Function,
+    ) -> ankurah_wasm_signal::Subscription {
+        let (abort_handle, abort_registration) = futures::stream::AbortHandle::new_pair();
+
+        let future = futures::stream::Abortable::new(
+            self.0.for_each(move |value| {
+                let js_value = ::wasm_bindgen::JsValue::from(value);
+                callback
+                    .call1(&::wasm_bindgen::JsValue::NULL, &js_value)
+                    .unwrap();
+                ::futures::future::ready(())
+            }),
+            abort_registration,
+        );
+
+        ::wasm_bindgen_futures::spawn_local(async move {
+            let _ = future.await;
+        });
+
+        ankurah_wasm_signal::Subscription::new(abort_handle)
+    }
 }
 
 struct ClientInner {
@@ -57,6 +102,10 @@ impl Client {
             // TODO: queue these messages?
             connection.send_message(message);
         }
+    }
+    #[wasm_bindgen(getter)]
+    pub fn connection_state(&self) -> ConnectionStateSignal {
+        ConnectionStateSignal::new(self.inner.state.signal())
     }
 }
 

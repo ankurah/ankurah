@@ -14,6 +14,7 @@ react = ["start"]
 
 [dependencies]
 ankurah-proto = { path = "../proto" }
+ankurah-wasm-signal = { path = "../wasm-signal" }
 wasm-bindgen = "0.2.84"
 console_error_panic_hook = { version = "0.1.7", optional = true }
 futures = "0.3.30"

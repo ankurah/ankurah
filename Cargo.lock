@@ -112,10 +112,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-wasm-signal"
+version = "0.1.0"
+dependencies = [
+ "ankurah-derive",
+ "futures",
+ "futures-signals",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "ankurah-web-client"
 version = "0.1.0"
 dependencies = [
  "ankurah-proto",
+ "ankurah-wasm-signal",
  "bincode",
  "console_error_panic_hook",
  "futures",
