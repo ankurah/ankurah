@@ -8,6 +8,7 @@ use yrs::{
 };
 
 use crate::property::{
+    value::ProjectedValue,
     backend::{Backends, YrsBackend},
     traits::{InitializeWith, StateSync},
 };
@@ -21,6 +22,13 @@ pub struct YrsString {
     previous_state: Arc<Mutex<StateVector>>,
 
     pub backend: Weak<YrsBackend>,
+}
+
+impl ProjectedValue for YrsString {
+    type Projected = String;
+    fn projected(&self) -> Self::Projected {
+        self.value()
+    }
 }
 
 // Starting with basic string type operations

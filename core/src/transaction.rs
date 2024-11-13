@@ -3,14 +3,10 @@ use std::{
 };
 
 use crate::{
-    error::RetrievalError,
-    model::{Record, RecordInner, ID},
-    Node,
+    error::RetrievalError, model::{Record, RecordInner, ID, ScopedRecord}, Model, Node
 };
 
 use append_only_vec::AppendOnlyVec;
-
-pub const PAGE_SIZE: usize = 16;
 
 // Q. When do we want unified vs individual property storage for TypeEngine operations?
 // A. When we start to care about differentiating possible recipients for different properties.
@@ -24,7 +20,7 @@ pub struct Operation {
 pub struct Transaction {
     pub(crate) node: Arc<Node>, // only here for committing records to storage engine
 
-    active_records: AppendOnlyVec<Box<dyn Record>>,
+    records: AppendOnlyVec<Box<dyn ScopedRecord>>,
 
     // markers
     implicit: bool,
@@ -40,32 +36,40 @@ impl Transaction {
     pub fn new(node: Arc<Node>) -> Self {
         Self {
             node: node,
-            active_records: AppendOnlyVec::new(),
+            records: AppendOnlyVec::new(),
             implicit: true,
             consumed: false,
         }
     }
 
-    pub fn get<A: Record>(
+    pub fn edit<A: Model>(
         &self,
-        bucket: &'static str,
         id: ID,
-    ) -> Result<&A, crate::error::RetrievalError> {
-        println!("mark 1");
+    ) -> Result<&A::ScopedRecord, crate::error::RetrievalError> {
+        let bucket = A::bucket_name();
+
+        // check if its already in this transaction
+        for record in self.records.iter() {
+            // TODO: Optimize this.
+            // It shouldn't be a problem until we have a LOT of records but still
+            // Probably just a hashing pre-check and then we retrieve it the same way
+            // Either that or use a different append-only structure that uses hashing.
+            if record.id() == id && record.bucket_name() == bucket {
+                let upcast = record.as_dyn_any();
+                return Ok(upcast
+                    .downcast_ref::<A::ScopedRecord>()
+                    .expect("Expected correct downcast"));
+            }
+        }
+
+        // we don't already have this record, fetch it from the node
         let raw_bucket = self.node.bucket(bucket);
         let record_state = raw_bucket.0.get(id)?;
-        let record_inner = RecordInner {
-            id: id,
-            collection: bucket,
-        };
-        println!("mark 2");
-        let base_record = A::from_record_state(id, &record_state)?;
-        println!("mark 3");
-        let index = self.active_records.push(Box::new(base_record));
-        let upcast = self.active_records[index].as_dyn_any();
-        println!("mark 4");
+        let base_record = <A::ScopedRecord>::from_record_state(id, &record_state)?;
+        let index = self.records.push(Box::new(base_record));
+        let upcast = self.records[index].as_dyn_any();
         Ok(upcast
-            .downcast_ref::<A>()
+            .downcast_ref::<A::ScopedRecord>()
             .expect("Expected correct downcast"))
     }
 
@@ -79,8 +83,8 @@ impl Transaction {
     pub(crate) fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
-        for record in self.active_records.iter() {
-            record.commit_record(self.node.clone());
+        for record in self.records.iter() {
+            record.commit_record(self.node.clone())?;
         }
         Ok(())
     }
@@ -93,7 +97,11 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         if self.implicit && !self.consumed {
-            self.commit_mut_ref();
+            match self.commit_mut_ref() {
+                Ok(()) => {},
+                // Probably shouldn't panic here, but for testing purposes whatever.
+                Err(err) => panic!("Failed to commit: {:?}", err),
+            }
         }
     }
 }

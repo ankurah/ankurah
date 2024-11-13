@@ -20,11 +20,23 @@ impl fmt::Display for ID {
 /// A model is a struct that represents the present values for a given record
 /// Schema is defined primarily by the Model object, and the Record is derived from that via macro.
 pub trait Model {
-    type Active: Record;
+    type Record: Record;
+    type ScopedRecord: ScopedRecord;
+    fn bucket_name() -> &'static str
+    where 
+        Self: Sized;
 }
 
-/// A specific instance of a record in the collection
-pub trait Record: Any + Send + Sync + 'static {
+/// An instance of a record.
+pub trait Record {
+    fn id(&self) -> ID;
+    fn bucket_name() -> &'static str
+    where
+        Self: Sized;
+}
+
+/// An editable instance of a record.
+pub trait ScopedRecord: Any + Send + Sync + 'static {
     fn id(&self) -> ID;
     fn bucket_name(&self) -> &'static str;
     fn record_state(&self) -> RecordState;
@@ -35,7 +47,6 @@ pub trait Record: Any + Send + Sync + 'static {
     where
         Self: Sized;
     fn commit_record(&self, node: Arc<Node>) -> Result<()>;
-
     fn as_dyn_any(&self) -> &dyn Any;
 }
 

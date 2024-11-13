@@ -8,6 +8,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let name = input.ident;
     let name_str = name.to_string().to_lowercase();
     let record_name = format_ident!("{}Record", name);
+    let scoped_record_name = format_ident!("{}ScopedRecord", name);
 
     let fields = match input.data {
         Data::Struct(ref data) => match data.fields {
@@ -56,21 +57,53 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
     let expanded: proc_macro::TokenStream = quote! {
         impl ankurah_core::model::Model for #name {
-            type Active = #record_name;
+            type Record = #record_name;
+            type ScopedRecord = #scoped_record_name;
+            fn bucket_name() -> &'static str {
+                #name_str
+            }
         }
 
         #[derive(Debug)]
         pub struct #record_name {
+            global_scope: #scoped_record_name,
+        }
+
+        impl ankurah_core::model::Record for #record_name {
+            fn id(&self) -> ankurah_core::model::ID {
+                self.id
+            }
+
+            fn bucket_name() -> &'static str {
+                #name_str
+            }
+
+            fn edit(&self, trx: &Transaction) -> #scoped_record_name {
+                trx.edit::<#name>(self.id(), self.bucket_name())
+            }
+        }
+
+        impl #record_name {
+            #(
+                pub fn #field_names(&self) -> &<#field_active_values as ankurah_core::property::ProjectedValue>::Projected {
+                    let active = self.global_scope.#field_names()
+                    <#field_active_values as ankurah_core::property::ProjectedValue>::projected(&active)
+                }
+            )*
+        }
+
+        #[derive(Debug)]
+        pub struct #scoped_record_name {
             id: ankurah_core::model::ID,
             inner: std::sync::Arc<ankurah_core::model::RecordInner>,
             backends: ankurah_core::property::Backends,
 
             // Field projections
-            #(#field_names: #field_active_values,)*
+            #(pub #field_names: #field_active_values,)*
             // TODO: Add fields for tracking changes and operation count
         }
 
-        impl ankurah_core::model::Record for #record_name {
+        impl ankurah_core::model::ScopedRecord for #scoped_record_name {
             fn as_dyn_any(&self) -> &dyn std::any::Any {
                 self as &dyn std::any::Any
             }
@@ -118,7 +151,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl #record_name {
+        impl #scoped_record_name {
             pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
                 use ankurah_core::property::InitializeWith;
                 let id = node.next_id();
