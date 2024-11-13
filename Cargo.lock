@@ -54,6 +54,7 @@ dependencies = [
  "futures-signals",
  "serde",
  "sled",
+ "thiserror 2.0.3",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -913,7 +914,7 @@ dependencies = [
  "pin-project",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 1.0.64",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -1219,7 +1220,7 @@ dependencies = [
  "config",
  "regex",
  "serde",
- "thiserror",
+ "thiserror 1.0.64",
  "typed-builder",
 ]
 
@@ -1314,7 +1315,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "slotmap",
- "thiserror",
+ "thiserror 1.0.64",
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1333,7 +1334,7 @@ dependencies = [
  "leptos_reactive",
  "serde",
  "server_fn",
- "thiserror",
+ "thiserror 1.0.64",
  "tracing",
 ]
 
@@ -1492,7 +1493,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c51ebcefb2f0b9a5e0bea115532c8ae4215d1b01eff176d0f4ba4192895c2708"
 dependencies = [
  "serde",
- "thiserror",
+ "thiserror 1.0.64",
 ]
 
 [[package]]
@@ -1817,7 +1818,7 @@ checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
 dependencies = [
  "getrandom",
  "libredox",
- "thiserror",
+ "thiserror 1.0.64",
 ]
 
 [[package]]
@@ -1860,7 +1861,7 @@ dependencies = [
  "quote",
  "syn",
  "syn_derive",
- "thiserror",
+ "thiserror 1.0.64",
 ]
 
 [[package]]
@@ -1984,7 +1985,7 @@ checksum = "0431a35568651e363364210c91983c1da5eb29404d9f0928b67d4ebcfa7d330c"
 dependencies = [
  "percent-encoding",
  "serde",
- "thiserror",
+ "thiserror 1.0.64",
 ]
 
 [[package]]
@@ -2028,7 +2029,7 @@ dependencies = [
  "serde_json",
  "serde_qs",
  "server_fn_macro_default",
- "thiserror",
+ "thiserror 1.0.64",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -2158,9 +2159,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.79"
+version = "2.0.87"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89132cd0bf050864e1d38dc3bbc07a0eb8e7530af26344d3d2bbbef83499f590"
+checksum = "25aa4ce346d03a6dcd68dd8b4010bcb74e54e62c90c573f394c46eae99aba32d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2197,7 +2198,16 @@ version = "1.0.64"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d50af8abc119fb8bb6dbabcfa89656f46f84aa0ac7688088608076ad2b459a84"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.64",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c006c85c7651b3cf2ada4584faa36773bd07bac24acfb39f3c431b36d7e667aa"
+dependencies = [
+ "thiserror-impl 2.0.3",
 ]
 
 [[package]]
@@ -2205,6 +2215,17 @@ name = "thiserror-impl"
 version = "1.0.64"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08904e7672f5eb876eaaf87e0ce17857500934f4981c4a0ab2b4aa98baac7fc3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f077553d607adc1caf65430528a576c757a71ed73944b66ebb58ef2bbd243568"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2439,7 +2460,7 @@ dependencies = [
  "log",
  "rand",
  "sha1",
- "thiserror",
+ "thiserror 1.0.64",
  "utf-8",
 ]
 
@@ -2927,7 +2948,7 @@ dependencies = [
  "serde_json",
  "smallstr",
  "smallvec",
- "thiserror",
+ "thiserror 1.0.64",
 ]
 
 [[package]]

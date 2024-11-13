@@ -34,6 +34,9 @@ impl YrsString {
             backend: Arc::downgrade(&backend),
         }
     }
+    pub fn from_backends(property_name: &'static str, backends: &Backends) -> Self {
+        Self::new(property_name, backends.yrs.clone())
+    }
     pub fn backend(&self) -> Arc<YrsBackend> {
         self.backend
             .upgrade()

@@ -1,8 +1,8 @@
 // use futures_signals::signal::Signal;
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, sync::Arc, fmt};
 
-use crate::{storage::RecordState, Node};
+use crate::{error::RetrievalError, storage::RecordState, Node};
 
 use anyhow::Result;
 
@@ -11,9 +11,17 @@ use ulid::Ulid;
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 pub struct ID(pub Ulid);
 
+impl fmt::Display for ID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        self.0.fmt(f)
+    }
+}
+
 /// A model is a struct that represents the present values for a given record
 /// Schema is defined primarily by the Model object, and the Record is derived from that via macro.
-pub trait Model {}
+pub trait Model {
+    type Active: Record;
+}
 
 /// A specific instance of a record in the collection
 pub trait Record: Any + Send + Sync + 'static {
@@ -23,7 +31,7 @@ pub trait Record: Any + Send + Sync + 'static {
     fn from_record_state(
         id: ID,
         record_state: &RecordState,
-    ) -> Result<Self, crate::error::RetrievalError>
+    ) -> Result<Self, RetrievalError>
     where
         Self: Sized;
     fn commit_record(&self, node: Arc<Node>) -> Result<()>;

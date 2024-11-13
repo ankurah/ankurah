@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use ankurah_core::model::Record;
-use ankurah_core::property::value::StringValue;
+use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ID, node::Node};
 use ankurah_derive::Model;
@@ -16,7 +15,7 @@ pub struct Album {
     // Implication: we will still need to have a native type to active type lookup in the Model macro for now.
     // We have the option of adding override attributes to switch backends in the future.
     // We will initially only use Model structs for initial construction of the record (or a property group thereof) but we may later consider
-    // using them for per-propertygroup retrieival binding, but preferably only via an immutable borrow.
+    // using them for per-property group retrieval binding, but preferably only via an immutable borrow.
     #[active_value(YrsString)]
     name: String,
 }
