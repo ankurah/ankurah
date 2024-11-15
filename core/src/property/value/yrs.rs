@@ -48,7 +48,7 @@ impl YrsString {
     pub fn backend(&self) -> Arc<YrsBackend> {
         self.backend
             .upgrade()
-            .expect("Expected `Yrs` property backend to exist in `RecordInner`")
+            .expect("Expected `Yrs` property backend to exist")
     }
     pub fn value(&self) -> String {
         self.backend().get_string(self.property_name)

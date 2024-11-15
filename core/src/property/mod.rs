@@ -4,4 +4,4 @@ pub mod value;
 
 pub use backend::Backends;
 pub use traits::InitializeWith;
-pub use value::YrsString;
+pub use value::{YrsString, ProjectedValue};

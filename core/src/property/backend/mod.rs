@@ -3,7 +3,7 @@ use std::sync::Arc;
 pub mod yrs;
 pub use yrs::YrsBackend;
 
-use crate::{error::RetrievalError, model::RecordInner, storage::RecordState};
+use crate::{error::RetrievalError, storage::RecordState};
 
 use anyhow::Result;
 
@@ -17,15 +17,15 @@ pub struct Backends {
 }
 
 impl Backends {
-    pub fn new(inner: Arc<RecordInner>) -> Self {
-        let yrs = Arc::new(YrsBackend::new(inner.clone()));
+    pub fn new() -> Self {
+        let yrs = Arc::new(YrsBackend::new());
         Self {
             yrs,
         }
     }
 
-    pub fn from_state_buffers(inner: Arc<RecordInner>, record_state: &RecordState) -> Result<Self, RetrievalError> {
-        let yrs = Arc::new(YrsBackend::from_state_buffer(inner.clone(), &record_state.yrs_state_buffer)?);
+    pub fn from_state_buffers(record_state: &RecordState) -> Result<Self, RetrievalError> {
+        let yrs = Arc::new(YrsBackend::from_state_buffer(&record_state.yrs_state_buffer)?);
         Ok(Self {
             yrs,
         })

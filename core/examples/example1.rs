@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
-use ankurah_core::{model::ID, node::Node};
+use ankurah_core::{model::{ID, Record, ScopedRecord}, node::Node};
 use ankurah_derive::Model;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -106,17 +106,18 @@ async fn main() -> Result<()> {
 
         info!("Album created: {:?}", album);
         client.begin();
-        album.edit(trx).name().insert(12, "e");
+        let scoped_album = album.edit(&trx).unwrap(); 
+        scoped_album.name().insert(12, "e");
+        use ankurah_core::property::traits::StateSync;
+        let update = scoped_album.name().get_pending_update();
+        println!("Update length: {}", update.unwrap().len());
+        assert_eq!(scoped_album.name().value(), "The Dark Side of the Moon");
         trx.commit().unwrap();
 
         album
     };
 
-    assert_eq!(album.name.value(), "The Dark Side of the Moon");
-
-    use ankurah_core::property::traits::StateSync;
-    let update = album.name().get_pending_update();
-    println!("Update length: {}", update.unwrap().len());
+    assert_eq!(album.name(), "The Dark Side of the Moon");
 
     // should immediately have two operations - one for the initial insert, and one for the edit
     // assert_eq!(album.operation_count(), 2);

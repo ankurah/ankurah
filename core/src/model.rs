@@ -49,9 +49,3 @@ pub trait ScopedRecord: Any + Send + Sync + 'static {
     fn commit_record(&self, node: Arc<Node>) -> Result<()>;
     fn as_dyn_any(&self) -> &dyn Any;
 }
-
-#[derive(Debug)]
-pub struct RecordInner {
-    pub collection: &'static str,
-    pub id: ID,
-}

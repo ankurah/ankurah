@@ -66,27 +66,35 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         #[derive(Debug)]
         pub struct #record_name {
-            global_scope: #scoped_record_name,
+            scoped: #scoped_record_name,
         }
 
         impl ankurah_core::model::Record for #record_name {
             fn id(&self) -> ankurah_core::model::ID {
-                self.id
+                use ankurah_core::model::ScopedRecord;
+                self.scoped.id()
             }
 
             fn bucket_name() -> &'static str {
                 #name_str
             }
-
-            fn edit(&self, trx: &Transaction) -> #scoped_record_name {
-                trx.edit::<#name>(self.id(), self.bucket_name())
-            }
         }
 
         impl #record_name {
+            pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
+                Self {
+                    scoped: #scoped_record_name::new(node, model),
+                }
+            }
+
+            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<&'rec #scoped_record_name, ankurah_core::error::RetrievalError> {
+                use ankurah_core::model::Record;
+                trx.edit::<#name>(self.id())
+            }
+
             #(
-                pub fn #field_names(&self) -> &<#field_active_values as ankurah_core::property::ProjectedValue>::Projected {
-                    let active = self.global_scope.#field_names()
+                pub fn #field_names(&self) -> <#field_active_values as ankurah_core::property::ProjectedValue>::Projected {
+                    let active = self.scoped.#field_names();
                     <#field_active_values as ankurah_core::property::ProjectedValue>::projected(&active)
                 }
             )*
@@ -95,7 +103,6 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         #[derive(Debug)]
         pub struct #scoped_record_name {
             id: ankurah_core::model::ID,
-            inner: std::sync::Arc<ankurah_core::model::RecordInner>,
             backends: ankurah_core::property::Backends,
 
             // Field projections
@@ -112,7 +119,6 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self.id
             }
 
-            // I think we might not need inner.collection or ID. Might need new to return Arc<Self> though. Not sure.
             fn bucket_name(&self) -> &'static str {
                 #name_str
             }
@@ -128,18 +134,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             where
                 Self: Sized,
             {
-                let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
-                    collection: #name_str,
-                    id: id,
-                });
-
-                let backends = ankurah_core::property::Backends::from_state_buffers(inner.clone(), &record_state)?;
+                let backends = ankurah_core::property::Backends::from_state_buffers(&record_state)?;
                 #(
                     let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs, &backends);
                 )*
                 Ok(Self {
                     id: id,
-                    inner: inner,
                     backends: backends,
                     #( #field_names: #field_names_avoid_conflicts, )*
                 })
@@ -156,18 +156,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 use ankurah_core::property::InitializeWith;
                 let id = node.next_id();
 
-                let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
-                    collection: #name_str,
-                    id: id,
-                });
-
-                let backends = ankurah_core::property::Backends::new(inner.clone());
+                let backends = ankurah_core::property::Backends::new();
                 #(
                     let #field_names_avoid_conflicts = #field_active_values::initialize_with(&backends, #field_name_strs, model.#field_names);
                 )*
                 Self {
                     id: id,
-                    inner: inner,
                     backends: backends,
                     #( #field_names: #field_names_avoid_conflicts, )*
                 }

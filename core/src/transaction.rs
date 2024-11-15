@@ -1,9 +1,7 @@
-use std::{
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use crate::{
-    error::RetrievalError, model::{Record, RecordInner, ID, ScopedRecord}, Model, Node
+    error::RetrievalError, model::{ScopedRecord, ID}, Model, Node
 };
 
 use append_only_vec::AppendOnlyVec;
@@ -42,13 +40,13 @@ impl Transaction {
         }
     }
 
-    pub fn edit<A: Model>(
+    /// Fetch a record already in the transaction.
+    pub fn fetch_record_from_transaction<A: Model>(
         &self,
         id: ID,
-    ) -> Result<&A::ScopedRecord, crate::error::RetrievalError> {
+    ) -> Option<&A::ScopedRecord> {
         let bucket = A::bucket_name();
 
-        // check if its already in this transaction
         for record in self.records.iter() {
             // TODO: Optimize this.
             // It shouldn't be a problem until we have a LOT of records but still
@@ -56,21 +54,59 @@ impl Transaction {
             // Either that or use a different append-only structure that uses hashing.
             if record.id() == id && record.bucket_name() == bucket {
                 let upcast = record.as_dyn_any();
-                return Ok(upcast
+                return Some(upcast
                     .downcast_ref::<A::ScopedRecord>()
                     .expect("Expected correct downcast"));
             }
         }
 
-        // we don't already have this record, fetch it from the node
+        None
+    }
+
+    /// Fetch a record already in the transaction.
+    pub fn fetch_record_from_storage<A: Model>(
+        &self,
+        id: ID,
+    ) -> Result<A::ScopedRecord, RetrievalError> {
+        let bucket = A::bucket_name();
+
         let raw_bucket = self.node.bucket(bucket);
         let record_state = raw_bucket.0.get(id)?;
-        let base_record = <A::ScopedRecord>::from_record_state(id, &record_state)?;
-        let index = self.records.push(Box::new(base_record));
+        let scoped_record = <A::ScopedRecord>::from_record_state(id, &record_state)?;
+        return Ok(scoped_record)
+    }
+
+    /// Fetch a record.
+    pub fn fetch_record<A: Model>(
+        &self,
+        id: ID,
+    ) -> Result<&A::ScopedRecord, RetrievalError> {
+        if let Some(local) = self.fetch_record_from_transaction::<A>(id) {
+            return Ok(local)
+        }
+
+        let scoped_record = self.fetch_record_from_storage::<A>(id)?;
+        let index = self.records.push(Box::new(scoped_record));
         let upcast = self.records[index].as_dyn_any();
         Ok(upcast
             .downcast_ref::<A::ScopedRecord>()
             .expect("Expected correct downcast"))
+    }
+
+    /*pub fn create<A: Model>(
+        &self,
+        model: &A,
+    ) -> anyhow::Result<A::Record, RetrievalError> {
+        //A::Record::new
+        Ok(())
+    }*/
+
+    pub fn edit<A: Model>(
+        &self,
+        id: ID,
+    ) -> Result<&A::ScopedRecord, crate::error::RetrievalError> {
+        // TODO: should we automatically create the record if it doesn't exist already?
+        self.fetch_record::<A>(id)
     }
 
     #[must_use]

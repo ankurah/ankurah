@@ -1,50 +1,20 @@
-use std::sync::{Arc, Weak};
 
 use yrs::{
-    updates::{decoder::Decode, encoder::Encode},
+    updates::decoder::Decode,
     GetString, ReadTxn, Text, Transact,
 };
-
-use crate::model::RecordInner;
 
 /// Stores one or more properties of a record
 #[derive(Debug)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
-    // unnecessary? we probably shouldn't care about this here.
-    //
-    // The main usecase before was for recording operations, BUT
-    // I think this might be better to do on a per case basis and then
-    // accumulated later on.
-    record_inner: Weak<RecordInner>,
 }
 
 impl YrsBackend {
-    /// Create a [`YrsBackend`] without a [`RecordInner`].
-    pub(crate) fn inactive() -> Self {
+    pub fn new() -> Self {
         Self {
             doc: yrs::Doc::new(),
-            record_inner: Weak::default(),
         }
-    }
-
-    pub fn new(record_inner: Arc<RecordInner>) -> Self {
-        Self {
-            doc: yrs::Doc::new(),
-            record_inner: Arc::downgrade(&record_inner),
-        }
-    }
-
-    pub fn get_record_inner(&self) -> Option<Arc<RecordInner>> {
-        self.record_inner.upgrade()
-    }
-
-    /// Gets a reference to the inner record.
-    ///
-    /// # Panics if the inner record doesn't exist or was de-allocated.
-    pub fn record_inner(&self) -> Arc<RecordInner> {
-        self.get_record_inner()
-            .expect("Expected `RecordInner` to exist for `YrsBackend`")
     }
 
     pub fn to_state_buffer(&self) -> Vec<u8> {
@@ -57,7 +27,6 @@ impl YrsBackend {
     }
 
     pub fn from_state_buffer(
-        record_inner: Arc<RecordInner>,
         state_buffer: &Vec<u8>,
     ) -> std::result::Result<Self, crate::error::RetrievalError> {
         let doc = yrs::Doc::new();
@@ -72,7 +41,6 @@ impl YrsBackend {
 
         Ok(Self {
             doc: doc,
-            record_inner: Arc::downgrade(&record_inner),
         })
     }
 

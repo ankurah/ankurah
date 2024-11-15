@@ -2,11 +2,10 @@ use ulid::Ulid;
 
 use crate::{
     event::Operation,
-    model::{Model, Record, ID},
+    model::{Record, ID},
     storage::{Bucket, StorageEngine},
     transaction::Transaction,
 };
-use anyhow::Result;
 use std::{
     collections::BTreeMap,
     sync::{mpsc, Arc, RwLock},
