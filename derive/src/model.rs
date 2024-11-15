@@ -1,28 +1,14 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
-
-/// Map model field types to their corresponding value types
-fn get_value_type(ty: &Type) -> proc_macro2::TokenStream {
-    let type_str = quote!(#ty).to_string();
-    let value_type = match type_str.as_str() {
-        "String" => quote!(StringValue),
-        "i32" => quote!(IntValue),
-        "f64" => quote!(FloatValue),
-        "bool" => quote!(BoolValue),
-        // Add more mappings as needed
-        _ => quote!(ankurah_core::property::value::Value<#ty>), // Default to a generic Value type
-    };
-    quote!(ankurah_core::property::value::#value_type)
-}
+use syn::{parse_macro_input, Data, DeriveInput, Fields};
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
-
 pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident;
     let name_str = name.to_string().to_lowercase();
     let record_name = format_ident!("{}Record", name);
+    let scoped_record_name = format_ident!("{}ScopedRecord", name);
 
     let fields = match input.data {
         Data::Struct(ref data) => match data.fields {
@@ -32,7 +18,32 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         _ => panic!("Only structs are supported"),
     };
 
-    let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
+    let active_value_ident = format_ident!("active_value");
+    let field_active_values = fields
+        .iter()
+        .map(|f| {
+            let active_value = f.attrs.iter()
+                .find(|attr| attr.path().get_ident() == Some(&active_value_ident));
+            match active_value {
+                Some(active_value) => {
+                    active_value.parse_args::<syn::Ident>()
+                        .unwrap()
+                },
+                // TODO: Better error, should include which field ident and an example on how to use.
+                None => panic!("All fields need an active value attribute"),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let field_names = fields.iter().map(|f| {
+        &f.ident
+    }).collect::<Vec<_>>();
+    let field_names_avoid_conflicts = fields.iter().enumerate().map(|(index, f)| {
+        match &f.ident {
+            Some(ident) => format_ident!("field_{}", ident),
+            None => format_ident!("field_{}", index),
+        }
+    }).collect::<Vec<_>>();
     let field_name_strs = fields
         .iter()
         .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
@@ -44,28 +55,62 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
 
-    // Update this to use the get_value_type function
-    let field_value_types = fields
-        .iter()
-        .map(|f| get_value_type(&f.ty))
-        .collect::<Vec<_>>();
-
     let expanded: proc_macro::TokenStream = quote! {
-        impl ankurah_core::model::Model for #name {}
+        impl ankurah_core::model::Model for #name {
+            type Record = #record_name;
+            type ScopedRecord = #scoped_record_name;
+            fn bucket_name() -> &'static str {
+                #name_str
+            }
+        }
 
         #[derive(Debug)]
         pub struct #record_name {
-            id: ankurah_core::model::ID,
-            inner: std::sync::Arc<ankurah_core::model::RecordInner>,
-
-            yrs: std::sync::Arc<ankurah_core::property::backend::YrsBackend>,
-
-            // Field projections
-            #(#field_names: #field_value_types,)*
-            // TODO: Add fields for tracking changes and operation count
+            scoped: #scoped_record_name,
         }
 
         impl ankurah_core::model::Record for #record_name {
+            fn id(&self) -> ankurah_core::model::ID {
+                use ankurah_core::model::ScopedRecord;
+                self.scoped.id()
+            }
+
+            fn bucket_name() -> &'static str {
+                #name_str
+            }
+        }
+
+        impl #record_name {
+            pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
+                Self {
+                    scoped: #scoped_record_name::new(node, model),
+                }
+            }
+
+            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<&'rec #scoped_record_name, ankurah_core::error::RetrievalError> {
+                use ankurah_core::model::Record;
+                trx.edit::<#name>(self.id())
+            }
+
+            #(
+                pub fn #field_names(&self) -> <#field_active_values as ankurah_core::property::ProjectedValue>::Projected {
+                    let active = self.scoped.#field_names();
+                    <#field_active_values as ankurah_core::property::ProjectedValue>::projected(&active)
+                }
+            )*
+        }
+
+        #[derive(Debug)]
+        pub struct #scoped_record_name {
+            id: ankurah_core::model::ID,
+            backends: ankurah_core::property::Backends,
+
+            // Field projections
+            #(pub #field_names: #field_active_values,)*
+            // TODO: Add fields for tracking changes and operation count
+        }
+
+        impl ankurah_core::model::ScopedRecord for #scoped_record_name {
             fn as_dyn_any(&self) -> &dyn std::any::Any {
                 self as &dyn std::any::Any
             }
@@ -74,15 +119,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self.id
             }
 
-            // I think we might not need inner.collection or ID. Might need new to return Arc<Self> though. Not sure.
             fn bucket_name(&self) -> &'static str {
                 #name_str
             }
 
             fn record_state(&self) -> ankurah_core::storage::RecordState {
-                ankurah_core::storage::RecordState {
-                    yrs_state_buffer: self.yrs.to_state_buffer(),
-                }
+                ankurah_core::storage::RecordState::from_backends(&self.backends)
             }
 
             fn from_record_state(
@@ -92,55 +134,41 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             where
                 Self: Sized,
             {
-                let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
-                    collection: #name_str,
-                    id: id,
-                });
-
-                println!("yrs decode");
-                let yrs_backend = std::sync::Arc::new(ankurah_core::property::backend::YrsBackend::from_state_buffer(inner.clone(), &record_state.yrs_state_buffer)?);
-                println!("yrs worked");
+                let backends = ankurah_core::property::Backends::from_state_buffers(&record_state)?;
+                #(
+                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs, &backends);
+                )*
                 Ok(Self {
                     id: id,
-                    inner: inner,
-                    yrs: yrs_backend.clone(),
-                    // TODO: Support other backends than Yrs, right now its just hardcoded YrsBackend.
-                    #(
-                        #field_names: #field_value_types::new(#field_name_strs, yrs_backend.clone()),
-                    )*
+                    backends: backends,
+                    #( #field_names: #field_names_avoid_conflicts, )*
                 })
             }
 
-            fn commit_record(&self, node: std::sync::Arc<ankurah_core::Node>) -> Result<()> {
+            fn commit_record(&self, node: std::sync::Arc<ankurah_core::Node>) -> anyhow::Result<()> {
                 // TODO, throw this shit in the storage bucket it belongs to.
                 Ok(())
             }
         }
 
-        impl #record_name {
+        impl #scoped_record_name {
             pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
-                use ankurah_core::property::traits::InitializeWith;
+                use ankurah_core::property::InitializeWith;
                 let id = node.next_id();
 
-                let inner = std::sync::Arc::new(ankurah_core::model::RecordInner {
-                    collection: #name_str,
-                    id: id,
-                });
-
-                let yrs = std::sync::Arc::new(ankurah_core::property::backend::YrsBackend::new(inner.clone()));
-                let backends = ankurah_core::property::backend::Backends {
-                    yrs: yrs.clone(),
-                };
+                let backends = ankurah_core::property::Backends::new();
+                #(
+                    let #field_names_avoid_conflicts = #field_active_values::initialize_with(&backends, #field_name_strs, model.#field_names);
+                )*
                 Self {
                     id: id,
-                    inner: inner,
-                    yrs: yrs,
-                    #(#field_names: <#field_value_types>::initialize_with(&backends, #field_name_strs, model.#field_names),)*
+                    backends: backends,
+                    #( #field_names: #field_names_avoid_conflicts, )*
                 }
             }
 
             #(
-                pub fn #field_names(&self) -> &#field_value_types {
+                pub fn #field_names(&self) -> &#field_active_values {
                     &self.#field_names
                 }
             )*

@@ -8,12 +8,13 @@ use yrs::{
 };
 
 use crate::property::{
+    value::ProjectedValue,
     backend::{Backends, YrsBackend},
     traits::{InitializeWith, StateSync},
 };
 
 #[derive(Debug)]
-pub struct StringValue {
+pub struct YrsString {
     // ideally we'd store the yrs::TransactionMut in the Transaction as an ExtendableOp or something like that
     // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
@@ -23,8 +24,15 @@ pub struct StringValue {
     pub backend: Weak<YrsBackend>,
 }
 
+impl ProjectedValue for YrsString {
+    type Projected = String;
+    fn projected(&self) -> Self::Projected {
+        self.value()
+    }
+}
+
 // Starting with basic string type operations
-impl StringValue {
+impl YrsString {
     pub fn new(property_name: &'static str, backend: Arc<YrsBackend>) -> Self {
         let starting_state = backend.doc.transact().state_vector();
         Self {
@@ -34,10 +42,13 @@ impl StringValue {
             backend: Arc::downgrade(&backend),
         }
     }
+    pub fn from_backends(property_name: &'static str, backends: &Backends) -> Self {
+        Self::new(property_name, backends.yrs.clone())
+    }
     pub fn backend(&self) -> Arc<YrsBackend> {
         self.backend
             .upgrade()
-            .expect("Expected `Yrs` property backend to exist in `RecordInner`")
+            .expect("Expected `Yrs` property backend to exist")
     }
     pub fn value(&self) -> String {
         self.backend().get_string(self.property_name)
@@ -50,7 +61,7 @@ impl StringValue {
     }
 }
 
-impl InitializeWith<String> for StringValue {
+impl InitializeWith<String> for YrsString {
     fn initialize_with(backends: &Backends, property_name: &'static str, value: String) -> Self {
         let new_string = Self::new(property_name, backends.yrs.clone());
         new_string.insert(0, &value);
@@ -58,7 +69,8 @@ impl InitializeWith<String> for StringValue {
     }
 }
 
-impl StateSync for StringValue {
+// TODO: Figure out whether to remove this
+impl StateSync for YrsString {
     // These should really be on the YrsBackend I think
     /// Apply an update to the field from an event/operation
     fn apply_update(&self, update: &[u8]) -> Result<()> {

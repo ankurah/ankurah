@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
 
-use crate::model::ID;
+use crate::{model::ID, property::Backends};
 
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
@@ -18,6 +18,14 @@ pub trait StorageBucket: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordState {
     pub yrs_state_buffer: Vec<u8>,
+}
+
+impl RecordState {
+    pub fn from_backends(backends: &Backends) -> Self {
+        Self {
+            yrs_state_buffer: backends.yrs.to_state_buffer(),
+        }
+    }
 }
 
 pub struct SledStorageEngine {

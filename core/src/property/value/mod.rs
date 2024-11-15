@@ -1,2 +1,7 @@
-pub mod string;
-pub use string::StringValue;
+pub mod yrs;
+pub use yrs::YrsString;
+
+pub trait ProjectedValue {
+    type Projected;
+    fn projected(&self) -> Self::Projected;
+}

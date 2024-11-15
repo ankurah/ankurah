@@ -1,45 +1,20 @@
-use std::sync::{Arc, Weak};
 
 use yrs::{
-    updates::{decoder::Decode, encoder::Encode},
+    updates::decoder::Decode,
     GetString, ReadTxn, Text, Transact,
 };
-
-use crate::model::RecordInner;
 
 /// Stores one or more properties of a record
 #[derive(Debug)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
-    record_inner: Weak<RecordInner>,
 }
 
 impl YrsBackend {
-    /// Create a [`YrsBackend`] without a [`RecordInner`].
-    pub(crate) fn inactive() -> Self {
+    pub fn new() -> Self {
         Self {
             doc: yrs::Doc::new(),
-            record_inner: Weak::default(),
         }
-    }
-
-    pub fn new(record_inner: Arc<RecordInner>) -> Self {
-        Self {
-            doc: yrs::Doc::new(),
-            record_inner: Arc::downgrade(&record_inner),
-        }
-    }
-
-    pub fn get_record_inner(&self) -> Option<Arc<RecordInner>> {
-        self.record_inner.upgrade()
-    }
-
-    /// Gets a reference to the inner record.
-    ///
-    /// # Panics if the inner record doesn't exist or was de-allocated.
-    pub fn record_inner(&self) -> Arc<RecordInner> {
-        self.get_record_inner()
-            .expect("Expected `RecordInner` to exist for `YrsBackend`")
     }
 
     pub fn to_state_buffer(&self) -> Vec<u8> {
@@ -52,27 +27,20 @@ impl YrsBackend {
     }
 
     pub fn from_state_buffer(
-        record_inner: Arc<RecordInner>,
         state_buffer: &Vec<u8>,
     ) -> std::result::Result<Self, crate::error::RetrievalError> {
-        println!("state_buffer: {:?}", state_buffer);
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
-        println!("decoding");
         let update = yrs::Update::decode_v2(&state_buffer)
             .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
-        println!("applying");
         txn.apply_update(update)
             .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
         //let current_state = txn.state_vector();
-        println!("commit");
         txn.commit(); // I just don't trust `Drop` too much
-        println!("dropping");
         drop(txn);
 
         Ok(Self {
             doc: doc,
-            record_inner: Arc::downgrade(&record_inner),
         })
     }
 
