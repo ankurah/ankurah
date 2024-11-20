@@ -82,15 +82,17 @@ impl Node {
 
     /// Apply events to local state buffer and broadcast to subscribed peers.
     pub fn commit_events(&self, events: &Vec<RecordEvent>) -> anyhow::Result<()> {
+        println!("node.commit_events");
         for record_event in events {
             // Apply record events to the Node's global records first.
-            self.apply_record_event(record_event);
+            let record = self.fetch_record(record_event.id(), record_event.bucket_name())?;
+            record.apply_record_event(record_event)?;
 
-            // Then we push the state buffers based on the global records.
-            self.commit_record_to_storage(record_event.id(), record_event.bucket_name());
+            // Push the state buffers to storage.
+            self.bucket(record_event.bucket_name())
+                .set_record_state(record_event.id(), &record.to_record_state())?;
 
-            // Then we push the record events to subscribed peers.
-            self.broadcast_record_event(record_event);
+            // TODO: Push the record events to subscribed peers.
         }
 
         //events.iter().map(|event| self.apply_record_event(event));
@@ -100,6 +102,7 @@ impl Node {
 
     /// Apply the record event to our Node's record.
     pub fn apply_record_event(&self, event: &RecordEvent) -> anyhow::Result<()> {
+        println!("node.apply_record_event");
         // Create or grab an `Arc<Box<dyn ScopedRecord>>` for our record.
 
         // Thinking do I need a `&'static str -> Fn(|Arc<Box<dyn ScopedRecord>>| {})`
@@ -119,9 +122,12 @@ impl Node {
     }
 
     pub fn commit_record_to_storage(&self, id: ID, bucket_name: &'static str) -> anyhow::Result<()> {
+        println!("node.commit_record_to_storage");
         let record = self.fetch_record(id, bucket_name)?;
+        println!("node.commit_record_to_storage 2");
         self.bucket(bucket_name)
             .set_record_state(id, &record.to_record_state())?;
+        println!("node.commit_record_to_storage 3");
         Ok(())
     }
 
@@ -139,16 +145,20 @@ impl Node {
         &self,
         record: &Arc<ErasedRecord>,
     ) -> Result<(), RetrievalError> {
+        println!("node.add_record");
         // Assuming that we should propagate panics to the whole program.
         let mut records = self.records.write().unwrap();
 
         match records.entry((record.id(), record.bucket_name())) {
-            Entry::Occupied(_) => {
-                panic!("Attempted to add a `ScopedRecord` that already existed in the node");
+            Entry::Occupied(mut entry) => {
+                if entry.get().strong_count() == 0 {
+                    entry.insert(Arc::downgrade(record));
+                } else {
+                    panic!("Attempted to add a `ScopedRecord` that already existed in the node")
+                }
             }
             Entry::Vacant(entry) => {
-                let store_record = record.clone();
-                entry.insert(Arc::downgrade(&store_record));
+                entry.insert(Arc::downgrade(record));
             }
         }
 
@@ -160,28 +170,40 @@ impl Node {
         id: ID,
         bucket_name: &'static str,
     ) -> Option<Arc<ErasedRecord>> {
+        println!("node.fetch_record_from_node");
         let records = self.records.read().unwrap();
+        println!("node.fetch_record_from_node 2");
         if let Some(record) = records.get(&(id, bucket_name)) {
+        println!("node.fetch_record_from_node Some");
             record.upgrade()
         } else {
+        println!("node.fetch_record_from_node None");
             None
         }
     }
 
-    /// Grab the record state and create a new [`ErasedRecord`] based on that.
+    /// Grab the record state if it exists and create a new [`ErasedRecord`] based on that.
     pub(crate) fn fetch_record_from_storage(
         &self,
         id: ID,
         bucket_name: &'static str,
     ) -> Result<ErasedRecord, RetrievalError> {
-        let record_state = self.get_record_state(id, bucket_name)?;
-        let scoped_record = ErasedRecord::from_record_state(id, bucket_name, &record_state)?;
-        Ok(scoped_record)
+        match self.get_record_state(id, bucket_name) {
+            Ok(record_state) => {
+                ErasedRecord::from_record_state(id, bucket_name, &record_state)
+            }
+            Err(RetrievalError::NotFound(id)) => {
+                Ok(ErasedRecord::new(id, bucket_name))
+            }
+            Err(err) => Err(err)
+        }
     }
 
     /// Fetch a record.
     pub(crate) fn fetch_record(&self, id: ID, bucket_name: &'static str) -> Result<Arc<ErasedRecord>, RetrievalError> {
+        println!("node.fetch_record");
         if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
+            println!("node.fetch_record local");
             return Ok(local);
         }
 

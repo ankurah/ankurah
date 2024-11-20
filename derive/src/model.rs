@@ -133,20 +133,19 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self as &dyn std::any::Any
             }
 
-            fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync> {
-                self as Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync>
+            fn as_arc_dyn_any(self: std::sync::Arc<Self>) -> std::sync::Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync> {
+                self as std::sync::Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync>
             }
 
             fn from_backends(id: ankurah_core::ID, backends: ankurah_core::property::Backends) -> Self {
                 #(
                     let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs, &backends);
                 )*
-                Ok(Self {
+                Self {
                     id: id,
                     backends: backends,
                     #( #field_names: #field_names_avoid_conflicts, )*
-                })
-
+                }
             }
 
             fn id(&self) -> ankurah_core::ID {
@@ -164,17 +163,17 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn from_record_state(
                 id: ankurah_core::model::ID,
                 record_state: &ankurah_core::storage::RecordState,
-            ) -> std::result::Result<Self, ankurah_core::error::RetrievalError>
+            ) -> Result<Self, ankurah_core::error::RetrievalError>
             where
                 Self: Sized,
             {
                 let backends = ankurah_core::property::Backends::from_state_buffers(&record_state)?;
-                Self::from_backends(backends)
+                Ok(Self::from_backends(id, backends))
             }
 
             fn get_record_event(&self) -> Option<ankurah_core::property::backend::RecordEvent> {
                 use ankurah_core::property::backend::PropertyBackend;
-                let mut record_event = ankurah_core::property::backend::RecordEvent::new(self.id());
+                let mut record_event = ankurah_core::property::backend::RecordEvent::new(self.id(), self.bucket_name());
                 record_event.extend(
                     ankurah_core::property::backend::YrsBackend::property_backend_name(),
                     self.backends.yrs.to_operations(),
@@ -198,13 +197,13 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         impl<'a> Into<ankurah_core::ID> for &'a #record_name {
             fn into(self) -> ankurah_core::ID {
-                self.id()
+                ankurah_core::model::Record::id(self)
             }
         }
 
         impl<'a> Into<ankurah_core::ID> for &'a #scoped_record_name {
             fn into(self) -> ankurah_core::ID {
-                self.id()
+                ankurah_core::model::ScopedRecord::id(self)
             }
         }
     }

@@ -107,6 +107,7 @@ impl Transaction {
     #[must_use]
     // only because Drop is &mut self not mut self
     pub(crate) fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
+        println!("trx.commit_mut_ref");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
         let record_events = self

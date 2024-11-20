@@ -99,14 +99,6 @@ impl ErasedRecord {
         Ok(())
     }
 
-    pub fn commit_to_storage(&self, event: &RecordEvent) -> Result<()> {
-        for (backend_name, operations) in &event.operations {
-            self.backends.apply_operation(backend_name, operations)?;
-        }
-
-        Ok(())
-    }
-
     pub fn into_scoped_record<M: Model>(&self) -> M::ScopedRecord {
         <M::ScopedRecord as ScopedRecord>::from_backends(self.id(), self.backends.duplicate())
     }
@@ -127,7 +119,7 @@ pub trait ScopedRecord: Any + Send + Sync + 'static {
         Self: Sized;
 
     fn get_record_event(&self) -> Option<RecordEvent>;
-    fn apply_record_event(&self, record_event: &RecordEvent) -> Result<()>;
+    //fn apply_record_event(&self, record_event: &RecordEvent) -> Result<()>;
 
     fn as_dyn_any(&self) -> &dyn Any;
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;

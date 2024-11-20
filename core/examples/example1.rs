@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
         trx.commit().unwrap();
 
         let trx = client.begin();
-        //let album = trx.edit::<Album>(album_id).unwrap();
+        let album = trx.edit::<Album>(album_id).unwrap();
         //album
         1
     };
