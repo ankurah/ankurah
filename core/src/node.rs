@@ -1,20 +1,16 @@
-use append_only_vec::AppendOnlyVec;
-use bincode::config::WithOtherEndian;
 use ulid::Ulid;
 
 use crate::{
     error::RetrievalError,
     event::Operation,
-    model::{Record, ScopedRecord, ID},
-    property::backend::{Events, RecordEvent},
+    model::{ErasedRecord, ScopedRecord, ID},
+    property::backend::RecordEvent,
     storage::{Bucket, RecordState, StorageEngine},
     transaction::Transaction,
     Model,
 };
 use std::{
-    any::Any,
-    collections::BTreeMap,
-    ops::Deref,
+    collections::{btree_map::Entry, BTreeMap},
     sync::{mpsc, Arc, Mutex, RwLock, Weak},
 };
 
@@ -27,9 +23,10 @@ pub struct Node {
     // Storage for each collection
     collections: RwLock<BTreeMap<&'static str, Bucket>>,
 
-    // TODO: Something other than an a Mutex.
-    // We mostly need the mutex to clean up records we don't care about anymore.
-    records: Arc<Mutex<Vec<Weak<dyn ScopedRecord>>>>,
+    // TODO: Something other than an a Mutex/Rwlock?.
+    // We mostly need the mutable access to clean up records we don't care about anymore.
+    //records: Arc<RwLock<BTreeMap<(ID, &'static str), Weak<dyn ScopedRecord>>>>,
+    records: Arc<RwLock<BTreeMap<(ID, &'static str), Weak<ErasedRecord>>>>,
     // peer_connections: Vec<PeerConnection>,
 }
 
@@ -38,7 +35,7 @@ impl Node {
         Self {
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
-            records: Arc::new(Mutex::new(Vec::new())),
+            records: Arc::new(RwLock::new(BTreeMap::new())),
             // peer_connections: Vec::new(),
         }
     }
@@ -53,13 +50,6 @@ impl Node {
         //         peer.apply_operation(operation);
         //     }
         // });
-    }
-
-    pub fn collection<T: Record>(&self, name: &'static str) -> Collection<T> {
-        Collection {
-            bucket: self.bucket(name),
-            phantom: std::marker::PhantomData,
-        }
     }
 
     pub fn bucket(&self, name: &'static str) -> Bucket {
@@ -89,88 +79,114 @@ impl Node {
     }
 
     /// Apply events to local state buffer and broadcast to subscribed peers.
-    pub fn commit_events(&self, events: &Events) -> anyhow::Result<()> {
-        for record_event in &events.record_events {
-            //self.storage_engine.insert(record_event)
+    pub fn commit_events(&self, events: &Vec<RecordEvent>) -> anyhow::Result<()> {
+        for record_event in events {
+            // Apply record events to the Node's global records first.
+            self.apply_record_event(record_event);
+
+            // Then we push the state buffers based on the global records.
+            self.update_record_state_buffer(record_event.id(), record_event.bucket_name());
+
+            // Then we push the record events to subscribed peers.
+            self.broadcast_record_event(record_event);
         }
+
+        //events.iter().map(|event| self.apply_record_event(event));
+
         Ok(())
     }
 
-    pub fn empty_record_slot(&self) -> Option<usize> {
-        // Assuming that we should propagate panics to the whole program.
-        let records = self.records.lock().unwrap();
-        for (index, record) in records.iter().enumerate() {
-            if record.strong_count() == 0 {
-                return Some(index);
-            }
-        }
+    /// Apply the record event to our Node's record.
+    pub fn apply_record_event(&self, event: &RecordEvent) -> anyhow::Result<()> {
+        // Create or grab an `Arc<Box<dyn ScopedRecord>>` for our record.
 
-        None
+        // Thinking do I need a `&'static str -> Fn(|Arc<Box<dyn ScopedRecord>>| {})`
+        // for this...?
+        // I don't think that'll work since you'd need to register it beforehand or have
+        // some piece of code run with an explicit model first.
+        // Then again we don't really need to update it if it doesn't exist already.
+
+        // Fetch the global shared record if it exists.
+        // We need to lock the records for the duration of the applying otherwise we might
+        // end up with a difference between our storage engine and the node's local record.
+
+        let records = self.records.read().unwrap();
+        let Some(record) = self.fetch_record_from_node_erased(event.id(), event.bucket_name()) else {
+            return Ok(());
+        };
+        record.apply_record_event(event)
     }
 
-    pub fn apply_record_event(&self, event: RecordEvent) {}
+    pub fn update_record_state_buffer(&self, id: ID, bucket_name: &'static str) {
+        // TODO
+    }
 
-    pub fn get_record_state<A: Model>(&self, id: ID) -> Result<RecordState, RetrievalError> {
-        let bucket = A::bucket_name();
-        let raw_bucket = self.bucket(bucket);
+    pub fn broadcast_record_event(&self, event: &RecordEvent) {
+        // TODO
+    }
+
+    pub fn get_record_state(&self, id: ID, bucket_name: &'static str) -> Result<RecordState, RetrievalError> {
+        let raw_bucket = self.bucket(bucket_name);
         raw_bucket.0.get_record_state(id)
     }
 
     // ----  Node record management ----
-    pub fn add_record<M: Model>(
+    pub(crate) fn add_record<M: Model>(
         &self,
-        record: M::ScopedRecord,
-    ) -> Result<Arc<M::ScopedRecord>, RetrievalError> {
+        record: &Arc<M::ScopedRecord>,
+    ) -> Result<(), RetrievalError> {
         // Assuming that we should propagate panics to the whole program.
-        let mut records = self.records.lock().unwrap();
+        let mut records = self.records.write().unwrap();
 
-        let mut empty_index = None;
-        for (index, record) in records.iter().enumerate() {
-            if record.strong_count() == 0 {
-                empty_index = Some(index);
+        match records.entry((record.id(), record.bucket_name())) {
+            Entry::Occupied(_) => {
+                panic!("Attempted to add a `ScopedRecord` that already existed in the node");
+            }
+            Entry::Vacant(entry) => {
+                let store_record = record.clone() as Arc<dyn ScopedRecord>;
+                entry.insert(Arc::downgrade(&store_record));
             }
         }
 
-        let return_record = Arc::new(record);
-        let scoped_record = return_record.clone() as Arc<dyn ScopedRecord>;
-        match empty_index {
-            Some(empty_index) => {
-                records[empty_index] = Arc::downgrade(&scoped_record);
-            }
-            None => {
-                records.push(Arc::downgrade(&scoped_record));
-            }
-        }
+        Ok(())
+    }
 
-        Ok(return_record)
+    pub fn fetch_record_from_node_erased(
+        &self,
+        id: ID,
+        bucket_name: &'static str,
+    ) -> Option<Arc<dyn ScopedRecord>> {
+        let records = self.records.read().unwrap();
+        if let Some(record) = records.get(&(id, bucket_name)) {
+            record.upgrade()
+        } else {
+            None
+        }
     }
 
     pub fn fetch_record_from_node<A: Model>(&self, id: ID) -> Option<Arc<A::ScopedRecord>> {
-        let bucket = A::bucket_name();
-
         // Assuming that we should propagate panics to the whole program.
-        let records = self.records.lock().unwrap();
-        for record in records.iter() {
+        let records = self.records.read().unwrap();
+        if let Some(record) = records.get(&(id, A::bucket_name())) {
             if let Some(record) = record.upgrade() {
-                if record.id() == id && record.bucket_name() == bucket {
-                    let upcast = record.as_arc_dyn_any();
-                    return Some(
-                        upcast
-                            .downcast::<A::ScopedRecord>()
-                            .expect("Expected correct downcast"),
-                    );
-                }
+                let upcast = record.as_arc_dyn_any();
+                return Some(
+                    upcast
+                        .downcast::<A::ScopedRecord>()
+                        .expect("Expected correct downcast"),
+                );
             }
         }
 
         None
     }
 
+    /// Grab the record state and create a new [`ScopedRecord`] based on that.
     pub fn fetch_record_from_storage<A: Model>(
         &self,
         id: ID,
     ) -> Result<A::ScopedRecord, RetrievalError> {
-        let record_state = self.get_record_state::<A>(id)?;
+        let record_state = self.get_record_state(id, A::bucket_name())?;
         let scoped_record = <A::ScopedRecord>::from_record_state(id, &record_state)?;
         Ok(scoped_record)
     }
@@ -182,15 +198,10 @@ impl Node {
         }
 
         let scoped_record = self.fetch_record_from_storage::<A>(id)?;
-        self.add_record::<A>(scoped_record)
+        let ref_record = Arc::new(scoped_record);
+        self.add_record::<A>(&ref_record)?;
+        Ok(ref_record)
     }
-}
-
-/// Handle to a collection of records of the same type
-/// Able to construct records of type `T`
-pub struct Collection<T: Record> {
-    bucket: Bucket,
-    phantom: std::marker::PhantomData<T>,
 }
 
 pub struct PeerConnection {

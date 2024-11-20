@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::{
     error::RetrievalError,
     model::{ScopedRecord, ID},
-    property::backend::Events,
     Model, Node,
 };
 
@@ -111,15 +110,10 @@ impl Transaction {
         let record_events = self
             .records
             .iter()
-            .filter_map(|record| record.get_record_event());
-        let events = Events {
-            record_events: record_events.collect(),
-        };
+            .filter_map(|record| record.get_record_event())
+            .collect::<Vec<_>>();
 
-        /*
-        node.commit_events(events)?;
-        */
-        Ok(())
+        self.node.commit_events(&record_events)
     }
 
     pub fn rollback(mut self) {

@@ -99,7 +99,7 @@ impl PropertyBackend for YrsBackend {
         operations
     }
 
-    fn apply_operations(&self, operations: Vec<Operation>) -> anyhow::Result<()> {
+    fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()> {
         for operation in operations {
             self.apply_update(&operation.diff)?;
         }

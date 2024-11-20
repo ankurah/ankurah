@@ -26,33 +26,31 @@ pub trait PropertyBackend {
     /// Retrieve operations applied to this backend since the last time we called this method.
     // TODO: Should this take a precursor id?
     fn to_operations(&self /*precursor: ULID*/) -> Vec<Operation>;
-    fn apply_operations(&self, operations: Vec<Operation>) -> anyhow::Result<()>;
-}
-
-pub struct Events {
-    pub record_events: Vec<RecordEvent>,
-}
-
-impl Events {
-    pub fn new() -> Self {
-        Self {
-            record_events: Vec::new(),
-        }
-    }
+    fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()>;
 }
 
 #[derive(Debug)]
 pub struct RecordEvent {
     pub id: ID,
+    pub bucket_name: &'static str,
     pub operations: BTreeMap<&'static str, Vec<Operation>>,
 }
 
 impl RecordEvent {
-    pub fn new(id: ID) -> Self {
+    pub fn new(id: ID, bucket_name: &'static str) -> Self {
         Self {
             id: id,
+            bucket_name: bucket_name,
             operations: BTreeMap::default(),
         }
+    }
+
+    pub fn id(&self) -> ID {
+        self.id
+    }
+
+    pub fn bucket_name(&self) -> &'static str {
+        self.bucket_name
     }
 
     pub fn is_empty(&self) -> bool {
@@ -120,5 +118,12 @@ impl Backends {
             &record_state.yrs_state_buffer,
         )?);
         Ok(Self { yrs })
+    }
+
+    pub fn apply_operation(&self, backend_name: &'static str, operations: &Vec<Operation>) -> Result<()> {
+        match backend_name {
+            "yrs" => self.yrs.apply_operations(operations),
+            _ => Ok(()),
+        }
     }
 }
