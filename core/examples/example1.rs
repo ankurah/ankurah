@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
-use ankurah_core::{model::{ID, Record, ScopedRecord}, node::Node};
+use ankurah_core::{
+    model::{Record, ScopedRecord, ID},
+    node::Node,
+};
 use ankurah_derive::Model;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -100,18 +103,21 @@ async fn main() -> Result<()> {
         let album = trx.create(&Album {
             name: "The Dark Sid of the Moon".into(),
         });
-        let album_id = album.id();
         info!("Album created: {:?}", album);
 
         album.name().insert(12, "e");
-        use ankurah_core::property::traits::StateSync;
-        let update = album.name().get_pending_update();
-        println!("Update length: {}", update.unwrap().len());
+        let record_event = album.get_record_event();
+        println!("Record event: {:?}", record_event);
         assert_eq!(album.name().value(), "The Dark Side of the Moon");
+
+        let album_id = album.id();
+        let from_scoped_album = trx.edit::<Album>(album).unwrap();
+        let from_id = trx.edit::<Album>(album_id).unwrap();
+
         trx.commit().unwrap();
 
         let trx = client.begin();
-        let album = trx.edit::<Album>(album_id).unwrap();
+        //let album = trx.edit::<Album>(album_id).unwrap();
         //album
         1
     };

@@ -22,28 +22,27 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let field_active_values = fields
         .iter()
         .map(|f| {
-            let active_value = f.attrs.iter()
+            let active_value = f
+                .attrs
+                .iter()
                 .find(|attr| attr.path().get_ident() == Some(&active_value_ident));
             match active_value {
-                Some(active_value) => {
-                    active_value.parse_args::<syn::Ident>()
-                        .unwrap()
-                },
+                Some(active_value) => active_value.parse_args::<syn::Ident>().unwrap(),
                 // TODO: Better error, should include which field ident and an example on how to use.
                 None => panic!("All fields need an active value attribute"),
             }
         })
         .collect::<Vec<_>>();
 
-    let field_names = fields.iter().map(|f| {
-        &f.ident
-    }).collect::<Vec<_>>();
-    let field_names_avoid_conflicts = fields.iter().enumerate().map(|(index, f)| {
-        match &f.ident {
+    let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
+    let field_names_avoid_conflicts = fields
+        .iter()
+        .enumerate()
+        .map(|(index, f)| match &f.ident {
             Some(ident) => format_ident!("field_{}", ident),
             None => format_ident!("field_{}", index),
-        }
-    }).collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
     let field_name_strs = fields
         .iter()
         .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
@@ -134,6 +133,10 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self as &dyn std::any::Any
             }
 
+            fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync> {
+                self as Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync>
+            }
+
             fn id(&self) -> ankurah_core::model::ID {
                 self.id
             }
@@ -164,9 +167,19 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 })
             }
 
-            fn commit_record(&self, node: std::sync::Arc<ankurah_core::Node>) -> anyhow::Result<()> {
-                // TODO, throw this shit in the storage bucket it belongs to.
-                Ok(())
+            fn get_record_event(&self) -> Option<ankurah_core::property::backend::RecordEvent> {
+                use ankurah_core::property::backend::PropertyBackend;
+                let mut record_event = ankurah_core::property::backend::RecordEvent::new(self.id());
+                record_event.extend(
+                    ankurah_core::property::backend::YrsBackend::property_backend_name(),
+                    self.backends.yrs.to_operations(),
+                );
+
+                if record_event.is_empty() {
+                    None
+                } else {
+                    Some(record_event)
+                }
             }
         }
 
@@ -176,6 +189,18 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                     &self.#field_names
                 }
             )*
+        }
+
+        impl<'a> Into<ankurah_core::ID> for &'a #record_name {
+            fn into(self) -> ankurah_core::ID {
+                self.id()
+            }
+        }
+
+        impl<'a> Into<ankurah_core::ID> for &'a #scoped_record_name {
+            fn into(self) -> ankurah_core::ID {
+                self.id()
+            }
         }
     }
     .into();

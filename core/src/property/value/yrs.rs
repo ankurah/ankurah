@@ -8,9 +8,9 @@ use yrs::{
 };
 
 use crate::property::{
-    value::ProjectedValue,
     backend::{Backends, YrsBackend},
     traits::{InitializeWith, StateSync},
+    value::ProjectedValue,
 };
 
 #[derive(Debug)]
@@ -19,8 +19,6 @@ pub struct YrsString {
     // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
     pub property_name: &'static str,
-    previous_state: Arc<Mutex<StateVector>>,
-
     pub backend: Weak<YrsBackend>,
 }
 
@@ -34,11 +32,8 @@ impl ProjectedValue for YrsString {
 // Starting with basic string type operations
 impl YrsString {
     pub fn new(property_name: &'static str, backend: Arc<YrsBackend>) -> Self {
-        let starting_state = backend.doc.transact().state_vector();
         Self {
             property_name,
-            previous_state: Arc::new(Mutex::new(starting_state)),
-
             backend: Arc::downgrade(&backend),
         }
     }
@@ -70,6 +65,7 @@ impl InitializeWith<String> for YrsString {
 }
 
 // TODO: Figure out whether to remove this
+/*
 impl StateSync for YrsString {
     // These should really be on the YrsBackend I think
     /// Apply an update to the field from an event/operation
@@ -105,3 +101,4 @@ impl StateSync for YrsString {
         }
     }
 }
+*/

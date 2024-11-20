@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
-    error::RetrievalError, model::{Record, ScopedRecord, ID}, Model, Node
+    error::RetrievalError,
+    model::{ScopedRecord, ID},
+    property::backend::Events,
+    Model, Node,
 };
 
 use append_only_vec::AppendOnlyVec;
@@ -41,10 +44,7 @@ impl Transaction {
     }
 
     /// Fetch a record already in the transaction.
-    pub fn fetch_record_from_transaction<A: Model>(
-        &self,
-        id: ID,
-    ) -> Option<&A::ScopedRecord> {
+    pub fn fetch_record_from_transaction<A: Model>(&self, id: ID) -> Option<&A::ScopedRecord> {
         let bucket = A::bucket_name();
 
         for record in self.records.iter() {
@@ -54,45 +54,28 @@ impl Transaction {
             // Either that or use a different append-only structure that uses hashing.
             if record.id() == id && record.bucket_name() == bucket {
                 let upcast = record.as_dyn_any();
-                return Some(upcast
-                    .downcast_ref::<A::ScopedRecord>()
-                    .expect("Expected correct downcast"));
+                return Some(
+                    upcast
+                        .downcast_ref::<A::ScopedRecord>()
+                        .expect("Expected correct downcast"),
+                );
             }
         }
 
         None
     }
 
-    /// Fetch a record already in the transaction.
-    pub fn fetch_record_from_storage<A: Model>(
-        &self,
-        id: ID,
-    ) -> Result<A::ScopedRecord, RetrievalError> {
-        let bucket = A::bucket_name();
-
-        let raw_bucket = self.node.bucket(bucket);
-        let record_state = raw_bucket.0.get(id)?;
-        let scoped_record = <A::ScopedRecord>::from_record_state(id, &record_state)?;
-        return Ok(scoped_record)
-    }
-
     /// Fetch a record.
-    pub fn fetch_record<A: Model>(
-        &self,
-        id: ID,
-    ) -> Result<&A::ScopedRecord, RetrievalError> {
+    pub fn fetch_record<A: Model>(&self, id: ID) -> Result<&A::ScopedRecord, RetrievalError> {
         if let Some(local) = self.fetch_record_from_transaction::<A>(id) {
-            return Ok(local)
+            return Ok(local);
         }
 
-        let scoped_record = self.fetch_record_from_storage::<A>(id)?;
+        let scoped_record = self.node.fetch_record_from_storage::<A>(id)?;
         Ok(self.add_record::<A>(scoped_record))
     }
-    
-    pub fn add_record<M: Model>(
-        &self,
-        record: M::ScopedRecord,
-    ) -> &M::ScopedRecord {
+
+    pub fn add_record<M: Model>(&self, record: M::ScopedRecord) -> &M::ScopedRecord {
         let index = self.records.push(Box::new(record));
         let upcast = self.records[index].as_dyn_any();
         upcast
@@ -100,10 +83,7 @@ impl Transaction {
             .expect("Expected correct downcast")
     }
 
-    pub fn create<M: Model>(
-        &self,
-        model: &M,
-    ) -> &M::ScopedRecord {
+    pub fn create<M: Model>(&self, model: &M) -> &M::ScopedRecord {
         let id = self.node.next_id();
         let new_record = <M as Model>::new_scoped_record(id, model);
         let record_ref = self.add_record::<M>(new_record);
@@ -112,8 +92,9 @@ impl Transaction {
 
     pub fn edit<M: Model>(
         &self,
-        id: ID,
+        id: impl Into<ID>,
     ) -> Result<&M::ScopedRecord, crate::error::RetrievalError> {
+        let id = id.into();
         self.fetch_record::<M>(id)
     }
 
@@ -127,9 +108,17 @@ impl Transaction {
     pub(crate) fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
-        for record in self.records.iter() {
-            record.commit_record(self.node.clone())?;
-        }
+        let record_events = self
+            .records
+            .iter()
+            .filter_map(|record| record.get_record_event());
+        let events = Events {
+            record_events: record_events.collect(),
+        };
+
+        /*
+        node.commit_events(events)?;
+        */
         Ok(())
     }
 
@@ -142,7 +131,7 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         if self.implicit && !self.consumed {
             match self.commit_mut_ref() {
-                Ok(()) => {},
+                Ok(()) => {}
                 // Probably shouldn't panic here, but for testing purposes whatever.
                 Err(err) => panic!("Failed to commit: {:?}", err),
             }

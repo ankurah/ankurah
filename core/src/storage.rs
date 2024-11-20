@@ -3,7 +3,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
 
-use crate::{model::ID, property::Backends};
+use crate::{
+    model::ID,
+    property::{backend::RecordEvent, Backends},
+};
 
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
@@ -11,8 +14,12 @@ pub trait StorageEngine: Send + Sync {
 }
 
 pub trait StorageBucket: Send + Sync {
-    fn set_state(&self, id: ID, state: RecordState) -> anyhow::Result<()>;
-    fn get(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError>;
+    fn set_record_state(&self, id: ID, state: &RecordState) -> anyhow::Result<()>;
+    fn get_record_state(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError>;
+
+    // TODO:
+    // fn add_record_event(&self, record_event: &RecordEvent) -> anyhow::Result<()>;
+    // fn get_record_events(&self, id: ID) -> Result<Vec<RecordEvent>, crate::error::RetrievalError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,9 +29,7 @@ pub struct RecordState {
 
 impl RecordState {
     pub fn from_backends(backends: &Backends) -> Self {
-        Self {
-            yrs_state_buffer: backends.yrs.to_state_buffer(),
-        }
+        backends.to_state_buffers()
     }
 }
 
@@ -76,12 +81,12 @@ impl SledStorageBucket {
 }
 
 impl StorageBucket for SledStorageBucket {
-    fn set_state(&self, id: ID, state: RecordState) -> anyhow::Result<()> {
-        let binary_state = bincode::serialize(&state)?;
+    fn set_record_state(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+        let binary_state = bincode::serialize(state)?;
         self.tree.insert(id.0.to_bytes(), binary_state)?;
         Ok(())
     }
-    fn get(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
+    fn get_record_state(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
         match self
             .tree
             .get(id.0.to_bytes())

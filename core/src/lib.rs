@@ -6,7 +6,7 @@ pub mod property;
 pub mod storage;
 pub mod transaction;
 
-pub use model::Model;
+pub use model::{Model, ID};
 pub use node::Node;
 #[cfg(feature = "derive")]
 extern crate ankurah_derive;

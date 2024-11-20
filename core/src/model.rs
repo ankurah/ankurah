@@ -1,8 +1,8 @@
 // use futures_signals::signal::Signal;
 
-use std::{any::Any, sync::Arc, fmt};
+use std::{any::Any, fmt, sync::Arc};
 
-use crate::{error::RetrievalError, storage::RecordState, Node};
+use crate::{error::RetrievalError, property::backend::RecordEvent, storage::RecordState, Node};
 
 use anyhow::Result;
 
@@ -17,13 +17,19 @@ impl fmt::Display for ID {
     }
 }
 
+impl AsRef<ID> for ID {
+    fn as_ref(&self) -> &ID {
+        &self
+    }
+}
+
 /// A model is a struct that represents the present values for a given record
 /// Schema is defined primarily by the Model object, and the Record is derived from that via macro.
 pub trait Model {
     type Record: Record;
     type ScopedRecord: ScopedRecord;
     fn bucket_name() -> &'static str
-    where 
+    where
         Self: Sized;
     fn new_scoped_record(id: ID, model: &Self) -> Self::ScopedRecord;
     //fn property(property_name: &'static str) -> Box<dyn Any>;
@@ -43,12 +49,10 @@ pub trait ScopedRecord: Any + Send + Sync + 'static {
     fn id(&self) -> ID;
     fn bucket_name(&self) -> &'static str;
     fn record_state(&self) -> RecordState;
-    fn from_record_state(
-        id: ID,
-        record_state: &RecordState,
-    ) -> Result<Self, RetrievalError>
+    fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self, RetrievalError>
     where
         Self: Sized;
-    fn commit_record(&self, node: Arc<Node>) -> Result<()>;
+    fn get_record_event(&self) -> Option<RecordEvent>;
     fn as_dyn_any(&self) -> &dyn Any;
+    fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }
