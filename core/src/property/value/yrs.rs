@@ -62,7 +62,7 @@ impl YrsString {
 }
 
 impl InitializeWith<String> for YrsString {
-    fn initialize_with(backends: &Backends, property_name: &'static str, value: String) -> Self {
+    fn initialize_with(backends: &Backends, property_name: &'static str, value: &String) -> Self {
         let new_string = Self::new(property_name, backends.yrs.clone());
         new_string.insert(0, &value);
         new_string

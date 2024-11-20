@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    error::RetrievalError, model::{ScopedRecord, ID}, Model, Node
+    error::RetrievalError, model::{Record, ScopedRecord, ID}, Model, Node
 };
 
 use append_only_vec::AppendOnlyVec;
@@ -86,27 +86,35 @@ impl Transaction {
         }
 
         let scoped_record = self.fetch_record_from_storage::<A>(id)?;
-        let index = self.records.push(Box::new(scoped_record));
+        Ok(self.add_record::<A>(scoped_record))
+    }
+    
+    pub fn add_record<M: Model>(
+        &self,
+        record: M::ScopedRecord,
+    ) -> &M::ScopedRecord {
+        let index = self.records.push(Box::new(record));
         let upcast = self.records[index].as_dyn_any();
-        Ok(upcast
-            .downcast_ref::<A::ScopedRecord>()
-            .expect("Expected correct downcast"))
+        upcast
+            .downcast_ref::<M::ScopedRecord>()
+            .expect("Expected correct downcast")
     }
 
-    /*pub fn create<A: Model>(
+    pub fn create<M: Model>(
         &self,
-        model: &A,
-    ) -> anyhow::Result<A::Record, RetrievalError> {
-        //A::Record::new
-        Ok(())
-    }*/
+        model: &M,
+    ) -> &M::ScopedRecord {
+        let id = self.node.next_id();
+        let new_record = <M as Model>::new_scoped_record(id, model);
+        let record_ref = self.add_record::<M>(new_record);
+        record_ref
+    }
 
-    pub fn edit<A: Model>(
+    pub fn edit<M: Model>(
         &self,
         id: ID,
-    ) -> Result<&A::ScopedRecord, crate::error::RetrievalError> {
-        // TODO: should we automatically create the record if it doesn't exist already?
-        self.fetch_record::<A>(id)
+    ) -> Result<&M::ScopedRecord, crate::error::RetrievalError> {
+        self.fetch_record::<M>(id)
     }
 
     #[must_use]

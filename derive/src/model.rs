@@ -62,6 +62,19 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn bucket_name() -> &'static str {
                 #name_str
             }
+            fn new_scoped_record(id: ankurah_core::model::ID, model: &Self) -> Self::ScopedRecord {
+                use ankurah_core::property::InitializeWith;
+
+                let backends = ankurah_core::property::Backends::new();
+                #(
+                    let #field_names_avoid_conflicts = #field_active_values::initialize_with(&backends, #field_name_strs, &model.#field_names);
+                )*
+                #scoped_record_name {
+                    id: id,
+                    backends: backends,
+                    #( #field_names: #field_names_avoid_conflicts, )*
+                }
+            }
         }
 
         #[derive(Debug)]
@@ -70,20 +83,26 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         }
 
         impl ankurah_core::model::Record for #record_name {
+            type Model = #name;
+            type ScopedRecord = #scoped_record_name;
+
             fn id(&self) -> ankurah_core::model::ID {
                 use ankurah_core::model::ScopedRecord;
                 self.scoped.id()
             }
 
-            fn bucket_name() -> &'static str {
-                #name_str
+            fn to_model(&self) -> Self::Model {
+                #name {
+                    #( #field_names: self.#field_names(), )*
+                }
             }
         }
 
         impl #record_name {
-            pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
+            pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: &#name) -> Self {
+                let next_id = node.next_id();
                 Self {
-                    scoped: #scoped_record_name::new(node, model),
+                    scoped: <#name as ankurah_core::Model>::new_scoped_record(next_id, model),
                 }
             }
 
@@ -152,21 +171,6 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         }
 
         impl #scoped_record_name {
-            pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: #name) -> Self {
-                use ankurah_core::property::InitializeWith;
-                let id = node.next_id();
-
-                let backends = ankurah_core::property::Backends::new();
-                #(
-                    let #field_names_avoid_conflicts = #field_active_values::initialize_with(&backends, #field_name_strs, model.#field_names);
-                )*
-                Self {
-                    id: id,
-                    backends: backends,
-                    #( #field_names: #field_names_avoid_conflicts, )*
-                }
-            }
-
             #(
                 pub fn #field_names(&self) -> &#field_active_values {
                     &self.#field_names

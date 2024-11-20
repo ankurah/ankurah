@@ -25,14 +25,17 @@ pub trait Model {
     fn bucket_name() -> &'static str
     where 
         Self: Sized;
+    fn new_scoped_record(id: ID, model: &Self) -> Self::ScopedRecord;
+    //fn property(property_name: &'static str) -> Box<dyn Any>;
 }
 
 /// An instance of a record.
 pub trait Record {
+    type Model: Model;
+    type ScopedRecord: ScopedRecord;
     fn id(&self) -> ID;
-    fn bucket_name() -> &'static str
-    where
-        Self: Sized;
+    fn to_model(&self) -> Self::Model;
+    //fn property(property_name: &'static str) -> Box<dyn Any>;
 }
 
 /// An editable instance of a record.

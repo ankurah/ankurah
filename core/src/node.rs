@@ -1,14 +1,14 @@
+use append_only_vec::AppendOnlyVec;
 use ulid::Ulid;
 
 use crate::{
     event::Operation,
-    model::{Record, ID},
+    model::{Record, ScopedRecord, ID},
     storage::{Bucket, StorageEngine},
     transaction::Transaction,
 };
 use std::{
-    collections::BTreeMap,
-    sync::{mpsc, Arc, RwLock},
+    collections::BTreeMap, sync::{mpsc, Arc, RwLock, Weak}
 };
 
 /// Manager for all records and their properties on this client.
@@ -19,6 +19,7 @@ pub struct Node {
     storage_engine: Box<dyn StorageEngine>,
     // Storage for each collection
     collections: RwLock<BTreeMap<&'static str, Bucket>>,
+    records: AppendOnlyVec<Weak<Box<dyn ScopedRecord>>>
     // peer_connections: Vec<PeerConnection>,
 }
 
@@ -27,6 +28,7 @@ impl Node {
         Self {
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
+            records: AppendOnlyVec::new(),
             // peer_connections: Vec::new(),
         }
     }

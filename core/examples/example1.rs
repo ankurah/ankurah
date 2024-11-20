@@ -73,14 +73,6 @@ async fn main() -> Result<()> {
     //     name: "The Dark Sid of the Moon",
     // };
     let album = {
-        let trx = client.begin();
-        let album = AlbumRecord::new(
-            &client,
-            Album {
-                name: "The Dark Sid of the Moon".into(),
-            },
-        );
-
         // let album = AlbumRecord::build(&client).with(Album {
         //     name: "The Dark Sid of the Moon".to_string(),
         // }).insert();
@@ -104,20 +96,27 @@ async fn main() -> Result<()> {
         // Downsides:
         // *
 
+        let trx = client.begin();
+        let album = trx.create(&Album {
+            name: "The Dark Sid of the Moon".into(),
+        });
+        let album_id = album.id();
         info!("Album created: {:?}", album);
-        client.begin();
-        let scoped_album = album.edit(&trx).unwrap(); 
-        scoped_album.name().insert(12, "e");
+
+        album.name().insert(12, "e");
         use ankurah_core::property::traits::StateSync;
-        let update = scoped_album.name().get_pending_update();
+        let update = album.name().get_pending_update();
         println!("Update length: {}", update.unwrap().len());
-        assert_eq!(scoped_album.name().value(), "The Dark Side of the Moon");
+        assert_eq!(album.name().value(), "The Dark Side of the Moon");
         trx.commit().unwrap();
 
-        album
+        let trx = client.begin();
+        let album = trx.edit::<Album>(album_id).unwrap();
+        //album
+        1
     };
 
-    assert_eq!(album.name(), "The Dark Side of the Moon");
+    //assert_eq!(album.name(), "The Dark Side of the Moon");
 
     // should immediately have two operations - one for the initial insert, and one for the edit
     // assert_eq!(album.operation_count(), 2);
