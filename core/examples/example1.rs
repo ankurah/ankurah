@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
+use ankurah_core::Model;
 use ankurah_core::{
     model::{Record, ScopedRecord, ID},
     node::Node,
@@ -105,9 +106,11 @@ async fn main() -> Result<()> {
         });
         info!("Album created: {:?}", album);
 
+        //let test = client.fetch_record(album.id(), Album::bucket_name()).unwrap();
+
         album.name().insert(12, "e");
-        let record_event = album.get_record_event();
-        println!("Record event: {:?}", record_event);
+        //let record_event = album.get_record_event();
+        //println!("Record event: {:?}", record_event);
         assert_eq!(album.name().value(), "The Dark Side of the Moon");
 
         let album_id = album.id();
@@ -118,6 +121,9 @@ async fn main() -> Result<()> {
 
         let trx = client.begin();
         let album = trx.edit::<Album>(album_id).unwrap();
+        println!("{:?}", album.name().value());
+        trx.rollback();
+
         //album
         1
     };
@@ -130,5 +136,6 @@ async fn main() -> Result<()> {
     // assert_eq!(client_albums.record_count(), 1);
 
     // Both client and server signals should trigger
+    std::thread::sleep(std::time::Duration::from_millis(500));
     Ok(())
 }

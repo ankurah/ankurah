@@ -116,6 +116,8 @@ impl Transaction {
             .filter_map(|record| record.get_record_event())
             .collect::<Vec<_>>();
 
+        println!("record_events: {:?}", record_events);
+
         self.node.commit_events(&record_events)
     }
 

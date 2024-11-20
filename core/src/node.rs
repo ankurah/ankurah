@@ -200,7 +200,7 @@ impl Node {
     }
 
     /// Fetch a record.
-    pub(crate) fn fetch_record(&self, id: ID, bucket_name: &'static str) -> Result<Arc<ErasedRecord>, RetrievalError> {
+    pub fn fetch_record(&self, id: ID, bucket_name: &'static str) -> Result<Arc<ErasedRecord>, RetrievalError> {
         println!("node.fetch_record");
         if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
             println!("node.fetch_record local");
