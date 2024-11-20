@@ -11,7 +11,7 @@ use crate::{
 };
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    sync::{mpsc, Arc, Mutex, RwLock, Weak},
+    sync::{mpsc, Arc, Mutex, RwLock, RwLockWriteGuard, Weak},
 };
 
 /// Manager for all records and their properties on this client.
@@ -26,9 +26,11 @@ pub struct Node {
     // TODO: Something other than an a Mutex/Rwlock?.
     // We mostly need the mutable access to clean up records we don't care about anymore.
     //records: Arc<RwLock<BTreeMap<(ID, &'static str), Weak<dyn ScopedRecord>>>>,
-    records: Arc<RwLock<BTreeMap<(ID, &'static str), Weak<ErasedRecord>>>>,
+    records: Arc<RwLock<NodeRecords>>,
     // peer_connections: Vec<PeerConnection>,
 }
+
+type NodeRecords = BTreeMap<(ID, &'static str), Weak<ErasedRecord>>;
 
 impl Node {
     pub fn new(engine: Box<dyn StorageEngine>) -> Self {
@@ -85,7 +87,7 @@ impl Node {
             self.apply_record_event(record_event);
 
             // Then we push the state buffers based on the global records.
-            self.update_record_state_buffer(record_event.id(), record_event.bucket_name());
+            self.commit_record_to_storage(record_event.id(), record_event.bucket_name());
 
             // Then we push the record events to subscribed peers.
             self.broadcast_record_event(record_event);
@@ -110,15 +112,17 @@ impl Node {
         // We need to lock the records for the duration of the applying otherwise we might
         // end up with a difference between our storage engine and the node's local record.
 
-        let records = self.records.read().unwrap();
-        let Some(record) = self.fetch_record_from_node_erased(event.id(), event.bucket_name()) else {
+        let Some(record) = self.fetch_record_from_node(event.id(), event.bucket_name()) else {
             return Ok(());
         };
         record.apply_record_event(event)
     }
 
-    pub fn update_record_state_buffer(&self, id: ID, bucket_name: &'static str) {
-        // TODO
+    pub fn commit_record_to_storage(&self, id: ID, bucket_name: &'static str) -> anyhow::Result<()> {
+        let record = self.fetch_record(id, bucket_name)?;
+        self.bucket(bucket_name)
+            .set_record_state(id, &record.to_record_state())?;
+        Ok(())
     }
 
     pub fn broadcast_record_event(&self, event: &RecordEvent) {
@@ -131,9 +135,9 @@ impl Node {
     }
 
     // ----  Node record management ----
-    pub(crate) fn add_record<M: Model>(
+    pub(crate) fn add_record(
         &self,
-        record: &Arc<M::ScopedRecord>,
+        record: &Arc<ErasedRecord>,
     ) -> Result<(), RetrievalError> {
         // Assuming that we should propagate panics to the whole program.
         let mut records = self.records.write().unwrap();
@@ -143,7 +147,7 @@ impl Node {
                 panic!("Attempted to add a `ScopedRecord` that already existed in the node");
             }
             Entry::Vacant(entry) => {
-                let store_record = record.clone() as Arc<dyn ScopedRecord>;
+                let store_record = record.clone();
                 entry.insert(Arc::downgrade(&store_record));
             }
         }
@@ -151,11 +155,11 @@ impl Node {
         Ok(())
     }
 
-    pub fn fetch_record_from_node_erased(
+    pub(crate) fn fetch_record_from_node(
         &self,
         id: ID,
         bucket_name: &'static str,
-    ) -> Option<Arc<dyn ScopedRecord>> {
+    ) -> Option<Arc<ErasedRecord>> {
         let records = self.records.read().unwrap();
         if let Some(record) = records.get(&(id, bucket_name)) {
             record.upgrade()
@@ -164,42 +168,26 @@ impl Node {
         }
     }
 
-    pub fn fetch_record_from_node<A: Model>(&self, id: ID) -> Option<Arc<A::ScopedRecord>> {
-        // Assuming that we should propagate panics to the whole program.
-        let records = self.records.read().unwrap();
-        if let Some(record) = records.get(&(id, A::bucket_name())) {
-            if let Some(record) = record.upgrade() {
-                let upcast = record.as_arc_dyn_any();
-                return Some(
-                    upcast
-                        .downcast::<A::ScopedRecord>()
-                        .expect("Expected correct downcast"),
-                );
-            }
-        }
-
-        None
-    }
-
-    /// Grab the record state and create a new [`ScopedRecord`] based on that.
-    pub fn fetch_record_from_storage<A: Model>(
+    /// Grab the record state and create a new [`ErasedRecord`] based on that.
+    pub(crate) fn fetch_record_from_storage(
         &self,
         id: ID,
-    ) -> Result<A::ScopedRecord, RetrievalError> {
-        let record_state = self.get_record_state(id, A::bucket_name())?;
-        let scoped_record = <A::ScopedRecord>::from_record_state(id, &record_state)?;
+        bucket_name: &'static str,
+    ) -> Result<ErasedRecord, RetrievalError> {
+        let record_state = self.get_record_state(id, bucket_name)?;
+        let scoped_record = ErasedRecord::from_record_state(id, bucket_name, &record_state)?;
         Ok(scoped_record)
     }
 
     /// Fetch a record.
-    pub fn fetch_record<A: Model>(&self, id: ID) -> Result<Arc<A::ScopedRecord>, RetrievalError> {
-        if let Some(local) = self.fetch_record_from_node::<A>(id) {
+    pub(crate) fn fetch_record(&self, id: ID, bucket_name: &'static str) -> Result<Arc<ErasedRecord>, RetrievalError> {
+        if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
             return Ok(local);
         }
 
-        let scoped_record = self.fetch_record_from_storage::<A>(id)?;
+        let scoped_record = self.fetch_record_from_storage(id, bucket_name)?;
         let ref_record = Arc::new(scoped_record);
-        self.add_record::<A>(&ref_record)?;
+        self.add_record(&ref_record)?;
         Ok(ref_record)
     }
 }

@@ -26,6 +26,7 @@ impl AsRef<ID> for ID {
 /// A model is a struct that represents the present values for a given record
 /// Schema is defined primarily by the Model object, and the Record is derived from that via macro.
 pub trait Model {
+    type Record: Record;
     type ScopedRecord: ScopedRecord;
     fn bucket_name() -> &'static str
     where
@@ -40,7 +41,6 @@ pub trait Model {
 }
 
 /// An instance of a record.
-/*
 pub trait Record {
     type Model: Model;
     type ScopedRecord: ScopedRecord;
@@ -48,7 +48,6 @@ pub trait Record {
     fn to_model(&self) -> Self::Model;
     //fn property(property_name: &'static str) -> Box<dyn Any>;
 }
-*/
 
 // Type erased record for modifying backends without 
 pub struct ErasedRecord {
@@ -79,8 +78,12 @@ impl ErasedRecord {
         self.bucket_name
     }
 
-    pub fn from_record_state(id: ID, bucket_name: &'static str, record_state: RecordState) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(&record_state)?;
+    pub fn to_record_state(&self) -> RecordState {
+        RecordState::from_backends(&self.backends)
+    }
+
+    pub fn from_record_state(id: ID, bucket_name: &'static str, record_state: &RecordState) -> Result<Self, RetrievalError> {
+        let backends = Backends::from_state_buffers(record_state)?;
         Ok(Self {
             id: id,
             bucket_name: bucket_name,
@@ -88,12 +91,24 @@ impl ErasedRecord {
         })
     }
 
-    pub fn apply_record_event(&mut self, event: &RecordEvent) -> Result<()> {
+    pub fn apply_record_event(&self, event: &RecordEvent) -> Result<()> {
         for (backend_name, operations) in &event.operations {
             self.backends.apply_operation(backend_name, operations)?;
         }
 
         Ok(())
+    }
+
+    pub fn commit_to_storage(&self, event: &RecordEvent) -> Result<()> {
+        for (backend_name, operations) in &event.operations {
+            self.backends.apply_operation(backend_name, operations)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn into_scoped_record<M: Model>(&self) -> M::ScopedRecord {
+        <M::ScopedRecord as ScopedRecord>::from_backends(self.id(), self.backends.duplicate())
     }
 }
 
@@ -101,6 +116,10 @@ impl ErasedRecord {
 pub trait ScopedRecord: Any + Send + Sync + 'static {
     fn id(&self) -> ID;
     fn bucket_name(&self) -> &'static str;
+
+    fn from_backends(id: ID, backends: Backends) -> Self
+    where 
+        Self: Sized;
 
     fn record_state(&self) -> RecordState;
     fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self, RetrievalError>

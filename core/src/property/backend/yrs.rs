@@ -9,7 +9,7 @@ use crate::{
 };
 
 /// Stores one or more properties of a record
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
     previous_state: Arc<Mutex<StateVector>>,

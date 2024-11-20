@@ -137,7 +137,19 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self as Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync>
             }
 
-            fn id(&self) -> ankurah_core::model::ID {
+            fn from_backends(id: ankurah_core::ID, backends: ankurah_core::property::Backends) -> Self {
+                #(
+                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs, &backends);
+                )*
+                Ok(Self {
+                    id: id,
+                    backends: backends,
+                    #( #field_names: #field_names_avoid_conflicts, )*
+                })
+
+            }
+
+            fn id(&self) -> ankurah_core::ID {
                 self.id
             }
 
@@ -157,14 +169,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 Self: Sized,
             {
                 let backends = ankurah_core::property::Backends::from_state_buffers(&record_state)?;
-                #(
-                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs, &backends);
-                )*
-                Ok(Self {
-                    id: id,
-                    backends: backends,
-                    #( #field_names: #field_names_avoid_conflicts, )*
-                })
+                Self::from_backends(backends)
             }
 
             fn get_record_event(&self) -> Option<ankurah_core::property::backend::RecordEvent> {

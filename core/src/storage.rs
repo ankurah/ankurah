@@ -10,7 +10,7 @@ use crate::{
 
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
-    fn bucket(&self, name: &str) -> anyhow::Result<Box<dyn StorageBucket>>;
+    fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>>;
 }
 
 pub trait StorageBucket: Send + Sync {
@@ -68,9 +68,9 @@ pub struct SledStorageBucket {
 }
 
 impl StorageEngine for SledStorageEngine {
-    fn bucket(&self, name: &str) -> anyhow::Result<Box<dyn StorageBucket>> {
+    fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>> {
         let tree = self.db.open_tree(name)?;
-        Ok(Box::new(SledStorageBucket { tree }))
+        Ok(Arc::new(SledStorageBucket { tree }))
     }
 }
 
@@ -107,17 +107,17 @@ impl StorageBucket for SledStorageBucket {
 
 /// Manages the storage and state of the collection without any knowledge of the model type
 #[derive(Clone)]
-pub struct Bucket(pub(crate) Arc<Box<dyn StorageBucket>>);
+pub struct Bucket(pub(crate) Arc<dyn StorageBucket>);
 
 /// Storage interface for a collection
 impl Bucket {
-    pub fn new(bucket: Box<dyn StorageBucket>) -> Self {
-        Self(Arc::new(bucket))
+    pub fn new(bucket: Arc<dyn StorageBucket>) -> Self {
+        Self(bucket)
     }
 }
 
 impl std::ops::Deref for Bucket {
-    type Target = Arc<Box<dyn StorageBucket>>;
+    type Target = Arc<dyn StorageBucket>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }

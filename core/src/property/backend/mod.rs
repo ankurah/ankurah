@@ -10,7 +10,7 @@ use crate::{error::RetrievalError, storage::RecordState, ID};
 
 use anyhow::Result;
 
-pub trait PropertyBackend {
+pub trait PropertyBackend: Clone {
     /// Unique property backend identifier.
     fn property_backend_name() -> &'static str;
 
@@ -93,7 +93,7 @@ pub struct Operation {
 }
 
 /// Holds the property backends inside of records.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Backends {
     // Probably should be an `Option` since not all records will use each backend?
     // Otherwise we might want to upcast this into something like `BTreeMap<BackendIdentifier, Box<dyn PropertyBackend>>`.
@@ -105,6 +105,13 @@ impl Backends {
     pub fn new() -> Self {
         let yrs = Arc::new(YrsBackend::new());
         Self { yrs }
+    }
+
+    /// Clone but sever the connection to the original reference.
+    pub fn duplicate(&self) -> Backends {
+        Self {
+            yrs: Arc::new(YrsBackend::clone(&self.yrs)),
+        }
     }
 
     pub fn to_state_buffers(&self) -> RecordState {
