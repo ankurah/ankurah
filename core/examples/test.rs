@@ -1,4 +1,3 @@
-
 use ankurah_core::property::YrsString;
 struct Album {
     pub name: String,

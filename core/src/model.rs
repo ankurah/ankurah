@@ -2,7 +2,12 @@
 
 use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
-use crate::{error::RetrievalError, property::{backend::RecordEvent, Backends}, storage::RecordState, Node};
+use crate::{
+    error::RetrievalError,
+    property::{backend::RecordEvent, Backends},
+    storage::RecordState,
+    Node,
+};
 
 use anyhow::Result;
 
@@ -49,7 +54,7 @@ pub trait Record {
     //fn property(property_name: &'static str) -> Box<dyn Any>;
 }
 
-// Type erased record for modifying backends without 
+// Type erased record for modifying backends without
 pub struct ErasedRecord {
     id: ID,
     bucket_name: &'static str,
@@ -82,7 +87,11 @@ impl ErasedRecord {
         RecordState::from_backends(&self.backends)
     }
 
-    pub fn from_record_state(id: ID, bucket_name: &'static str, record_state: &RecordState) -> Result<Self, RetrievalError> {
+    pub fn from_record_state(
+        id: ID,
+        bucket_name: &'static str,
+        record_state: &RecordState,
+    ) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(record_state)?;
         Ok(Self {
             id: id,
@@ -110,7 +119,7 @@ pub trait ScopedRecord: Any + Send + Sync + 'static {
     fn bucket_name(&self) -> &'static str;
 
     fn from_backends(id: ID, backends: Backends) -> Self
-    where 
+    where
         Self: Sized;
 
     fn record_state(&self) -> RecordState;

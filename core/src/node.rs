@@ -121,7 +121,11 @@ impl Node {
         record.apply_record_event(event)
     }
 
-    pub fn commit_record_to_storage(&self, id: ID, bucket_name: &'static str) -> anyhow::Result<()> {
+    pub fn commit_record_to_storage(
+        &self,
+        id: ID,
+        bucket_name: &'static str,
+    ) -> anyhow::Result<()> {
         println!("node.commit_record_to_storage");
         let record = self.fetch_record(id, bucket_name)?;
         println!("node.commit_record_to_storage 2");
@@ -135,16 +139,17 @@ impl Node {
         // TODO
     }
 
-    pub fn get_record_state(&self, id: ID, bucket_name: &'static str) -> Result<RecordState, RetrievalError> {
+    pub fn get_record_state(
+        &self,
+        id: ID,
+        bucket_name: &'static str,
+    ) -> Result<RecordState, RetrievalError> {
         let raw_bucket = self.bucket(bucket_name);
         raw_bucket.0.get_record_state(id)
     }
 
     // ----  Node record management ----
-    pub(crate) fn add_record(
-        &self,
-        record: &Arc<ErasedRecord>,
-    ) -> Result<(), RetrievalError> {
+    pub(crate) fn add_record(&self, record: &Arc<ErasedRecord>) -> Result<(), RetrievalError> {
         println!("node.add_record");
         // Assuming that we should propagate panics to the whole program.
         let mut records = self.records.write().unwrap();
@@ -174,10 +179,10 @@ impl Node {
         let records = self.records.read().unwrap();
         println!("node.fetch_record_from_node 2");
         if let Some(record) = records.get(&(id, bucket_name)) {
-        println!("node.fetch_record_from_node Some");
+            println!("node.fetch_record_from_node Some");
             record.upgrade()
         } else {
-        println!("node.fetch_record_from_node None");
+            println!("node.fetch_record_from_node None");
             None
         }
     }
@@ -189,18 +194,18 @@ impl Node {
         bucket_name: &'static str,
     ) -> Result<ErasedRecord, RetrievalError> {
         match self.get_record_state(id, bucket_name) {
-            Ok(record_state) => {
-                ErasedRecord::from_record_state(id, bucket_name, &record_state)
-            }
-            Err(RetrievalError::NotFound(id)) => {
-                Ok(ErasedRecord::new(id, bucket_name))
-            }
-            Err(err) => Err(err)
+            Ok(record_state) => ErasedRecord::from_record_state(id, bucket_name, &record_state),
+            Err(RetrievalError::NotFound(id)) => Ok(ErasedRecord::new(id, bucket_name)),
+            Err(err) => Err(err),
         }
     }
 
     /// Fetch a record.
-    pub fn fetch_record(&self, id: ID, bucket_name: &'static str) -> Result<Arc<ErasedRecord>, RetrievalError> {
+    pub fn fetch_record(
+        &self,
+        id: ID,
+        bucket_name: &'static str,
+    ) -> Result<Arc<ErasedRecord>, RetrievalError> {
         println!("node.fetch_record");
         if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
             println!("node.fetch_record local");

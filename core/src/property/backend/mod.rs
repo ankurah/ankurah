@@ -127,7 +127,11 @@ impl Backends {
         Ok(Self { yrs })
     }
 
-    pub fn apply_operation(&self, backend_name: &'static str, operations: &Vec<Operation>) -> Result<()> {
+    pub fn apply_operation(
+        &self,
+        backend_name: &'static str,
+        operations: &Vec<Operation>,
+    ) -> Result<()> {
         match backend_name {
             "yrs" => self.yrs.apply_operations(operations),
             _ => Ok(()),
