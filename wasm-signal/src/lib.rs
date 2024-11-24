@@ -1,27 +1,34 @@
 // Re-export the ankurah-derive WasmSignal derive macro
 pub use ankurah_derive::WasmSignal;
+use reactive_graph::{effect::Effect, owner::LocalStorage, traits::Dispose};
 
 use std::rc::Rc;
 
-use futures::future::AbortHandle;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 #[wasm_bindgen]
 pub struct Subscription {
-    abort_handle: AbortHandle,
+    effect: Option<Effect<LocalStorage>>,
 }
 
 impl Subscription {
-    pub fn new(abort_handle: AbortHandle) -> Self {
-        Self { abort_handle }
+    pub fn new(effect: Effect<LocalStorage>) -> Self {
+        Self {
+            effect: Some(effect),
+        }
     }
 }
 
 #[wasm_bindgen]
 impl Subscription {
-    // Method to unsubscribe (cancel the future)
     #[wasm_bindgen]
-    pub fn unsubscribe(self) {
-        self.abort_handle.abort();
+    pub fn unsubscribe(&mut self) {
+        self.effect.take().unwrap().dispose();
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.effect.take().unwrap().dispose();
     }
 }

@@ -1,16 +1,18 @@
-use ankurah_wasm_signal::WasmSignal;
-use futures_signals::signal::ReadOnlyMutable;
-use futures_signals::signal::{Mutable, SignalExt};
+// use ankurah_wasm_signal::WasmSignal;
+
 use gloo_timers::future::sleep;
 use log::info;
+use reactive_graph::prelude::*;
 use std::cell::RefCell;
+use std::fmt::Display;
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
+
+use crate::connection::Connection;
+use reactive_graph::effect::Effect;
 
 const MAX_RECONNECT_DELAY: u64 = 10000;
 
@@ -24,6 +26,30 @@ pub enum ConnectionState {
     Error,
 }
 
+impl Display for ConnectionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ConnectionState::None => write!(f, "None"),
+            ConnectionState::Connecting => write!(f, "Connecting"),
+            ConnectionState::Open => write!(f, "Open"),
+            ConnectionState::Closed => write!(f, "Closed"),
+            ConnectionState::Error => write!(f, "Error"),
+        }
+    }
+}
+
+impl ConnectionState {
+    pub fn str(&self) -> &'static str {
+        match self {
+            ConnectionState::None => "None",
+            ConnectionState::Connecting => "Connecting",
+            ConnectionState::Open => "Open",
+            ConnectionState::Closed => "Closed",
+            ConnectionState::Error => "Error",
+        }
+    }
+}
+
 // #[wasm_bindgen]
 // impl ConnectionState {
 //     pub fn display(&self) -> String {
@@ -32,43 +58,39 @@ pub enum ConnectionState {
 // }
 
 #[wasm_bindgen]
-pub struct ConnectionStateSignal(::futures_signals::signal::MutableSignal<ConnectionState>);
+pub struct ConnectionStateSignal(reactive_graph::signal::ReadSignal<&'static str>);
+
+// impl ConnectionStateSignal {
+//     pub fn new(signal: Box<dyn ::futures_signals::signal::Signal<Item = ConnectionState>>) -> Self {
+//         Self(signal)
+//     }
+// }
 
 #[wasm_bindgen]
 impl ConnectionStateSignal {
-    fn new(signal: ::futures_signals::signal::MutableSignal<ConnectionState>) -> Self {
-        Self(signal)
-    }
-
-    pub fn for_each(
-        self,
-        // #[ typescript_type = "(state: ConnectionState) => void")]
-        callback: ::js_sys::Function,
-    ) -> ankurah_wasm_signal::Subscription {
-        let (abort_handle, abort_registration) = futures::stream::AbortHandle::new_pair();
-
-        let future = futures::stream::Abortable::new(
-            self.0.for_each(move |value| {
-                let js_value = ::wasm_bindgen::JsValue::from(value);
-                callback
-                    .call1(&::wasm_bindgen::JsValue::NULL, &js_value)
-                    .unwrap();
-                ::futures::future::ready(())
-            }),
-            abort_registration,
-        );
-
-        ::wasm_bindgen_futures::spawn_local(async move {
-            let _ = future.await;
+    #[wasm_bindgen(js_name = "subscribe")]
+    pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_wasm_signal::Subscription {
+        let signal = self.0;
+        let effect = Effect::new(move |_| {
+            let value = signal.get();
+            let js_value = wasm_bindgen::JsValue::from_str(value);
+            callback
+                .call1(&wasm_bindgen::JsValue::NULL, &js_value)
+                .unwrap();
         });
 
-        ankurah_wasm_signal::Subscription::new(abort_handle)
+        ankurah_wasm_signal::Subscription::new(effect)
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn value(&self) -> String {
+        self.0.get().to_string()
     }
 }
 
 struct ClientInner {
     connection: RefCell<Option<Connection>>,
-    state: Mutable<ConnectionState>,
+    state: reactive_graph::signal::RwSignal<&'static str>,
 }
 
 #[wasm_bindgen]
@@ -76,12 +98,14 @@ pub struct Client {
     inner: Rc<ClientInner>,
 }
 
+/// Client provides a primary handle to speak to the server
 #[wasm_bindgen]
 impl Client {
     pub fn new() -> Result<Client, JsValue> {
+        let _ = any_spawner::Executor::init_wasm_bindgen();
         let inner = Rc::new(ClientInner {
             connection: RefCell::new(None),
-            state: Mutable::new(ConnectionState::None),
+            state: reactive_graph::signal::RwSignal::new(ConnectionState::None.str()),
         });
 
         inner.connect(0)?;
@@ -89,11 +113,11 @@ impl Client {
         Ok(Client { inner })
     }
     pub async fn ready(&self) {
-        self.inner
-            .state
-            .signal()
-            .wait_for(ConnectionState::Open)
-            .await;
+        // self.inner
+        //     .state
+        //     .signal()
+        //     .wait_for(ConnectionState::Open)
+        //     .await;
     }
     pub fn send_message(&self, message: &str) {
         info!("send_message: Sending message: {}", message);
@@ -103,9 +127,15 @@ impl Client {
             connection.send_message(message);
         }
     }
-    #[wasm_bindgen(getter)]
-    pub fn connection_state(&self) -> ConnectionStateSignal {
-        ConnectionStateSignal::new(self.inner.state.signal())
+    #[wasm_bindgen(getter, js_name = "connection_state")]
+    pub fn js_connection_state(&self) -> ConnectionStateSignal {
+        ConnectionStateSignal(self.inner.state.read_only())
+    }
+}
+
+impl Client {
+    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<&'static str> {
+        self.inner.state.read_only()
     }
 }
 
@@ -113,46 +143,28 @@ impl ClientInner {
     pub fn connect(self: &Rc<Self>, mut delay: u64) -> Result<(), JsValue> {
         let connection = Connection::new()?;
         let state = connection.state.clone();
-        self.connection.borrow_mut().replace(connection);
+        *self.connection.borrow_mut() = Some(connection);
 
-        self.state.set(ConnectionState::Connecting);
+        self.state.set(ConnectionState::Connecting.str());
         let client_inner = Rc::clone(self);
+        let self2 = self.clone();
 
         info!("Connecting to websocket");
-        let self2 = self.clone();
-        spawn_local(async move {
-            state
-                .signal()
-                .for_each(|state| {
-                    info!("connect: state changed to {:?}", state);
-                    client_inner.state.set(state);
-                    // if state isn't open or connecting, reconnect
-                    match state {
-                        ConnectionState::Open => {
-                            delay = 0;
-                        }
-                        ConnectionState::Connecting => (),
-                        _ => self2.reconnect(delay + 500),
-                    }
-                    futures::future::ready(())
-                })
-                .await;
-            info!("connect: for_each future complete");
-        });
 
-        // This isn't quite right, because we're not checking the latest connection
-        // we're closing over the connection state from this run
-        // and also we're not coordinating with the reconnect logic, so we've got
-        // dueling reconnects
-        // let state2 = state.clone();
-        // let self3 = self.clone();
-        // spawn_local(async move {
-        //     sleep(Duration::from_secs(30)).await;
-        //     if state2.get() != ConnectionState::Open {
-        //         warn!("connect: Connection timed out");
-        //         self3.reconnect(delay);
-        //     }
-        // });
+        Effect::new(move |_| {
+            let connection_state = state.get();
+            info!("connect: state changed to {:?}", connection_state);
+            let state_ref: &'static str = connection_state.str();
+            client_inner.state.set(state_ref);
+
+            match connection_state {
+                ConnectionState::Open => {
+                    delay = 0;
+                }
+                ConnectionState::Connecting => (),
+                _ => self2.reconnect(delay + 500),
+            }
+        });
 
         Ok(())
     }
@@ -168,79 +180,5 @@ impl ClientInner {
             info!("reconnect: reconnecting");
             self2.connect(delay).expect("Failed to reconnect");
         });
-    }
-}
-
-struct Connection {
-    ws: WebSocket,
-    on_message: Closure<dyn FnMut(MessageEvent)>,
-    on_error: Closure<dyn FnMut(Event)>,
-    on_close: Closure<dyn FnMut(CloseEvent)>,
-    on_open: Closure<dyn FnMut()>,
-    state: ReadOnlyMutable<ConnectionState>,
-}
-
-impl Connection {
-    fn new() -> Result<Connection, JsValue> {
-        let ws = WebSocket::new("ws://127.0.0.1:9797/ws")?;
-
-        let writable_state = Mutable::new(ConnectionState::Connecting);
-        let writable_state2 = writable_state.clone();
-        let writable_state3 = writable_state.clone();
-        let state = writable_state.read_only();
-        let on_message =
-            Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |e: MessageEvent| {
-                if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
-                    info!("Message received: {}", text);
-                }
-            }));
-
-        let on_error = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_| {
-            info!("Connection Error");
-            writable_state.set(ConnectionState::Error);
-        }));
-
-        let on_close = Closure::<dyn FnMut(CloseEvent)>::wrap(Box::new(move |e: CloseEvent| {
-            info!("Connection closed: {}", e.code());
-            writable_state2.set(ConnectionState::Closed);
-        }));
-
-        // convert ready into a future
-        let on_open = Closure::<dyn FnMut()>::wrap(Box::new(move || {
-            info!("Connection opened (event)");
-            writable_state3.set(ConnectionState::Open);
-        }));
-
-        // Set up WebSocket event handlers
-        ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-        ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-        ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-
-        Ok(Connection {
-            ws,
-            on_message,
-            on_error,
-            on_close,
-            on_open,
-            state,
-        })
-    }
-
-    pub fn send_message(&self, message: &str) {
-        self.ws.send_with_str(message).unwrap_or_else(|err| {
-            info!("Failed to send message: {:?}", err);
-        });
-    }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        info!("Dropping connection");
-        // unbind the listeners and close the connection
-        self.ws.set_onmessage(None);
-        self.ws.set_onerror(None);
-        self.ws.set_onclose(None);
-        self.ws.close().unwrap();
     }
 }

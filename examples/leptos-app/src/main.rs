@@ -1,7 +1,7 @@
 use ankurah_web_client::Client;
 use example_model::*;
 use leptos::logging::*;
-use leptos::*;
+use leptos::prelude::*;
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -11,26 +11,32 @@ fn main() {
         name: "test".to_string(),
     };
 
-    let client = Client::new().unwrap();
-    leptos::mount_to_body(|| view! { <App client=client/> })
+    mount_to_body(|| view! { <App/> })
 }
 
 #[component]
-fn App(client: Client) -> impl IntoView {
+fn App() -> impl IntoView {
     log!("App");
-    let (count, set_count) = create_signal(0);
 
+    let client = Client::new().unwrap();
+    let (count, set_count) = signal(0);
+
+    let connection_state: leptos::prelude::ReadSignal<&'static str> = client.connection_state();
     view! {
-        <button
-            on:click=move |_| {
-                // on stable, this is set_count.set(3);
-                set_count(3);
-                client.send_message(&format!("the counter state is {}", count()));
-            }
-        >
-            "Click me: "
-            // on stable, this is move || count.get();
-            {move || count()}
-        </button>
+        <div>
+            <p>{count}</p>
+            <p>{connection_state}</p>
+            // <button
+            //     on:click=move |_| {
+            //         // on stable, this is set_count.set(3);
+            //         set_count(3);
+            //         client.send_message(&format!("the counter state is {}", count()));
+            //     }
+            // >
+            //     "Click me: "
+            //     // on stable, this is move || count.get();
+            //     {move || count()}
+            // </button>
+        </div>
     }
 }

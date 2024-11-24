@@ -9,11 +9,14 @@ function App() {
   const appState = useAppState()
   console.log('appState', appState);
 
-  const [connectionState, setConnectionState] = useState<bindings.ConnectionState | null>(null);
+  const [connectionState, setConnectionState] = useState<string | null>(null);
 
   useEffect(() => {
+    console.log('useEffect', appState?.client);
     if (appState?.client) {
-      appState.client.connection_state.for_each((state: bindings.ConnectionState) => {
+      console.log('subscribing to connection state');
+      appState.client.connection_state.subscribe((state: string) => {
+        console.log('connection state changed', state);
         setConnectionState(state);
       });
     }
@@ -41,7 +44,7 @@ function App() {
       <h1>Vite + React</h1>
       <div className="card">
         <div className="connection-status">
-          Connection State: {connectionState ? bindings.ConnectionState[connectionState] : 'Not Connected'}
+          Connection State: {connectionState}
         </div>
         <button onClick={handleSendMessage} disabled={!appState?.client}>
           Send Message
