@@ -11,12 +11,6 @@ use append_only_vec::AppendOnlyVec;
 // Q. When do we want unified vs individual property storage for TypeEngine operations?
 // A. When we start to care about differentiating possible recipients for different properties.
 
-#[derive(Debug)]
-pub struct Operation {
-    engine: &'static str,
-    payload: Vec<u8>,
-}
-
 pub struct Transaction {
     pub(crate) node: Arc<Node>, // only here for committing records to storage engine
 

@@ -3,10 +3,7 @@ use std::sync::{Arc, Mutex};
 use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
-use crate::{
-    property::backend::{Operation, PropertyBackend},
-    ID,
-};
+use crate::property::backend::{Operation, PropertyBackend};
 
 /// Stores one or more properties of a record
 #[derive(Debug, Clone)]

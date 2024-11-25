@@ -1,10 +1,8 @@
-use std::sync::Arc;
 
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
-use ankurah_core::Model;
 use ankurah_core::{
-    model::{Record, ScopedRecord, ID},
+    model::ScopedRecord,
     node::Node,
 };
 use ankurah_derive::Model;
@@ -21,7 +19,7 @@ pub struct Album {
     // We will initially only use Model structs for initial construction of the record (or a property group thereof) but we may later consider
     // using them for per-property group retrieval binding, but preferably only via an immutable borrow.
     #[active_value(YrsString)]
-    name: String,
+    pub name: String,
 }
 
 #[tokio::main]
@@ -54,8 +52,7 @@ async fn main() -> Result<()> {
 
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
-    let mut client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
-    let client = Arc::new(client);
+    let client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
 
     // client.local_connect(&server);
 
@@ -104,6 +101,7 @@ async fn main() -> Result<()> {
         let album = trx.create(&Album {
             name: "The Dark Sid of the Moon".into(),
         });
+
         info!("Album created: {:?}", album);
 
         //let test = client.fetch_record(album.id(), Album::bucket_name()).unwrap();
@@ -122,10 +120,10 @@ async fn main() -> Result<()> {
         let trx = client.begin();
         let album = trx.edit::<Album>(album_id).unwrap();
         println!("{:?}", album.name().value());
+        let album = album.to_erased_record();
         trx.rollback();
 
-        //album
-        1
+        album
     };
 
     //assert_eq!(album.name(), "The Dark Side of the Moon");

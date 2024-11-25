@@ -1,15 +1,8 @@
-use std::sync::{Arc, Mutex, Weak};
-
-use anyhow::Result;
-
-use yrs::{
-    updates::{decoder::Decode, encoder::Encode},
-    ReadTxn, StateVector, Transact, Update,
-};
+use std::sync::{Arc, Weak};
 
 use crate::property::{
     backend::{Backends, YrsBackend},
-    traits::{InitializeWith, StateSync},
+    traits::InitializeWith,
     value::ProjectedValue,
 };
 

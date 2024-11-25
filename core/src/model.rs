@@ -1,12 +1,11 @@
 // use futures_signals::signal::Signal;
 
-use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
+use std::{any::Any, fmt, sync::Arc};
 
 use crate::{
     error::RetrievalError,
     property::{backend::RecordEvent, Backends},
-    storage::RecordState,
-    Node,
+    storage::RecordState, transaction::Transaction,
 };
 
 use anyhow::Result;
@@ -51,6 +50,7 @@ pub trait Record {
     type ScopedRecord: ScopedRecord;
     fn id(&self) -> ID;
     fn to_model(&self) -> Self::Model;
+    fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx Transaction) -> Result<&'rec Self::ScopedRecord, RetrievalError>;
     //fn property(property_name: &'static str) -> Box<dyn Any>;
 }
 
@@ -87,17 +87,25 @@ impl ErasedRecord {
         RecordState::from_backends(&self.backends)
     }
 
+    pub fn from_backends(
+        id: ID,
+        bucket_name: &'static str,
+        backends: Backends,
+    ) -> Self {
+        Self {
+            id: id,
+            bucket_name: bucket_name,
+            backends: backends,
+        }
+    }
+
     pub fn from_record_state(
         id: ID,
         bucket_name: &'static str,
         record_state: &RecordState,
     ) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(record_state)?;
-        Ok(Self {
-            id: id,
-            bucket_name: bucket_name,
-            backends: backends,
-        })
+        Ok(Self::from_backends(id, bucket_name, backends))
     }
 
     pub fn apply_record_event(&self, event: &RecordEvent) -> Result<()> {
@@ -117,7 +125,15 @@ impl ErasedRecord {
 pub trait ScopedRecord: Any + Send + Sync + 'static {
     fn id(&self) -> ID;
     fn bucket_name(&self) -> &'static str;
+    fn backends(&self) -> &Backends;
 
+    fn to_erased_record(&self) -> ErasedRecord {
+        ErasedRecord::from_backends(
+            self.id(),
+            self.bucket_name(), 
+            self.backends().duplicate()
+        )
+    }
     fn from_backends(id: ID, backends: Backends) -> Self
     where
         Self: Sized;

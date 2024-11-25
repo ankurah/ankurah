@@ -34,6 +34,11 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         })
         .collect::<Vec<_>>();
 
+    let field_visibility = fields
+        .iter()
+        .map(|f|  &f.vis)
+        .collect::<Vec<_>>();
+
     let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
     let field_names_avoid_conflicts = fields
         .iter()
@@ -47,12 +52,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         .iter()
         .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
         .collect::<Vec<_>>();
-    let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
+    /*let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
     let field_indices = fields
         .iter()
         .enumerate()
         .map(|(index, _)| index)
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>();*/
 
     let expanded: proc_macro::TokenStream = quote! {
         impl ankurah_core::model::Model for #name {
@@ -61,7 +66,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn bucket_name() -> &'static str {
                 #name_str
             }
-            fn new_scoped_record(id: ankurah_core::model::ID, model: &Self) -> Self::ScopedRecord {
+            fn new_scoped_record(id: ankurah_core::ID, model: &Self) -> Self::ScopedRecord {
                 use ankurah_core::property::InitializeWith;
 
                 let backends = ankurah_core::property::Backends::new();
@@ -85,7 +90,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             type Model = #name;
             type ScopedRecord = #scoped_record_name;
 
-            fn id(&self) -> ankurah_core::model::ID {
+            fn id(&self) -> ankurah_core::ID {
                 use ankurah_core::model::ScopedRecord;
                 self.scoped.id()
             }
@@ -94,6 +99,11 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 #name {
                     #( #field_names: self.#field_names(), )*
                 }
+            }
+
+            fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<&'rec #scoped_record_name, ankurah_core::error::RetrievalError> {
+                use ankurah_core::model::Record;
+                trx.edit::<#name>(self.id())
             }
         }
 
@@ -105,13 +115,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 }
             }
 
-            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<&'rec #scoped_record_name, ankurah_core::error::RetrievalError> {
-                use ankurah_core::model::Record;
-                trx.edit::<#name>(self.id())
-            }
-
             #(
-                pub fn #field_names(&self) -> <#field_active_values as ankurah_core::property::ProjectedValue>::Projected {
+                #field_visibility fn #field_names(&self) -> <#field_active_values as ankurah_core::property::ProjectedValue>::Projected {
                     let active = self.scoped.#field_names();
                     <#field_active_values as ankurah_core::property::ProjectedValue>::projected(&active)
                 }
@@ -120,11 +125,11 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         #[derive(Debug)]
         pub struct #scoped_record_name {
-            id: ankurah_core::model::ID,
+            id: ankurah_core::ID,
             backends: ankurah_core::property::Backends,
 
             // Field projections
-            #(pub #field_names: #field_active_values,)*
+            #(#field_visibility #field_names: #field_active_values,)*
             // TODO: Add fields for tracking changes and operation count
         }
 
@@ -155,13 +160,17 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn bucket_name(&self) -> &'static str {
                 #name_str
             }
+            
+            fn backends(&self) -> &ankurah_core::property::Backends {
+                &self.backends
+            }
 
             fn record_state(&self) -> ankurah_core::storage::RecordState {
                 ankurah_core::storage::RecordState::from_backends(&self.backends)
             }
 
             fn from_record_state(
-                id: ankurah_core::model::ID,
+                id: ankurah_core::ID,
                 record_state: &ankurah_core::storage::RecordState,
             ) -> Result<Self, ankurah_core::error::RetrievalError>
             where
@@ -189,7 +198,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         impl #scoped_record_name {
             #(
-                pub fn #field_names(&self) -> &#field_active_values {
+                #field_visibility fn #field_names(&self) -> &#field_active_values {
                     &self.#field_names
                 }
             )*

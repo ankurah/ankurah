@@ -5,7 +5,7 @@ use sled::{Config, Db};
 
 use crate::{
     model::ID,
-    property::{backend::RecordEvent, Backends},
+    property::Backends,
 };
 
 pub trait StorageEngine: Send + Sync {

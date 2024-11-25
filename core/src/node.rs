@@ -3,15 +3,14 @@ use ulid::Ulid;
 use crate::{
     error::RetrievalError,
     event::Operation,
-    model::{ErasedRecord, ScopedRecord, ID},
+    model::{ErasedRecord, ID},
     property::backend::RecordEvent,
     storage::{Bucket, RecordState, StorageEngine},
     transaction::Transaction,
-    Model,
 };
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    sync::{mpsc, Arc, Mutex, RwLock, RwLockWriteGuard, Weak},
+    sync::{mpsc, Arc, RwLock, Weak},
 };
 
 /// Manager for all records and their properties on this client.
@@ -33,13 +32,13 @@ pub struct Node {
 type NodeRecords = BTreeMap<(ID, &'static str), Weak<ErasedRecord>>;
 
 impl Node {
-    pub fn new(engine: Box<dyn StorageEngine>) -> Self {
-        Self {
+    pub fn new(engine: Box<dyn StorageEngine>) -> Arc<Self> {
+        Arc::new(Self {
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             records: Arc::new(RwLock::new(BTreeMap::new())),
             // peer_connections: Vec::new(),
-        }
+        })
     }
 
     pub fn local_connect(&self, _peer: &Arc<Node>) {
@@ -95,48 +94,7 @@ impl Node {
             // TODO: Push the record events to subscribed peers.
         }
 
-        //events.iter().map(|event| self.apply_record_event(event));
-
         Ok(())
-    }
-
-    /// Apply the record event to our Node's record.
-    pub fn apply_record_event(&self, event: &RecordEvent) -> anyhow::Result<()> {
-        println!("node.apply_record_event");
-        // Create or grab an `Arc<Box<dyn ScopedRecord>>` for our record.
-
-        // Thinking do I need a `&'static str -> Fn(|Arc<Box<dyn ScopedRecord>>| {})`
-        // for this...?
-        // I don't think that'll work since you'd need to register it beforehand or have
-        // some piece of code run with an explicit model first.
-        // Then again we don't really need to update it if it doesn't exist already.
-
-        // Fetch the global shared record if it exists.
-        // We need to lock the records for the duration of the applying otherwise we might
-        // end up with a difference between our storage engine and the node's local record.
-
-        let Some(record) = self.fetch_record_from_node(event.id(), event.bucket_name()) else {
-            return Ok(());
-        };
-        record.apply_record_event(event)
-    }
-
-    pub fn commit_record_to_storage(
-        &self,
-        id: ID,
-        bucket_name: &'static str,
-    ) -> anyhow::Result<()> {
-        println!("node.commit_record_to_storage");
-        let record = self.fetch_record(id, bucket_name)?;
-        println!("node.commit_record_to_storage 2");
-        self.bucket(bucket_name)
-            .set_record_state(id, &record.to_record_state())?;
-        println!("node.commit_record_to_storage 3");
-        Ok(())
-    }
-
-    pub fn broadcast_record_event(&self, event: &RecordEvent) {
-        // TODO
     }
 
     pub fn get_record_state(
@@ -149,7 +107,9 @@ impl Node {
     }
 
     // ----  Node record management ----
-    pub(crate) fn add_record(&self, record: &Arc<ErasedRecord>) -> Result<(), RetrievalError> {
+    /// Add record to the node's list of records, if this returns false, then the erased record was already present.
+    #[must_use]
+    pub(crate) fn add_record(&self, record: &Arc<ErasedRecord>) -> bool {
         println!("node.add_record");
         // Assuming that we should propagate panics to the whole program.
         let mut records = self.records.write().unwrap();
@@ -159,7 +119,8 @@ impl Node {
                 if entry.get().strong_count() == 0 {
                     entry.insert(Arc::downgrade(record));
                 } else {
-                    panic!("Attempted to add a `ScopedRecord` that already existed in the node")
+                    return false;
+                    //panic!("Attempted to add a `ScopedRecord` that already existed in the node")
                 }
             }
             Entry::Vacant(entry) => {
@@ -167,7 +128,7 @@ impl Node {
             }
         }
 
-        Ok(())
+        true
     }
 
     pub(crate) fn fetch_record_from_node(
@@ -214,7 +175,14 @@ impl Node {
 
         let scoped_record = self.fetch_record_from_storage(id, bucket_name)?;
         let ref_record = Arc::new(scoped_record);
-        self.add_record(&ref_record)?;
+        let already_present = self.add_record(&ref_record);
+        if already_present { 
+            // We hit a small edge case where the record was fetched twice
+            // at the same time and the other fetch added the record first.
+            // So try this function again.
+            return self.fetch_record(id, bucket_name);
+        }
+
         Ok(ref_record)
     }
 }
