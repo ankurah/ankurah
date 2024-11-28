@@ -1,10 +1,6 @@
-
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
-use ankurah_core::{
-    model::ScopedRecord,
-    node::Node,
-};
+use ankurah_core::{model::ScopedRecord, node::Node};
 use ankurah_derive::Model;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

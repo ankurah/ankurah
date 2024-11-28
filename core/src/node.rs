@@ -3,7 +3,7 @@ use ulid::Ulid;
 use crate::{
     error::RetrievalError,
     event::Operation,
-    model::{ErasedRecord, ID},
+    model::{ErasedRecord, Record, ID},
     property::backend::RecordEvent,
     storage::{Bucket, RecordState, StorageEngine},
     transaction::Transaction,
@@ -84,7 +84,7 @@ impl Node {
         println!("node.commit_events");
         for record_event in events {
             // Apply record events to the Node's global records first.
-            let record = self.fetch_record(record_event.id(), record_event.bucket_name())?;
+            let record = self.fetch_erased(record_event.id(), record_event.bucket_name())?;
             record.apply_record_event(record_event)?;
 
             // Push the state buffers to storage.
@@ -162,7 +162,7 @@ impl Node {
     }
 
     /// Fetch a record.
-    pub fn fetch_record(
+    pub fn fetch_erased(
         &self,
         id: ID,
         bucket_name: &'static str,
@@ -176,14 +176,21 @@ impl Node {
         let scoped_record = self.fetch_record_from_storage(id, bucket_name)?;
         let ref_record = Arc::new(scoped_record);
         let already_present = self.add_record(&ref_record);
-        if already_present { 
+        if already_present {
             // We hit a small edge case where the record was fetched twice
             // at the same time and the other fetch added the record first.
             // So try this function again.
-            return self.fetch_record(id, bucket_name);
+            return self.fetch_erased(id, bucket_name);
         }
 
         Ok(ref_record)
+    }
+
+    pub fn get_record<R: Record>(&self, id: ID) -> Result<R, RetrievalError> {
+        use crate::model::Model;
+        let collection_name = R::Model::bucket_name();
+        let erased = &self.fetch_erased(id, collection_name)?;
+        Ok(R::from_erased(erased))
     }
 }
 

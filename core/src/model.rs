@@ -5,7 +5,8 @@ use std::{any::Any, fmt, sync::Arc};
 use crate::{
     error::RetrievalError,
     property::{backend::RecordEvent, Backends},
-    storage::RecordState, transaction::Transaction,
+    storage::RecordState,
+    transaction::Transaction,
 };
 
 use anyhow::Result;
@@ -44,13 +45,18 @@ pub trait Model {
     */
 }
 
-/// An instance of a record.
+/// A record is an instance of a model which is kept up to date with the latest changes from local and remote edits
 pub trait Record {
     type Model: Model;
     type ScopedRecord: ScopedRecord;
     fn id(&self) -> ID;
     fn to_model(&self) -> Self::Model;
-    fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx Transaction) -> Result<&'rec Self::ScopedRecord, RetrievalError>;
+    // TODO: Consider possibly moving this into the regular impl, not this trait (else we'll have to provide a prelude)
+    fn edit<'rec, 'trx: 'rec>(
+        &self,
+        trx: &'trx Transaction,
+    ) -> Result<&'rec Self::ScopedRecord, RetrievalError>;
+    fn from_erased(erased: &ErasedRecord) -> Self;
     //fn property(property_name: &'static str) -> Box<dyn Any>;
 }
 
@@ -87,11 +93,7 @@ impl ErasedRecord {
         RecordState::from_backends(&self.backends)
     }
 
-    pub fn from_backends(
-        id: ID,
-        bucket_name: &'static str,
-        backends: Backends,
-    ) -> Self {
+    pub fn from_backends(id: ID, bucket_name: &'static str, backends: Backends) -> Self {
         Self {
             id: id,
             bucket_name: bucket_name,
@@ -119,20 +121,26 @@ impl ErasedRecord {
     pub fn into_scoped_record<M: Model>(&self) -> M::ScopedRecord {
         <M::ScopedRecord as ScopedRecord>::from_backends(self.id(), self.backends.duplicate())
     }
+    // pub fn into_record<R: Record>(&self) -> R {}
 }
 
-/// An editable instance of a record.
+// TODO: ScopedRecord should have either a Record, or another ScopedRecord as its parent (nested transactions)
+pub enum RecordParent<M: Model> {
+    // Node(Arc<crate::Node>), // If we want to consolidate Record and ScopedRecord
+    Record(Arc<M::Record>),
+    ScopedRecord(Arc<M::ScopedRecord>),
+}
+
+/// An editable instance of a record which corresponds to a single transaction. Not updated with changes.
+/// Not able to be subscribed to.
 pub trait ScopedRecord: Any + Send + Sync + 'static {
+    // type Record: Record;
     fn id(&self) -> ID;
     fn bucket_name(&self) -> &'static str;
     fn backends(&self) -> &Backends;
 
     fn to_erased_record(&self) -> ErasedRecord {
-        ErasedRecord::from_backends(
-            self.id(),
-            self.bucket_name(), 
-            self.backends().duplicate()
-        )
+        ErasedRecord::from_backends(self.id(), self.bucket_name(), self.backends().duplicate())
     }
     fn from_backends(id: ID, backends: Backends) -> Self
     where

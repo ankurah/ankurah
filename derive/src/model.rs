@@ -105,6 +105,15 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 use ankurah_core::model::Record;
                 trx.edit::<#name>(self.id())
             }
+
+            fn from_erased(erased: &ankurah_core::model::ErasedRecord) -> Self {
+                // TODO: This needs to have an internal Arc (for prettier API) and register that inner with the node
+                // to receive updates. Maybe that inner is just an ErasedRecord? If so, where do active subscriptions live?
+                
+                #record_name {
+                    scoped: erased.into_scoped_record::<#name>(),
+                }
+            }
         }
 
         impl #record_name {
@@ -125,6 +134,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         #[derive(Debug)]
         pub struct #scoped_record_name {
+            // TODO: Invert Record and ScopedRecord so that ScopedRecord has an internal Record, and Record has id,backends, field projections
+            // parent: RecordParent<#name>,
+
             id: ankurah_core::ID,
             backends: ankurah_core::property::Backends,
 

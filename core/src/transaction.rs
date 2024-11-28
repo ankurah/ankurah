@@ -64,7 +64,7 @@ impl Transaction {
             return Ok(local);
         }
 
-        let erased_record = self.node.fetch_record(id, A::bucket_name())?;
+        let erased_record = self.node.fetch_erased(id, A::bucket_name())?;
         let scoped_record = erased_record.into_scoped_record::<A>();
 
         Ok(self.add_record::<A>(scoped_record))
