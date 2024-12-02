@@ -172,11 +172,11 @@ impl Backends {
         let backends = self.backends.lock().unwrap();
         let mut duplicated = BTreeMap::new();
         for (name, backend) in &*backends {
-            duplicated.insert(name.clone(), backend.duplicate());
+            duplicated.insert(name.clone(), backend.duplicate().into());
         }
 
         Self {
-            backends: Arc::new(Mutex::new(BTreeMap::default())),
+            backends: Arc::new(Mutex::new(duplicated)),
         }
     }
 

@@ -110,6 +110,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 // TODO: This needs to have an internal Arc (for prettier API) and register that inner with the node
                 // to receive updates. Maybe that inner is just an ErasedRecord? If so, where do active subscriptions live?
                 
+                println!("blah 1");
                 #record_name {
                     scoped: erased.into_scoped_record::<#name>(),
                 }
@@ -155,6 +156,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
 
             fn from_backends(id: ankurah_core::ID, backends: ankurah_core::property::Backends) -> Self {
+                let test = backends.get::<ankurah_core::property::backend::YrsBackend>().unwrap();
+                println!("test: {:?}", test.get_string("name"));
                 #(
                     let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs.into(), &backends);
                 )*

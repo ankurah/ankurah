@@ -157,7 +157,7 @@ impl Node {
                 ErasedRecord::from_record_state(id, bucket_name, &record_state)
             }
             Err(RetrievalError::NotFound(id)) => {
-                println!("ID not found");
+                println!("ID not found, creating new record");
                 Ok(ErasedRecord::new(id, bucket_name))
             }
             Err(err) => Err(err),
