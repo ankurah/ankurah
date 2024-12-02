@@ -52,3 +52,12 @@ pub fn humanize(bytes: impl AsRef<[u8]>, words_out: usize) -> String {
         .collect::<Vec<String>>()
         .join("-")
 }
+
+pub fn hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|&x| format!("{:x?}", x))
+        .collect::<Vec<String>>()
+        .join("")
+}

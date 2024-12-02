@@ -52,8 +52,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         .iter()
         .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
         .collect::<Vec<_>>();
-    /*let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
-    let field_indices = fields
+    let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
+    /*let field_indices = fields
         .iter()
         .enumerate()
         .map(|(index, _)| index)
@@ -126,7 +126,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
 
             #(
-                #field_visibility fn #field_names(&self) -> <#field_active_values as ankurah_core::property::ProjectedValue>::Projected {
+                #field_visibility fn #field_names(&self) -> #field_types {
                     let active = self.scoped.#field_names();
                     <#field_active_values as ankurah_core::property::ProjectedValue>::projected(&active)
                 }
