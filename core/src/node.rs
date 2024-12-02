@@ -120,7 +120,7 @@ impl Node {
                 if entry.get().strong_count() == 0 {
                     entry.insert(Arc::downgrade(record));
                 } else {
-                    return false;
+                    return true;
                     //panic!("Attempted to add a `ScopedRecord` that already existed in the node")
                 }
             }
@@ -129,7 +129,7 @@ impl Node {
             }
         }
 
-        true
+        false
     }
 
     pub(crate) fn fetch_record_from_node(
@@ -137,14 +137,10 @@ impl Node {
         id: ID,
         bucket_name: &'static str,
     ) -> Option<Arc<ErasedRecord>> {
-        println!("node.fetch_record_from_node");
         let records = self.records.read().unwrap();
-        println!("node.fetch_record_from_node 2");
         if let Some(record) = records.get(&(id, bucket_name)) {
-            println!("node.fetch_record_from_node Some");
             record.upgrade()
         } else {
-            println!("node.fetch_record_from_node None");
             None
         }
     }
@@ -156,8 +152,14 @@ impl Node {
         bucket_name: &'static str,
     ) -> Result<ErasedRecord, RetrievalError> {
         match self.get_record_state(id, bucket_name) {
-            Ok(record_state) => ErasedRecord::from_record_state(id, bucket_name, &record_state),
-            Err(RetrievalError::NotFound(id)) => Ok(ErasedRecord::new(id, bucket_name)),
+            Ok(record_state) => {
+                println!("fetched record state: {:?}", record_state);
+                ErasedRecord::from_record_state(id, bucket_name, &record_state)
+            }
+            Err(RetrievalError::NotFound(id)) => {
+                println!("ID not found");
+                Ok(ErasedRecord::new(id, bucket_name))
+            }
             Err(err) => Err(err),
         }
     }
@@ -168,9 +170,9 @@ impl Node {
         id: ID,
         bucket_name: &'static str,
     ) -> Result<Arc<ErasedRecord>, RetrievalError> {
-        println!("node.fetch_record");
+        println!("fetch_record {:?}-{:?}", id, bucket_name);
         if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
-            println!("node.fetch_record local");
+            println!("passing ref to existing record");
             return Ok(local);
         }
 

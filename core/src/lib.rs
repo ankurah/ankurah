@@ -1,5 +1,6 @@
 pub mod error;
 pub mod event;
+pub mod human_id;
 pub mod model;
 pub mod node;
 pub mod property;

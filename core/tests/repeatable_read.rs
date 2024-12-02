@@ -33,11 +33,19 @@ fn repeatable_read() -> Result<()> {
         });
         assert_eq!(album_rw.name().value(), "I love cats");
         id = album_rw.id;
+
         trx.commit()?;
     }
 
+    println!("_____________");
+    println!("REFETCHING");
+    println!("_____________");
     // TODO: implement ScopedRecord.read() -> Record
     let album_ro: AlbumRecord = client.get_record(id).unwrap();
+
+    println!("_____________");
+    println!("name: {:?}", album_ro.name());
+    println!("_____________");
 
     let trx2 = client.begin();
     let album_rw2 = album_ro.edit(&trx2)?;

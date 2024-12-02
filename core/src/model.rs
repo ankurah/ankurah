@@ -14,12 +14,20 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ID(pub Ulid);
+
+impl fmt::Debug for ID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let humanized = crate::human_id::humanize(self.0.to_bytes(), 4);
+        f.debug_tuple("ID").field(&humanized).finish()
+    }
+}
 
 impl fmt::Display for ID {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        self.0.fmt(f)
+        let humanized = crate::human_id::humanize(self.0.to_bytes(), 4);
+        f.debug_tuple("ID").field(&humanized).finish()
     }
 }
 
