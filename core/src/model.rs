@@ -11,9 +11,10 @@ use crate::{
 
 use anyhow::Result;
 
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ID(pub Ulid);
 
 impl fmt::Display for ID {
@@ -89,7 +90,7 @@ impl ErasedRecord {
         self.bucket_name
     }
 
-    pub fn to_record_state(&self) -> RecordState {
+    pub fn to_record_state(&self) -> Result<RecordState> {
         RecordState::from_backends(&self.backends)
     }
 
@@ -112,7 +113,8 @@ impl ErasedRecord {
 
     pub fn apply_record_event(&self, event: &RecordEvent) -> Result<()> {
         for (backend_name, operations) in &event.operations {
-            self.backends.apply_operation(backend_name, operations)?;
+            self.backends
+                .apply_operations((*backend_name).to_owned(), operations)?;
         }
 
         Ok(())
@@ -146,7 +148,7 @@ pub trait ScopedRecord: Any + Send + Sync + 'static {
     where
         Self: Sized;
 
-    fn record_state(&self) -> RecordState;
+    fn record_state(&self) -> anyhow::Result<RecordState>;
     fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self, RetrievalError>
     where
         Self: Sized;

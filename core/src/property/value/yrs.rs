@@ -4,6 +4,7 @@ use crate::property::{
     backend::{Backends, YrsBackend},
     traits::InitializeWith,
     value::ProjectedValue,
+    PropertyName,
 };
 
 #[derive(Debug)]
@@ -11,7 +12,7 @@ pub struct YrsString {
     // ideally we'd store the yrs::TransactionMut in the Transaction as an ExtendableOp or something like that
     // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
-    pub property_name: &'static str,
+    pub property_name: PropertyName,
     pub backend: Weak<YrsBackend>,
 }
 
@@ -24,14 +25,15 @@ impl ProjectedValue for YrsString {
 
 // Starting with basic string type operations
 impl YrsString {
-    pub fn new(property_name: &'static str, backend: Arc<YrsBackend>) -> Self {
+    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self {
         Self {
             property_name,
             backend: Arc::downgrade(&backend),
         }
     }
-    pub fn from_backends(property_name: &'static str, backends: &Backends) -> Self {
-        Self::new(property_name, backends.yrs.clone())
+    pub fn from_backends(property_name: PropertyName, backends: &Backends) -> Self {
+        let backend = backends.get::<YrsBackend>().unwrap();
+        Self::new(property_name, backend)
     }
     pub fn backend(&self) -> Arc<YrsBackend> {
         self.backend
@@ -39,19 +41,19 @@ impl YrsString {
             .expect("Expected `Yrs` property backend to exist")
     }
     pub fn value(&self) -> String {
-        self.backend().get_string(self.property_name)
+        self.backend().get_string(&self.property_name)
     }
     pub fn insert(&self, index: u32, value: &str) {
-        self.backend().insert(self.property_name, index, value);
+        self.backend().insert(&self.property_name, index, value);
     }
     pub fn delete(&self, index: u32, length: u32) {
-        self.backend().delete(self.property_name, index, length);
+        self.backend().delete(&self.property_name, index, length);
     }
 }
 
 impl InitializeWith<String> for YrsString {
-    fn initialize_with(backends: &Backends, property_name: &'static str, value: &String) -> Self {
-        let new_string = Self::new(property_name, backends.yrs.clone());
+    fn initialize_with(backends: &Backends, property_name: PropertyName, value: &String) -> Self {
+        let new_string = Self::from_backends(property_name, backends);
         new_string.insert(0, &value);
         new_string
     }

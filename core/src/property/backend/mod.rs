@@ -1,21 +1,32 @@
 use std::{
+    any::Any,
     collections::{btree_map::Entry, BTreeMap},
-    sync::Arc,
+    fmt::Debug,
+    sync::{Arc, Mutex},
 };
 
+pub mod lww;
 pub mod yrs;
+pub use lww::LWWBackend;
+use serde::{Deserialize, Serialize};
 pub use yrs::YrsBackend;
 
 use crate::{error::RetrievalError, storage::RecordState, ID};
 
 use anyhow::Result;
 
-pub trait PropertyBackend: Clone {
+pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
+    fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
+    fn as_debug(&self) -> &dyn Debug;
+    fn duplicate(&self) -> Box<dyn PropertyBackend>;
+
     /// Unique property backend identifier.
-    fn property_backend_name() -> &'static str;
+    fn property_backend_name() -> String
+    where
+        Self: Sized;
 
     /// Get the latest state buffer for this property backend.
-    fn to_state_buffer(&self) -> Vec<u8>;
+    fn to_state_buffer(&self) -> Result<Vec<u8>>;
     /// Construct a property backend from a state buffer.
     fn from_state_buffer(
         state_buffer: &Vec<u8>,
@@ -29,11 +40,11 @@ pub trait PropertyBackend: Clone {
     fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RecordEvent {
     pub id: ID,
     pub bucket_name: &'static str,
-    pub operations: BTreeMap<&'static str, Vec<Operation>>,
+    pub operations: BTreeMap<String, Vec<Operation>>,
 }
 
 impl RecordEvent {
@@ -65,7 +76,7 @@ impl RecordEvent {
     }
 
     pub fn push(&mut self, property_backend: &'static str, operation: Operation) {
-        match self.operations.entry(property_backend) {
+        match self.operations.entry(property_backend.to_owned()) {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().push(operation);
             }
@@ -76,7 +87,7 @@ impl RecordEvent {
     }
 
     pub fn extend(&mut self, property_backend: &'static str, operations: Vec<Operation>) {
-        match self.operations.entry(property_backend) {
+        match self.operations.entry(property_backend.to_owned()) {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().extend(operations);
             }
@@ -87,7 +98,7 @@ impl RecordEvent {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Operation {
     pub diff: Vec<u8>,
 }
@@ -97,44 +108,119 @@ pub struct Operation {
 pub struct Backends {
     // Probably should be an `Option` since not all records will use each backend?
     // Otherwise we might want to upcast this into something like `BTreeMap<BackendIdentifier, Box<dyn PropertyBackend>>`.
-    pub yrs: Arc<YrsBackend>,
+    //pub yrs: Arc<YrsBackend>,
     // extend this with any backends needed.
+    backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
+}
+
+// This is where this gets a bit tough.
+// PropertyBackends should either have a concrete type of some sort,
+// or if they can take a generic, they should also take a `Vec<u8>`.
+pub fn backend_from_string(
+    name: &str,
+    buffer: Option<&Vec<u8>>,
+) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
+    if name == "yrs" {
+        let backend = match buffer {
+            Some(buffer) => YrsBackend::from_state_buffer(buffer)?,
+            None => YrsBackend::new(),
+        };
+        Ok(Arc::new(backend))
+    } else if name == "lww" {
+        let backend = match buffer {
+            Some(buffer) => LWWBackend::from_state_buffer(buffer)?,
+            None => LWWBackend::new(),
+        };
+        Ok(Arc::new(backend))
+    } else {
+        panic!("unknown backend: {:?}", name);
+    }
 }
 
 impl Backends {
     pub fn new() -> Self {
-        let yrs = Arc::new(YrsBackend::new());
-        Self { yrs }
+        Self {
+            backends: Arc::new(Mutex::new(BTreeMap::default())),
+        }
+    }
+
+    pub fn get<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
+        let backend_name = P::property_backend_name();
+        let backend = self.get_raw(backend_name)?;
+        let upcasted = backend.as_arc_dyn_any();
+        let backend = upcasted.downcast::<P>().unwrap();
+        Ok(backend)
+    }
+
+    pub fn get_raw(
+        &self,
+        backend_name: String,
+    ) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
+        let mut backends = self.backends.lock().unwrap();
+        if let Some(backend) = backends.get(&backend_name) {
+            Ok(backend.clone())
+        } else {
+            let backend = backend_from_string(&backend_name, None)?;
+            backends.insert(backend_name, backend.clone());
+            Ok(backend)
+        }
     }
 
     /// Clone but sever the connection to the original reference.
+    ///
     pub fn duplicate(&self) -> Backends {
+        let backends = self.backends.lock().unwrap();
+        let mut duplicated = BTreeMap::new();
+        for (name, backend) in &*backends {
+            duplicated.insert(name.clone(), backend.duplicate());
+        }
+
         Self {
-            yrs: Arc::new(YrsBackend::clone(&self.yrs)),
+            backends: Arc::new(Mutex::new(BTreeMap::default())),
         }
     }
 
-    pub fn to_state_buffers(&self) -> RecordState {
-        RecordState {
-            yrs_state_buffer: self.yrs.to_state_buffer(),
+    fn insert(&self, backend_name: String, backend: Arc<dyn PropertyBackend>) {
+        let mut backends = self.backends.lock().expect("Backends lock failed");
+        backends.insert(backend_name, backend);
+    }
+
+    pub fn to_state_buffers(&self) -> Result<RecordState> {
+        let backends = self.backends.lock().expect("Backends lock failed");
+        let mut state_buffers = BTreeMap::default();
+        for (name, backend) in &*backends {
+            let state_buffer = backend.to_state_buffer()?;
+            state_buffers.insert(name.clone(), state_buffer);
         }
+        Ok(RecordState { state_buffers })
     }
 
     pub fn from_state_buffers(record_state: &RecordState) -> Result<Self, RetrievalError> {
-        let yrs = Arc::new(YrsBackend::from_state_buffer(
-            &record_state.yrs_state_buffer,
-        )?);
-        Ok(Self { yrs })
+        let backends = Backends::new();
+        for (name, state_buffer) in &record_state.state_buffers {
+            let backend = backend_from_string(name, Some(state_buffer))?;
+            backends.insert(name.to_owned(), backend);
+        }
+        Ok(backends)
     }
 
-    pub fn apply_operation(
+    pub fn to_operations(&self) -> BTreeMap<String, Vec<Operation>> {
+        let backends = self.backends.lock().unwrap();
+        let mut operations = BTreeMap::<String, Vec<Operation>>::new();
+        for (name, backend) in &*backends {
+            operations.insert(name.clone(), backend.to_operations());
+        }
+
+        operations
+    }
+
+    pub fn apply_operations(
         &self,
-        backend_name: &'static str,
+        backend_name: String,
         operations: &Vec<Operation>,
     ) -> Result<()> {
-        match backend_name {
-            "yrs" => self.yrs.apply_operations(operations),
-            _ => Ok(()),
-        }
+        let backend = self.get_raw(backend_name)?;
+        backend.apply_operations(operations)?;
+        Ok(())
     }
 }

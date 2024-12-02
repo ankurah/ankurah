@@ -1,9 +1,9 @@
 use anyhow::Result;
 
-use crate::property::backend::Backends;
+use crate::property::{backend::Backends, PropertyName};
 
 pub trait InitializeWith<T> {
-    fn initialize_with(backends: &Backends, property_name: &'static str, value: &T) -> Self;
+    fn initialize_with(backends: &Backends, property_name: PropertyName, value: &T) -> Self;
 }
 
 pub trait StateSync {

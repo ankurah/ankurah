@@ -1,12 +1,9 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
 
-use crate::{
-    model::ID,
-    property::Backends,
-};
+use crate::{model::ID, property::Backends};
 
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
@@ -24,11 +21,11 @@ pub trait StorageBucket: Send + Sync {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordState {
-    pub yrs_state_buffer: Vec<u8>,
+    pub(crate) state_buffers: BTreeMap<String, Vec<u8>>,
 }
 
 impl RecordState {
-    pub fn from_backends(backends: &Backends) -> Self {
+    pub fn from_backends(backends: &Backends) -> anyhow::Result<Self> {
         backends.to_state_buffers()
     }
 }

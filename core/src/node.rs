@@ -87,9 +87,10 @@ impl Node {
             let record = self.fetch_erased(record_event.id(), record_event.bucket_name())?;
             record.apply_record_event(record_event)?;
 
+            let record_state = record.to_record_state()?;
             // Push the state buffers to storage.
             self.bucket(record_event.bucket_name())
-                .set_record_state(record_event.id(), &record.to_record_state())?;
+                .set_record_state(record_event.id(), &record_state)?;
 
             // TODO: Push the record events to subscribed peers.
         }

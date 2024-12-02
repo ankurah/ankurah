@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    any::Any,
+    fmt::Debug,
+    sync::{Arc, Mutex},
+};
 
 use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
@@ -22,19 +26,19 @@ impl YrsBackend {
         }
     }
 
-    pub fn get_string(&self, property_name: &'static str) -> String {
-        let text = self.doc.get_or_insert_text(property_name); // We only have one field in the yrs doc
+    pub fn get_string(&self, property_name: impl AsRef<str>) -> String {
+        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
         text.get_string(&self.doc.transact())
     }
 
-    pub fn insert(&self, property_name: &'static str, index: u32, value: &str) {
-        let text = self.doc.get_or_insert_text(property_name); // We only have one field in the yrs doc
+    pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) {
+        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.insert(&mut ytx, index, value);
     }
 
-    pub fn delete(&self, property_name: &'static str, index: u32, length: u32) {
-        let text = self.doc.get_or_insert_text(property_name); // We only have one field in the yrs doc
+    pub fn delete(&self, property_name: impl AsRef<str>, index: u32, length: u32) {
+        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
     }
@@ -48,17 +52,35 @@ impl YrsBackend {
 }
 
 impl PropertyBackend for YrsBackend {
-    fn property_backend_name() -> &'static str {
-        "yrs"
+    fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> {
+        self as Arc<dyn Any + Send + Sync + 'static>
     }
 
-    fn to_state_buffer(&self) -> Vec<u8> {
+    fn as_debug(&self) -> &dyn Debug {
+        self as &dyn Debug
+    }
+
+    fn duplicate(&self) -> Box<dyn PropertyBackend> {
+        let doc = self.doc.clone();
+        let starting_state = doc.transact().state_vector();
+
+        Box::new(Self {
+            doc: doc,
+            previous_state: Arc::new(Mutex::new(starting_state)),
+        })
+    }
+
+    fn property_backend_name() -> String {
+        "yrs".to_owned()
+    }
+
+    fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
         let txn = self.doc.transact();
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
         let state_buffer = txn.encode_state_as_update_v2(&yrs::StateVector::default());
         println!("state_buffer: {:?}", state_buffer);
-        state_buffer
+        Ok(state_buffer)
     }
 
     fn from_state_buffer(

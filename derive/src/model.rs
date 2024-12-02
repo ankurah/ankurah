@@ -71,7 +71,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
                 let backends = ankurah_core::property::Backends::new();
                 #(
-                    let #field_names_avoid_conflicts = #field_active_values::initialize_with(&backends, #field_name_strs, &model.#field_names);
+                    let #field_names_avoid_conflicts = #field_active_values::initialize_with(&backends, #field_name_strs.into(), &model.#field_names);
                 )*
                 #scoped_record_name {
                     id: id,
@@ -156,7 +156,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
             fn from_backends(id: ankurah_core::ID, backends: ankurah_core::property::Backends) -> Self {
                 #(
-                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs, &backends);
+                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs.into(), &backends);
                 )*
                 Self {
                     id: id,
@@ -177,7 +177,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 &self.backends
             }
 
-            fn record_state(&self) -> ankurah_core::storage::RecordState {
+            fn record_state(&self) -> Result<ankurah_core::storage::RecordState> {
                 ankurah_core::storage::RecordState::from_backends(&self.backends)
             }
 
@@ -194,11 +194,11 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
             fn get_record_event(&self) -> Option<ankurah_core::property::backend::RecordEvent> {
                 use ankurah_core::property::backend::PropertyBackend;
-                let mut record_event = ankurah_core::property::backend::RecordEvent::new(self.id(), self.bucket_name());
-                record_event.extend(
-                    ankurah_core::property::backend::YrsBackend::property_backend_name(),
-                    self.backends.yrs.to_operations(),
-                );
+                let mut record_event = ankurah_core::property::backend::RecordEvent {
+                    id: self.id(),
+                    bucket_name: self.bucket_name(),
+                    operations: self.backends.to_operations(),
+                };
 
                 if record_event.is_empty() {
                     None
