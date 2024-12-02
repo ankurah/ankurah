@@ -7,6 +7,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::{info, Level};
 
+use std::sync::Arc;
+
 #[derive(Model, Debug, Serialize, Deserialize)] // This line now uses the Model derive macro
 pub struct Album {
     // DECISION: The model always contains projected types, which will initally be just the native types.
@@ -21,7 +23,7 @@ pub struct Album {
 
 #[test]
 fn repeatable_read() -> Result<()> {
-    let client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
+    let client = Arc::new(Node::new(Box::new(SledStorageEngine::new().unwrap())));
 
     let id;
     {

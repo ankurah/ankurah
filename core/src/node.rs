@@ -32,13 +32,13 @@ pub struct Node {
 type NodeRecords = BTreeMap<(ID, &'static str), Weak<ErasedRecord>>;
 
 impl Node {
-    pub fn new(engine: Box<dyn StorageEngine>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(engine: Box<dyn StorageEngine>) -> Self {
+        Self {
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             records: Arc::new(RwLock::new(BTreeMap::new())),
             // peer_connections: Vec::new(),
-        })
+        }
     }
 
     pub fn local_connect(&self, _peer: &Arc<Node>) {

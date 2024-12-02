@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};
@@ -48,7 +50,7 @@ async fn main() -> Result<()> {
 
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
-    let client = Node::new(Box::new(SledStorageEngine::new().unwrap()));
+    let client = Arc::new(Node::new(Box::new(SledStorageEngine::new().unwrap())));
 
     // client.local_connect(&server);
 
