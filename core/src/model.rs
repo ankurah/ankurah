@@ -1,12 +1,11 @@
 // use futures_signals::signal::Signal;
 
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use crate::{
     error::RetrievalError,
     property::{backend::RecordEvent, Backends},
     storage::RecordState,
-    transaction::Transaction,
 };
 
 use anyhow::Result;
@@ -45,25 +44,26 @@ pub trait Model {
     fn bucket_name() -> &'static str
     where
         Self: Sized;
-    fn new_record_inner(&self, id: ID) -> RecordInner;
+    fn to_record_inner(&self, id: ID) -> RecordInner;
 }
 
 /// A record is an instance of a model which is kept up to date with the latest changes from local and remote edits
 pub trait Record {
     type Model: Model;
     type ScopedRecord<'trx>: ScopedRecord<'trx>;
-    fn id(&self) -> ID;
+    fn id(&self) -> ID {
+        self.record_inner().id()
+    }
+    fn backends(&self) -> &Backends {
+        self.record_inner().backends()
+    }
     fn to_model(&self) -> Self::Model;
-    // TODO: Consider possibly moving this into the regular impl, not this trait (else we'll have to provide a prelude)
-    fn edit<'rec, 'trx: 'rec>(
-        &self,
-        trx: &'trx Transaction,
-    ) -> Result<Self::ScopedRecord<'rec>, RetrievalError>;
-    fn from_record_inner(inner: &RecordInner) -> Self;
-    //fn property(property_name: &'static str) -> Box<dyn Any>;
+    fn record_inner(&self) -> &Arc<RecordInner>;
+    fn from_record_inner(inner: Arc<RecordInner>) -> Self;
 }
 
 // Type erased record for modifying backends without knowing the specifics.
+#[derive(Debug)]
 pub struct RecordInner {
     id: ID,
     bucket_name: &'static str,
@@ -85,6 +85,10 @@ impl RecordInner {
 
     pub fn bucket_name(&self) -> &'static str {
         self.bucket_name
+    }
+
+    pub fn backends(&self) -> &Backends {
+        &self.backends
     }
 
     pub fn to_record_state(&self) -> Result<RecordState> {
@@ -142,29 +146,34 @@ impl RecordInner {
 
 /// An editable instance of a record which corresponds to a single transaction. Not updated with changes.
 /// Not able to be subscribed to.
-pub trait ScopedRecord<'trx> {
+pub trait ScopedRecord<'rec> {
     // type Record: Record;
-    fn id(&self) -> ID;
-    fn bucket_name(&self) -> &'static str;
-    fn backends(&self) -> &Backends;
+    fn bucket_name() -> &'static str;
+    fn id(&self) -> ID {
+        self.record_inner().id
+    }
+    fn backends(&self) -> &Backends {
+        &self.record_inner().backends
+    }
 
-    fn record_inner(&self) -> Arc<RecordInner>;
-    fn from_record_inner(inner: Arc<RecordInner>) -> Self
+    fn record_inner(&self) -> &RecordInner;
+    fn from_record_inner(inner: &'rec RecordInner) -> Self
     where
         Self: Sized;
 
     fn record_state(&self) -> anyhow::Result<RecordState> {
         RecordState::from_backends(&self.backends())
     }
-    fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self, RetrievalError>
+    /*fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self, RetrievalError>
     where
-        Self: Sized;
+        Self: Sized,
+    {
+        let inner = RecordInner::from_record_state(id, Self::bucket_name(), record_state)?;
+        Ok(Self::from_record_inner(inner))
+    }*/
 
-    fn get_record_event(&self) -> Option<RecordEvent> {
+    fn record_event(&self) -> Option<RecordEvent> {
         self.record_inner().get_record_event()
     }
     //fn apply_record_event(&self, record_event: &RecordEvent) -> Result<()>;
-
-    fn as_dyn_any(&self) -> &dyn Any;
-    fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }

@@ -193,7 +193,7 @@ impl Node {
     pub fn get_record<R: Record>(&self, id: ID) -> Result<R, RetrievalError> {
         use crate::model::Model;
         let collection_name = R::Model::bucket_name();
-        let record_inner = &self.fetch_record_inner(id, collection_name)?;
+        let record_inner = self.fetch_record_inner(id, collection_name)?;
         Ok(R::from_record_inner(record_inner))
     }
 }

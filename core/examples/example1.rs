@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         assert_eq!(album.name().value(), "The Dark Side of the Moon");
 
         let album_id = album.id();
-        let from_scoped_album = trx.edit::<Album>(album).unwrap();
+        let from_scoped_album = trx.edit::<Album>(&album).unwrap();
         let from_id = trx.edit::<Album>(album_id).unwrap();
 
         trx.commit().unwrap();
@@ -118,10 +118,10 @@ async fn main() -> Result<()> {
         let trx = client.begin();
         let album = trx.edit::<Album>(album_id).unwrap();
         println!("{:?}", album.name().value());
-        let album = album.to_erased_record();
+        //let album = album.record_inner();
         trx.rollback();
 
-        album
+        //album
     };
 
     //assert_eq!(album.name(), "The Dark Side of the Moon");

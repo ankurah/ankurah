@@ -33,7 +33,7 @@ fn repeatable_read() -> Result<()> {
             name: "I love cats".into(),
         });
         assert_eq!(album_rw.name().value(), "I love cats");
-        id = album_rw.id;
+        id = album_rw.id();
 
         println!("{:?}", album_rw.record_state());
 
@@ -46,10 +46,8 @@ fn repeatable_read() -> Result<()> {
     // TODO: implement ScopedRecord.read() -> Record
     let album_ro: AlbumRecord = client.get_record(id).unwrap();
 
-    let scoped_back = album_ro.scoped.backends().get::<YrsBackend>().unwrap();
+    let scoped_back = album_ro.backends().get::<YrsBackend>().unwrap();
     println!("mark 1: {:?}", scoped_back.get_string("name"));
-    let yrs_back = album_ro.scoped.name.backend.upgrade().unwrap();
-    println!("mark 2: {:?}", yrs_back.get_string("name"));
     println!("_____________");
     println!("name: {:?}", album_ro.name());
     println!("_____________");
