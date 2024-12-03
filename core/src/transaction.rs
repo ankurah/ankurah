@@ -14,7 +14,7 @@ use append_only_vec::AppendOnlyVec;
 pub struct Transaction {
     pub(crate) node: Arc<Node>, // only here for committing records to storage engine
 
-    records: AppendOnlyVec<Arc<RecordInner>>,
+    records: AppendOnlyVec<RecordInner>,
 
     // markers
     implicit: bool,
@@ -36,14 +36,14 @@ impl Transaction {
         &self,
         id: ID,
         bucket_name: &'static str,
-    ) -> Option<Arc<RecordInner>> {
+    ) -> Option<&RecordInner> {
         for record in self.records.iter() {
             // TODO: Optimize this.
             // It shouldn't be a problem until we have a LOT of records but still
             // Probably just a hashing pre-check and then we retrieve it the same way
             // Either that or use a different append-only structure that uses hashing.
             if record.id() == id && record.bucket_name() == bucket_name {
-                return Some(record.clone());
+                return Some(&record);
             }
         }
 
@@ -55,25 +55,26 @@ impl Transaction {
         &self,
         id: ID,
         bucket_name: &'static str,
-    ) -> Result<Arc<RecordInner>, RetrievalError> {
+    ) -> Result<&RecordInner, RetrievalError> {
         if let Some(local) = self.fetch_record_from_transaction(id, bucket_name) {
             return Ok(local);
         }
 
         let record_inner = self.node.fetch_record_inner(id, bucket_name)?;
-        self.add_record(record_inner.clone());
-        Ok(record_inner)
+        let record_ref = self.add_record(record_inner.snapshot());
+        Ok(record_ref)
     }
 
-    pub fn add_record(&self, record: Arc<RecordInner>) {
-        self.records.push(record);
+    pub fn add_record(&self, record: RecordInner) -> &RecordInner {
+        let index = self.records.push(record);
+        &self.records[index]
     }
 
     pub fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::ScopedRecord<'rec> {
         let id = self.node.next_id();
-        let record_inner = Arc::new(model.new_record_inner(id));
-        self.add_record(record_inner.clone());
-        <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_inner)
+        let record_inner = model.to_record_inner(id);
+        let record_ref = self.add_record(record_inner);
+        <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref)
     }
 
     pub fn edit<'rec, 'trx: 'rec, M: Model>(
@@ -81,9 +82,8 @@ impl Transaction {
         id: impl Into<ID>,
     ) -> Result<M::ScopedRecord<'rec>, crate::error::RetrievalError> {
         let id = id.into();
-        let record_inner = self.fetch_record(id, M::bucket_name())?;
-        self.add_record(record_inner.clone());
-        Ok(<M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_inner))
+        let record_ref = self.fetch_record(id, M::bucket_name())?;
+        Ok(<M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref))
     }
 
     #[must_use]
