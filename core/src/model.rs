@@ -57,6 +57,9 @@ pub trait Record {
     fn backends(&self) -> &Backends {
         self.record_inner().backends()
     }
+    fn bucket_name() -> &'static str {
+        <Self::Model as Model>::bucket_name()
+    }
     fn to_model(&self) -> Self::Model;
     fn record_inner(&self) -> &Arc<RecordInner>;
     fn from_record_inner(inner: Arc<RecordInner>) -> Self;
@@ -147,10 +150,13 @@ impl RecordInner {
 /// An editable instance of a record which corresponds to a single transaction. Not updated with changes.
 /// Not able to be subscribed to.
 pub trait ScopedRecord<'rec> {
-    // type Record: Record;
-    fn bucket_name() -> &'static str;
+    type Model: Model;
+    type Record: Record;
     fn id(&self) -> ID {
         self.record_inner().id
+    }
+    fn bucket_name() -> &'static str {
+        <Self::Model as Model>::bucket_name()
     }
     fn backends(&self) -> &Backends {
         &self.record_inner().backends
@@ -164,13 +170,6 @@ pub trait ScopedRecord<'rec> {
     fn record_state(&self) -> anyhow::Result<RecordState> {
         RecordState::from_backends(&self.backends())
     }
-    /*fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self, RetrievalError>
-    where
-        Self: Sized,
-    {
-        let inner = RecordInner::from_record_state(id, Self::bucket_name(), record_state)?;
-        Ok(Self::from_record_inner(inner))
-    }*/
 
     fn record_event(&self) -> Option<RecordEvent> {
         self.record_inner().get_record_event()

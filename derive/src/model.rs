@@ -98,6 +98,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
 
             fn from_record_inner(inner: std::sync::Arc<ankurah_core::model::RecordInner>) -> Self {
+                use ankurah_core::model::Record;
+                assert_eq!(Self::bucket_name(), inner.bucket_name());
                 #record_name {
                     inner: inner,
                 }
@@ -121,10 +123,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         #[derive(Debug)]
         pub struct #scoped_record_name<'rec> {
             // TODO: Invert Record and ScopedRecord so that ScopedRecord has an internal Record, and Record has id,backends, field projections
-            // parent: RecordParent<#name>,
+            //parent: RecordParent<#name>,
 
             inner: &'rec ankurah_core::model::RecordInner,
-            //phantom: std::marker::PhantomData<&'rec ()>,
 
             // Field projections
             #(#field_visibility #field_names: #field_active_values,)*
@@ -132,22 +133,21 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         }
 
         impl<'rec> ankurah_core::model::ScopedRecord<'rec> for #scoped_record_name<'rec> {
+            type Model = #name;
+            type Record = #record_name;
+
             fn record_inner(&self) -> &ankurah_core::model::RecordInner {
                 &self.inner
             }
 
-            fn bucket_name() -> &'static str {
-                #name_str
-            }
-
             fn from_record_inner(inner: &'rec ankurah_core::model::RecordInner) -> Self {
-                assert_eq!(inner.bucket_name(), #name_str);
+                use ankurah_core::model::ScopedRecord;
+                assert_eq!(inner.bucket_name(), Self::bucket_name());
                 #(
                     let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs.into(), inner.backends());
                 )*
                 Self {
                     inner: inner,
-                    //phantom: std::marker::PhantomData,
                     #( #field_names: #field_names_avoid_conflicts, )*
                 }
             }
