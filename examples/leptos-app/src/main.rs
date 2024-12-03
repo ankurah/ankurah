@@ -21,11 +21,11 @@ fn App() -> impl IntoView {
     let client = Client::new("localhost:9797").unwrap();
     let (count, set_count) = signal(0);
 
-    let connection_state: leptos::prelude::ReadSignal<&'static str> = client.connection_state();
+    let connection_state = client.connection_state();
     view! {
         <div>
             <p>{count}</p>
-            <p>{connection_state}</p>
+            <p>{move || connection_state.get().to_string()}</p>
             // <button
             //     on:click=move |_| {
             //         // on stable, this is set_count.set(3);

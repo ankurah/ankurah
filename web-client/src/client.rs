@@ -1,4 +1,4 @@
-// use ankurah_wasm_signal::WasmSignal;
+// use ankurah_react_signals::WasmSignal;
 
 use gloo_timers::future::sleep;
 use log::info;
@@ -66,24 +66,28 @@ pub struct ConnectionStateSignal(reactive_graph::signal::ReadSignal<&'static str
 //     }
 // }
 
+#[cfg(feature = "react")]
 #[wasm_bindgen]
 impl ConnectionStateSignal {
     #[wasm_bindgen(js_name = "subscribe")]
-    pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_wasm_signal::Subscription {
-        let signal = self.0;
-        let effect = Effect::new(move |_| {
-            let value = signal.get();
-            let js_value = wasm_bindgen::JsValue::from_str(value);
-            callback
-                .call1(&wasm_bindgen::JsValue::NULL, &js_value)
-                .unwrap();
-        });
+    pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_react_signals::Subscription {
+        //     let signal = self.0;
+        //     let effect = Effect::new(move |_| {
+        //         let value = signal.get();
+        //         let js_value = wasm_bindgen::JsValue::from_str(value);
+        //         callback
+        //             .call1(&wasm_bindgen::JsValue::NULL, &js_value)
+        //             .unwrap();
+        //     });
 
-        ankurah_wasm_signal::Subscription::new(effect)
+        //     ankurah_react_signals::Subscription::new(effect)
+
+        unimplemented!()
     }
 
     #[wasm_bindgen(getter)]
     pub fn value(&self) -> String {
+        log::info!("ConnectionStateSignal value");
         self.0.get().to_string()
     }
 }
@@ -158,8 +162,9 @@ impl ClientInner {
         info!("Connecting to websocket");
 
         Effect::new(move |_| {
+            log::info!("connect mark 1");
             let connection_state = state.get();
-            info!("connect: state changed to {:?}", connection_state);
+            log::info!("connect mark 2: state changed to {:?}", connection_state);
             let state_ref: &'static str = connection_state.str();
             client_inner.state.set(state_ref);
 
