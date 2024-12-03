@@ -1,3 +1,5 @@
+pub mod react_binding;
+
 // Re-export the ankurah-derive WasmSignal derive macro
 pub use ankurah_derive::WasmSignal;
 use reactive_graph::{effect::Effect, owner::LocalStorage, traits::Dispose};
