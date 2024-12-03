@@ -61,16 +61,10 @@ impl PropertyBackend for YrsBackend {
     }
 
     fn duplicate(&self) -> Box<dyn PropertyBackend> {
-        let doc = self.doc.clone();
-        let starting_state = doc.transact().state_vector();
-
-        let text = doc.get_or_insert_text("name"); // We only have one field in the yrs doc
-        println!("str dup: {:?}", text.get_string(&doc.transact()));
-
-        Box::new(Self {
-            doc: doc,
-            previous_state: Arc::new(Mutex::new(starting_state)),
-        })
+        // TODO: Don't do all this just to sever the internal Yrs Arcs
+        let state_buffer = self.to_state_buffer().unwrap();
+        let backend = Self::from_state_buffer(&state_buffer).unwrap();
+        Box::new(backend)
     }
 
     fn property_backend_name() -> String {

@@ -1,5 +1,3 @@
-use ankurah_core::model::Record;
-use ankurah_core::property::backend::YrsBackend;
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};
@@ -46,8 +44,6 @@ fn repeatable_read() -> Result<()> {
     // TODO: implement ScopedRecord.read() -> Record
     let album_ro: AlbumRecord = client.get_record(id).unwrap();
 
-    let scoped_back = album_ro.backends().get::<YrsBackend>().unwrap();
-    println!("mark 1: {:?}", scoped_back.get_string("name"));
     println!("_____________");
     println!("name: {:?}", album_ro.name());
     println!("_____________");
