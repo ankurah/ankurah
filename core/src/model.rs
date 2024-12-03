@@ -41,52 +41,41 @@ impl AsRef<ID> for ID {
 /// Schema is defined primarily by the Model object, and the Record is derived from that via macro.
 pub trait Model {
     type Record: Record;
-    type ScopedRecord: ScopedRecord;
+    type ScopedRecord<'trx>: ScopedRecord<'trx>;
     fn bucket_name() -> &'static str
     where
         Self: Sized;
-    fn new_scoped_record(id: ID, model: &Self) -> Self::ScopedRecord;
-
-    /*
-    fn new_erased_record(id: ID) -> ErasedRecord;
-    fn property(property_name: &'static str) -> Box<dyn Any + Send + Sync + 'static>;
-    fn properties() -> Vec<&'static str>;
-    */
+    fn new_record_inner(&self, id: ID) -> RecordInner;
 }
 
 /// A record is an instance of a model which is kept up to date with the latest changes from local and remote edits
 pub trait Record {
     type Model: Model;
-    type ScopedRecord: ScopedRecord;
+    type ScopedRecord<'trx>: ScopedRecord<'trx>;
     fn id(&self) -> ID;
     fn to_model(&self) -> Self::Model;
     // TODO: Consider possibly moving this into the regular impl, not this trait (else we'll have to provide a prelude)
     fn edit<'rec, 'trx: 'rec>(
         &self,
         trx: &'trx Transaction,
-    ) -> Result<&'rec Self::ScopedRecord, RetrievalError>;
-    fn from_erased(erased: &ErasedRecord) -> Self;
+    ) -> Result<Self::ScopedRecord<'rec>, RetrievalError>;
+    fn from_record_inner(inner: &RecordInner) -> Self;
     //fn property(property_name: &'static str) -> Box<dyn Any>;
 }
 
-// Type erased record for modifying backends without
-pub struct ErasedRecord {
+// Type erased record for modifying backends without knowing the specifics.
+pub struct RecordInner {
     id: ID,
     bucket_name: &'static str,
     backends: Backends,
-    //property_to_backend: BTreeMap<&'static str, &'static str>,
-    // Maybe in the future? Rg
-    //property_backends: BTreeMap<&'static str, Box<dyn Any + Send + Sync + 'static>>,
 }
 
-impl ErasedRecord {
+impl RecordInner {
     pub fn new(id: ID, bucket_name: &'static str) -> Self {
         Self {
             id: id,
             bucket_name: bucket_name,
             backends: Backends::new(),
-            //property_to_backend: BTreeMap::new(),
-            //property_backends: BTreeMap::new(),
         }
     }
 
@@ -119,6 +108,20 @@ impl ErasedRecord {
         Ok(Self::from_backends(id, bucket_name, backends))
     }
 
+    pub fn get_record_event(&self) -> Option<RecordEvent> {
+        let record_event = RecordEvent {
+            id: self.id(),
+            bucket_name: self.bucket_name(),
+            operations: self.backends.to_operations(),
+        };
+
+        if record_event.is_empty() {
+            None
+        } else {
+            Some(record_event)
+        }
+    }
+
     pub fn apply_record_event(&self, event: &RecordEvent) -> Result<()> {
         for (backend_name, operations) in &event.operations {
             self.backends
@@ -128,40 +131,38 @@ impl ErasedRecord {
         Ok(())
     }
 
-    pub fn into_scoped_record<M: Model>(&self) -> M::ScopedRecord {
-        <M::ScopedRecord as ScopedRecord>::from_backends(self.id(), self.backends.duplicate())
+    pub fn snapshot(&self) -> Self {
+        Self {
+            id: self.id(),
+            bucket_name: self.bucket_name(),
+            backends: self.backends.duplicate(),
+        }
     }
-    // pub fn into_record<R: Record>(&self) -> R {}
-}
-
-// TODO: ScopedRecord should have either a Record, or another ScopedRecord as its parent (nested transactions)
-pub enum RecordParent<M: Model> {
-    // Node(Arc<crate::Node>), // If we want to consolidate Record and ScopedRecord
-    Record(Arc<M::Record>),
-    ScopedRecord(Arc<M::ScopedRecord>),
 }
 
 /// An editable instance of a record which corresponds to a single transaction. Not updated with changes.
 /// Not able to be subscribed to.
-pub trait ScopedRecord: Any + Send + Sync + 'static {
+pub trait ScopedRecord<'trx> {
     // type Record: Record;
     fn id(&self) -> ID;
     fn bucket_name(&self) -> &'static str;
     fn backends(&self) -> &Backends;
 
-    fn to_erased_record(&self) -> ErasedRecord {
-        ErasedRecord::from_backends(self.id(), self.bucket_name(), self.backends().duplicate())
-    }
-    fn from_backends(id: ID, backends: Backends) -> Self
+    fn record_inner(&self) -> Arc<RecordInner>;
+    fn from_record_inner(inner: Arc<RecordInner>) -> Self
     where
         Self: Sized;
 
-    fn record_state(&self) -> anyhow::Result<RecordState>;
+    fn record_state(&self) -> anyhow::Result<RecordState> {
+        RecordState::from_backends(&self.backends())
+    }
     fn from_record_state(id: ID, record_state: &RecordState) -> Result<Self, RetrievalError>
     where
         Self: Sized;
 
-    fn get_record_event(&self) -> Option<RecordEvent>;
+    fn get_record_event(&self) -> Option<RecordEvent> {
+        self.record_inner().get_record_event()
+    }
     //fn apply_record_event(&self, record_event: &RecordEvent) -> Result<()>;
 
     fn as_dyn_any(&self) -> &dyn Any;

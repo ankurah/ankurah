@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     error::RetrievalError,
-    model::{ScopedRecord, ID},
+    model::{RecordInner, ScopedRecord, ID},
     Model, Node,
 };
 
@@ -14,16 +14,11 @@ use append_only_vec::AppendOnlyVec;
 pub struct Transaction {
     pub(crate) node: Arc<Node>, // only here for committing records to storage engine
 
-    records: AppendOnlyVec<Box<dyn ScopedRecord>>,
+    records: AppendOnlyVec<Arc<RecordInner>>,
 
     // markers
     implicit: bool,
     consumed: bool,
-}
-
-pub struct RecordAccessor<'trx, A> {
-    pub transaction: &'trx Transaction,
-    pub record: A,
 }
 
 impl Transaction {
@@ -37,21 +32,18 @@ impl Transaction {
     }
 
     /// Fetch a record already in the transaction.
-    pub fn fetch_record_from_transaction<A: Model>(&self, id: ID) -> Option<&A::ScopedRecord> {
-        let bucket = A::bucket_name();
-
+    pub fn fetch_record_from_transaction(
+        &self,
+        id: ID,
+        bucket_name: &'static str,
+    ) -> Option<Arc<RecordInner>> {
         for record in self.records.iter() {
             // TODO: Optimize this.
             // It shouldn't be a problem until we have a LOT of records but still
             // Probably just a hashing pre-check and then we retrieve it the same way
             // Either that or use a different append-only structure that uses hashing.
-            if record.id() == id && record.bucket_name() == bucket {
-                let upcast = record.as_dyn_any();
-                return Some(
-                    upcast
-                        .downcast_ref::<A::ScopedRecord>()
-                        .expect("Expected correct downcast"),
-                );
+            if record.id() == id && record.bucket_name() == bucket_name {
+                return Some(record.clone());
             }
         }
 
@@ -59,38 +51,39 @@ impl Transaction {
     }
 
     /// Fetch a record.
-    pub fn fetch_record<A: Model>(&self, id: ID) -> Result<&A::ScopedRecord, RetrievalError> {
-        if let Some(local) = self.fetch_record_from_transaction::<A>(id) {
+    pub fn fetch_record(
+        &self,
+        id: ID,
+        bucket_name: &'static str,
+    ) -> Result<Arc<RecordInner>, RetrievalError> {
+        if let Some(local) = self.fetch_record_from_transaction(id, bucket_name) {
             return Ok(local);
         }
 
-        let erased_record = self.node.fetch_erased(id, A::bucket_name())?;
-        let scoped_record = erased_record.into_scoped_record::<A>();
-
-        Ok(self.add_record::<A>(scoped_record))
+        let record_inner = self.node.fetch_record_inner(id, bucket_name)?;
+        self.add_record(record_inner.clone());
+        Ok(record_inner)
     }
 
-    pub fn add_record<M: Model>(&self, record: M::ScopedRecord) -> &M::ScopedRecord {
-        let index = self.records.push(Box::new(record));
-        let upcast = self.records[index].as_dyn_any();
-        upcast
-            .downcast_ref::<M::ScopedRecord>()
-            .expect("Expected correct downcast")
+    pub fn add_record(&self, record: Arc<RecordInner>) {
+        self.records.push(record);
     }
 
-    pub fn create<M: Model>(&self, model: &M) -> &M::ScopedRecord {
+    pub fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::ScopedRecord<'rec> {
         let id = self.node.next_id();
-        let new_record = <M as Model>::new_scoped_record(id, model);
-        let record_ref = self.add_record::<M>(new_record);
-        record_ref
+        let record_inner = Arc::new(model.new_record_inner(id));
+        self.add_record(record_inner.clone());
+        <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_inner)
     }
 
-    pub fn edit<M: Model>(
-        &self,
+    pub fn edit<'rec, 'trx: 'rec, M: Model>(
+        &'trx self,
         id: impl Into<ID>,
-    ) -> Result<&M::ScopedRecord, crate::error::RetrievalError> {
+    ) -> Result<M::ScopedRecord<'rec>, crate::error::RetrievalError> {
         let id = id.into();
-        self.fetch_record::<M>(id)
+        let record_inner = self.fetch_record(id, M::bucket_name())?;
+        self.add_record(record_inner.clone());
+        Ok(<M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_inner))
     }
 
     #[must_use]

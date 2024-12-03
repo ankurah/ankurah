@@ -66,24 +66,18 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn bucket_name() -> &'static str {
                 #name_str
             }
-            fn new_scoped_record(id: ankurah_core::ID, model: &Self) -> Self::ScopedRecord {
-                use ankurah_core::property::InitializeWith;
-
+            fn new_record_inner(id: ankurah_core::ID, model: &Self) -> Self::ScopedRecord {
                 let backends = ankurah_core::property::Backends::new();
-                #(
-                    let #field_names_avoid_conflicts = #field_active_values::initialize_with(&backends, #field_name_strs.into(), &model.#field_names);
-                )*
-                #scoped_record_name {
+                ankurah_core::model::RecordInner {
                     id: id,
                     backends: backends,
-                    #( #field_names: #field_names_avoid_conflicts, )*
                 }
             }
         }
 
         #[derive(Debug)]
         pub struct #record_name {
-            scoped: #scoped_record_name,
+            pub inner: Arc<ankurah_core::model::RecordInner>,
         }
 
         impl ankurah_core::model::Record for #record_name {
@@ -106,25 +100,14 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 trx.edit::<#name>(self.id())
             }
 
-            fn from_erased(erased: &ankurah_core::model::ErasedRecord) -> Self {
-                // TODO: This needs to have an internal Arc (for prettier API) and register that inner with the node
-                // to receive updates. Maybe that inner is just an ErasedRecord? If so, where do active subscriptions live?
-                
-                println!("blah 1");
+            fn from_record_inner(inner: Arc<ankurah_core::model::RecordInner>) -> Self {
                 #record_name {
-                    scoped: erased.into_scoped_record::<#name>(),
+                    inner: inner,
                 }
             }
         }
 
         impl #record_name {
-            pub fn new(node: &std::sync::Arc<ankurah_core::Node>, model: &#name) -> Self {
-                let next_id = node.next_id();
-                Self {
-                    scoped: <#name as ankurah_core::Model>::new_scoped_record(next_id, model),
-                }
-            }
-
             #(
                 #field_visibility fn #field_names(&self) -> #field_types {
                     let active = self.scoped.#field_names();
@@ -138,8 +121,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             // TODO: Invert Record and ScopedRecord so that ScopedRecord has an internal Record, and Record has id,backends, field projections
             // parent: RecordParent<#name>,
 
-            id: ankurah_core::ID,
-            backends: ankurah_core::property::Backends,
+            inner: RecordInner,
 
             // Field projections
             #(#field_visibility #field_names: #field_active_values,)*
@@ -155,21 +137,23 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self as std::sync::Arc<dyn std::any::Any + std::marker::Send + std::marker::Sync>
             }
 
-            fn from_backends(id: ankurah_core::ID, backends: ankurah_core::property::Backends) -> Self {
-                let test = backends.get::<ankurah_core::property::backend::YrsBackend>().unwrap();
-                println!("test: {:?}", test.get_string("name"));
+            fn from_record_inner(inner: std::sync::Arc<ankurah_core::model::RecordInner>) -> Self {
+                assert_eq!(inner.bucket_name, #name_str);
                 #(
-                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs.into(), &backends);
+                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs.into(), &inner.backends);
                 )*
                 Self {
-                    id: id,
-                    backends: backends,
+                    inner: inner,
                     #( #field_names: #field_names_avoid_conflicts, )*
                 }
             }
 
+            fn record_inner(&self) -> std::sync::Arc<ankurah_core::model::RecordInner> {
+                self.inner.clone()
+            }
+
             fn id(&self) -> ankurah_core::ID {
-                self.id
+                self.inner.id
             }
 
             fn bucket_name(&self) -> &'static str {
@@ -177,11 +161,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
             
             fn backends(&self) -> &ankurah_core::property::Backends {
-                &self.backends
-            }
-
-            fn record_state(&self) -> Result<ankurah_core::storage::RecordState> {
-                ankurah_core::storage::RecordState::from_backends(&self.backends)
+                &self.inner.backends
             }
 
             fn from_record_state(

@@ -3,7 +3,7 @@ use ulid::Ulid;
 use crate::{
     error::RetrievalError,
     event::Operation,
-    model::{ErasedRecord, Record, ID},
+    model::{Record, RecordInner, ID},
     property::backend::RecordEvent,
     storage::{Bucket, RecordState, StorageEngine},
     transaction::Transaction,
@@ -29,7 +29,7 @@ pub struct Node {
     // peer_connections: Vec<PeerConnection>,
 }
 
-type NodeRecords = BTreeMap<(ID, &'static str), Weak<ErasedRecord>>;
+type NodeRecords = BTreeMap<(ID, &'static str), Weak<RecordInner>>;
 
 impl Node {
     pub fn new(engine: Box<dyn StorageEngine>) -> Self {
@@ -84,7 +84,7 @@ impl Node {
         println!("node.commit_events");
         for record_event in events {
             // Apply record events to the Node's global records first.
-            let record = self.fetch_erased(record_event.id(), record_event.bucket_name())?;
+            let record = self.fetch_record_inner(record_event.id(), record_event.bucket_name())?;
             record.apply_record_event(record_event)?;
 
             let record_state = record.to_record_state()?;
@@ -110,7 +110,7 @@ impl Node {
     // ----  Node record management ----
     /// Add record to the node's list of records, if this returns false, then the erased record was already present.
     #[must_use]
-    pub(crate) fn add_record(&self, record: &Arc<ErasedRecord>) -> bool {
+    pub(crate) fn add_record(&self, record: &Arc<RecordInner>) -> bool {
         println!("node.add_record");
         // Assuming that we should propagate panics to the whole program.
         let mut records = self.records.write().unwrap();
@@ -136,7 +136,7 @@ impl Node {
         &self,
         id: ID,
         bucket_name: &'static str,
-    ) -> Option<Arc<ErasedRecord>> {
+    ) -> Option<Arc<RecordInner>> {
         let records = self.records.read().unwrap();
         if let Some(record) = records.get(&(id, bucket_name)) {
             record.upgrade()
@@ -145,31 +145,31 @@ impl Node {
         }
     }
 
-    /// Grab the record state if it exists and create a new [`ErasedRecord`] based on that.
+    /// Grab the record state if it exists and create a new [`RecordInner`] based on that.
     pub(crate) fn fetch_record_from_storage(
         &self,
         id: ID,
         bucket_name: &'static str,
-    ) -> Result<ErasedRecord, RetrievalError> {
+    ) -> Result<RecordInner, RetrievalError> {
         match self.get_record_state(id, bucket_name) {
             Ok(record_state) => {
                 println!("fetched record state: {:?}", record_state);
-                ErasedRecord::from_record_state(id, bucket_name, &record_state)
+                RecordInner::from_record_state(id, bucket_name, &record_state)
             }
             Err(RetrievalError::NotFound(id)) => {
                 println!("ID not found, creating new record");
-                Ok(ErasedRecord::new(id, bucket_name))
+                Ok(RecordInner::new(id, bucket_name))
             }
             Err(err) => Err(err),
         }
     }
 
     /// Fetch a record.
-    pub fn fetch_erased(
+    pub fn fetch_record_inner(
         &self,
         id: ID,
         bucket_name: &'static str,
-    ) -> Result<Arc<ErasedRecord>, RetrievalError> {
+    ) -> Result<Arc<RecordInner>, RetrievalError> {
         println!("fetch_record {:?}-{:?}", id, bucket_name);
         if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
             println!("passing ref to existing record");
@@ -183,7 +183,8 @@ impl Node {
             // We hit a small edge case where the record was fetched twice
             // at the same time and the other fetch added the record first.
             // So try this function again.
-            return self.fetch_erased(id, bucket_name);
+            // TODO: lock only once to prevent this?
+            return self.fetch_record_inner(id, bucket_name);
         }
 
         Ok(ref_record)
@@ -192,8 +193,8 @@ impl Node {
     pub fn get_record<R: Record>(&self, id: ID) -> Result<R, RetrievalError> {
         use crate::model::Model;
         let collection_name = R::Model::bucket_name();
-        let erased = &self.fetch_erased(id, collection_name)?;
-        Ok(R::from_erased(erased))
+        let record_inner = &self.fetch_record_inner(id, collection_name)?;
+        Ok(R::from_record_inner(record_inner))
     }
 }
 
