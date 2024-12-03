@@ -1,3 +1,4 @@
+pub mod effect;
 pub mod react_binding;
 
 // Re-export the ankurah-derive WasmSignal derive macro

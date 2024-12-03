@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useState } from 'react';
 import init_bindings, * as bindings from 'example-wasm-bindings';
 
 interface AppState {
@@ -12,7 +12,7 @@ export const useAppState = () => useContext(AppState);
 export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [appState, setAppState] = useState<AppState | null>(null);
 
-  useMemo(() => { // use useMemo to ensure that the client is only initialized once
+  useEffect(() => { // use useMemo to ensure that the client is only initialized once
     // React functional components are just classes with more steps. Change my mind
     // if (initializing) {
     //   return;

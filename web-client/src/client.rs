@@ -66,24 +66,28 @@ pub struct ConnectionStateSignal(reactive_graph::signal::ReadSignal<&'static str
 //     }
 // }
 
+#[cfg(feature = "react")]
 #[wasm_bindgen]
 impl ConnectionStateSignal {
     #[wasm_bindgen(js_name = "subscribe")]
     pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_wasm_signal::Subscription {
-        let signal = self.0;
-        let effect = Effect::new(move |_| {
-            let value = signal.get();
-            let js_value = wasm_bindgen::JsValue::from_str(value);
-            callback
-                .call1(&wasm_bindgen::JsValue::NULL, &js_value)
-                .unwrap();
-        });
+        //     let signal = self.0;
+        //     let effect = Effect::new(move |_| {
+        //         let value = signal.get();
+        //         let js_value = wasm_bindgen::JsValue::from_str(value);
+        //         callback
+        //             .call1(&wasm_bindgen::JsValue::NULL, &js_value)
+        //             .unwrap();
+        //     });
 
-        ankurah_wasm_signal::Subscription::new(effect)
+        //     ankurah_wasm_signal::Subscription::new(effect)
+
+        unimplemented!()
     }
 
     #[wasm_bindgen(getter)]
     pub fn value(&self) -> String {
+        log::info!("ConnectionStateSignal value");
         self.0.get().to_string()
     }
 }
@@ -102,7 +106,6 @@ pub struct Client {
 #[wasm_bindgen]
 impl Client {
     pub fn new() -> Result<Client, JsValue> {
-        let _ = any_spawner::Executor::init_wasm_bindgen();
         let inner = Rc::new(ClientInner {
             connection: RefCell::new(None),
             state: reactive_graph::signal::RwSignal::new(ConnectionState::None.str()),
@@ -152,8 +155,9 @@ impl ClientInner {
         info!("Connecting to websocket");
 
         Effect::new(move |_| {
+            log::info!("connect mark 1");
             let connection_state = state.get();
-            info!("connect: state changed to {:?}", connection_state);
+            log::info!("connect mark 2: state changed to {:?}", connection_state);
             let state_ref: &'static str = connection_state.str();
             client_inner.state.set(state_ref);
 
