@@ -55,6 +55,14 @@ impl PNBackend {
         }
     }
 
+    pub fn get(&self, property_name: PropertyName) -> i64 {
+        let values = self.values.read().unwrap();
+        values
+            .get(&property_name)
+            .map(|pnvalue| pnvalue.value)
+            .unwrap_or(0)
+    }
+
     pub fn add(&self, property_name: PropertyName, amount: i64) {
         let values = self.values.write().unwrap();
         Self::add_raw(values, property_name, amount);

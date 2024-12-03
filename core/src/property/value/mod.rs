@@ -1,7 +1,9 @@
-pub mod yrs;
 pub mod lww;
-pub use yrs::YrsString;
+pub mod pn_counter;
+pub mod yrs;
 pub use lww::LWW;
+pub use pn_counter::PNCounter;
+pub use yrs::YrsString;
 
 pub trait ProjectedValue {
     type Projected;

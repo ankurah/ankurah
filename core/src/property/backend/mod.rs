@@ -6,10 +6,10 @@ use std::{
 };
 
 pub mod lww;
-pub mod pncounter;
+pub mod pn_counter;
 pub mod yrs;
 pub use lww::LWWBackend;
-pub use pncounter::PNBackend;
+pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
 
 use crate::{error::RetrievalError, storage::RecordState, ID};
