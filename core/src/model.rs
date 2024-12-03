@@ -115,17 +115,17 @@ impl RecordInner {
         Ok(Self::from_backends(id, bucket_name, backends))
     }
 
-    pub fn get_record_event(&self) -> Option<RecordEvent> {
+    pub fn get_record_event(&self) -> Result<Option<RecordEvent>> {
         let record_event = RecordEvent {
             id: self.id(),
             bucket_name: self.bucket_name(),
-            operations: self.backends.to_operations(),
+            operations: self.backends.to_operations()?,
         };
 
         if record_event.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(record_event)
+            Ok(Some(record_event))
         }
     }
 
@@ -171,7 +171,7 @@ pub trait ScopedRecord<'rec> {
         RecordState::from_backends(&self.backends())
     }
 
-    fn record_event(&self) -> Option<RecordEvent> {
+    fn record_event(&self) -> anyhow::Result<Option<RecordEvent>> {
         self.record_inner().get_record_event()
     }
     //fn apply_record_event(&self, record_event: &RecordEvent) -> Result<()>;

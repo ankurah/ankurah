@@ -97,11 +97,12 @@ impl Transaction {
         println!("trx.commit_mut_ref");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
-        let record_events = self
-            .records
-            .iter()
-            .filter_map(|record| record.get_record_event())
-            .collect::<Vec<_>>();
+        let mut record_events = Vec::new();
+        for record in self.records.iter() {
+            if let Some(record_event) = record.get_record_event()? {
+                record_events.push(record_event);
+            }
+        }
 
         println!("record_events: {:?}", record_events);
 

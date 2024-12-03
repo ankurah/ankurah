@@ -6,14 +6,16 @@ use std::{
 };
 
 pub mod lww;
+pub mod pncounter;
 pub mod yrs;
 pub use lww::LWWBackend;
-use serde::{Deserialize, Serialize};
+pub use pncounter::PNBackend;
 pub use yrs::YrsBackend;
 
 use crate::{error::RetrievalError, storage::RecordState, ID};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
@@ -36,7 +38,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Retrieve operations applied to this backend since the last time we called this method.
     // TODO: Should this take a precursor id?
-    fn to_operations(&self /*precursor: ULID*/) -> Vec<Operation>;
+    fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<Operation>>;
     fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()>;
 }
 
@@ -204,14 +206,14 @@ impl Backends {
         Ok(backends)
     }
 
-    pub fn to_operations(&self) -> BTreeMap<String, Vec<Operation>> {
+    pub fn to_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>> {
         let backends = self.backends.lock().unwrap();
         let mut operations = BTreeMap::<String, Vec<Operation>>::new();
         for (name, backend) in &*backends {
-            operations.insert(name.clone(), backend.to_operations());
+            operations.insert(name.clone(), backend.to_operations()?);
         }
 
-        operations
+        Ok(operations)
     }
 
     pub fn apply_operations(

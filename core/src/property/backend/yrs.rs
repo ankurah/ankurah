@@ -103,7 +103,7 @@ impl PropertyBackend for YrsBackend {
         })
     }
 
-    fn to_operations(&self /*precursor: ULID*/) -> Vec<Operation> {
+    fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<Operation>> {
         let mut operations = Vec::new();
 
         let mut previous_state = self.previous_state.lock().unwrap();
@@ -116,7 +116,7 @@ impl PropertyBackend for YrsBackend {
             operations.push(Operation { diff: diff })
         }
 
-        operations
+        Ok(operations)
     }
 
     fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()> {

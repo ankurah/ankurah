@@ -8,13 +8,11 @@ use std::{
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::property::PropertyName;
-
-use super::PropertyBackend;
+use crate::property::{backend::PropertyBackend, PropertyName};
 
 #[derive(Clone, Debug)]
 pub struct LWWBackend {
-    // TODO: store a timestamp at time of setting value (or maybe when we commit?).
+    // TODO: store a timestamp/precursor id at time of setting value (or maybe when we commit?).
     values: Arc<RwLock<BTreeMap<PropertyName, Vec<u8>>>>,
 }
 
@@ -84,7 +82,7 @@ impl PropertyBackend for LWWBackend {
         })
     }
 
-    fn to_operations(&self /*precursor: ULID*/) -> Vec<super::Operation> {
+    fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<super::Operation>> {
         todo!()
     }
 
