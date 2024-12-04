@@ -1,4 +1,4 @@
-// use ankurah_react_signals::WasmSignal;
+use ankurah_react_signals::WasmSignal;
 
 use gloo_timers::future::sleep;
 use log::info;
@@ -17,7 +17,7 @@ use reactive_graph::effect::Effect;
 const MAX_RECONNECT_DELAY: u64 = 10000;
 
 #[wasm_bindgen]
-#[derive(Clone, Copy, PartialEq, Debug /* , WasmSignal*/)]
+#[derive(Clone, Copy, PartialEq, Debug, WasmSignal)]
 pub enum ConnectionState {
     None,
     Connecting,
@@ -50,52 +50,10 @@ impl ConnectionState {
     }
 }
 
-// #[wasm_bindgen]
-// impl ConnectionState {
-//     pub fn display(&self) -> String {
-//         format!("{:?}", self)
-//     }
-// }
-
-#[wasm_bindgen]
-pub struct ConnectionStateSignal(reactive_graph::signal::ReadSignal<&'static str>);
-
-// impl ConnectionStateSignal {
-//     pub fn new(signal: Box<dyn ::futures_signals::signal::Signal<Item = ConnectionState>>) -> Self {
-//         Self(signal)
-//     }
-// }
-
-#[cfg(feature = "react")]
-#[wasm_bindgen]
-impl ConnectionStateSignal {
-    #[wasm_bindgen(js_name = "subscribe")]
-    pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_react_signals::Subscription {
-        //     let signal = self.0;
-        //     let effect = Effect::new(move |_| {
-        //         let value = signal.get();
-        //         let js_value = wasm_bindgen::JsValue::from_str(value);
-        //         callback
-        //             .call1(&wasm_bindgen::JsValue::NULL, &js_value)
-        //             .unwrap();
-        //     });
-
-        //     ankurah_react_signals::Subscription::new(effect)
-
-        unimplemented!()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn value(&self) -> String {
-        log::info!("ConnectionStateSignal value");
-        self.0.get().to_string()
-    }
-}
-
 struct ClientInner {
     server_url: String,
     connection: RefCell<Option<Connection>>,
-    state: reactive_graph::signal::RwSignal<&'static str>,
+    state: reactive_graph::signal::RwSignal<ConnectionState>,
 }
 
 #[wasm_bindgen]
@@ -112,7 +70,7 @@ impl Client {
         let inner = Rc::new(ClientInner {
             server_url: server_url.to_string(),
             connection: RefCell::new(None),
-            state: reactive_graph::signal::RwSignal::new(ConnectionState::None.str()),
+            state: reactive_graph::signal::RwSignal::new(ConnectionState::None),
         });
 
         inner.connect(0)?;
@@ -144,7 +102,7 @@ impl Client {
 }
 
 impl Client {
-    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<&'static str> {
+    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> {
         self.inner.state.read_only()
     }
 }
@@ -155,7 +113,7 @@ impl ClientInner {
         let state = connection.state.clone();
         *self.connection.borrow_mut() = Some(connection);
 
-        self.state.set(ConnectionState::Connecting.str());
+        self.state.set(ConnectionState::Connecting);
         let client_inner = Rc::clone(self);
         let self2 = self.clone();
 
@@ -165,8 +123,7 @@ impl ClientInner {
             log::info!("connect mark 1");
             let connection_state = state.get();
             log::info!("connect mark 2: state changed to {:?}", connection_state);
-            let state_ref: &'static str = connection_state.str();
-            client_inner.state.set(state_ref);
+            client_inner.state.set(connection_state);
 
             match connection_state {
                 ConnectionState::Open => {

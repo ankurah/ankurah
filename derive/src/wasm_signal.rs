@@ -12,51 +12,37 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
     // Generate the wrapper struct name
     let wrapper_name = Ident::new(&format!("{}Signal", name), name.span());
+    println!("wrapper_name: {}", wrapper_name);
 
     // Generate the code
     let expanded = quote! {
         #[::wasm_bindgen::prelude::wasm_bindgen]
-        pub struct #wrapper_name {
-            inner: ::std::rc::Rc<::std::cell::RefCell<::std::boxed::Box<dyn ::futures_signals::signal::Signal<Item = #name>>>>,
-        }
+        pub struct #wrapper_name( ::reactive_graph::signal::ReadSignal<#name> );
 
-        // #[::wasm_bindgen::prelude::wasm_bindgen]
+        #[::wasm_bindgen::prelude::wasm_bindgen]
         impl #wrapper_name {
-            fn new<S>(signal: S) -> Self
-            where
-                S: ::futures_signals::signal::Signal<Item = #name> + 'static,
-            {
-                Self {
-                    inner: ::std::rc::Rc::new(::std::cell::RefCell::new(::std::boxed::Box::new(signal))),
-                }
+            fn new(signal: ::reactive_graph::signal::ReadSignal<#name>) -> Self {
+                Self(signal)
             }
 
-            // #[::wasm_bindgen::prelude::wasm_bindgen]
-            pub fn for_each(&self, callback: ::js_sys::Function) -> ::ankurah_react_signals::Subscription {
-                let signal = ::std::rc::Rc::clone(&self.inner);
-                let callback = ::std::rc::Rc::new(callback);
-
-                let (abort_handle, abort_registration) = ::futures::future::AbortHandle::new_pair();
-
-                let future = {
-                    let callback = callback.clone();
-                    let signal = (*signal.borrow()).as_ref();
-
-                    let stream_future = signal.for_each(move |value| {
-                        let this = ::wasm_bindgen::JsValue::NULL;
-                        let js_value = ::wasm_bindgen::JsValue::from(value);
-                        callback.call1(&this, &js_value).unwrap();
-                        ::futures::future::ready(())
-                    });
-
-                    ::futures::future::Abortable::new(stream_future, abort_registration)
-                };
-
-                ::wasm_bindgen_futures::spawn_local(async move {
-                    let _ = future.await;
+            #[::wasm_bindgen::prelude::wasm_bindgen]
+            #[wasm_bindgen(js_name = "subscribe")]
+            pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_react_signals::Subscription {
+                let signal = self.0;
+                let effect = Effect::new(move |_| {
+                    let value = signal.get();
+                    // let js_value = wasm_bindgen::JsValue::from_str(value);
+                    callback
+                        .call1(&wasm_bindgen::JsValue::NULL, &value.into())
+                        .unwrap();
                 });
 
-                ::ankurah_react_signals::Subscription::new(callback, abort_handle)
+                ankurah_react_signals::Subscription::new(effect)
+            }
+
+            #[wasm_bindgen(getter)]
+            pub fn value(&self) -> #name {
+                self.0.get()
             }
         }
     };
