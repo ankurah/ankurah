@@ -1,5 +1,5 @@
 [package]
-name = "ankurah-wasm-signal"
+name = "ankurah-react-signals"
 version = "0.1.0"
 edition = "2021"
 

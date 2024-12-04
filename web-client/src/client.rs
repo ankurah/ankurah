@@ -1,4 +1,4 @@
-// use ankurah_wasm_signal::WasmSignal;
+// use ankurah_react_signals::WasmSignal;
 
 use gloo_timers::future::sleep;
 use log::info;
@@ -70,7 +70,7 @@ pub struct ConnectionStateSignal(reactive_graph::signal::ReadSignal<&'static str
 #[wasm_bindgen]
 impl ConnectionStateSignal {
     #[wasm_bindgen(js_name = "subscribe")]
-    pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_wasm_signal::Subscription {
+    pub fn js_subscribe(&self, callback: js_sys::Function) -> ankurah_react_signals::Subscription {
         //     let signal = self.0;
         //     let effect = Effect::new(move |_| {
         //         let value = signal.get();
@@ -80,7 +80,7 @@ impl ConnectionStateSignal {
         //             .unwrap();
         //     });
 
-        //     ankurah_wasm_signal::Subscription::new(effect)
+        //     ankurah_react_signals::Subscription::new(effect)
 
         unimplemented!()
     }

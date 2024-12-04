@@ -32,7 +32,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
             }
 
             // #[::wasm_bindgen::prelude::wasm_bindgen]
-            pub fn for_each(&self, callback: ::js_sys::Function) -> ::ankurah_wasm_signal::Subscription {
+            pub fn for_each(&self, callback: ::js_sys::Function) -> ::ankurah_react_signals::Subscription {
                 let signal = ::std::rc::Rc::clone(&self.inner);
                 let callback = ::std::rc::Rc::new(callback);
 
@@ -56,7 +56,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
                     let _ = future.await;
                 });
 
-                ::ankurah_wasm_signal::Subscription::new(callback, abort_handle)
+                ::ankurah_react_signals::Subscription::new(callback, abort_handle)
             }
         }
     };

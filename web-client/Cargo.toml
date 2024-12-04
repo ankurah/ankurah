@@ -9,12 +9,12 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-react = ["ankurah-wasm-signal"]
+react = ["ankurah-react-signals"]
 
 [dependencies]
 ankurah-proto = { path = "../proto" }
 
-ankurah-wasm-signal = { path = "../wasm-signal", optional = true }
+ankurah-react-signals = { path = "../react-signals", optional = true }
 wasm-bindgen = "0.2.84"
 futures = "0.3.30"
 js-sys = "0.3.69"

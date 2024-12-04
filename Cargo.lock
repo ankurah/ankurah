@@ -86,6 +86,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-react-signals"
+version = "0.1.0"
+dependencies = [
+ "ankurah-derive",
+ "any_spawner",
+ "futures",
+ "futures-signals",
+ "js-sys",
+ "log",
+ "or_poisoned 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reactive_graph",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "ankurah-server"
 version = "0.1.0"
 dependencies = [
@@ -114,27 +130,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ankurah-wasm-signal"
-version = "0.1.0"
-dependencies = [
- "ankurah-derive",
- "any_spawner",
- "futures",
- "futures-signals",
- "js-sys",
- "log",
- "or_poisoned 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "reactive_graph",
- "wasm-bindgen",
- "wasm-bindgen-futures",
-]
-
-[[package]]
 name = "ankurah-web-client"
 version = "0.1.0"
 dependencies = [
  "ankurah-proto",
- "ankurah-wasm-signal",
+ "ankurah-react-signals",
  "any_spawner",
  "bincode",
  "futures",

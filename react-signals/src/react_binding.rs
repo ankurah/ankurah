@@ -23,14 +23,14 @@ extern "C" {
 // Substantially an homage to https://github.com/preactjs/signals/blob/main/packages/react/runtime/src/auto.ts
 // TODO need to get fancier with this, probably by hooking into the react internals, similar technique to preact-signals
 // For now it works, but the render cycle start/finish is thrashy:
-// INFO wasm-signal/src/react_binding.rs:65 effectstore new
-// example_wasm_bindings_bg.wasm:0x78592 INFO wasm-signal/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO wasm-signal/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO wasm-signal/src/react_binding.rs:95 effectstore finish
-// example_wasm_bindings_bg.wasm:0x78592 INFO wasm-signal/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO wasm-signal/src/react_binding.rs:95 effectstore finish
-// example_wasm_bindings_bg.wasm:0x78592 INFO wasm-signal/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO wasm-signal/src/react_binding.rs:95 effectstore finish
+// INFO react-signals/src/react_binding.rs:65 effectstore new
+// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
+// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
+// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:95 effectstore finish
+// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
+// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:95 effectstore finish
+// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
+// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:95 effectstore finish
 
 /// Creates a subscription to track signal usage within a React component.
 ///
