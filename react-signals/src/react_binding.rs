@@ -60,7 +60,6 @@ extern "C" {
 /// WebAssembly-based signal integration with React
 #[wasm_bindgen(js_name = useSignals)]
 pub fn use_signals() -> JsValue {
-    log::info!("useSignals");
     let ref_value = useRef();
 
     let mut store = js_sys::Reflect::get(&ref_value, &"current".into()).unwrap();
@@ -77,7 +76,6 @@ pub fn use_signals() -> JsValue {
         js_sys::Reflect::set(&ref_value, &"current".into(), &store).unwrap();
     } else {
         let ptr = js_sys::Reflect::get(&store, &JsValue::from_str("__wbg_ptr")).unwrap();
-        log::info!("ptr: {:?}", store);
         let store = {
             // workaround for lack of downcasting in wasm-bindgen
             // https://github.com/rustwasm/wasm-bindgen/pull/3088
@@ -119,8 +117,6 @@ thread_local! {
 
 impl EffectStore {
     pub fn new() -> Self {
-        log::info!("effectstore new");
-
         // Necessary for hooking into the react render cycle
         let version = Arc::new(AtomicU64::new(0));
         let (sender, rx) = crate::effect::channel::channel();
@@ -145,24 +141,16 @@ impl EffectStore {
 
                     async move {
                         while rx.next().await.is_some() {
-                            log::info!("effectstore rx next");
-                            if subscriber.with_observer(|| subscriber.update_if_necessary()) {
+                            // Do we need to call with_observer here? I can't see why
+                            // if subscriber.with_observer(|| subscriber.update_if_necessary())
+                            if subscriber.update_if_necessary() {
                                 subscriber.clear_sources(&subscriber);
-                                log::info!("effectstore rx clear_sources");
                                 on_store_change.call0(&JsValue::NULL).unwrap();
-                                // let old_value = mem::take(
-                                //     &mut *value.write().or_poisoned(),
-                                // );
-                                // let new_value = owner.with_cleanup(|| {
-                                //     subscriber.with_observer(|| fun(old_value))
-                                // });
-                                // *value.write().or_poisoned() = Some(new_value);
                             }
                         }
                     }
                 });
 
-                log::info!("effectstore on_change_notify");
                 version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 // TODO: return unsubscribe closure
@@ -174,7 +162,6 @@ impl EffectStore {
 
             Closure::wrap(Box::new(move || {
                 let version = version.load(std::sync::atomic::Ordering::Relaxed);
-                log::info!("effectstore get_snapshot {}", version);
                 JsValue::from(version)
             }) as Box<dyn Fn() -> JsValue>)
         };
@@ -192,12 +179,9 @@ impl EffectStore {
 #[wasm_bindgen]
 impl EffectStore {
     pub fn start(&self) {
-        log::info!("effectstore start");
-        // self.0.tracker.update_if_necessary();
         reactive_graph::graph::Observer::set(Some(self.0.tracker.to_any_subscriber()));
     }
     pub fn finish(&self) {
-        log::info!("effectstore finish");
         reactive_graph::graph::Observer::set(None);
     }
 }
@@ -216,12 +200,9 @@ struct TrackerState {
 }
 
 impl ReactiveNode for TrackerInner {
-    fn mark_subscribers_check(&self) {
-        log::info!("effectstore mark_subscribers_check");
-    }
+    fn mark_subscribers_check(&self) {}
 
     fn update_if_necessary(&self) -> bool {
-        log::info!("effectstore update_if_necessary");
         let mut guard = self.0.write().or_poisoned();
         let (is_dirty, sources) = (guard.dirty, (!guard.dirty).then(|| guard.sources.clone()));
 
@@ -240,12 +221,10 @@ impl ReactiveNode for TrackerInner {
     }
 
     fn mark_check(&self) {
-        log::info!("effectstore mark_check");
         self.0.write().or_poisoned().notifier.notify();
     }
 
     fn mark_dirty(&self) {
-        log::info!("effectstore mark_dirty");
         let mut lock = self.0.write().or_poisoned();
         lock.dirty = true;
         lock.version
@@ -256,12 +235,10 @@ impl ReactiveNode for TrackerInner {
 
 impl Subscriber for TrackerInner {
     fn add_source(&self, source: AnySource) {
-        log::info!("effectstore add_source");
         self.0.write().or_poisoned().sources.insert(source);
     }
 
     fn clear_sources(&self, subscriber: &AnySubscriber) {
-        log::info!("effectstore clear_sources");
         self.0
             .write()
             .or_poisoned()
