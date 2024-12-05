@@ -32,9 +32,9 @@ pub struct Node {
 type NodeRecords = BTreeMap<(ID, &'static str), Weak<RecordInner>>;
 
 impl Node {
-    pub fn new(engine: Box<dyn StorageEngine>) -> Self {
+    pub fn new(engine: impl StorageEngine + 'static) -> Self {
         Self {
-            storage_engine: engine,
+            storage_engine: Box::new(engine),
             collections: RwLock::new(BTreeMap::new()),
             records: Arc::new(RwLock::new(BTreeMap::new())),
             // peer_connections: Vec::new(),

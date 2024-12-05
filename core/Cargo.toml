@@ -5,8 +5,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["derive"]
+default = ["derive", "postgres"]
 derive = ["ankurah-derive"]
+postgres = ["tokio-postgres"]
 
 [dependencies]
 anyhow = "1.0.89"
@@ -27,7 +28,7 @@ yrs = "0.21.2"
 
 # Storage engines
 sled = "0.34.7"
-postgres = "0.19"
+tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]
 ankurah-derive = { path = "../derive" }

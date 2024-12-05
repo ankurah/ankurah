@@ -3,7 +3,7 @@ use crate::{
     storage::{RecordState, StorageBucket, StorageEngine},
 };
 
-use postgres::Client;
+use tokio_postgres::Client;
 
 pub struct PostgresStorageEngine {
     // TODO: the rest of the owl

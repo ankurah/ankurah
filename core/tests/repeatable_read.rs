@@ -22,7 +22,7 @@ pub struct Album {
 
 #[test]
 fn repeatable_read() -> Result<()> {
-    let client = Arc::new(Node::new(Box::new(SledStorageEngine::new().unwrap())));
+    let client = Arc::new(Node::new(SledStorageEngine::new().unwrap()));
 
     let id;
     {
