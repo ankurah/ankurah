@@ -1,58 +1,13 @@
-// Trimmed down version of https://github.com/pest-parser/pest/blob/master/grammars/src/grammars/sql.pest
+// Stripped down version of the SQL grammar focusing on Selection
+// From https://raw.githubusercontent.com/pest-parser/pest/refs/heads/master/grammars/src/grammars/sql.pest
 
-Query = { (SelectWithOptionalContinuation | Values | Insert | Update | Delete) }
-    SelectWithOptionalContinuation = { Select ~ (ExceptContinuation | UnionAllContinuation)? }
-        ExceptContinuation   = { ((^"except" ~ ^"distinct") | ^"except") ~ Select }
-        UnionAllContinuation = { ^"union" ~ ^"all" ~ Select }
-    Select = {
-        ^"select" ~ Projection ~ ^"from" ~ Scan ~
-        Join? ~ WhereClause? ~
-        (^"group" ~ ^"by" ~ GroupBy)? ~
-        (^"having" ~ Having)?
-    }
-        Projection = { Distinct? ~ ProjectionElement ~ ("," ~ ProjectionElement)* }
-            ProjectionElement = _{ Asterisk | Column }
-            Column = { Expr ~ ((^"as")? ~ Identifier)? }
-            Asterisk = { "*" }
-        WhereClause = _{ ^"where" ~ Selection }
-        Selection = { Expr }
-        Scan = { (Identifier | SubQuery) ~ ((^"as")? ~ Identifier)? }
-        Join = { JoinKind? ~ ^"join" ~ Scan ~ ^"on" ~ Expr }
-            JoinKind = _{ ( InnerJoinKind | LeftJoinKind ) }
-                InnerJoinKind = { ^"inner" }
-                LeftJoinKind = { ^"left" ~ (^"outer")? }
-        GroupBy = { Expr ~ ("," ~ Expr)* }
-        Having = { Expr }
-    SubQuery = { "(" ~ (SelectWithOptionalContinuation | Values) ~ ")" }
-    Insert = { ^"insert" ~ ^"into" ~ Identifier ~ ("(" ~ TargetColumns ~ ")")? ~ (Values | Select) ~ OnConflict? }
-        TargetColumns = { Identifier ~ ("," ~ Identifier)* }
-        OnConflict = _{ ^"on conflict" ~ ^"do" ~ (DoNothing | DoReplace | DoFail) }
-        DoReplace = { ^"replace" }
-        DoNothing = { ^"nothing" }
-        DoFail = { ^"fail" }
-    Update = { ^"update" ~ Identifier ~ ^"set" ~ UpdateList ~ (UpdateFrom | WhereClause)? }
-        UpdateList = { UpdateItem ~ ("," ~ UpdateItem)* }
-        UpdateItem = { Identifier ~ "=" ~ Expr }
-        UpdateFrom = _{ ^"from" ~ Scan ~ (^"where" ~ Expr)? }
-    Values = { ^"values" ~ Row ~ ("," ~ Row)* }
-    Delete = { ^"delete" ~ ^"from" ~ Identifier ~ (^"where" ~ DeleteFilter)? }
-    	DeleteFilter = { Expr }
-
-Identifier = @{ DoubleQuotedIdentifier | IdentifierInner  }
-    DoubleQuotedIdentifier = @{ ("\"" ~ IdentifierInner ~ "\"") }
-    IdentifierInner = @{ !(Keyword ~ ("(" | WHITESPACE | "," | EOF)) ~ (IdentifierNonDigit ~ (IdentifierNonDigit | ASCII_DIGIT)*) }
-        IdentifierNonDigit = _{ ('a'..'z' | 'A' .. 'Z' | 'А' .. 'Я' | 'а' .. 'я' | "-" | "_") }
-    Keyword = { ^"left" | ^"having" | ^"not" | ^"inner" | ^"group"
-                | ^"on" | ^"join" | ^"from" | ^"exists" | ^"except"
-                | ^"union" | ^"where" | ^"distinct" | ^"between" | ^"option"
-                | ^"values"}
+Selection = _{ SOI ~ Expr ~ EOI }
 
 Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
-    ExprInfixOp = _{ Between | ArithInfixOp | CmpInfixOp | ConcatInfixOp | And | Or }
+    ExprInfixOp = _{ Between | ArithInfixOp | CmpInfixOp | And | Or }
         Between       = { NotFlag? ~ ^"between" }
         And           = { ^"and" }
         Or            = { ^"or" }
-        ConcatInfixOp = { "||" }
         ArithInfixOp  = _{ Add | Subtract | Multiply | Divide }
             Add      = { "+" }
             Subtract = { "-" }
@@ -69,7 +24,7 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
     ExprAtomValue = _{ UnaryNot* ~ AtomicExpr ~ IsNullPostfix? }
         UnaryNot   = @{ NotFlag }
         IsNullPostfix = { ^"is" ~ NotFlag? ~ ^"null" }
-        AtomicExpr = _{ Literal | Parameter | Cast | IdentifierWithOptionalContinuation | ExpressionInParentheses | UnaryOperator | SubQuery | Row }
+        AtomicExpr = _{ Literal | IdentifierWithOptionalContinuation | ExpressionInParentheses }
             Literal = _{ True | False | Null | Double | Decimal | Unsigned | Integer | SingleQuotedString }
                 True     = { ^"true" }
                 False    = { ^"false" }
@@ -81,35 +36,19 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
                 SingleQuotedString = @{ OnlyQuotesSequence | AnythingButQuotesSequence }
                     OnlyQuotesSequence = @{ ("'" ~ "'")+ }
                     AnythingButQuotesSequence = @{ "'" ~ (!("'") ~ ANY)* ~ "'" }
-            Parameter = { PgParameter | QuestionParameter }
-                QuestionParameter = @{ "?" }
-                PgParameter = { "$" ~ Unsigned }
-            IdentifierWithOptionalContinuation = { Identifier ~ (ReferenceContinuation | FunctionInvocationContinuation)? }
+            IdentifierWithOptionalContinuation = { Identifier ~ (ReferenceContinuation)? }
                 ReferenceContinuation          = { "." ~ Identifier }
-                FunctionInvocationContinuation = { "(" ~ (CountAsterisk | FunctionArgs)? ~ ")" }
-                    FunctionArgs = { Distinct? ~ (Expr ~ ("," ~ Expr)*)? }
-                    CountAsterisk = { "*" }
             ExpressionInParentheses = { "(" ~ Expr ~ ")" }
-            Cast = { ^"cast" ~ "(" ~ Expr ~ ^"as" ~ TypeCast ~ ")" }
-                TypeCast = _{ TypeAny | ColumnDefType }
-                ColumnDefType = { TypeBool | TypeDecimal | TypeDouble | TypeInt | TypeNumber
-                                   | TypeScalar | TypeString | TypeText | TypeUnsigned | TypeVarchar }
-                    TypeAny = { ^"any" }
-                    TypeBool = { (^"boolean" | ^"bool") }
-                    TypeDecimal = { ^"decimal" }
-                    TypeDouble = { ^"double" }
-                    TypeInt = { (^"integer" | ^"int") }
-                    TypeNumber = { ^"number" }
-                    TypeScalar = { ^"scalar" }
-                    TypeString = { ^"string" }
-                    TypeText = { ^"text" }
-                    TypeUnsigned = { ^"unsigned" }
-                    TypeVarchar = { ^"varchar" ~ "(" ~ Unsigned ~ ")" }
-            UnaryOperator = _{ Exists }
-                Exists = { NotFlag? ~ ^"exists" ~ SubQuery }
-            Row = { "(" ~ Expr ~ ("," ~ Expr)* ~ ")" }
 
-Distinct = { ^"distinct" }
+Identifier = @{ DoubleQuotedIdentifier | IdentifierInner  }
+    DoubleQuotedIdentifier = @{ ("\"" ~ IdentifierInner ~ "\"") }
+    IdentifierInner = @{ !(Keyword ~ ("(" | WHITESPACE | "," | EOF)) ~ (IdentifierNonDigit ~ (IdentifierNonDigit | ASCII_DIGIT)*) }
+        IdentifierNonDigit = _{ ('a'..'z' | 'A' .. 'Z' | 'А' .. 'Я' | 'а' .. 'я' | "-" | "_") }
+    Keyword = { ^"left" | ^"having" | ^"not" | ^"inner" | ^"group"
+                | ^"on" | ^"join" | ^"from" | ^"exists" | ^"except"
+                | ^"union" | ^"where" | ^"distinct" | ^"between" | ^"option"
+                | ^"values"}
+
 NotFlag = { ^"not" }
 EOF = { EOI | ";" }
 WHITESPACE = _{ " " | "\t" | "\n" | "\r\n" }
