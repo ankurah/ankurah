@@ -6,3 +6,5 @@
 //! <hr/>
 //!
 //! If this pans out, we might someday consider a more complete implementation and ISO/IEC 39075:2024 compliance.
+
+pub mod grammar;
