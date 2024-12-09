@@ -95,13 +95,18 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, Box<dyn Error
     while let Some(op) = pairs.next() {
         let right = pairs.next().ok_or(ParseError::MissingOperand("right"))?;
         result = match op.as_rule() {
-            grammar::Rule::Eq => create_comparison(result, right)?,
+            grammar::Rule::Eq
+            | grammar::Rule::GtEq
+            | grammar::Rule::Gt
+            | grammar::Rule::LtEq
+            | grammar::Rule::Lt
+            | grammar::Rule::NotEq => create_comparison(result, op.as_rule(), right)?,
             grammar::Rule::And | grammar::Rule::Or => {
                 create_logical_op(op.as_rule(), result, right, &mut pairs)?
             }
             _ => {
                 return Err(Box::new(ParseError::UnexpectedRule {
-                    expected: "Eq, And, or Or",
+                    expected: "comparison operator, And, or Or",
                     got: op.as_rule(),
                 }));
             }
@@ -114,12 +119,27 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, Box<dyn Error
 /// Create a comparison predicate from a left expression and a right pair
 fn create_comparison(
     left: ast::Expr,
+    op: grammar::Rule,
     right: Pair<grammar::Rule>,
 ) -> Result<ast::Expr, Box<dyn Error>> {
     let right_expr = parse_atomic_expr(right)?;
+    let operator = match op {
+        grammar::Rule::Eq => ast::ComparisonOperator::Equal,
+        grammar::Rule::GtEq => ast::ComparisonOperator::GreaterThanOrEqual,
+        grammar::Rule::Gt => ast::ComparisonOperator::GreaterThan,
+        grammar::Rule::LtEq => ast::ComparisonOperator::LessThanOrEqual,
+        grammar::Rule::Lt => ast::ComparisonOperator::LessThan,
+        grammar::Rule::NotEq => ast::ComparisonOperator::NotEqual,
+        _ => {
+            return Err(Box::new(ParseError::UnexpectedRule {
+                expected: "comparison operator",
+                got: op,
+            }));
+        }
+    };
     Ok(ast::Expr::Predicate(ast::Predicate::Comparison {
         left: Box::new(left),
-        operator: ast::ComparisonOperator::Equal,
+        operator,
         right: Box::new(right_expr),
     }))
 }
@@ -136,21 +156,37 @@ fn create_logical_op(
     // Parse the right side, which might be part of a comparison
     let right_expr = parse_atomic_expr(right)?;
     let right_pred = if let Some(next_op) = rest.next() {
-        if next_op.as_rule() == grammar::Rule::Eq {
-            let next_right = rest
-                .next()
-                .ok_or(ParseError::MissingOperand("comparison right"))?;
-            let next_right_expr = parse_atomic_expr(next_right)?;
-            ast::Predicate::Comparison {
-                left: Box::new(right_expr),
-                operator: ast::ComparisonOperator::Equal,
-                right: Box::new(next_right_expr),
+        match next_op.as_rule() {
+            grammar::Rule::Eq
+            | grammar::Rule::GtEq
+            | grammar::Rule::Gt
+            | grammar::Rule::LtEq
+            | grammar::Rule::Lt
+            | grammar::Rule::NotEq => {
+                let next_right = rest
+                    .next()
+                    .ok_or(ParseError::MissingOperand("comparison right"))?;
+                let next_right_expr = parse_atomic_expr(next_right)?;
+                ast::Predicate::Comparison {
+                    left: Box::new(right_expr),
+                    operator: match next_op.as_rule() {
+                        grammar::Rule::Eq => ast::ComparisonOperator::Equal,
+                        grammar::Rule::GtEq => ast::ComparisonOperator::GreaterThanOrEqual,
+                        grammar::Rule::Gt => ast::ComparisonOperator::GreaterThan,
+                        grammar::Rule::LtEq => ast::ComparisonOperator::LessThanOrEqual,
+                        grammar::Rule::Lt => ast::ComparisonOperator::LessThan,
+                        grammar::Rule::NotEq => ast::ComparisonOperator::NotEqual,
+                        _ => unreachable!(),
+                    },
+                    right: Box::new(next_right_expr),
+                }
             }
-        } else {
-            return Err(Box::new(ParseError::UnexpectedRule {
-                expected: "Eq",
-                got: next_op.as_rule(),
-            }));
+            _ => {
+                return Err(Box::new(ParseError::UnexpectedRule {
+                    expected: "comparison operator",
+                    got: next_op.as_rule(),
+                }));
+            }
         }
     } else {
         right_expr.into_predicate()?
