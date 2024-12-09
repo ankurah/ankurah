@@ -1,0 +1,12 @@
+[package]
+name = "ankql"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pest = { version = "2.7.15", features = ["pretty-print"] }
+pest_derive = "2.7.15"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11.5"
