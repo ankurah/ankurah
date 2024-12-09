@@ -49,6 +49,7 @@ dependencies = [
  "log",
  "pest",
  "pest_derive",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
