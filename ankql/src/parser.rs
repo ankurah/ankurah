@@ -241,9 +241,39 @@ fn parse_identifier(pair: Pair<grammar::Rule>) -> Result<ast::Expr, Box<dyn Erro
         }));
     }
 
-    Ok(ast::Expr::Identifier(ast::Identifier::Property(
-        ident.as_str().trim().to_string(),
-    )))
+    let collection = ident.as_str().trim().to_string();
+
+    // Check if we have a ReferenceContinuation
+    if let Some(ref_cont) = ident_parts.next() {
+        if ref_cont.as_rule() != grammar::Rule::ReferenceContinuation {
+            return Err(Box::new(ParseError::UnexpectedRule {
+                expected: "ReferenceContinuation",
+                got: ref_cont.as_rule(),
+            }));
+        }
+
+        // Get the property name from the ReferenceContinuation
+        let property = ref_cont
+            .into_inner()
+            .next()
+            .ok_or(ParseError::InvalidPredicate(
+                "Empty reference continuation".into(),
+            ))?;
+
+        if property.as_rule() != grammar::Rule::Identifier {
+            return Err(Box::new(ParseError::UnexpectedRule {
+                expected: "Identifier",
+                got: property.as_rule(),
+            }));
+        }
+
+        Ok(ast::Expr::Identifier(ast::Identifier::CollectionProperty(
+            collection,
+            property.as_str().trim().to_string(),
+        )))
+    } else {
+        Ok(ast::Expr::Identifier(ast::Identifier::Property(collection)))
+    }
 }
 
 /// Parse a string literal, removing the surrounding quotes
