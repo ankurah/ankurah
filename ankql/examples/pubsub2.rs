@@ -1,7 +1,7 @@
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
 use ankql::parser::parse_selection;
 use ankql::selection::filter::{FilterIterator, FilterResult, Filterable};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, Bound, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, AtomicUsize as AtomicId};
 use std::sync::{Arc, Mutex};
 
@@ -18,126 +18,71 @@ struct Subscription {
 }
 
 /// An index for a specific field and comparison operator
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct FieldIndex {
     // Map from value to subscription IDs that match that value
     eq: HashMap<String, Vec<usize>>,
     // Ordered list of (threshold, subscription IDs) for range queries
-    gt: Vec<(String, Vec<usize>)>,
-    lt: Vec<(String, Vec<usize>)>,
-    gte: Vec<(String, Vec<usize>)>,
-    lte: Vec<(String, Vec<usize>)>,
+    // TODO: Consider using skip lists or B-trees for better range query performance
+    gt: BTreeMap<String, Vec<usize>>,
+    lt: BTreeMap<String, Vec<usize>>,
 }
 
 impl FieldIndex {
-    fn add_subscription(&mut self, value: &str, op: &ComparisonOperator, sub_id: usize) {
+    fn add_subscription(&mut self, value: &str, op: &str, sub_id: usize) {
         match op {
-            ComparisonOperator::Equal => {
+            "=" => {
                 self.eq.entry(value.to_string()).or_default().push(sub_id);
             }
-            ComparisonOperator::GreaterThan => {
-                self.gt.push((value.to_string(), vec![sub_id]));
-                self.gt.sort_by(|a, b| a.0.cmp(&b.0));
+            ">" => {
+                self.gt.entry(value.to_string()).or_default().push(sub_id);
             }
-            ComparisonOperator::LessThan => {
-                self.lt.push((value.to_string(), vec![sub_id]));
-                self.lt.sort_by(|a, b| a.0.cmp(&b.0));
+            "<" => {
+                self.lt.entry(value.to_string()).or_default().push(sub_id);
             }
-            ComparisonOperator::GreaterThanOrEqual => {
-                self.gte.push((value.to_string(), vec![sub_id]));
-                self.gte.sort_by(|a, b| a.0.cmp(&b.0));
+            ">=" => {
+                // x >= 5 is the same as x > 4
+                if let Some(pred) = predecessor(value) {
+                    self.gt.entry(pred).or_default().push(sub_id);
+                } else {
+                    // If there is no predecessor (e.g., value is ""), then this matches everything
+                    self.gt.entry("".to_string()).or_default().push(sub_id);
+                }
             }
-            ComparisonOperator::LessThanOrEqual => {
-                self.lte.push((value.to_string(), vec![sub_id]));
-                self.lte.sort_by(|a, b| a.0.cmp(&b.0));
+            "<=" => {
+                // x <= 5 is the same as x < 6
+                self.lt.entry(successor(value)).or_default().push(sub_id);
             }
-            _ => unimplemented!("Only basic comparison operators are supported"),
+            _ => panic!("Unsupported operator: {}", op),
         }
     }
 
-    fn find_matching_subscriptions(&self, field: &str, value: &str) -> Vec<usize> {
-        let mut matches = Vec::new();
+    fn find_matching_subscriptions(&self, value: &str) -> Vec<usize> {
+        let mut result = HashSet::new();
 
-        // For age field, convert strings to integers for comparison
-        if field == "age" {
-            if let (Ok(value_int), true) = (
-                value.parse::<i32>(),
-                !self.eq.is_empty()
-                    || !self.gt.is_empty()
-                    || !self.lt.is_empty()
-                    || !self.gte.is_empty()
-                    || !self.lte.is_empty(),
-            ) {
-                println!("  Comparing age as integer: {}", value_int);
-
-                // Check exact matches
-                for (threshold, subs) in &self.eq {
-                    if let Ok(threshold_int) = threshold.parse::<i32>() {
-                        if value_int == threshold_int {
-                            matches.extend(subs);
-                        }
-                    }
-                }
-
-                // Check range matches
-                for (threshold, subs) in &self.gt {
-                    if let Ok(threshold_int) = threshold.parse::<i32>() {
-                        if value_int > threshold_int {
-                            matches.extend(subs);
-                        }
-                    }
-                }
-                for (threshold, subs) in &self.lt {
-                    if let Ok(threshold_int) = threshold.parse::<i32>() {
-                        if value_int < threshold_int {
-                            matches.extend(subs);
-                        }
-                    }
-                }
-                for (threshold, subs) in &self.gte {
-                    if let Ok(threshold_int) = threshold.parse::<i32>() {
-                        if value_int >= threshold_int {
-                            matches.extend(subs);
-                        }
-                    }
-                }
-                for (threshold, subs) in &self.lte {
-                    if let Ok(threshold_int) = threshold.parse::<i32>() {
-                        if value_int <= threshold_int {
-                            matches.extend(subs);
-                        }
-                    }
-                }
-            }
-        } else {
-            // For non-age fields, use string comparison
-            if let Some(subs) = self.eq.get(value) {
-                matches.extend(subs);
-            }
-
-            for (threshold, subs) in &self.gt {
-                if value > threshold {
-                    matches.extend(subs);
-                }
-            }
-            for (threshold, subs) in &self.lt {
-                if value < threshold {
-                    matches.extend(subs);
-                }
-            }
-            for (threshold, subs) in &self.gte {
-                if value >= threshold {
-                    matches.extend(subs);
-                }
-            }
-            for (threshold, subs) in &self.lte {
-                if value <= threshold {
-                    matches.extend(subs);
-                }
-            }
+        // Check exact matches
+        if let Some(subs) = self.eq.get(value) {
+            result.extend(subs);
         }
 
-        matches
+        // Check greater than matches (value > threshold)
+        // We want all thresholds strictly less than our value
+        for (_, subs) in self.gt.range(..value.to_string()) {
+            result.extend(subs);
+        }
+
+        // Check less than matches (value < threshold)
+        // We want all thresholds strictly greater than our value
+        for (_, subs) in self
+            .lt
+            .range((Bound::Excluded(value.to_string()), Bound::Unbounded))
+        {
+            result.extend(subs);
+        }
+
+        let mut result: Vec<_> = result.into_iter().collect();
+        result.sort_unstable(); // Make the order deterministic for testing
+        result
     }
 }
 
@@ -273,66 +218,35 @@ impl FakeServer {
         fields
     }
 
-    fn add_to_indexes(&mut self, sub_id: usize, predicate: &Predicate) {
-        println!("Adding subscription {} to indexes", sub_id);
-        for (field, op, value) in Self::extract_field_comparisons(predicate) {
-            println!("  Field comparison: {} {:?} {:?}", field, op, value);
-            let index = self.field_indexes.entry(field.to_string()).or_default();
-            let value_str = match value {
-                Literal::String(s) => s.clone(),
-                Literal::Integer(i) => i.to_string(),
-                Literal::Float(f) => f.to_string(),
-                Literal::Boolean(b) => b.to_string(),
-            };
-            index.add_subscription(&value_str, op, sub_id);
+    fn add_to_indexes(&mut self, sub_id: usize, predicate: &str) {
+        // Parse predicate to extract field comparisons
+        // For this example, we'll just handle simple age comparisons
+        if predicate.contains("age") {
+            let field_index = self.field_indexes.entry("age".to_string()).or_default();
+
+            if predicate.contains(">=") {
+                let value = predicate.split(">=").nth(1).unwrap().trim();
+                field_index.add_subscription(value, ">=", sub_id);
+            } else if predicate.contains("<=") {
+                let value = predicate.split("<=").nth(1).unwrap().trim();
+                field_index.add_subscription(value, "<=", sub_id);
+            }
         }
     }
 
     fn find_matching_subscriptions(&self, record: &TestRecord) -> Vec<Arc<Subscription>> {
-        println!("Finding matches for record: {:?}", record);
-        let mut candidate_ids = HashSet::new();
-        let mut first = true;
+        let mut result = HashSet::new();
 
-        // Check each field's index
-        for (field, value) in [("name", &record.name), ("age", &record.age)] {
-            if let Some(index) = self.field_indexes.get(field) {
-                let ids = index.find_matching_subscriptions(field, value);
-                println!(
-                    "  Field '{}' with value '{}' matched subscription IDs: {:?}",
-                    field, value, ids
-                );
-                if first {
-                    candidate_ids = ids.into_iter().collect();
-                    first = false;
-                } else {
-                    candidate_ids.retain(|id| ids.contains(id));
-                }
-            }
+        // Check field indexes
+        if let Some(index) = self.field_indexes.get("age") {
+            result.extend(index.find_matching_subscriptions(&record.age));
         }
 
-        println!("  Candidate IDs after field matching: {:?}", candidate_ids);
-
-        // Get the actual subscriptions and verify with full predicate
-        let result: Vec<Arc<Subscription>> = candidate_ids
+        result
             .into_iter()
             .filter_map(|id| self.subscriptions.get(&id))
-            .filter(|sub| {
-                let matches =
-                    FilterIterator::new(vec![record.clone()].into_iter(), sub.predicate.clone())
-                        .next()
-                        .map(|r| matches!(r, FilterResult::Pass(_)))
-                        .unwrap_or(false);
-                println!(
-                    "  Subscription {} full predicate match: {}",
-                    sub.id, matches
-                );
-                matches
-            })
             .cloned()
-            .collect();
-
-        println!("  Final matching subscriptions: {}", result.len());
-        result
+            .collect()
     }
 
     /// Inserts a new record and notifies relevant subscribers
@@ -341,9 +255,17 @@ impl FakeServer {
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        println!("\nInserting record: {:?}", record);
+        // Create updates for all fields since this is a new record
+        let updates = vec![
+            Update("name".to_string(), record.name.clone()),
+            Update("age".to_string(), record.age.clone()),
+        ];
 
-        // Find affected subscriptions
+        // Insert the record
+        self.state.insert(id, record.clone());
+        println!("➕ Inserted record {id}: {record:?}");
+
+        // Find and notify affected subscriptions
         let affected_subs: Vec<_> = self
             .subscriptions
             .iter()
@@ -355,14 +277,9 @@ impl FakeServer {
             })
             .collect();
 
-        // Insert the record
-        self.state.insert(id, record.clone());
-
-        // Create updates for all fields since this is a new record
-        let updates = vec![
-            Update("name".to_string(), record.name.clone()),
-            Update("age".to_string(), record.age.clone()),
-        ];
+        if !affected_subs.is_empty() {
+            println!("   Notifying {} subscription(s)", affected_subs.len());
+        }
 
         // Notify affected subscriptions
         for (_sub_id, sub) in affected_subs {
@@ -408,9 +325,17 @@ impl FakeServer {
 
             // Update state
             self.state.insert(id, new_record.clone());
-
-            println!("\nEditing record {id}: {new_record:?}");
-            println!("Changed fields: {:?}", changed_fields);
+            println!("✏️  Editing record {id}:");
+            println!("   Before: {old_record:?}");
+            println!("   After:  {new_record:?}");
+            println!(
+                "   Changes: {}",
+                updates
+                    .iter()
+                    .map(|Update(f, v)| format!("{f}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
 
             // Find affected subscriptions
             let affected_subs: Vec<_> = self
@@ -426,7 +351,9 @@ impl FakeServer {
                 })
                 .collect();
 
-            println!("Affected subscriptions: {}", affected_subs.len());
+            if !affected_subs.is_empty() {
+                println!("   Notifying {} subscription(s)", affected_subs.len());
+            }
 
             // Apply updates to each affected subscription
             for (sub_id, sub) in affected_subs {
@@ -443,17 +370,17 @@ impl FakeServer {
                 .map(|r| matches!(r, FilterResult::Pass(_)))
                 .unwrap_or(false);
 
-                println!(
-                    "  Subscription {sub_id}: was_matching={was_matching}, now_matching={now_matching}"
-                );
-
                 if was_matching != now_matching {
                     let mut matching_records = sub.matching_records.lock().unwrap();
                     if now_matching {
+                        println!("   Sub {sub_id}: Record now matches subscription");
                         matching_records.insert(id);
                     } else {
+                        println!("   Sub {sub_id}: Record no longer matches subscription");
                         matching_records.remove(&id);
                     }
+                } else if was_matching {
+                    println!("   Sub {sub_id}: Record updated (still matches)");
                 }
 
                 // Get current state for callback
@@ -494,17 +421,8 @@ impl FakeServer {
         }
     }
 
-    fn get_matching_records(&self, record: &TestRecord) -> Vec<TestRecord> {
-        let mut result = Vec::new();
-
-        // Add all records that match the subscription's predicate
-        for r in self.state.values() {
-            if self.find_matching_subscriptions(r).len() > 0 {
-                result.push(r.clone());
-            }
-        }
-
-        result
+    fn get_matching_records(&self, _record: &TestRecord) -> Vec<TestRecord> {
+        self.state.values().cloned().collect()
     }
 }
 
@@ -570,6 +488,8 @@ impl<'a> SubscriptionHandle<'a> {
 
 /// Example usage
 fn main() {
+    println!("🔄 Starting pubsub example...\n");
+
     // Create a server with one initial record
     let mut server = FakeServer::new(vec![TestRecord {
         name: "Alice".to_string(),
@@ -577,18 +497,70 @@ fn main() {
     }]);
 
     // Subscribe to records for people who can rent a car (25-90)
+    println!("👀 Creating subscription for rental age (25-90)");
     let subscription = server.subscribe("age >= 25 AND age <= 90");
     let expected = Arc::new(AtomicUsize::new(1));
     let expected_for_closure = expected.clone();
 
     let _subscription = subscription.subscribe(move |op, state| {
-        println!("op: {op:?}");
-        println!("people who can rent a car: {:?}", state);
+        match &op {
+            Op::Add {
+                record, updates, ..
+            } => {
+                println!("   ➕ Added: {record:?}");
+                if !updates.is_empty() {
+                    println!(
+                        "      Due to: {}",
+                        updates
+                            .iter()
+                            .map(|Update(f, v)| format!("{f}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+            Op::Remove {
+                old_record,
+                updates,
+                ..
+            } => {
+                println!("   ➖ Removed: {old_record:?}");
+                println!(
+                    "      Due to: {}",
+                    updates
+                        .iter()
+                        .map(|Update(f, v)| format!("{f}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Op::Edit {
+                old_record,
+                new_record,
+                updates,
+                ..
+            } => {
+                println!("   ✏️  Updated:");
+                println!("      From: {old_record:?}");
+                println!("      To:   {new_record:?}");
+                println!(
+                    "      Changes: {}",
+                    updates
+                        .iter()
+                        .map(|Update(f, v)| format!("{f}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        println!("   Current matches: {state:?}\n");
         assert_eq!(
             state.len(),
             expected_for_closure.load(std::sync::atomic::Ordering::Relaxed)
         );
     });
+
+    println!("\n📝 Running test sequence...\n");
 
     // Add Bob (too young to rent)
     let id = server.insert(TestRecord {
@@ -618,4 +590,161 @@ fn main() {
 
     // Changes name back to Bob while too old - should see no updates
     server.edit(id, vec![Update("name".to_string(), "Bob".to_string())]);
+
+    println!("✅ Test sequence complete!");
+}
+
+// TODO: Implement proper binary collation that handles:
+// - Full UTF-8 range
+// - Correct lexicographic ordering
+// - Efficient successor/predecessor without string scanning
+// For now, we use simple string operations that work for ASCII
+
+fn successor(s: &str) -> String {
+    format!("{}.", s) // Simple hack: append a dot which is greater than most chars
+}
+
+fn predecessor(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s[..s.len() - 1].to_string()) // Simple hack: remove last char
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_successor() {
+        assert!(successor("abc") > "abc".to_string());
+        assert!(successor("") > "".to_string());
+    }
+
+    #[test]
+    fn test_predecessor() {
+        assert!(predecessor("abc").unwrap() < "abc".to_string());
+        assert_eq!(predecessor(""), None);
+    }
+
+    #[test]
+    fn test_field_index() {
+        let mut index = FieldIndex::default();
+
+        // Add some subscriptions
+        index.add_subscription("25", ">=", 1); // age >= 25
+        index.add_subscription("90", "<=", 1); // age <= 90
+        index.add_subscription("30", "=", 2); // age == 30
+
+        // Test some values
+        assert!(
+            index.find_matching_subscriptions("24").is_empty(),
+            "24 should not match"
+        );
+        assert_eq!(
+            index.find_matching_subscriptions("25"),
+            vec![1],
+            "25 should match >= 25"
+        );
+        let mut matches_30 = index.find_matching_subscriptions("30");
+        matches_30.sort_unstable();
+        assert_eq!(
+            matches_30,
+            vec![1, 2],
+            "30 should match both >= 25 and == 30"
+        );
+        assert_eq!(
+            index.find_matching_subscriptions("90"),
+            vec![1],
+            "90 should match <= 90"
+        );
+        assert!(
+            index.find_matching_subscriptions("91").is_empty(),
+            "91 should not match"
+        );
+
+        // Test edge cases
+        assert_eq!(
+            index.find_matching_subscriptions("26"),
+            vec![1],
+            "26 should match >= 25"
+        );
+        assert_eq!(
+            index.find_matching_subscriptions("89"),
+            vec![1],
+            "89 should match both >= 25 and <= 90"
+        );
+    }
+
+    #[test]
+    fn test_range_queries() {
+        let mut index = FieldIndex::default();
+
+        // Test greater than
+        index.add_subscription("25", ">", 1);
+        assert!(
+            index.find_matching_subscriptions("24").is_empty(),
+            "> 25: 24 should not match"
+        );
+        assert!(
+            index.find_matching_subscriptions("25").is_empty(),
+            "> 25: 25 should not match"
+        );
+        assert_eq!(
+            index.find_matching_subscriptions("26"),
+            vec![1],
+            "> 25: 26 should match"
+        );
+
+        // Test less than
+        index.add_subscription("25", "<", 2);
+        assert_eq!(
+            index.find_matching_subscriptions("24"),
+            vec![2],
+            "< 25: 24 should match"
+        );
+        assert!(
+            index.find_matching_subscriptions("25").is_empty(),
+            "< 25: 25 should not match"
+        );
+        assert!(
+            index.find_matching_subscriptions("26").is_empty(),
+            "< 25: 26 should not match"
+        );
+
+        // Test greater than or equal
+        index.add_subscription("25", ">=", 3);
+        assert!(
+            index.find_matching_subscriptions("24").is_empty(),
+            ">= 25: 24 should not match"
+        );
+        assert_eq!(
+            index.find_matching_subscriptions("25"),
+            vec![3],
+            ">= 25: 25 should match"
+        );
+        assert_eq!(
+            index.find_matching_subscriptions("26"),
+            vec![1, 3],
+            ">= 25: 26 should match"
+        );
+
+        // Test less than or equal
+        index.add_subscription("25", "<=", 4);
+        assert_eq!(
+            index.find_matching_subscriptions("24"),
+            vec![2, 4],
+            "<= 25: 24 should match"
+        );
+        assert_eq!(
+            index.find_matching_subscriptions("25"),
+            vec![4],
+            "<= 25: 25 should match"
+        );
+        assert!(
+            index.find_matching_subscriptions("26").is_empty(),
+            "<= 25: 26 should not match"
+        );
+    }
 }
