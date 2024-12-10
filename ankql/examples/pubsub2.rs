@@ -145,23 +145,29 @@ impl FieldIndex {
 #[derive(Debug)]
 pub enum Op {
     /// A record has been added or now matches the subscription query
-    Add { id: usize, record: TestRecord },
+    Add {
+        id: usize,
+        record: TestRecord,
+        updates: Vec<Update>, // What changes caused this record to be added to the subscription
+    },
     /// A record no longer matches the subscription query
     Remove {
         id: usize,
-        old_record: TestRecord,     // The last record that matched
-        current_record: TestRecord, // The current record that doesn't match
+        old_record: TestRecord,
+        current_record: TestRecord,
+        updates: Vec<Update>, // What changes caused this record to be removed from the subscription
     },
     /// A record was updated and still matches the subscription query
     Edit {
         id: usize,
         old_record: TestRecord,
         new_record: TestRecord,
+        updates: Vec<Update>,
     },
 }
 
 #[derive(Debug, Clone)]
-struct Update(&'static str, &'static str);
+struct Update(String, String);
 
 #[derive(Debug, Clone)]
 pub struct TestRecord {
@@ -331,39 +337,53 @@ impl FakeServer {
 
     /// Inserts a new record and notifies relevant subscribers
     pub fn insert(&mut self, record: TestRecord) -> usize {
-        println!("\nInserting record: {:?}", record);
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.state.insert(id, record.clone());
 
-        // Check all subscriptions (for insert we need to check all since it's new)
-        for sub in self.subscriptions.values() {
-            let matches =
+        println!("\nInserting record: {:?}", record);
+
+        // Find affected subscriptions
+        let affected_subs: Vec<_> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, sub)| {
                 FilterIterator::new(vec![record.clone()].into_iter(), sub.predicate.clone())
                     .next()
                     .map(|r| matches!(r, FilterResult::Pass(_)))
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+            })
+            .collect();
 
-            if matches {
-                let mut matching_records = sub.matching_records.lock().unwrap();
-                matching_records.insert(id);
+        // Insert the record
+        self.state.insert(id, record.clone());
 
-                let current_records: Vec<_> = matching_records
-                    .iter()
-                    .filter_map(|id| self.state.get(id))
-                    .cloned()
-                    .collect();
+        // Create updates for all fields since this is a new record
+        let updates = vec![
+            Update("name".to_string(), record.name.clone()),
+            Update("age".to_string(), record.age.clone()),
+        ];
 
-                for callback in sub.callbacks.iter() {
-                    callback(
-                        Op::Add {
-                            id,
-                            record: record.clone(),
-                        },
-                        current_records.clone(),
-                    );
-                }
+        // Notify affected subscriptions
+        for (_sub_id, sub) in affected_subs {
+            let mut matching_records = sub.matching_records.lock().unwrap();
+            matching_records.insert(id);
+
+            let state: Vec<_> = matching_records
+                .iter()
+                .filter_map(|id| self.state.get(id))
+                .cloned()
+                .collect();
+
+            for callback in sub.callbacks.iter() {
+                callback(
+                    Op::Add {
+                        id,
+                        record: record.clone(),
+                        updates: updates.clone(),
+                    },
+                    state.clone(),
+                );
             }
         }
 
@@ -377,11 +397,11 @@ impl FakeServer {
             let mut new_record = old_record.clone();
             let mut changed_fields = HashSet::new();
 
-            for Update(field, value) in updates {
-                changed_fields.insert(field.to_string());
-                match field {
-                    "name" => new_record.name = value.to_string(),
-                    "age" => new_record.age = value.to_string(),
+            for Update(field, value) in &updates {
+                changed_fields.insert(field.clone());
+                match field.as_str() {
+                    "name" => new_record.name = value.clone(),
+                    "age" => new_record.age = value.clone(),
                     _ => panic!("Unknown field: {}", field),
                 }
             }
@@ -453,15 +473,18 @@ impl FakeServer {
                             id,
                             old_record: old_record.clone(),
                             current_record: new_record.clone(),
+                            updates: updates.clone(),
                         },
                         (false, true) => Op::Add {
                             id,
                             record: new_record.clone(),
+                            updates: updates.clone(),
                         },
                         (true, true) => Op::Edit {
                             id,
                             old_record: old_record.clone(),
                             new_record: new_record.clone(),
+                            updates: updates.clone(),
                         },
                         (false, false) => continue,
                     };
@@ -534,6 +557,7 @@ impl<'a> SubscriptionHandle<'a> {
                     Op::Add {
                         id: *matching_records.iter().next().unwrap(),
                         record: initial_records[0].clone(),
+                        updates: vec![],
                     },
                     initial_records.clone(),
                 );
@@ -573,25 +597,25 @@ fn main() {
     });
 
     // Change Bob's name while too young - should see no updates
-    server.edit(id, vec![Update("name", "Robert")]);
+    server.edit(id, vec![Update("name".to_string(), "Robert".to_string())]);
 
     // Bob/Robert turns 25 (can now rent)
     expected.store(2, std::sync::atomic::Ordering::Relaxed);
-    server.edit(id, vec![Update("age", "25")]);
+    server.edit(id, vec![Update("age".to_string(), "25".to_string())]);
 
     // Robert changes name back to Bob while age matches - should see an edit
-    server.edit(id, vec![Update("name", "Bob")]);
+    server.edit(id, vec![Update("name".to_string(), "Bob".to_string())]);
 
     // Bob turns 26 (still can rent)
-    server.edit(id, vec![Update("age", "26")]);
+    server.edit(id, vec![Update("age".to_string(), "26".to_string())]);
 
     // Bob changes name to Robert while age matches - should see an edit
-    server.edit(id, vec![Update("name", "Robert")]);
+    server.edit(id, vec![Update("name".to_string(), "Robert".to_string())]);
 
     // Robert turns 91 (too old to rent)
     expected.store(1, std::sync::atomic::Ordering::Relaxed);
-    server.edit(id, vec![Update("age", "91")]);
+    server.edit(id, vec![Update("age".to_string(), "91".to_string())]);
 
     // Changes name back to Bob while too old - should see no updates
-    server.edit(id, vec![Update("name", "Bob")]);
+    server.edit(id, vec![Update("name".to_string(), "Bob".to_string())]);
 }
