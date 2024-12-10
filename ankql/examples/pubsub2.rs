@@ -160,8 +160,10 @@ pub enum Op {
     },
 }
 
-/// A simple record type for demonstration
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
+struct Update(&'static str, &'static str);
+
+#[derive(Debug, Clone)]
 pub struct TestRecord {
     pub name: String,
     pub age: String,
@@ -369,41 +371,50 @@ impl FakeServer {
     }
 
     /// Updates an existing record and notifies relevant subscribers
-    pub fn edit(&mut self, id: usize, new_record: TestRecord) {
-        println!("\nEditing record {}: {:?}", id, new_record);
+    pub fn edit(&mut self, id: usize, updates: Vec<Update>) {
         if let Some(old_record) = self.state.get(&id).cloned() {
-            // Find which fields changed
-            let changed_fields: HashSet<_> = [
-                ("name", (&old_record.name, &new_record.name)),
-                ("age", (&old_record.age, &new_record.age)),
-            ]
-            .iter()
-            .filter(|(_, (old, new))| old != new)
-            .map(|(field, _)| *field)
-            .collect();
+            // Apply updates to create new record
+            let mut new_record = old_record.clone();
+            let mut changed_fields = HashSet::new();
 
+            for Update(field, value) in updates {
+                changed_fields.insert(field.to_string());
+                match field {
+                    "name" => new_record.name = value.to_string(),
+                    "age" => new_record.age = value.to_string(),
+                    _ => panic!("Unknown field: {}", field),
+                }
+            }
+
+            // Update state
+            self.state.insert(id, new_record.clone());
+
+            println!("\nEditing record {id}: {new_record:?}");
             println!("Changed fields: {:?}", changed_fields);
 
-            // Find subscriptions that depend on the changed fields
+            // Find affected subscriptions
             let affected_subs: Vec<_> = self
                 .subscriptions
-                .values()
-                .filter(|sub| {
-                    sub.fields
-                        .iter()
-                        .any(|f| changed_fields.contains(f.as_str()))
+                .iter()
+                .filter(|(_, sub)| {
+                    // A subscription is affected if:
+                    // 1. Any of its dependent fields changed OR
+                    // 2. The record currently matches the subscription
+                    let fields = &sub.fields;
+                    fields.intersection(&changed_fields).next().is_some()
+                        || sub.matching_records.lock().unwrap().contains(&id)
                 })
-                .cloned()
                 .collect();
 
             println!("Affected subscriptions: {}", affected_subs.len());
 
-            // Update the record
-            self.state.insert(id, new_record.clone());
+            // Apply updates to each affected subscription
+            for (sub_id, sub) in affected_subs {
+                let was_matching = {
+                    let matching = sub.matching_records.lock().unwrap();
+                    matching.contains(&id)
+                };
 
-            // Check each affected subscription
-            for sub in affected_subs {
-                let was_matching = sub.matching_records.lock().unwrap().contains(&id);
                 let now_matching = FilterIterator::new(
                     vec![new_record.clone()].into_iter(),
                     sub.predicate.clone(),
@@ -413,8 +424,7 @@ impl FakeServer {
                 .unwrap_or(false);
 
                 println!(
-                    "  Subscription {}: was_matching={}, now_matching={}",
-                    sub.id, was_matching, now_matching
+                    "  Subscription {sub_id}: was_matching={was_matching}, now_matching={now_matching}"
                 );
 
                 if was_matching != now_matching {
@@ -424,49 +434,38 @@ impl FakeServer {
                     } else {
                         matching_records.remove(&id);
                     }
+                }
 
-                    // Get current matching records
-                    let current_records: Vec<_> = matching_records
-                        .iter()
-                        .filter_map(|id| self.state.get(id))
-                        .cloned()
-                        .collect();
+                // Get current state for callback
+                let state: Vec<TestRecord> = sub
+                    .matching_records
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|id| self.state.get(id))
+                    .cloned()
+                    .collect();
 
-                    // Notify callbacks
-                    for callback in sub.callbacks.iter() {
-                        let op = match (was_matching, now_matching) {
-                            (true, false) => Op::Remove {
-                                id,
-                                old_record: old_record.clone(),
-                                current_record: new_record.clone(),
-                            },
-                            (false, true) => Op::Add {
-                                id,
-                                record: new_record.clone(),
-                            },
-                            _ => unreachable!(),
-                        };
-                        callback(op, current_records.clone());
-                    }
-                } else if was_matching {
-                    // Record still matches, just notify of the edit
-                    let matching_records = sub.matching_records.lock().unwrap();
-                    let current_records: Vec<_> = matching_records
-                        .iter()
-                        .filter_map(|id| self.state.get(id))
-                        .cloned()
-                        .collect();
-
-                    for callback in sub.callbacks.iter() {
-                        callback(
-                            Op::Edit {
-                                id,
-                                old_record: old_record.clone(),
-                                new_record: new_record.clone(),
-                            },
-                            current_records.clone(),
-                        );
-                    }
+                // Notify callbacks
+                for callback in sub.callbacks.iter() {
+                    let op = match (was_matching, now_matching) {
+                        (true, false) => Op::Remove {
+                            id,
+                            old_record: old_record.clone(),
+                            current_record: new_record.clone(),
+                        },
+                        (false, true) => Op::Add {
+                            id,
+                            record: new_record.clone(),
+                        },
+                        (true, true) => Op::Edit {
+                            id,
+                            old_record: old_record.clone(),
+                            new_record: new_record.clone(),
+                        },
+                        (false, false) => continue,
+                    };
+                    callback(op, state.clone());
                 }
             }
         }
@@ -574,46 +573,25 @@ fn main() {
     });
 
     // Change Bob's name while too young - should see no updates
-    server.edit(id, TestRecord {
-        name: "Robert".to_string(),
-        age: "22".to_string(),
-    });
+    server.edit(id, vec![Update("name", "Robert")]);
 
     // Bob/Robert turns 25 (can now rent)
     expected.store(2, std::sync::atomic::Ordering::Relaxed);
-    server.edit(id, TestRecord {
-        name: "Robert".to_string(),
-        age: "25".to_string(),
-    });
+    server.edit(id, vec![Update("age", "25")]);
 
     // Robert changes name back to Bob while age matches - should see an edit
-    server.edit(id, TestRecord {
-        name: "Bob".to_string(),
-        age: "25".to_string(),
-    });
+    server.edit(id, vec![Update("name", "Bob")]);
 
     // Bob turns 26 (still can rent)
-    server.edit(id, TestRecord {
-        name: "Bob".to_string(),
-        age: "26".to_string(),
-    });
+    server.edit(id, vec![Update("age", "26")]);
 
     // Bob changes name to Robert while age matches - should see an edit
-    server.edit(id, TestRecord {
-        name: "Robert".to_string(),
-        age: "26".to_string(),
-    });
+    server.edit(id, vec![Update("name", "Robert")]);
 
     // Robert turns 91 (too old to rent)
     expected.store(1, std::sync::atomic::Ordering::Relaxed);
-    server.edit(id, TestRecord {
-        name: "Robert".to_string(),
-        age: "91".to_string(),
-    });
+    server.edit(id, vec![Update("age", "91")]);
 
     // Changes name back to Bob while too old - should see no updates
-    server.edit(id, TestRecord {
-        name: "Bob".to_string(),
-        age: "91".to_string(),
-    });
+    server.edit(id, vec![Update("name", "Bob")]);
 }
