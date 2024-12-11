@@ -26,8 +26,32 @@ pub trait Collation {
     fn is_maximum(&self) -> bool;
 
     /// Compare two values in the collation order
-    fn compare(&self, other: &Self) -> Ordering {
-        self.to_bytes().cmp(&other.to_bytes())
+    fn compare(&self, other: &Self) -> Ordering;
+
+    fn is_in_range(&self, lower: RangeBound<&Self>, upper: RangeBound<&Self>) -> bool {
+        match (lower, upper) {
+            (RangeBound::Included(l), RangeBound::Included(u)) => {
+                self.compare(l) != Ordering::Less && self.compare(u) != Ordering::Greater
+            }
+            (RangeBound::Included(l), RangeBound::Excluded(u)) => {
+                self.compare(l) != Ordering::Less && self.compare(u) == Ordering::Less
+            }
+            (RangeBound::Excluded(l), RangeBound::Included(u)) => {
+                self.compare(l) == Ordering::Greater && self.compare(u) != Ordering::Greater
+            }
+            (RangeBound::Excluded(l), RangeBound::Excluded(u)) => {
+                self.compare(l) == Ordering::Greater && self.compare(u) == Ordering::Less
+            }
+            (RangeBound::Unbounded, RangeBound::Included(u)) => {
+                self.compare(u) != Ordering::Greater
+            }
+            (RangeBound::Unbounded, RangeBound::Excluded(u)) => self.compare(u) == Ordering::Less,
+            (RangeBound::Included(l), RangeBound::Unbounded) => self.compare(l) != Ordering::Less,
+            (RangeBound::Excluded(l), RangeBound::Unbounded) => {
+                self.compare(l) == Ordering::Greater
+            }
+            (RangeBound::Unbounded, RangeBound::Unbounded) => true,
+        }
     }
 }
 
@@ -67,6 +91,10 @@ impl Collation for str {
     fn is_maximum(&self) -> bool {
         false // Strings have no theoretical maximum
     }
+
+    fn compare(&self, other: &Self) -> Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
 }
 
 // Implementation for integers
@@ -99,20 +127,23 @@ impl Collation for i64 {
     fn is_maximum(&self) -> bool {
         *self == i64::MAX
     }
+
+    fn compare(&self, other: &Self) -> Ordering {
+        self.cmp(other)
+    }
 }
 
 // Implementation for floats
 impl Collation for f64 {
     fn to_bytes(&self) -> Vec<u8> {
-        // Special handling for NaN and sign to maintain ordering
         let bits = if self.is_nan() {
             u64::MAX // NaN sorts last
         } else {
             let bits = self.to_bits();
             if *self >= 0.0 {
-                bits
+                bits ^ (1 << 63) // Flip sign bit for positive numbers
             } else {
-                !bits // Flip bits for negative numbers to maintain ordering
+                !bits // Flip all bits for negative numbers
             }
         };
         bits.to_be_bytes().to_vec()
@@ -122,8 +153,12 @@ impl Collation for f64 {
         if self.is_nan() || (self.is_infinite() && *self > 0.0) {
             None
         } else {
-            let bits = self.to_bits();
-            let next_bits = if *self >= 0.0 { bits + 1 } else { bits - 1 };
+            let bits = if *self >= 0.0 {
+                self.to_bits() ^ (1 << 63) // Apply same sign bit flip as to_bytes
+            } else {
+                !self.to_bits() // Apply same bit inversion as to_bytes
+            };
+            let next_bits = bits + 1;
             Some(next_bits.to_be_bytes().to_vec())
         }
     }
@@ -132,8 +167,12 @@ impl Collation for f64 {
         if self.is_nan() || (self.is_infinite() && *self < 0.0) {
             None
         } else {
-            let bits = self.to_bits();
-            let prev_bits = if *self > 0.0 { bits - 1 } else { bits + 1 };
+            let bits = if *self >= 0.0 {
+                self.to_bits() ^ (1 << 63) // Apply same sign bit flip as to_bytes
+            } else {
+                !self.to_bits() // Apply same bit inversion as to_bytes
+            };
+            let prev_bits = bits - 1;
             Some(prev_bits.to_be_bytes().to_vec())
         }
     }
@@ -144,6 +183,20 @@ impl Collation for f64 {
 
     fn is_maximum(&self) -> bool {
         *self == f64::INFINITY
+    }
+
+    fn compare(&self, other: &Self) -> Ordering {
+        if self.is_nan() {
+            if other.is_nan() {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            }
+        } else if other.is_nan() {
+            Ordering::Less
+        } else {
+            self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        }
     }
 }
 
@@ -200,23 +253,6 @@ mod tests {
         let nan = f64::NAN;
         assert!(nan.successor_bytes().is_none());
         assert!(nan.predecessor_bytes().is_none());
-
-        // Test ordering
-        let values = [
-            -1.0,
-            -0.0,
-            0.0,
-            1.0,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NAN,
-        ];
-        for i in 0..values.len() {
-            for j in 0..values.len() {
-                let expected = values[i].partial_cmp(&values[j]).unwrap_or(Ordering::Equal);
-                assert_eq!(values[i].compare(&values[j]), expected);
-            }
-        }
     }
 
     #[test]

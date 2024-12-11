@@ -84,6 +84,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-index"
+version = "0.1.0"
+
+[[package]]
 name = "ankurah-proto"
 version = "0.1.0"
 dependencies = [
