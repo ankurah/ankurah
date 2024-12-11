@@ -90,6 +90,9 @@ dependencies = [
 [[package]]
 name = "ankurah-index"
 version = "0.1.0"
+dependencies = [
+ "ankql",
+]
 
 [[package]]
 name = "ankurah-proto"
