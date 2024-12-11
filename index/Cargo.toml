@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ankql = { path = "../ankql" }
+anyhow = "1.0.94"
+dashmap = "6.1.0"
+
+[dev-dependencies]

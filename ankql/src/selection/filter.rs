@@ -15,6 +15,8 @@ pub enum Error {
 // Just to make this fast, lets assume all values are strings.
 pub trait Filterable {
     fn collection(&self) -> &str;
+    // TODO figure out how to make this generic so we can perform typecast eligibity checking
+    // and perform the actual typecast for comparisions
     fn value(&self, name: &str) -> Option<String>;
 }
 
@@ -46,7 +48,7 @@ fn evaluate_expr<R: Filterable>(record: &R, expr: &Expr) -> Result<String, Error
     }
 }
 
-fn evaluate_predicate<R: Filterable>(record: &R, predicate: &Predicate) -> Result<bool, Error> {
+pub fn evaluate_predicate<R: Filterable>(record: &R, predicate: &Predicate) -> Result<bool, Error> {
     match predicate {
         Predicate::Comparison {
             left,

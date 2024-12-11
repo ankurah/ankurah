@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use ankql::ast;
 /// Represents a bound in a range query
 #[derive(Debug, Clone, PartialEq)]
 pub enum RangeBound<T> {
@@ -9,7 +10,7 @@ pub enum RangeBound<T> {
 }
 
 /// Trait for types that support collation operations
-pub trait Collation {
+pub trait Collatable {
     /// Convert the value to its binary representation for collation
     fn to_bytes(&self) -> Vec<u8>;
 
@@ -26,7 +27,9 @@ pub trait Collation {
     fn is_maximum(&self) -> bool;
 
     /// Compare two values in the collation order
-    fn compare(&self, other: &Self) -> Ordering;
+    fn compare(&self, other: &Self) -> Ordering {
+        self.to_bytes().cmp(&other.to_bytes())
+    }
 
     fn is_in_range(&self, lower: RangeBound<&Self>, upper: RangeBound<&Self>) -> bool {
         match (lower, upper) {
@@ -55,8 +58,135 @@ pub trait Collation {
     }
 }
 
-// Implementation for strings
-impl Collation for str {
+impl Collatable for ast::Literal {
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            ast::Literal::String(s) => s.as_bytes().to_vec(),
+            ast::Literal::Integer(i) => i.to_be_bytes().to_vec(),
+            ast::Literal::Float(f) => {
+                let bits = if f.is_nan() {
+                    u64::MAX // NaN sorts last
+                } else {
+                    let bits = f.to_bits();
+                    if *f >= 0.0 {
+                        bits ^ (1 << 63) // Flip sign bit for positive numbers
+                    } else {
+                        !bits // Flip all bits for negative numbers
+                    }
+                };
+                bits.to_be_bytes().to_vec()
+            }
+            ast::Literal::Boolean(b) => vec![*b as u8],
+        }
+    }
+
+    fn successor_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            ast::Literal::String(s) => {
+                if s.is_empty() {
+                    let mut bytes = s.as_bytes().to_vec();
+                    // TODO - I think this is wrong. We shouldn't just push a byte. We should increment by one bit perhaps?
+                    // It also occurs to me that we need a fixed length for strings in order collate properly.
+                    bytes.push(0);
+                    Some(bytes)
+                } else {
+                    let mut bytes = s.as_bytes().to_vec();
+                    // TODO - I think this is wrong
+                    bytes.push(0);
+                    Some(bytes)
+                }
+            }
+            ast::Literal::Integer(i) => {
+                if *i == i64::MAX {
+                    None
+                } else {
+                    Some((i + 1).to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::Float(f) => {
+                if f.is_nan() || (f.is_infinite() && *f > 0.0) {
+                    None
+                } else {
+                    let bits = if *f >= 0.0 {
+                        f.to_bits() ^ (1 << 63)
+                    } else {
+                        !f.to_bits()
+                    };
+                    let next_bits = bits + 1;
+                    Some(next_bits.to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::Boolean(b) => {
+                if !b {
+                    None
+                } else {
+                    Some(vec![1])
+                }
+            }
+        }
+    }
+
+    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            ast::Literal::String(s) => {
+                if s.is_empty() {
+                    None
+                } else {
+                    let bytes = s.as_bytes();
+                    Some(bytes[..bytes.len() - 1].to_vec())
+                }
+            }
+            ast::Literal::Integer(i) => {
+                if *i == i64::MIN {
+                    None
+                } else {
+                    Some((i - 1).to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::Float(f) => {
+                if f.is_nan() || (f.is_infinite() && *f < 0.0) {
+                    None
+                } else {
+                    let bits = if *f >= 0.0 {
+                        f.to_bits() ^ (1 << 63)
+                    } else {
+                        !f.to_bits()
+                    };
+                    let prev_bits = bits - 1;
+                    Some(prev_bits.to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::Boolean(b) => {
+                if *b {
+                    Some(vec![0])
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn is_minimum(&self) -> bool {
+        match self {
+            ast::Literal::String(s) => s.is_empty(),
+            ast::Literal::Integer(i) => *i == i64::MIN,
+            ast::Literal::Float(f) => *f == f64::NEG_INFINITY,
+            ast::Literal::Boolean(b) => !b,
+        }
+    }
+
+    fn is_maximum(&self) -> bool {
+        match self {
+            ast::Literal::String(_) => false, // Strings have no theoretical maximum
+            ast::Literal::Integer(i) => *i == i64::MAX,
+            ast::Literal::Float(f) => *f == f64::INFINITY,
+            ast::Literal::Boolean(b) => *b,
+        }
+    }
+}
+
+// // Implementation for strings
+impl Collatable for &str {
     fn to_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
@@ -91,14 +221,10 @@ impl Collation for str {
     fn is_maximum(&self) -> bool {
         false // Strings have no theoretical maximum
     }
-
-    fn compare(&self, other: &Self) -> Ordering {
-        self.as_bytes().cmp(other.as_bytes())
-    }
 }
 
 // Implementation for integers
-impl Collation for i64 {
+impl Collatable for i64 {
     fn to_bytes(&self) -> Vec<u8> {
         // Use big-endian encoding to preserve ordering
         self.to_be_bytes().to_vec()
@@ -127,14 +253,10 @@ impl Collation for i64 {
     fn is_maximum(&self) -> bool {
         *self == i64::MAX
     }
-
-    fn compare(&self, other: &Self) -> Ordering {
-        self.cmp(other)
-    }
 }
 
 // Implementation for floats
-impl Collation for f64 {
+impl Collatable for f64 {
     fn to_bytes(&self) -> Vec<u8> {
         let bits = if self.is_nan() {
             u64::MAX // NaN sorts last
@@ -183,20 +305,6 @@ impl Collation for f64 {
 
     fn is_maximum(&self) -> bool {
         *self == f64::INFINITY
-    }
-
-    fn compare(&self, other: &Self) -> Ordering {
-        if self.is_nan() {
-            if other.is_nan() {
-                Ordering::Equal
-            } else {
-                Ordering::Greater
-            }
-        } else if other.is_nan() {
-            Ordering::Less
-        } else {
-            self.partial_cmp(other).unwrap_or(Ordering::Equal)
-        }
     }
 }
 
