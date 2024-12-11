@@ -1,7 +1,8 @@
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
+use ankql::collation::Collation;
 use ankql::parser::parse_selection;
 use ankql::selection::filter::{FilterIterator, FilterResult, Filterable};
-use std::collections::{BTreeMap, Bound, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, AtomicUsize as AtomicId};
 use std::sync::{Arc, Mutex};
 
@@ -21,37 +22,39 @@ struct Subscription {
 #[derive(Debug, Default)]
 struct FieldIndex {
     // Map from value to subscription IDs that match that value
-    eq: HashMap<String, Vec<usize>>,
+    eq: HashMap<Vec<u8>, Vec<usize>>,
     // Ordered list of (threshold, subscription IDs) for range queries
-    // TODO: Consider using skip lists or B-trees for better range query performance
-    gt: BTreeMap<String, Vec<usize>>,
-    lt: BTreeMap<String, Vec<usize>>,
+    gt: BTreeMap<Vec<u8>, Vec<usize>>,
+    lt: BTreeMap<Vec<u8>, Vec<usize>>,
 }
 
 impl FieldIndex {
     fn add_subscription(&mut self, value: &str, op: &str, sub_id: usize) {
+        let bytes = value.to_bytes();
         match op {
             "=" => {
-                self.eq.entry(value.to_string()).or_default().push(sub_id);
+                self.eq.entry(bytes).or_default().push(sub_id);
             }
             ">" => {
-                self.gt.entry(value.to_string()).or_default().push(sub_id);
+                self.gt.entry(bytes).or_default().push(sub_id);
             }
             "<" => {
-                self.lt.entry(value.to_string()).or_default().push(sub_id);
+                self.lt.entry(bytes).or_default().push(sub_id);
             }
             ">=" => {
-                // x >= 5 is the same as x > 4
-                if let Some(pred) = predecessor(value) {
+                // x >= 5 is equivalent to x > 4
+                if let Some(pred) = value.predecessor_bytes() {
                     self.gt.entry(pred).or_default().push(sub_id);
                 } else {
-                    // If there is no predecessor (e.g., value is ""), then this matches everything
-                    self.gt.entry("".to_string()).or_default().push(sub_id);
+                    // If there is no predecessor (e.g., value is minimum), then this matches everything
+                    self.gt.entry(Vec::new()).or_default().push(sub_id);
                 }
             }
             "<=" => {
-                // x <= 5 is the same as x < 6
-                self.lt.entry(successor(value)).or_default().push(sub_id);
+                // x <= 5 is equivalent to x < 6
+                if let Some(succ) = value.successor_bytes() {
+                    self.lt.entry(succ).or_default().push(sub_id);
+                }
             }
             _ => panic!("Unsupported operator: {}", op),
         }
@@ -59,25 +62,25 @@ impl FieldIndex {
 
     fn find_matching_subscriptions(&self, value: &str) -> Vec<usize> {
         let mut result = HashSet::new();
+        let bytes = value.to_bytes();
 
         // Check exact matches
-        if let Some(subs) = self.eq.get(value) {
+        if let Some(subs) = self.eq.get(&bytes) {
             result.extend(subs);
         }
 
         // Check greater than matches (value > threshold)
         // We want all thresholds strictly less than our value
-        for (_, subs) in self.gt.range(..value.to_string()) {
+        for (_, subs) in self.gt.range(..bytes.clone()) {
             result.extend(subs);
         }
 
         // Check less than matches (value < threshold)
         // We want all thresholds strictly greater than our value
-        for (_, subs) in self
-            .lt
-            .range((Bound::Excluded(value.to_string()), Bound::Unbounded))
-        {
-            result.extend(subs);
+        for (threshold, subs) in self.lt.range(bytes.clone()..) {
+            if threshold > &bytes {
+                result.extend(subs);
+            }
         }
 
         let mut result: Vec<_> = result.into_iter().collect();
@@ -594,39 +597,9 @@ fn main() {
     println!("✅ Test sequence complete!");
 }
 
-// TODO: Implement proper binary collation that handles:
-// - Full UTF-8 range
-// - Correct lexicographic ordering
-// - Efficient successor/predecessor without string scanning
-// For now, we use simple string operations that work for ASCII
-
-fn successor(s: &str) -> String {
-    format!("{}.", s) // Simple hack: append a dot which is greater than most chars
-}
-
-fn predecessor(s: &str) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s[..s.len() - 1].to_string()) // Simple hack: remove last char
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_successor() {
-        assert!(successor("abc") > "abc".to_string());
-        assert!(successor("") > "".to_string());
-    }
-
-    #[test]
-    fn test_predecessor() {
-        assert!(predecessor("abc").unwrap() < "abc".to_string());
-        assert_eq!(predecessor(""), None);
-    }
 
     #[test]
     fn test_field_index() {
