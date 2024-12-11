@@ -9,12 +9,15 @@ pub enum RangeBound<T> {
 }
 
 /// Trait for types that support collation operations
-pub trait Collation: Sized {
-    /// Returns the immediate successor of the current value if one exists
-    fn successor(&self) -> Option<Self>;
+pub trait Collation {
+    /// Convert the value to its binary representation for collation
+    fn to_bytes(&self) -> Vec<u8>;
 
-    /// Returns the immediate predecessor of the current value if one exists
-    fn predecessor(&self) -> Option<Self>;
+    /// Returns the immediate successor's binary representation if one exists
+    fn successor_bytes(&self) -> Option<Vec<u8>>;
+
+    /// Returns the immediate predecessor's binary representation if one exists
+    fn predecessor_bytes(&self) -> Option<Vec<u8>>;
 
     /// Returns true if this value represents a minimum bound in its domain
     fn is_minimum(&self) -> bool;
@@ -23,81 +26,28 @@ pub trait Collation: Sized {
     fn is_maximum(&self) -> bool;
 
     /// Compare two values in the collation order
-    fn compare(&self, other: &Self) -> Ordering;
-
-    /// Returns true if this value is within the given range
-    fn is_in_range(&self, lower: RangeBound<&Self>, upper: RangeBound<&Self>) -> bool {
-        match (&lower, &upper) {
-            (RangeBound::Unbounded, RangeBound::Unbounded) => true,
-            (RangeBound::Unbounded, RangeBound::Included(upper)) => {
-                self.compare(upper) != Ordering::Greater
-            }
-            (RangeBound::Unbounded, RangeBound::Excluded(upper)) => {
-                self.compare(upper) == Ordering::Less
-            }
-            (RangeBound::Included(lower), RangeBound::Unbounded) => {
-                self.compare(lower) != Ordering::Less
-            }
-            (RangeBound::Excluded(lower), RangeBound::Unbounded) => {
-                self.compare(lower) == Ordering::Greater
-            }
-            (RangeBound::Included(lower), RangeBound::Included(upper)) => {
-                self.compare(lower) != Ordering::Less && self.compare(upper) != Ordering::Greater
-            }
-            (RangeBound::Included(lower), RangeBound::Excluded(upper)) => {
-                self.compare(lower) != Ordering::Less && self.compare(upper) == Ordering::Less
-            }
-            (RangeBound::Excluded(lower), RangeBound::Included(upper)) => {
-                self.compare(lower) == Ordering::Greater && self.compare(upper) != Ordering::Greater
-            }
-            (RangeBound::Excluded(lower), RangeBound::Excluded(upper)) => {
-                self.compare(lower) == Ordering::Greater && self.compare(upper) == Ordering::Less
-            }
-        }
-    }
-
-    /// Returns the next value after the given bound (useful for converting inclusive to exclusive bounds)
-    fn after_bound(bound: RangeBound<Self>) -> RangeBound<Self> {
-        match bound {
-            RangeBound::Included(value) => {
-                if let Some(next) = value.successor() {
-                    RangeBound::Excluded(next)
-                } else {
-                    RangeBound::Unbounded
-                }
-            }
-            other => other,
-        }
-    }
-
-    /// Returns the previous value before the given bound (useful for converting inclusive to exclusive bounds)
-    fn before_bound(bound: RangeBound<Self>) -> RangeBound<Self> {
-        match bound {
-            RangeBound::Included(value) => {
-                if let Some(prev) = value.predecessor() {
-                    RangeBound::Excluded(prev)
-                } else {
-                    RangeBound::Unbounded
-                }
-            }
-            other => other,
-        }
+    fn compare(&self, other: &Self) -> Ordering {
+        self.to_bytes().cmp(&other.to_bytes())
     }
 }
 
 // Implementation for strings
-impl Collation for String {
-    fn successor(&self) -> Option<Self> {
+impl Collation for str {
+    fn to_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+
+    fn successor_bytes(&self) -> Option<Vec<u8>> {
         if self.is_maximum() {
             None
         } else {
             let mut bytes = self.as_bytes().to_vec();
             bytes.push(0);
-            Some(String::from_utf8(bytes).unwrap())
+            Some(bytes)
         }
     }
 
-    fn predecessor(&self) -> Option<Self> {
+    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
         if self.is_minimum() {
             None
         } else {
@@ -105,7 +55,7 @@ impl Collation for String {
             if bytes.is_empty() {
                 None
             } else {
-                Some(String::from_utf8(bytes[..bytes.len() - 1].to_vec()).unwrap())
+                Some(bytes[..bytes.len() - 1].to_vec())
             }
         }
     }
@@ -117,27 +67,28 @@ impl Collation for String {
     fn is_maximum(&self) -> bool {
         false // Strings have no theoretical maximum
     }
-
-    fn compare(&self, other: &Self) -> Ordering {
-        self.cmp(other)
-    }
 }
 
 // Implementation for integers
 impl Collation for i64 {
-    fn successor(&self) -> Option<Self> {
+    fn to_bytes(&self) -> Vec<u8> {
+        // Use big-endian encoding to preserve ordering
+        self.to_be_bytes().to_vec()
+    }
+
+    fn successor_bytes(&self) -> Option<Vec<u8>> {
         if self == &i64::MAX {
             None
         } else {
-            Some(self + 1)
+            Some((self + 1).to_be_bytes().to_vec())
         }
     }
 
-    fn predecessor(&self) -> Option<Self> {
+    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
         if self == &i64::MIN {
             None
         } else {
-            Some(self - 1)
+            Some((self - 1).to_be_bytes().to_vec())
         }
     }
 
@@ -148,33 +99,42 @@ impl Collation for i64 {
     fn is_maximum(&self) -> bool {
         *self == i64::MAX
     }
-
-    fn compare(&self, other: &Self) -> Ordering {
-        self.cmp(other)
-    }
 }
 
 // Implementation for floats
 impl Collation for f64 {
-    fn successor(&self) -> Option<Self> {
+    fn to_bytes(&self) -> Vec<u8> {
+        // Special handling for NaN and sign to maintain ordering
+        let bits = if self.is_nan() {
+            u64::MAX // NaN sorts last
+        } else {
+            let bits = self.to_bits();
+            if *self >= 0.0 {
+                bits
+            } else {
+                !bits // Flip bits for negative numbers to maintain ordering
+            }
+        };
+        bits.to_be_bytes().to_vec()
+    }
+
+    fn successor_bytes(&self) -> Option<Vec<u8>> {
         if self.is_nan() || (self.is_infinite() && *self > 0.0) {
             None
         } else {
-            // Use bit manipulation for next representable float
             let bits = self.to_bits();
             let next_bits = if *self >= 0.0 { bits + 1 } else { bits - 1 };
-            Some(f64::from_bits(next_bits))
+            Some(next_bits.to_be_bytes().to_vec())
         }
     }
 
-    fn predecessor(&self) -> Option<Self> {
+    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
         if self.is_nan() || (self.is_infinite() && *self < 0.0) {
             None
         } else {
-            // Use bit manipulation for previous representable float
             let bits = self.to_bits();
             let prev_bits = if *self > 0.0 { bits - 1 } else { bits + 1 };
-            Some(f64::from_bits(prev_bits))
+            Some(prev_bits.to_be_bytes().to_vec())
         }
     }
 
@@ -185,14 +145,6 @@ impl Collation for f64 {
     fn is_maximum(&self) -> bool {
         *self == f64::INFINITY
     }
-
-    fn compare(&self, other: &Self) -> Ordering {
-        if self.is_nan() || other.is_nan() {
-            Ordering::Equal // NaN is considered equal to itself for collation purposes
-        } else {
-            self.partial_cmp(other).unwrap_or(Ordering::Equal)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -201,27 +153,33 @@ mod tests {
 
     #[test]
     fn test_string_collation() {
-        let s = String::from("hello");
-        assert!(s.successor().unwrap().compare(&s) == Ordering::Greater);
-        assert!(s.predecessor().unwrap().compare(&s) == Ordering::Less);
+        let s = "hello";
+        assert!(s.successor_bytes().unwrap() > s.to_bytes());
+        assert!(s.predecessor_bytes().unwrap() < s.to_bytes());
         assert!(!s.is_minimum());
         assert!(!s.is_maximum());
 
-        let empty = String::new();
+        let empty = "";
         assert!(empty.is_minimum());
-        assert!(empty.predecessor().is_none());
+        assert!(empty.predecessor_bytes().is_none());
     }
 
     #[test]
     fn test_integer_collation() {
         let n = 42i64;
-        assert_eq!(n.successor().unwrap(), 43);
-        assert_eq!(n.predecessor().unwrap(), 41);
+        assert_eq!(
+            i64::from_be_bytes(n.successor_bytes().unwrap().try_into().unwrap()),
+            43
+        );
+        assert_eq!(
+            i64::from_be_bytes(n.predecessor_bytes().unwrap().try_into().unwrap()),
+            41
+        );
         assert!(!n.is_minimum());
         assert!(!n.is_maximum());
 
-        assert!(i64::MAX.successor().is_none());
-        assert!(i64::MIN.predecessor().is_none());
+        assert!(i64::MAX.successor_bytes().is_none());
+        assert!(i64::MIN.predecessor_bytes().is_none());
         assert!(i64::MAX.is_maximum());
         assert!(i64::MIN.is_minimum());
     }
@@ -229,20 +187,36 @@ mod tests {
     #[test]
     fn test_float_collation() {
         let f = 1.0f64;
-        assert!(f.successor().unwrap().compare(&f) == Ordering::Greater);
-        assert!(f.predecessor().unwrap().compare(&f) == Ordering::Less);
+        assert!(f.successor_bytes().unwrap() > f.to_bytes());
+        assert!(f.predecessor_bytes().unwrap() < f.to_bytes());
         assert!(!f.is_minimum());
         assert!(!f.is_maximum());
 
         assert!(f64::INFINITY.is_maximum());
         assert!(f64::NEG_INFINITY.is_minimum());
-        assert!(f64::INFINITY.successor().is_none());
-        assert!(f64::NEG_INFINITY.predecessor().is_none());
+        assert!(f64::INFINITY.successor_bytes().is_none());
+        assert!(f64::NEG_INFINITY.predecessor_bytes().is_none());
 
         let nan = f64::NAN;
-        assert!(nan.successor().is_none());
-        assert!(nan.predecessor().is_none());
-        assert!(nan.compare(&nan) == Ordering::Equal); // NaN equals NaN for collation
+        assert!(nan.successor_bytes().is_none());
+        assert!(nan.predecessor_bytes().is_none());
+
+        // Test ordering
+        let values = [
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for i in 0..values.len() {
+            for j in 0..values.len() {
+                let expected = values[i].partial_cmp(&values[j]).unwrap_or(Ordering::Equal);
+                assert_eq!(values[i].compare(&values[j]), expected);
+            }
+        }
     }
 
     #[test]
