@@ -1,10 +1,11 @@
 use ankurah_core::property::value::YrsString;
-use ankurah_core::storage::PostgresStorageEngine;
+use ankurah_core::storage::Postgres;
 use ankurah_core::{model::ScopedRecord, node::Node};
 use ankurah_derive::Model;
 use anyhow::Result;
+use postgres::{Error, NoTls};
+use r2d2_postgres::PostgresConnectionManager;
 use serde::{Deserialize, Serialize};
-use tokio_postgres::{Error, NoTls};
 use tracing::{info, Level};
 
 use std::sync::Arc;
@@ -21,21 +22,29 @@ pub struct Album {
     pub name: String,
 }
 
-#[tokio::test]
-async fn postgres() -> Result<()> {
-    let (client, connection) =
-        tokio_postgres::connect("host=localhost user=postgres password=postgres", NoTls).await?;
+#[test]
+fn postgres() -> Result<()> {
+    let manager = PostgresConnectionManager::new(
+        "host=localhost user=postgres password=postgres dbname=ankurah"
+            .parse()
+            .unwrap(),
+        NoTls,
+    );
+    let pool = r2d2::Pool::new(manager).unwrap();
 
-    // The connection object performs the actual communication with the database,
-    // so spawn it off to run on its own.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-
-    let storage_engine = PostgresStorageEngine::new(client)?;
+    let storage_engine = Postgres::new(pool)?;
     let node = Arc::new(Node::new(storage_engine));
+
+    println!("mark 1");
+    let trx = node.begin();
+    println!("mark 2");
+    let album = trx.create(&Album {
+        name: "The rest of the owl".to_owned(),
+    });
+    println!("mark 3");
+
+    trx.commit().unwrap();
+    println!("mark 4");
 
     Ok(())
 }

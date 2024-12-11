@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+exit 0;
 cat > "$PGDATA/server.key" <<-EOKEY
 -----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEAllItXwrj62MkxKVlz2FimJk42WWc3K82Rn2vAl6z38zQxSCj

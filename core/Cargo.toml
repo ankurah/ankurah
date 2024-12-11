@@ -5,9 +5,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["derive", "postgres"]
+default = ["derive"]
 derive = ["ankurah-derive"]
-postgres = ["tokio-postgres"]
 
 [dependencies]
 anyhow = "1.0.89"
@@ -17,7 +16,8 @@ dirs = "5.0.1"
 futures-signals = "0.3.34"
 serde = "1.0.210"
 tokio = { version = "1.40.0", features = ["full"] }
-ulid = { version = "1.1.3", features = ["serde"] }
+ulid = { version = "1.1.3", features = ["serde", "uuid"] }
+uuid = "1.1"
 ankurah-derive = { path = "../derive", optional = true }
 tracing = "0.1.40"
 bincode = "1.3.3"
@@ -28,7 +28,9 @@ yrs = "0.21.2"
 
 # Storage engines
 sled = "0.34.7"
-tokio-postgres = { version = "0.7", optional = true }
+postgres = { version = "0.19", features = ["with-uuid-1"] }
+r2d2_postgres = "0.18"
+r2d2 = "0.8"
 
 [dev-dependencies]
 ankurah-derive = { path = "../derive" }

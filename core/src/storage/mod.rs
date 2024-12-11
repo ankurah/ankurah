@@ -6,7 +6,7 @@ use crate::{model::ID, property::Backends};
 
 pub mod postgres;
 pub mod sled;
-pub use postgres::PostgresStorageEngine;
+pub use postgres::Postgres;
 pub use sled::SledStorageEngine;
 
 pub trait StorageEngine: Send + Sync {
@@ -26,6 +26,7 @@ pub trait StorageBucket: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordState {
     pub(crate) state_buffers: BTreeMap<String, Vec<u8>>,
+    // TODO: Store materialized data here?
 }
 
 impl RecordState {
