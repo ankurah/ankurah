@@ -24,11 +24,13 @@ impl ComparisonIndex {
             lt: BTreeMap::new(),
         }
     }
-    fn for_entry<F>(&mut self, value: &str, op: ComparisonOperator, f: F)
+
+    fn for_entry<F, V>(&mut self, value: V, op: ComparisonOperator, f: F)
     where
         F: FnOnce(&mut Vec<SubscriptionId>),
+        V: Collation,
     {
-        let bytes = crate::collation::Collation::to_bytes(value);
+        let bytes = value.to_bytes();
         match op {
             ComparisonOperator::Equal => {
                 let entry = self.eq.entry(bytes).or_default();
@@ -44,7 +46,7 @@ impl ComparisonIndex {
             }
             ComparisonOperator::GreaterThanOrEqual => {
                 // x >= 5 is equivalent to x > 4
-                if let Some(pred) = crate::collation::Collation::predecessor_bytes(value) {
+                if let Some(pred) = crate::collation::Collation::predecessor_bytes(&value) {
                     let entry = self.gt.entry(pred).or_default();
                     f(entry);
                 } else {
@@ -55,7 +57,7 @@ impl ComparisonIndex {
             }
             ComparisonOperator::LessThanOrEqual => {
                 // x <= 5 is equivalent to x < 6
-                if let Some(succ) = crate::collation::Collation::successor_bytes(value) {
+                if let Some(succ) = crate::collation::Collation::successor_bytes(&value) {
                     let entry = self.lt.entry(succ).or_default();
                     f(entry);
                 }
@@ -64,11 +66,16 @@ impl ComparisonIndex {
         }
     }
 
-    pub fn add_entry(&mut self, value: &str, op: ComparisonOperator, sub_id: SubscriptionId) {
+    pub fn add<V: Collation>(&mut self, value: V, op: ComparisonOperator, sub_id: SubscriptionId) {
         self.for_entry(value, op, |entries| entries.push(sub_id));
     }
 
-    pub fn remove_entry(&mut self, value: &str, op: ComparisonOperator, sub_id: SubscriptionId) {
+    pub fn remove<V: Collation>(
+        &mut self,
+        value: V,
+        op: ComparisonOperator,
+        sub_id: SubscriptionId,
+    ) {
         self.for_entry(value, op, |entries| {
             if let Some(pos) = entries.iter().position(|id| *id == sub_id) {
                 entries.remove(pos);
@@ -112,9 +119,9 @@ mod tests {
         let mut index = ComparisonIndex::default();
 
         // Add some subscriptions
-        index.add_entry("25", ComparisonOperator::GreaterThanOrEqual, 1.into()); // age >= 25
-        index.add_entry("90", ComparisonOperator::LessThanOrEqual, 1.into()); // age <= 90
-        index.add_entry("30", ComparisonOperator::Equal, 2.into()); // age == 30
+        index.add("25", ComparisonOperator::GreaterThanOrEqual, 1.into()); // age >= 25
+        index.add("90", ComparisonOperator::LessThanOrEqual, 1.into()); // age <= 90
+        index.add("30", ComparisonOperator::Equal, 2.into()); // age == 30
 
         // Test some values
         assert!(
@@ -161,7 +168,7 @@ mod tests {
         let mut index = ComparisonIndex::default();
 
         // Test greater than
-        index.add_entry("25", ComparisonOperator::GreaterThan, 1.into());
+        index.add("25", ComparisonOperator::GreaterThan, 1.into());
         assert!(
             index.find_matching_subscriptions("24").is_empty(),
             "> 25: 24 should not match"
@@ -177,7 +184,7 @@ mod tests {
         );
 
         // Test less than
-        index.add_entry("25", ComparisonOperator::LessThan, 2.into());
+        index.add("25", ComparisonOperator::LessThan, 2.into());
         assert_eq!(
             index.find_matching_subscriptions("24"),
             vec![2],
@@ -193,7 +200,7 @@ mod tests {
         );
 
         // Test greater than or equal
-        index.add_entry("25", ComparisonOperator::GreaterThanOrEqual, 3.into());
+        index.add("25", ComparisonOperator::GreaterThanOrEqual, 3.into());
         assert!(
             index.find_matching_subscriptions("24").is_empty(),
             ">= 25: 24 should not match"
@@ -210,7 +217,7 @@ mod tests {
         );
 
         // Test less than or equal
-        index.add_entry("25", ComparisonOperator::LessThanOrEqual, 4.into());
+        index.add("25", ComparisonOperator::LessThanOrEqual, 4.into());
         assert_eq!(
             index.find_matching_subscriptions("24"),
             vec![2, 4],

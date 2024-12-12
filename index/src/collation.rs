@@ -56,7 +56,7 @@ pub trait Collation {
 }
 
 // Implementation for strings
-impl Collation for str {
+impl Collation for &str {
     fn to_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }

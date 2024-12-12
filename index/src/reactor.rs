@@ -16,7 +16,7 @@ where
     S: StorageEngine<R>,
 {
     /// Current subscriptions
-    subscriptions: DashMap<usize, Arc<Subscription<R, S::Update>>>,
+    subscriptions: DashMap<SubscriptionId, Arc<Subscription<R, S::Update>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: DashMap<FieldId, ComparisonIndex>,
     /// Index of subscriptions that presently match each record.
@@ -64,9 +64,10 @@ where
     where
         F: Fn(ChangeSet<R, S::Update>) + Send + Sync + 'static,
     {
-        let sub_id = self
+        let sub_id: SubscriptionId = self
             .next_sub_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .into();
         let subscription = Arc::new(Subscription {
             id: sub_id,
             predicate: predicate.clone(),
@@ -78,7 +79,7 @@ where
         self.subscriptions.insert(sub_id, subscription.clone());
 
         // Find initial matching records
-        let mut matching_records = self.storage.fetch_records(predicate);
+        let matching_records = self.storage.fetch_records(predicate);
 
         // iterate over the records and set the record watchers to reflect the currently matching records
         for record in matching_records.iter() {
@@ -105,14 +106,10 @@ where
         })
     }
 
-    fn recurse_predicate<F>(&self, sub_id: usize, predicate: &Predicate, f: F)
+    fn recurse_predicate<F>(&self, predicate: &Predicate, f: F)
     where
-        F: Fn(
-                &mut dashmap::Entry<FieldId, ComparisonIndex>,
-                &str,
-                &ankql::ast::ComparisonOperator,
-                SubscriptionId,
-            ) + Copy,
+        F: Fn(dashmap::Entry<FieldId, ComparisonIndex>, &str, &ankql::ast::ComparisonOperator)
+            + Copy,
     {
         use ankql::ast::{Expr, Identifier, Literal, Predicate};
         match predicate {
@@ -138,46 +135,33 @@ where
 
                     // For add_index_watchers, this will create if not exists
                     // For remove_index_watchers, this will only get if exists
-                    let mut entry = self.index_watchers.entry(FieldId(field_name));
-                    f(&mut entry, &value, operator, &sub_id);
+                    let entry = self.index_watchers.entry(FieldId(field_name));
+                    f(entry, &value, operator);
                 }
             }
             Predicate::And(left, right) | Predicate::Or(left, right) => {
-                self.recurse_predicate(sub_id, left, f);
-                self.recurse_predicate(sub_id, right, f);
+                self.recurse_predicate(left, f);
+                self.recurse_predicate(right, f);
             }
             Predicate::Not(pred) => {
-                self.recurse_predicate(sub_id, pred, f);
+                self.recurse_predicate(pred, f);
             }
             Predicate::IsNull(_) => {}
         }
     }
 
-    fn add_index_watchers(&self, sub_id: usize, predicate: &Predicate) {
-        // First get the ComparisonIndex for the field
-        self.recurse_predicate(sub_id, predicate, |entry, value, operator, sub_id| {
-            // This gets called once for each comparison in the predicate, recursively
-
-            match entry {
-                dashmap::Entry::Occupied(entry) => {
-                    // push the subscription id on to the vec
-                    entry.get_mut().add_entry(value, operator.clone(), sub_id);
-                }
-                dashmap::Entry::Vacant(&mut entry) => {
-                    entry
-                        .insert(ComparisonIndex::new())
-                        .add_entry(value, operator.clone(), sub_id);
-                }
-            };
+    fn add_index_watchers(&self, sub_id: SubscriptionId, predicate: &Predicate) {
+        self.recurse_predicate(predicate, |entry, value, operator| {
+            entry
+                .or_insert_with(ComparisonIndex::new)
+                .add(value, operator.clone(), sub_id);
         });
     }
 
-    fn remove_index_watchers(&self, sub_id: usize, predicate: &Predicate) {
-        self.recurse_predicate(sub_id, predicate, |entry, value, operator, sub_id| {
-            if let dashmap::Entry::Occupied(entry) = entry {
-                entry
-                    .get_mut()
-                    .remove_entry(value, operator.clone(), sub_id);
+    fn remove_index_watchers(&self, sub_id: SubscriptionId, predicate: &Predicate) {
+        self.recurse_predicate(predicate, |entry, value, operator| {
+            if let dashmap::Entry::Occupied(mut index) = entry {
+                index.get_mut().remove(value, operator.clone(), sub_id);
             }
         });
     }
@@ -207,7 +191,7 @@ type Callback<R, U> = Box<dyn Fn(ChangeSet<R, U>) + Send + Sync + 'static>;
 
 /// A subscription that can be shared between indexes
 pub struct Subscription<R, U> {
-    id: usize,
+    id: SubscriptionId,
     predicate: ankql::ast::Predicate,
     callback: Arc<Callback<R, U>>,
 }
@@ -235,40 +219,58 @@ impl From<usize> for SubscriptionId {
 pub struct SubscriptionHandle<S, R>
 where
     S: StorageEngine<R>,
+    R: Record,
 {
     id: SubscriptionId,
     reactor: Arc<Reactor<S, R>>,
 }
 
-impl<S, R> SubscriptionHandle<S, R> where S: StorageEngine<R> {}
+impl<S, R> SubscriptionHandle<S, R>
+where
+    S: StorageEngine<R>,
+    R: Record,
+{
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ankql;
+
+    #[derive(Debug, Clone)]
+    struct DummyRecord {
+        id: usize,
+    }
+
+    impl Record for DummyRecord {
+        type Id = usize;
+
+        fn id(&self) -> Self::Id {
+            self.id
+        }
+    }
+
     struct DummyEngine {}
-    impl StorageEngine<()> for DummyEngine {
+
+    impl StorageEngine<DummyRecord> for DummyEngine {
         type Id = usize;
         type Update = ();
-        fn fetch_records(&self, _predicate: &Predicate) -> Vec<()> {
+        fn fetch_records(&self, _predicate: &Predicate) -> Vec<DummyRecord> {
             vec![]
         }
     }
+
+    #[test]
     pub fn test_watch_index() {
         let server = Arc::new(DummyEngine {});
-        let mut reactor = Reactor::new(server);
-        let predicate =
-            ankql::parser::parse_selection("name = 'Alice' and age > 25 OR lattitude < 80")
-                .unwrap();
+        let reactor: Reactor<DummyEngine, DummyRecord> = Reactor::new(server);
 
-        reactor.add_index_watchers(0, &predicate);
+        let predicate = ankql::ast::Predicate::IsNull(Box::new(ankql::ast::Expr::Identifier(
+            ankql::ast::Identifier::Property("test".to_string()),
+        )));
+        let sub_id = SubscriptionId::from(0);
+        reactor.add_index_watchers(sub_id, &predicate);
 
         println!("{:?}", reactor.index_watchers);
-
-        // TODO
-        // check to make sure that:
-        // name has an eq watcher
-        // age has a gt watcher
-        // lattitude has a lt watcher
     }
 }
