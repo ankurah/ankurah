@@ -11,9 +11,9 @@ use ankql::ast::ComparisonOperator;
 /// registrations on intermediate nodes for range comparisons.
 #[derive(Debug, Default)]
 pub(crate) struct ComparisonIndex {
-    eq: HashMap<Vec<u8>, Vec<SubscriptionId>>,
-    gt: BTreeMap<Vec<u8>, Vec<SubscriptionId>>,
-    lt: BTreeMap<Vec<u8>, Vec<SubscriptionId>>,
+    pub(crate) eq: HashMap<Vec<u8>, Vec<SubscriptionId>>,
+    pub(crate) gt: BTreeMap<Vec<u8>, Vec<SubscriptionId>>,
+    pub(crate) lt: BTreeMap<Vec<u8>, Vec<SubscriptionId>>,
 }
 
 impl ComparisonIndex {
@@ -82,8 +82,7 @@ impl ComparisonIndex {
             }
         });
     }
-
-    fn find_matching_subscriptions(&self, value: &str) -> Vec<SubscriptionId> {
+    pub fn find_matching_subscriptions<V: Collation>(&self, value: V) -> Vec<SubscriptionId> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 

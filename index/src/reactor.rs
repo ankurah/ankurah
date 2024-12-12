@@ -8,6 +8,11 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, Weak};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
+impl Into<FieldId> for &str {
+    fn into(self) -> FieldId {
+        FieldId(self.to_string())
+    }
+}
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of records
 pub struct Reactor<S, R>
@@ -265,12 +270,36 @@ mod tests {
         let server = Arc::new(DummyEngine {});
         let reactor: Reactor<DummyEngine, DummyRecord> = Reactor::new(server);
 
-        let predicate = ankql::ast::Predicate::IsNull(Box::new(ankql::ast::Expr::Identifier(
-            ankql::ast::Identifier::Property("test".to_string()),
-        )));
+        let predicate =
+            ankql::parser::parse_selection("name = 'Alice' and age > 25 OR lattitude < 80")
+                .unwrap();
         let sub_id = SubscriptionId::from(0);
         reactor.add_index_watchers(sub_id, &predicate);
 
-        println!("{:?}", reactor.index_watchers);
+        let iw = &reactor.index_watchers;
+        let name = FieldId("name".to_string());
+        let age = FieldId("age".to_string());
+        let lattitude = FieldId("lattitude".to_string());
+        assert_eq!(
+            iw.get(&name).map(|i| {
+                assert_eq!(i.eq.len(), 1);
+                i.find_matching_subscriptions("Alice")
+            }),
+            Some(vec![sub_id])
+        );
+        assert_eq!(
+            iw.get(&age).map(|i| {
+                assert_eq!(i.gt.len(), 1);
+                i.find_matching_subscriptions("26")
+            }),
+            Some(vec![sub_id])
+        );
+        assert_eq!(
+            iw.get(&lattitude).map(|i| {
+                assert_eq!(i.lt.len(), 1);
+                i.find_matching_subscriptions("79")
+            }),
+            Some(vec![sub_id])
+        );
     }
 }
