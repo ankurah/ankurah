@@ -1,8 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{collation::Collation, reactor::SubscriptionId};
+use ankql::ast::ComparisonOperator;
 
 /// An index for a specific field and comparison operator
+/// Used for storage engines that don't offer watchable indexes
+/// This is a naive implementation that uses a BTreeMap for each operator
+/// This is not efficient for large datasets. If this ends up being used in production
+/// we should consider using a more efficient index structure like a B+ tree with subscription
+/// registrations on intermediate nodes for range comparisons.
 #[derive(Debug, Default)]
 pub(crate) struct ComparisonIndex {
     eq: HashMap<Vec<u8>, Vec<SubscriptionId>>,
@@ -11,35 +17,56 @@ pub(crate) struct ComparisonIndex {
 }
 
 impl ComparisonIndex {
-    fn add_subscription(&mut self, value: &str, op: &str, sub_id: SubscriptionId) {
+    fn for_entry<F>(&mut self, value: &str, op: ComparisonOperator, f: F)
+    where
+        F: FnOnce(&mut Vec<SubscriptionId>),
+    {
         let bytes = crate::collation::Collation::to_bytes(value);
         match op {
-            "=" => {
-                self.eq.entry(bytes).or_default().push(sub_id);
+            ComparisonOperator::Equal => {
+                let entry = self.eq.entry(bytes).or_default();
+                f(entry);
             }
-            ">" => {
-                self.gt.entry(bytes).or_default().push(sub_id);
+            ComparisonOperator::GreaterThan => {
+                let entry = self.gt.entry(bytes).or_default();
+                f(entry);
             }
-            "<" => {
-                self.lt.entry(bytes).or_default().push(sub_id);
+            ComparisonOperator::LessThan => {
+                let entry = self.lt.entry(bytes).or_default();
+                f(entry);
             }
-            ">=" => {
+            ComparisonOperator::GreaterThanOrEqual => {
                 // x >= 5 is equivalent to x > 4
                 if let Some(pred) = crate::collation::Collation::predecessor_bytes(value) {
-                    self.gt.entry(pred).or_default().push(sub_id);
+                    let entry = self.gt.entry(pred).or_default();
+                    f(entry);
                 } else {
                     // If there is no predecessor (e.g., value is minimum), then this matches everything
-                    self.gt.entry(Vec::new()).or_default().push(sub_id);
+                    let entry = self.gt.entry(Vec::new()).or_default();
+                    f(entry);
                 }
             }
-            "<=" => {
+            ComparisonOperator::LessThanOrEqual => {
                 // x <= 5 is equivalent to x < 6
                 if let Some(succ) = crate::collation::Collation::successor_bytes(value) {
-                    self.lt.entry(succ).or_default().push(sub_id);
+                    let entry = self.lt.entry(succ).or_default();
+                    f(entry);
                 }
             }
-            _ => panic!("Unsupported operator: {}", op),
+            _ => panic!("Unsupported operator: {:?}", op),
         }
+    }
+
+    pub fn add_entry(&mut self, value: &str, op: ComparisonOperator, sub_id: SubscriptionId) {
+        self.for_entry(value, op, |entries| entries.push(sub_id));
+    }
+
+    pub fn remove_entry(&mut self, value: &str, op: ComparisonOperator, sub_id: SubscriptionId) {
+        self.for_entry(value, op, |entries| {
+            if let Some(pos) = entries.iter().position(|id| *id == sub_id) {
+                entries.remove(pos);
+            }
+        });
     }
 
     fn find_matching_subscriptions(&self, value: &str) -> Vec<SubscriptionId> {
@@ -78,9 +105,9 @@ mod tests {
         let mut index = ComparisonIndex::default();
 
         // Add some subscriptions
-        index.add_subscription("25", ">=", 1.into()); // age >= 25
-        index.add_subscription("90", "<=", 1.into()); // age <= 90
-        index.add_subscription("30", "=", 2.into()); // age == 30
+        index.add_entry("25", ComparisonOperator::GreaterThanOrEqual, 1.into()); // age >= 25
+        index.add_entry("90", ComparisonOperator::LessThanOrEqual, 1.into()); // age <= 90
+        index.add_entry("30", ComparisonOperator::Equal, 2.into()); // age == 30
 
         // Test some values
         assert!(
@@ -127,7 +154,7 @@ mod tests {
         let mut index = ComparisonIndex::default();
 
         // Test greater than
-        index.add_subscription("25", ">", 1.into());
+        index.add_entry("25", ComparisonOperator::GreaterThan, 1.into());
         assert!(
             index.find_matching_subscriptions("24").is_empty(),
             "> 25: 24 should not match"
@@ -143,7 +170,7 @@ mod tests {
         );
 
         // Test less than
-        index.add_subscription("25", "<", 2.into());
+        index.add_entry("25", ComparisonOperator::LessThan, 2.into());
         assert_eq!(
             index.find_matching_subscriptions("24"),
             vec![2],
@@ -159,7 +186,7 @@ mod tests {
         );
 
         // Test greater than or equal
-        index.add_subscription("25", ">=", 3.into());
+        index.add_entry("25", ComparisonOperator::GreaterThanOrEqual, 3.into());
         assert!(
             index.find_matching_subscriptions("24").is_empty(),
             ">= 25: 24 should not match"
@@ -176,7 +203,7 @@ mod tests {
         );
 
         // Test less than or equal
-        index.add_subscription("25", "<=", 4.into());
+        index.add_entry("25", ComparisonOperator::LessThanOrEqual, 4.into());
         assert_eq!(
             index.find_matching_subscriptions("24"),
             vec![2, 4],

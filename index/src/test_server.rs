@@ -1,137 +1,135 @@
-use std::{collections::HashMap, sync::atomic::AtomicUsize};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, atomic::AtomicUsize},
+};
 
-use crate::reactor::{Reactor, SubscriptionHandle};
+use ankql::selection::filter::FilterIterator;
+
+use crate::{
+    operation::Operation,
+    reactor::{Reactor, StorageEngine, SubscriptionHandle},
+};
 
 #[derive(Debug, Clone)]
 struct Update(String, String);
 
+/// A super basic record that we can use for test cases
 #[derive(Debug, Clone)]
-pub struct TestRecord {
+pub struct TestModel {
     pub name: String,
     pub age: String,
 }
+#[derive(Debug, Clone)]
+pub struct TestRecord {
+    pub id: usize,
+    pub model: TestModel,
+}
 
-impl ankql::selection::filter::Filterable for TestRecord {
+impl crate::reactor::Record<TestRecord> for TestRecord {
+    type Id = usize;
+    fn id(&self) -> Self::Id {
+        self.id
+    }
+}
+
+impl ankql::selection::filter::Filterable for &TestRecord {
     fn collection(&self) -> &str {
         "users"
     }
 
     fn value(&self, name: &str) -> Option<String> {
         match name {
-            "name" => Some(self.name.clone()),
-            "age" => Some(self.age.clone()),
+            "name" => Some(self.model.name.clone()),
+            "age" => Some(self.model.age.clone()),
             _ => None,
         }
     }
 }
 
-/// A server that maintains a set of records and notifies subscribers of changes
-pub struct FakeServer {
-    records: HashMap<usize, TestRecord>,
-    next_record_id: AtomicUsize,
-    reactor: Reactor,
+/// A very basic server that we can use for test cases
+pub struct TestServer {
+    // Storing the record id redundantly for now
+    storage: Arc<TestStorageEngine>,
+    reactor: Reactor<TestStorageEngine, TestRecord>,
 }
 
-impl FakeServer {
-    /// Creates a new server with initial records
-    pub fn new(initial_records: Vec<TestRecord>) -> Self {
-        let mut state = HashMap::new();
-        for record in initial_records {
-            state.insert(0, record);
-        }
-        Self {
-            records: state,
-            next_record_id: AtomicId::new(1),
-            next_sub_id: AtomicId::new(0),
-            reactor,
-        }
+pub struct TestStorageEngine {
+    records: Mutex<HashMap<usize, TestRecord>>,
+    next_record_id: AtomicUsize,
+}
+
+impl StorageEngine<TestRecord> for TestStorageEngine {
+    type Id = usize;
+    type Update = Update;
+
+    fn fetch_records(&self, predicate: &ankql::ast::Predicate) -> Vec<TestRecord> {
+        self.fetch_records(predicate)
+    }
+}
+
+impl TestStorageEngine {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            records: Mutex::new(HashMap::new()),
+            next_record_id: AtomicUsize::new(1),
+        })
+    }
+    pub fn insert(&self, model: TestModel) -> usize {
+        let id = self
+            .next_record_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.records
+            .lock()
+            .unwrap()
+            .insert(id, TestRecord { id, model });
+        id
     }
 
-    /// Creates a new subscription for records matching the given query
-    pub fn subscribe(&mut self, query: &str) -> SubscriptionHandle {
-        let predicate = ankql::parser::parse_selection(query).unwrap();
-        let fields = Self::extract_fields(&predicate);
-        println!("Subscription depends on fields: {:?}", fields);
-        SubscriptionHandle {
-            predicate,
-            fields,
-            server: self,
-        }
-    }
-
-    fn extract_field_comparisons(
-        predicate: &Predicate,
-    ) -> Vec<(&str, &ComparisonOperator, &Literal)> {
-        let mut comparisons = Vec::new();
-        match predicate {
-            Predicate::Comparison {
-                left,
-                operator,
-                right,
-            } => {
-                if let (Expr::Identifier(field), Expr::Literal(value)) =
-                    (left.as_ref(), right.as_ref())
-                {
-                    match field {
-                        Identifier::Property(name) => {
-                            comparisons.push((name.as_str(), operator, value));
-                        }
-                        Identifier::CollectionProperty(_, name) => {
-                            comparisons.push((name.as_str(), operator, value));
-                        }
-                    }
+    /// just brute force for now - we don't need indexes for a test server
+    fn fetch_records(&self, predicate: &ankql::ast::Predicate) -> Vec<TestRecord> {
+        use ankql::selection::filter::FilterResult;
+        let records = self.records.lock().unwrap();
+        let matching_records = FilterIterator::new(records.values(), predicate.clone());
+        matching_records
+            .filter_map(|r| {
+                if let FilterResult::Pass(e) = r {
+                    Some(e.clone())
+                } else {
+                    None
                 }
-            }
-            Predicate::And(left, right) => {
-                comparisons.extend(Self::extract_field_comparisons(left));
-                comparisons.extend(Self::extract_field_comparisons(right));
-            }
-            _ => {}
-        }
-        comparisons
-    }
-
-    fn extract_fields(predicate: &Predicate) -> HashSet<String> {
-        let mut fields = HashSet::new();
-        for (field, _, _) in Self::extract_field_comparisons(predicate) {
-            fields.insert(field.to_string());
-        }
-        fields
-    }
-
-    fn add_to_indexes(&mut self, sub_id: usize, predicate: &str) {
-        // Parse predicate to extract field comparisons
-        // For this example, we'll just handle simple age comparisons
-        if predicate.contains("age") {
-            let field_index = self.field_indexes.entry("age".to_string()).or_default();
-
-            if predicate.contains(">=") {
-                let value = predicate.split(">=").nth(1).unwrap().trim();
-                field_index.add_subscription(value, ">=", sub_id);
-            } else if predicate.contains("<=") {
-                let value = predicate.split("<=").nth(1).unwrap().trim();
-                field_index.add_subscription(value, "<=", sub_id);
-            }
-        }
-    }
-
-    fn find_matching_subscriptions(&self, record: &TestRecord) -> Vec<Arc<Subscription>> {
-        let mut result = HashSet::new();
-
-        // Check field indexes
-        if let Some(index) = self.field_indexes.get("age") {
-            result.extend(index.find_matching_subscriptions(&record.age));
-        }
-
-        result
-            .into_iter()
-            .filter_map(|id| self.subscriptions.get(&id))
-            .cloned()
+            })
             .collect()
     }
+}
 
+impl TestServer {
+    /// Creates a new server with initial records
+    pub fn new(initial: Vec<TestModel>) -> Arc<Self> {
+        let storage = TestStorageEngine::new();
+
+        for model in initial {
+            storage.insert(model);
+        }
+
+        let reactor = Reactor::new(storage.clone());
+        Arc::new(Self { storage, reactor })
+    }
+    pub fn insert(&mut self, model: TestModel) -> usize {
+        self.storage.insert(model)
+    }
+    /// Creates a new subscription for records matching the given query
+    pub fn subscribe(
+        &mut self,
+        query: &str,
+        callback: impl Fn(Operation<TestRecord, Update>, Vec<TestRecord>) + Send + Sync + 'static,
+    ) -> SubscriptionHandle<TestStorageEngine, TestRecord> {
+        let predicate = ankql::parser::parse_selection(query).unwrap();
+        self.reactor.subscribe(&predicate, callback).unwrap()
+    }
+
+    // LEFT OFF HERE
     /// Inserts a new record and notifies relevant subscribers
-    pub fn insert(&mut self, record: TestRecord) -> usize {
+    pub fn insert(&mut self, record: TestModel) -> usize {
         let id = self
             .next_record_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -265,7 +263,7 @@ impl FakeServer {
                 }
 
                 // Get current state for callback
-                let state: Vec<TestRecord> = sub
+                let state: Vec<TestModel> = sub
                     .matching_records
                     .lock()
                     .unwrap()
@@ -300,9 +298,5 @@ impl FakeServer {
                 }
             }
         }
-    }
-
-    fn get_matching_records(&self, _record: &TestRecord) -> Vec<TestRecord> {
-        self.records.values().cloned().collect()
     }
 }
