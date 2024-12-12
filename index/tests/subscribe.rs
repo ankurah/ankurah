@@ -6,7 +6,7 @@ fn test_rental_age_subscription() {
     println!("🔄 Starting pubsub example...\n");
 
     // Create a server with one initial record
-    let mut server = FakeServer::new(vec![TestRecord {
+    let mut server = TestServer::new(vec![TestRecord {
         name: "Alice".to_string(),
         age: "36".to_string(),
     }]);
