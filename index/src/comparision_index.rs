@@ -17,6 +17,13 @@ pub(crate) struct ComparisonIndex {
 }
 
 impl ComparisonIndex {
+    pub(crate) fn new() -> Self {
+        Self {
+            eq: HashMap::new(),
+            gt: BTreeMap::new(),
+            lt: BTreeMap::new(),
+        }
+    }
     fn for_entry<F>(&mut self, value: &str, op: ComparisonOperator, f: F)
     where
         F: FnOnce(&mut Vec<SubscriptionId>),

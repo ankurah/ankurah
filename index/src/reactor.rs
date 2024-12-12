@@ -154,14 +154,31 @@ where
     }
 
     fn add_index_watchers(&self, sub_id: usize, predicate: &Predicate) {
+        // First get the ComparisonIndex for the field
         self.recurse_predicate(sub_id, predicate, |entry, value, operator, sub_id| {
-            entry.insert(ComparisonIndex::new(value, operator.clone(), sub_id));
+            // This gets called once for each comparison in the predicate, recursively
+
+            match entry {
+                dashmap::Entry::Occupied(entry) => {
+                    // push the subscription id on to the vec
+                    entry.get_mut().add_entry(value, operator.clone(), sub_id);
+                }
+                dashmap::Entry::Vacant(&mut entry) => {
+                    entry
+                        .insert(ComparisonIndex::new())
+                        .add_entry(value, operator.clone(), sub_id);
+                }
+            };
         });
     }
 
     fn remove_index_watchers(&self, sub_id: usize, predicate: &Predicate) {
-        self.recurse_predicate(sub_id, predicate, |index, value, operator, sub_id| {
-            index.remove_entry(value, operator.clone(), sub_id);
+        self.recurse_predicate(sub_id, predicate, |entry, value, operator, sub_id| {
+            if let dashmap::Entry::Occupied(entry) = entry {
+                entry
+                    .get_mut()
+                    .remove_entry(value, operator.clone(), sub_id);
+            }
         });
     }
 }
