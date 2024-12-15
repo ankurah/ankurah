@@ -51,6 +51,7 @@ pub(crate) trait Record: Filterable + Clone {
     fn value(&self, name: &str) -> Option<Value>;
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     String(String),
     Integer(i64),
@@ -420,13 +421,14 @@ where
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RecordChangeKind {
     Add,
     Remove,
     Edit,
 }
 /// Represents a change in the record set
+#[derive(Debug, Clone)]
 pub struct RecordChange<R, U> {
     record: R,
     updates: Vec<U>,
@@ -434,6 +436,7 @@ pub struct RecordChange<R, U> {
 }
 
 /// A set of changes to the record set
+#[derive(Debug, Clone)]
 pub struct ChangeSet<R, U> {
     changes: Vec<RecordChange<R, U>>,
     // other stuff later
@@ -509,22 +512,22 @@ mod tests {
         age: i64,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub struct ActivePet {
-        inner: Arc<Mutex<Pet>>,
+        model: Arc<Mutex<Pet>>,
         engine: Weak<DummyEngine>,
     }
 
     impl ActivePet {
         fn new(pet: Pet, engine: &Arc<DummyEngine>) -> Self {
             Self {
-                inner: Arc::new(Mutex::new(pet)),
+                model: Arc::new(Mutex::new(pet)),
                 engine: Arc::downgrade(engine),
             }
         }
 
         pub fn set_name(&self, name: String) {
-            let mut pet = self.inner.lock().unwrap();
+            let mut pet = self.model.lock().unwrap();
             pet.name = name.clone();
             if let Some(engine) = self.engine.upgrade() {
                 engine.notify_change(
@@ -536,8 +539,11 @@ mod tests {
         }
 
         pub fn set_age(&self, age: i64) {
-            let mut pet = self.inner.lock().unwrap();
-            pet.age = age;
+            {
+                let mut pet = self.model.lock().unwrap();
+                pet.age = age;
+            }
+
             if let Some(engine) = self.engine.upgrade() {
                 engine.notify_change(
                     self.clone(),
@@ -552,14 +558,14 @@ mod tests {
         type Id = i64;
         type Model = Pet;
         fn id(&self) -> Self::Id {
-            self.inner.lock().unwrap().id
+            self.model.lock().unwrap().id
         }
 
         fn value(&self, name: &str) -> Option<Value> {
             match name {
                 "id" => Some(Value::Integer(self.id())),
-                "name" => Some(Value::String(self.inner.lock().unwrap().name.clone())),
-                "age" => Some(Value::Integer(self.inner.lock().unwrap().age)),
+                "name" => Some(Value::String(self.model.lock().unwrap().name.clone())),
+                "age" => Some(Value::Integer(self.model.lock().unwrap().age)),
                 _ => None,
             }
         }
@@ -571,7 +577,7 @@ mod tests {
         }
 
         fn value(&self, name: &str) -> Option<String> {
-            let pet = self.inner.lock().unwrap();
+            let pet = self.model.lock().unwrap();
             match name {
                 "id" => Some(pet.id.to_string()),
                 "name" => Some(pet.name.clone()),
@@ -713,6 +719,7 @@ mod tests {
 
     #[test]
     fn test_subscription_and_notification() {
+        println!("MARK 1: Creating server");
         let server = DummyEngine::new(vec![
             Pet {
                 id: 1,
@@ -730,52 +737,93 @@ mod tests {
                 age: 6,
             },
         ]);
+        println!("MARK 2: Creating reactor");
         let reactor = Reactor::new(server.clone());
         server.set_reactor(&reactor);
 
+        println!("MARK 3: Setting up changesets");
         let received_changesets = Arc::new(Mutex::new(Vec::new()));
         let received_changesets_clone = received_changesets.clone();
+        let check_received = move || {
+            let mut changesets = received_changesets.lock().unwrap();
+            let result: Vec<(Vec<PetUpdate>, RecordChangeKind)> = (*changesets)
+                .iter()
+                .map(|c: &ChangeSet<ActivePet, PetUpdate>| {
+                    (c.changes[0].updates.clone(), c.changes[0].kind.clone())
+                })
+                .collect();
+            changesets.clear();
+            result
+        };
 
-        // Subscribe to pets named Rex OR pets between 2 and 5 years old
+        println!("MARK 4: Creating subscription");
         let predicate =
             ankql::parser::parse_selection("name = 'Rex' OR (age > 2 and age < 5)").unwrap();
-        let handle = reactor
+        let _handle = reactor
             .subscribe(&predicate, move |changeset| {
+                println!("MARK 5: Callback received");
                 let mut received = received_changesets_clone.lock().unwrap();
                 received.push(changeset);
             })
             .unwrap();
 
-        // Get Rex's record
+        println!("MARK 6: Getting Rex's record");
         let rex = server.get(1).expect("Rex should exist");
+        assert_eq!(
+            Record::value(&rex, "name").unwrap(),
+            Value::String("Rex".to_string())
+        );
 
-        // Verify initial state (Should see Rex only)
+        let snuffy = server.get(2).expect("Snuffy should exist");
+        assert_eq!(
+            Record::value(&snuffy, "name").unwrap(),
+            Value::String("Snuffy".to_string())
+        );
+
+        let jasper = server.get(3).expect("Jasper should exist");
+        assert_eq!(
+            Record::value(&jasper, "name").unwrap(),
+            Value::String("Jasper".to_string())
+        );
+
+        println!("MARK 7: Verifying initial state");
         {
-            let received = received_changesets.lock().unwrap();
-            assert_eq!(received.len(), 1, "Should receive initial changeset");
-            let changeset = &received[0];
-            assert_eq!(changeset.changes.len(), 1, "Should have one change");
-            assert!(matches!(changeset.changes[0].kind, RecordChangeKind::Add));
-            assert!(changeset.changes[0].updates.is_empty());
+            let received = check_received();
+            assert_eq!(received, vec![(vec![], RecordChangeKind::Add)]);
         }
 
-        // Clear the changesets
-        received_changesets.lock().unwrap().clear();
-
-        // Make Rex too old to match the age criteria
+        println!("MARK 9: Updating Rex's age");
         rex.set_age(7);
 
-        // Verify Rex was removed with age update
-        {
-            let received = received_changesets.lock().unwrap();
-            assert_eq!(received.len(), 1, "Should receive one changeset");
-            let changeset = &received[0];
-            assert_eq!(changeset.changes.len(), 1, "Should have one change");
-            assert!(matches!(
-                changeset.changes[0].kind,
-                RecordChangeKind::Remove
-            ));
-            assert_eq!(changeset.changes[0].updates, vec![PetUpdate::Age(7)]);
-        }
+        // should have recieved one changeset with updates [PetUpdate::Age(7)] and kind RecordChangeKind::Edit
+        assert_eq!(check_received(), vec![(
+            vec![PetUpdate::Age(7)],
+            RecordChangeKind::Edit // it's an edit because it was already matching
+                                   // rex always shows up because he's an OR predicate by name
+        )]);
+
+        // snuffy turns 3
+        snuffy.set_age(3);
+        assert_eq!(check_received(), vec![(
+            vec![PetUpdate::Age(3)],
+            RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
+        )]);
+
+        // turns out we had Jasper's age wrong, he's actually 4
+        jasper.set_age(4);
+        assert_eq!(check_received(), vec![(
+            vec![PetUpdate::Age(4)],
+            RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
+        )]);
+
+        // snuffy and jasper turn 5 and 6
+        snuffy.set_age(5);
+        jasper.set_age(6);
+
+        // we should have received two changesets with a remove and an add
+        assert_eq!(check_received(), vec![
+            (vec![PetUpdate::Age(5)], RecordChangeKind::Remove),
+            (vec![PetUpdate::Age(6)], RecordChangeKind::Remove)
+        ]);
     }
 }
