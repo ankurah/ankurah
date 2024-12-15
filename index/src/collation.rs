@@ -85,10 +85,13 @@ impl Collatable for ast::Literal {
             ast::Literal::String(s) => {
                 if s.is_empty() {
                     let mut bytes = s.as_bytes().to_vec();
+                    // TODO - I think this is wrong. We shouldn't just push a byte. We should increment by one bit perhaps?
+                    // It also occurs to me that we need a fixed length for strings in order collate properly.
                     bytes.push(0);
                     Some(bytes)
                 } else {
                     let mut bytes = s.as_bytes().to_vec();
+                    // TODO - I think this is wrong
                     bytes.push(0);
                     Some(bytes)
                 }

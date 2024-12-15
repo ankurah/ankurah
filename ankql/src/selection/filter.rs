@@ -48,7 +48,7 @@ fn evaluate_expr<R: Filterable>(record: &R, expr: &Expr) -> Result<String, Error
     }
 }
 
-fn evaluate_predicate<R: Filterable>(record: &R, predicate: &Predicate) -> Result<bool, Error> {
+pub fn evaluate_predicate<R: Filterable>(record: &R, predicate: &Predicate) -> Result<bool, Error> {
     match predicate {
         Predicate::Comparison {
             left,

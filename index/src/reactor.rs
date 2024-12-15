@@ -1,6 +1,7 @@
 use super::collation::Collatable;
 use super::comparision_index::ComparisonIndex;
 use ankql::ast;
+use ankql::selection::filter::Filterable;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
@@ -40,13 +41,145 @@ where
     R: Record,
 {
     type Id: std::hash::Hash + std::cmp::Eq;
-    type Update;
+    type Update: Clone;
     fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<R>;
 }
-pub(crate) trait Record: Clone {
+pub(crate) trait Record: Filterable + Clone {
     type Id: std::hash::Hash + std::cmp::Eq + Copy + Clone;
     type Model;
     fn id(&self) -> Self::Id;
+    fn value(&self, name: &str) -> Option<Value>;
+}
+
+pub enum Value {
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+}
+
+impl Collatable for Value {
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Value::String(s) => s.as_bytes().to_vec(),
+            Value::Integer(i) => i.to_be_bytes().to_vec(),
+            Value::Float(f) => {
+                let bits = if f.is_nan() {
+                    u64::MAX // NaN sorts last
+                } else {
+                    let bits = f.to_bits();
+                    if *f >= 0.0 {
+                        bits ^ (1 << 63) // Flip sign bit for positive numbers
+                    } else {
+                        !bits // Flip all bits for negative numbers
+                    }
+                };
+                bits.to_be_bytes().to_vec()
+            }
+            Value::Boolean(b) => vec![*b as u8],
+        }
+    }
+
+    fn successor_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            Value::String(s) => {
+                if s.is_empty() {
+                    let mut bytes = s.as_bytes().to_vec();
+                    bytes.push(0);
+                    Some(bytes)
+                } else {
+                    let mut bytes = s.as_bytes().to_vec();
+                    bytes.push(0);
+                    Some(bytes)
+                }
+            }
+            Value::Integer(i) => {
+                if *i == i64::MAX {
+                    None
+                } else {
+                    Some((i + 1).to_be_bytes().to_vec())
+                }
+            }
+            Value::Float(f) => {
+                if f.is_nan() || (f.is_infinite() && *f > 0.0) {
+                    None
+                } else {
+                    let bits = if *f >= 0.0 {
+                        f.to_bits() ^ (1 << 63)
+                    } else {
+                        !f.to_bits()
+                    };
+                    let next_bits = bits + 1;
+                    Some(next_bits.to_be_bytes().to_vec())
+                }
+            }
+            Value::Boolean(b) => {
+                if *b {
+                    None
+                } else {
+                    Some(vec![1])
+                }
+            }
+        }
+    }
+
+    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            Value::String(s) => {
+                if s.is_empty() {
+                    None
+                } else {
+                    let bytes = s.as_bytes();
+                    Some(bytes[..bytes.len() - 1].to_vec())
+                }
+            }
+            Value::Integer(i) => {
+                if *i == i64::MIN {
+                    None
+                } else {
+                    Some((i - 1).to_be_bytes().to_vec())
+                }
+            }
+            Value::Float(f) => {
+                if f.is_nan() || (f.is_infinite() && *f < 0.0) {
+                    None
+                } else {
+                    let bits = if *f >= 0.0 {
+                        f.to_bits() ^ (1 << 63)
+                    } else {
+                        !f.to_bits()
+                    };
+                    let prev_bits = bits - 1;
+                    Some(prev_bits.to_be_bytes().to_vec())
+                }
+            }
+            Value::Boolean(b) => {
+                if *b {
+                    Some(vec![0])
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn is_minimum(&self) -> bool {
+        match self {
+            Value::String(s) => s.is_empty(),
+            Value::Integer(i) => *i == i64::MIN,
+            Value::Float(f) => *f == f64::NEG_INFINITY,
+            Value::Boolean(b) => !b,
+        }
+    }
+
+    fn is_maximum(&self) -> bool {
+        match self {
+            Value::String(_) => false, // Strings have no theoretical maximum
+            Value::Integer(i) => *i == i64::MAX,
+            Value::Float(f) => *f == f64::INFINITY,
+            Value::Boolean(b) => *b,
+        }
+    }
 }
 
 impl<S, R> Reactor<S, R>
@@ -79,13 +212,10 @@ where
         // Start watching the relevant indexes
         self.add_index_watchers(sub_id, predicate);
 
-        // Store subscription
-        self.subscriptions.insert(sub_id, subscription.clone());
-
         // Find initial matching records
         let matching_records = self.storage.fetch_records(predicate);
 
-        // Update subscription's matching records and record watchers
+        // Set up record watchers
         for record in matching_records.iter() {
             self.record_watchers
                 .entry(record.id())
@@ -93,12 +223,16 @@ where
                 .push(sub_id);
         }
 
+        // Create subscription with initial matching records
         let subscription = Arc::new(Subscription {
             id: sub_id,
             predicate: predicate.clone(),
             callback: Arc::new(Box::new(callback)),
-            matching_records: Mutex::new(matching_records),
+            matching_records: Mutex::new(matching_records.clone()),
         });
+
+        // Store subscription
+        self.subscriptions.insert(sub_id, subscription.clone());
 
         // Call callback with initial state
         (subscription.callback)(ChangeSet {
@@ -227,35 +361,57 @@ where
 
     /// Notify subscriptions about a record change
     pub fn notify_change(&self, record: R, updates: Vec<S::Update>, kind: RecordChangeKind) {
-        // Find all subscriptions that care about this record's fields
-        let mut interested_subs = HashSet::new();
+        let mut possibly_interested_subs = HashSet::new();
 
-        // Check index watchers for fields that changed
-        for (field_id, index) in self.index_watchers.iter() {
-            // TODO: Extract changed value for this field from updates
-            // For now, assume all fields changed
-            interested_subs.extend(index.find_matching_subscriptions(&record));
+        // Find subscriptions that might be interested based on index watchers
+        for index_ref in self.index_watchers.iter() {
+            // Get the field value from the record
+            if let Some(field_value) = Record::value(&record, &index_ref.key().0) {
+                possibly_interested_subs.extend(index_ref.find_matching(field_value));
+            }
         }
 
-        // For each interested subscription, check if record matches predicate
-        for sub_id in interested_subs {
+        // Check each possibly interested subscription with full predicate evaluation
+        for sub_id in possibly_interested_subs {
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                let matches = self
-                    .storage
-                    .fetch_records(&subscription.predicate)
+                // Use evaluate_predicate directly on the record instead of fetch_records
+                let matches = match ankql::selection::filter::evaluate_predicate(
+                    &record,
+                    &subscription.predicate,
+                ) {
+                    Ok(matches) => matches,
+                    Err(_) => false, // If we can't evaluate the predicate, assume no match
+                };
+
+                let did_match = subscription
+                    .matching_records
+                    .lock()
+                    .unwrap()
                     .iter()
                     .any(|r| r.id() == record.id());
 
-                // Update record watchers
-                self.update_record_watchers(&record, matches, sub_id);
+                // Only update watchers and notify if matching status changed
+                if matches != did_match {
+                    self.update_record_watchers(&record, matches, sub_id);
 
-                // Notify subscription if needed
-                if matches {
                     (subscription.callback)(ChangeSet {
                         changes: vec![RecordChange {
                             record: record.clone(),
                             updates: updates.clone(),
-                            kind: kind.clone(),
+                            kind: if matches {
+                                RecordChangeKind::Add
+                            } else {
+                                RecordChangeKind::Remove
+                            },
+                        }],
+                    });
+                } else if matches && kind == RecordChangeKind::Edit {
+                    // Record still matches but was edited
+                    (subscription.callback)(ChangeSet {
+                        changes: vec![RecordChange {
+                            record: record.clone(),
+                            updates: updates.clone(),
+                            kind: RecordChangeKind::Edit,
                         }],
                     });
                 }
@@ -264,7 +420,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum RecordChangeKind {
     Add,
     Remove,
@@ -340,7 +496,7 @@ mod tests {
     use ankql;
     use std::sync::Mutex;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, PartialEq)]
     pub enum PetUpdate {
         Name(String),
         Age(i64),
@@ -397,6 +553,15 @@ mod tests {
         type Model = Pet;
         fn id(&self) -> Self::Id {
             self.inner.lock().unwrap().id
+        }
+
+        fn value(&self, name: &str) -> Option<Value> {
+            match name {
+                "id" => Some(Value::Integer(self.id())),
+                "name" => Some(Value::String(self.inner.lock().unwrap().name.clone())),
+                "age" => Some(Value::Integer(self.inner.lock().unwrap().age)),
+                _ => None,
+            }
         }
     }
 
@@ -517,25 +682,30 @@ mod tests {
         let iw = &reactor.index_watchers;
         let name = FieldId("name".to_string());
         let age = FieldId("age".to_string());
-        let lattitude = FieldId("lattitude".to_string());
+
+        // Check name = 'Rex'
         assert_eq!(
             iw.get(&name).map(|i| {
                 assert_eq!(i.eq.len(), 1);
-                i.find_matching_subscriptions("Rex")
+                i.find_matching(Value::String("Rex".to_string()))
             }),
             Some(vec![sub_id])
         );
+
+        // Check age > 2
         assert_eq!(
             iw.get(&age).map(|i| {
                 assert_eq!(i.gt.len(), 1);
-                i.find_matching_subscriptions(3)
+                i.find_matching(Value::Integer(3))
             }),
             Some(vec![sub_id])
         );
+
+        // Check age < 5
         assert_eq!(
-            iw.get(&lattitude).map(|i| {
+            iw.get(&age).map(|i| {
                 assert_eq!(i.lt.len(), 1);
-                i.find_matching_subscriptions(7)
+                i.find_matching(Value::Integer(4))
             }),
             Some(vec![sub_id])
         );

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::{collation::Collatable, reactor::SubscriptionId};
+use crate::{collation::Collatable, reactor::SubscriptionId, reactor::Value};
 use ankql::ast;
 
 /// An index for a specific field and comparison operator
@@ -86,31 +86,36 @@ impl ComparisonIndex {
             }
         });
     }
-    pub fn find_matching_subscriptions<V: Collatable>(&self, value: V) -> Vec<SubscriptionId> {
+    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<SubscriptionId> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
+        println!("\nChecking value with bytes: {:?}", bytes);
+
         // Check exact matches
         if let Some(subs) = self.eq.get(&bytes) {
-            println!("eq: {:?}", subs);
+            println!("eq match - subs: {:?}", subs);
             result.extend(subs.iter().cloned());
         }
 
-        // Check greater than matches (value > threshold)
-        // We want all thresholds strictly less than our value
-        for (_, subs) in self.gt.range(..bytes.clone()) {
-            println!("gt: {:?}", subs);
-            result.extend(subs);
+        // Check greater than matches (x > threshold)
+        println!("\ngt index contents: {:?}", self.gt);
+        println!("gt range query: ..{:?}", bytes);
+        for (threshold, subs) in self.gt.range(..bytes.clone()) {
+            println!("gt got threshold: {:?}", threshold);
+            result.extend(subs.iter().cloned());
         }
 
-        // Check less than matches (value < threshold)
-        // We want all thresholds strictly greater than our value
-        for (threshold, subs) in self.lt.range(bytes.clone()..) {
-            println!("lt: {:?} {:?}", threshold, bytes);
-            if threshold > &bytes {
+        // Check less than matches (x < threshold)
+        println!("lt index contents: {:?}", self.lt);
+        if let Some(pred) = value.successor_bytes() {
+            println!("lt range query: {:?}..", pred);
+            for (threshold, subs) in self.lt.range(pred..) {
+                println!("lt got threshold: {:?}", threshold);
                 result.extend(subs.iter().cloned());
             }
         }
+
         // Should just return the BTreeSet but this sucks for test cases
         result.into_iter().collect()
     }
@@ -122,38 +127,63 @@ mod tests {
 
     #[test]
     fn test_field_index() {
-        let mut index = ComparisonIndex::default();
+        let mut index = ComparisonIndex::new();
 
-        // Add some subscriptions
-        index.add(25, ast::ComparisonOperator::GreaterThanOrEqual, 1.into()); // age >= 25
-        index.add(90, ast::ComparisonOperator::LessThanOrEqual, 2.into()); // age <= 90
-        index.add(30, ast::ComparisonOperator::Equal, 3.into()); // age == 30
+        // Less than 8 ------------------------------------------------------------
+        let sub0 = SubscriptionId::from(0);
+        index.add(
+            ast::Literal::Integer(8),
+            ast::ComparisonOperator::LessThan,
+            sub0,
+        );
 
-        // Test some values
-        assert_eq!(
-            index.find_matching_subscriptions(24),
-            vec![2],
-            "24 should match <= 90"
+        // 8 should match nothing
+        assert!(index.find_matching(Value::Integer(8)).is_empty());
+
+        // 7 should match sub0
+        assert_eq!(index.find_matching(Value::Integer(7)), vec![sub0]);
+
+        let sub1 = SubscriptionId::from(1);
+
+        // Greater than 20 ------------------------------------------------------------
+        index.add(
+            ast::Literal::Integer(20),
+            ast::ComparisonOperator::GreaterThan,
+            sub1,
         );
-        assert_eq!(
-            index.find_matching_subscriptions(25),
-            vec![1, 2],
-            "25 should match >= 25 and <= 90"
+
+        // 20 should match nothing
+        assert!(index.find_matching(Value::Integer(20)).is_empty());
+
+        // 21 should match sub1
+        assert_eq!(index.find_matching(Value::Integer(21)), vec![sub1]);
+
+        // // Add subscriptions for various numeric comparisons
+        index.add(
+            ast::Literal::Integer(5),
+            ast::ComparisonOperator::Equal,
+            sub0,
         );
-        assert_eq!(
-            index.find_matching_subscriptions(30),
-            vec![1, 2, 3],
-            "30 should match >= 25 and <= 90 and == 30"
+        // println!("MARK 4: Added = 5 subscription");
+
+        // // Test exact match (5)
+        // println!("Testing exact match (5)");
+        assert_eq!(index.find_matching(Value::Integer(5)), vec![sub0]);
+
+        // Less than 25 ------------------------------------------------------------
+        index.add(
+            ast::Literal::Integer(25),
+            ast::ComparisonOperator::LessThan,
+            sub0,
         );
-        assert_eq!(
-            index.find_matching_subscriptions(90),
-            vec![1, 2],
-            "90 should match >= 25 and <= 90"
-        );
-        assert_eq!(
-            index.find_matching_subscriptions(91),
-            vec![1],
-            "91 should match >= 25"
-        );
+
+        // 22 should match sub0 and sub1 because > 20 and < 25
+        assert_eq!(index.find_matching(Value::Integer(22)), vec![sub0, sub1]);
+
+        // 25 should match sub1 because > 20 and !< 25
+        assert_eq!(index.find_matching(Value::Integer(25)), vec![sub1]);
+
+        // 26 should match sub0 and sub1 because > 20 and !< 25
+        assert_eq!(index.find_matching(Value::Integer(26)), vec![sub1]);
     }
 }
