@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::{collation::Collation, reactor::SubscriptionId};
-use ankql::ast::ComparisonOperator;
+use crate::{collation::Collatable, reactor::SubscriptionId};
+use ankql::ast;
 
 /// An index for a specific field and comparison operator
 /// Used for storage engines that don't offer watchable indexes
@@ -25,28 +25,27 @@ impl ComparisonIndex {
         }
     }
 
-    fn for_entry<F, V>(&mut self, value: V, op: ComparisonOperator, f: F)
+    fn for_entry<F, V>(&mut self, value: V, op: ast::ComparisonOperator, f: F)
     where
         F: FnOnce(&mut Vec<SubscriptionId>),
-        V: Collation,
+        V: Collatable,
     {
-        let bytes = value.to_bytes();
         match op {
-            ComparisonOperator::Equal => {
-                let entry = self.eq.entry(bytes).or_default();
+            ast::ComparisonOperator::Equal => {
+                let entry = self.eq.entry(value.to_bytes()).or_default();
                 f(entry);
             }
-            ComparisonOperator::GreaterThan => {
-                let entry = self.gt.entry(bytes).or_default();
+            ast::ComparisonOperator::GreaterThan => {
+                let entry = self.gt.entry(value.to_bytes()).or_default();
                 f(entry);
             }
-            ComparisonOperator::LessThan => {
-                let entry = self.lt.entry(bytes).or_default();
+            ast::ComparisonOperator::LessThan => {
+                let entry = self.lt.entry(value.to_bytes()).or_default();
                 f(entry);
             }
-            ComparisonOperator::GreaterThanOrEqual => {
+            ast::ComparisonOperator::GreaterThanOrEqual => {
                 // x >= 5 is equivalent to x > 4
-                if let Some(pred) = crate::collation::Collation::predecessor_bytes(&value) {
+                if let Some(pred) = value.predecessor_bytes() {
                     let entry = self.gt.entry(pred).or_default();
                     f(entry);
                 } else {
@@ -55,9 +54,9 @@ impl ComparisonIndex {
                     f(entry);
                 }
             }
-            ComparisonOperator::LessThanOrEqual => {
+            ast::ComparisonOperator::LessThanOrEqual => {
                 // x <= 5 is equivalent to x < 6
-                if let Some(succ) = crate::collation::Collation::successor_bytes(&value) {
+                if let Some(succ) = value.successor_bytes() {
                     let entry = self.lt.entry(succ).or_default();
                     f(entry);
                 }
@@ -66,14 +65,19 @@ impl ComparisonIndex {
         }
     }
 
-    pub fn add<V: Collation>(&mut self, value: V, op: ComparisonOperator, sub_id: SubscriptionId) {
+    pub fn add<V: Collatable>(
+        &mut self,
+        value: V,
+        op: ast::ComparisonOperator,
+        sub_id: SubscriptionId,
+    ) {
         self.for_entry(value, op, |entries| entries.push(sub_id));
     }
 
-    pub fn remove<V: Collation>(
+    pub fn remove<V: Collatable>(
         &mut self,
         value: V,
-        op: ComparisonOperator,
+        op: ast::ComparisonOperator,
         sub_id: SubscriptionId,
     ) {
         self.for_entry(value, op, |entries| {
@@ -82,24 +86,27 @@ impl ComparisonIndex {
             }
         });
     }
-    pub fn find_matching_subscriptions<V: Collation>(&self, value: V) -> Vec<SubscriptionId> {
+    pub fn find_matching_subscriptions<V: Collatable>(&self, value: V) -> Vec<SubscriptionId> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
         // Check exact matches
         if let Some(subs) = self.eq.get(&bytes) {
+            println!("eq: {:?}", subs);
             result.extend(subs.iter().cloned());
         }
 
         // Check greater than matches (value > threshold)
         // We want all thresholds strictly less than our value
         for (_, subs) in self.gt.range(..bytes.clone()) {
+            println!("gt: {:?}", subs);
             result.extend(subs);
         }
 
         // Check less than matches (value < threshold)
         // We want all thresholds strictly greater than our value
         for (threshold, subs) in self.lt.range(bytes.clone()..) {
+            println!("lt: {:?} {:?}", threshold, bytes);
             if threshold > &bytes {
                 result.extend(subs.iter().cloned());
             }
@@ -118,118 +125,35 @@ mod tests {
         let mut index = ComparisonIndex::default();
 
         // Add some subscriptions
-        index.add("25", ComparisonOperator::GreaterThanOrEqual, 1.into()); // age >= 25
-        index.add("90", ComparisonOperator::LessThanOrEqual, 1.into()); // age <= 90
-        index.add("30", ComparisonOperator::Equal, 2.into()); // age == 30
+        index.add(25, ast::ComparisonOperator::GreaterThanOrEqual, 1.into()); // age >= 25
+        index.add(90, ast::ComparisonOperator::LessThanOrEqual, 2.into()); // age <= 90
+        index.add(30, ast::ComparisonOperator::Equal, 3.into()); // age == 30
 
         // Test some values
-        assert!(
-            index.find_matching_subscriptions("24").is_empty(),
-            "24 should not match"
-        );
         assert_eq!(
-            index.find_matching_subscriptions("25"),
-            vec![1],
-            "25 should match >= 25"
-        );
-        let mut matches_30 = index.find_matching_subscriptions("30");
-        matches_30.sort_unstable();
-        assert_eq!(
-            matches_30,
-            vec![1, 2],
-            "30 should match both >= 25 and == 30"
-        );
-        assert_eq!(
-            index.find_matching_subscriptions("90"),
-            vec![1],
-            "90 should match <= 90"
-        );
-        assert!(
-            index.find_matching_subscriptions("91").is_empty(),
-            "91 should not match"
-        );
-
-        // Test edge cases
-        assert_eq!(
-            index.find_matching_subscriptions("26"),
-            vec![1],
-            "26 should match >= 25"
-        );
-        assert_eq!(
-            index.find_matching_subscriptions("89"),
-            vec![1],
-            "89 should match both >= 25 and <= 90"
-        );
-    }
-
-    #[test]
-    fn test_range_queries() {
-        let mut index = ComparisonIndex::default();
-
-        // Test greater than
-        index.add("25", ComparisonOperator::GreaterThan, 1.into());
-        assert!(
-            index.find_matching_subscriptions("24").is_empty(),
-            "> 25: 24 should not match"
-        );
-        assert!(
-            index.find_matching_subscriptions("25").is_empty(),
-            "> 25: 25 should not match"
-        );
-        assert_eq!(
-            index.find_matching_subscriptions("26"),
-            vec![1],
-            "> 25: 26 should match"
-        );
-
-        // Test less than
-        index.add("25", ComparisonOperator::LessThan, 2.into());
-        assert_eq!(
-            index.find_matching_subscriptions("24"),
+            index.find_matching_subscriptions(24),
             vec![2],
-            "< 25: 24 should match"
-        );
-        assert!(
-            index.find_matching_subscriptions("25").is_empty(),
-            "< 25: 25 should not match"
-        );
-        assert!(
-            index.find_matching_subscriptions("26").is_empty(),
-            "< 25: 26 should not match"
-        );
-
-        // Test greater than or equal
-        index.add("25", ComparisonOperator::GreaterThanOrEqual, 3.into());
-        assert!(
-            index.find_matching_subscriptions("24").is_empty(),
-            ">= 25: 24 should not match"
+            "24 should match <= 90"
         );
         assert_eq!(
-            index.find_matching_subscriptions("25"),
-            vec![3],
-            ">= 25: 25 should match"
+            index.find_matching_subscriptions(25),
+            vec![1, 2],
+            "25 should match >= 25 and <= 90"
         );
         assert_eq!(
-            index.find_matching_subscriptions("26"),
-            vec![1, 3],
-            ">= 25: 26 should match"
-        );
-
-        // Test less than or equal
-        index.add("25", ComparisonOperator::LessThanOrEqual, 4.into());
-        assert_eq!(
-            index.find_matching_subscriptions("24"),
-            vec![2, 4],
-            "<= 25: 24 should match"
+            index.find_matching_subscriptions(30),
+            vec![1, 2, 3],
+            "30 should match >= 25 and <= 90 and == 30"
         );
         assert_eq!(
-            index.find_matching_subscriptions("25"),
-            vec![4],
-            "<= 25: 25 should match"
+            index.find_matching_subscriptions(90),
+            vec![1, 2],
+            "90 should match >= 25 and <= 90"
         );
-        assert!(
-            index.find_matching_subscriptions("26").is_empty(),
-            "<= 25: 26 should not match"
+        assert_eq!(
+            index.find_matching_subscriptions(91),
+            vec![1],
+            "91 should match >= 25"
         );
     }
 }

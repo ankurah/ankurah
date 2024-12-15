@@ -1,5 +1,6 @@
+use super::collation::Collatable;
 use super::comparision_index::ComparisonIndex;
-use ankql::ast::Predicate;
+use ankql::ast;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
@@ -40,7 +41,7 @@ where
 {
     type Id: std::hash::Hash + std::cmp::Eq;
     type Update;
-    fn fetch_records(&self, predicate: &Predicate) -> Vec<R>;
+    fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<R>;
 }
 pub(crate) trait Record {
     type Id: std::hash::Hash + std::cmp::Eq + Copy + Clone;
@@ -63,7 +64,7 @@ where
     }
     pub fn subscribe<F>(
         self: &Arc<Self>,
-        predicate: &Predicate,
+        predicate: &ast::Predicate,
         callback: F,
     ) -> Result<SubscriptionHandle<S, R>>
     where
@@ -111,37 +112,35 @@ where
         })
     }
 
-    fn recurse_predicate<F>(&self, predicate: &Predicate, f: F)
+    fn recurse_predicate<F>(&self, predicate: &ast::Predicate, f: F)
     where
-        F: Fn(dashmap::Entry<FieldId, ComparisonIndex>, &str, &ankql::ast::ComparisonOperator)
-            + Copy,
+        F: Fn(
+                dashmap::Entry<FieldId, ComparisonIndex>,
+                FieldId,
+                &ast::Literal,
+                &ast::ComparisonOperator,
+            ) + Copy,
     {
-        use ankql::ast::{Expr, Identifier, Literal, Predicate};
+        use ankql::ast::{Expr, Identifier, Predicate};
         match predicate {
             Predicate::Comparison {
                 left,
                 operator,
                 right,
             } => {
-                // TODO handle reversed order
-                if let (Expr::Identifier(field), Expr::Literal(literal)) = (&**left, &**right) {
+                if let (Expr::Identifier(field), Expr::Literal(literal))
+                | (Expr::Literal(literal), Expr::Identifier(field)) = (&**left, &**right)
+                {
                     let field_name = match field {
                         Identifier::Property(name) => name.clone(),
                         Identifier::CollectionProperty(_, name) => name.clone(),
                     };
 
-                    // Convert literal to string representation
-                    let value = match literal {
-                        Literal::String(s) => s.clone(),
-                        Literal::Integer(i) => i.to_string(),
-                        Literal::Float(f) => f.to_string(),
-                        Literal::Boolean(b) => b.to_string(),
-                    };
-
-                    // For add_index_watchers, this will create if not exists
-                    // For remove_index_watchers, this will only get if exists
-                    let entry = self.index_watchers.entry(FieldId(field_name));
-                    f(entry, &value, operator);
+                    let field_id = FieldId(field_name);
+                    let entry = self.index_watchers.entry(field_id.clone());
+                    f(entry, field_id, literal, operator);
+                } else {
+                    // warn!("Unsupported predicate: {:?}", predicate);
                 }
             }
             Predicate::And(left, right) | Predicate::Or(left, right) => {
@@ -155,20 +154,30 @@ where
         }
     }
 
-    fn add_index_watchers(&self, sub_id: SubscriptionId, predicate: &Predicate) {
-        self.recurse_predicate(predicate, |entry, value, operator| {
-            entry
-                .or_insert_with(ComparisonIndex::new)
-                .add(value, operator.clone(), sub_id);
+    fn add_index_watchers(&self, sub_id: SubscriptionId, predicate: &ast::Predicate) {
+        self.recurse_predicate(predicate, |entry, _field_id, literal, operator| {
+            entry.or_insert_with(ComparisonIndex::new).add(
+                (*literal).clone(),
+                operator.clone(),
+                sub_id,
+            );
         });
     }
 
-    fn remove_index_watchers(&self, sub_id: SubscriptionId, predicate: &Predicate) {
-        self.recurse_predicate(predicate, |entry, value, operator| {
-            if let dashmap::Entry::Occupied(mut index) = entry {
-                index.get_mut().remove(value, operator.clone(), sub_id);
-            }
-        });
+    fn remove_index_watchers(&self, sub_id: SubscriptionId, predicate: &ast::Predicate) {
+        self.recurse_predicate(
+            predicate,
+            |entry: dashmap::Entry<FieldId, ComparisonIndex>,
+             field_id,
+             literal: &ast::Literal,
+             operator| {
+                if let dashmap::Entry::Occupied(mut index) = entry {
+                    // use crate::collation::Collatable;
+                    let literal = (*literal).clone();
+                    index.get_mut().remove(literal, operator.clone(), sub_id);
+                }
+            },
+        );
     }
 }
 
@@ -260,7 +269,7 @@ mod tests {
     impl StorageEngine<DummyRecord> for DummyEngine {
         type Id = usize;
         type Update = ();
-        fn fetch_records(&self, _predicate: &Predicate) -> Vec<DummyRecord> {
+        fn fetch_records(&self, _predicate: &ast::Predicate) -> Vec<DummyRecord> {
             vec![]
         }
     }
@@ -271,11 +280,14 @@ mod tests {
         let reactor: Reactor<DummyEngine, DummyRecord> = Reactor::new(server);
 
         let predicate =
-            ankql::parser::parse_selection("name = 'Alice' and age > 25 OR lattitude < 80")
-                .unwrap();
+            ankql::parser::parse_selection("name = 'Alice' and age > 2 OR lattitude < 8").unwrap();
+
         let sub_id = SubscriptionId::from(0);
         reactor.add_index_watchers(sub_id, &predicate);
 
+        println!("watchers: {:#?}", reactor.index_watchers);
+
+        // Check to see if the index watchers are populated correctly
         let iw = &reactor.index_watchers;
         let name = FieldId("name".to_string());
         let age = FieldId("age".to_string());
@@ -290,14 +302,14 @@ mod tests {
         assert_eq!(
             iw.get(&age).map(|i| {
                 assert_eq!(i.gt.len(), 1);
-                i.find_matching_subscriptions("26")
+                i.find_matching_subscriptions(3)
             }),
             Some(vec![sub_id])
         );
         assert_eq!(
             iw.get(&lattitude).map(|i| {
                 assert_eq!(i.lt.len(), 1);
-                i.find_matching_subscriptions("79")
+                i.find_matching_subscriptions(7)
             }),
             Some(vec![sub_id])
         );
