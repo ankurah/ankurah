@@ -142,7 +142,7 @@ impl RecordInner {
         Self {
             id: self.id(),
             bucket_name: self.bucket_name(),
-            backends: self.backends.duplicate(),
+            backends: self.backends.fork(),
         }
     }
 }

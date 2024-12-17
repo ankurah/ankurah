@@ -55,12 +55,12 @@ impl SledStorageBucket {
 }
 
 impl StorageBucket for SledStorageBucket {
-    fn set_record_state(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+    fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
         let binary_state = bincode::serialize(state)?;
         self.tree.insert(id.0.to_bytes(), binary_state)?;
         Ok(())
     }
-    fn get_record_state(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
+    fn get_record(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
         match self
             .tree
             .get(id.0.to_bytes())

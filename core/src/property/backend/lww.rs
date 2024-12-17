@@ -8,7 +8,10 @@ use std::{
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::property::{backend::PropertyBackend, PropertyName};
+use crate::{
+    property::{backend::PropertyBackend, PropertyName},
+    storage::Materialized,
+};
 
 #[derive(Clone, Debug)]
 pub struct LWWBackend {
@@ -50,7 +53,7 @@ impl PropertyBackend for LWWBackend {
         self as &dyn Debug
     }
 
-    fn duplicate(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Box<dyn PropertyBackend> {
         let values = self.values.read().unwrap();
         let cloned = (*values).clone();
         drop(values);
@@ -58,6 +61,15 @@ impl PropertyBackend for LWWBackend {
         Box::new(Self {
             values: Arc::new(RwLock::new(cloned)),
         })
+    }
+
+    fn properties(&self) -> Vec<String> {
+        let values = self.values.read().unwrap();
+        values.keys().cloned().collect::<Vec<String>>()
+    }
+
+    fn materialized(&self) -> BTreeMap<PropertyName, Materialized> {
+        unimplemented!()
     }
 
     fn property_backend_name() -> String {

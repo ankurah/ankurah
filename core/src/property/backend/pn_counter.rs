@@ -8,9 +8,12 @@ use std::{
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::property::{
-    backend::{Operation, PropertyBackend},
-    PropertyName,
+use crate::{
+    property::{
+        backend::{Operation, PropertyBackend},
+        PropertyName,
+    },
+    storage::Materialized,
 };
 
 #[derive(Debug)]
@@ -90,7 +93,7 @@ impl PropertyBackend for PNBackend {
         self as &dyn Debug
     }
 
-    fn duplicate(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Box<dyn PropertyBackend> {
         let values = self.values.read().unwrap();
         let snapshotted = values
             .iter()
@@ -99,6 +102,21 @@ impl PropertyBackend for PNBackend {
         Box::new(Self {
             values: Arc::new(RwLock::new(snapshotted)),
         })
+    }
+
+    fn properties(&self) -> Vec<String> {
+        let values = self.values.read().unwrap();
+        values.keys().cloned().collect::<Vec<String>>()
+    }
+
+    fn materialized(&self) -> BTreeMap<PropertyName, Materialized> {
+        let values = self.values.read().unwrap();
+        let mut map = BTreeMap::new();
+        for (property, data) in values.iter() {
+            map.insert(property.clone(), Materialized::Number(data.value));
+        }
+
+        map
     }
 
     fn property_backend_name() -> String {

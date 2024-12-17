@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::ID, property::Backends};
+use crate::{
+    model::ID,
+    property::{Backends, PropertyName},
+};
 
 pub mod postgres;
 pub mod sled;
@@ -15,18 +18,35 @@ pub trait StorageEngine: Send + Sync {
 }
 
 pub trait StorageBucket: Send + Sync {
-    fn set_record_state(&self, id: ID, state: &RecordState) -> anyhow::Result<()>;
-    fn get_record_state(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError>;
+    fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()>;
+    fn set_records(&self, records: Vec<(ID, &RecordState)>) -> anyhow::Result<()> {
+        for (id, state) in records {
+            self.set_record(id, state)?;
+        }
+
+        Ok(())
+    }
+    fn get_record(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError>;
 
     // TODO:
     // fn add_record_event(&self, record_event: &RecordEvent) -> anyhow::Result<()>;
     // fn get_record_events(&self, id: ID) -> Result<Vec<RecordEvent>, crate::error::RetrievalError>;
 }
 
+#[derive(Serialize, Deserialize)]
+pub enum MaterializedTag {
+    String,
+    Number,
+}
+
+pub enum Materialized {
+    String(String),
+    Number(i64),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordState {
-    pub(crate) state_buffers: BTreeMap<String, Vec<u8>>,
-    // TODO: Store materialized data here?
+    pub state_buffers: BTreeMap<String, Vec<u8>>,
 }
 
 impl RecordState {

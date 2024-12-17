@@ -90,7 +90,7 @@ impl Node {
             let record_state = record.to_record_state()?;
             // Push the state buffers to storage.
             self.bucket(record_event.bucket_name())
-                .set_record_state(record_event.id(), &record_state)?;
+                .set_record(record_event.id(), &record_state)?;
 
             // TODO: Push the record events to subscribed peers.
         }
@@ -104,7 +104,7 @@ impl Node {
         bucket_name: &'static str,
     ) -> Result<RecordState, RetrievalError> {
         let raw_bucket = self.bucket(bucket_name);
-        raw_bucket.0.get_record_state(id)
+        raw_bucket.0.get_record(id)
     }
 
     // ----  Node record management ----

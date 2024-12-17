@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::BTreeMap,
     fmt::Debug,
     sync::{Arc, Mutex},
 };
@@ -7,7 +8,13 @@ use std::{
 use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
-use crate::property::backend::{Operation, PropertyBackend};
+use crate::{
+    property::{
+        backend::{Operation, PropertyBackend},
+        PropertyName,
+    },
+    storage::Materialized,
+};
 
 /// Stores one or more properties of a record
 #[derive(Debug, Clone)]
@@ -60,11 +67,22 @@ impl PropertyBackend for YrsBackend {
         self as &dyn Debug
     }
 
-    fn duplicate(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Box<dyn PropertyBackend> {
         // TODO: Don't do all this just to sever the internal Yrs Arcs
         let state_buffer = self.to_state_buffer().unwrap();
         let backend = Self::from_state_buffer(&state_buffer).unwrap();
         Box::new(backend)
+    }
+
+    fn properties(&self) -> Vec<String> {
+        let trx = Transact::transact(&self.doc);
+        let root_refs = trx.root_refs();
+        root_refs.map(|(name, _)| name.to_owned()).collect()
+    }
+
+    fn materialized(&self) -> BTreeMap<PropertyName, Materialized> {
+        //let mut map = BTreeMap::new();
+        unimplemented!()
     }
 
     fn property_backend_name() -> String {

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ankurah_core::property::backend::{PropertyBackend, YrsBackend};
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};
@@ -101,6 +102,9 @@ async fn main() -> Result<()> {
         });
 
         info!("Album created: {:?}", album);
+
+        let yrs = album.backends().get::<YrsBackend>().unwrap();
+        yrs.properties();
 
         //let test = client.fetch_record(album.id(), Album::bucket_name()).unwrap();
 
