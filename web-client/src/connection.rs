@@ -14,8 +14,9 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new() -> Result<Connection, JsValue> {
-        let ws = WebSocket::new("ws://127.0.0.1:9797/ws")?;
+    pub fn new(server_url: &str) -> Result<Connection, JsValue> {
+        let ws_url = format!("wss://{}/ws", server_url);
+        let ws = WebSocket::new(&ws_url)?;
 
         let (rstate, wstate) =
             reactive_graph::signal::RwSignal::new(ConnectionState::Connecting).split();

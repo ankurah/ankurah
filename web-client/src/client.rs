@@ -89,6 +89,7 @@ impl ConnectionStateSignal {
 }
 
 struct ClientInner {
+    server_url: String,
     connection: RefCell<Option<Connection>>,
     state: reactive_graph::signal::RwSignal<&'static str>,
 }
@@ -101,9 +102,11 @@ pub struct Client {
 /// Client provides a primary handle to speak to the server
 #[wasm_bindgen]
 impl Client {
-    pub fn new() -> Result<Client, JsValue> {
+    #[wasm_bindgen(constructor)]
+    pub fn new(server_url: &str) -> Result<Client, JsValue> {
         let _ = any_spawner::Executor::init_wasm_bindgen();
         let inner = Rc::new(ClientInner {
+            server_url: server_url.to_string(),
             connection: RefCell::new(None),
             state: reactive_graph::signal::RwSignal::new(ConnectionState::None.str()),
         });
@@ -112,6 +115,7 @@ impl Client {
 
         Ok(Client { inner })
     }
+
     pub async fn ready(&self) {
         // self.inner
         //     .state
@@ -119,6 +123,7 @@ impl Client {
         //     .wait_for(ConnectionState::Open)
         //     .await;
     }
+
     pub fn send_message(&self, message: &str) {
         info!("send_message: Sending message: {}", message);
 
@@ -127,6 +132,7 @@ impl Client {
             connection.send_message(message);
         }
     }
+
     #[wasm_bindgen(getter, js_name = "connection_state")]
     pub fn js_connection_state(&self) -> ConnectionStateSignal {
         ConnectionStateSignal(self.inner.state.read_only())
@@ -141,7 +147,7 @@ impl Client {
 
 impl ClientInner {
     pub fn connect(self: &Rc<Self>, mut delay: u64) -> Result<(), JsValue> {
-        let connection = Connection::new()?;
+        let connection = Connection::new(&self.server_url)?;
         let state = connection.state.clone();
         *self.connection.borrow_mut() = Some(connection);
 
@@ -168,6 +174,7 @@ impl ClientInner {
 
         Ok(())
     }
+
     pub fn reconnect(self: &Rc<Self>, mut delay: u64) {
         delay = delay.min(MAX_RECONNECT_DELAY);
         info!("reconnect: removing old connection");

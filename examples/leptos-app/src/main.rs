@@ -18,7 +18,7 @@ fn main() {
 fn App() -> impl IntoView {
     log!("App");
 
-    let client = Client::new().unwrap();
+    let client = Client::new("localhost:9797").unwrap();
     let (count, set_count) = signal(0);
 
     let connection_state: leptos::prelude::ReadSignal<&'static str> = client.connection_state();
