@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
@@ -12,20 +13,26 @@ pub struct SledStorageEngine {
 }
 
 impl SledStorageEngine {
-    // Open the storage engine without any specific column families
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn with_homedir_folder(folder_name: &str) -> anyhow::Result<Self> {
         let dir = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Failed to get home directory"))?
-            .join(".ankurah");
+            .join(folder_name);
 
-        std::fs::create_dir_all(&dir)?;
+        Self::with_path(dir)
+    }
 
-        let dbpath = dir.join("sled");
-
+    pub fn with_path(path: PathBuf) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(&path)?;
+        let dbpath = path.join("sled");
         let db = sled::open(&dbpath)?;
-
         Ok(Self { db })
     }
+
+    // Open the storage engine without any specific column families
+    pub fn new() -> anyhow::Result<Self> {
+        Self::with_homedir_folder(".ankurah")
+    }
+
     pub fn new_test() -> anyhow::Result<Self> {
         let db = Config::new()
             .temporary(true)
@@ -70,11 +77,7 @@ impl StorageBucket for SledStorageBucket {
                 let record_state = bincode::deserialize(&*ivec)?;
                 Ok(record_state)
             }
-            None => {
-                //Ok(RecordState { field_states: Vec::new() });
-                //Err(format!("Missing Ivec for id"))
-                Err(crate::error::RetrievalError::NotFound(id))
-            }
+            None => Err(crate::error::RetrievalError::NotFound(id)),
         }
     }
 }
