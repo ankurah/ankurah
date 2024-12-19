@@ -1,9 +1,8 @@
 use ankurah_core::property::value::YrsString;
-use ankurah_core::storage::{Postgres, SledStorageEngine};
+use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};
 use ankurah_derive::Model;
 use anyhow::Result;
-use postgres::NoTls;
 use serde::{Deserialize, Serialize};
 use tracing::{info, Level};
 
@@ -23,18 +22,7 @@ pub struct Album {
 
 #[test]
 fn repeatable_read() -> Result<()> {
-    let manager = r2d2_postgres::PostgresConnectionManager::new(
-        "host=localhost user=postgres password=postgres dbname=ankurah"
-            .parse()
-            .unwrap(),
-        NoTls,
-    );
-    let pool = r2d2::Pool::new(manager).unwrap();
-
-    let postgres = Postgres::new(pool)?;
-    let sled = SledStorageEngine::new()?;
-
-    let client = Arc::new(Node::new(postgres));
+    let client = Arc::new(Node::new(Box::new(SledStorageEngine::new().unwrap())));
 
     let id;
     {

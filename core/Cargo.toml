@@ -7,6 +7,7 @@ edition = "2021"
 [features]
 default = ["derive"]
 derive = ["ankurah-derive"]
+postgres = ["dep:postgres", "dep:r2d2_postgres", "dep:r2d2"]
 
 [dependencies]
 anyhow = "1.0.89"
@@ -30,10 +31,13 @@ yrs = "0.21.2"
 
 # Storage engines
 sled = "0.34.7"
-postgres = { version = "0.19", features = ["with-uuid-1"] }
-r2d2_postgres = "0.18"
-r2d2 = "0.8"
+postgres = { version = "0.19", features = ["with-uuid-1"], optional = true }
+r2d2_postgres = { version = "0.18", optional = true }
+r2d2 = { version = "0.8", optional = true }
 
 [dev-dependencies]
 ankurah-derive = { path = "../derive" }
 tracing-subscriber = "0.3.18"
+testcontainers = "0.23.1"
+testcontainers-modules = { version = "0.11.4", features = ["blocking", "postgres"] }
+ctor = "0.2.9"

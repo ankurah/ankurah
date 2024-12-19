@@ -7,8 +7,10 @@ use crate::{
     property::{Backends, PropertyName},
 };
 
-pub mod postgres;
+#[cfg(feature = "postgres")]
+mod postgres;
 pub mod sled;
+#[cfg(feature = "postgres")]
 pub use postgres::Postgres;
 pub use sled::SledStorageEngine;
 
