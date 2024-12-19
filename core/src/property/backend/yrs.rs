@@ -39,9 +39,10 @@ impl YrsBackend {
         }
     }
 
-    pub fn get_string(&self, property_name: impl AsRef<str>) -> String {
-        let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
-        text.get_string(&self.doc.transact())
+    pub fn get_string(&self, property_name: impl AsRef<str>) -> Option<String> {
+        let txn = self.doc.transact();
+        let text = txn.get_text(property_name.as_ref()); // We only have one field in the yrs doc
+        text.map(|t| t.get_string(&txn))
     }
 
     pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) {
@@ -93,6 +94,10 @@ impl PropertyBackend for YrsBackend {
 
     fn property_backend_name() -> String {
         "yrs".to_owned()
+    }
+
+    fn get_property_value_string(&self, property_name: &str) -> Option<String> {
+        self.get_string(property_name)
     }
 
     fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {

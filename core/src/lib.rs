@@ -4,6 +4,7 @@ pub mod human_id;
 pub mod model;
 pub mod node;
 pub mod property;
+pub mod resultset;
 pub mod storage;
 pub mod transaction;
 

@@ -40,6 +40,9 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn properties(&self) -> Vec<String>;
     fn materialized(&self) -> BTreeMap<PropertyName, Materialized>;
 
+    // TODO: This should be a specific typecast, not just a string
+    fn get_property_value_string(&self, property_name: &str) -> Option<String>;
+
     /// Unique property backend identifier.
     fn property_backend_name() -> String
     where

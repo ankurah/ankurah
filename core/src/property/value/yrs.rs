@@ -19,7 +19,7 @@ pub struct YrsString {
 impl ProjectedValue for YrsString {
     type Projected = String;
     fn projected(&self) -> Self::Projected {
-        self.value()
+        self.value().unwrap_or_default()
     }
 }
 
@@ -40,7 +40,7 @@ impl YrsString {
             .upgrade()
             .expect("Expected `Yrs` property backend to exist")
     }
-    pub fn value(&self) -> String {
+    pub fn value(&self) -> Option<String> {
         self.backend().get_string(&self.property_name)
     }
     pub fn insert(&self, index: u32, value: &str) {

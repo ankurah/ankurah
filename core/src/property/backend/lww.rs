@@ -104,6 +104,14 @@ impl PropertyBackend for LWWBackend {
     fn apply_operations(&self, _operations: &Vec<super::Operation>) -> anyhow::Result<()> {
         todo!()
     }
+
+    fn get_property_value_string(&self, property_name: &str) -> Option<String> {
+        self.values
+            .read()
+            .unwrap()
+            .get(property_name)
+            .map(|v| String::from_utf8_lossy(v).to_string())
+    }
 }
 
 // Need ID based happens-before determination to resolve conflicts

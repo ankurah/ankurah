@@ -5,6 +5,7 @@ use crate::{
     event::Operation,
     model::{Record, RecordInner, ID},
     property::backend::RecordEvent,
+    resultset::ResultSet,
     storage::{Bucket, RecordState, StorageEngine},
     transaction::Transaction,
 };
@@ -32,9 +33,9 @@ pub struct Node {
 type NodeRecords = BTreeMap<(ID, &'static str), Weak<RecordInner>>;
 
 impl Node {
-    pub fn new(engine: Box<dyn StorageEngine>) -> Self {
+    pub fn new<E: StorageEngine + 'static>(engine: E) -> Self {
         Self {
-            storage_engine: engine,
+            storage_engine: Box::new(engine),
             collections: RwLock::new(BTreeMap::new()),
             records: Arc::new(RwLock::new(BTreeMap::new())),
             // peer_connections: Vec::new(),
@@ -195,6 +196,36 @@ impl Node {
         let collection_name = R::Model::bucket_name();
         let record_inner = self.fetch_record_inner(id, collection_name)?;
         Ok(R::from_record_inner(record_inner))
+    }
+
+    pub fn fetch<R: Record>(&self, predicate_str: &str) -> anyhow::Result<ResultSet<R>> {
+        use crate::model::Model;
+        let collection_name = R::Model::bucket_name();
+
+        // Parse the predicate
+        let predicate = ankql::parser::parse_selection(predicate_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse predicate: {}", e))?;
+
+        // Fetch raw states from storage
+        let states = self
+            .storage_engine
+            .fetch_states(collection_name, &predicate)?;
+
+        // Convert states to records
+        let records = states
+            .into_iter()
+            .map(|(id, state)| {
+                let record_inner = RecordInner::from_record_state(id, collection_name, &state)?;
+                let ref_record = Arc::new(record_inner);
+                // Only add the record if it doesn't exist yet in the node's state
+                if self.fetch_record_from_node(id, collection_name).is_none() {
+                    self.add_record(&ref_record);
+                }
+                Ok(R::from_record_inner(ref_record))
+            })
+            .collect::<anyhow::Result<Vec<R>>>()?;
+
+        Ok(ResultSet { records })
     }
 }
 

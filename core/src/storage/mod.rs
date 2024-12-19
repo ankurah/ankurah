@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::ID,
+    model::{Record, ID},
     property::Backends,
 };
 
@@ -17,6 +17,13 @@ pub use sled::SledStorageEngine;
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
     fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>>;
+
+    // Fetch raw record states matching a predicate
+    fn fetch_states(
+        &self,
+        bucket_name: &'static str,
+        predicate: &ankql::ast::Predicate,
+    ) -> anyhow::Result<Vec<(ID, RecordState)>>;
 }
 
 pub trait StorageBucket: Send + Sync {

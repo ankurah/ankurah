@@ -6,7 +6,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-
 use crate::{
     property::{
         backend::{Operation, PropertyBackend},
@@ -20,8 +19,7 @@ pub struct PNBackend {
     values: Arc<RwLock<BTreeMap<PropertyName, PNValue>>>,
 }
 
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PNValue {
     // TODO: Maybe use something aside from i64 for the base?
     pub value: i64,
@@ -41,7 +39,6 @@ impl PNValue {
         self.value - self.previous_value
     }
 }
-
 
 impl Default for PNBackend {
     fn default() -> Self {
@@ -74,10 +71,7 @@ impl PNBackend {
         property_name: PropertyName,
         amount: i64,
     ) {
-        let value = values
-            .deref_mut()
-            .entry(property_name)
-            .or_default();
+        let value = values.deref_mut().entry(property_name).or_default();
         value.value += amount;
     }
 }
@@ -176,5 +170,13 @@ impl PropertyBackend for PNBackend {
         }
 
         Ok(())
+    }
+
+    fn get_property_value_string(&self, property_name: &str) -> Option<String> {
+        self.values
+            .read()
+            .unwrap()
+            .get(property_name)
+            .map(|v| v.value.to_string())
     }
 }

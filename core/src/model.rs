@@ -10,6 +10,7 @@ use crate::{
 
 use anyhow::Result;
 
+use ankql::selection::filter::Filterable;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -144,6 +145,22 @@ impl RecordInner {
             bucket_name: self.bucket_name(),
             backends: self.backends.fork(),
         }
+    }
+}
+
+impl Filterable for RecordInner {
+    fn collection(&self) -> &str {
+        self.bucket_name()
+    }
+
+    fn value(&self, name: &str) -> Option<String> {
+        // Iterate through backends to find one that has this property
+        self.backends
+            .backends
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|backend| backend.get_property_value_string(name))
     }
 }
 
