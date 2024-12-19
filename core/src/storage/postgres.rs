@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     error::RetrievalError,
-    model::ID,
+    model::{RecordInner, ID},
     property::{
         backend::{BackendDowncasted, PropertyBackend},
         Backends,
@@ -10,7 +10,7 @@ use crate::{
     storage::{RecordState, StorageBucket, StorageEngine},
 };
 
-// use ankql::selection::sql::generate_selection_sql;
+use ankql::selection::filter::evaluate_predicate;
 use postgres::{error::SqlState, types::ToSql};
 use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 
@@ -51,6 +51,61 @@ impl StorageEngine for Postgres {
             pool: self.pool.clone(),
             bucket_name: name.to_owned(),
         }))
+    }
+
+    fn fetch_states(
+        &self,
+        bucket_name: &'static str,
+        predicate: &ankql::ast::Predicate,
+    ) -> anyhow::Result<Vec<(ID, RecordState)>> {
+        if !Postgres::sane_name(bucket_name) {
+            return Err(anyhow::anyhow!(
+                "bucket name must only contain valid characters"
+            ));
+        }
+
+        let mut client = self.pool.get()?;
+        let mut results = Vec::new();
+
+        // For now, fetch all records and filter in memory
+        // TODO: Convert predicate to SQL WHERE clause for better performance
+        let query = format!(r#"SELECT "id", "state_buffer" FROM "{}""#, bucket_name);
+
+        let rows = match client.query(&query, &[]) {
+            Ok(rows) => rows,
+            Err(err) => {
+                let kind = error_kind(&err);
+                match kind {
+                    ErrorKind::UndefinedTable { table } => {
+                        if table == bucket_name {
+                            // Table doesn't exist yet, return empty results
+                            return Ok(Vec::new());
+                        }
+                    }
+                    _ => {}
+                }
+                return Err(err.into());
+            }
+        };
+
+        for row in rows {
+            let uuid: uuid::Uuid = row.get(0);
+            let state_buffer: Vec<u8> = row.get(1);
+            let id = ID(ulid::Ulid::from(uuid));
+
+            let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer)?;
+            let record_state = RecordState { state_buffers };
+
+            // Create record to evaluate predicate
+            let record_inner = RecordInner::from_record_state(id, bucket_name, &record_state)?;
+
+            // Apply predicate filter
+            if evaluate_predicate(&record_inner, predicate)? {
+                results.push((id, record_state));
+            }
+        }
+
+        Ok(results)
     }
 }
 
@@ -129,9 +184,10 @@ impl StorageBucket for PostgresBucket {
                     println!("yrs found");
                     for property in yrs.properties() {
                         println!("property: {:?}", property);
-                        let string = yrs.get_string(property.clone());
-                        materialized_columns.push(property);
-                        materialized.push(PostgresParams::String(string));
+                        if let Some(string) = yrs.get_string(property.clone()) {
+                            materialized_columns.push(property);
+                            materialized.push(PostgresParams::String(string));
+                        }
                     }
                 }
                 BackendDowncasted::LWW(lww) => {

@@ -37,7 +37,9 @@ impl Transaction {
         id: ID,
         bucket_name: &'static str,
     ) -> Option<&RecordInner> {
-        self.records.iter().find(|&record| record.id() == id && record.bucket_name() == bucket_name)
+        self.records
+            .iter()
+            .find(|&record| record.id() == id && record.bucket_name() == bucket_name)
     }
 
     /// Fetch a record.

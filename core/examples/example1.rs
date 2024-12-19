@@ -111,7 +111,10 @@ async fn main() -> Result<()> {
         album.name().insert(12, "e");
         //let record_event = album.get_record_event();
         //println!("Record event: {:?}", record_event);
-        assert_eq!(album.name().value(), "The Dark Side of the Moon");
+        assert_eq!(
+            album.name().value(),
+            Some("The Dark Side of the Moon".to_string())
+        );
 
         let album_id = album.id();
         let from_scoped_album = trx.edit::<Album>(&album).unwrap();

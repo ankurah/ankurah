@@ -1,20 +1,11 @@
 #![cfg(feature = "postgres")]
 
-mod basic;
-mod repeatable_read;
-
-use ankurah_core::{
-    model::ScopedRecord, node::Node, property::value::YrsString, storage::Postgres,
-};
-use ankurah_derive::Model;
 use anyhow::Result;
 // use postgres::NoTls;
+use ankurah_core::storage::Postgres;
 use r2d2_postgres::PostgresConnectionManager;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use testcontainers::Container;
-use tracing::Level;
-
 use testcontainers_modules::{postgres, testcontainers::runners::SyncRunner};
 
 pub fn create_postgres_container() -> Result<(
@@ -25,7 +16,7 @@ pub fn create_postgres_container() -> Result<(
         .with_db_name("ankurah")
         .with_user("postgres")
         .with_password("postgres")
-        .with_init_sql(include_str!("init.sql").to_string().into_bytes())
+        .with_init_sql(include_str!("pg_init.sql").to_string().into_bytes())
         .start()
         .unwrap();
 
@@ -42,19 +33,4 @@ pub fn create_postgres_container() -> Result<(
     let storage_engine = Postgres::new(pool)?;
 
     Ok((container, storage_engine))
-}
-
-#[derive(Model, Debug, Serialize, Deserialize)]
-pub struct Album {
-    #[active_value(YrsString)]
-    pub name: String,
-}
-
-// Initialize tracing for tests
-#[ctor::ctor]
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_test_writer()
-        .init();
 }
