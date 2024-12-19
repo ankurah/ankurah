@@ -9,10 +9,10 @@ use std::{
 };
 
 #[derive(Debug)]
-pub(crate) struct Sender(Arc<Inner>);
+pub struct Sender(Arc<Inner>);
 
 #[derive(Debug)]
-pub(crate) struct Receiver(Weak<Inner>);
+pub struct Receiver(Weak<Inner>);
 
 #[derive(Debug, Default)]
 struct Inner {

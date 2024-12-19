@@ -199,5 +199,6 @@ impl Node {
 }
 
 pub struct PeerConnection {
+    #[allow(unused)]
     channel: mpsc::Sender<Operation>,
 }

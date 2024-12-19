@@ -6,9 +6,14 @@ use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
 
 pub struct Connection {
     ws: WebSocket,
+
+    #[allow(unused)]
     on_message: Closure<dyn FnMut(MessageEvent)>,
+    #[allow(unused)]
     on_error: Closure<dyn FnMut(Event)>,
+    #[allow(unused)]
     on_close: Closure<dyn FnMut(CloseEvent)>,
+    #[allow(unused)]
     on_open: Closure<dyn FnMut()>,
     pub state: reactive_graph::signal::ReadSignal<ConnectionState>,
 }

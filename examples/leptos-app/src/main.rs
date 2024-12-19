@@ -19,7 +19,7 @@ fn App() -> impl IntoView {
     log!("App");
 
     let client = Client::new("localhost:9797").unwrap();
-    let (count, set_count) = signal(0);
+    let (count, _set_count) = signal(0);
 
     let connection_state = client.connection_state();
     view! {

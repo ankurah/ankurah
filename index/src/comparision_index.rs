@@ -17,7 +17,8 @@ pub(crate) struct ComparisonIndex {
 }
 
 impl ComparisonIndex {
-    pub(crate) fn new() -> Self {
+    #[allow(unused)]
+    pub fn new() -> Self {
         Self {
             eq: HashMap::new(),
             gt: BTreeMap::new(),

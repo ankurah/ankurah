@@ -1,18 +1,17 @@
-use std::{collections::BTreeMap, ops::DerefMut, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     error::RetrievalError,
     model::ID,
     property::{
-        backend::{BackendDowncasted, PropertyBackend, YrsBackend},
+        backend::{BackendDowncasted, PropertyBackend},
         Backends,
     },
     storage::{RecordState, StorageBucket, StorageEngine},
 };
 
-use ankql::selection::sql::generate_selection_sql;
-use postgres::{error::SqlState, tls::MakeTlsConnect, types::ToSql};
-use r2d2::PooledConnection;
+// use ankql::selection::sql::generate_selection_sql;
+use postgres::{error::SqlState, types::ToSql};
 use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 
 pub struct Postgres {
@@ -301,7 +300,7 @@ pub enum ErrorKind {
 
 pub fn error_kind(err: &postgres::Error) -> ErrorKind {
     let string = err.to_string().trim().to_owned();
-    let db_error = err.as_db_error();
+    let _db_error = err.as_db_error();
     let sql_code = err.code().cloned();
 
     if string == "query returned an unexpected number of rows" {
@@ -349,6 +348,7 @@ pub fn error_kind(err: &postgres::Error) -> ErrorKind {
     }
 }
 
+#[allow(unused)]
 pub struct MissingMaterialized {
     pub name: String,
 }

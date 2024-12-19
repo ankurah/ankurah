@@ -36,7 +36,7 @@ where
     storage: Arc<S>,
 }
 
-pub(crate) trait StorageEngine<R>
+pub trait StorageEngine<R>
 where
     R: Record,
 {
@@ -44,7 +44,8 @@ where
     type Update: Clone;
     fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<R>;
 }
-pub(crate) trait Record: Filterable + Clone {
+
+pub trait Record: Filterable + Clone {
     type Id: std::hash::Hash + std::cmp::Eq + Copy + Clone;
     type Model;
     fn id(&self) -> Self::Id;
@@ -307,7 +308,7 @@ where
         self.recurse_predicate(
             predicate,
             |entry: dashmap::Entry<FieldId, ComparisonIndex>,
-             field_id,
+             _field_id,
              literal: &ast::Literal,
              operator| {
                 if let dashmap::Entry::Occupied(mut index) = entry {
@@ -424,14 +425,18 @@ pub enum RecordChangeKind {
 /// Represents a change in the record set
 #[derive(Debug, Clone)]
 pub struct RecordChange<R, U> {
+    #[allow(unused)]
     record: R,
+    #[allow(unused)]
     updates: Vec<U>,
+    #[allow(unused)]
     kind: RecordChangeKind,
 }
 
 /// A set of changes to the record set
 #[derive(Debug, Clone)]
 pub struct ChangeSet<R, U> {
+    #[allow(unused)]
     changes: Vec<RecordChange<R, U>>,
     // other stuff later
 }
@@ -441,6 +446,7 @@ type Callback<R, U> = Box<dyn Fn(ChangeSet<R, U>) + Send + Sync + 'static>;
 
 /// A subscription that can be shared between indexes
 pub struct Subscription<R, U> {
+    #[allow(unused)]
     id: SubscriptionId,
     predicate: ankql::ast::Predicate,
     callback: Arc<Callback<R, U>>,
@@ -495,6 +501,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum PetUpdate {
+        #[allow(unused)]
         Name(String),
         Age(i64),
     }
@@ -520,6 +527,7 @@ mod tests {
             }
         }
 
+        #[allow(unused)]
         pub fn set_name(&self, name: String) {
             let mut pet = self.model.lock().unwrap();
             pet.name = name.clone();

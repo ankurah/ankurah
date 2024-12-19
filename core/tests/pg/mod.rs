@@ -12,8 +12,8 @@ use anyhow::Result;
 use r2d2_postgres::PostgresConnectionManager;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use testcontainers::{Container, GenericImage};
-use tracing::{info, Level};
+use testcontainers::Container;
+use tracing::Level;
 
 use testcontainers_modules::{postgres, testcontainers::runners::SyncRunner};
 

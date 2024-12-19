@@ -5,7 +5,6 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-
 use crate::{
     property::{backend::PropertyBackend, PropertyName},
     storage::Materialized,
@@ -102,7 +101,7 @@ impl PropertyBackend for LWWBackend {
         todo!()
     }
 
-    fn apply_operations(&self, operations: &Vec<super::Operation>) -> anyhow::Result<()> {
+    fn apply_operations(&self, _operations: &Vec<super::Operation>) -> anyhow::Result<()> {
         todo!()
     }
 }

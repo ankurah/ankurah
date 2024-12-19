@@ -9,7 +9,7 @@ use axum::{
 use axum_extra::{headers, TypedHeader};
 use bincode::deserialize;
 use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
@@ -62,7 +62,6 @@ pub struct ServerBuilder {
     bind_address: Option<String>,
     storage: Option<Box<dyn StorageEngine>>,
 }
-
 
 impl ServerBuilder {
     pub fn bind_address(mut self, addr: impl Into<String>) -> Self {
@@ -139,8 +138,8 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: ServerStat
 async fn process_message(
     msg: Message,
     who: SocketAddr,
-    sender: &SplitSink<WebSocket, Message>,
-    state: &ServerState,
+    _sender: &SplitSink<WebSocket, Message>,
+    _state: &ServerState,
 ) -> ControlFlow<(), ()> {
     match msg {
         Message::Text(t) => {
@@ -151,7 +150,7 @@ async fn process_message(
 
             if let Ok(message) = deserialize::<proto::Message>(&d) {
                 match message {
-                    proto::Message::Request(request) => {
+                    proto::Message::Request(_request) => {
                         println!("Received request");
                     }
                     proto::Message::Response(_) => {
@@ -160,7 +159,7 @@ async fn process_message(
                 }
             } else {
                 println!("Failed to deserialize message");
-            }
+            };
         }
         Message::Close(c) => {
             if let Some(cf) = c {
@@ -182,3 +181,26 @@ async fn process_message(
     }
     ControlFlow::Continue(())
 }
+
+// async fn handle_request(
+//     _sender: &SplitSink<WebSocket, Message>,
+//     _state: &ServerState,
+// ) -> Result<()> {
+//     todo!()
+// }
+
+// async fn handle_message(message: Message) -> ControlFlow<(), ()> {
+//     match message {
+//         Message::Text(text) => {
+//             let message: proto::Message = deserialize(text.as_bytes()).unwrap();
+//             match message {
+//                 proto::Message::Request(_request) => {
+//                     // TODO: handle request
+//                     ControlFlow::Continue(())
+//                 }
+//                 _ => ControlFlow::Continue(()),
+//             }
+//         }
+//         _ => ControlFlow::Continue(()),
+//     }
+// }

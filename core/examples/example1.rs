@@ -117,6 +117,10 @@ async fn main() -> Result<()> {
         let from_scoped_album = trx.edit::<Album>(&album).unwrap();
         let from_id = trx.edit::<Album>(album_id).unwrap();
 
+        // Verify that both ways of getting an album reference point to the same data
+        assert_eq!(from_scoped_album.name().value(), from_id.name().value());
+        assert_eq!(from_scoped_album.id(), from_id.id());
+
         trx.commit().unwrap();
 
         let trx = client.begin();

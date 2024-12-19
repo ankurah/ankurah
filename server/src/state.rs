@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ServerState {
+    #[allow(unused)]
     node: Arc<Node>,
 }
 
@@ -11,6 +12,7 @@ impl ServerState {
         Self { node }
     }
 
+    #[allow(unused)]
     pub fn node(&self) -> &Arc<Node> {
         &self.node
     }
