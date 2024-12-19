@@ -4,7 +4,6 @@ use ankurah_core::{model::ScopedRecord, node::Node};
 use ankurah_derive::Model;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::{info, Level};
 
 use std::sync::Arc;
 

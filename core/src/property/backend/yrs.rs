@@ -23,12 +23,18 @@ pub struct YrsBackend {
     previous_state: Arc<Mutex<StateVector>>,
 }
 
+impl Default for YrsBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl YrsBackend {
     pub fn new() -> Self {
         let doc = yrs::Doc::new();
         let starting_state = doc.transact().state_vector();
         Self {
-            doc: doc,
+            doc,
             previous_state: Arc::new(Mutex::new(starting_state)),
         }
     }
@@ -104,7 +110,7 @@ impl PropertyBackend for YrsBackend {
         println!("yrs backend from state buffer: {:?}", state_buffer);
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
-        let update = yrs::Update::decode_v2(&state_buffer)
+        let update = yrs::Update::decode_v2(state_buffer)
             .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
         txn.apply_update(update)
             .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
@@ -116,7 +122,7 @@ impl PropertyBackend for YrsBackend {
         println!("str: {:?}", text.get_string(&doc.transact()));
 
         Ok(Self {
-            doc: doc,
+            doc,
             previous_state: Arc::new(Mutex::new(starting_state)),
         })
     }
@@ -131,7 +137,7 @@ impl PropertyBackend for YrsBackend {
         *previous_state = txn.state_vector();
 
         if !diff.is_empty() {
-            operations.push(Operation { diff: diff })
+            operations.push(Operation { diff })
         }
 
         Ok(operations)

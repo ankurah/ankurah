@@ -4,15 +4,15 @@ use ankql::ast;
 use ankql::selection::filter::Filterable;
 use anyhow::Result;
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
-impl Into<FieldId> for &str {
-    fn into(self) -> FieldId {
-        FieldId(self.to_string())
+impl From<&str> for FieldId {
+    fn from(val: &str) -> Self {
+        FieldId(val.to_string())
     }
 }
 
@@ -297,11 +297,9 @@ where
 
     fn add_index_watchers(&self, sub_id: SubscriptionId, predicate: &ast::Predicate) {
         self.recurse_predicate(predicate, |entry, _field_id, literal, operator| {
-            entry.or_insert_with(ComparisonIndex::new).add(
-                (*literal).clone(),
-                operator.clone(),
-                sub_id,
-            );
+            entry
+                .or_default()
+                .add((*literal).clone(), operator.clone(), sub_id);
         });
     }
 
@@ -376,13 +374,9 @@ where
         for sub_id in possibly_interested_subs {
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
                 // Use evaluate_predicate directly on the record instead of fetch_records
-                let matches = match ankql::selection::filter::evaluate_predicate(
-                    &record,
-                    &subscription.predicate,
-                ) {
-                    Ok(matches) => matches,
-                    Err(_) => false, // If we can't evaluate the predicate, assume no match
-                };
+                let matches =
+                    ankql::selection::filter::evaluate_predicate(&record, &subscription.predicate)
+                        .unwrap_or(false);
 
                 let did_match = subscription
                     .matching_records
@@ -497,7 +491,7 @@ where
 mod tests {
     use super::*;
     use ankql;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, Weak};
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum PetUpdate {
@@ -796,34 +790,46 @@ mod tests {
         rex.set_age(7);
 
         // should have recieved one changeset with updates [PetUpdate::Age(7)] and kind RecordChangeKind::Edit
-        assert_eq!(check_received(), vec![(
-            vec![PetUpdate::Age(7)],
-            RecordChangeKind::Edit // it's an edit because it was already matching
-                                   // rex always shows up because he's an OR predicate by name
-        )]);
+        assert_eq!(
+            check_received(),
+            vec![(
+                vec![PetUpdate::Age(7)],
+                RecordChangeKind::Edit // it's an edit because it was already matching
+                                       // rex always shows up because he's an OR predicate by name
+            )]
+        );
 
         // snuffy turns 3
         snuffy.set_age(3);
-        assert_eq!(check_received(), vec![(
-            vec![PetUpdate::Age(3)],
-            RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
-        )]);
+        assert_eq!(
+            check_received(),
+            vec![(
+                vec![PetUpdate::Age(3)],
+                RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
+            )]
+        );
 
         // turns out we had Jasper's age wrong, he's actually 4
         jasper.set_age(4);
-        assert_eq!(check_received(), vec![(
-            vec![PetUpdate::Age(4)],
-            RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
-        )]);
+        assert_eq!(
+            check_received(),
+            vec![(
+                vec![PetUpdate::Age(4)],
+                RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
+            )]
+        );
 
         // snuffy and jasper turn 5 and 6
         snuffy.set_age(5);
         jasper.set_age(6);
 
         // we should have received two changesets with a remove and an add
-        assert_eq!(check_received(), vec![
-            (vec![PetUpdate::Age(5)], RecordChangeKind::Remove),
-            (vec![PetUpdate::Age(6)], RecordChangeKind::Remove)
-        ]);
+        assert_eq!(
+            check_received(),
+            vec![
+                (vec![PetUpdate::Age(5)], RecordChangeKind::Remove),
+                (vec![PetUpdate::Age(6)], RecordChangeKind::Remove)
+            ]
+        );
     }
 }

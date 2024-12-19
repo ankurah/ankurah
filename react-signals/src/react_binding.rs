@@ -112,7 +112,13 @@ struct Inner {
 
 // Thread local for currently active SignalContext
 thread_local! {
-    pub static CURRENT_STORE: RefCell<Option<EffectStore>> = RefCell::new(None);
+    pub static CURRENT_STORE: RefCell<Option<EffectStore>> = const { RefCell::new(None) };
+}
+
+impl Default for EffectStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EffectStore {
@@ -134,7 +140,7 @@ impl EffectStore {
                 let Some(mut rx) = rx.borrow_mut().take() else {
                     return JsValue::UNDEFINED;
                 };
-                use reactive_graph::graph::WithObserver;
+                
                 any_spawner::Executor::spawn_local({
                     //     // let value = Arc::clone(&value);
                     let subscriber = tracker.to_any_subscriber();

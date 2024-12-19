@@ -29,7 +29,7 @@ impl Connection {
             }));
 
         let on_error = {
-            let wstate = wstate.clone();
+            let wstate = wstate;
             Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_| {
                 info!("Connection Error");
                 wstate.set(ConnectionState::Error);
@@ -37,7 +37,7 @@ impl Connection {
         };
 
         let on_close = {
-            let wstate = wstate.clone();
+            let wstate = wstate;
             Closure::<dyn FnMut(CloseEvent)>::wrap(Box::new(move |e: CloseEvent| {
                 info!("Connection closed: {}", e.code());
                 wstate.set(ConnectionState::Closed);

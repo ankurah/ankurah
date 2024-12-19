@@ -24,7 +24,7 @@ pub struct Transaction {
 impl Transaction {
     pub fn new(node: Arc<Node>) -> Self {
         Self {
-            node: node,
+            node,
             records: AppendOnlyVec::new(),
             implicit: true,
             consumed: false,
@@ -37,17 +37,7 @@ impl Transaction {
         id: ID,
         bucket_name: &'static str,
     ) -> Option<&RecordInner> {
-        for record in self.records.iter() {
-            // TODO: Optimize this.
-            // It shouldn't be a problem until we have a LOT of records but still
-            // Probably just a hashing pre-check and then we retrieve it the same way
-            // Either that or use a different append-only structure that uses hashing.
-            if record.id() == id && record.bucket_name() == bucket_name {
-                return Some(&record);
-            }
-        }
-
-        None
+        self.records.iter().find(|&record| record.id() == id && record.bucket_name() == bucket_name)
     }
 
     /// Fetch a record.

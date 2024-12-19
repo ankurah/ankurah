@@ -77,8 +77,8 @@ pub struct RecordEvent {
 impl RecordEvent {
     pub fn new(id: ID, bucket_name: &'static str) -> Self {
         Self {
-            id: id,
-            bucket_name: bucket_name,
+            id,
+            bucket_name,
             operations: BTreeMap::default(),
         }
     }
@@ -93,7 +93,7 @@ impl RecordEvent {
 
     pub fn is_empty(&self) -> bool {
         let mut empty = true;
-        for (_, operations) in &self.operations {
+        for operations in self.operations.values() {
             if operations.len() > 0 {
                 empty = false;
             }
@@ -157,6 +157,12 @@ pub fn backend_from_string(
         Ok(Arc::new(backend))
     } else {
         panic!("unknown backend: {:?}", name);
+    }
+}
+
+impl Default for Backends {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

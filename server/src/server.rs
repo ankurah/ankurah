@@ -57,19 +57,12 @@ impl Server {
     }
 }
 
+#[derive(Default)]
 pub struct ServerBuilder {
     bind_address: Option<String>,
     storage: Option<Box<dyn StorageEngine>>,
 }
 
-impl Default for ServerBuilder {
-    fn default() -> Self {
-        Self {
-            bind_address: None,
-            storage: None,
-        }
-    }
-}
 
 impl ServerBuilder {
     pub fn bind_address(mut self, addr: impl Into<String>) -> Self {

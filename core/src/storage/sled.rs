@@ -74,7 +74,7 @@ impl StorageBucket for SledStorageBucket {
             .map_err(|e| crate::error::RetrievalError::StorageError(Box::new(e)))?
         {
             Some(ivec) => {
-                let record_state = bincode::deserialize(&*ivec)?;
+                let record_state = bincode::deserialize(&ivec)?;
                 Ok(record_state)
             }
             None => Err(crate::error::RetrievalError::NotFound(id)),

@@ -5,11 +5,8 @@ pub mod react_binding;
 pub use ankurah_derive::WasmSignal;
 use reactive_graph::{effect::Effect, owner::LocalStorage, traits::Dispose};
 
-use std::sync::Mutex;
-use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use wasm_bindgen::prelude::wasm_bindgen;
-use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 pub struct Subscription {

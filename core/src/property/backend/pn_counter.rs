@@ -1,12 +1,11 @@
 use std::{
     any::Any,
-    collections::{btree_map::Entry, BTreeMap},
+    collections::BTreeMap,
     fmt::Debug,
-    ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, RwLock},
+    ops::DerefMut,
+    sync::{Arc, RwLock},
 };
 
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     property::{
@@ -22,6 +21,7 @@ pub struct PNBackend {
 }
 
 #[derive(Debug)]
+#[derive(Default)]
 pub struct PNValue {
     // TODO: Maybe use something aside from i64 for the base?
     pub value: i64,
@@ -42,12 +42,10 @@ impl PNValue {
     }
 }
 
-impl Default for PNValue {
+
+impl Default for PNBackend {
     fn default() -> Self {
-        Self {
-            value: 0,
-            previous_value: 0,
-        }
+        Self::new()
     }
 }
 
@@ -79,7 +77,7 @@ impl PNBackend {
         let value = values
             .deref_mut()
             .entry(property_name)
-            .or_insert(PNValue::default());
+            .or_default();
         value.value += amount;
     }
 }
@@ -143,7 +141,7 @@ impl PropertyBackend for PNBackend {
                 (
                     key,
                     PNValue {
-                        value: value,
+                        value,
                         previous_value: value,
                     },
                 )

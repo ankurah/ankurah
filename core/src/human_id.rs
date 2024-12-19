@@ -1,5 +1,5 @@
 #[rustfmt::skip]
-pub const WORDLIST: &'static [&'static str; 256] = &[
+pub const WORDLIST: &[&str; 256] = &[
     "ack", "alabama", "alanine", "alaska", "alpha", "angel", "apart", "april",
     "arizona", "arkansas", "artist", "asparagus", "aspen", "august", "autumn",
     "avocado", "bacon", "bakerloo", "batman", "beer", "berlin", "beryllium",

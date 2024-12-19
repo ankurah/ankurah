@@ -2,11 +2,9 @@ use std::{
     any::Any,
     collections::{btree_map::Entry, BTreeMap},
     fmt::Debug,
-    ops::Deref,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
 };
 
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     property::{backend::PropertyBackend, PropertyName},
@@ -17,6 +15,12 @@ use crate::{
 pub struct LWWBackend {
     // TODO: store a timestamp/precursor id at time of setting value (or maybe when we commit?).
     values: Arc<RwLock<BTreeMap<PropertyName, Vec<u8>>>>,
+}
+
+impl Default for LWWBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LWWBackend {

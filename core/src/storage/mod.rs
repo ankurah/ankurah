@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::ID,
-    property::{Backends, PropertyName},
+    property::Backends,
 };
 
 #[cfg(feature = "postgres")]

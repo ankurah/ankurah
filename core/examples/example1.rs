@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     //     client,
     //     name: "The Dark Sid of the Moon",
     // };
-    let album = {
+    {
         // let album = AlbumRecord::build(&client).with(Album {
         //     name: "The Dark Sid of the Moon".to_string(),
         // }).insert();

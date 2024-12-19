@@ -32,7 +32,7 @@ impl fmt::Display for ID {
 
 impl AsRef<ID> for ID {
     fn as_ref(&self) -> &ID {
-        &self
+        self
     }
 }
 
@@ -76,8 +76,8 @@ pub struct RecordInner {
 impl RecordInner {
     pub fn new(id: ID, bucket_name: &'static str) -> Self {
         Self {
-            id: id,
-            bucket_name: bucket_name,
+            id,
+            bucket_name,
             backends: Backends::new(),
         }
     }
@@ -100,9 +100,9 @@ impl RecordInner {
 
     pub fn from_backends(id: ID, bucket_name: &'static str, backends: Backends) -> Self {
         Self {
-            id: id,
-            bucket_name: bucket_name,
-            backends: backends,
+            id,
+            bucket_name,
+            backends,
         }
     }
 
@@ -168,7 +168,7 @@ pub trait ScopedRecord<'rec> {
         Self: Sized;
 
     fn record_state(&self) -> anyhow::Result<RecordState> {
-        RecordState::from_backends(&self.backends())
+        RecordState::from_backends(self.backends())
     }
 
     fn record_event(&self) -> anyhow::Result<Option<RecordEvent>> {

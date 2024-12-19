@@ -54,7 +54,7 @@ impl YrsString {
 impl InitializeWith<String> for YrsString {
     fn initialize_with(backends: &Backends, property_name: PropertyName, value: &String) -> Self {
         let new_string = Self::from_backends(property_name, backends);
-        new_string.insert(0, &value);
+        new_string.insert(0, value);
         new_string
     }
 }

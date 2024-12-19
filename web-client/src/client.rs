@@ -110,7 +110,7 @@ impl Client {
 impl ClientInner {
     pub fn connect(self: &Rc<Self>, mut delay: u64) -> Result<(), JsValue> {
         let connection = Connection::new(&self.server_url)?;
-        let state = connection.state.clone();
+        let state = connection.state;
         *self.connection.borrow_mut() = Some(connection);
 
         self.state.set(ConnectionState::Connecting);

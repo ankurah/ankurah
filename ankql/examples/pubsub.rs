@@ -163,7 +163,7 @@ impl FakeServer {
     }
 }
 
-impl<'a> SubscriptionHandle<'a> {
+impl SubscriptionHandle<'_> {
     /// Registers a callback to be called when matching records change
     pub fn subscribe<F>(self, callback: F) -> Self
     where
