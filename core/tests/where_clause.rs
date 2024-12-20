@@ -21,15 +21,18 @@ async fn basic_where_clause() -> Result<()> {
         trx.create(&Album {
             name: "Ice on the Dune".into(),
             year: "2013".into(),
-        });
+        })
+        .await;
         trx.create(&Album {
             name: "Two Vines".into(),
             year: "2016".into(),
-        });
+        })
+        .await;
         trx.create(&Album {
             name: "Ask That God".into(),
             year: "2024".into(),
-        });
+        })
+        .await;
         trx.commit().await?;
         id
     };

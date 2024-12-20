@@ -17,6 +17,7 @@ pub enum EventPayload {
     Operation(Operation),
 }
 
+#[derive(Clone)]
 pub enum Operation {
     Create(),
     Update(),

@@ -73,7 +73,7 @@ impl StorageEngine for SledStorageEngine {
         task::spawn_blocking(move || -> anyhow::Result<Vec<(ID, RecordState)>> {
             let mut results = Vec::new();
             let mut seen_ids = HashSet::new();
-            println!("SledStorageEngine: Starting fetch_states scan");
+            // println!("SledStorageEngine: Starting fetch_states scan");
 
             // For now, do a full table scan
             for item in bucket.tree.iter() {
@@ -96,16 +96,16 @@ impl StorageEngine for SledStorageEngine {
 
                 // Apply predicate filter
                 if evaluate_predicate(&record_inner, &predicate)? {
-                    println!("SledStorageEngine: Found matching record with ID: {:?}", id);
+                    // println!("SledStorageEngine: Found matching record with ID: {:?}", id);
                     seen_ids.insert(id);
                     results.push((id, record_state));
                 }
             }
 
-            println!(
-                "SledStorageEngine: Finished fetch_states scan, found {} matches",
-                results.len()
-            );
+            // println!(
+            //     "SledStorageEngine: Finished fetch_states scan, found {} matches",
+            //     results.len()
+            // );
             Ok(results)
         })
         .await?
