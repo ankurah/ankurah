@@ -105,14 +105,13 @@ impl PropertyBackend for YrsBackend {
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
         let state_buffer = txn.encode_state_as_update_v2(&yrs::StateVector::default());
-        println!("state_buffer: {:?}", state_buffer);
+        // println!("state_buffer: {:?}", state_buffer);
         Ok(state_buffer)
     }
 
     fn from_state_buffer(
         state_buffer: &Vec<u8>,
     ) -> std::result::Result<Self, crate::error::RetrievalError> {
-        println!("yrs backend from state buffer: {:?}", state_buffer);
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
         let update = yrs::Update::decode_v2(state_buffer)
@@ -123,8 +122,8 @@ impl PropertyBackend for YrsBackend {
         drop(txn);
         let starting_state = doc.transact().state_vector();
 
-        let text = doc.get_or_insert_text("name"); // We only have one field in the yrs doc
-        println!("str: {:?}", text.get_string(&doc.transact()));
+        // let text = doc.get_or_insert_text("name"); // We only have one field in the yrs doc
+        // println!("str: {:?}", text.get_string(&doc.transact()));
 
         Ok(Self {
             doc,
@@ -149,7 +148,7 @@ impl PropertyBackend for YrsBackend {
     }
 
     fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()> {
-        println!("apply operations: {:?}", operations);
+        // println!("apply operations: {:?}", operations);
         for operation in operations {
             self.apply_update(&operation.diff)?;
         }

@@ -70,7 +70,7 @@ pub enum BackendDowncasted {
     Unknown(Arc<dyn Any>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RecordEvent {
     pub id: ID,
     pub bucket_name: &'static str,
@@ -128,7 +128,7 @@ impl RecordEvent {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Operation {
     pub diff: Vec<u8>,
 }

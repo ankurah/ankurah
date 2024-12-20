@@ -99,7 +99,7 @@ impl Transaction {
             }
         }
 
-        println!("record_events: {:?}", record_events);
+        // println!("record_events: {:?}", record_events);
 
         self.node.commit_events(&record_events).await
     }

@@ -11,11 +11,55 @@ use crate::{
 };
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    sync::{mpsc, Arc, RwLock, Weak},
+    sync::{Arc, RwLock, Weak},
 };
+use tokio::sync::{mpsc, oneshot};
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub struct NodeId(Ulid);
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub struct RequestId(Ulid);
+
+#[derive(Debug)]
+pub struct NodeRequest {
+    id: RequestId,
+    to: NodeId,
+    from: NodeId,
+    body: NodeRequestBody,
+}
+
+#[derive(Debug)]
+pub struct NodeResponse {
+    request_id: RequestId,
+    from: NodeId,
+    to: NodeId,
+    result: anyhow::Result<NodeResponseBody>,
+}
+
+#[derive(Debug)]
+enum NodeRequestBody {
+    // Events to be committed on the remote node
+    CommitEvents(Vec<RecordEvent>),
+    // Request to fetch records matching a predicate
+    FetchRecords {
+        bucket_name: &'static str,
+        predicate: String,
+    },
+}
+
+#[derive(Debug)]
+enum NodeResponseBody {
+    // Response to CommitEvents
+    CommitComplete(anyhow::Result<()>),
+    // Response to FetchRecords
+    Records(anyhow::Result<Vec<RecordState>>),
+}
 
 /// Manager for all records and their properties on this client.
 pub struct Node {
+    id: NodeId,
+
     /// Ground truth local state for records.
     ///
     /// Things like `postgres`, `sled`, `TKiV`.
@@ -28,30 +72,170 @@ pub struct Node {
     //records: Arc<RwLock<BTreeMap<(ID, &'static str), Weak<dyn ScopedRecord>>>>,
     records: Arc<RwLock<NodeRecords>>,
     // peer_connections: Vec<PeerConnection>,
+    peer_connections: RwLock<BTreeMap<NodeId, PeerConnection>>,
+    pending_requests:
+        RwLock<BTreeMap<RequestId, oneshot::Sender<anyhow::Result<NodeResponseBody>>>>,
 }
 
 type NodeRecords = BTreeMap<(ID, &'static str), Weak<RecordInner>>;
 
+#[derive(Debug)]
+enum PeerMessage {
+    Request(NodeRequest),
+    Response(NodeResponse),
+}
+
+#[derive(Clone)]
+pub enum PeerConnection {
+    Local(mpsc::Sender<PeerMessage>),
+}
+
 impl Node {
     pub fn new(engine: Box<dyn StorageEngine>) -> Self {
         Self {
+            id: NodeId(Ulid::new()),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             records: Arc::new(RwLock::new(BTreeMap::new())),
-            // peer_connections: Vec::new(),
+            peer_connections: RwLock::new(BTreeMap::new()),
+            pending_requests: RwLock::new(BTreeMap::new()),
         }
     }
 
-    pub fn local_connect(&self, _peer: &Arc<Node>) {
-        unimplemented!()
-        // let (tx, rx) = mpsc::channel();
-        // self.peer_connections.push(PeerConnection { channel: tx });
-        // let peer = peer.clone();
-        // tokio::spawn(async move {
-        //     for operation in rx {
-        //         peer.apply_operation(operation);
-        //     }
-        // });
+    pub fn local_connect(self: &Arc<Self>, peer: &Arc<Node>) {
+        let (my_tx, my_rx) = mpsc::channel(100);
+        let (peer_tx, peer_rx) = mpsc::channel(100); // Buffer size of 100
+
+        self.setup_local_handler(my_rx);
+        peer.setup_local_handler(peer_rx);
+        // Store the peer connection for the client
+        self.peer_connections
+            .write()
+            .unwrap()
+            .insert(peer.id.clone(), PeerConnection::Local(peer_tx));
+        // Store the peer connection for the server
+        peer.peer_connections
+            .write()
+            .unwrap()
+            .insert(self.id.clone(), PeerConnection::Local(my_tx));
+    }
+
+    fn setup_local_handler(self: &Arc<Self>, mut rx: mpsc::Receiver<PeerMessage>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                println!("Received message: {:?}", message);
+                match message {
+                    PeerMessage::Request(request) => {
+                        // double check to make sure we have a connection to the peer based on the node id
+                        let conn = {
+                            let peer_connections = me.peer_connections.read().unwrap();
+                            peer_connections.get(&request.from).cloned()
+                        };
+
+                        if let Some(tx) = conn {
+                            let me = me.clone();
+                            tokio::spawn(async move {
+                                let from = request.from.clone();
+                                let to = request.to.clone();
+                                let id = request.id.clone();
+                                let result = me.handle_request(request).await;
+                                tx.send_message(PeerMessage::Response(NodeResponse {
+                                    request_id: id,
+                                    from: from,
+                                    to: to,
+                                    result,
+                                }))
+                                .await
+                                .unwrap();
+                            });
+                        }
+                    }
+                    PeerMessage::Response(response) => {
+                        if let Some(tx) = me
+                            .pending_requests
+                            .write()
+                            .unwrap()
+                            .remove(&response.request_id)
+                        {
+                            tx.send(response.result).unwrap();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub async fn request(
+        &self,
+        node_id: NodeId,
+        request_body: NodeRequestBody,
+    ) -> anyhow::Result<NodeResponseBody> {
+        let (response_tx, response_rx) =
+            oneshot::channel::<Result<NodeResponseBody, anyhow::Error>>();
+        let request_id = RequestId(Ulid::new());
+
+        // Store the response channel
+        self.pending_requests
+            .write()
+            .unwrap()
+            .insert(request_id.clone(), response_tx);
+
+        let request = NodeRequest {
+            id: request_id,
+            to: node_id.clone(),
+            from: self.id.clone(),
+            body: request_body,
+        };
+
+        // Get the peer connection
+        let peer_connections = self.peer_connections.read().unwrap();
+        let connection = peer_connections
+            .get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("No connection to peer"))?;
+
+        // Send the request
+        connection
+            .send_message(PeerMessage::Request(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send request"))?;
+
+        // Wait for response
+        let response = response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?;
+
+        response
+    }
+
+    async fn handle_request(
+        self: &Arc<Self>,
+        request: NodeRequest,
+    ) -> anyhow::Result<NodeResponseBody> {
+        match request.body {
+            NodeRequestBody::CommitEvents(events) => Ok(NodeResponseBody::CommitComplete(
+                // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
+                // With moderate potential for duplication, while not creating message loops
+                // Doing so would be a secondary/tertiary/etc hop for this message
+                self.commit_events_local(&events).await,
+            )),
+            NodeRequestBody::FetchRecords {
+                bucket_name,
+                predicate,
+            } => {
+                let predicate = ankql::parser::parse_selection(&predicate)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse predicate: {}", e))?;
+                let states: Vec<_> = self
+                    .storage_engine
+                    .fetch_states(bucket_name, &predicate)
+                    .await?
+                    //             .await?
+                    .into_iter()
+                    .map(|(_, state)| state)
+                    .collect();
+                Ok(NodeResponseBody::Records(Ok(states)))
+            }
+        }
     }
 
     pub fn bucket(&self, name: &'static str) -> Bucket {
@@ -80,14 +264,18 @@ impl Node {
         Transaction::new(self.clone())
     }
 
-    /// Apply events to local state buffer and broadcast to subscribed peers.
-    pub async fn commit_events(&self, events: &Vec<RecordEvent>) -> anyhow::Result<()> {
-        println!("node.commit_events");
+    pub async fn commit_events_local(
+        self: &Arc<Self>,
+        events: &Vec<RecordEvent>,
+    ) -> anyhow::Result<()> {
+        // println!("node.commit_events_local");
+        // First apply events locally
         for record_event in events {
             // Apply record events to the Node's global records first.
             let record = self
                 .fetch_record_inner(record_event.id(), record_event.bucket_name())
                 .await?;
+
             record.apply_record_event(record_event)?;
 
             let record_state = record.to_record_state()?;
@@ -95,8 +283,44 @@ impl Node {
             self.bucket(record_event.bucket_name())
                 .set_record(record_event.id(), &record_state)
                 .await?;
+        }
 
-            // TODO: Push the record events to subscribed peers.
+        Ok(())
+    }
+
+    /// Apply events to local state buffer and broadcast to peers.
+    pub async fn commit_events(self: &Arc<Self>, events: &Vec<RecordEvent>) -> anyhow::Result<()> {
+        // println!("node.commit_events");
+
+        self.commit_events_local(events).await?;
+
+        // Then propagate to all peers
+        let mut futures = Vec::new();
+        let peer_ids = {
+            self.peer_connections
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(peer_id, _)| peer_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // LEFT OFF HERE - can't hold this across an await
+        // Send commit request to all peers
+        for peer_id in peer_ids {
+            futures.push(self.request(
+                peer_id.clone(),
+                NodeRequestBody::CommitEvents(events.to_vec()),
+            ));
+        }
+
+        // // Wait for all peers to confirm
+        for future in futures {
+            match future.await {
+                Ok(NodeResponseBody::CommitComplete(result)) => result?,
+                Ok(_) => return Err(anyhow::anyhow!("Unexpected response type")),
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(())
@@ -115,7 +339,7 @@ impl Node {
     /// Add record to the node's list of records, if this returns false, then the erased record was already present.
     #[must_use]
     pub(crate) fn add_record(&self, record: &Arc<RecordInner>) -> bool {
-        println!("node.add_record");
+        // println!("node.add_record");
         // Assuming that we should propagate panics to the whole program.
         let mut records = self.records.write().unwrap();
 
@@ -157,11 +381,11 @@ impl Node {
     ) -> Result<RecordInner, RetrievalError> {
         match self.get_record_state(id, bucket_name).await {
             Ok(record_state) => {
-                println!("fetched record state: {:?}", record_state);
+                // println!("fetched record state: {:?}", record_state);
                 RecordInner::from_record_state(id, bucket_name, &record_state)
             }
             Err(RetrievalError::NotFound(id)) => {
-                println!("ID not found, creating new record");
+                // println!("ID not found, creating new record");
                 Ok(RecordInner::new(id, bucket_name))
             }
             Err(err) => Err(err),
@@ -174,7 +398,7 @@ impl Node {
         id: ID,
         bucket_name: &'static str,
     ) -> Result<Arc<RecordInner>, RetrievalError> {
-        println!("fetch_record {:?}-{:?}", id, bucket_name);
+        // println!("fetch_record {:?}-{:?}", id, bucket_name);
         if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
             println!("passing ref to existing record");
             return Ok(local);
@@ -235,7 +459,16 @@ impl Node {
     }
 }
 
-pub struct PeerConnection {
-    #[allow(unused)]
-    channel: mpsc::Sender<Operation>,
+impl PeerConnection {
+    async fn send_message(&self, message: PeerMessage) -> anyhow::Result<()> {
+        match self {
+            PeerConnection::Local(sender) => {
+                sender
+                    .send(message)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Failed to send message"))?;
+                Ok(())
+            }
+        }
+    }
 }
