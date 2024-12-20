@@ -107,9 +107,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         }
 
         impl #record_name {
-            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<#scoped_record_name<'rec>, ankurah_core::error::RetrievalError> {
+            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<#scoped_record_name<'rec>, ankurah_core::error::RetrievalError> {
                 use ankurah_core::model::Record;
-                trx.edit::<#name>(self.id())
+                trx.edit::<#name>(self.id()).await
             }
 
             #(

@@ -11,16 +11,17 @@ use crate::{
 };
 
 use ankql::selection::filter::evaluate_predicate;
-use postgres::{error::SqlState, types::ToSql};
-use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
+use async_trait::async_trait;
+use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
+use tokio_postgres::{error::SqlState, types::ToSql};
 
 pub struct Postgres {
     // TODO: the rest of the owl
-    pool: r2d2::Pool<PostgresConnectionManager<NoTls>>,
+    pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
 }
 
 impl Postgres {
-    pub fn new(pool: r2d2::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> {
+    pub fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> {
         Ok(Self { pool: pool })
     }
 
@@ -39,6 +40,8 @@ impl Postgres {
         true
     }
 }
+
+#[async_trait]
 impl StorageEngine for Postgres {
     fn bucket(&self, name: &str) -> anyhow::Result<std::sync::Arc<dyn StorageBucket>> {
         if !Postgres::sane_name(name) {
@@ -53,7 +56,7 @@ impl StorageEngine for Postgres {
         }))
     }
 
-    fn fetch_states(
+    async fn fetch_states(
         &self,
         bucket_name: &'static str,
         predicate: &ankql::ast::Predicate,
@@ -64,14 +67,14 @@ impl StorageEngine for Postgres {
             ));
         }
 
-        let mut client = self.pool.get()?;
+        let mut client = self.pool.get().await?;
         let mut results = Vec::new();
 
         // For now, fetch all records and filter in memory
         // TODO: Convert predicate to SQL WHERE clause for better performance
         let query = format!(r#"SELECT "id", "state_buffer" FROM "{}""#, bucket_name);
 
-        let rows = match client.query(&query, &[]) {
+        let rows = match client.query(&query, &[]).await {
             Ok(rows) => rows,
             Err(err) => {
                 let kind = error_kind(&err);
@@ -110,12 +113,12 @@ impl StorageEngine for Postgres {
 }
 
 pub struct PostgresBucket {
-    pool: r2d2::Pool<PostgresConnectionManager<NoTls>>,
+    pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
     bucket_name: String,
 }
 
 impl PostgresBucket {
-    pub fn create_table(&self, client: &mut postgres::Client) -> anyhow::Result<()> {
+    pub async fn create_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
         // Create the table
         let create_query = format!(
             r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA)"#,
@@ -123,13 +126,13 @@ impl PostgresBucket {
         );
 
         eprintln!("Running: {}", create_query);
-        client.execute(&create_query, &[])?;
+        client.execute(&create_query, &[]).await?;
         Ok(())
     }
 
-    pub fn add_missing_columns(
+    pub async fn add_missing_columns(
         &self,
-        client: &mut postgres::Client,
+        client: &mut tokio_postgres::Client,
         missing: Vec<(String, &'static str)>, // column name, datatype
     ) -> anyhow::Result<()> {
         for (column, datatype) in missing {
@@ -139,7 +142,7 @@ impl PostgresBucket {
                     self.bucket_name, column, datatype,
                 );
                 eprintln!("Running: {}", alter_query);
-                client.execute(&alter_query, &[])?;
+                client.execute(&alter_query, &[]).await?;
             }
         }
 
@@ -163,8 +166,9 @@ impl PostgresParams {
     }
 }
 
+#[async_trait]
 impl StorageBucket for PostgresBucket {
-    fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
         // TODO: Create/Alter table
         let state_buffers = bincode::serialize(&state.state_buffers)?;
         let uuid: uuid::Uuid = id.0.into();
@@ -246,17 +250,17 @@ impl StorageBucket for PostgresBucket {
             self.bucket_name, columns_str, values_str, columns_update_str
         );
 
-        let mut client = self.pool.get()?;
+        let mut client = self.pool.get().await?;
         eprintln!("Running: {}", query);
-        let rows_affected = match client.execute(&query, params.as_slice()) {
+        let rows_affected = match client.execute(&query, params.as_slice()).await {
             Ok(rows_affected) => rows_affected,
             Err(err) => {
                 let kind = error_kind(&err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
                         if table == self.bucket_name {
-                            self.create_table(&mut *client)?;
-                            return self.set_record(id, state); // retry
+                            self.create_table(&mut *client).await?;
+                            return self.set_record(id, state).await; // retry
                         }
                     }
                     ErrorKind::UndefinedColumn { table, column } => {
@@ -273,8 +277,9 @@ impl StorageBucket for PostgresBucket {
                                 self.add_missing_columns(
                                     &mut client,
                                     vec![(column, param.postgres_type())],
-                                )?;
-                                return self.set_record(id, state); // retry
+                                )
+                                .await?;
+                                return self.set_record(id, state).await; // retry
                             } else {
                                 eprintln!("column '{}' not found in materialized", column);
                             }
@@ -291,7 +296,7 @@ impl StorageBucket for PostgresBucket {
         Ok(())
     }
 
-    fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError> {
+    async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError> {
         let uuid: uuid::Uuid = id.0.into();
 
         // be careful with sql injection via bucket name
@@ -300,7 +305,7 @@ impl StorageBucket for PostgresBucket {
             self.bucket_name
         );
 
-        let mut client = match self.pool.get() {
+        let mut client = match self.pool.get().await {
             Ok(client) => client,
             Err(err) => {
                 return Err(RetrievalError::StorageError(err.into()));
@@ -308,7 +313,7 @@ impl StorageBucket for PostgresBucket {
         };
 
         eprintln!("Running: {}", query);
-        let row = match client.query_one(&query, &[&uuid]) {
+        let row = match client.query_one(&query, &[&uuid]).await {
             Ok(row) => row,
             Err(err) => {
                 let kind = error_kind(&err);
@@ -319,6 +324,7 @@ impl StorageBucket for PostgresBucket {
                     ErrorKind::UndefinedTable { table } => {
                         if self.bucket_name == table {
                             self.create_table(&mut client)
+                                .await
                                 .map_err(|e| RetrievalError::StorageError(e.into()))?;
                             return Err(RetrievalError::NotFound(id));
                         }
@@ -354,7 +360,7 @@ pub enum ErrorKind {
     Unknown,
 }
 
-pub fn error_kind(err: &postgres::Error) -> ErrorKind {
+pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
     let string = err.to_string().trim().to_owned();
     let _db_error = err.as_db_error();
     let sql_code = err.code().cloned();

@@ -1,8 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    error::RetrievalError,
     model::{Record, ID},
     property::Backends,
 };
@@ -14,28 +16,30 @@ pub mod sled;
 pub use postgres::Postgres;
 pub use sled::SledStorageEngine;
 
+#[async_trait]
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
     fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>>;
 
     // Fetch raw record states matching a predicate
-    fn fetch_states(
+    async fn fetch_states(
         &self,
         bucket_name: &'static str,
         predicate: &ankql::ast::Predicate,
     ) -> anyhow::Result<Vec<(ID, RecordState)>>;
 }
 
+#[async_trait]
 pub trait StorageBucket: Send + Sync {
-    fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()>;
-    fn set_records(&self, records: Vec<(ID, &RecordState)>) -> anyhow::Result<()> {
-        for (id, state) in records {
-            self.set_record(id, state)?;
-        }
+    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()>;
+    async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError>;
 
+    async fn set_records(&self, records: Vec<(ID, &RecordState)>) -> anyhow::Result<()> {
+        for (id, state) in records {
+            self.set_record(id, state).await?;
+        }
         Ok(())
     }
-    fn get_record(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError>;
 
     // TODO:
     // fn add_record_event(&self, record_event: &RecordEvent) -> anyhow::Result<()>;

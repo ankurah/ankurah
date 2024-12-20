@@ -1,34 +1,31 @@
 #![cfg(feature = "postgres")]
 
-use anyhow::Result;
-// use postgres::NoTls;
 use ankurah_core::storage::Postgres;
-use r2d2_postgres::PostgresConnectionManager;
-use std::sync::Arc;
-use testcontainers::Container;
-use testcontainers_modules::{postgres, testcontainers::runners::SyncRunner};
+use anyhow::Result;
+use bb8_postgres::PostgresConnectionManager;
+use testcontainers::ContainerAsync;
+use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
-pub fn create_postgres_container() -> Result<(
-    Container<postgres::Postgres>,
+pub async fn create_postgres_container() -> Result<(
+    ContainerAsync<postgres::Postgres>,
     ankurah_core::storage::Postgres,
 )> {
-    let container: Container<postgres::Postgres> = postgres::Postgres::default()
+    let container: ContainerAsync<postgres::Postgres> = postgres::Postgres::default()
         .with_db_name("ankurah")
         .with_user("postgres")
         .with_password("postgres")
         .with_init_sql(include_str!("pg_init.sql").to_string().into_bytes())
         .start()
+        .await
         .unwrap();
 
-    let host = container.get_host()?;
-    let port = container.get_host_port_ipv4(5432)?;
-    let manager = PostgresConnectionManager::new(
-        format!("host={host} port={port} user=postgres password=postgres dbname=ankurah")
-            .parse()
-            .unwrap(),
-        ::postgres::NoTls,
-    );
-    let pool = r2d2::Pool::new(manager).unwrap();
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let manager = PostgresConnectionManager::new_from_stringlike(
+        format!("host={host} port={port} user=postgres password=postgres dbname=ankurah"),
+        tokio_postgres::NoTls,
+    )?;
+    let pool = bb8::Pool::builder().build(manager).await?;
 
     let storage_engine = Postgres::new(pool)?;
 
