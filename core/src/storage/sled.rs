@@ -8,7 +8,9 @@ use crate::{
 };
 
 use ankql::selection::filter::evaluate_predicate;
+use async_trait::async_trait;
 use sled::{Config, Db};
+use tokio::task;
 
 pub struct SledStorageEngine {
     pub db: Db,
@@ -50,13 +52,14 @@ pub struct SledStorageBucket {
     pub tree: sled::Tree,
 }
 
+#[async_trait]
 impl StorageEngine for SledStorageEngine {
     fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>> {
         let tree = self.db.open_tree(name)?;
         Ok(Arc::new(SledStorageBucket { tree }))
     }
 
-    fn fetch_states(
+    async fn fetch_states(
         &self,
         bucket_name: &'static str,
         predicate: &ankql::ast::Predicate,
@@ -64,63 +67,78 @@ impl StorageEngine for SledStorageEngine {
         let tree = self.db.open_tree(bucket_name)?;
         let bucket = SledStorageBucket { tree };
 
-        let mut results = Vec::new();
-        let mut seen_ids = HashSet::new();
-        println!("SledStorageEngine: Starting fetch_states scan");
+        let predicate = predicate.clone();
 
-        // For now, do a full table scan
-        for item in bucket.tree.iter() {
-            let (key_bytes, value_bytes) = item?;
-            let id = ID(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into()?));
+        // Use spawn_blocking for the full scan operation
+        task::spawn_blocking(move || -> anyhow::Result<Vec<(ID, RecordState)>> {
+            let mut results = Vec::new();
+            let mut seen_ids = HashSet::new();
+            println!("SledStorageEngine: Starting fetch_states scan");
 
-            // Skip if we've already seen this ID
-            if seen_ids.contains(&id) {
-                println!(
-                    "SledStorageEngine: Skipping duplicate record with ID: {:?}",
-                    id
-                );
-                continue;
+            // For now, do a full table scan
+            for item in bucket.tree.iter() {
+                let (key_bytes, value_bytes) = item?;
+                let id = ID(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into()?));
+
+                // Skip if we've already seen this ID
+                if seen_ids.contains(&id) {
+                    println!(
+                        "SledStorageEngine: Skipping duplicate record with ID: {:?}",
+                        id
+                    );
+                    continue;
+                }
+
+                let record_state: RecordState = bincode::deserialize(&value_bytes)?;
+
+                // Create record to evaluate predicate
+                let record_inner = RecordInner::from_record_state(id, bucket_name, &record_state)?;
+
+                // Apply predicate filter
+                if evaluate_predicate(&record_inner, &predicate)? {
+                    println!("SledStorageEngine: Found matching record with ID: {:?}", id);
+                    seen_ids.insert(id);
+                    results.push((id, record_state));
+                }
             }
 
-            let record_state: RecordState = bincode::deserialize(&value_bytes)?;
-
-            // Create record to evaluate predicate
-            let record_inner = RecordInner::from_record_state(id, bucket_name, &record_state)?;
-
-            // Apply predicate filter
-            if evaluate_predicate(&record_inner, predicate)? {
-                println!("SledStorageEngine: Found matching record with ID: {:?}", id);
-                seen_ids.insert(id);
-                results.push((id, record_state));
-            }
-        }
-
-        println!(
-            "SledStorageEngine: Finished fetch_states scan, found {} matches",
-            results.len()
-        );
-        Ok(results)
+            println!(
+                "SledStorageEngine: Finished fetch_states scan, found {} matches",
+                results.len()
+            );
+            Ok(results)
+        })
+        .await?
     }
 }
 
-impl SledStorageBucket {
-    pub fn new(tree: sled::Tree) -> Self {
-        Self { tree }
-    }
-}
-
+#[async_trait]
 impl StorageBucket for SledStorageBucket {
-    fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+        let tree = self.tree.clone();
         let binary_state = bincode::serialize(state)?;
-        self.tree.insert(id.0.to_bytes(), binary_state)?;
-        Ok(())
+        let id_bytes = id.0.to_bytes();
+
+        // Use spawn_blocking since sled operations are not async
+        task::spawn_blocking(move || -> anyhow::Result<()> {
+            tree.insert(id_bytes, binary_state)?;
+            Ok(())
+        })
+        .await?
     }
-    fn get_record(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
-        match self
-            .tree
-            .get(id.0.to_bytes())
-            .map_err(|e| crate::error::RetrievalError::StorageError(Box::new(e)))?
-        {
+
+    async fn get_record(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
+        let tree = self.tree.clone();
+        let id_bytes = id.0.to_bytes();
+
+        // Use spawn_blocking since sled operations are not async
+        let result = task::spawn_blocking(move || -> Result<Option<sled::IVec>, sled::Error> {
+            tree.get(id_bytes)
+        })
+        .await
+        .map_err(|e| crate::error::RetrievalError::StorageError(Box::new(e)))?;
+
+        match result? {
             Some(ivec) => {
                 let record_state = bincode::deserialize(&ivec)?;
                 Ok(record_state)

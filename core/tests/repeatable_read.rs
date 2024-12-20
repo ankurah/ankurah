@@ -19,39 +19,41 @@ pub struct Album {
     pub name: String,
 }
 
-#[test]
-fn repeatable_read() -> Result<()> {
+#[tokio::test]
+async fn repeatable_read() -> Result<()> {
     let client = Arc::new(Node::new(Box::new(SledStorageEngine::new().unwrap())));
 
     let id;
     {
         let trx = client.begin();
-        let album_rw = trx.create(&Album {
-            name: "I love cats".into(),
-        });
+        let album_rw = trx
+            .create(&Album {
+                name: "I love cats".into(),
+            })
+            .await;
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
 
         println!("{:?}", album_rw.record_state());
 
-        trx.commit()?;
+        trx.commit().await?;
     }
 
     println!("_____________");
     println!("REFETCHING");
     println!("_____________");
     // TODO: implement ScopedRecord.read() -> Record
-    let album_ro: AlbumRecord = client.get_record(id).unwrap();
+    let album_ro: AlbumRecord = client.get_record(id).await?;
 
     println!("_____________");
     println!("name: {:?}", album_ro.name());
     println!("_____________");
 
     let trx2 = client.begin();
-    let album_rw2 = album_ro.edit(&trx2)?;
+    let album_rw2 = album_ro.edit(&trx2).await?;
 
     let trx3 = client.begin();
-    let album_rw3 = album_ro.edit(&trx3)?;
+    let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu
     album_rw2.name().delete(7, 4);
@@ -66,12 +68,12 @@ fn repeatable_read() -> Result<()> {
 
     // trx2 and 3 are uncommited, so the value should not be updated
     assert_eq!(album_ro.name(), "I love cats");
-    trx2.commit()?;
+    trx2.commit().await?;
 
     // FAIL - the value must be updated now
     assert_eq!(album_ro.name(), "I love tofu");
 
-    trx3.commit()?;
+    trx3.commit().await?;
 
     // FAIL - the value must be updated now
     assert_eq!(album_ro.name(), "I devour tofu");
@@ -83,30 +85,32 @@ fn repeatable_read() -> Result<()> {
 mod pg_common;
 
 #[cfg(feature = "postgres")]
-#[test]
-fn pg_repeatable_read() -> Result<()> {
-    let (_container, postgres) = pg_common::create_postgres_container()?;
+#[tokio::test]
+async fn pg_repeatable_read() -> Result<()> {
+    let (_container, postgres) = pg_common::create_postgres_container().await?;
     let client = Arc::new(Node::new(Box::new(postgres)));
 
     let id;
     {
         let trx = client.begin();
-        let album_rw = trx.create(&Album {
-            name: "I love cats".into(),
-        });
+        let album_rw = trx
+            .create(&Album {
+                name: "I love cats".into(),
+            })
+            .await;
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
-        trx.commit()?;
+        trx.commit().await?;
     }
 
     // TODO: implement ScopedRecord.read() -> Record
-    let album_ro: AlbumRecord = client.get_record(id).unwrap();
+    let album_ro: AlbumRecord = client.get_record(id).await?;
 
     let trx2 = client.begin();
-    let album_rw2 = album_ro.edit(&trx2)?;
+    let album_rw2 = album_ro.edit(&trx2).await?;
 
     let trx3 = client.begin();
-    let album_rw3 = album_ro.edit(&trx3)?;
+    let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu
     album_rw2.name().delete(7, 4);
@@ -121,12 +125,12 @@ fn pg_repeatable_read() -> Result<()> {
 
     // trx2 and 3 are uncommited, so the value should not be updated
     assert_eq!(album_ro.name(), "I love cats");
-    trx2.commit()?;
+    trx2.commit().await?;
 
     // FAIL - the value must be updated now
     assert_eq!(album_ro.name(), "I love tofu");
 
-    trx3.commit()?;
+    trx3.commit().await?;
 
     // FAIL - the value must be updated now
     assert_eq!(album_ro.name(), "I devour tofu");

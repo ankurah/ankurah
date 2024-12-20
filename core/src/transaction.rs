@@ -43,7 +43,7 @@ impl Transaction {
     }
 
     /// Fetch a record.
-    pub fn fetch_record(
+    pub async fn fetch_record(
         &self,
         id: ID,
         bucket_name: &'static str,
@@ -52,7 +52,7 @@ impl Transaction {
             return Ok(local);
         }
 
-        let record_inner = self.node.fetch_record_inner(id, bucket_name)?;
+        let record_inner = self.node.fetch_record_inner(id, bucket_name).await?;
         let record_ref = self.add_record(record_inner.snapshot());
         Ok(record_ref)
     }
@@ -62,30 +62,33 @@ impl Transaction {
         &self.records[index]
     }
 
-    pub fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::ScopedRecord<'rec> {
+    pub async fn create<'rec, 'trx: 'rec, M: Model>(
+        &'trx self,
+        model: &M,
+    ) -> M::ScopedRecord<'rec> {
         let id = self.node.next_id();
         let record_inner = model.to_record_inner(id);
         let record_ref = self.add_record(record_inner);
         <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref)
     }
 
-    pub fn edit<'rec, 'trx: 'rec, M: Model>(
+    pub async fn edit<'rec, 'trx: 'rec, M: Model>(
         &'trx self,
         id: impl Into<ID>,
     ) -> Result<M::ScopedRecord<'rec>, crate::error::RetrievalError> {
         let id = id.into();
-        let record_ref = self.fetch_record(id, M::bucket_name())?;
+        let record_ref = self.fetch_record(id, M::bucket_name()).await?;
         Ok(<M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref))
     }
 
     #[must_use]
-    pub fn commit(mut self) -> anyhow::Result<()> {
-        self.commit_mut_ref()
+    pub async fn commit(mut self) -> anyhow::Result<()> {
+        self.commit_mut_ref().await
     }
 
     #[must_use]
     // only because Drop is &mut self not mut self
-    pub(crate) fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
         println!("trx.commit_mut_ref");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
@@ -98,7 +101,7 @@ impl Transaction {
 
         println!("record_events: {:?}", record_events);
 
-        self.node.commit_events(&record_events)
+        self.node.commit_events(&record_events).await
     }
 
     pub fn rollback(mut self) {
@@ -109,7 +112,10 @@ impl Transaction {
 impl Drop for Transaction {
     fn drop(&mut self) {
         if self.implicit && !self.consumed {
-            match self.commit_mut_ref() {
+            // Since we can't make drop async, we'll need to block on the commit
+            // This is not ideal, but necessary for the implicit transaction case
+            // TODO: Make this a rollback, which will also mean we don't need use block_on
+            match tokio::runtime::Handle::current().block_on(self.commit_mut_ref()) {
                 Ok(()) => {}
                 // Probably shouldn't panic here, but for testing purposes whatever.
                 Err(err) => panic!("Failed to commit: {:?}", err),

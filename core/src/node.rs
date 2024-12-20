@@ -81,17 +81,20 @@ impl Node {
     }
 
     /// Apply events to local state buffer and broadcast to subscribed peers.
-    pub fn commit_events(&self, events: &Vec<RecordEvent>) -> anyhow::Result<()> {
+    pub async fn commit_events(&self, events: &Vec<RecordEvent>) -> anyhow::Result<()> {
         println!("node.commit_events");
         for record_event in events {
             // Apply record events to the Node's global records first.
-            let record = self.fetch_record_inner(record_event.id(), record_event.bucket_name())?;
+            let record = self
+                .fetch_record_inner(record_event.id(), record_event.bucket_name())
+                .await?;
             record.apply_record_event(record_event)?;
 
             let record_state = record.to_record_state()?;
             // Push the state buffers to storage.
             self.bucket(record_event.bucket_name())
-                .set_record(record_event.id(), &record_state)?;
+                .set_record(record_event.id(), &record_state)
+                .await?;
 
             // TODO: Push the record events to subscribed peers.
         }
@@ -99,13 +102,13 @@ impl Node {
         Ok(())
     }
 
-    pub fn get_record_state(
+    pub async fn get_record_state(
         &self,
         id: ID,
         bucket_name: &'static str,
     ) -> Result<RecordState, RetrievalError> {
         let raw_bucket = self.bucket(bucket_name);
-        raw_bucket.0.get_record(id)
+        raw_bucket.0.get_record(id).await
     }
 
     // ----  Node record management ----
@@ -147,12 +150,12 @@ impl Node {
     }
 
     /// Grab the record state if it exists and create a new [`RecordInner`] based on that.
-    pub(crate) fn fetch_record_from_storage(
+    pub(crate) async fn fetch_record_from_storage(
         &self,
         id: ID,
         bucket_name: &'static str,
     ) -> Result<RecordInner, RetrievalError> {
-        match self.get_record_state(id, bucket_name) {
+        match self.get_record_state(id, bucket_name).await {
             Ok(record_state) => {
                 println!("fetched record state: {:?}", record_state);
                 RecordInner::from_record_state(id, bucket_name, &record_state)
@@ -166,7 +169,7 @@ impl Node {
     }
 
     /// Fetch a record.
-    pub fn fetch_record_inner(
+    pub async fn fetch_record_inner(
         &self,
         id: ID,
         bucket_name: &'static str,
@@ -177,7 +180,7 @@ impl Node {
             return Ok(local);
         }
 
-        let scoped_record = self.fetch_record_from_storage(id, bucket_name)?;
+        let scoped_record = self.fetch_record_from_storage(id, bucket_name).await?;
         let ref_record = Arc::new(scoped_record);
         let already_present = self.add_record(&ref_record);
         if already_present {
@@ -185,20 +188,22 @@ impl Node {
             // at the same time and the other fetch added the record first.
             // So try this function again.
             // TODO: lock only once to prevent this?
-            return self.fetch_record_inner(id, bucket_name);
+            if let Some(local) = self.fetch_record_from_node(id, bucket_name) {
+                return Ok(local);
+            }
         }
 
         Ok(ref_record)
     }
 
-    pub fn get_record<R: Record>(&self, id: ID) -> Result<R, RetrievalError> {
+    pub async fn get_record<R: Record>(&self, id: ID) -> Result<R, RetrievalError> {
         use crate::model::Model;
         let collection_name = R::Model::bucket_name();
-        let record_inner = self.fetch_record_inner(id, collection_name)?;
+        let record_inner = self.fetch_record_inner(id, collection_name).await?;
         Ok(R::from_record_inner(record_inner))
     }
 
-    pub fn fetch<R: Record>(&self, predicate_str: &str) -> anyhow::Result<ResultSet<R>> {
+    pub async fn fetch<R: Record>(&self, predicate_str: &str) -> anyhow::Result<ResultSet<R>> {
         use crate::model::Model;
         let collection_name = R::Model::bucket_name();
 
@@ -209,7 +214,8 @@ impl Node {
         // Fetch raw states from storage
         let states = self
             .storage_engine
-            .fetch_states(collection_name, &predicate)?;
+            .fetch_states(collection_name, &predicate)
+            .await?;
 
         // Convert states to records
         let records = states

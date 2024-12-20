@@ -19,4 +19,10 @@ impl From<bincode::Error> for RetrievalError {
     }
 }
 
+impl From<sled::Error> for RetrievalError {
+    fn from(err: sled::Error) -> Self {
+        RetrievalError::StorageError(Box::new(err))
+    }
+}
+
 //impl std::error::Error for RetrievalError {}

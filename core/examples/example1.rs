@@ -97,9 +97,11 @@ async fn main() -> Result<()> {
         // *
 
         let trx = client.begin();
-        let album = trx.create(&Album {
-            name: "The Dark Sid of the Moon".into(),
-        });
+        let album = trx
+            .create(&Album {
+                name: "The Dark Sid of the Moon".into(),
+            })
+            .await;
 
         info!("Album created: {:?}", album);
 
@@ -117,13 +119,13 @@ async fn main() -> Result<()> {
         );
 
         let album_id = album.id();
-        let from_scoped_album = trx.edit::<Album>(&album).unwrap();
-        let from_id = trx.edit::<Album>(album_id).unwrap();
+        let from_scoped_album = trx.edit::<Album>(&album).await?;
+        let from_id = trx.edit::<Album>(album_id).await?;
 
-        trx.commit().unwrap();
+        trx.commit().await?;
 
         let trx = client.begin();
-        let album = trx.edit::<Album>(album_id).unwrap();
+        let album = trx.edit::<Album>(album_id).await?;
         println!("{:?}", album.name().value());
         //let album = album.record_inner();
         trx.rollback();
