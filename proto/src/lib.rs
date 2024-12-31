@@ -1,11 +1,11 @@
 pub mod human_id;
 pub mod message;
-pub mod record;
+// pub mod record;
 pub mod record_id;
 
 pub use human_id::*;
 pub use message::*;
-pub use record::*;
+// pub use record::*;
 pub use record_id::ID;
 
 use serde::{Deserialize, Serialize};
