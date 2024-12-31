@@ -1,12 +1,16 @@
+pub mod collation;
+pub mod comparision_index;
 pub mod connector;
 pub mod error;
 pub mod event;
 pub mod model;
 pub mod node;
 pub mod property;
+pub mod reactor;
 pub mod resultset;
 pub mod storage;
 pub mod transaction;
+
 pub use model::Model;
 pub use node::Node;
 

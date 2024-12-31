@@ -68,6 +68,7 @@ dependencies = [
  "bincode",
  "chrono",
  "ctor",
+ "dashmap",
  "dirs",
  "futures",
  "futures-signals",
@@ -95,15 +96,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "ankurah-index"
-version = "0.1.0"
-dependencies = [
- "ankql",
- "anyhow",
- "dashmap",
 ]
 
 [[package]]

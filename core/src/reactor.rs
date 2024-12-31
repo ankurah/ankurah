@@ -20,7 +20,7 @@ impl From<&str> for FieldId {
 pub struct Reactor<S, R>
 where
     R: Record,
-    S: StorageEngine<R>,
+    S: TestStorageEngine<R>,
 {
     /// Current subscriptions
     subscriptions: DashMap<SubscriptionId, Arc<Subscription<R, S::Update>>>,
@@ -36,7 +36,7 @@ where
     storage: Arc<S>,
 }
 
-pub trait StorageEngine<R>
+pub trait TestStorageEngine<R>
 where
     R: Record,
 {
@@ -187,7 +187,7 @@ impl Collatable for Value {
 impl<S, R> Reactor<S, R>
 where
     R: Record,
-    S: StorageEngine<R>,
+    S: TestStorageEngine<R>,
 {
     pub fn new(storage: Arc<S>) -> Arc<Self> {
         Arc::new(Self {
@@ -476,7 +476,7 @@ impl From<usize> for SubscriptionId {
 /// A handle to a subscription that can be used to register callbacks
 pub struct SubscriptionHandle<S, R>
 where
-    S: StorageEngine<R>,
+    S: TestStorageEngine<R>,
     R: Record,
 {
     id: SubscriptionId,
@@ -485,7 +485,7 @@ where
 
 impl<S, R> Drop for SubscriptionHandle<S, R>
 where
-    S: StorageEngine<R>,
+    S: TestStorageEngine<R>,
     R: Record,
 {
     fn drop(&mut self) {
@@ -640,7 +640,7 @@ mod tests {
         }
     }
 
-    impl StorageEngine<ActivePet> for DummyEngine {
+    impl TestStorageEngine<ActivePet> for DummyEngine {
         type Id = usize;
         type Update = PetUpdate;
 
