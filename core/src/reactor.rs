@@ -364,6 +364,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate as ankurah_core;
+    use crate::property::YrsString;
+    use crate::Model;
+
     use super::*;
     use ankql;
     use std::sync::{Arc, Mutex, Weak};
@@ -375,11 +379,13 @@ mod tests {
         Age(i64),
     }
 
-    #[derive(Debug, Clone)]
+    use crate::derive_deps::wasm_bindgen::prelude::wasm_bindgen;
+    #[derive(Debug, Clone, Model)]
     pub struct Pet {
-        id: i64,
-        name: String,
-        age: i64,
+        #[active_value(YrsString)]
+        pub name: String,
+        #[active_value(YrsString)]
+        pub age: String,
     }
 
     #[derive(Clone, Debug)]
@@ -412,7 +418,7 @@ mod tests {
         pub fn set_age(&self, age: i64) {
             {
                 let mut pet = self.model.lock().unwrap();
-                pet.age = age;
+                pet.age = age.to_string();
             }
 
             if let Some(engine) = self.engine.upgrade() {
@@ -425,30 +431,34 @@ mod tests {
         }
     }
 
-    impl Record for ActivePet {
-        type Id = i64;
-        type Model = Pet;
-        fn id(&self) -> Self::Id {
-            self.model.lock().unwrap().id
-        }
+    // impl Record for ActivePet {
+    //     type Id = i64;
+    //     type Model = Pet;
+    //     fn id(&self) -> Self::Id {
+    //         self.model.lock().unwrap().id
+    //     }
 
-        fn value(&self, name: &str) -> Option<Value> {
-            match name {
-                "id" => Some(Value::Integer(self.id())),
-                "name" => Some(Value::String(self.model.lock().unwrap().name.clone())),
-                "age" => Some(Value::Integer(self.model.lock().unwrap().age)),
-                _ => None,
-            }
-        }
-    }
+    //     fn value(&self, name: &str) -> Option<Value> {
+    //         match name {
+    //             "id" => Some(Value::Integer(self.id())),
+    //             "name" => Some(Value::String(self.model.lock().unwrap().name.clone())),
+    //             "age" => Some(Value::Integer(
+    //                 self.model.lock().unwrap().age.parse::<i64>().unwrap(),
+    //             )),
+    //             _ => None,
+    //         }
+    //     }
+    // }
 
     // LEFT OFF HERE - NEXT STEPS:
-    // [ ] implement value<T>(name: &str) -> Option<T> for RecordInner and PropertyBackends such that we can get a typecasted value
-    // [ ] implement Filterable trait for RecordInner
+    // [X] implement value<T>(name: &str) -> Option<T> for RecordInner and PropertyBackends such that we can get a typecasted value
+    //     Filterable is already implemented for RecordInner
+    // [X] implement Filterable trait for RecordInner
     // [ ] Update the reactor code and these tests to operate on Record/RecordInner and make Pet Model with a derived PetRecord
     // [ ] get the tests passing here
     // [ ] integrate reactor into node
     // [ ] adapt the tests here to use node directly (and reactor indirectly)
+    // [ ] proper typecasting of values
     //  * Continue using ComparisonIndex for now in the interest of expedience
     //  * Later we will replace the ComparisonIndex functionality into the storage engine implementations
 
@@ -519,40 +529,38 @@ mod tests {
         }
     }
 
-    impl TestStorageEngine<ActivePet> for DummyEngine {
-        type Id = usize;
-        type Update = PetUpdate;
+    // Use StorageEngine instead
+    // impl TestStorageEngine<ActivePet> for DummyEngine {
+    //     type Id = usize;
+    //     type Update = PetUpdate;
 
-        fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<ActivePet> {
-            use ankql::selection::filter::{FilterIterator, FilterResult};
+    //     fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<ActivePet> {
+    //         use ankql::selection::filter::{FilterIterator, FilterResult};
 
-            let records = self.records.lock().unwrap();
-            FilterIterator::new(records.iter().cloned(), predicate.clone())
-                .filter_map(|result| match result {
-                    FilterResult::Pass(record) => Some(record),
-                    _ => None,
-                })
-                .collect()
-        }
-    }
+    //         let records = self.records.lock().unwrap();
+    //         FilterIterator::new(records.iter().cloned(), predicate.clone())
+    //             .filter_map(|result| match result {
+    //                 FilterResult::Pass(record) => Some(record),
+    //                 _ => None,
+    //             })
+    //             .collect()
+    //     }
+    // }
 
     #[test]
     pub fn test_watch_index() {
         let server = DummyEngine::new(vec![
             Pet {
-                id: 1,
                 name: "Rex".to_string(),
-                age: 1,
+                age: "1".to_string(),
             },
             Pet {
-                id: 2,
                 name: "Snuffy".to_string(),
-                age: 2,
+                age: "2".to_string(),
             },
             Pet {
-                id: 3,
                 name: "Jasper".to_string(),
-                age: 4,
+                age: "4".to_string(),
             },
         ]);
         let reactor = Arc::new(Reactor::new(server.clone()));
@@ -603,19 +611,16 @@ mod tests {
         println!("MARK 1: Creating server");
         let server = DummyEngine::new(vec![
             Pet {
-                id: 1,
                 name: "Rex".to_string(),
-                age: 1,
+                age: "1".to_string(),
             },
             Pet {
-                id: 2,
                 name: "Snuffy".to_string(),
-                age: 2,
+                age: "2".to_string(),
             },
             Pet {
-                id: 3,
                 name: "Jasper".to_string(),
-                age: 6,
+                age: "6".to_string(),
             },
         ]);
         println!("MARK 2: Creating reactor");

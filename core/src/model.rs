@@ -127,6 +127,9 @@ impl Filterable for RecordInner {
         self.bucket_name()
     }
 
+    /// TODO Implement this as a typecasted value. eg value<T> -> Option<Result<T>>
+    /// where None is returned if the property is not found, and Err is returned if the property is found but is not able to be typecasted
+    /// to the requested type. (need to think about the rust type system here more)
     fn value(&self, name: &str) -> Option<String> {
         // Iterate through backends to find one that has this property
         self.backends
