@@ -59,8 +59,8 @@ impl LocalProcessConnection {
             .await;
 
         Ok(Self {
-            receiver1_task: Self::setup_receiver(&node1, node1_rx),
-            receiver2_task: Self::setup_receiver(&node2, node2_rx),
+            receiver1_task: Self::setup_receiver(node1, node1_rx),
+            receiver2_task: Self::setup_receiver(node2, node2_rx),
         })
     }
 

@@ -1,12 +1,10 @@
 use ankurah_proto as proto;
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     sync::{Arc, Weak},
 };
-use tokio::sync::{mpsc, oneshot, RwLock};
-use ulid::Ulid;
+use tokio::sync::{oneshot, RwLock};
 
 use crate::{
     connector::PeerSender,

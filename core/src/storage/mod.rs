@@ -1,9 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::RetrievalError, model::Record, property::Backends};
+use crate::error::RetrievalError;
 use ankurah_proto::{RecordState, ID};
 
 #[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]

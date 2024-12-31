@@ -16,9 +16,9 @@ pub enum ConnectionState {
 
 // TODO make a WasmEnum macro to generate this:
 
-impl Into<ConnectionStateEnum> for ConnectionState {
-    fn into(self) -> ConnectionStateEnum {
-        ConnectionStateEnum(self)
+impl From<ConnectionState> for ConnectionStateEnum {
+    fn from(val: ConnectionState) -> Self {
+        ConnectionStateEnum(val)
     }
 }
 impl std::ops::Deref for ConnectionStateEnum {

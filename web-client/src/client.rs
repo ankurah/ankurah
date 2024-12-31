@@ -1,14 +1,9 @@
-use ankurah_core::connector::{PeerSender, SendError};
 use ankurah_core::Node;
-use ankurah_proto as proto;
 
 use crate::connection_state::*;
-use async_trait::async_trait;
 use gloo_timers::future::sleep;
 use reactive_graph::prelude::*;
-use send_wrapper::SendWrapper;
 use std::cell::RefCell;
-use std::fmt::Display;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +38,7 @@ impl WebsocketClient {
             server_url: server_url.to_string(),
             node,
             connection: RefCell::new(None),
-            state: reactive_graph::signal::RwSignal::new(ConnectionState::None.into()),
+            state: reactive_graph::signal::RwSignal::new(ConnectionState::None),
         });
 
         let current_delay = Rc::new(RefCell::new(0u64));
@@ -167,8 +162,7 @@ impl Inner {
         self.state.set(
             ConnectionState::Connecting {
                 url: self.server_url.clone(),
-            }
-            .into(),
+            },
         );
 
         info!("Connecting to websocket");

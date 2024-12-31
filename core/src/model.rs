@@ -1,7 +1,7 @@
 use ankurah_proto::{RecordEvent, RecordState, ID};
 // use futures_signals::signal::Signal;
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use crate::{error::RetrievalError, property::Backends};
 
