@@ -58,8 +58,7 @@ impl Inner {
                         ConnectionState::Connected {
                             url: self.url.clone(),
                             node_id,
-                        }
-                        .into(),
+                        },
                     );
                 }
                 proto::ServerMessage::PeerMessage(msg) => {
@@ -148,8 +147,7 @@ impl Connection {
                 inner.state.set(
                     ConnectionState::Error {
                         message: "".to_string(),
-                    }
-                    .into(),
+                    },
                 );
             }))
         };
@@ -158,7 +156,7 @@ impl Connection {
             let inner = inner.clone();
             Closure::<dyn FnMut(CloseEvent)>::wrap(Box::new(move |e: CloseEvent| {
                 info!("Connection closed: {}", e.code());
-                inner.state.set(ConnectionState::Closed.into());
+                inner.state.set(ConnectionState::Closed);
             }))
         };
 

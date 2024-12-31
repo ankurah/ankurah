@@ -7,7 +7,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use thiserror::Error;
 
 use crate::storage::Materialized;
 

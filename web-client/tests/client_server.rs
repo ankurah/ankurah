@@ -46,9 +46,9 @@
 // #[cfg(target_arch = "wasm32")]
 mod client {
 
-    use std::sync::Arc;
+    
 
-    use ankurah_web_client::indexeddb::IndexedDBStorageEngine;
+    
     use wasm_bindgen_test::*;
     wasm_bindgen_test_configure!(run_in_browser);
 

@@ -1,10 +1,8 @@
 use std::{panic, sync::Arc};
 
 pub use ankurah_core::Node;
-use ankurah_web_client::ConnectionState;
 pub use ankurah_web_client::{indexeddb::IndexedDBStorageEngine, WebsocketClient};
 use example_model::*;
-use reactive_graph::effect::Effect;
 use tracing::info;
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
@@ -25,7 +23,7 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     let node = Arc::new(Node::new(Box::new(storage_engine)));
     let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797")?;
-    use reactive_graph::prelude::*;
+    
     info!("Waiting for client to connect");
     let state = connector.connection_state();
 

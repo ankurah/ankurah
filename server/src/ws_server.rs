@@ -1,4 +1,4 @@
-use ankurah_core::connector::{PeerSender, SendError};
+use ankurah_core::connector::PeerSender;
 use ankurah_proto as proto;
 use anyhow::Result;
 use axum::extract::{connect_info::ConnectInfo, State};
@@ -73,7 +73,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
 }
 
-async fn handle_socket(mut socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
+async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
     println!("Connected to {}", who);
 
     let (mut sender, mut receiver) = socket.split();

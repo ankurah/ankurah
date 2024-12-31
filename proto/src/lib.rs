@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use ulid::Ulid;
-use wasm_bindgen::prelude::*;
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct NodeId(Ulid);
@@ -26,9 +25,21 @@ impl From<NodeId> for String {
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct RequestId(Ulid);
 
+impl Default for NodeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NodeId {
     pub fn new() -> Self {
         Self(Ulid::new())
+    }
+}
+
+impl Default for RequestId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

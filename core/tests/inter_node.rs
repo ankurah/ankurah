@@ -2,7 +2,7 @@ mod common;
 
 use ankurah_core::connector::local_process::LocalProcessConnection;
 use ankurah_core::storage::SledStorageEngine;
-use ankurah_core::{model::ScopedRecord, node::Node};
+use ankurah_core::node::Node;
 use anyhow::Result;
 
 use common::{Album, AlbumRecord};

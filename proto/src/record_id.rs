@@ -14,6 +14,12 @@ impl From<ID> for Ulid {
     }
 }
 
+impl Default for ID {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ID {
     pub fn new() -> Self {
         ID(Ulid::new())
