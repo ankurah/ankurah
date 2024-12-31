@@ -10,7 +10,7 @@ pub mod reactor;
 pub mod resultset;
 pub mod storage;
 pub mod transaction;
-
+pub mod value;
 pub use model::Model;
 pub use node::Node;
 

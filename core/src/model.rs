@@ -38,7 +38,9 @@ pub trait Record {
     fn from_record_inner(inner: Arc<RecordInner>) -> Self;
 }
 
-// Type erased record for modifying backends without knowing the specifics.
+/// A record inner is a type erased/ dynamic typed record.
+/// This is used to interoperate with the storage engine
+/// TODO: Consider renaming this to Record and renaming trait Record to ActiveRecord or something like that
 #[derive(Debug)]
 pub struct RecordInner {
     pub id: ID,

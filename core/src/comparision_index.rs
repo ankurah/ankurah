@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::{collation::Collatable, reactor::SubscriptionId};
+use crate::{collation::Collatable, reactor::SubscriptionId, value::Value};
 use ankql::ast;
 
 /// An index for a specific field and comparison operator
@@ -125,7 +125,7 @@ impl ComparisonIndex {
 #[cfg(test)]
 mod tests {
     use super::ComparisonIndex;
-    use crate::reactor::{SubscriptionId, Value};
+    use crate::{reactor::SubscriptionId, value::Value};
     use ankql::ast;
 
     #[test]
