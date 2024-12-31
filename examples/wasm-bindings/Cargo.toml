@@ -6,15 +6,18 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-
 [dependencies]
-example-model = { path = "../model" }
+ankurah-core = { path = "../../core" }
 ankurah-web-client = { path = "../../web-client", features = ["react"] }
+example-model = { path = "../model" }
 wasm-bindgen = "0.2.84"
 wasm-bindgen-futures = "0.4.42"
 wasm-logger = "0.2.0"
+tracing = "0.1.40"
+tracing-wasm = "0.2.1"
 console_error_panic_hook = "0.1.7"
 any_spawner = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", version = "0.2.0", features = ["wasm-bindgen"] }
+reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = ["effects"] }
 
 [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
 dwarf-debug-info = true

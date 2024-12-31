@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{atomic::AtomicUsize, Arc, Mutex},
 };
 
 use ankql::selection::filter::FilterIterator;
@@ -127,7 +127,6 @@ impl TestServer {
         self.reactor.subscribe(&predicate, callback).unwrap()
     }
 
-    // LEFT OFF HERE
     /// Inserts a new record and notifies relevant subscribers
     pub fn insert(&mut self, record: TestModel) -> usize {
         let id = self

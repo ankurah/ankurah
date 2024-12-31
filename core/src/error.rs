@@ -1,4 +1,4 @@
-use crate::model::ID;
+use ankurah_proto::ID;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -18,11 +18,3 @@ impl From<bincode::Error> for RetrievalError {
         RetrievalError::DeserializationError(e)
     }
 }
-
-impl From<sled::Error> for RetrievalError {
-    fn from(err: sled::Error) -> Self {
-        RetrievalError::StorageError(Box::new(err))
-    }
-}
-
-//impl std::error::Error for RetrievalError {}

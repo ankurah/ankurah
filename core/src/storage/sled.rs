@@ -1,14 +1,17 @@
+use ankurah_proto::{RecordState, ID};
+use anyhow::Result;
+use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    model::{RecordInner, ID},
-    storage::{RecordState, StorageBucket, StorageEngine},
+    error::RetrievalError,
+    model::RecordInner,
+    storage::{StorageBucket, StorageEngine},
 };
 
 use ankql::selection::filter::evaluate_predicate;
-use async_trait::async_trait;
 use sled::{Config, Db};
 use tokio::task;
 
@@ -54,17 +57,18 @@ pub struct SledStorageBucket {
 
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
-    fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>> {
+    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>> {
+        // could this block for any meaningful period of time? We might consider spawn_blocking
         let tree = self.db.open_tree(name)?;
         Ok(Arc::new(SledStorageBucket { tree }))
     }
 
     async fn fetch_states(
         &self,
-        bucket_name: &'static str,
+        bucket_name: String,
         predicate: &ankql::ast::Predicate,
     ) -> anyhow::Result<Vec<(ID, RecordState)>> {
-        let tree = self.db.open_tree(bucket_name)?;
+        let tree = self.db.open_tree(&bucket_name)?;
         let bucket = SledStorageBucket { tree };
 
         let predicate = predicate.clone();
@@ -78,7 +82,7 @@ impl StorageEngine for SledStorageEngine {
             // For now, do a full table scan
             for item in bucket.tree.iter() {
                 let (key_bytes, value_bytes) = item?;
-                let id = ID(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into()?));
+                let id = ID::from_ulid(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into()?));
 
                 // Skip if we've already seen this ID
                 if seen_ids.contains(&id) {
@@ -92,7 +96,7 @@ impl StorageEngine for SledStorageEngine {
                 let record_state: RecordState = bincode::deserialize(&value_bytes)?;
 
                 // Create record to evaluate predicate
-                let record_inner = RecordInner::from_record_state(id, bucket_name, &record_state)?;
+                let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
 
                 // Apply predicate filter
                 if evaluate_predicate(&record_inner, &predicate)? {
@@ -117,7 +121,7 @@ impl StorageBucket for SledStorageBucket {
     async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
         let tree = self.tree.clone();
         let binary_state = bincode::serialize(state)?;
-        let id_bytes = id.0.to_bytes();
+        let id_bytes = id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -127,23 +131,29 @@ impl StorageBucket for SledStorageBucket {
         .await?
     }
 
-    async fn get_record(&self, id: ID) -> Result<RecordState, crate::error::RetrievalError> {
+    async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError> {
         let tree = self.tree.clone();
-        let id_bytes = id.0.to_bytes();
+        let id_bytes = id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         let result = task::spawn_blocking(move || -> Result<Option<sled::IVec>, sled::Error> {
             tree.get(id_bytes)
         })
         .await
-        .map_err(|e| crate::error::RetrievalError::StorageError(Box::new(e)))?;
+        .map_err(|e| RetrievalError::StorageError(Box::new(e)))?;
 
         match result? {
             Some(ivec) => {
                 let record_state = bincode::deserialize(&ivec)?;
                 Ok(record_state)
             }
-            None => Err(crate::error::RetrievalError::NotFound(id)),
+            None => Err(RetrievalError::NotFound(id)),
         }
+    }
+}
+
+impl From<sled::Error> for RetrievalError {
+    fn from(err: sled::Error) -> Self {
+        RetrievalError::StorageError(Box::new(err))
     }
 }

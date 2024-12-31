@@ -7,4 +7,6 @@ edition = "2021"
 console_error_panic_hook = "0.1.7"
 leptos = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = ["csr", "nightly"] }
 ankurah-web-client = { path = "../../web-client" }
+ankurah-core = { path = "../../core" }
 example-model = { path = "../model" }
+send_wrapper = "0.6.0"

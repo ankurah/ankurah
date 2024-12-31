@@ -1,25 +1,23 @@
+use ankurah_proto::{Operation, RecordState};
+use anyhow::Result;
+use std::any::Any;
+use std::fmt::Debug;
 use std::{
-    any::Any,
-    collections::{btree_map::Entry, BTreeMap},
-    fmt::Debug,
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
+
+use thiserror::Error;
+
+use crate::storage::Materialized;
 
 pub mod lww;
 pub mod pn_counter;
 pub mod yrs;
+use crate::error::RetrievalError;
 pub use lww::LWWBackend;
 pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
-
-use crate::{
-    error::RetrievalError,
-    storage::{Materialized, RecordState},
-    ID,
-};
-
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
 
 use super::PropertyName;
 
@@ -70,68 +68,29 @@ pub enum BackendDowncasted {
     Unknown(Arc<dyn Any>),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RecordEvent {
-    pub id: ID,
-    pub bucket_name: &'static str,
-    pub operations: BTreeMap<String, Vec<Operation>>,
-}
+// impl RecordEvent {
+//     pub fn push(&mut self, property_backend: &'static str, operation: Operation) {
+//         match self.operations.entry(property_backend.to_owned()) {
+//             Entry::Occupied(mut entry) => {
+//                 entry.get_mut().push(operation);
+//             }
+//             Entry::Vacant(entry) => {
+//                 entry.insert(vec![operation]);
+//             }
+//         }
+//     }
 
-impl RecordEvent {
-    pub fn new(id: ID, bucket_name: &'static str) -> Self {
-        Self {
-            id,
-            bucket_name,
-            operations: BTreeMap::default(),
-        }
-    }
-
-    pub fn id(&self) -> ID {
-        self.id
-    }
-
-    pub fn bucket_name(&self) -> &'static str {
-        self.bucket_name
-    }
-
-    pub fn is_empty(&self) -> bool {
-        let mut empty = true;
-        for operations in self.operations.values() {
-            if operations.len() > 0 {
-                empty = false;
-            }
-        }
-
-        empty
-    }
-
-    pub fn push(&mut self, property_backend: &'static str, operation: Operation) {
-        match self.operations.entry(property_backend.to_owned()) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().push(operation);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(vec![operation]);
-            }
-        }
-    }
-
-    pub fn extend(&mut self, property_backend: &'static str, operations: Vec<Operation>) {
-        match self.operations.entry(property_backend.to_owned()) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().extend(operations);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(operations);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Operation {
-    pub diff: Vec<u8>,
-}
+//     pub fn extend(&mut self, property_backend: &'static str, operations: Vec<Operation>) {
+//         match self.operations.entry(property_backend.to_owned()) {
+//             Entry::Occupied(mut entry) => {
+//                 entry.get_mut().extend(operations);
+//             }
+//             Entry::Vacant(entry) => {
+//                 entry.insert(operations);
+//             }
+//         }
+//     }
+// }
 
 /// Holds the property backends inside of records.
 #[derive(Debug)]

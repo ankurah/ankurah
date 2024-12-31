@@ -1,41 +1,13 @@
+use ankurah_proto::{RecordEvent, RecordState, ID};
 // use futures_signals::signal::Signal;
 
 use std::{fmt, sync::Arc};
 
-use crate::{
-    error::RetrievalError,
-    property::{backend::RecordEvent, Backends},
-    storage::RecordState,
-};
+use crate::{error::RetrievalError, property::Backends};
 
 use anyhow::Result;
 
 use ankql::selection::filter::Filterable;
-use serde::{Deserialize, Serialize};
-use ulid::Ulid;
-
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct ID(pub Ulid);
-
-impl fmt::Debug for ID {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let humanized = crate::human_id::hex(self.0.to_bytes());
-        f.debug_tuple("ID").field(&humanized).finish()
-    }
-}
-
-impl fmt::Display for ID {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        let humanized = crate::human_id::hex(self.0.to_bytes());
-        f.debug_tuple("ID").field(&humanized).finish()
-    }
-}
-
-impl AsRef<ID> for ID {
-    fn as_ref(&self) -> &ID {
-        self
-    }
-}
 
 /// A model is a struct that represents the present values for a given record
 /// Schema is defined primarily by the Model object, and the Record is derived from that via macro.
@@ -69,13 +41,13 @@ pub trait Record {
 // Type erased record for modifying backends without knowing the specifics.
 #[derive(Debug)]
 pub struct RecordInner {
-    id: ID,
-    bucket_name: &'static str,
+    pub id: ID,
+    pub bucket_name: String,
     backends: Backends,
 }
 
 impl RecordInner {
-    pub fn new(id: ID, bucket_name: &'static str) -> Self {
+    pub fn new(id: ID, bucket_name: String) -> Self {
         Self {
             id,
             bucket_name,
@@ -87,8 +59,8 @@ impl RecordInner {
         self.id
     }
 
-    pub fn bucket_name(&self) -> &'static str {
-        self.bucket_name
+    pub fn bucket_name(&self) -> &str {
+        &self.bucket_name
     }
 
     pub fn backends(&self) -> &Backends {
@@ -96,20 +68,20 @@ impl RecordInner {
     }
 
     pub fn to_record_state(&self) -> Result<RecordState> {
-        RecordState::from_backends(&self.backends)
+        self.backends.to_state_buffers()
     }
 
-    pub fn from_backends(id: ID, bucket_name: &'static str, backends: Backends) -> Self {
+    pub fn from_backends(id: ID, bucket_name: &str, backends: Backends) -> Self {
         Self {
             id,
-            bucket_name,
+            bucket_name: bucket_name.to_string(),
             backends,
         }
     }
 
     pub fn from_record_state(
         id: ID,
-        bucket_name: &'static str,
+        bucket_name: &str,
         record_state: &RecordState,
     ) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(record_state)?;
@@ -119,11 +91,11 @@ impl RecordInner {
     pub fn get_record_event(&self) -> Result<Option<RecordEvent>> {
         let record_event = RecordEvent {
             id: self.id(),
-            bucket_name: self.bucket_name(),
+            bucket_name: self.bucket_name().to_string(),
             operations: self.backends.to_operations()?,
         };
 
-        if record_event.is_empty() {
+        if record_event.operations.is_empty() {
             Ok(None)
         } else {
             Ok(Some(record_event))
@@ -142,7 +114,7 @@ impl RecordInner {
     pub fn snapshot(&self) -> Self {
         Self {
             id: self.id(),
-            bucket_name: self.bucket_name(),
+            bucket_name: self.bucket_name().to_string(),
             backends: self.backends.fork(),
         }
     }
@@ -185,7 +157,7 @@ pub trait ScopedRecord<'rec> {
         Self: Sized;
 
     fn record_state(&self) -> anyhow::Result<RecordState> {
-        RecordState::from_backends(self.backends())
+        self.record_inner().to_record_state()
     }
 
     fn record_event(&self) -> anyhow::Result<Option<RecordEvent>> {

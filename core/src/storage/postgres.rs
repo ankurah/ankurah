@@ -2,18 +2,19 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     error::RetrievalError,
-    model::{RecordInner, ID},
+    model::RecordInner,
     property::{
         backend::{BackendDowncasted, PropertyBackend},
         Backends,
     },
     storage::{RecordState, StorageBucket, StorageEngine},
 };
-
 use ankql::selection::filter::evaluate_predicate;
+use ankurah_proto::ID;
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
+use tracing::{error, info};
 
 pub struct Postgres {
     // TODO: the rest of the owl
@@ -43,25 +44,31 @@ impl Postgres {
 
 #[async_trait]
 impl StorageEngine for Postgres {
-    fn bucket(&self, name: &str) -> anyhow::Result<std::sync::Arc<dyn StorageBucket>> {
+    async fn bucket(&self, name: &str) -> anyhow::Result<std::sync::Arc<dyn StorageBucket>> {
         if !Postgres::sane_name(name) {
             return Err(anyhow::anyhow!(
                 "bucket name must only contain valid characters"
             ));
         }
 
-        Ok(Arc::new(PostgresBucket {
+        let bucket = PostgresBucket {
             pool: self.pool.clone(),
             bucket_name: name.to_owned(),
-        }))
+        };
+
+        // Try to create the table if it doesn't exist
+        let mut client = self.pool.get().await?;
+        bucket.create_table(&mut client).await?;
+
+        Ok(Arc::new(bucket))
     }
 
     async fn fetch_states(
         &self,
-        bucket_name: &'static str,
+        bucket_name: String,
         predicate: &ankql::ast::Predicate,
     ) -> anyhow::Result<Vec<(ID, RecordState)>> {
-        if !Postgres::sane_name(bucket_name) {
+        if !Postgres::sane_name(&bucket_name) {
             return Err(anyhow::anyhow!(
                 "bucket name must only contain valid characters"
             ));
@@ -94,13 +101,13 @@ impl StorageEngine for Postgres {
         for row in rows {
             let uuid: uuid::Uuid = row.get(0);
             let state_buffer: Vec<u8> = row.get(1);
-            let id = ID(ulid::Ulid::from(uuid));
+            let id = ID::from_ulid(ulid::Ulid::from(uuid));
 
             let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer)?;
             let record_state = RecordState { state_buffers };
 
             // Create record to evaluate predicate
-            let record_inner = RecordInner::from_record_state(id, bucket_name, &record_state)?;
+            let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
 
             // Apply predicate filter
             if evaluate_predicate(&record_inner, predicate)? {
@@ -125,7 +132,7 @@ impl PostgresBucket {
             self.bucket_name
         );
 
-        eprintln!("Running: {}", create_query);
+        error!("Running: {}", create_query);
         client.execute(&create_query, &[]).await?;
         Ok(())
     }
@@ -141,7 +148,7 @@ impl PostgresBucket {
                     r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#,
                     self.bucket_name, column, datatype,
                 );
-                eprintln!("Running: {}", alter_query);
+                error!("Running: {}", alter_query);
                 client.execute(&alter_query, &[]).await?;
             }
         }
@@ -171,7 +178,8 @@ impl StorageBucket for PostgresBucket {
     async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
         // TODO: Create/Alter table
         let state_buffers = bincode::serialize(&state.state_buffers)?;
-        let uuid: uuid::Uuid = id.0.into();
+        let ulid: ulid::Ulid = id.into();
+        let uuid: uuid::Uuid = ulid.into();
 
         let backends = Backends::from_state_buffers(state)?;
         let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned()];
@@ -185,9 +193,9 @@ impl StorageBucket for PostgresBucket {
         for backend in backends.downcasted() {
             match backend {
                 BackendDowncasted::Yrs(yrs) => {
-                    println!("yrs found");
+                    info!("yrs found");
                     for property in yrs.properties() {
-                        println!("property: {:?}", property);
+                        info!("property: {:?}", property);
                         if let Some(string) = yrs.get_string(property.clone()) {
                             materialized_columns.push(property);
                             materialized.push(PostgresParams::String(string));
@@ -242,7 +250,7 @@ impl StorageBucket for PostgresBucket {
             .collect::<Vec<String>>()
             .join(", ");
 
-        println!("columns: {:?}", columns);
+        info!("columns: {:?}", columns);
 
         // be careful with sql injection via bucket name
         let query = format!(
@@ -251,7 +259,7 @@ impl StorageBucket for PostgresBucket {
         );
 
         let mut client = self.pool.get().await?;
-        eprintln!("Running: {}", query);
+        error!("Running: {}", query);
         let rows_affected = match client.execute(&query, params.as_slice()).await {
             Ok(rows_affected) => rows_affected,
             Err(err) => {
@@ -281,7 +289,7 @@ impl StorageBucket for PostgresBucket {
                                 .await?;
                                 return self.set_record(id, state).await; // retry
                             } else {
-                                eprintln!("column '{}' not found in materialized", column);
+                                error!("column '{}' not found in materialized", column);
                             }
                         }
                     }
@@ -292,12 +300,13 @@ impl StorageBucket for PostgresBucket {
             }
         };
 
-        eprintln!("Rows affected: {}", rows_affected);
+        error!("Rows affected: {}", rows_affected);
         Ok(())
     }
 
     async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError> {
-        let uuid: uuid::Uuid = id.0.into();
+        let ulid: ulid::Ulid = id.into();
+        let uuid: uuid::Uuid = ulid.into();
 
         // be careful with sql injection via bucket name
         let query = format!(
@@ -312,7 +321,7 @@ impl StorageBucket for PostgresBucket {
             }
         };
 
-        eprintln!("Running: {}", query);
+        error!("Running: {}", query);
         let row = match client.query_one(&query, &[&uuid]).await {
             Ok(row) => row,
             Err(err) => {
@@ -336,7 +345,7 @@ impl StorageBucket for PostgresBucket {
             }
         };
 
-        eprintln!("Row: {:?}", row);
+        error!("Row: {:?}", row);
         let row_id: uuid::Uuid = row.get("id");
         assert_eq!(row_id, uuid);
 
@@ -370,10 +379,10 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
     }
 
     // Useful for adding new errors
-    eprintln!("db_err: {:?}", err.as_db_error());
-    eprintln!("sql_code: {:?}", err.code());
-    eprintln!("err: {:?}", err);
-    eprintln!("err: {:?}", err.to_string());
+    error!("db_err: {:?}", err.as_db_error());
+    error!("sql_code: {:?}", err.code());
+    error!("err: {:?}", err);
+    error!("err: {:?}", err.to_string());
 
     let quote_indices = |s: &str| {
         let mut quotes = Vec::new();

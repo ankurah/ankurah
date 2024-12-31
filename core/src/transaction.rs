@@ -1,10 +1,12 @@
+use ankurah_proto::ID;
 use std::sync::Arc;
 
 use crate::{
     error::RetrievalError,
-    model::{RecordInner, ScopedRecord, ID},
+    model::{RecordInner, ScopedRecord},
     Model, Node,
 };
+use tracing::debug;
 
 use append_only_vec::AppendOnlyVec;
 
@@ -66,7 +68,8 @@ impl Transaction {
         &'trx self,
         model: &M,
     ) -> M::ScopedRecord<'rec> {
-        let id = self.node.next_id();
+        let id = self.node.next_record_id();
+        tracing::info!("Creating record with id: {:?}", id);
         let record_inner = model.to_record_inner(id);
         let record_ref = self.add_record(record_inner);
         <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref)
@@ -89,22 +92,31 @@ impl Transaction {
     #[must_use]
     // only because Drop is &mut self not mut self
     pub(crate) async fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
-        println!("trx.commit_mut_ref");
+        tracing::info!("trx.commit_mut_ref");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
         let mut record_events = Vec::new();
         for record in self.records.iter() {
+            debug!("trx.commit_mut_ref: record: {:?}", record);
             if let Some(record_event) = record.get_record_event()? {
+                debug!("trx.commit_mut_ref: record_event: {:?}", record_event);
                 record_events.push(record_event);
             }
         }
 
-        // println!("record_events: {:?}", record_events);
+        debug!(
+            "trx.commit_mut_ref: record_events HERE: {:?}",
+            record_events
+        );
 
-        self.node.commit_events(&record_events).await
+        self.node.commit_events(&record_events).await?;
+
+        debug!("trx.commit_mut_ref: done");
+        Ok(())
     }
 
     pub fn rollback(mut self) {
+        tracing::info!("trx.rollback");
         self.consumed = true; // just do nothing on drop
     }
 }
@@ -115,11 +127,20 @@ impl Drop for Transaction {
             // Since we can't make drop async, we'll need to block on the commit
             // This is not ideal, but necessary for the implicit transaction case
             // TODO: Make this a rollback, which will also mean we don't need use block_on
-            match tokio::runtime::Handle::current().block_on(self.commit_mut_ref()) {
-                Ok(()) => {}
-                // Probably shouldn't panic here, but for testing purposes whatever.
-                Err(err) => panic!("Failed to commit: {:?}", err),
-            }
+            // #[cfg(not(target_arch = "wasm32"))]
+            // tokio::spawn(async move {
+            //     self.commit_mut_ref()
+            //         .await
+            //         .expect("Failed to commit implicit transaction");
+            // });
+
+            // #[cfg(target_arch = "wasm32")]
+            // wasm_bindgen_futures::spawn_local(async move {
+            //     if let Err(e) = fut.await {
+            //         tracing::error!("Failed to commit implicit transaction: {}", e);
+            //     }
+            // });
+            todo!()
         }
     }
 }

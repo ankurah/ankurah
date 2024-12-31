@@ -26,3 +26,4 @@ axum-extra = { version = "0.9.3", features = ["typed-header"] }
 futures-util = "0.3.30"
 tower = "0.4.13"
 tower-http = { version = "0.5.2", features = ["trace"] }
+async-trait = "0.1"
