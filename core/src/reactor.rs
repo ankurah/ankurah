@@ -20,7 +20,7 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of records
 pub struct Reactor<S, R>
 where
-    R: Record,
+    R: TestRecord,
     S: TestStorageEngine<R>,
 {
     /// Current subscriptions
@@ -37,25 +37,27 @@ where
     storage: Arc<S>,
 }
 
-pub trait TestStorageEngine<R>
-where
-    R: Record,
-{
-    type Id: std::hash::Hash + std::cmp::Eq;
-    type Update: Clone;
-    fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<R>;
-}
+// Remove this in favor of the StorageEngine trait
+// pub trait TestStorageEngine<R>
+// where
+//     R: TestRecord,
+// {
+//     type Id: std::hash::Hash + std::cmp::Eq;
+//     type Update: Clone;
+//     fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<R>;
+// }
 
-pub trait Record: Filterable + Clone {
-    type Id: std::hash::Hash + std::cmp::Eq + Copy + Clone;
-    type Model;
-    fn id(&self) -> Self::Id;
-    fn value(&self, name: &str) -> Option<Value>;
-}
+// Remove this in favor of the RecordInner struct and the Filterable trait, which impls fn value. It only returns string for now, but we will upgrade that later
+// pub trait TestRecord: Filterable + Clone {
+//     type Id: std::hash::Hash + std::cmp::Eq + Copy + Clone;
+//     type Model;
+//     fn id(&self) -> Self::Id;
+//     fn value(&self, name: &str) -> Option<Value>;
+// }
 
 impl<S, R> Reactor<S, R>
 where
-    R: Record,
+    R: TestRecord,
     S: TestStorageEngine<R>,
 {
     pub fn new(storage: Arc<S>) -> Arc<Self> {
@@ -235,7 +237,7 @@ where
         // Find subscriptions that might be interested based on index watchers
         for index_ref in self.index_watchers.iter() {
             // Get the field value from the record
-            if let Some(field_value) = Record::value(&record, &index_ref.key().0) {
+            if let Some(field_value) = TestRecord::value(&record, &index_ref.key().0) {
                 possibly_interested_subs.extend(index_ref.find_matching(field_value));
             }
         }
@@ -346,7 +348,7 @@ impl From<usize> for SubscriptionId {
 pub struct SubscriptionHandle<S, R>
 where
     S: TestStorageEngine<R>,
-    R: Record,
+    R: TestRecord,
 {
     id: SubscriptionId,
     reactor: Arc<Reactor<S, R>>,
@@ -355,7 +357,7 @@ where
 impl<S, R> Drop for SubscriptionHandle<S, R>
 where
     S: TestStorageEngine<R>,
-    R: Record,
+    R: TestRecord,
 {
     fn drop(&mut self) {
         self.reactor.unsubscribe(self.id);
@@ -388,50 +390,52 @@ mod tests {
         pub age: String,
     }
 
-    #[derive(Clone, Debug)]
-    pub struct ActivePet {
-        model: Arc<Mutex<Pet>>,
-        engine: Weak<DummyEngine>,
-    }
+    // Replaced by PetRecord, which is derived by the Model macro
+    // #[derive(Clone, Debug)]
+    // pub struct ActivePet {
+    //     model: Arc<Mutex<Pet>>,
+    //     engine: Weak<DummyEngine>,
+    // }
 
-    impl ActivePet {
-        fn new(pet: Pet, engine: &Arc<DummyEngine>) -> Self {
-            Self {
-                model: Arc::new(Mutex::new(pet)),
-                engine: Arc::downgrade(engine),
-            }
-        }
+    // impl ActivePet {
+    //     fn new(pet: Pet, engine: &Arc<DummyEngine>) -> Self {
+    //         Self {
+    //             model: Arc::new(Mutex::new(pet)),
+    //             engine: Arc::downgrade(engine),
+    //         }
+    //     }
 
-        #[allow(unused)]
-        pub fn set_name(&self, name: String) {
-            let mut pet = self.model.lock().unwrap();
-            pet.name = name.clone();
-            if let Some(engine) = self.engine.upgrade() {
-                engine.notify_change(
-                    self.clone(),
-                    vec![PetUpdate::Name(name)],
-                    RecordChangeKind::Edit,
-                );
-            }
-        }
+    //     #[allow(unused)]
+    //     pub fn set_name(&self, name: String) {
+    //         let mut pet = self.model.lock().unwrap();
+    //         pet.name = name.clone();
+    //         if let Some(engine) = self.engine.upgrade() {
+    //             engine.notify_change(
+    //                 self.clone(),
+    //                 vec![PetUpdate::Name(name)],
+    //                 RecordChangeKind::Edit,
+    //             );
+    //         }
+    //     }
 
-        pub fn set_age(&self, age: i64) {
-            {
-                let mut pet = self.model.lock().unwrap();
-                pet.age = age.to_string();
-            }
+    //     pub fn set_age(&self, age: i64) {
+    //         {
+    //             let mut pet = self.model.lock().unwrap();
+    //             pet.age = age.to_string();
+    //         }
 
-            if let Some(engine) = self.engine.upgrade() {
-                engine.notify_change(
-                    self.clone(),
-                    vec![PetUpdate::Age(age)],
-                    RecordChangeKind::Edit,
-                );
-            }
-        }
-    }
+    //         if let Some(engine) = self.engine.upgrade() {
+    //             engine.notify_change(
+    //                 self.clone(),
+    //                 vec![PetUpdate::Age(age)],
+    //                 RecordChangeKind::Edit,
+    //             );
+    //         }
+    //     }
+    // }
 
-    // impl Record for ActivePet {
+    // Remove this in favor of the RecordInner struct and the Filterable trait, which impls fn value. It only returns string for now, but we will upgrade that later
+    // impl TestRecord for ActivePet {
     //     type Id = i64;
     //     type Model = Pet;
     //     fn id(&self) -> Self::Id {
@@ -656,19 +660,19 @@ mod tests {
         println!("MARK 6: Getting Rex's record");
         let rex = server.get(1).expect("Rex should exist");
         assert_eq!(
-            Record::value(&rex, "name").unwrap(),
+            TestRecord::value(&rex, "name").unwrap(),
             Value::String("Rex".to_string())
         );
 
         let snuffy = server.get(2).expect("Snuffy should exist");
         assert_eq!(
-            Record::value(&snuffy, "name").unwrap(),
+            TestRecord::value(&snuffy, "name").unwrap(),
             Value::String("Snuffy".to_string())
         );
 
         let jasper = server.get(3).expect("Jasper should exist");
         assert_eq!(
-            Record::value(&jasper, "name").unwrap(),
+            TestRecord::value(&jasper, "name").unwrap(),
             Value::String("Jasper".to_string())
         );
 
