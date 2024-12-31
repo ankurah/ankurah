@@ -442,6 +442,16 @@ mod tests {
         }
     }
 
+    // LEFT OFF HERE - NEXT STEPS:
+    // [ ] implement value<T>(name: &str) -> Option<T> for RecordInner and PropertyBackends such that we can get a typecasted value
+    // [ ] implement Filterable trait for RecordInner
+    // [ ] Update the reactor code and these tests to operate on Record/RecordInner and make Pet Model with a derived PetRecord
+    // [ ] get the tests passing here
+    // [ ] integrate reactor into node
+    // [ ] adapt the tests here to use node directly (and reactor indirectly)
+    //  * Continue using ComparisonIndex for now in the interest of expedience
+    //  * Later we will replace the ComparisonIndex functionality into the storage engine implementations
+
     impl ankql::selection::filter::Filterable for ActivePet {
         fn collection(&self) -> &str {
             "pets"
