@@ -3,28 +3,28 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::RetrievalError,
-    model::{Record, ID},
-    property::Backends,
-};
+use crate::{error::RetrievalError, model::Record, property::Backends};
+use ankurah_proto::{RecordState, ID};
 
-#[cfg(feature = "postgres")]
+#[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
 mod postgres;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sled;
-#[cfg(feature = "postgres")]
+
+#[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
 pub use postgres::Postgres;
+#[cfg(not(target_arch = "wasm32"))]
 pub use sled::SledStorageEngine;
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
-    fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>>;
+    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>>;
 
     // Fetch raw record states matching a predicate
     async fn fetch_states(
         &self,
-        bucket_name: &'static str,
+        bucket_name: String,
         predicate: &ankql::ast::Predicate,
     ) -> anyhow::Result<Vec<(ID, RecordState)>>;
 }
@@ -55,17 +55,6 @@ pub enum MaterializedTag {
 pub enum Materialized {
     String(String),
     Number(i64),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecordState {
-    pub state_buffers: BTreeMap<String, Vec<u8>>,
-}
-
-impl RecordState {
-    pub fn from_backends(backends: &Backends) -> anyhow::Result<Self> {
-        backends.to_state_buffers()
-    }
 }
 
 /// Manages the storage and state of the collection without any knowledge of the model type

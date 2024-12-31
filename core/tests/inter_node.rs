@@ -1,5 +1,6 @@
 mod common;
 
+use ankurah_core::connector::local_process::LocalProcessConnection;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};
 use anyhow::Result;
@@ -9,21 +10,19 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn basic_inter_node() -> Result<()> {
-    let server = Arc::new(Node::new(Box::new(SledStorageEngine::new_test().unwrap())));
-    let client = Arc::new(Node::new(Box::new(SledStorageEngine::new_test().unwrap())));
+    let remote_node = Arc::new(Node::new(Box::new(SledStorageEngine::new_test().unwrap())));
+    let local_node = Arc::new(Node::new(Box::new(SledStorageEngine::new_test().unwrap())));
 
-    // this doesn't work yet
-    client.local_connect(&server);
+    let _local_connector = LocalProcessConnection::new(&local_node, &remote_node).await?;
 
-    let id = {
-        let trx = client.begin();
+    {
+        let trx = local_node.begin();
         let album = trx
             .create(&Album {
                 name: "Walking on a Dream".into(),
                 year: "2008".into(),
             })
             .await;
-        let id = album.id();
 
         trx.create(&Album {
             name: "Ice on the Dune".into(),
@@ -44,13 +43,12 @@ async fn basic_inter_node() -> Result<()> {
         .await;
 
         trx.commit().await?;
-        id
     };
 
     // Mock client - This works:
     {
         let albums: ankurah_core::resultset::ResultSet<AlbumRecord> =
-            client.fetch("name = 'Walking on a Dream'").await?;
+            local_node.fetch("name = 'Walking on a Dream'").await?;
 
         assert_eq!(
             albums
@@ -65,7 +63,7 @@ async fn basic_inter_node() -> Result<()> {
     // mock server - The next step is to make this work:
     {
         let albums: ankurah_core::resultset::ResultSet<AlbumRecord> =
-            server.fetch("name = 'Walking on a Dream'").await?;
+            remote_node.fetch("name = 'Walking on a Dream'").await?;
 
         assert_eq!(
             albums

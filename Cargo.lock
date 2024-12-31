@@ -49,7 +49,7 @@ dependencies = [
  "log",
  "pest",
  "pest_derive",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
 ]
 
 [[package]]
@@ -58,6 +58,8 @@ version = "0.1.0"
 dependencies = [
  "ankql",
  "ankurah-derive",
+ "ankurah-proto",
+ "ankurah-react-signals",
  "anyhow",
  "append-only-vec",
  "async-trait",
@@ -67,18 +69,22 @@ dependencies = [
  "chrono",
  "ctor",
  "dirs",
+ "futures",
  "futures-signals",
+ "js-sys",
+ "reactive_graph",
  "serde",
  "sled",
  "testcontainers",
  "testcontainers-modules",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
  "tokio",
  "tokio-postgres",
  "tracing",
  "tracing-subscriber",
  "ulid",
  "uuid",
+ "wasm-bindgen",
  "yrs",
 ]
 
@@ -136,6 +142,7 @@ dependencies = [
  "ankurah-core",
  "ankurah-proto",
  "anyhow",
+ "async-trait",
  "axum",
  "axum-extra",
  "base64 0.22.1",
@@ -161,16 +168,27 @@ dependencies = [
 name = "ankurah-web-client"
 version = "0.1.0"
 dependencies = [
+ "ankql",
+ "ankurah-core",
+ "ankurah-derive",
  "ankurah-proto",
  "ankurah-react-signals",
  "any_spawner",
+ "anyhow",
+ "async-trait",
  "bincode",
  "console_error_panic_hook",
  "futures",
  "gloo-timers",
  "js-sys",
- "log",
  "reactive_graph",
+ "send_wrapper",
+ "serde",
+ "strum",
+ "thiserror 2.0.9",
+ "tracing",
+ "tracing-wasm",
+ "ulid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -233,15 +251,15 @@ version = "0.2.0"
 source = "git+https://github.com/synestheticsystems/leptos?branch=reactive_graph_pub_items#0c251d6f4efc8c51420a29dc356d2ab99ad4650f"
 dependencies = [
  "futures",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
  "wasm-bindgen-futures",
 ]
 
 [[package]]
 name = "anyhow"
-version = "1.0.94"
+version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1fd03a028ef38ba2276dce7e33fcd6369c158a1bca17946c4b1b701891c1ff7"
+checksum = "34ac096ce696dc2fcabef30516bb13c0a68a11d30131d3df6f04711467681b04"
 
 [[package]]
 name = "append-only-vec"
@@ -978,15 +996,24 @@ dependencies = [
 [[package]]
 name = "example-model"
 version = "0.1.0"
+dependencies = [
+ "ankurah-core",
+ "serde",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "example-wasm-bindings"
 version = "0.1.0"
 dependencies = [
+ "ankurah-core",
  "ankurah-web-client",
  "any_spawner",
  "console_error_panic_hook",
  "example-model",
+ "reactive_graph",
+ "tracing",
+ "tracing-wasm",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-logger",
@@ -1293,6 +1320,12 @@ checksum = "54b4a22553d4242c49fddb9ba998a99962b5cc6f22cb5a3482bec22522403ce4"
 dependencies = [
  "http",
 ]
+
+[[package]]
+name = "heck"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
@@ -1752,7 +1785,7 @@ dependencies = [
  "server_fn",
  "slotmap",
  "tachys",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
  "throw_error",
  "typed-builder",
  "typed-builder-macro",
@@ -1764,10 +1797,12 @@ dependencies = [
 name = "leptos-example"
 version = "0.1.0"
 dependencies = [
+ "ankurah-core",
  "ankurah-web-client",
  "console_error_panic_hook",
  "example-model",
  "leptos",
+ "send_wrapper",
 ]
 
 [[package]]
@@ -1778,7 +1813,7 @@ dependencies = [
  "config",
  "regex",
  "serde",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
  "typed-builder",
 ]
 
@@ -2073,7 +2108,7 @@ version = "0.2.0"
 source = "git+https://github.com/synestheticsystems/leptos?branch=reactive_graph_pub_items#0c251d6f4efc8c51420a29dc356d2ab99ad4650f"
 dependencies = [
  "serde",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
 ]
 
 [[package]]
@@ -2217,7 +2252,7 @@ dependencies = [
  "memchr",
  "serde",
  "serde_json",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
  "ucd-trie",
 ]
 
@@ -2515,7 +2550,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "slotmap",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
  "web-sys",
 ]
 
@@ -2928,7 +2963,7 @@ dependencies = [
  "serde_json",
  "serde_qs",
  "server_fn_macro_default",
- "thiserror 2.0.8",
+ "thiserror 2.0.9",
  "throw_error",
  "url",
  "wasm-bindgen",
@@ -3124,6 +3159,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "strum"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3249,11 +3306,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.8"
+version = "2.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08f5383f3e0071702bf93ab5ee99b52d26936be9dedd9413067cbdcddcb6141a"
+checksum = "f072643fd0190df67a8bab670c20ef5d8737177d6ac6b2e9a236cb096206b2cc"
 dependencies = [
- "thiserror-impl 2.0.8",
+ "thiserror-impl 2.0.9",
 ]
 
 [[package]]
@@ -3269,9 +3326,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.8"
+version = "2.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f357fcec90b3caef6623a099691be676d033b40a058ac95d2a6ade6fa0c943"
+checksum = "7b50fa271071aae2e6ee85f842e2e28ba8cd2c5fb67f11fcb1fd70b276f9e7d4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3614,6 +3671,17 @@ dependencies = [
  "thread_local",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tracing-wasm"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4575c663a174420fa2d78f4108ff68f65bf2fbb7dd89f33749b6e826b3626e07"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
 ]
 
 [[package]]

@@ -1,8 +1,10 @@
-use ankurah_core::storage::SledStorageEngine;
+use ankurah_core::{node::Node, storage::SledStorageEngine};
 use anyhow::Result;
+use std::sync::Arc;
 use tracing::Level;
 
-use ankurah_server::Server;
+use ankurah_server::ws_server::WebsocketServer;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // initialize tracing
@@ -11,13 +13,12 @@ async fn main() -> Result<()> {
     // Initialize storage engine
     let storage = SledStorageEngine::with_homedir_folder(".syncra")?;
 
-    // Create and start the server
-    let server = Server::builder()
-        .bind_address("0.0.0.0:9797")
-        .with_storage(storage)
-        .build()?;
+    // Create the node
+    let node = Arc::new(Node::new(Box::new(storage)));
 
-    server.run().await?;
+    // Create and start the websocket server
+    let server = WebsocketServer::new(node);
+    server.run("0.0.0.0:9797").await?;
 
     Ok(())
 }
