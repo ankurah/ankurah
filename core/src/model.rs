@@ -168,5 +168,9 @@ pub trait ScopedRecord<'rec> {
     fn record_event(&self) -> anyhow::Result<Option<RecordEvent>> {
         self.record_inner().get_record_event()
     }
+
+    fn read(&self) -> Self::Record {
+        Self::Record::from_record_inner(Arc::new(self.record_inner().snapshot()))
+    }
     //fn apply_record_event(&self, record_event: &RecordEvent) -> Result<()>;
 }

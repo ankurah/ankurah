@@ -1,8 +1,8 @@
 mod common;
 
 use ankurah_core::connector::local_process::LocalProcessConnection;
-use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::node::Node;
+use ankurah_core::storage::SledStorageEngine;
 use anyhow::Result;
 
 use common::{Album, AlbumRecord};
@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn basic_inter_node() -> Result<()> {
-    let remote_node = Arc::new(Node::new(Box::new(SledStorageEngine::new_test().unwrap())));
-    let local_node = Arc::new(Node::new(Box::new(SledStorageEngine::new_test().unwrap())));
+    let remote_node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let local_node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     let _local_connector = LocalProcessConnection::new(&local_node, &remote_node).await?;
 

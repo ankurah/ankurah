@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
 
     // Gradually uncomment this example as we add functionality
     // let server = Node::new();
-    let client = Arc::new(Node::new(Box::new(SledStorageEngine::new().unwrap())));
+    let client = Arc::new(Node::new(Arc::new(SledStorageEngine::new().unwrap())));
 
     // client.local_connect(&server);
 

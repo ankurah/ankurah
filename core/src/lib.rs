@@ -8,7 +8,6 @@ pub mod model;
 pub mod node;
 pub mod property;
 pub mod reactor;
-mod reactor_test;
 pub mod resultset;
 pub mod storage;
 pub mod subscription;

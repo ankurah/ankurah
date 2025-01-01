@@ -7,7 +7,7 @@ use common::{Album, AlbumRecord};
 use std::sync::Arc;
 #[tokio::test]
 async fn basic_where_clause() -> Result<()> {
-    let client = Arc::new(Node::new(Box::new(SledStorageEngine::new_test().unwrap())));
+    let client = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     let id = {
         let trx = client.begin();
@@ -59,7 +59,7 @@ mod pg_common;
 #[tokio::test]
 async fn pg_basic_where_clause() -> Result<()> {
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let client = Arc::new(Node::new(Box::new(storage_engine)));
+    let client = Arc::new(Node::new(Arc::new(storage_engine)));
 
     {
         let trx = client.begin();

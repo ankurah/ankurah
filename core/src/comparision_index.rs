@@ -126,6 +126,7 @@ impl ComparisonIndex {
 mod tests {
     use super::ComparisonIndex;
     use crate::subscription::SubscriptionId;
+    use crate::value::Value;
     use ankql::ast;
 
     #[test]

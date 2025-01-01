@@ -49,6 +49,10 @@ impl YrsString {
     pub fn delete(&self, index: u32, length: u32) {
         self.backend().delete(&self.property_name, index, length);
     }
+    pub fn overwrite(&self, start: u32, length: u32, value: &str) {
+        self.backend().delete(&self.property_name, start, length);
+        self.backend().insert(&self.property_name, start, value);
+    }
 }
 
 impl InitializeWith<String> for YrsString {
