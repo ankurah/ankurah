@@ -44,9 +44,9 @@ pub struct Node {
 type NodeRecords = BTreeMap<(proto::ID, String), Weak<RecordInner>>;
 
 impl Node {
-    pub fn new(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+    pub fn new(engine: Arc<dyn StorageEngine>) -> Self {
         let reactor = Reactor::new(engine.clone());
-        Arc::new(Self {
+        Self {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
@@ -54,7 +54,7 @@ impl Node {
             peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
             reactor,
-        })
+        }
     }
 
     pub async fn register_peer_sender(&self, sender: Box<dyn PeerSender>) {
@@ -141,7 +141,7 @@ impl Node {
                         Ok(result) => result,
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                     };
-                    let foo = sender
+                    let _result = sender
                         .send_message(proto::PeerMessage::Response(proto::NodeResponse {
                             request_id,
                             from,
@@ -149,6 +149,7 @@ impl Node {
                             body,
                         }))
                         .await;
+                    // TODO - do something with this error. Should probably send it to a log file
                 }
             }
             proto::PeerMessage::Response(response) => {
@@ -290,7 +291,7 @@ impl Node {
             .await?;
 
         // Add to node's records
-        self.add_record(&record).await;
+        let _ = self.add_record(&record).await;
 
         // Notify subscribers
         let change = RecordChange {

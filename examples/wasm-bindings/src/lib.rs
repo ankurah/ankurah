@@ -21,9 +21,9 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
     let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app")
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let node = Arc::new(Node::new(Box::new(storage_engine)));
+    let node = Arc::new(Node::new(Arc::new(storage_engine)));
     let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797")?;
-    
+
     info!("Waiting for client to connect");
     let state = connector.connection_state();
 

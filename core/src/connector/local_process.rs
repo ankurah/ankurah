@@ -71,7 +71,7 @@ impl LocalProcessConnection {
         let node = node.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                node.handle_message(message).await;
+                let _ = node.handle_message(message).await;
             }
         })
     }
