@@ -98,18 +98,15 @@ impl Reactor {
         (subscription.callback)(ChangeSet {
             changes: matching_records
                 .into_iter()
-                .map(|r| RecordChange {
-                    record: r,
-                    updates: vec![],
+                .map(|record| RecordChange {
+                    record,
                     kind: RecordChangeKind::Add,
+                    updates: vec![],
                 })
                 .collect(),
         });
 
-        Ok(SubscriptionHandle {
-            id: sub_id,
-            reactor: self.clone(),
-        })
+        Ok(SubscriptionHandle::new(self.clone(), sub_id))
     }
 
     fn recurse_predicate<F>(&self, predicate: &ast::Predicate, f: F)

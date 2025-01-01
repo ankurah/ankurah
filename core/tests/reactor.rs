@@ -108,9 +108,9 @@ async fn test_complex_subscription_conditions() {
     // Helper function to check received changesets
     let check_received = move || {
         let mut changesets = received_changesets.lock().unwrap();
-        let result: Vec<(Vec<ankurah_proto::RecordEvent>, RecordChangeKind)> = (*changesets)
+        let result: Vec<RecordChangeKind> = (*changesets)
             .iter()
-            .map(|c: &ChangeSet| (c.changes[0].updates.clone(), c.changes[0].kind.clone()))
+            .flat_map(|c: &ChangeSet| c.changes.iter().map(|change| change.kind.clone()))
             .collect();
         changesets.clear();
         result
@@ -156,6 +156,7 @@ async fn test_complex_subscription_conditions() {
     // Verify initial state
     let received = check_received();
     assert_eq!(received.len(), 1); // Should have received one changeset for Rex (matches by name)
+    assert_eq!(received[0], RecordChangeKind::Add); // Initial state should be an Add
 
     // Update Rex's age to 7
     let trx = node.begin();
@@ -166,6 +167,7 @@ async fn test_complex_subscription_conditions() {
     // Verify Rex's update was received
     let received = check_received();
     assert_eq!(received.len(), 1); // Should have received one changeset for Rex's age change
+    assert_eq!(received[0], RecordChangeKind::Edit);
 
     // Update Snuffy's age to 3
     let trx = node.begin();
@@ -176,6 +178,7 @@ async fn test_complex_subscription_conditions() {
     // Verify Snuffy's update was received (now matches age > 2 and age < 5)
     let received = check_received();
     assert_eq!(received.len(), 1);
+    assert_eq!(received[0], RecordChangeKind::Add);
 
     // Update Jasper's age to 4
     let trx = node.begin();
@@ -186,6 +189,7 @@ async fn test_complex_subscription_conditions() {
     // Verify Jasper's update was received (now matches age > 2 and age < 5)
     let received = check_received();
     assert_eq!(received.len(), 1);
+    assert_eq!(received[0], RecordChangeKind::Add);
 
     // Update Snuffy and Jasper to ages outside the range
     let trx = node.begin();
@@ -198,6 +202,8 @@ async fn test_complex_subscription_conditions() {
     // Verify both updates were received as removals
     let received = check_received();
     assert_eq!(received.len(), 2); // Should have received two changesets for removals
+    assert_eq!(received[0], RecordChangeKind::Remove);
+    assert_eq!(received[1], RecordChangeKind::Remove);
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a RecordChangeKind::Remove since it no longer matches
@@ -209,5 +215,5 @@ async fn test_complex_subscription_conditions() {
     // Verify Rex's "removal" was received
     let received = check_received();
     assert_eq!(received.len(), 1); // Should have received one changeset for Rex no longer matching
-    assert_eq!(received[0].1, RecordChangeKind::Remove); // Should be a removal (from the result set)
+    assert_eq!(received[0], RecordChangeKind::Remove); // Should be a removal (from the result set)
 }

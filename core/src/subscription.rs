@@ -44,6 +44,12 @@ pub struct SubscriptionHandle {
     pub(crate) reactor: Arc<crate::reactor::Reactor>,
 }
 
+impl SubscriptionHandle {
+    pub fn new(reactor: Arc<crate::reactor::Reactor>, id: SubscriptionId) -> Self {
+        Self { id, reactor }
+    }
+}
+
 impl Drop for SubscriptionHandle {
     fn drop(&mut self) {
         self.reactor.unsubscribe(self.id);
