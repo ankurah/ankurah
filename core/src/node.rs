@@ -7,9 +7,11 @@ use std::{
 use tokio::sync::{oneshot, RwLock};
 
 use crate::{
+    changes::{ChangeSet, RecordChange, RecordChangeKind},
     connector::PeerSender,
     error::RetrievalError,
     model::{Record, RecordInner},
+    reactor::Reactor,
     resultset::ResultSet,
     storage::{Bucket, StorageEngine},
     transaction::Transaction,
@@ -22,7 +24,7 @@ pub struct Node {
     /// Ground truth local state for records.
     ///
     /// Things like `postgres`, `sled`, `TKiV`.
-    storage_engine: Box<dyn StorageEngine>,
+    storage_engine: Arc<dyn StorageEngine>,
     // Storage for each collection
     collections: RwLock<BTreeMap<String, Bucket>>,
 
@@ -34,20 +36,25 @@ pub struct Node {
     peer_connections: tokio::sync::RwLock<BTreeMap<proto::NodeId, Box<dyn PeerSender>>>,
     pending_requests:
         tokio::sync::RwLock<BTreeMap<proto::RequestId, oneshot::Sender<proto::NodeResponseBody>>>,
+
+    /// The reactor for handling subscriptions
+    reactor: Arc<Reactor>,
 }
 
 type NodeRecords = BTreeMap<(proto::ID, String), Weak<RecordInner>>;
 
 impl Node {
-    pub fn new(engine: Box<dyn StorageEngine>) -> Self {
-        Self {
+    pub fn new(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+        let reactor = Reactor::new(engine.clone());
+        Arc::new(Self {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             records: Arc::new(RwLock::new(BTreeMap::new())),
             peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
-        }
+            reactor,
+        })
     }
 
     pub async fn register_peer_sender(&self, sender: Box<dyn PeerSender>) {
@@ -226,6 +233,8 @@ impl Node {
     ) -> anyhow::Result<()> {
         debug!("node.commit_events_local 1");
 
+        let mut changes = Vec::new();
+
         // First apply events locally
         for record_event in events {
             debug!(
@@ -252,7 +261,103 @@ impl Node {
                 .set_record(record_event.id(), &record_state)
                 .await?;
             debug!("node.commit_events_local 6: done");
+
+            // Collect the change
+            changes.push(RecordChange {
+                record: record.clone(),
+                updates: events.clone(),
+                kind: RecordChangeKind::Edit,
+            });
         }
+
+        // Notify reactor with a single changeset containing all changes
+        let changeset = ChangeSet { changes };
+        self.reactor.notify_change(changeset);
+
+        Ok(())
+    }
+
+    /// Create a new record and notify subscribers
+    pub(crate) async fn create_record(
+        self: &Arc<Self>,
+        record: Arc<RecordInner>,
+    ) -> anyhow::Result<()> {
+        // Store the record
+        let record_state = record.to_record_state()?;
+        self.bucket(record.bucket_name())
+            .await
+            .set_record(record.id(), &record_state)
+            .await?;
+
+        // Add to node's records
+        self.add_record(&record).await;
+
+        // Notify subscribers
+        let change = RecordChange {
+            record: record.clone(),
+            updates: vec![],
+            kind: RecordChangeKind::Add,
+        };
+        let changeset = ChangeSet {
+            changes: vec![change],
+        };
+        self.reactor.notify_change(changeset);
+
+        Ok(())
+    }
+
+    // /// Delete a record and notify subscribers
+    // pub(crate) async fn delete_record(
+    //     self: &Arc<Self>,
+    //     record: Arc<RecordInner>,
+    // ) -> anyhow::Result<()> {
+    //     // Remove from storage
+    //     self.bucket(record.bucket_name())
+    //         .await
+    //         .delete_record(record.id())
+    //         .await?;
+
+    //     // Remove from node's records
+    //     let mut records = self.records.write().await;
+    //     records.remove(&(record.id(), record.bucket_name().to_string()));
+
+    //     // Notify subscribers
+    //     let change = RecordChange {
+    //         record: record.clone(),
+    //         updates: vec![],
+    //         kind: RecordChangeKind::Remove,
+    //     };
+    //     let changeset = ChangeSet {
+    //         changes: vec![change],
+    //     };
+    //     self.reactor.notify_change(changeset);
+
+    //     Ok(())
+    // }
+
+    /// Update a record and notify subscribers
+    pub(crate) async fn update_record(
+        self: &Arc<Self>,
+        record: Arc<RecordInner>,
+        events: Vec<proto::RecordEvent>,
+    ) -> anyhow::Result<()> {
+        // Store the record
+        let record_state = record.to_record_state()?;
+        self.bucket(record.bucket_name())
+            .await
+            .set_record(record.id(), &record_state)
+            .await?;
+
+        // Notify subscribers
+        let change = RecordChange {
+            record: record.clone(),
+            updates: events,
+            kind: RecordChangeKind::Edit,
+        };
+        let changeset = ChangeSet {
+            changes: vec![change],
+        };
+        self.reactor.notify_change(changeset);
 
         Ok(())
     }
@@ -437,5 +542,20 @@ impl Node {
         }
 
         Ok(ResultSet { records })
+    }
+
+    /// Subscribe to changes in records matching a predicate
+    pub async fn subscribe<F>(
+        self: &Arc<Self>,
+        bucket_name: &str,
+        predicate: &ankql::ast::Predicate,
+        callback: F,
+    ) -> Result<crate::subscription::SubscriptionHandle>
+    where
+        F: Fn(crate::changes::ChangeSet) + Send + Sync + 'static,
+    {
+        self.reactor
+            .subscribe(bucket_name, predicate, callback)
+            .await
     }
 }

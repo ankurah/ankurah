@@ -1,3 +1,4 @@
+pub mod changes;
 pub mod collation;
 pub mod comparision_index;
 pub mod connector;
@@ -7,8 +8,10 @@ pub mod model;
 pub mod node;
 pub mod property;
 pub mod reactor;
+mod reactor_test;
 pub mod resultset;
 pub mod storage;
+pub mod subscription;
 pub mod transaction;
 pub mod value;
 pub use model::Model;

@@ -1,14 +1,16 @@
-use super::collation::Collatable;
 use super::comparision_index::ComparisonIndex;
+use crate::changes::{ChangeSet, RecordChange, RecordChangeKind};
+use crate::storage::StorageEngine;
+use crate::subscription::{Subscription, SubscriptionHandle, SubscriptionId};
 use crate::value::Value;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::ops::Deref;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 impl From<&str> for FieldId {
@@ -18,49 +20,23 @@ impl From<&str> for FieldId {
 }
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of records
-pub struct Reactor<S, R>
-where
-    R: TestRecord,
-    S: TestStorageEngine<R>,
-{
+pub struct Reactor {
     /// Current subscriptions
-    subscriptions: DashMap<SubscriptionId, Arc<Subscription<R, S::Update>>>,
+    subscriptions: DashMap<SubscriptionId, Arc<Subscription>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: DashMap<FieldId, ComparisonIndex>,
     /// Index of subscriptions that presently match each record.
     /// This is used to quickly find all subscriptions that need to be notified when a record changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
-    record_watchers: DashMap<R::Id, Vec<SubscriptionId>>,
+    record_watchers: DashMap<ankurah_proto::ID, Vec<SubscriptionId>>,
     /// Next subscription id
     next_sub_id: AtomicUsize,
-    /// Weak reference to the server, which we need to perform the initial subscription setup
-    storage: Arc<S>,
+    /// Reference to the storage engine
+    storage: Arc<dyn StorageEngine>,
 }
 
-// Remove this in favor of the StorageEngine trait
-// pub trait TestStorageEngine<R>
-// where
-//     R: TestRecord,
-// {
-//     type Id: std::hash::Hash + std::cmp::Eq;
-//     type Update: Clone;
-//     fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<R>;
-// }
-
-// Remove this in favor of the RecordInner struct and the Filterable trait, which impls fn value. It only returns string for now, but we will upgrade that later
-// pub trait TestRecord: Filterable + Clone {
-//     type Id: std::hash::Hash + std::cmp::Eq + Copy + Clone;
-//     type Model;
-//     fn id(&self) -> Self::Id;
-//     fn value(&self, name: &str) -> Option<Value>;
-// }
-
-impl<S, R> Reactor<S, R>
-where
-    R: TestRecord,
-    S: TestStorageEngine<R>,
-{
-    pub fn new(storage: Arc<S>) -> Arc<Self> {
+impl Reactor {
+    pub fn new(storage: Arc<dyn StorageEngine>) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: DashMap::new(),
             index_watchers: DashMap::new(),
@@ -69,13 +45,15 @@ where
             storage,
         })
     }
-    pub fn subscribe<F>(
+
+    pub async fn subscribe<F>(
         self: &Arc<Self>,
+        bucket_name: &str,
         predicate: &ast::Predicate,
         callback: F,
-    ) -> Result<SubscriptionHandle<S, R>>
+    ) -> Result<SubscriptionHandle>
     where
-        F: Fn(ChangeSet<R, S::Update>) + Send + Sync + 'static,
+        F: Fn(ChangeSet) + Send + Sync + 'static,
     {
         let sub_id: SubscriptionId = self
             .next_sub_id
@@ -86,10 +64,19 @@ where
         self.add_index_watchers(sub_id, predicate);
 
         // Find initial matching records
-        let matching_records = self.storage.fetch_records(predicate);
+        let states = self
+            .storage
+            .fetch_states(bucket_name.to_string(), predicate)
+            .await?;
+        let mut matching_records = Vec::new();
 
-        // Set up record watchers
-        for record in matching_records.iter() {
+        // Convert states to RecordInner
+        for (id, state) in states {
+            let record = crate::model::RecordInner::from_record_state(id, bucket_name, &state)?;
+            let record = Arc::new(record);
+            matching_records.push(record.clone());
+
+            // Set up record watchers
             self.record_watchers
                 .entry(record.id())
                 .or_default()
@@ -101,7 +88,7 @@ where
             id: sub_id,
             predicate: predicate.clone(),
             callback: Arc::new(Box::new(callback)),
-            matching_records: Mutex::new(matching_records.clone()),
+            matching_records: std::sync::Mutex::new(matching_records.clone()),
         });
 
         // Store subscription
@@ -183,7 +170,6 @@ where
              literal: &ast::Literal,
              operator| {
                 if let dashmap::Entry::Occupied(mut index) = entry {
-                    // use crate::collation::Collatable;
                     let literal = (*literal).clone();
                     index.get_mut().remove(literal, operator.clone(), sub_id);
                 }
@@ -192,7 +178,7 @@ where
     }
 
     /// Remove a subscription and clean up its watchers
-    fn unsubscribe(&self, sub_id: SubscriptionId) {
+    pub(crate) fn unsubscribe(&self, sub_id: SubscriptionId) {
         if let Some((_, subscription)) = self.subscriptions.remove(&sub_id) {
             // Remove from index watchers
             self.remove_index_watchers(sub_id, &subscription.predicate);
@@ -208,7 +194,12 @@ where
     }
 
     /// Update record watchers when a record's matching status changes
-    fn update_record_watchers(&self, record: &R, matching: bool, sub_id: SubscriptionId) {
+    fn update_record_watchers(
+        &self,
+        record: &Arc<crate::model::RecordInner>,
+        matching: bool,
+        sub_id: SubscriptionId,
+    ) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
             let mut records = subscription.matching_records.lock().unwrap();
             let mut watchers = self.record_watchers.entry(record.id()).or_default();
@@ -231,501 +222,64 @@ where
     }
 
     /// Notify subscriptions about a record change
-    pub fn notify_change(&self, record: R, updates: Vec<S::Update>, kind: RecordChangeKind) {
-        let mut possibly_interested_subs = HashSet::new();
+    pub fn notify_change(&self, changeset: ChangeSet) {
+        for change in &changeset.changes {
+            let mut possibly_interested_subs = HashSet::new();
 
-        // Find subscriptions that might be interested based on index watchers
-        for index_ref in self.index_watchers.iter() {
-            // Get the field value from the record
-            if let Some(field_value) = TestRecord::value(&record, &index_ref.key().0) {
-                possibly_interested_subs.extend(index_ref.find_matching(field_value));
+            // Find subscriptions that might be interested based on index watchers
+            for index_ref in self.index_watchers.iter() {
+                // Get the field value from the record
+                if let Some(field_value) = change.record.value(&index_ref.key().0) {
+                    possibly_interested_subs
+                        .extend(index_ref.find_matching(Value::String(field_value)));
+                }
             }
-        }
 
-        // Check each possibly interested subscription with full predicate evaluation
-        for sub_id in possibly_interested_subs {
-            if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                // Use evaluate_predicate directly on the record instead of fetch_records
-                let matches =
-                    ankql::selection::filter::evaluate_predicate(&record, &subscription.predicate)
-                        .unwrap_or(false);
+            // TODO NOW - we should be creating one changeset per subscription, and populating it with the relevant changes from the input changeset
+            // Check each possibly interested subscription with full predicate evaluation
+            for sub_id in possibly_interested_subs {
+                if let Some(subscription) = self.subscriptions.get(&sub_id) {
+                    // Use evaluate_predicate directly on the record instead of fetch_records
+                    let matches = ankql::selection::filter::evaluate_predicate(
+                        &*change.record,
+                        &subscription.predicate,
+                    )
+                    .unwrap_or(false);
 
-                let did_match = subscription
-                    .matching_records
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|r| r.id() == record.id());
+                    let did_match = subscription
+                        .matching_records
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r.id() == change.record.id());
 
-                // Only update watchers and notify if matching status changed
-                if matches != did_match {
-                    self.update_record_watchers(&record, matches, sub_id);
+                    // Only update watchers and notify if matching status changed
+                    if matches != did_match {
+                        self.update_record_watchers(&change.record, matches, sub_id);
 
-                    (subscription.callback)(ChangeSet {
-                        changes: vec![RecordChange {
-                            record: record.clone(),
-                            updates: updates.clone(),
-                            kind: if matches {
-                                RecordChangeKind::Add
-                            } else {
-                                RecordChangeKind::Remove
-                            },
-                        }],
-                    });
-                } else if matches && kind == RecordChangeKind::Edit {
-                    // Record still matches but was edited
-                    (subscription.callback)(ChangeSet {
-                        changes: vec![RecordChange {
-                            record: record.clone(),
-                            updates: updates.clone(),
-                            kind: RecordChangeKind::Edit,
-                        }],
-                    });
+                        (subscription.callback)(ChangeSet {
+                            changes: vec![RecordChange {
+                                record: change.record.clone(),
+                                updates: change.updates.clone(),
+                                kind: if matches {
+                                    RecordChangeKind::Add
+                                } else {
+                                    RecordChangeKind::Remove
+                                },
+                            }],
+                        });
+                    } else if matches && change.kind == RecordChangeKind::Edit {
+                        // Record still matches but was edited
+                        (subscription.callback)(ChangeSet {
+                            changes: vec![RecordChange {
+                                record: change.record.clone(),
+                                updates: change.updates.clone(),
+                                kind: RecordChangeKind::Edit,
+                            }],
+                        });
+                    }
                 }
             }
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RecordChangeKind {
-    Add,
-    Remove,
-    Edit,
-}
-/// Represents a change in the record set
-#[derive(Debug, Clone)]
-pub struct RecordChange<R, U> {
-    #[allow(unused)]
-    record: R,
-    #[allow(unused)]
-    updates: Vec<U>,
-    #[allow(unused)]
-    kind: RecordChangeKind,
-}
-
-/// A set of changes to the record set
-#[derive(Debug, Clone)]
-pub struct ChangeSet<R, U> {
-    #[allow(unused)]
-    changes: Vec<RecordChange<R, U>>,
-    // other stuff later
-}
-
-/// A callback function that receives subscription updates
-type Callback<R, U> = Box<dyn Fn(ChangeSet<R, U>) + Send + Sync + 'static>;
-
-/// A subscription that can be shared between indexes
-pub struct Subscription<R, U> {
-    #[allow(unused)]
-    id: SubscriptionId,
-    predicate: ankql::ast::Predicate,
-    callback: Arc<Callback<R, U>>,
-    // Track which records currently match this subscription
-    matching_records: Mutex<Vec<R>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SubscriptionId(usize);
-impl Deref for SubscriptionId {
-    type Target = usize;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl PartialEq<usize> for SubscriptionId {
-    fn eq(&self, other: &usize) -> bool {
-        self.0 == *other
-    }
-}
-impl From<usize> for SubscriptionId {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
-}
-
-/// A handle to a subscription that can be used to register callbacks
-pub struct SubscriptionHandle<S, R>
-where
-    S: TestStorageEngine<R>,
-    R: TestRecord,
-{
-    id: SubscriptionId,
-    reactor: Arc<Reactor<S, R>>,
-}
-
-impl<S, R> Drop for SubscriptionHandle<S, R>
-where
-    S: TestStorageEngine<R>,
-    R: TestRecord,
-{
-    fn drop(&mut self) {
-        self.reactor.unsubscribe(self.id);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate as ankurah_core;
-    use crate::property::YrsString;
-    use crate::Model;
-
-    use super::*;
-    use ankql;
-    use std::sync::{Arc, Mutex, Weak};
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum PetUpdate {
-        #[allow(unused)]
-        Name(String),
-        Age(i64),
-    }
-
-    use crate::derive_deps::wasm_bindgen::prelude::wasm_bindgen;
-    #[derive(Debug, Clone, Model)]
-    pub struct Pet {
-        #[active_value(YrsString)]
-        pub name: String,
-        #[active_value(YrsString)]
-        pub age: String,
-    }
-
-    // Replaced by PetRecord, which is derived by the Model macro
-    // #[derive(Clone, Debug)]
-    // pub struct ActivePet {
-    //     model: Arc<Mutex<Pet>>,
-    //     engine: Weak<DummyEngine>,
-    // }
-
-    // impl ActivePet {
-    //     fn new(pet: Pet, engine: &Arc<DummyEngine>) -> Self {
-    //         Self {
-    //             model: Arc::new(Mutex::new(pet)),
-    //             engine: Arc::downgrade(engine),
-    //         }
-    //     }
-
-    //     #[allow(unused)]
-    //     pub fn set_name(&self, name: String) {
-    //         let mut pet = self.model.lock().unwrap();
-    //         pet.name = name.clone();
-    //         if let Some(engine) = self.engine.upgrade() {
-    //             engine.notify_change(
-    //                 self.clone(),
-    //                 vec![PetUpdate::Name(name)],
-    //                 RecordChangeKind::Edit,
-    //             );
-    //         }
-    //     }
-
-    //     pub fn set_age(&self, age: i64) {
-    //         {
-    //             let mut pet = self.model.lock().unwrap();
-    //             pet.age = age.to_string();
-    //         }
-
-    //         if let Some(engine) = self.engine.upgrade() {
-    //             engine.notify_change(
-    //                 self.clone(),
-    //                 vec![PetUpdate::Age(age)],
-    //                 RecordChangeKind::Edit,
-    //             );
-    //         }
-    //     }
-    // }
-
-    // Remove this in favor of the RecordInner struct and the Filterable trait, which impls fn value. It only returns string for now, but we will upgrade that later
-    // impl TestRecord for ActivePet {
-    //     type Id = i64;
-    //     type Model = Pet;
-    //     fn id(&self) -> Self::Id {
-    //         self.model.lock().unwrap().id
-    //     }
-
-    //     fn value(&self, name: &str) -> Option<Value> {
-    //         match name {
-    //             "id" => Some(Value::Integer(self.id())),
-    //             "name" => Some(Value::String(self.model.lock().unwrap().name.clone())),
-    //             "age" => Some(Value::Integer(
-    //                 self.model.lock().unwrap().age.parse::<i64>().unwrap(),
-    //             )),
-    //             _ => None,
-    //         }
-    //     }
-    // }
-
-    // LEFT OFF HERE - NEXT STEPS:
-    // [X] implement value<T>(name: &str) -> Option<T> for RecordInner and PropertyBackends such that we can get a typecasted value
-    //     Filterable is already implemented for RecordInner
-    // [X] implement Filterable trait for RecordInner
-    // [ ] Update the reactor code and these tests to operate on Record/RecordInner and make Pet Model with a derived PetRecord
-    // [ ] get the tests passing here
-    // [ ] integrate reactor into node
-    // [ ] adapt the tests here to use node directly (and reactor indirectly)
-    // [ ] proper typecasting of values
-    //  * Continue using ComparisonIndex for now in the interest of expedience
-    //  * Later we will replace the ComparisonIndex functionality into the storage engine implementations
-
-    impl ankql::selection::filter::Filterable for ActivePet {
-        fn collection(&self) -> &str {
-            "pets"
-        }
-
-        fn value(&self, name: &str) -> Option<String> {
-            let pet = self.model.lock().unwrap();
-            match name {
-                "id" => Some(pet.id.to_string()),
-                "name" => Some(pet.name.clone()),
-                "age" => Some(pet.age.to_string()),
-                _ => None,
-            }
-        }
-    }
-
-    struct DummyEngine {
-        records: Mutex<Vec<ActivePet>>,
-        reactor: Mutex<Option<Weak<Reactor<Self, ActivePet>>>>,
-    }
-
-    impl DummyEngine {
-        fn new(records: Vec<Pet>) -> Arc<Self> {
-            let me = Arc::new(Self {
-                records: Mutex::new(vec![]),
-                reactor: Mutex::new(None),
-            });
-            {
-                let mut r = me.records.lock().unwrap();
-                for record in records {
-                    r.push(ActivePet::new(record, &me));
-                }
-            }
-            me
-        }
-
-        fn set_reactor(&self, reactor: &Arc<Reactor<Self, ActivePet>>) {
-            *self.reactor.lock().unwrap() = Some(Arc::downgrade(reactor));
-        }
-
-        fn notify_change(
-            &self,
-            record: ActivePet,
-            updates: Vec<PetUpdate>,
-            kind: RecordChangeKind,
-        ) {
-            if let Some(reactor) = self
-                .reactor
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(Weak::upgrade)
-            {
-                reactor.notify_change(record, updates, kind);
-            }
-        }
-
-        fn get(&self, id: i64) -> Option<ActivePet> {
-            self.records
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|p| p.id() == id)
-                .cloned()
-        }
-    }
-
-    // Use StorageEngine instead
-    // impl TestStorageEngine<ActivePet> for DummyEngine {
-    //     type Id = usize;
-    //     type Update = PetUpdate;
-
-    //     fn fetch_records(&self, predicate: &ast::Predicate) -> Vec<ActivePet> {
-    //         use ankql::selection::filter::{FilterIterator, FilterResult};
-
-    //         let records = self.records.lock().unwrap();
-    //         FilterIterator::new(records.iter().cloned(), predicate.clone())
-    //             .filter_map(|result| match result {
-    //                 FilterResult::Pass(record) => Some(record),
-    //                 _ => None,
-    //             })
-    //             .collect()
-    //     }
-    // }
-
-    #[test]
-    pub fn test_watch_index() {
-        let server = DummyEngine::new(vec![
-            Pet {
-                name: "Rex".to_string(),
-                age: "1".to_string(),
-            },
-            Pet {
-                name: "Snuffy".to_string(),
-                age: "2".to_string(),
-            },
-            Pet {
-                name: "Jasper".to_string(),
-                age: "4".to_string(),
-            },
-        ]);
-        let reactor = Arc::new(Reactor::new(server.clone()));
-
-        let predicate =
-            ankql::parser::parse_selection("name = 'Rex' OR age > 2 and age < 5").unwrap();
-
-        let sub_id = SubscriptionId::from(0);
-        reactor.add_index_watchers(sub_id, &predicate);
-
-        println!("watchers: {:#?}", reactor.index_watchers);
-
-        // Check to see if the index watchers are populated correctly
-        let iw = &reactor.index_watchers;
-        let name = FieldId("name".to_string());
-        let age = FieldId("age".to_string());
-
-        // Check name = 'Rex'
-        assert_eq!(
-            iw.get(&name).map(|i| {
-                assert_eq!(i.eq.len(), 1);
-                i.find_matching(Value::String("Rex".to_string()))
-            }),
-            Some(vec![sub_id])
-        );
-
-        // Check age > 2
-        assert_eq!(
-            iw.get(&age).map(|i| {
-                assert_eq!(i.gt.len(), 1);
-                i.find_matching(Value::Integer(3))
-            }),
-            Some(vec![sub_id])
-        );
-
-        // Check age < 5
-        assert_eq!(
-            iw.get(&age).map(|i| {
-                assert_eq!(i.lt.len(), 1);
-                i.find_matching(Value::Integer(4))
-            }),
-            Some(vec![sub_id])
-        );
-    }
-
-    #[test]
-    fn test_subscription_and_notification() {
-        println!("MARK 1: Creating server");
-        let server = DummyEngine::new(vec![
-            Pet {
-                name: "Rex".to_string(),
-                age: "1".to_string(),
-            },
-            Pet {
-                name: "Snuffy".to_string(),
-                age: "2".to_string(),
-            },
-            Pet {
-                name: "Jasper".to_string(),
-                age: "6".to_string(),
-            },
-        ]);
-        println!("MARK 2: Creating reactor");
-        let reactor = Reactor::new(server.clone());
-        server.set_reactor(&reactor);
-
-        println!("MARK 3: Setting up changesets");
-        let received_changesets = Arc::new(Mutex::new(Vec::new()));
-        let received_changesets_clone = received_changesets.clone();
-        let check_received = move || {
-            let mut changesets = received_changesets.lock().unwrap();
-            let result: Vec<(Vec<PetUpdate>, RecordChangeKind)> = (*changesets)
-                .iter()
-                .map(|c: &ChangeSet<ActivePet, PetUpdate>| {
-                    (c.changes[0].updates.clone(), c.changes[0].kind.clone())
-                })
-                .collect();
-            changesets.clear();
-            result
-        };
-
-        println!("MARK 4: Creating subscription");
-        let predicate =
-            ankql::parser::parse_selection("name = 'Rex' OR (age > 2 and age < 5)").unwrap();
-        let _handle = reactor
-            .subscribe(&predicate, move |changeset| {
-                println!("MARK 5: Callback received");
-                let mut received = received_changesets_clone.lock().unwrap();
-                received.push(changeset);
-            })
-            .unwrap();
-
-        println!("MARK 6: Getting Rex's record");
-        let rex = server.get(1).expect("Rex should exist");
-        assert_eq!(
-            TestRecord::value(&rex, "name").unwrap(),
-            Value::String("Rex".to_string())
-        );
-
-        let snuffy = server.get(2).expect("Snuffy should exist");
-        assert_eq!(
-            TestRecord::value(&snuffy, "name").unwrap(),
-            Value::String("Snuffy".to_string())
-        );
-
-        let jasper = server.get(3).expect("Jasper should exist");
-        assert_eq!(
-            TestRecord::value(&jasper, "name").unwrap(),
-            Value::String("Jasper".to_string())
-        );
-
-        println!("MARK 7: Verifying initial state");
-        {
-            let received = check_received();
-            assert_eq!(received, vec![(vec![], RecordChangeKind::Add)]);
-        }
-
-        println!("MARK 9: Updating Rex's age");
-        rex.set_age(7);
-
-        // should have recieved one changeset with updates [PetUpdate::Age(7)] and kind RecordChangeKind::Edit
-        assert_eq!(
-            check_received(),
-            vec![(
-                vec![PetUpdate::Age(7)],
-                RecordChangeKind::Edit // it's an edit because it was already matching
-                                       // rex always shows up because he's an OR predicate by name
-            )]
-        );
-
-        // snuffy turns 3
-        snuffy.set_age(3);
-        assert_eq!(
-            check_received(),
-            vec![(
-                vec![PetUpdate::Age(3)],
-                RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
-            )]
-        );
-
-        // turns out we had Jasper's age wrong, he's actually 4
-        jasper.set_age(4);
-        assert_eq!(
-            check_received(),
-            vec![(
-                vec![PetUpdate::Age(4)],
-                RecordChangeKind::Add // It's an add because it formerly didn't match the predicate
-            )]
-        );
-
-        // snuffy and jasper turn 5 and 6
-        snuffy.set_age(5);
-        jasper.set_age(6);
-
-        // we should have received two changesets with a remove and an add
-        assert_eq!(
-            check_received(),
-            vec![
-                (vec![PetUpdate::Age(5)], RecordChangeKind::Remove),
-                (vec![PetUpdate::Age(6)], RecordChangeKind::Remove)
-            ]
-        );
     }
 }

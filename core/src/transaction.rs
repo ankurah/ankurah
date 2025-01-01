@@ -119,6 +119,21 @@ impl Transaction {
         tracing::info!("trx.rollback");
         self.consumed = true; // just do nothing on drop
     }
+
+    // TODO: Implement delete functionality after core query/edit operations are stable
+    // For now, "removal" from result sets is handled by edits that cause records to no longer match queries
+    /*
+    pub async fn delete<'rec, 'trx: 'rec, M: Model>(
+        &'trx self,
+        id: impl Into<ID>,
+    ) -> Result<(), crate::error::RetrievalError> {
+        let id = id.into();
+        let record = self.fetch_record(id, M::bucket_name()).await?;
+        let record = Arc::new(record.clone());
+        self.node.delete_record(record).await?;
+        Ok(())
+    }
+    */
 }
 
 impl Drop for Transaction {
