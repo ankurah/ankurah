@@ -136,8 +136,7 @@ async fn process_message(
                                 let peer_sender =
                                     WebSocketPeerSender::new(presence.node_id, ws_sender);
 
-                                node.register_peer_sender(Box::new(peer_sender.clone()))
-                                    .await;
+                                node.register_peer(Box::new(peer_sender.clone())).await;
                                 *sender = SenderKind::Peer(peer_sender);
                             }
                         }

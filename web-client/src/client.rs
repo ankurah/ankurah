@@ -148,10 +148,7 @@ impl Inner {
                     let connection = connection.clone();
                     spawn_local(async move {
                         info!("Effect 2.3");
-                        self_clone
-                            .node
-                            .register_peer_sender(Box::new(connection))
-                            .await;
+                        self_clone.node.register_peer(Box::new(connection)).await;
                     });
                 }
             });
@@ -159,11 +156,9 @@ impl Inner {
 
         *self.connection.borrow_mut() = Some((connection, owner));
 
-        self.state.set(
-            ConnectionState::Connecting {
-                url: self.server_url.clone(),
-            },
-        );
+        self.state.set(ConnectionState::Connecting {
+            url: self.server_url.clone(),
+        });
 
         info!("Connecting to websocket");
         Ok(())

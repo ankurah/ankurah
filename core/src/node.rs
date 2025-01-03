@@ -19,10 +19,9 @@ use crate::{
 };
 use tracing::{debug, info};
 
-// stub
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
-    subscriptions: BTreeMap<String, Vec<SubscriptionHandle>>,
+    subscriptions: BTreeMap<proto::SubscriptionId, Vec<SubscriptionHandle>>,
 }
 
 /// Manager for all records and their properties on this client.
@@ -41,7 +40,7 @@ pub struct Node {
     //records: Arc<RwLock<BTreeMap<(ID, &'static str), Weak<dyn ScopedRecord>>>>,
     records: Arc<RwLock<NodeRecords>>,
     // peer_connections: Vec<PeerConnection>,
-    peer_connections: tokio::sync::RwLock<BTreeMap<proto::NodeId, Box<dyn PeerSender>>>,
+    peer_connections: tokio::sync::RwLock<BTreeMap<proto::NodeId, PeerState>>,
     pending_requests:
         tokio::sync::RwLock<BTreeMap<proto::RequestId, oneshot::Sender<proto::NodeResponseBody>>>,
 
@@ -65,14 +64,20 @@ impl Node {
         }
     }
 
-    pub async fn register_peer_sender(&self, sender: Box<dyn PeerSender>) {
+    pub async fn register_peer(&self, sender: Box<dyn PeerSender>) {
         info!("node.register_peer_sender 1");
         let mut peer_connections = self.peer_connections.write().await;
-        peer_connections.insert(sender.node_id(), sender);
+        peer_connections.insert(
+            sender.node_id(),
+            PeerState {
+                sender,
+                subscriptions: BTreeMap::new(),
+            },
+        );
         info!("node.register_peer_sender 2");
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
-    pub async fn deregister_peer_sender(&self, node_id: proto::NodeId) {
+    pub async fn deregister_peer(&self, node_id: proto::NodeId) {
         let mut peer_connections = self.peer_connections.write().await;
         peer_connections.remove(&node_id);
     }
@@ -105,6 +110,7 @@ impl Node {
             let connection = peer_connections
                 .get(&node_id)
                 .ok_or_else(|| anyhow!("No connection to peer"))?
+                .sender
                 .cloned();
 
             drop(peer_connections);
@@ -139,7 +145,9 @@ impl Node {
                 // double check to make sure we have a connection to the peer based on the node id
                 if let Some(sender) = {
                     let peer_connections = self.peer_connections.read().await;
-                    peer_connections.get(&request.from).map(|c| c.cloned())
+                    peer_connections
+                        .get(&request.from)
+                        .map(|c| c.sender.cloned())
                 } {
                     let from = request.from.clone();
                     let to = request.to.clone();

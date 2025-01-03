@@ -46,13 +46,13 @@ impl LocalProcessConnection {
 
         // we have to register the senders with the nodes
         node1
-            .register_peer_sender(Box::new(LocalProcessSender {
+            .register_peer(Box::new(LocalProcessSender {
                 node_id: node2.id.clone(),
                 sender: node2_tx,
             }))
             .await;
         node2
-            .register_peer_sender(Box::new(LocalProcessSender {
+            .register_peer(Box::new(LocalProcessSender {
                 node_id: node1.id.clone(),
                 sender: node1_tx,
             }))
