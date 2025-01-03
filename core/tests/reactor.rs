@@ -55,7 +55,7 @@ async fn test_subscription_and_notification() -> Result<()> {
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
     let _handle = client
-        .subscribe(Album::bucket_name(), &predicate, move |changeset| {
+        .subscribe(Album::bucket_name(), predicate, move |changeset| {
             let mut received = received_changesets_clone.lock().unwrap();
             received.push(changeset);
         })
@@ -97,83 +97,90 @@ async fn test_complex_subscription_conditions() {
     // Create a new node
     let node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
-    // Set up a subscription to watch for records with name = 'Rex' OR (age > 2 and age < 5)
-    let predicate =
-        ankql::parser::parse_selection("name = 'Rex' OR (age > 2 and age < 5)").unwrap();
-
     // Track received changesets
-    let received_changesets = Arc::new(Mutex::new(Vec::new()));
-    let received_changesets_clone = received_changesets.clone();
+    let received = Arc::new(Mutex::new(Vec::new()));
 
     // Helper function to check received changesets
-    let check_received = move || {
-        let mut changesets = received_changesets.lock().unwrap();
-        let result: Vec<RecordChangeKind> = (*changesets)
-            .iter()
-            .flat_map(|c: &ChangeSet| c.changes.iter().map(|change| change.kind.clone()))
-            .collect();
-        changesets.clear();
-        result
+    let check_received = {
+        let received = received.clone();
+        move || {
+            let mut changesets = received.lock().unwrap();
+            let result: Vec<RecordChangeKind> = (*changesets)
+                .iter()
+                .flat_map(|c: &ChangeSet| c.changes.iter().map(|change| change.kind.clone()))
+                .collect();
+            changesets.clear();
+            result
+        }
     };
 
     // Subscribe to changes
     let _handle = node
-        .subscribe("pets", &predicate, move |changeset| {
-            let mut received = received_changesets_clone.lock().unwrap();
-            received.push(changeset);
-        })
+        .subscribe(
+            "pets",
+            "name = 'Rex' OR (age > 2 and age < 5)",
+            move |changeset| {
+                let mut received = received.lock().unwrap();
+                received.push(changeset);
+            },
+        )
         .await
         .unwrap();
 
-    // Create some test records
-    let trx = node.begin();
-    let rex = trx
-        .create(&Pet {
-            name: "Rex".to_string(),
-            age: "1".to_string(),
-        })
-        .await;
-    let rex = rex.read();
+    let (rex, snuffy, jasper);
+    {
+        // Create some test records
+        let trx = node.begin();
+        rex = trx
+            .create(&Pet {
+                name: "Rex".to_string(),
+                age: "1".to_string(),
+            })
+            .await
+            .read();
 
-    let snuffy = trx
-        .create(&Pet {
-            name: "Snuffy".to_string(),
-            age: "2".to_string(),
-        })
-        .await;
-    let snuffy = snuffy.read();
+        snuffy = trx
+            .create(&Pet {
+                name: "Snuffy".to_string(),
+                age: "2".to_string(),
+            })
+            .await
+            .read();
 
-    let jasper = trx
-        .create(&Pet {
-            name: "Jasper".to_string(),
-            age: "6".to_string(),
-        })
-        .await;
-    let jasper = jasper.read();
+        jasper = trx
+            .create(&Pet {
+                name: "Jasper".to_string(),
+                age: "6".to_string(),
+            })
+            .await
+            .read();
 
-    trx.commit().await.unwrap();
+        trx.commit().await.unwrap();
+    };
 
     // Verify initial state
     let received = check_received();
     assert_eq!(received.len(), 1); // Should have received one changeset for Rex (matches by name)
     assert_eq!(received[0], RecordChangeKind::Add); // Initial state should be an Add
 
-    // Update Rex's age to 7
-    let trx = node.begin();
-    let mut rex_edit = rex.edit(&trx).await.unwrap();
-    rex_edit.age().overwrite(0, 1, "7");
-    trx.commit().await.unwrap();
+    {
+        // Update Rex's age to 7
+        let trx = node.begin();
+        rex.edit(&trx).await.unwrap().age().overwrite(0, 1, "7");
+        trx.commit().await.unwrap();
+    }
 
     // Verify Rex's update was received
     let received = check_received();
     assert_eq!(received.len(), 1); // Should have received one changeset for Rex's age change
     assert_eq!(received[0], RecordChangeKind::Edit);
 
-    // Update Snuffy's age to 3
-    let trx = node.begin();
-    let mut snuffy_edit = snuffy.edit(&trx).await.unwrap();
-    snuffy_edit.age().overwrite(0, 1, "3");
-    trx.commit().await.unwrap();
+    {
+        // Update Snuffy's age to 3
+        let trx = node.begin();
+        snuffy.edit(&trx).await.unwrap().age().overwrite(0, 1, "3");
+        trx.commit().await.unwrap();
+    }
 
     // Verify Snuffy's update was received (now matches age > 2 and age < 5)
     let received = check_received();
@@ -181,10 +188,12 @@ async fn test_complex_subscription_conditions() {
     assert_eq!(received[0], RecordChangeKind::Add);
 
     // Update Jasper's age to 4
-    let trx = node.begin();
-    let mut jasper_edit = jasper.edit(&trx).await.unwrap();
-    jasper_edit.age().overwrite(0, 1, "4");
-    trx.commit().await.unwrap();
+
+    {
+        let trx = node.begin();
+        jasper.edit(&trx).await.unwrap().age().overwrite(0, 1, "4");
+        trx.commit().await.unwrap();
+    }
 
     // Verify Jasper's update was received (now matches age > 2 and age < 5)
     let received = check_received();

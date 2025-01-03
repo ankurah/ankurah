@@ -49,7 +49,7 @@ impl Reactor {
     pub async fn subscribe<F>(
         self: &Arc<Self>,
         bucket_name: &str,
-        predicate: &ast::Predicate,
+        predicate: ast::Predicate,
         callback: F,
     ) -> Result<SubscriptionHandle>
     where
@@ -61,12 +61,12 @@ impl Reactor {
             .into();
 
         // Start watching the relevant indexes
-        self.add_index_watchers(sub_id, predicate);
+        self.add_index_watchers(sub_id, &predicate);
 
         // Find initial matching records
         let states = self
             .storage
-            .fetch_states(bucket_name.to_string(), predicate)
+            .fetch_states(bucket_name.to_string(), &predicate)
             .await?;
         let mut matching_records = Vec::new();
 
@@ -86,7 +86,7 @@ impl Reactor {
         // Create subscription with initial matching records
         let subscription = Arc::new(Subscription {
             id: sub_id,
-            predicate: predicate.clone(),
+            predicate,
             callback: Arc::new(Box::new(callback)),
             matching_records: std::sync::Mutex::new(matching_records.clone()),
         });
