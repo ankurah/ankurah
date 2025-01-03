@@ -4,14 +4,14 @@ use ankurah_core::connector::local_process::LocalProcessConnection;
 use ankurah_core::node::Node;
 use ankurah_core::storage::SledStorageEngine;
 use anyhow::Result;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ankurah_core::changes::RecordChangeKind;
 use ankurah_core::model::ScopedRecord;
-use common::{Album, AlbumRecord, Pet, PetRecord};
+use common::{Album, AlbumRecord, Pet};
 
 #[tokio::test]
-async fn basic_inter_node() -> Result<()> {
+async fn inter_node_fetch() -> Result<()> {
     let remote_node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
     let local_node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
@@ -19,7 +19,7 @@ async fn basic_inter_node() -> Result<()> {
 
     {
         let trx = local_node.begin();
-        let album = trx
+        let _album = trx
             .create(&Album {
                 name: "Walking on a Dream".into(),
                 year: "2008".into(),
@@ -81,7 +81,7 @@ async fn basic_inter_node() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_inter_node_subscription() -> Result<()> {
+async fn inter_node_subscription() -> Result<()> {
     // Create two nodes
     let node1 = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
     let node2 = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));

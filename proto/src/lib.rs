@@ -10,7 +10,7 @@ use ankql::ast;
 pub use record_id::ID;
 
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Deref};
+use std::collections::BTreeMap;
 
 use ulid::Ulid;
 

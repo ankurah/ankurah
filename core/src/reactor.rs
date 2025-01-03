@@ -7,7 +7,6 @@ use ankql::ast;
 use ankql::selection::filter::Filterable;
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use ankurah_proto as proto;

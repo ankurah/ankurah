@@ -1,9 +1,6 @@
 use crate::{changes::ChangeSet, model::RecordInner};
 use ankurah_proto as proto;
-use std::{
-    ops::Deref,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 /// A callback function that receives subscription updates
 pub type Callback = Box<dyn Fn(ChangeSet) + Send + Sync + 'static>;

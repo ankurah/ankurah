@@ -375,34 +375,34 @@ impl Node {
         Ok(())
     }
 
-    /// Create a new record and notify subscribers
-    pub(crate) async fn create_record(
-        self: &Arc<Self>,
-        record: Arc<RecordInner>,
-    ) -> anyhow::Result<()> {
-        // Store the record
-        let record_state = record.to_record_state()?;
-        self.bucket(record.bucket_name())
-            .await
-            .set_record(record.id(), &record_state)
-            .await?;
+    // /// Create a new record and notify subscribers
+    // pub(crate) async fn create_record(
+    //     self: &Arc<Self>,
+    //     record: Arc<RecordInner>,
+    // ) -> anyhow::Result<()> {
+    //     // Store the record
+    //     let record_state = record.to_record_state()?;
+    //     self.bucket(record.bucket_name())
+    //         .await
+    //         .set_record(record.id(), &record_state)
+    //         .await?;
 
-        // Add to node's records
-        let _ = self.add_record(&record).await;
+    //     // Add to node's records
+    //     let _ = self.add_record(&record).await;
 
-        // Notify subscribers about the creation
-        let change = RecordChange {
-            record: record.clone(),
-            updates: vec![], // The record was just created, so no updates yet
-            kind: RecordChangeKind::Add,
-        };
-        let changeset = ChangeSet {
-            changes: vec![change],
-        };
-        self.reactor.notify_change(changeset);
+    //     // Notify subscribers about the creation
+    //     let change = RecordChange {
+    //         record: record.clone(),
+    //         updates: vec![], // The record was just created, so no updates yet
+    //         kind: RecordChangeKind::Add,
+    //     };
+    //     let changeset = ChangeSet {
+    //         changes: vec![change],
+    //     };
+    //     self.reactor.notify_change(changeset);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     // /// Delete a record and notify subscribers
     // pub(crate) async fn delete_record(
@@ -434,31 +434,31 @@ impl Node {
     // }
 
     /// Update a record and notify subscribers
-    pub(crate) async fn update_record(
-        self: &Arc<Self>,
-        record: Arc<RecordInner>,
-        events: Vec<proto::RecordEvent>,
-    ) -> anyhow::Result<()> {
-        // Store the record
-        let record_state = record.to_record_state()?;
-        self.bucket(record.bucket_name())
-            .await
-            .set_record(record.id(), &record_state)
-            .await?;
+    // pub(crate) async fn update_record(
+    //     self: &Arc<Self>,
+    //     record: Arc<RecordInner>,
+    //     events: Vec<proto::RecordEvent>,
+    // ) -> anyhow::Result<()> {
+    //     // Store the record
+    //     let record_state = record.to_record_state()?;
+    //     self.bucket(record.bucket_name())
+    //         .await
+    //         .set_record(record.id(), &record_state)
+    //         .await?;
 
-        // Notify subscribers
-        let change = RecordChange {
-            record: record.clone(),
-            updates: events,
-            kind: RecordChangeKind::Edit,
-        };
-        let changeset = ChangeSet {
-            changes: vec![change],
-        };
-        self.reactor.notify_change(changeset);
+    //     // Notify subscribers
+    //     let change = RecordChange {
+    //         record: record.clone(),
+    //         updates: events,
+    //         kind: RecordChangeKind::Edit,
+    //     };
+    //     let changeset = ChangeSet {
+    //         changes: vec![change],
+    //     };
+    //     self.reactor.notify_change(changeset);
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     /// Apply events to local state buffer and broadcast to peers.
     pub async fn commit_events(
@@ -553,23 +553,23 @@ impl Node {
     }
 
     /// Grab the record state if it exists and create a new [`RecordInner`] based on that.
-    pub(crate) async fn fetch_record_from_storage(
-        &self,
-        id: proto::ID,
-        bucket_name: &str,
-    ) -> Result<RecordInner, RetrievalError> {
-        match self.get_record_state(id, bucket_name).await {
-            Ok(record_state) => {
-                // info!("fetched record state: {:?}", record_state);
-                RecordInner::from_record_state(id, bucket_name, &record_state)
-            }
-            Err(RetrievalError::NotFound(id)) => {
-                // info!("ID not found, creating new record");
-                Ok(RecordInner::new(id, bucket_name.to_string()))
-            }
-            Err(err) => Err(err),
-        }
-    }
+    // pub(crate) async fn fetch_record_from_storage(
+    //     &self,
+    //     id: proto::ID,
+    //     bucket_name: &str,
+    // ) -> Result<RecordInner, RetrievalError> {
+    //     match self.get_record_state(id, bucket_name).await {
+    //         Ok(record_state) => {
+    //             // info!("fetched record state: {:?}", record_state);
+    //             RecordInner::from_record_state(id, bucket_name, &record_state)
+    //         }
+    //         Err(RetrievalError::NotFound(id)) => {
+    //             // info!("ID not found, creating new record");
+    //             Ok(RecordInner::new(id, bucket_name.to_string()))
+    //         }
+    //         Err(err) => Err(err),
+    //     }
+    // }
 
     /// Fetch a record.
     pub async fn fetch_record_inner(
