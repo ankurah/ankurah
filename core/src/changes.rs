@@ -2,14 +2,6 @@ use crate::model::RecordInner;
 use ankurah_proto::RecordEvent;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum RecordChangeKind {
-    Initial,
-    Add,
-    Remove,
-    Edit,
-}
-
 /// Represents a change in the record set
 #[derive(Debug, Clone)]
 pub enum RecordChange {

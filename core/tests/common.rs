@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tracing::Level;
 
 use ankurah_core::{
-    changes::{ChangeSet, RecordChange, RecordChangeKind},
+    changes::{ChangeSet, RecordChange},
     property::value::YrsString,
 };
 use ankurah_derive::Model;
@@ -35,9 +35,28 @@ fn init_tracing() {
         .init();
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeKind {
+    Initial,
+    Add,
+    Remove,
+    Edit,
+}
+
+impl From<&RecordChange> for ChangeKind {
+    fn from(change: &RecordChange) -> Self {
+        match change {
+            RecordChange::Initial { .. } => ChangeKind::Initial,
+            RecordChange::Add { .. } => ChangeKind::Add,
+            RecordChange::Remove { .. } => ChangeKind::Remove,
+            RecordChange::Update { .. } => ChangeKind::Edit,
+        }
+    }
+}
+
 pub fn changeset_watcher() -> (
     Box<dyn Fn(ChangeSet) + Send + Sync>,
-    Box<dyn Fn() -> Vec<RecordChangeKind>>,
+    Box<dyn Fn() -> Vec<ChangeKind>>,
 ) {
     let (tx, rx) = mpsc::channel();
     let watcher = Box::new(move |changeset: ChangeSet| {
@@ -46,7 +65,7 @@ pub fn changeset_watcher() -> (
 
     let check = Box::new(move || {
         match rx.try_recv() {
-            Ok(changeset) => changeset.changes.iter().map(|c| c.kind()).collect(),
+            Ok(changeset) => changeset.changes.iter().map(|c| c.into()).collect(),
             Err(_) => vec![], // Return empty vec instead of panicking
         }
     });
