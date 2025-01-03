@@ -13,15 +13,17 @@ use common::{Album, AlbumRecord, Pet};
 
 use common::ChangeKind;
 
+pub fn names(resultset: ResultSet<AlbumRecord>) -> Vec<String> {
+    resultset.records.iter().map(|r| r.name()).collect::<Vec<String>>()
+}
+
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
-    let remote_node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
-    let local_node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
-
-    let _conn = LocalProcessConnection::new(&local_node, &remote_node).await?;
+    let node1 = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let node2 = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     {
-        let trx = local_node.begin();
+        let trx = node1.begin();
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
         trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
         trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
@@ -29,24 +31,18 @@ async fn inter_node_fetch() -> Result<()> {
         trx.commit().await?;
     };
 
-    {
-        let albums: ResultSet<AlbumRecord> = local_node.fetch("name = 'Walking on a Dream'").await?;
+    let p = "name = 'Walking on a Dream'";
+    // Should already be on node1
+    assert_eq!(names(node1.fetch(p).await?), ["Walking on a Dream"]);
 
-        assert_eq!(
-            albums.records.iter().map(|active_record| active_record.name()).collect::<Vec<String>>(),
-            vec!["Walking on a Dream".to_string()]
-        );
-    }
+    // But node2 because they arent connected
+    assert_eq!(names(node2.fetch(p).await?), [] as [&str; 0]);
 
-    // mock server - The next step is to make this work:
-    {
-        let albums: ankurah_core::resultset::ResultSet<AlbumRecord> = remote_node.fetch("name = 'Walking on a Dream'").await?;
+    // Connect the nodes
+    let _conn = LocalProcessConnection::new(&node1, &node2).await?;
 
-        assert_eq!(
-            albums.records.iter().map(|active_record| active_record.name()).collect::<Vec<String>>(),
-            vec!["Walking on a Dream".to_string()]
-        );
-    }
+    // Now node2 should now successfully fetch the record
+    assert_eq!(names(node2.fetch(p).await?), ["Walking on a Dream"]);
 
     Ok(())
 }

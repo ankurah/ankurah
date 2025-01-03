@@ -1,5 +1,3 @@
-
-
 use crate::ast;
 use crate::error::ParseError;
 use crate::grammar;
@@ -287,19 +285,6 @@ fn parse_number(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
         .map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse number: {}", e)))?;
 
     Ok(ast::Expr::Literal(ast::Literal::Integer(num)))
-}
-
-impl TryInto<ast::Predicate> for ast::Expr {
-    type Error = ParseError;
-
-    fn try_into(self) -> Result<ast::Predicate, Self::Error> {
-        match self {
-            ast::Expr::Predicate(p) => Ok(p),
-            _ => Err(ParseError::InvalidPredicate(
-                "Expression is not a predicate".into(),
-            )),
-        }
-    }
 }
 
 #[cfg(test)]

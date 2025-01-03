@@ -46,6 +46,7 @@ pub struct Node {
 
     /// The reactor for handling subscriptions
     reactor: Arc<Reactor>,
+    durable: bool,
 }
 
 type NodeRecords = BTreeMap<(proto::ID, String), Weak<RecordInner>>;
@@ -61,6 +62,20 @@ impl Node {
             peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
             reactor,
+            durable: false,
+        }
+    }
+    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Self {
+        let reactor = Reactor::new(engine.clone());
+        Self {
+            id: proto::NodeId::new(),
+            storage_engine: engine,
+            collections: RwLock::new(BTreeMap::new()),
+            records: Arc::new(RwLock::new(BTreeMap::new())),
+            peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
+            pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
+            reactor,
+            durable: true,
         }
     }
 
@@ -639,13 +654,16 @@ impl Node {
         Ok(R::from_record_inner(record_inner))
     }
 
-    pub async fn fetch<R: Record>(&self, predicate_str: &str) -> anyhow::Result<ResultSet<R>> {
+    pub async fn fetch<R: Record>(
+        &self,
+        predicate: impl TryInto<ankql::ast::Predicate, Error = ankql::error::ParseError>,
+    ) -> anyhow::Result<ResultSet<R>> {
+        let predicate = predicate
+            .try_into()
+            .map_err(|e| anyhow!("Failed to parse predicate: {:?}", e))?;
+
         use crate::model::Model;
         let collection_name = R::Model::bucket_name();
-
-        // Parse the predicate
-        let predicate = ankql::parser::parse_selection(predicate_str)
-            .map_err(|e| anyhow!("Failed to parse predicate: {}", e))?;
 
         // Fetch raw states from storage
         let states = self
