@@ -12,8 +12,7 @@ mod common;
 use common::{Album, AlbumRecord, Pet, PetRecord};
 
 #[tokio::test]
-async fn test_subscription_and_notification() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
+async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     // Create some initial records
@@ -85,7 +84,7 @@ async fn test_subscription_and_notification() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-async fn test_complex_subscription_conditions() {
+async fn complex_local_subscription() {
     // Create a new node
     let node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
     let (watcher, check) = common::changeset_watcher();
