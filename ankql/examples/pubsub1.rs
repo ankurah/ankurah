@@ -2,8 +2,8 @@ use ankql::ast::Predicate;
 use ankql::parser::parse_selection;
 use ankql::selection::filter::{FilterIterator, FilterResult, Filterable};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicUsize as AtomicId};
+use std::sync::Arc;
 
 /// A callback function that receives subscription updates
 type Callback = Box<dyn Fn(Op, Vec<TestRecord>)>;
