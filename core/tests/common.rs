@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use tracing::Level;
 
 use ankurah_core::{
-    changes::{ChangeSet, RecordChangeKind},
+    changes::{ChangeSet, RecordChange, RecordChangeKind},
     property::value::YrsString,
 };
 use ankurah_derive::Model;
 use serde::{Deserialize, Serialize};
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, Model)]
 pub struct Pet {
@@ -17,7 +18,7 @@ pub struct Pet {
     pub age: String,
 }
 
-#[derive(Model, Debug, Serialize, Deserialize)] // This line now uses the Model derive macro
+#[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Album {
     #[active_value(YrsString)]
     pub name: String,
@@ -34,28 +35,21 @@ fn init_tracing() {
         .init();
 }
 
-pub fn changeset_watcher() -> (impl Fn(ChangeSet), impl Fn() -> Vec<RecordChangeKind>) {
-    // Track received changesets
-    let received = Arc::new(Mutex::new(Vec::new()));
+pub fn changeset_watcher() -> (
+    Box<dyn Fn(ChangeSet) + Send + Sync>,
+    Box<dyn Fn() -> Vec<RecordChangeKind>>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let watcher = Box::new(move |changeset: ChangeSet| {
+        tx.send(changeset).unwrap();
+    });
 
-    // Helper function to check received changesets
-    let check_received = {
-        let received = received.clone();
-        move || {
-            let mut changesets = received.lock().unwrap();
-            let result: Vec<RecordChangeKind> = (*changesets)
-                .iter()
-                .flat_map(|c: &ChangeSet| c.changes.iter().map(|change| change.kind.clone()))
-                .collect();
-            changesets.clear();
-            result
+    let check = Box::new(move || {
+        match rx.try_recv() {
+            Ok(changeset) => changeset.changes.iter().map(|c| c.kind()).collect(),
+            Err(_) => vec![], // Return empty vec instead of panicking
         }
-    };
+    });
 
-    let watcher = move |changeset| {
-        let mut received = received.lock().unwrap();
-        received.push(changeset);
-    };
-
-    (watcher, check_received)
+    (watcher, check)
 }

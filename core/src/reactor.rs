@@ -63,17 +63,21 @@ impl Reactor {
             .await?;
         let mut matching_records = Vec::new();
 
-        // Convert states to RecordInner
+        // Convert states to RecordInner and filter by predicate
         for (id, state) in states {
             let record = crate::model::RecordInner::from_record_state(id, bucket_name, &state)?;
             let record = Arc::new(record);
-            matching_records.push(record.clone());
 
-            // Set up record watchers
-            self.record_watchers
-                .entry(record.id())
-                .or_default()
-                .push(sub_id);
+            // Evaluate predicate for each record
+            if ankql::selection::filter::evaluate_predicate(&*record, &predicate).unwrap_or(false) {
+                matching_records.push(record.clone());
+
+                // Set up record watchers
+                self.record_watchers
+                    .entry(record.id())
+                    .or_default()
+                    .push(sub_id);
+            }
         }
 
         // Create subscription with initial matching records
@@ -88,16 +92,16 @@ impl Reactor {
         self.subscriptions.insert(sub_id, subscription.clone());
 
         // Call callback with initial state
-        (subscription.callback)(ChangeSet {
-            changes: matching_records
-                .into_iter()
-                .map(|record| RecordChange {
-                    record,
-                    kind: RecordChangeKind::Add,
-                    updates: vec![],
-                })
-                .collect(),
-        });
+        if !matching_records.is_empty() {
+            (subscription.callback)(ChangeSet {
+                changes: matching_records
+                    .into_iter()
+                    .map(|record| RecordChange::Initial {
+                        record: record.clone(),
+                    })
+                    .collect(),
+            });
+        }
 
         Ok(SubscriptionHandle::new(self.clone(), sub_id))
     }
@@ -213,25 +217,30 @@ impl Reactor {
 
     /// Notify subscriptions about a record change
     pub fn notify_change(&self, changeset: ChangeSet) {
+        // Group changes by subscription
+        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<RecordChange>> =
+            std::collections::HashMap::new();
+
         for change in &changeset.changes {
             let mut possibly_interested_subs = HashSet::new();
 
             // Find subscriptions that might be interested based on index watchers
             for index_ref in self.index_watchers.iter() {
                 // Get the field value from the record
-                if let Some(field_value) = change.record.value(&index_ref.key().0) {
+                if let Some(field_value) = change.record().value(&index_ref.key().0) {
                     possibly_interested_subs
                         .extend(index_ref.find_matching(Value::String(field_value)));
                 }
             }
 
-            // TODO NOW - we should be creating one changeset per subscription, and populating it with the relevant changes from the input changeset
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
+                    let record = change.record();
+
                     // Use evaluate_predicate directly on the record instead of fetch_records
                     let matches = ankql::selection::filter::evaluate_predicate(
-                        &*change.record,
+                        &**record,
                         &subscription.predicate,
                     )
                     .unwrap_or(false);
@@ -241,37 +250,81 @@ impl Reactor {
                         .lock()
                         .unwrap()
                         .iter()
-                        .any(|r| r.id() == change.record.id());
+                        .any(|r| r.id() == record.id());
 
                     // Update record watchers and notify subscription if needed
-                    self.update_record_watchers(&change.record, matches, sub_id);
+                    self.update_record_watchers(record, matches, sub_id);
 
-                    // Only notify if the matching status changed
-                    if matches != did_match {
-                        let kind = if matches {
-                            RecordChangeKind::Add
+                    // Determine the change type
+                    let new_change = if matches != did_match {
+                        // Matching status changed
+                        Some(if matches {
+                            RecordChange::Add {
+                                record: record.clone(),
+                                events: match change {
+                                    RecordChange::Add {
+                                        events: updates, ..
+                                    }
+                                    | RecordChange::Update {
+                                        events: updates, ..
+                                    }
+                                    | RecordChange::Remove {
+                                        events: updates, ..
+                                    } => updates.clone(),
+                                    RecordChange::Initial { .. } => vec![],
+                                },
+                            }
                         } else {
-                            RecordChangeKind::Remove
-                        };
-
-                        (subscription.callback)(ChangeSet {
-                            changes: vec![RecordChange {
-                                record: change.record.clone(),
-                                kind,
-                                updates: change.updates.clone(),
-                            }],
-                        });
+                            RecordChange::Remove {
+                                record: record.clone(),
+                                events: match change {
+                                    RecordChange::Add {
+                                        events: updates, ..
+                                    }
+                                    | RecordChange::Update {
+                                        events: updates, ..
+                                    }
+                                    | RecordChange::Remove {
+                                        events: updates, ..
+                                    } => updates.clone(),
+                                    RecordChange::Initial { .. } => vec![],
+                                },
+                            }
+                        })
                     } else if matches {
-                        // Record still matches, so notify about the edit
-                        (subscription.callback)(ChangeSet {
-                            changes: vec![RecordChange {
-                                record: change.record.clone(),
-                                kind: RecordChangeKind::Edit,
-                                updates: change.updates.clone(),
-                            }],
-                        });
+                        // Record still matches but was updated
+                        Some(RecordChange::Update {
+                            record: record.clone(),
+                            events: match change {
+                                RecordChange::Add {
+                                    events: updates, ..
+                                }
+                                | RecordChange::Update {
+                                    events: updates, ..
+                                }
+                                | RecordChange::Remove {
+                                    events: updates, ..
+                                } => updates.clone(),
+                                RecordChange::Initial { .. } => vec![],
+                            },
+                        })
+                    } else {
+                        // Record didn't match before and still doesn't match
+                        None
+                    };
+
+                    // Add the change to the subscription's changes if there is one
+                    if let Some(new_change) = new_change {
+                        sub_changes.entry(sub_id).or_default().push(new_change);
                     }
                 }
+            }
+        }
+
+        // Send batched notifications
+        for (sub_id, changes) in sub_changes {
+            if let Some(subscription) = self.subscriptions.get(&sub_id) {
+                (subscription.callback)(ChangeSet { changes });
             }
         }
     }

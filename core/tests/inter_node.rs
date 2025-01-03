@@ -6,7 +6,7 @@ use ankurah_core::storage::SledStorageEngine;
 use anyhow::Result;
 use std::sync::Arc;
 
-use ankurah_core::changes::RecordChangeKind;
+use ankurah_core::changes::{RecordChange, RecordChangeKind};
 use ankurah_core::model::ScopedRecord;
 use common::{Album, AlbumRecord, Pet};
 
@@ -127,7 +127,8 @@ async fn inter_node_subscription() -> Result<()> {
         .await?;
 
     // Initial state should include Rex (name = 'Rex')
-    assert_eq!(check_node2(), [RecordChangeKind::Add]);
+    let changes = check_node2();
+    assert_eq!(changes, vec![RecordChangeKind::Initial]);
 
     // Update Rex's age to 7 on node1
     {
@@ -137,7 +138,8 @@ async fn inter_node_subscription() -> Result<()> {
     }
 
     // Should receive notification about Rex being removed (no longer matches either condition)
-    assert_eq!(check_node2(), [RecordChangeKind::Remove]);
+    let changes = check_node2();
+    assert_eq!(changes, vec![RecordChangeKind::Remove]);
 
     // Update Snuffy's age to 3 on node1
     {
@@ -147,7 +149,8 @@ async fn inter_node_subscription() -> Result<()> {
     }
 
     // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
-    assert_eq!(check_node2(), [RecordChangeKind::Add]);
+    let changes = check_node2();
+    assert_eq!(changes, vec![RecordChangeKind::Add]);
 
     Ok(())
 }

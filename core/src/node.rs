@@ -7,7 +7,7 @@ use std::{
 use tokio::sync::{oneshot, RwLock};
 
 use crate::{
-    changes::{ChangeSet, RecordChange, RecordChangeKind},
+    changes::{ChangeSet, RecordChange},
     connector::PeerSender,
     error::RetrievalError,
     model::{Record, RecordInner},
@@ -214,57 +214,8 @@ impl Node {
                 collection: bucket_name,
                 predicate,
             } => {
-                // First fetch initial state
-                let states: Vec<_> = self
-                    .storage_engine
-                    .fetch_states(bucket_name.clone(), &predicate)
-                    .await?
-                    .into_iter()
-                    .map(|(_, state)| state)
-                    .collect();
-
-                // Generate a new subscription ID
-                let subscription_id = proto::SubscriptionId::new();
-
-                // Set up subscription that forwards changes to the peer
-                let peer_id = request.from.clone();
-                let node = self.clone();
-                let handle = self
-                    .reactor
-                    .subscribe(&bucket_name, predicate, move |changeset| {
-                        // When changes occur, send them to the peer as CommitEvents
-                        let events: Vec<_> = changeset
-                            .changes
-                            .iter()
-                            .flat_map(|change| change.updates.clone())
-                            .collect();
-
-                        if !events.is_empty() {
-                            let node = node.clone();
-                            let peer_id = peer_id.clone();
-                            tokio::spawn(async move {
-                                let _ = node
-                                    .request(peer_id, proto::NodeRequestBody::CommitEvents(events))
-                                    .await;
-                            });
-                        }
-                    })
-                    .await?;
-
-                // Store the subscription handle
-                let mut peer_connections = self.peer_connections.write().await;
-                if let Some(peer_state) = peer_connections.get_mut(&request.from) {
-                    peer_state
-                        .subscriptions
-                        .entry(subscription_id)
-                        .or_insert_with(Vec::new)
-                        .push(handle);
-                }
-
-                Ok(proto::NodeResponseBody::Subscribe {
-                    initial: states,
-                    subscription_id,
-                })
+                self.handle_subscribe_request(request.from, bucket_name, predicate)
+                    .await
             }
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
                 // Remove and drop the subscription handle
@@ -275,6 +226,72 @@ impl Node {
                 Ok(proto::NodeResponseBody::Success)
             }
         }
+    }
+
+    async fn handle_subscribe_request(
+        self: &Arc<Self>,
+        peer_id: proto::NodeId,
+        bucket_name: String,
+        predicate: ankql::ast::Predicate,
+    ) -> anyhow::Result<proto::NodeResponseBody> {
+        // First fetch initial state
+        let states = self
+            .storage_engine
+            .fetch_states(bucket_name.clone(), &predicate)
+            .await?;
+
+        // Set up subscription that forwards changes to the peer
+        let node = self.clone();
+        let handle = {
+            let peer_id = peer_id.clone();
+            self.reactor
+                .subscribe(&bucket_name, predicate, move |changeset| {
+                    // When changes occur, send them to the peer as CommitEvents
+                    let events: Vec<_> = changeset
+                        .changes
+                        .iter()
+                        .flat_map(|change| match change {
+                            RecordChange::Add {
+                                events: updates, ..
+                            }
+                            | RecordChange::Update {
+                                events: updates, ..
+                            }
+                            | RecordChange::Remove {
+                                events: updates, ..
+                            } => updates.clone(),
+                            RecordChange::Initial { .. } => vec![],
+                        })
+                        .collect();
+
+                    if !events.is_empty() {
+                        let node = node.clone();
+                        let peer_id = peer_id.clone();
+                        tokio::spawn(async move {
+                            let _ = node
+                                .request(peer_id, proto::NodeRequestBody::CommitEvents(events))
+                                .await;
+                        });
+                    }
+                })
+                .await?
+        };
+
+        let subscription_id = handle.id.clone();
+        // Store the subscription handle
+        let mut peer_connections = self.peer_connections.write().await;
+        if let Some(peer_state) = peer_connections.get_mut(&peer_id) {
+            peer_state
+                .subscriptions
+                .entry(handle.id)
+                .or_insert_with(Vec::new)
+                .push(handle);
+        }
+
+        Ok(proto::NodeResponseBody::Subscribe {
+            initial: states.into_iter().map(|(_, state)| state).collect(),
+            subscription_id,
+        })
     }
 
     pub async fn bucket(&self, name: &str) -> Bucket {
@@ -353,19 +370,20 @@ impl Node {
                 .await?;
             debug!("node.commit_events_local 6: done");
 
-            // Determine the kind of change
-            let kind = if !existed {
-                RecordChangeKind::Add
-            } else {
-                RecordChangeKind::Edit
-            };
-
+            // TODO: I think we probably want to use different kinds of RecordChange for commit vs subscription
+            // because Inital doesn't make sense for commit (or does it? thinking emoji face)
             // Collect the change
-            changes.push(RecordChange {
-                record: record.clone(),
-                updates: events.clone(),
-                kind,
-            });
+            if !existed {
+                changes.push(RecordChange::Add {
+                    record: record.clone(),
+                    events: vec![record_event.clone()],
+                });
+            } else {
+                changes.push(RecordChange::Update {
+                    record: record.clone(),
+                    events: vec![record_event.clone()],
+                });
+            }
         }
 
         // Notify reactor with a single changeset containing all changes
@@ -578,6 +596,7 @@ impl Node {
         bucket_name: &str,
     ) -> Result<(Arc<RecordInner>, bool), RetrievalError> {
         debug!("fetch_record {:?}-{:?}", id, bucket_name);
+
         if let Some(local) = self.fetch_record_from_node(id, bucket_name).await {
             info!("passing ref to existing record");
             return Ok((local, true));

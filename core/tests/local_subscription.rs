@@ -136,7 +136,7 @@ async fn complex_local_subscription() {
         trx.commit().await.unwrap();
     }
 
-    // Verify Rex's update was received
+    // Verify Rex's update was received - should be Edit since it still matches name = 'Rex'
     assert_eq!(check(), [RecordChangeKind::Edit]);
 
     {
@@ -150,7 +150,6 @@ async fn complex_local_subscription() {
     assert_eq!(check(), [RecordChangeKind::Add]);
 
     // Update Jasper's age to 4
-
     {
         let trx = node.begin();
         jasper.edit(&trx).await.unwrap().age().overwrite(0, 1, "4");

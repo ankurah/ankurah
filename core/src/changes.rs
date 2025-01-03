@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecordChangeKind {
+    Initial,
     Add,
     Remove,
     Edit,
@@ -11,35 +12,53 @@ pub enum RecordChangeKind {
 
 /// Represents a change in the record set
 #[derive(Debug, Clone)]
-pub struct RecordChange {
-    pub record: Arc<RecordInner>,
-    pub updates: Vec<RecordEvent>,
-    pub kind: RecordChangeKind,
+pub enum RecordChange {
+    /// Initial retrieval of a record upon subscription
+    Initial { record: Arc<RecordInner> },
+    /// A new record was added OR changed such that it now matches the subscription
+    Add {
+        record: Arc<RecordInner>,
+        events: Vec<RecordEvent>,
+    },
+    /// A record that previously matched the subscription has changed in a way that has not changed the matching condition
+    Update {
+        record: Arc<RecordInner>,
+        events: Vec<RecordEvent>,
+    },
+    /// A record that previously matched the subscription has changed in a way that no longer matches the subscription
+    Remove {
+        record: Arc<RecordInner>,
+        events: Vec<RecordEvent>,
+    },
 }
 
-// I think RecordChange needs to be this:
-// pub enum RecordChange {
-//     /// Initial retrieval of a record upon subscription
-//     Initial{
-//         record: Arc<RecordInner>,
-//         // we don't have updates here because we only have the initial state
-//     },
-//     /// A new record was added OR changed such that it now matches the subscription
-//     Add{
-//         record: Arc<RecordInner>,
-//         updates: Vec<RecordEvent>, // these updates can be relayed by the local node to the remote subscribing node via a NodeRequestBody::CommitEvents message
-//     },
-//     /// A record that previously matched the subscription has changed in a way that has not changed the matching condition
-//     Update{
-//         record: Arc<RecordInner>,
-//         updates: Vec<RecordEvent>, // these updates can be relayed by the local node to the remote subscribing node via a NodeRequestBody::CommitEvents message
-//     },
-//     /// A record that previously matched the subscription has changed in a way that no longer matches the subscription
-//     Remove{
-//         record: Arc<RecordInner>,
-//         updates: Vec<RecordEvent>, // these updates can be relayed by the local node to the remote subscribing node via a NodeRequestBody::CommitEvents message
-//     },
-// }
+impl RecordChange {
+    pub fn kind(&self) -> RecordChangeKind {
+        match self {
+            RecordChange::Initial { .. } => RecordChangeKind::Initial,
+            RecordChange::Add { .. } => RecordChangeKind::Add,
+            RecordChange::Update { .. } => RecordChangeKind::Edit,
+            RecordChange::Remove { .. } => RecordChangeKind::Remove,
+        }
+    }
+    pub fn record(&self) -> &Arc<RecordInner> {
+        match self {
+            RecordChange::Initial { record }
+            | RecordChange::Add { record, .. }
+            | RecordChange::Update { record, .. }
+            | RecordChange::Remove { record, .. } => record,
+        }
+    }
+
+    pub fn events(&self) -> &[RecordEvent] {
+        match self {
+            RecordChange::Add { events, .. }
+            | RecordChange::Update { events, .. }
+            | RecordChange::Remove { events, .. } => events,
+            _ => &[],
+        }
+    }
+}
 
 /// A set of changes to the record set
 #[derive(Debug, Clone)]
