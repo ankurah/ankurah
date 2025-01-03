@@ -9,15 +9,7 @@ use ankurah_derive::Model;
 use std::sync::{Arc, Mutex};
 
 mod common;
-use common::{Album, AlbumRecord};
-
-#[derive(Debug, Clone, Model)]
-pub struct Pet {
-    #[active_value(YrsString)]
-    pub name: String,
-    #[active_value(YrsString)]
-    pub age: String,
-}
+use common::{Album, AlbumRecord, Pet, PetRecord};
 
 #[tokio::test]
 async fn test_subscription_and_notification() -> Result<(), Box<dyn std::error::Error + Send + Sync>>

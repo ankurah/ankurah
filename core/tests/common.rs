@@ -9,6 +9,14 @@ use ankurah_core::{
 use ankurah_derive::Model;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Model)]
+pub struct Pet {
+    #[active_value(YrsString)]
+    pub name: String,
+    #[active_value(YrsString)]
+    pub age: String,
+}
+
 #[derive(Model, Debug, Serialize, Deserialize)] // This line now uses the Model derive macro
 pub struct Album {
     #[active_value(YrsString)]
