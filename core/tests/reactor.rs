@@ -1,14 +1,14 @@
 #[cfg(feature = "derive")]
-use ankurah_core::changes::{ChangeSet, RecordChangeKind};
+use ankurah_core::changes::RecordChangeKind;
 use ankurah_core::model::Model;
 use ankurah_core::property::YrsString;
+use ankurah_core::resultset::ResultSet;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};
 use ankurah_derive::Model;
 use std::sync::{Arc, Mutex};
 
 mod common;
-use anyhow::Result;
 use common::{Album, AlbumRecord};
 
 #[derive(Debug, Clone, Model)]
@@ -20,7 +20,8 @@ pub struct Pet {
 }
 
 #[tokio::test]
-async fn test_subscription_and_notification() -> Result<()> {
+async fn test_subscription_and_notification() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     let client = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     // Create some initial records
@@ -73,8 +74,7 @@ async fn test_subscription_and_notification() -> Result<()> {
     // Update a record
     {
         let trx = client.begin();
-        let albums: ankurah_core::resultset::ResultSet<AlbumRecord> =
-            client.fetch("name = 'Ice on the Dune'").await?;
+        let albums: ResultSet<AlbumRecord> = client.fetch("name = 'Ice on the Dune'").await?;
         let album = albums.records[0].edit(&trx).await?;
         album.year().overwrite(0, 4, "2020");
         trx.commit().await?;
@@ -96,34 +96,11 @@ async fn test_subscription_and_notification() -> Result<()> {
 async fn test_complex_subscription_conditions() {
     // Create a new node
     let node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
-
-    // Track received changesets
-    let received = Arc::new(Mutex::new(Vec::new()));
-
-    // Helper function to check received changesets
-    let check_received = {
-        let received = received.clone();
-        move || {
-            let mut changesets = received.lock().unwrap();
-            let result: Vec<RecordChangeKind> = (*changesets)
-                .iter()
-                .flat_map(|c: &ChangeSet| c.changes.iter().map(|change| change.kind.clone()))
-                .collect();
-            changesets.clear();
-            result
-        }
-    };
+    let (watcher, check) = common::changeset_watcher();
 
     // Subscribe to changes
     let _handle = node
-        .subscribe(
-            "pets",
-            "name = 'Rex' OR (age > 2 and age < 5)",
-            move |changeset| {
-                let mut received = received.lock().unwrap();
-                received.push(changeset);
-            },
-        )
+        .subscribe("pets", "name = 'Rex' OR (age > 2 and age < 5)", watcher)
         .await
         .unwrap();
 
@@ -159,9 +136,7 @@ async fn test_complex_subscription_conditions() {
     };
 
     // Verify initial state
-    let received = check_received();
-    assert_eq!(received.len(), 1); // Should have received one changeset for Rex (matches by name)
-    assert_eq!(received[0], RecordChangeKind::Add); // Initial state should be an Add
+    assert_eq!(check(), [RecordChangeKind::Add]); // Initial state should be an Add
 
     {
         // Update Rex's age to 7
@@ -171,9 +146,7 @@ async fn test_complex_subscription_conditions() {
     }
 
     // Verify Rex's update was received
-    let received = check_received();
-    assert_eq!(received.len(), 1); // Should have received one changeset for Rex's age change
-    assert_eq!(received[0], RecordChangeKind::Edit);
+    assert_eq!(check(), [RecordChangeKind::Edit]);
 
     {
         // Update Snuffy's age to 3
@@ -183,9 +156,7 @@ async fn test_complex_subscription_conditions() {
     }
 
     // Verify Snuffy's update was received (now matches age > 2 and age < 5)
-    let received = check_received();
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0], RecordChangeKind::Add);
+    assert_eq!(check(), [RecordChangeKind::Add]);
 
     // Update Jasper's age to 4
 
@@ -196,33 +167,29 @@ async fn test_complex_subscription_conditions() {
     }
 
     // Verify Jasper's update was received (now matches age > 2 and age < 5)
-    let received = check_received();
-    assert_eq!(received.len(), 1);
-    assert_eq!(received[0], RecordChangeKind::Add);
+    assert_eq!(check(), [RecordChangeKind::Add]);
 
     // Update Snuffy and Jasper to ages outside the range
     let trx = node.begin();
-    let mut snuffy_edit = snuffy.edit(&trx).await.unwrap();
+    let snuffy_edit = snuffy.edit(&trx).await.unwrap();
     snuffy_edit.age().overwrite(0, 1, "5");
-    let mut jasper_edit = jasper.edit(&trx).await.unwrap();
+    let jasper_edit = jasper.edit(&trx).await.unwrap();
     jasper_edit.age().overwrite(0, 1, "6");
     trx.commit().await.unwrap();
 
     // Verify both updates were received as removals
-    let received = check_received();
-    assert_eq!(received.len(), 2); // Should have received two changesets for removals
-    assert_eq!(received[0], RecordChangeKind::Remove);
-    assert_eq!(received[1], RecordChangeKind::Remove);
+    assert_eq!(
+        check(),
+        [RecordChangeKind::Remove, RecordChangeKind::Remove]
+    );
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a RecordChangeKind::Remove since it no longer matches
     let trx = node.begin();
-    let mut rex_edit = rex.edit(&trx).await.unwrap();
+    let rex_edit = rex.edit(&trx).await.unwrap();
     rex_edit.name().overwrite(0, 3, "NotRex");
     trx.commit().await.unwrap();
 
     // Verify Rex's "removal" was received
-    let received = check_received();
-    assert_eq!(received.len(), 1); // Should have received one changeset for Rex no longer matching
-    assert_eq!(received[0], RecordChangeKind::Remove); // Should be a removal (from the result set)
+    assert_eq!(check(), [RecordChangeKind::Remove]);
 }

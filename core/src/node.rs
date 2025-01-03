@@ -1,7 +1,8 @@
 use ankurah_proto as proto;
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
+    pin,
     sync::{Arc, Weak},
 };
 use tokio::sync::{oneshot, RwLock};
@@ -227,6 +228,17 @@ impl Node {
     pub fn begin(self: &Arc<Self>) -> Transaction {
         Transaction::new(self.clone())
     }
+    // TODO: Fix this - arghhh async lifetimes
+    // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
+    // where
+    //     F: for<'a> FnOnce(&'a Transaction) -> Fut,
+    //     Fut: std::future::Future<Output = anyhow::Result<T>>,
+    // {
+    //     let trx = self.begin();
+    //     let result = f(&trx).await?;
+    //     trx.commit().await?;
+    //     Ok(result)
+    // }
 
     pub async fn commit_events_local(
         self: &Arc<Self>,
@@ -551,7 +563,7 @@ impl Node {
         bucket_name: &str,
         predicate: P,
         callback: F,
-    ) -> Result<crate::subscription::SubscriptionHandle>
+    ) -> Result<crate::subscription::SubscriptionHandle, Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(crate::changes::ChangeSet) + Send + Sync + 'static,
         P: TryInto<ankql::ast::Predicate>,

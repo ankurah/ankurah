@@ -5,7 +5,6 @@ use crate::subscription::{Subscription, SubscriptionHandle, SubscriptionId};
 use crate::value::Value;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
-use anyhow::Result;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicUsize;
@@ -51,7 +50,7 @@ impl Reactor {
         bucket_name: &str,
         predicate: ast::Predicate,
         callback: F,
-    ) -> Result<SubscriptionHandle>
+    ) -> Result<SubscriptionHandle, Box<dyn std::error::Error + Send + Sync>>
     where
         F: Fn(ChangeSet) + Send + Sync + 'static,
     {

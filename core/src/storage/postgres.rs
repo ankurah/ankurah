@@ -74,7 +74,7 @@ impl StorageEngine for Postgres {
             ));
         }
 
-        let mut client = self.pool.get().await?;
+        let client = self.pool.get().await?;
         let mut results = Vec::new();
 
         // For now, fetch all records and filter in memory
