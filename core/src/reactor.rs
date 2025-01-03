@@ -1,5 +1,5 @@
 use super::comparision_index::ComparisonIndex;
-use crate::changes::{ChangeSet, RecordChange, RecordChangeKind};
+use crate::changes::{ChangeSet, RecordChange};
 use crate::storage::StorageEngine;
 use crate::subscription::{Subscription, SubscriptionHandle};
 use crate::value::Value;

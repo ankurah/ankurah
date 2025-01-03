@@ -25,14 +25,6 @@ pub enum RecordChange {
 }
 
 impl RecordChange {
-    pub fn kind(&self) -> RecordChangeKind {
-        match self {
-            RecordChange::Initial { .. } => RecordChangeKind::Initial,
-            RecordChange::Add { .. } => RecordChangeKind::Add,
-            RecordChange::Update { .. } => RecordChangeKind::Edit,
-            RecordChange::Remove { .. } => RecordChangeKind::Remove,
-        }
-    }
     pub fn record(&self) -> &Arc<RecordInner> {
         match self {
             RecordChange::Initial { record }
