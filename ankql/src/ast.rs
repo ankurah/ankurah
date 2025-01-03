@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Literal(Literal),
     Identifier(Identifier),
@@ -10,7 +12,7 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
     String(String),
     Integer(i64),
@@ -18,13 +20,13 @@ pub enum Literal {
     Boolean(bool),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Identifier {
     Property(String),
     CollectionProperty(String, String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
     Comparison {
         left: Box<Expr>,
@@ -37,7 +39,7 @@ pub enum Predicate {
     Not(Box<Predicate>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ComparisonOperator {
     Equal,              // =
     NotEqual,           // <> or !=
@@ -49,7 +51,7 @@ pub enum ComparisonOperator {
     Between,            // BETWEEN
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InfixOperator {
     Add,
     Subtract,

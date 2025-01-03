@@ -1,6 +1,7 @@
+use ankurah_proto as proto;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::{collation::Collatable, subscription::SubscriptionId};
+use crate::collation::Collatable;
 use ankql::ast;
 
 /// An index for a specific field and comparison operator
@@ -11,9 +12,9 @@ use ankql::ast;
 /// registrations on intermediate nodes for range comparisons.
 #[derive(Debug, Default)]
 pub(crate) struct ComparisonIndex {
-    pub(crate) eq: HashMap<Vec<u8>, Vec<SubscriptionId>>,
-    pub(crate) gt: BTreeMap<Vec<u8>, Vec<SubscriptionId>>,
-    pub(crate) lt: BTreeMap<Vec<u8>, Vec<SubscriptionId>>,
+    pub(crate) eq: HashMap<Vec<u8>, Vec<proto::SubscriptionId>>,
+    pub(crate) gt: BTreeMap<Vec<u8>, Vec<proto::SubscriptionId>>,
+    pub(crate) lt: BTreeMap<Vec<u8>, Vec<proto::SubscriptionId>>,
 }
 
 impl ComparisonIndex {
@@ -28,7 +29,7 @@ impl ComparisonIndex {
 
     fn for_entry<F, V>(&mut self, value: V, op: ast::ComparisonOperator, f: F)
     where
-        F: FnOnce(&mut Vec<SubscriptionId>),
+        F: FnOnce(&mut Vec<proto::SubscriptionId>),
         V: Collatable,
     {
         match op {
@@ -70,7 +71,7 @@ impl ComparisonIndex {
         &mut self,
         value: V,
         op: ast::ComparisonOperator,
-        sub_id: SubscriptionId,
+        sub_id: proto::SubscriptionId,
     ) {
         self.for_entry(value, op, |entries| entries.push(sub_id));
     }
@@ -79,7 +80,7 @@ impl ComparisonIndex {
         &mut self,
         value: V,
         op: ast::ComparisonOperator,
-        sub_id: SubscriptionId,
+        sub_id: proto::SubscriptionId,
     ) {
         self.for_entry(value, op, |entries| {
             if let Some(pos) = entries.iter().position(|id| *id == sub_id) {
@@ -87,7 +88,7 @@ impl ComparisonIndex {
             }
         });
     }
-    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<SubscriptionId> {
+    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<proto::SubscriptionId> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
@@ -125,16 +126,16 @@ impl ComparisonIndex {
 #[cfg(test)]
 mod tests {
     use super::ComparisonIndex;
-    use crate::subscription::SubscriptionId;
     use crate::value::Value;
     use ankql::ast;
+    use ankurah_proto as proto;
 
     #[test]
     fn test_field_index() {
         let mut index = ComparisonIndex::new();
 
         // Less than 8 ------------------------------------------------------------
-        let sub0 = SubscriptionId::from(0);
+        let sub0 = proto::SubscriptionId::from(0);
         index.add(
             ast::Literal::Integer(8),
             ast::ComparisonOperator::LessThan,
@@ -147,7 +148,7 @@ mod tests {
         // 7 should match sub0
         assert_eq!(index.find_matching(Value::Integer(7)), vec![sub0]);
 
-        let sub1 = SubscriptionId::from(1);
+        let sub1 = proto::SubscriptionId::from(1);
 
         // Greater than 20 ------------------------------------------------------------
         index.add(

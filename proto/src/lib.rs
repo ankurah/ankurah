@@ -6,10 +6,11 @@ pub mod record_id;
 pub use human_id::*;
 pub use message::*;
 // pub use record::*;
+use ankql::ast;
 pub use record_id::ID;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Deref};
 
 use ulid::Ulid;
 
@@ -24,6 +25,9 @@ impl From<NodeId> for String {
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct RequestId(Ulid);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SubscriptionId(usize);
 
 impl Default for NodeId {
     fn default() -> Self {
@@ -98,8 +102,15 @@ pub enum NodeRequestBody {
     CommitEvents(Vec<RecordEvent>),
     // Request to fetch records matching a predicate
     FetchRecords {
-        bucket_name: String,
-        predicate: String,
+        collection: String,
+        predicate: ast::Predicate,
+    },
+    Subscribe {
+        collection: String,
+        predicate: ast::Predicate,
+    },
+    Unsubscribe {
+        subscription_id: SubscriptionId,
     },
 }
 
@@ -108,7 +119,12 @@ pub enum NodeResponseBody {
     // Response to CommitEvents
     CommitComplete,
     // Response to FetchRecords
-    Records(Vec<RecordState>),
+    Fetch(Vec<RecordState>),
+    Subscribe {
+        initial: Vec<RecordState>,
+        subscription_id: SubscriptionId,
+    },
+    Success,
     Error(String),
 }
 
@@ -133,4 +149,23 @@ pub enum ServerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Presence {
     pub node_id: NodeId,
+}
+
+impl Deref for SubscriptionId {
+    type Target = usize;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PartialEq<usize> for SubscriptionId {
+    fn eq(&self, other: &usize) -> bool {
+        self.0 == *other
+    }
+}
+
+impl From<usize> for SubscriptionId {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
 }

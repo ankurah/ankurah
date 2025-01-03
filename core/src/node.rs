@@ -2,7 +2,6 @@ use ankurah_proto as proto;
 use anyhow::anyhow;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
-    pin,
     sync::{Arc, Weak},
 };
 use tokio::sync::{oneshot, RwLock};
@@ -15,9 +14,17 @@ use crate::{
     reactor::Reactor,
     resultset::ResultSet,
     storage::{Bucket, StorageEngine},
+    subscription::SubscriptionHandle,
     transaction::Transaction,
 };
 use tracing::{debug, info};
+
+// stub
+pub struct PeerState {
+    sender: Box<dyn PeerSender>,
+    subscriptions: BTreeMap<String, Vec<SubscriptionHandle>>,
+}
+
 /// Manager for all records and their properties on this client.
 pub struct Node {
     pub id: proto::NodeId,
@@ -183,11 +190,9 @@ impl Node {
                 }
             }
             proto::NodeRequestBody::FetchRecords {
-                bucket_name,
+                collection: bucket_name,
                 predicate,
             } => {
-                let predicate = ankql::parser::parse_selection(&predicate)
-                    .map_err(|e| anyhow!("Failed to parse predicate: {}", e))?;
                 let states: Vec<_> = self
                     .storage_engine
                     .fetch_states(bucket_name, &predicate)
@@ -195,7 +200,16 @@ impl Node {
                     .into_iter()
                     .map(|(_, state)| state)
                     .collect();
-                Ok(proto::NodeResponseBody::Records(states))
+                Ok(proto::NodeResponseBody::Fetch(states))
+            }
+            proto::NodeRequestBody::Subscribe {
+                collection: bucket_name,
+                predicate,
+            } => {
+                unimplemented!()
+            }
+            proto::NodeRequestBody::Unsubscribe { subscription_id } => {
+                unimplemented!()
             }
         }
     }

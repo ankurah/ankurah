@@ -1,4 +1,5 @@
-use ankurah_proto::{RecordEvent, RecordState, ID};
+use ankurah_proto as proto;
+use proto::{RecordEvent, RecordState};
 // use futures_signals::signal::Signal;
 
 use std::sync::Arc;
@@ -17,14 +18,14 @@ pub trait Model {
     fn bucket_name() -> &'static str
     where
         Self: Sized;
-    fn to_record_inner(&self, id: ID) -> RecordInner;
+    fn to_record_inner(&self, id: proto::ID) -> RecordInner;
 }
 
 /// A record is an instance of a model which is kept up to date with the latest changes from local and remote edits
 pub trait Record {
     type Model: Model;
     type ScopedRecord<'trx>: ScopedRecord<'trx>;
-    fn id(&self) -> ID {
+    fn id(&self) -> proto::ID {
         self.record_inner().id()
     }
     fn backends(&self) -> &Backends {
@@ -43,13 +44,13 @@ pub trait Record {
 /// TODO: Consider renaming this to Record and renaming trait Record to ActiveRecord or something like that
 #[derive(Debug)]
 pub struct RecordInner {
-    pub id: ID,
+    pub id: proto::ID,
     pub bucket_name: String,
     backends: Backends,
 }
 
 impl RecordInner {
-    pub fn new(id: ID, bucket_name: String) -> Self {
+    pub fn new(id: proto::ID, bucket_name: String) -> Self {
         Self {
             id,
             bucket_name,
@@ -57,7 +58,7 @@ impl RecordInner {
         }
     }
 
-    pub fn id(&self) -> ID {
+    pub fn id(&self) -> proto::ID {
         self.id
     }
 
@@ -73,7 +74,7 @@ impl RecordInner {
         self.backends.to_state_buffers()
     }
 
-    pub fn from_backends(id: ID, bucket_name: &str, backends: Backends) -> Self {
+    pub fn from_backends(id: proto::ID, bucket_name: &str, backends: Backends) -> Self {
         Self {
             id,
             bucket_name: bucket_name.to_string(),
@@ -82,7 +83,7 @@ impl RecordInner {
     }
 
     pub fn from_record_state(
-        id: ID,
+        id: proto::ID,
         bucket_name: &str,
         record_state: &RecordState,
     ) -> Result<Self, RetrievalError> {
@@ -146,7 +147,7 @@ impl Filterable for RecordInner {
 pub trait ScopedRecord<'rec> {
     type Model: Model;
     type Record: Record;
-    fn id(&self) -> ID {
+    fn id(&self) -> proto::ID {
         self.record_inner().id
     }
     fn bucket_name() -> &'static str {

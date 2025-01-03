@@ -1,7 +1,7 @@
 use super::comparision_index::ComparisonIndex;
 use crate::changes::{ChangeSet, RecordChange, RecordChangeKind};
 use crate::storage::StorageEngine;
-use crate::subscription::{Subscription, SubscriptionHandle, SubscriptionId};
+use crate::subscription::{Subscription, SubscriptionHandle};
 use crate::value::Value;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 impl From<&str> for FieldId {
@@ -21,13 +22,13 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of records
 pub struct Reactor {
     /// Current subscriptions
-    subscriptions: DashMap<SubscriptionId, Arc<Subscription>>,
+    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: DashMap<FieldId, ComparisonIndex>,
     /// Index of subscriptions that presently match each record.
     /// This is used to quickly find all subscriptions that need to be notified when a record changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
-    record_watchers: DashMap<ankurah_proto::ID, Vec<SubscriptionId>>,
+    record_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
     /// Next subscription id
     next_sub_id: AtomicUsize,
     /// Reference to the storage engine
@@ -54,7 +55,7 @@ impl Reactor {
     where
         F: Fn(ChangeSet) + Send + Sync + 'static,
     {
-        let sub_id: SubscriptionId = self
+        let sub_id: proto::SubscriptionId = self
             .next_sub_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .into();
@@ -150,7 +151,7 @@ impl Reactor {
         }
     }
 
-    fn add_index_watchers(&self, sub_id: SubscriptionId, predicate: &ast::Predicate) {
+    fn add_index_watchers(&self, sub_id: proto::SubscriptionId, predicate: &ast::Predicate) {
         self.recurse_predicate(predicate, |entry, _field_id, literal, operator| {
             entry
                 .or_default()
@@ -158,7 +159,7 @@ impl Reactor {
         });
     }
 
-    fn remove_index_watchers(&self, sub_id: SubscriptionId, predicate: &ast::Predicate) {
+    fn remove_index_watchers(&self, sub_id: proto::SubscriptionId, predicate: &ast::Predicate) {
         self.recurse_predicate(
             predicate,
             |entry: dashmap::Entry<FieldId, ComparisonIndex>,
@@ -174,7 +175,7 @@ impl Reactor {
     }
 
     /// Remove a subscription and clean up its watchers
-    pub(crate) fn unsubscribe(&self, sub_id: SubscriptionId) {
+    pub(crate) fn unsubscribe(&self, sub_id: proto::SubscriptionId) {
         if let Some((_, subscription)) = self.subscriptions.remove(&sub_id) {
             // Remove from index watchers
             self.remove_index_watchers(sub_id, &subscription.predicate);
@@ -194,7 +195,7 @@ impl Reactor {
         &self,
         record: &Arc<crate::model::RecordInner>,
         matching: bool,
-        sub_id: SubscriptionId,
+        sub_id: proto::SubscriptionId,
     ) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
             let mut records = subscription.matching_records.lock().unwrap();
