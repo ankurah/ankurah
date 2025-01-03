@@ -21,13 +21,14 @@ use tracing::{debug, info};
 
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
+    durable: bool,
     subscriptions: BTreeMap<proto::SubscriptionId, Vec<SubscriptionHandle>>,
 }
 
 /// Manager for all records and their properties on this client.
 pub struct Node {
     pub id: proto::NodeId,
-
+    pub durable: bool,
     /// Ground truth local state for records.
     ///
     /// Things like `postgres`, `sled`, `TKiV`.
@@ -46,7 +47,6 @@ pub struct Node {
 
     /// The reactor for handling subscriptions
     reactor: Arc<Reactor>,
-    durable: bool,
 }
 
 type NodeRecords = BTreeMap<(proto::ID, String), Weak<RecordInner>>;
@@ -79,13 +79,14 @@ impl Node {
         }
     }
 
-    pub async fn register_peer(&self, sender: Box<dyn PeerSender>) {
+    pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("node.register_peer_sender 1");
         let mut peer_connections = self.peer_connections.write().await;
         peer_connections.insert(
-            sender.node_id(),
+            presence.node_id,
             PeerState {
                 sender,
+                durable: presence.durable,
                 subscriptions: BTreeMap::new(),
             },
         );

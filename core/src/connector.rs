@@ -7,7 +7,6 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait PeerSender: Send + Sync {
-    fn node_id(&self) -> proto::NodeId;
     async fn send_message(&self, message: proto::PeerMessage) -> Result<(), SendError>;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }

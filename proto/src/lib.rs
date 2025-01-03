@@ -152,7 +152,8 @@ pub enum ServerMessage {
     PeerMessage(PeerMessage),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Presence {
     pub node_id: NodeId,
+    pub durable: bool,
 }

@@ -9,16 +9,11 @@ use crate::node::Node;
 #[derive(Clone)]
 /// Sender for local process connection
 pub struct LocalProcessSender {
-    node_id: proto::NodeId,
     sender: mpsc::Sender<proto::PeerMessage>,
 }
 
 #[async_trait]
 impl PeerSender for LocalProcessSender {
-    fn node_id(&self) -> proto::NodeId {
-        self.node_id.clone()
-    }
-
     async fn send_message(&self, message: proto::PeerMessage) -> Result<(), SendError> {
         self.sender
             .send(message)
@@ -46,16 +41,22 @@ impl LocalProcessConnection {
 
         // we have to register the senders with the nodes
         node1
-            .register_peer(Box::new(LocalProcessSender {
-                node_id: node2.id.clone(),
-                sender: node2_tx,
-            }))
+            .register_peer(
+                proto::Presence {
+                    node_id: node2.id.clone(),
+                    durable: node2.durable,
+                },
+                Box::new(LocalProcessSender { sender: node2_tx }),
+            )
             .await;
         node2
-            .register_peer(Box::new(LocalProcessSender {
-                node_id: node1.id.clone(),
-                sender: node1_tx,
-            }))
+            .register_peer(
+                proto::Presence {
+                    node_id: node1.id.clone(),
+                    durable: node1.durable,
+                },
+                Box::new(LocalProcessSender { sender: node1_tx }),
+            )
             .await;
 
         Ok(Self {

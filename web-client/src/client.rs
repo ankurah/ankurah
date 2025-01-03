@@ -142,13 +142,16 @@ impl Inner {
                 self_clone.state.set(connection_state.clone());
 
                 info!("Effect 2.1");
-                if let ConnectionState::Connected { .. } = connection_state {
+                if let ConnectionState::Connected { presence, .. } = connection_state {
                     info!("Effect 2.2");
                     let self_clone = self_clone.clone();
                     let connection = connection.clone();
                     spawn_local(async move {
                         info!("Effect 2.3");
-                        self_clone.node.register_peer(Box::new(connection)).await;
+                        self_clone
+                            .node
+                            .register_peer(presence, Box::new(connection))
+                            .await;
                     });
                 }
             });

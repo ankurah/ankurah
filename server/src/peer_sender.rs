@@ -13,13 +13,11 @@ pub enum SenderKind {
 // Add this new struct to handle peer sending
 #[derive(Clone)]
 pub struct WebSocketPeerSender {
-    node_id: proto::NodeId,
     tx: mpsc::Sender<axum::extract::ws::Message>,
 }
 
 impl WebSocketPeerSender {
     pub fn new(
-        node_id: proto::NodeId,
         mut sender: futures_util::stream::SplitSink<
             axum::extract::ws::WebSocket,
             axum::extract::ws::Message,
@@ -36,7 +34,7 @@ impl WebSocketPeerSender {
             }
         });
 
-        Self { node_id, tx }
+        Self { tx }
     }
     pub async fn send_message(&self, message: proto::ServerMessage) -> Result<(), SendError> {
         let data = bincode::serialize(&message)
@@ -53,10 +51,6 @@ impl WebSocketPeerSender {
 
 #[async_trait]
 impl PeerSender for WebSocketPeerSender {
-    fn node_id(&self) -> proto::NodeId {
-        self.node_id.clone()
-    }
-
     async fn send_message(&self, message: proto::PeerMessage) -> Result<(), SendError> {
         let server_message = proto::ServerMessage::PeerMessage(message);
         self.send_message(server_message).await

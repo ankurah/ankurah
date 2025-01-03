@@ -81,6 +81,7 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
     // Send server presence immediately after connection
     let presence = proto::ServerMessage::Presence(proto::Presence {
         node_id: node.id.clone(),
+        durable: node.durable,
     });
     use futures_util::SinkExt;
     if let Ok(data) = bincode::serialize(&presence) {
@@ -133,10 +134,10 @@ async fn process_message(
 
                                 use crate::peer_sender::WebSocketPeerSender;
                                 // Register peer sender for this client
-                                let peer_sender =
-                                    WebSocketPeerSender::new(presence.node_id, ws_sender);
+                                let peer_sender = WebSocketPeerSender::new(ws_sender);
 
-                                node.register_peer(Box::new(peer_sender.clone())).await;
+                                node.register_peer(presence, Box::new(peer_sender.clone()))
+                                    .await;
                                 *sender = SenderKind::Peer(peer_sender);
                             }
                         }

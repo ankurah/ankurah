@@ -52,14 +52,12 @@ impl Inner {
 
         if let Ok(message) = bincode::deserialize::<proto::ServerMessage>(&data) {
             match message {
-                proto::ServerMessage::Presence(Presence { node_id }) => {
+                proto::ServerMessage::Presence(presence) => {
                     info!("Received server presence");
-                    self.state.set(
-                        ConnectionState::Connected {
-                            url: self.url.clone(),
-                            node_id,
-                        },
-                    );
+                    self.state.set(ConnectionState::Connected {
+                        url: self.url.clone(),
+                        presence,
+                    });
                 }
                 proto::ServerMessage::PeerMessage(msg) => {
                     let node = self.node.clone();
@@ -92,6 +90,7 @@ impl Inner {
         // Send our presence message
         let presence = proto::Presence {
             node_id: self.node.id.clone(),
+            durable: self.node.durable,
         };
 
         if let Err(e) = self.send_message(proto::ClientMessage::Presence(presence)) {
@@ -113,9 +112,6 @@ impl PartialEq for Connection {
 
 #[async_trait]
 impl PeerSender for Connection {
-    fn node_id(&self) -> proto::NodeId {
-        self.inner.node.id.clone()
-    }
     async fn send_message(
         &self,
         message: proto::PeerMessage,
@@ -130,8 +126,8 @@ impl PeerSender for Connection {
 }
 
 impl Connection {
-    pub fn new(server_url: String, node: Arc<Node>) -> Result<Connection, JsValue> {
-        let inner = Arc::new(SendWrapper::new(Inner::new(node, server_url)?));
+    pub fn new(server_url: String, my_node: Arc<Node>) -> Result<Connection, JsValue> {
+        let inner = Arc::new(SendWrapper::new(Inner::new(my_node, server_url)?));
 
         let on_message = {
             let inner = inner.clone();
@@ -144,11 +140,9 @@ impl Connection {
             let inner = inner.clone();
             Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_| {
                 info!("Connection Error");
-                inner.state.set(
-                    ConnectionState::Error {
-                        message: "".to_string(),
-                    },
-                );
+                inner.state.set(ConnectionState::Error {
+                    message: "".to_string(),
+                });
             }))
         };
 
