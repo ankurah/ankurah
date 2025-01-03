@@ -659,7 +659,7 @@ impl Node {
         bucket_name: &str,
         predicate: P,
         callback: F,
-    ) -> Result<crate::subscription::SubscriptionHandle, Box<dyn std::error::Error + Send + Sync>>
+    ) -> anyhow::Result<crate::subscription::SubscriptionHandle>
     where
         F: Fn(crate::changes::ChangeSet) + Send + Sync + 'static,
         P: TryInto<ankql::ast::Predicate>,
@@ -667,7 +667,7 @@ impl Node {
     {
         let predicate = predicate
             .try_into()
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(|e| anyhow!("Failed to parse predicate: {}", e))?;
         self.reactor
             .subscribe(bucket_name, predicate, callback)
             .await

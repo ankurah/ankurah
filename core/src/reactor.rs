@@ -48,7 +48,7 @@ impl Reactor {
         bucket_name: &str,
         predicate: ast::Predicate,
         callback: F,
-    ) -> Result<SubscriptionHandle, Box<dyn std::error::Error + Send + Sync>>
+    ) -> anyhow::Result<SubscriptionHandle>
     where
         F: Fn(ChangeSet) + Send + Sync + 'static,
     {
@@ -61,14 +61,12 @@ impl Reactor {
         let states = self
             .storage
             .fetch_states(bucket_name.to_string(), &predicate)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .await?;
         let mut matching_records = Vec::new();
 
         // Convert states to RecordInner
         for (id, state) in states {
-            let record = crate::model::RecordInner::from_record_state(id, bucket_name, &state)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let record = crate::model::RecordInner::from_record_state(id, bucket_name, &state)?;
             let record = Arc::new(record);
             matching_records.push(record.clone());
 
