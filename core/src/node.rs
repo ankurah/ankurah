@@ -214,10 +214,65 @@ impl Node {
                 collection: bucket_name,
                 predicate,
             } => {
-                unimplemented!()
+                // First fetch initial state
+                let states: Vec<_> = self
+                    .storage_engine
+                    .fetch_states(bucket_name.clone(), &predicate)
+                    .await?
+                    .into_iter()
+                    .map(|(_, state)| state)
+                    .collect();
+
+                // Generate a new subscription ID
+                let subscription_id = proto::SubscriptionId::new();
+
+                // Set up subscription that forwards changes to the peer
+                let peer_id = request.from.clone();
+                let node = self.clone();
+                let handle = self
+                    .reactor
+                    .subscribe(&bucket_name, predicate, move |changeset| {
+                        // When changes occur, send them to the peer as CommitEvents
+                        let events: Vec<_> = changeset
+                            .changes
+                            .iter()
+                            .flat_map(|change| change.updates.clone())
+                            .collect();
+
+                        if !events.is_empty() {
+                            let node = node.clone();
+                            let peer_id = peer_id.clone();
+                            tokio::spawn(async move {
+                                let _ = node
+                                    .request(peer_id, proto::NodeRequestBody::CommitEvents(events))
+                                    .await;
+                            });
+                        }
+                    })
+                    .await?;
+
+                // Store the subscription handle
+                let mut peer_connections = self.peer_connections.write().await;
+                if let Some(peer_state) = peer_connections.get_mut(&request.from) {
+                    peer_state
+                        .subscriptions
+                        .entry(subscription_id)
+                        .or_insert_with(Vec::new)
+                        .push(handle);
+                }
+
+                Ok(proto::NodeResponseBody::Subscribe {
+                    initial: states,
+                    subscription_id,
+                })
             }
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
-                unimplemented!()
+                // Remove and drop the subscription handle
+                let mut peer_connections = self.peer_connections.write().await;
+                if let Some(peer_state) = peer_connections.get_mut(&request.from) {
+                    peer_state.subscriptions.remove(&subscription_id);
+                }
+                Ok(proto::NodeResponseBody::Success)
             }
         }
     }
@@ -276,8 +331,9 @@ impl Node {
                 "node.commit_events_local 2: record_event: {:?}",
                 record_event
             );
+
             // Apply record events to the Node's global records first.
-            let record = self
+            let (record, existed) = self
                 .fetch_record_inner(record_event.id, &record_event.bucket_name)
                 .await?;
 
@@ -297,11 +353,18 @@ impl Node {
                 .await?;
             debug!("node.commit_events_local 6: done");
 
+            // Determine the kind of change
+            let kind = if !existed {
+                RecordChangeKind::Add
+            } else {
+                RecordChangeKind::Edit
+            };
+
             // Collect the change
             changes.push(RecordChange {
                 record: record.clone(),
                 updates: events.clone(),
-                kind: RecordChangeKind::Edit,
+                kind,
             });
         }
 
@@ -327,10 +390,10 @@ impl Node {
         // Add to node's records
         let _ = self.add_record(&record).await;
 
-        // Notify subscribers
+        // Notify subscribers about the creation
         let change = RecordChange {
             record: record.clone(),
-            updates: vec![],
+            updates: vec![], // The record was just created, so no updates yet
             kind: RecordChangeKind::Add,
         };
         let changeset = ChangeSet {
@@ -513,36 +576,47 @@ impl Node {
         &self,
         id: proto::ID,
         bucket_name: &str,
-    ) -> Result<Arc<RecordInner>, RetrievalError> {
+    ) -> Result<(Arc<RecordInner>, bool), RetrievalError> {
         debug!("fetch_record {:?}-{:?}", id, bucket_name);
         if let Some(local) = self.fetch_record_from_node(id, bucket_name).await {
             info!("passing ref to existing record");
-            return Ok(local);
+            return Ok((local, true));
         }
         debug!("fetch_record 2");
 
-        let scoped_record = self.fetch_record_from_storage(id, bucket_name).await?;
-        debug!("fetch_record 3");
-        let ref_record = Arc::new(scoped_record);
-        debug!("fetch_record 4");
-        let already_present = self.add_record(&ref_record).await;
-        if already_present {
-            // We hit a small edge case where the record was fetched twice
-            // at the same time and the other fetch added the record first.
-            // So try this function again.
-            // TODO: lock only once to prevent this?
-            if let Some(local) = self.fetch_record_from_node(id, bucket_name).await {
-                return Ok(local);
+        match self.get_record_state(id, bucket_name).await {
+            Ok(record_state) => {
+                let scoped_record =
+                    crate::model::RecordInner::from_record_state(id, bucket_name, &record_state)?;
+                debug!("fetch_record 3");
+                let ref_record = Arc::new(scoped_record);
+                debug!("fetch_record 4");
+                let already_present = self.add_record(&ref_record).await;
+                if already_present {
+                    // We hit a small edge case where the record was fetched twice
+                    // at the same time and the other fetch added the record first.
+                    // So try this function again.
+                    // TODO: lock only once to prevent this?
+                    if let Some(local) = self.fetch_record_from_node(id, bucket_name).await {
+                        return Ok((local, true));
+                    }
+                }
+                Ok((ref_record, true))
             }
+            Err(RetrievalError::NotFound(_)) => {
+                let scoped_record = RecordInner::new(id, bucket_name.to_string());
+                let ref_record = Arc::new(scoped_record);
+                let _ = self.add_record(&ref_record).await;
+                Ok((ref_record, false))
+            }
+            Err(e) => Err(e),
         }
-
-        Ok(ref_record)
     }
 
     pub async fn get_record<R: Record>(&self, id: proto::ID) -> Result<R, RetrievalError> {
         use crate::model::Model;
         let collection_name = R::Model::bucket_name();
-        let record_inner = self.fetch_record_inner(id, collection_name).await?;
+        let (record_inner, _) = self.fetch_record_inner(id, collection_name).await?;
         Ok(R::from_record_inner(record_inner))
     }
 
@@ -591,7 +665,9 @@ impl Node {
         P: TryInto<ankql::ast::Predicate>,
         P::Error: std::error::Error + Send + Sync + 'static,
     {
-        let predicate = predicate.try_into().map_err(|e| anyhow::anyhow!("{}", e))?;
+        let predicate = predicate
+            .try_into()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         self.reactor
             .subscribe(bucket_name, predicate, callback)
             .await

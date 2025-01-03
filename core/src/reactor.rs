@@ -29,8 +29,6 @@ pub struct Reactor {
     /// This is used to quickly find all subscriptions that need to be notified when a record changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
     record_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
-    /// Next subscription id
-    next_sub_id: AtomicUsize,
     /// Reference to the storage engine
     storage: Arc<dyn StorageEngine>,
 }
@@ -41,7 +39,6 @@ impl Reactor {
             subscriptions: DashMap::new(),
             index_watchers: DashMap::new(),
             record_watchers: DashMap::new(),
-            next_sub_id: AtomicUsize::new(0),
             storage,
         })
     }
@@ -55,10 +52,7 @@ impl Reactor {
     where
         F: Fn(ChangeSet) + Send + Sync + 'static,
     {
-        let sub_id: proto::SubscriptionId = self
-            .next_sub_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .into();
+        let sub_id = proto::SubscriptionId::new();
 
         // Start watching the relevant indexes
         self.add_index_watchers(sub_id, &predicate);
@@ -67,12 +61,14 @@ impl Reactor {
         let states = self
             .storage
             .fetch_states(bucket_name.to_string(), &predicate)
-            .await?;
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         let mut matching_records = Vec::new();
 
         // Convert states to RecordInner
         for (id, state) in states {
-            let record = crate::model::RecordInner::from_record_state(id, bucket_name, &state)?;
+            let record = crate::model::RecordInner::from_record_state(id, bucket_name, &state)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             let record = Arc::new(record);
             matching_records.push(record.clone());
 
@@ -250,28 +246,31 @@ impl Reactor {
                         .iter()
                         .any(|r| r.id() == change.record.id());
 
-                    // Only update watchers and notify if matching status changed
+                    // Update record watchers and notify subscription if needed
+                    self.update_record_watchers(&change.record, matches, sub_id);
+
+                    // Only notify if the matching status changed
                     if matches != did_match {
-                        self.update_record_watchers(&change.record, matches, sub_id);
+                        let kind = if matches {
+                            RecordChangeKind::Add
+                        } else {
+                            RecordChangeKind::Remove
+                        };
 
                         (subscription.callback)(ChangeSet {
                             changes: vec![RecordChange {
                                 record: change.record.clone(),
+                                kind,
                                 updates: change.updates.clone(),
-                                kind: if matches {
-                                    RecordChangeKind::Add
-                                } else {
-                                    RecordChangeKind::Remove
-                                },
                             }],
                         });
-                    } else if matches && change.kind == RecordChangeKind::Edit {
-                        // Record still matches but was edited
+                    } else if matches {
+                        // Record still matches, so notify about the edit
                         (subscription.callback)(ChangeSet {
                             changes: vec![RecordChange {
                                 record: change.record.clone(),
-                                updates: change.updates.clone(),
                                 kind: RecordChangeKind::Edit,
+                                updates: change.updates.clone(),
                             }],
                         });
                     }

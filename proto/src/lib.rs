@@ -27,7 +27,7 @@ impl From<NodeId> for String {
 pub struct RequestId(Ulid);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct SubscriptionId(usize);
+pub struct SubscriptionId(Ulid);
 
 impl Default for NodeId {
     fn default() -> Self {
@@ -48,6 +48,12 @@ impl Default for RequestId {
 }
 
 impl RequestId {
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+}
+
+impl SubscriptionId {
     pub fn new() -> Self {
         Self(Ulid::new())
     }
@@ -149,23 +155,4 @@ pub enum ServerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Presence {
     pub node_id: NodeId,
-}
-
-impl Deref for SubscriptionId {
-    type Target = usize;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl PartialEq<usize> for SubscriptionId {
-    fn eq(&self, other: &usize) -> bool {
-        self.0 == *other
-    }
-}
-
-impl From<usize> for SubscriptionId {
-    fn from(value: usize) -> Self {
-        Self(value)
-    }
 }
