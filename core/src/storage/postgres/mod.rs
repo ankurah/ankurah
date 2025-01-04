@@ -2,14 +2,17 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     error::RetrievalError,
-    model::RecordInner,
     property::{
         backend::{BackendDowncasted, PropertyBackend},
         Backends,
     },
     storage::{RecordState, StorageBucket, StorageEngine},
 };
-use ankql::selection::filter::evaluate_predicate;
+
+use futures_util::TryStreamExt;
+
+pub mod predicate;
+
 use ankurah_proto::{Clock, ID};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
@@ -67,25 +70,50 @@ impl StorageEngine for Postgres {
         &self,
         bucket_name: String,
         predicate: &ankql::ast::Predicate,
-    ) -> anyhow::Result<Vec<(ID, RecordState)>> {
+    ) -> Result<Vec<(ID, RecordState)>, RetrievalError> {
         if !Postgres::sane_name(&bucket_name) {
-            return Err(anyhow::anyhow!(
-                "bucket name must only contain valid characters"
-            ));
+            return Err(RetrievalError::InvalidBucketName);
         }
 
-        let client = self.pool.get().await?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
+
         let mut results = Vec::new();
 
-        // For now, fetch all records and filter in memory
-        // TODO: Convert predicate to SQL WHERE clause for better performance
-        let query = format!(
-            r#"SELECT "id", "state_buffer", "head" FROM "{}""#,
-            bucket_name
-        );
+        let mut ankql_sql = predicate::Sql::new();
+        ankql_sql.predicate(&predicate);
 
-        let rows = match client.query(&query, &[]).await {
-            Ok(rows) => rows,
+        let (sql, args) = ankql_sql.collapse();
+
+        let filtered_query = if args.len() > 0 {
+            format!(
+                r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE {}"#,
+                bucket_name.as_str(),
+                sql,
+            )
+        } else {
+            format!(
+                r#"SELECT "id", "state_buffer", "head" FROM "{}""#,
+                bucket_name.as_str()
+            )
+        };
+
+        eprintln!("Running: {}", filtered_query);
+        // `query_raw` fixes 2 problems here
+        // - `query` only takes `&[&dyn ToSql + Sync]`... and rust can't coerce
+        //   `&[&dyn ToSql + Send + Sync]` for reasons unknown to me.
+        // - It gives us a `RowStream` instead of a `Vec<Row>`, which means
+        //   we can return rows as they come instead of waiting for all of them
+        //   in the future.
+        //   (... I believe? Don't quote me on this)
+        let rows = match client.query_raw(&filtered_query, args).await {
+            Ok(stream) => match stream.try_collect::<Vec<_>>().await {
+                Ok(rows) => rows,
+                Err(err) => return Err(RetrievalError::StorageError(err.into())),
+            },
             Err(err) => {
                 let kind = error_kind(&err);
                 match kind {
@@ -97,7 +125,8 @@ impl StorageEngine for Postgres {
                     }
                     _ => {}
                 }
-                return Err(err.into());
+
+                return Err(RetrievalError::StorageError(err.into()));
             }
         };
 
@@ -113,13 +142,15 @@ impl StorageEngine for Postgres {
                 head: row.get::<_, Vec<uuid::Uuid>>(2).into(),
             };
 
+            results.push((id, record_state));
+
             // Create record to evaluate predicate
-            let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
+            //let record_inner = RecordInner::from_record_state(id, bucket_name, &record_state)?;
 
             // Apply predicate filter
-            if evaluate_predicate(&record_inner, predicate)? {
+            /*if evaluate_predicate(&record_inner, predicate)? {
                 results.push((id, record_state));
-            }
+            }*/
         }
 
         Ok(results)
@@ -452,4 +483,10 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
 #[allow(unused)]
 pub struct MissingMaterialized {
     pub name: String,
+}
+
+impl From<tokio_postgres::Error> for RetrievalError {
+    fn from(err: tokio_postgres::Error) -> Self {
+        RetrievalError::StorageError(Box::new(err))
+    }
 }

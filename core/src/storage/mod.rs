@@ -27,7 +27,7 @@ pub trait StorageEngine: Send + Sync {
         &self,
         bucket_name: String,
         predicate: &ankql::ast::Predicate,
-    ) -> anyhow::Result<Vec<(ID, RecordState)>>;
+    ) -> Result<Vec<(ID, RecordState)>, RetrievalError>;
 }
 
 #[async_trait]
