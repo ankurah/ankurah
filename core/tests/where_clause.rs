@@ -72,6 +72,11 @@ async fn pg_basic_where_clause() -> Result<()> {
         })
         .await;
         trx.create(&Album {
+            name: "Death Magnetic".into(),
+            year: "2008".into(),
+        })
+        .await;
+        trx.create(&Album {
             name: "Ice on the Dune".into(),
             year: "2013".into(),
         })
@@ -101,6 +106,34 @@ async fn pg_basic_where_clause() -> Result<()> {
             .map(|active_record| active_record.name())
             .collect::<Vec<String>>(),
         vec!["Walking on a Dream".to_string()]
+    );
+
+    let albums: ankurah_core::resultset::ResultSet<AlbumRecord> =
+        client.fetch("year = '2008'").await?;
+
+    assert_eq!(
+        albums
+            .records
+            .iter()
+            .map(|active_record| active_record.name())
+            .collect::<Vec<String>>(),
+        vec![
+            "Walking on a Dream".to_string(),
+            "Death Magnetic".to_string()
+        ]
+    );
+
+    let albums: ankurah_core::resultset::ResultSet<AlbumRecord> = client
+        .fetch("name = 'Walking on a Dream' AND year = '1800'")
+        .await?;
+
+    assert_eq!(
+        albums
+            .records
+            .iter()
+            .map(|active_record| active_record.name())
+            .count(),
+        0,
     );
 
     Ok(())

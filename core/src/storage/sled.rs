@@ -67,14 +67,14 @@ impl StorageEngine for SledStorageEngine {
         &self,
         bucket_name: String,
         predicate: &ankql::ast::Predicate,
-    ) -> anyhow::Result<Vec<(ID, RecordState)>> {
+    ) -> Result<Vec<(ID, RecordState)>, RetrievalError> {
         let tree = self.db.open_tree(&bucket_name)?;
         let bucket = SledStorageBucket { tree };
 
         let predicate = predicate.clone();
 
         // Use spawn_blocking for the full scan operation
-        task::spawn_blocking(move || -> anyhow::Result<Vec<(ID, RecordState)>> {
+        task::spawn_blocking(move || -> Result<Vec<(ID, RecordState)>, RetrievalError> {
             let mut results = Vec::new();
             let mut seen_ids = HashSet::new();
             // println!("SledStorageEngine: Starting fetch_states scan");
@@ -82,7 +82,12 @@ impl StorageEngine for SledStorageEngine {
             // For now, do a full table scan
             for item in bucket.tree.iter() {
                 let (key_bytes, value_bytes) = item?;
-                let id = ID::from_ulid(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into()?));
+                let id = ID::from_ulid(ulid::Ulid::from_bytes(
+                    key_bytes
+                        .as_ref()
+                        .try_into()
+                        .map_err(RetrievalError::storage)?,
+                ));
 
                 // Skip if we've already seen this ID
                 if seen_ids.contains(&id) {
@@ -112,7 +117,8 @@ impl StorageEngine for SledStorageEngine {
             // );
             Ok(results)
         })
-        .await?
+        .await
+        .map_err(RetrievalError::future_join)?
     }
 }
 

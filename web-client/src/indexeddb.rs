@@ -145,7 +145,7 @@ impl StorageEngine for IndexedDBStorageEngine {
         &self,
         bucket_name: String,
         predicate: &ankql::ast::Predicate,
-    ) -> anyhow::Result<Vec<(proto::ID, proto::RecordState)>> {
+    ) -> Result<Vec<(proto::ID, proto::RecordState)>, RetrievalError> {
         SendWrapper::new(async move {
             let transaction = self
                 .db
@@ -188,8 +188,10 @@ impl StorageEngine for IndexedDBStorageEngine {
 
                 let id_str = js_sys::Reflect::get(&record, &"id".into())
                     .map_err(|_e| anyhow::anyhow!("Failed to get record id"))?;
-                let id =
-                    proto::ID::from_ulid(ulid::Ulid::from_string(&id_str.as_string().unwrap())?);
+                let id = proto::ID::from_ulid(
+                    ulid::Ulid::from_string(&id_str.as_string().unwrap())
+                        .map_err(RetrievalError::storage)?,
+                );
 
                 let state_buffer = js_sys::Reflect::get(&record, &"state_buffer".into())
                     .map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;

@@ -73,6 +73,7 @@ dependencies = [
  "dirs",
  "futures",
  "futures-signals",
+ "futures-util",
  "js-sys",
  "reactive_graph",
  "serde",
