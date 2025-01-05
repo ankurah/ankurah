@@ -25,6 +25,21 @@ pub struct PeerState {
     subscriptions: BTreeMap<proto::SubscriptionId, Vec<SubscriptionHandle>>,
 }
 
+pub struct FetchArgs {
+    pub predicate: ankql::ast::Predicate,
+    pub cached: bool,
+}
+
+impl TryInto<FetchArgs> for &str {
+    type Error = ankql::error::ParseError;
+    fn try_into(self) -> Result<FetchArgs, Self::Error> {
+        Ok(FetchArgs {
+            predicate: ankql::parser::parse_selection(self)?,
+            cached: false,
+        })
+    }
+}
+
 /// Manager for all records and their properties on this client.
 pub struct Node {
     pub id: proto::NodeId,
@@ -632,7 +647,7 @@ impl Node {
         self: &Arc<Self>,
         collection_name: &str,
         predicate: &ankql::ast::Predicate,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(), RetrievalError> {
         // Get first durable peer
         let peer_id = {
             self.peer_connections
@@ -641,7 +656,7 @@ impl Node {
                 .iter()
                 .find(|(_, state)| state.durable)
                 .map(|(id, _)| id.clone())
-                .ok_or_else(|| anyhow!("No durable peers available for fetch operation"))?
+                .ok_or(RetrievalError::NoDurablePeers)?
         };
 
         match self
@@ -652,42 +667,57 @@ impl Node {
                     predicate: predicate.clone(),
                 },
             )
-            .await?
+            .await
+            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
         {
             proto::NodeResponseBody::Fetch(states) => {
                 let raw_bucket = self.bucket(collection_name).await;
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for (id, state) in states {
-                    raw_bucket.0.set_record(id, &state).await?;
+                    raw_bucket
+                        .0
+                        .set_record(id, &state)
+                        .await
+                        .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
             }
             proto::NodeResponseBody::Error(e) => {
                 debug!("Error from peer fetch: {}", e);
-                Err(anyhow!(e))
+                Err(RetrievalError::Other(format!("{:?}", e)))
             }
             _ => {
                 debug!("Unexpected response type from peer fetch");
-                Err(anyhow!("Unexpected response type"))
+                Err(RetrievalError::Other(
+                    "Unexpected response type".to_string(),
+                ))
             }
         }
     }
 
     pub async fn fetch<R: Record>(
         self: &Arc<Self>,
-        predicate: impl TryInto<ankql::ast::Predicate, Error = ankql::error::ParseError>,
+        args: impl TryInto<FetchArgs>,
     ) -> anyhow::Result<ResultSet<R>> {
-        let predicate = predicate
+        let args = args
             .try_into()
-            .map_err(|e| anyhow!("Failed to parse predicate: {:?}", e))?;
+            .map_err(|e| anyhow!("Failed to parse predicate:"))?;
+
+        let predicate = args.predicate;
 
         use crate::model::Model;
         let collection_name = R::Model::bucket_name();
 
         if !self.durable {
             // Fetch from peers and commit first response
-            self.fetch_from_peer(collection_name, &predicate).await?;
+            match self.fetch_from_peer(collection_name, &predicate).await {
+                Ok(_) => (),
+                Err(RetrievalError::NoDurablePeers) if args.cached => (),
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
         }
 
         // Fetch raw states from storage

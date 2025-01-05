@@ -11,7 +11,7 @@ async fn test_postgres() -> Result<()> {
     use common::*;
 
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let node = Arc::new(Node::new(Arc::new(storage_engine)));
+    let node = Arc::new(Node::new_durable(Arc::new(storage_engine)));
 
     let trx = node.begin();
     let _album = trx

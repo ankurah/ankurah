@@ -12,7 +12,9 @@ use common::{Album, AlbumRecord, ChangeKind, Pet, PetRecord};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let client = Arc::new(Node::new_durable(Arc::new(
+        SledStorageEngine::new_test().unwrap(),
+    )));
 
     // Create some initial records
     {
@@ -85,7 +87,9 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 #[tokio::test]
 async fn complex_local_subscription() {
     // Create a new node
-    let node = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let node = Arc::new(Node::new_durable(Arc::new(
+        SledStorageEngine::new_test().unwrap(),
+    )));
     let (watcher, check) = common::changeset_watcher();
 
     // Subscribe to changes

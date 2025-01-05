@@ -21,7 +21,9 @@ pub struct Album {
 
 #[tokio::test]
 async fn repeatable_read() -> Result<()> {
-    let client = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let client = Arc::new(Node::new_durable(Arc::new(
+        SledStorageEngine::new_test().unwrap(),
+    )));
 
     let id;
     {
@@ -88,7 +90,7 @@ mod pg_common;
 #[tokio::test]
 async fn pg_repeatable_read() -> Result<()> {
     let (_container, postgres) = pg_common::create_postgres_container().await?;
-    let client = Arc::new(Node::new(Arc::new(postgres)));
+    let client = Arc::new(Node::new_durable(Arc::new(postgres)));
 
     let id;
     {

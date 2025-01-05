@@ -61,7 +61,7 @@ mod pg_common;
 #[tokio::test]
 async fn pg_basic_where_clause() -> Result<()> {
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let client = Arc::new(Node::new(Arc::new(storage_engine)));
+    let client = Arc::new(Node::new_durable(Arc::new(storage_engine)));
 
     {
         let trx = client.begin();

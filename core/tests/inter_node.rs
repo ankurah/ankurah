@@ -1,7 +1,7 @@
 mod common;
 
 use ankurah_core::connector::local_process::LocalProcessConnection;
-use ankurah_core::node::Node;
+use ankurah_core::node::{FetchArgs, Node};
 use ankurah_core::storage::SledStorageEngine;
 use anyhow::Result;
 use std::sync::Arc;
@@ -58,7 +58,17 @@ async fn inter_node_fetch() -> Result<()> {
     assert_eq!(names(node1.fetch(p).await?), ["Walking on a Dream"]);
 
     // But node2 because they arent connected
-    assert_eq!(names(node2.fetch(p).await?), [] as [&str; 0]);
+    assert_eq!(
+        names(
+            node2
+                .fetch(FetchArgs {
+                    predicate: p.try_into()?,
+                    cached: true
+                })
+                .await?
+        ),
+        [] as [&str; 0]
+    );
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
@@ -72,7 +82,9 @@ async fn inter_node_fetch() -> Result<()> {
 #[tokio::test]
 async fn inter_node_subscription() -> Result<()> {
     // Create two nodes
-    let node1 = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let node1 = Arc::new(Node::new_durable(Arc::new(
+        SledStorageEngine::new_test().unwrap(),
+    )));
     let node2 = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     // Connect the nodes

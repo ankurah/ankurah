@@ -11,6 +11,11 @@ pub enum RetrievalError {
     FailedUpdate(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Deserialization error: {0}")]
     DeserializationError(bincode::Error),
+    #[error("No durable peers available for fetch operation")]
+    NoDurablePeers,
+
+    #[error("Other error: {0}")]
+    Other(String),
 }
 
 impl From<bincode::Error> for RetrievalError {

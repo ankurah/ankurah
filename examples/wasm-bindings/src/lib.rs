@@ -35,7 +35,7 @@ use ankurah_core::resultset::ResultSet;
 pub async fn fetch_test_records(client: &WebsocketClient) -> Vec<SessionRecord> {
     let sessions: ResultSet<SessionRecord> = client
         .node()
-        .fetch::<SessionRecord>("date_connected = '2024-01-01'")
+        .fetch("date_connected = '2024-01-01'")
         .await
         .unwrap();
     sessions.into()
