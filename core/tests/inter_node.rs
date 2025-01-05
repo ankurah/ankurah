@@ -5,6 +5,7 @@ use ankurah_core::node::{FetchArgs, Node};
 use ankurah_core::storage::SledStorageEngine;
 use anyhow::Result;
 use std::sync::Arc;
+use tracing::info;
 
 use ankurah_core::changes::ItemChange;
 use ankurah_core::model::ScopedRecord;
@@ -119,14 +120,21 @@ async fn inter_node_subscription() -> Result<()> {
         trx.commit().await?;
     }
 
+    info!(
+        "rex: {:?}, snuffy: {:?}, jasper: {:?}",
+        rex.id(),
+        snuffy.id(),
+        jasper.id()
+    );
+
     // Set up subscription on node2
     let (watcher, check_node2) = common::changeset_watcher();
     let _handle = node2
-        .subscribe("pets", "name = 'Rex' OR (age > 2 and age < 5)", watcher)
+        .subscribe("pet", "name = 'Rex' OR (age > 2 and age < 5)", watcher)
         .await?;
 
     // Initial state should include Rex
-    assert_eq!(check_node2(), vec![ChangeKind::Initial]);
+    assert_eq!(check_node2(), vec![(rex.id(), ChangeKind::Initial)]);
 
     // Update Rex's age to 7 on node1
     {
@@ -135,7 +143,7 @@ async fn inter_node_subscription() -> Result<()> {
         trx.commit().await?;
     }
 
-    assert_eq!(check_node2(), vec![ChangeKind::Edit]); // Rex still matches the predicate, but the age has changed
+    assert_eq!(check_node2(), vec![(rex.id(), ChangeKind::Update)]); // Rex still matches the predicate, but the age has changed
 
     // Update Snuffy's age to 3 on node1
     {
@@ -144,9 +152,12 @@ async fn inter_node_subscription() -> Result<()> {
         trx.commit().await?;
     }
 
+    // Sleep for a bit to ensure the change is propagated
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
     // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
     let changes = check_node2();
-    assert_eq!(changes, vec![ChangeKind::Add]);
+    assert_eq!(changes, vec![(snuffy.id(), ChangeKind::Add)]);
 
     Ok(())
 }

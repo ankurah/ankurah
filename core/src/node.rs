@@ -244,6 +244,7 @@ impl Node {
                 collection: bucket_name,
                 predicate,
             } => {
+                info!("MARK 0 - subscribe");
                 self.handle_subscribe_request(request.from, bucket_name, predicate)
                     .await
             }
@@ -264,11 +265,14 @@ impl Node {
         bucket_name: String,
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
+        info!("MARK 0.5 - subscribe");
         // First fetch initial state
         let states = self
             .storage_engine
             .fetch_states(bucket_name.clone(), &predicate)
             .await?;
+
+        info!("MARK 1");
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
@@ -276,6 +280,7 @@ impl Node {
             let peer_id = peer_id.clone();
             self.reactor
                 .subscribe(&bucket_name, predicate, move |changeset| {
+                    info!("MARK 2");
                     // When changes occur, send them to the peer as CommitEvents
                     let events: Vec<_> = changeset
                         .changes
@@ -290,7 +295,14 @@ impl Node {
                             | ItemChange::Remove {
                                 events: updates, ..
                             } => updates.clone(),
-                            ItemChange::Initial { .. } => vec![],
+                            ItemChange::Initial { record } => {
+                                // For initial records, create an Add event with no operations
+                                vec![proto::RecordEvent {
+                                    id: record.id(),
+                                    bucket_name: record.bucket_name().to_string(),
+                                    operations: std::collections::BTreeMap::new(),
+                                }]
+                            }
                         })
                         .collect();
 
@@ -319,7 +331,7 @@ impl Node {
         }
 
         Ok(proto::NodeResponseBody::Subscribe {
-            initial: states.into_iter().collect(),
+            initial: states,
             subscription_id,
         })
     }
@@ -750,7 +762,52 @@ impl Node {
     {
         let predicate = predicate
             .try_into()
-            .map_err(|e| anyhow!("Failed to parse predicate: {}", e))?;
+            .map_err(|e| anyhow!("Failed to parse predicate:"))?;
+
+        // First, find any durable nodes to subscribe to
+        let durable_peer_id = {
+            let peer_connections = self.peer_connections.read().await;
+            peer_connections
+                .iter()
+                .find(|(_, state)| state.durable)
+                .map(|(id, _)| id.clone())
+        };
+
+        // If we have a durable node, send a subscription request to it
+        if let Some(peer_id) = durable_peer_id {
+            match self
+                .request(
+                    peer_id,
+                    proto::NodeRequestBody::Subscribe {
+                        collection: bucket_name.to_string(),
+                        predicate: predicate.clone(),
+                    },
+                )
+                .await?
+            {
+                proto::NodeResponseBody::Subscribe {
+                    initial,
+                    subscription_id: _,
+                } => {
+                    // Apply initial states to our storage
+                    let raw_bucket = self.bucket(bucket_name).await;
+                    for (id, state) in initial {
+                        raw_bucket
+                            .set_record(id, &state)
+                            .await
+                            .map_err(|e| anyhow!("Failed to set record: {:?}", e))?;
+                    }
+                }
+                proto::NodeResponseBody::Error(e) => {
+                    return Err(anyhow!("Error from peer subscription: {}", e));
+                }
+                _ => {
+                    return Err(anyhow!("Unexpected response type from peer subscription"));
+                }
+            }
+        }
+
+        // Now set up our local subscription
         self.reactor
             .subscribe(bucket_name, predicate, callback)
             .await

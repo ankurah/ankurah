@@ -8,6 +8,7 @@ use ankql::selection::filter::Filterable;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::info;
 
 use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -254,6 +255,11 @@ impl Reactor {
                     // Update record watchers and notify subscription if needed
                     self.update_record_watchers(record, matches, sub_id);
 
+                    info!(
+                        "NOTIFY CHANGE: {} {matches} {did_match} {change:?}",
+                        record.id(),
+                        change = change.clone()
+                    );
                     // Determine the change type
                     let new_change = if matches != did_match {
                         // Matching status changed
