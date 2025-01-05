@@ -54,7 +54,7 @@ impl Transaction {
             return Ok(local);
         }
 
-        let (record_inner, _) = self.node.fetch_record_inner(id, bucket_name).await?;
+        let record_inner = self.node.fetch_record_inner(id, bucket_name).await?;
         let record_ref = self.add_record(record_inner.snapshot());
         Ok(record_ref)
     }

@@ -114,6 +114,12 @@ impl RecordInner {
         Ok(())
     }
 
+    /// HACK - we probably shouldn't be stomping on the backends like this
+    pub fn apply_record_state(&self, state: &RecordState) -> Result<(), RetrievalError> {
+        self.backends.apply_state(state)?;
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Self {
         Self {
             id: self.id(),

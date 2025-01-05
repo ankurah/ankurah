@@ -1,5 +1,5 @@
 use super::comparision_index::ComparisonIndex;
-use crate::changes::{ChangeSet, RecordChange};
+use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::storage::StorageEngine;
 use crate::subscription::{Subscription, SubscriptionHandle};
 use crate::value::Value;
@@ -96,7 +96,7 @@ impl Reactor {
             (subscription.callback)(ChangeSet {
                 changes: matching_records
                     .into_iter()
-                    .map(|record| RecordChange::Initial {
+                    .map(|record| ItemChange::Initial {
                         record: record.clone(),
                     })
                     .collect(),
@@ -216,18 +216,18 @@ impl Reactor {
     }
 
     /// Notify subscriptions about a record change
-    pub fn notify_change(&self, changeset: ChangeSet) {
+    pub fn notify_change(&self, changes: Vec<EntityChange>) {
         // Group changes by subscription
-        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<RecordChange>> =
+        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange>> =
             std::collections::HashMap::new();
 
-        for change in &changeset.changes {
+        for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
 
             // Find subscriptions that might be interested based on index watchers
             for index_ref in self.index_watchers.iter() {
                 // Get the field value from the record
-                if let Some(field_value) = change.record().value(&index_ref.key().0) {
+                if let Some(field_value) = change.record.value(&index_ref.key().0) {
                     possibly_interested_subs
                         .extend(index_ref.find_matching(Value::String(field_value)));
                 }
@@ -236,8 +236,7 @@ impl Reactor {
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                    let record = change.record();
-
+                    let record = &change.record;
                     // Use evaluate_predicate directly on the record instead of fetch_records
                     let matches = ankql::selection::filter::evaluate_predicate(
                         &**record,
@@ -259,54 +258,21 @@ impl Reactor {
                     let new_change = if matches != did_match {
                         // Matching status changed
                         Some(if matches {
-                            RecordChange::Add {
+                            ItemChange::Add {
                                 record: record.clone(),
-                                events: match change {
-                                    RecordChange::Add {
-                                        events: updates, ..
-                                    }
-                                    | RecordChange::Update {
-                                        events: updates, ..
-                                    }
-                                    | RecordChange::Remove {
-                                        events: updates, ..
-                                    } => updates.clone(),
-                                    RecordChange::Initial { .. } => vec![],
-                                },
+                                events: change.events.clone(),
                             }
                         } else {
-                            RecordChange::Remove {
+                            ItemChange::Remove {
                                 record: record.clone(),
-                                events: match change {
-                                    RecordChange::Add {
-                                        events: updates, ..
-                                    }
-                                    | RecordChange::Update {
-                                        events: updates, ..
-                                    }
-                                    | RecordChange::Remove {
-                                        events: updates, ..
-                                    } => updates.clone(),
-                                    RecordChange::Initial { .. } => vec![],
-                                },
+                                events: change.events.clone(),
                             }
                         })
                     } else if matches {
                         // Record still matches but was updated
-                        Some(RecordChange::Update {
+                        Some(ItemChange::Update {
                             record: record.clone(),
-                            events: match change {
-                                RecordChange::Add {
-                                    events: updates, ..
-                                }
-                                | RecordChange::Update {
-                                    events: updates, ..
-                                }
-                                | RecordChange::Remove {
-                                    events: updates, ..
-                                } => updates.clone(),
-                                RecordChange::Initial { .. } => vec![],
-                            },
+                            events: change.events.clone(),
                         })
                     } else {
                         // Record didn't match before and still doesn't match

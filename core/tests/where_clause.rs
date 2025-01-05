@@ -7,7 +7,9 @@ use common::{Album, AlbumRecord};
 use std::sync::Arc;
 #[tokio::test]
 async fn basic_where_clause() -> Result<()> {
-    let client = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let client = Arc::new(Node::new_durable(Arc::new(
+        SledStorageEngine::new_test().unwrap(),
+    )));
 
     let id = {
         let trx = client.begin();

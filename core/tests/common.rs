@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tracing::Level;
 
 use ankurah_core::{
-    changes::{ChangeSet, RecordChange},
+    changes::{ChangeSet, ItemChange},
     property::value::YrsString,
 };
 use ankurah_derive::Model;
@@ -43,13 +43,13 @@ pub enum ChangeKind {
     Edit,
 }
 
-impl From<&RecordChange> for ChangeKind {
-    fn from(change: &RecordChange) -> Self {
+impl From<&ItemChange> for ChangeKind {
+    fn from(change: &ItemChange) -> Self {
         match change {
-            RecordChange::Initial { .. } => ChangeKind::Initial,
-            RecordChange::Add { .. } => ChangeKind::Add,
-            RecordChange::Remove { .. } => ChangeKind::Remove,
-            RecordChange::Update { .. } => ChangeKind::Edit,
+            ItemChange::Initial { .. } => ChangeKind::Initial,
+            ItemChange::Add { .. } => ChangeKind::Add,
+            ItemChange::Remove { .. } => ChangeKind::Remove,
+            ItemChange::Update { .. } => ChangeKind::Edit,
         }
     }
 }

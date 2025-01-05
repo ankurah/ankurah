@@ -135,7 +135,7 @@ mod tests {
         let mut index = ComparisonIndex::new();
 
         // Less than 8 ------------------------------------------------------------
-        let sub0 = proto::SubscriptionId::from(0);
+        let sub0 = proto::SubscriptionId::test(0);
         index.add(
             ast::Literal::Integer(8),
             ast::ComparisonOperator::LessThan,
@@ -148,7 +148,7 @@ mod tests {
         // 7 should match sub0
         assert_eq!(index.find_matching(Value::Integer(7)), vec![sub0]);
 
-        let sub1 = proto::SubscriptionId::from(1);
+        let sub1 = proto::SubscriptionId::test(1);
 
         // Greater than 20 ------------------------------------------------------------
         index.add(

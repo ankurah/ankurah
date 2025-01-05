@@ -57,6 +57,11 @@ impl SubscriptionId {
     pub fn new() -> Self {
         Self(Ulid::new())
     }
+
+    /// To be used only for testing
+    pub fn test(id: u64) -> Self {
+        Self(Ulid::from_parts(id, 0))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,7 +102,7 @@ pub struct Operation {
     pub diff: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RecordState {
     pub state_buffers: BTreeMap<String, Vec<u8>>,
 }
@@ -125,9 +130,9 @@ pub enum NodeResponseBody {
     // Response to CommitEvents
     CommitComplete,
     // Response to FetchRecords
-    Fetch(Vec<RecordState>),
+    Fetch(Vec<(ID, RecordState)>),
     Subscribe {
-        initial: Vec<RecordState>,
+        initial: Vec<(ID, RecordState)>,
         subscription_id: SubscriptionId,
     },
     Success,
@@ -152,7 +157,7 @@ pub enum ServerMessage {
     PeerMessage(PeerMessage),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Presence {
     pub node_id: NodeId,
     pub durable: bool,

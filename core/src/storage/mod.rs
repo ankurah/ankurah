@@ -22,6 +22,7 @@ pub trait StorageEngine: Send + Sync {
     async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>>;
 
     // Fetch raw record states matching a predicate
+    // TODO: Move this to the StorageBucket trait
     async fn fetch_states(
         &self,
         bucket_name: String,
@@ -31,6 +32,9 @@ pub trait StorageEngine: Send + Sync {
 
 #[async_trait]
 pub trait StorageBucket: Send + Sync {
+    // TODO - implement merge_states based on event history.
+    // Consider whether to play events forward from a prior checkpoint (probably this)
+    // or maybe to require PropertyBackends to be able to merge states.
     async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()>;
     async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError>;
 
