@@ -381,15 +381,18 @@ impl Node {
 
             let record_state = record.to_record_state()?;
             // Push the state buffers to storage.
-            self.bucket(record_event.bucket_name())
+            let changed = self
+                .bucket(record_event.bucket_name())
                 .await
                 .set_record(record_event.id(), &record_state)
                 .await?;
 
-            changes.push(EntityChange {
-                record: record.clone(),
-                events: vec![record_event.clone()],
-            });
+            if changed {
+                changes.push(EntityChange {
+                    record: record.clone(),
+                    events: vec![record_event.clone()],
+                });
+            }
         }
         self.reactor.notify_change(changes);
 

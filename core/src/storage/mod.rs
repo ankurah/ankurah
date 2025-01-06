@@ -35,7 +35,7 @@ pub trait StorageBucket: Send + Sync {
     // TODO - implement merge_states based on event history.
     // Consider whether to play events forward from a prior checkpoint (probably this)
     // or maybe to require PropertyBackends to be able to merge states.
-    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()>;
+    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<bool>;
     async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError>;
 
     async fn set_records(&self, records: Vec<(ID, &RecordState)>) -> anyhow::Result<()> {

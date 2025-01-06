@@ -162,7 +162,7 @@ pub struct Operation {
     pub diff: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct RecordState {
     pub state_buffers: BTreeMap<String, Vec<u8>>,
 }

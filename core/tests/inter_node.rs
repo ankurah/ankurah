@@ -145,6 +145,7 @@ async fn inter_node_subscription() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     assert_eq!(check_node2(), vec![(rex.id(), ChangeKind::Update)]); // Rex still matches the predicate, but the age has changed
 
+    // short circuit to simplify debugging
     return Ok(());
     // Update Snuffy's age to 3 on node1
     {
