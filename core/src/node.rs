@@ -189,8 +189,8 @@ impl Node {
                     let _result = sender
                         .send_message(proto::PeerMessage::Response(proto::NodeResponse {
                             request_id,
-                            from,
-                            to,
+                            from: self.id.clone(),
+                            to: from,
                             body,
                         }))
                         .await;
@@ -592,7 +592,6 @@ impl Node {
         debug!("fetch_record {:?}-{:?}", id, bucket_name);
 
         if let Some(local) = self.fetch_record_from_node(id, bucket_name).await {
-            info!("passing ref to existing record");
             return Ok(local);
         }
         debug!("fetch_record 2");

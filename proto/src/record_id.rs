@@ -49,7 +49,7 @@ impl ID {
 
 impl fmt::Display for ID {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0.to_string())
+        write!(f, "I{}", &self.0.to_string()[20..])
     }
 }
 

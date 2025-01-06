@@ -137,7 +137,7 @@ impl std::fmt::Display for RecordEvent {
             self.operations
                 .iter()
                 .map(|(backend, ops)| format!(
-                    "{} => {} bytes",
+                    "{} => {}b",
                     backend,
                     ops.iter().map(|op| op.diff.len()).sum::<usize>()
                 ))
@@ -165,6 +165,20 @@ pub struct Operation {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RecordState {
     pub state_buffers: BTreeMap<String, Vec<u8>>,
+}
+
+impl std::fmt::Display for RecordState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RecordState({})",
+            self.state_buffers
+                .iter()
+                .map(|(backend, buf)| format!("{} => {}b", backend, buf.len()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,11 +264,11 @@ impl std::fmt::Display for NodeResponseBody {
                 subscription_id,
             } => write!(
                 f,
-                "Subscribe {} [{}]",
+                "Subscribe {} initial [{}]",
                 subscription_id,
                 initial
                     .iter()
-                    .map(|(id, _)| id.to_string())
+                    .map(|(id, state)| format!("{} {}", id.to_string(), state))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
