@@ -225,7 +225,7 @@ impl StorageEngine for IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageBucket for IndexedDBBucket {
-    async fn set_record(&self, id: proto::ID, state: &proto::RecordState) -> anyhow::Result<()> {
+    async fn set_record(&self, id: proto::ID, state: &proto::RecordState) -> anyhow::Result<bool> {
         SendWrapper::new(async move {
             // Serialize the state
             let state_buffer = bincode::serialize(&state.state_buffers)?;

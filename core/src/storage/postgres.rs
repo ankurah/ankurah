@@ -175,7 +175,7 @@ impl PostgresParams {
 
 #[async_trait]
 impl StorageBucket for PostgresBucket {
-    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<bool> {
         // TODO: Create/Alter table
         let state_buffers = bincode::serialize(&state.state_buffers)?;
         let ulid: ulid::Ulid = id.into();
