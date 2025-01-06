@@ -10,7 +10,7 @@ use ankql::ast;
 pub use record_id::ID;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ulid::Ulid;
 
@@ -125,6 +125,8 @@ pub struct RecordEvent {
     pub id: ID,
     pub bucket_name: String,
     pub operations: BTreeMap<String, Vec<Operation>>,
+    /// The set of concurrent events (usually only one) which is the precursor of this event
+    pub parent: BTreeSet<ID>,
 }
 
 impl std::fmt::Display for RecordEvent {
@@ -164,7 +166,10 @@ pub struct Operation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct RecordState {
+    /// The current accumulated state of the record inclusive of all events up to this point
     pub state_buffers: BTreeMap<String, Vec<u8>>,
+    /// The set of concurrent events (usually only one) which have been applied to the record state above
+    pub head: BTreeSet<ID>,
 }
 
 impl std::fmt::Display for RecordState {
