@@ -130,7 +130,7 @@ async fn complex_local_subscription() {
     };
 
     // Verify initial state
-    assert_eq!(check(), [ChangeKind::Add]); // Initial state should be an Add
+    assert_eq!(check(), [(rex.id(), ChangeKind::Add)]); // Initial state should be an Add
 
     {
         // Update Rex's age to 7
@@ -140,7 +140,7 @@ async fn complex_local_subscription() {
     }
 
     // Verify Rex's update was received - should be Edit since it still matches name = 'Rex'
-    assert_eq!(check(), [ChangeKind::Edit]);
+    assert_eq!(check(), [(rex.id(), ChangeKind::Update)]);
 
     {
         // Update Snuffy's age to 3
@@ -150,7 +150,7 @@ async fn complex_local_subscription() {
     }
 
     // Verify Snuffy's update was received (now matches age > 2 and age < 5)
-    assert_eq!(check(), [ChangeKind::Add]);
+    assert_eq!(check(), [(snuffy.id(), ChangeKind::Add)]);
 
     // Update Jasper's age to 4
     {
@@ -160,7 +160,7 @@ async fn complex_local_subscription() {
     }
 
     // Verify Jasper's update was received (now matches age > 2 and age < 5)
-    assert_eq!(check(), [ChangeKind::Add]);
+    assert_eq!(check(), [(jasper.id(), ChangeKind::Add)]);
 
     // Update Snuffy and Jasper to ages outside the range
     let trx = node.begin();
@@ -171,7 +171,13 @@ async fn complex_local_subscription() {
     trx.commit().await.unwrap();
 
     // Verify both updates were received as removals
-    assert_eq!(check(), [ChangeKind::Remove, ChangeKind::Remove]);
+    assert_eq!(
+        check(),
+        [
+            (snuffy.id(), ChangeKind::Remove),
+            (jasper.id(), ChangeKind::Remove)
+        ]
+    );
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches
@@ -181,5 +187,5 @@ async fn complex_local_subscription() {
     trx.commit().await.unwrap();
 
     // Verify Rex's "removal" was received
-    assert_eq!(check(), [ChangeKind::Remove]);
+    assert_eq!(check(), [(rex.id(), ChangeKind::Remove)]);
 }

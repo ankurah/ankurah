@@ -60,7 +60,6 @@ impl IndexedDBStorageEngine {
                 let db: SendWrapper<IdbDatabase> =
                     SendWrapper::new(target.result().unwrap().unchecked_into());
 
-                tracing::info!("Creating records store");
                 // Create records store with index on collection
                 let store = match db.create_object_store("records") {
                     Ok(store) => store,
@@ -228,25 +227,17 @@ impl StorageEngine for IndexedDBStorageEngine {
 impl StorageBucket for IndexedDBBucket {
     async fn set_record(&self, id: proto::ID, state: &proto::RecordState) -> anyhow::Result<()> {
         SendWrapper::new(async move {
-            tracing::info!("MARK 1: Starting record set operation");
             // Serialize the state
             let state_buffer = bincode::serialize(&state.state_buffers)?;
-            tracing::info!(
-                "MARK 2: State serialized, buffer size: {}",
-                state_buffer.len()
-            );
-
             // Create transaction and get object store
             let transaction = self
                 .db
                 .transaction_with_str_and_mode("records", web_sys::IdbTransactionMode::Readwrite)
                 .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
-            tracing::info!("MARK 3: Transaction created");
 
             let store = transaction
                 .object_store("records")
                 .map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
-            tracing::info!("MARK 4: Object store obtained");
 
             // Create a JS object to store our data
             let record = js_sys::Object::new();
@@ -260,25 +251,21 @@ impl StorageBucket for IndexedDBBucket {
                 &js_sys::Uint8Array::from(&state_buffer[..]).into(),
             )
             .map_err(|_e| anyhow::anyhow!("Failed to set data on record"))?;
-            tracing::info!("MARK 5: Record object created and populated");
 
             // Put the record in the store
             let request = store
                 .put_with_key(&record, &id.as_string().into())
                 .map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
-            tracing::info!("MARK 6: Put request created");
 
             let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
             request_fut
                 .await
                 .map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
-            tracing::info!("MARK 7: Put request completed");
 
             let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
             trx_fut
                 .await
                 .map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
-            tracing::info!("MARK 8: Transaction completed successfully");
 
             Ok(())
         })

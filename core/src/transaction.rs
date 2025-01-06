@@ -69,7 +69,6 @@ impl Transaction {
         model: &M,
     ) -> M::ScopedRecord<'rec> {
         let id = self.node.next_record_id();
-        tracing::info!("Creating record with id: {:?}", id);
         let record_inner = model.to_record_inner(id);
         let record_ref = self.add_record(record_inner);
         <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref)
@@ -92,26 +91,17 @@ impl Transaction {
     #[must_use]
     // only because Drop is &mut self not mut self
     pub(crate) async fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
-        tracing::info!("trx.commit_mut_ref");
+        tracing::debug!("trx.commit");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
         let mut record_events = Vec::new();
         for record in self.records.iter() {
-            debug!("trx.commit_mut_ref: record: {:?}", record);
             if let Some(record_event) = record.get_record_event()? {
-                debug!("trx.commit_mut_ref: record_event: {:?}", record_event);
                 record_events.push(record_event);
             }
         }
-
-        debug!(
-            "trx.commit_mut_ref: record_events HERE: {:?}",
-            record_events
-        );
-
         self.node.commit_events(&record_events).await?;
 
-        debug!("trx.commit_mut_ref: done");
         Ok(())
     }
 

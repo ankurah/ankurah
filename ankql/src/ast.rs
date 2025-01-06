@@ -39,6 +39,12 @@ pub enum Predicate {
     Not(Box<Predicate>),
 }
 
+impl std::fmt::Display for Predicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", crate::selection::sql::generate_selection_sql(self))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ComparisonOperator {
     Equal,              // =

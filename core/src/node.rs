@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, RecordState};
+use ankurah_proto as proto;
 use anyhow::anyhow;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
@@ -7,7 +7,7 @@ use std::{
 use tokio::sync::{oneshot, RwLock};
 
 use crate::{
-    changes::{ChangeSet, EntityChange, ItemChange},
+    changes::{EntityChange, ItemChange},
     connector::PeerSender,
     error::RetrievalError,
     model::{Record, RecordInner},
@@ -95,7 +95,6 @@ impl Node {
     }
 
     pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
-        info!("node.register_peer_sender 1");
         let mut peer_connections = self.peer_connections.write().await;
         peer_connections.insert(
             presence.node_id,
@@ -105,7 +104,6 @@ impl Node {
                 subscriptions: BTreeMap::new(),
             },
         );
-        info!("node.register_peer_sender 2");
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
     pub async fn deregister_peer(&self, node_id: proto::NodeId) {
@@ -165,9 +163,9 @@ impl Node {
         self: &Arc<Self>,
         message: proto::PeerMessage,
     ) -> anyhow::Result<()> {
-        info!("Received message: {:?}", message);
         match message {
             proto::PeerMessage::Request(request) => {
+                info!("{} {request}", self.id);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
                 // I think we want timeouts to be handled by the node, not the connector,
@@ -200,6 +198,7 @@ impl Node {
                 }
             }
             proto::PeerMessage::Response(response) => {
+                info!("{} {response}", self.id);
                 if let Some(tx) = self
                     .pending_requests
                     .write()
@@ -244,7 +243,6 @@ impl Node {
                 collection: bucket_name,
                 predicate,
             } => {
-                info!("MARK 0 - subscribe");
                 self.handle_subscribe_request(request.from, bucket_name, predicate)
                     .await
             }
@@ -265,14 +263,11 @@ impl Node {
         bucket_name: String,
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
-        info!("MARK 0.5 - subscribe");
         // First fetch initial state
         let states = self
             .storage_engine
             .fetch_states(bucket_name.clone(), &predicate)
             .await?;
-
-        info!("MARK 1");
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
@@ -280,7 +275,6 @@ impl Node {
             let peer_id = peer_id.clone();
             self.reactor
                 .subscribe(&bucket_name, predicate, move |changeset| {
-                    info!("MARK 2");
                     // When changes occur, send them to the peer as CommitEvents
                     let events: Vec<_> = changeset
                         .changes
@@ -294,16 +288,10 @@ impl Node {
                             }
                             | ItemChange::Remove {
                                 events: updates, ..
-                            } => updates.clone(),
-                            ItemChange::Initial { record } => {
-                                // For initial records, create an Add event with no operations
-                                vec![proto::RecordEvent {
-                                    id: record.id(),
-                                    bucket_name: record.bucket_name().to_string(),
-                                    operations: std::collections::BTreeMap::new(),
-                                }]
-                            }
+                            } => &updates[..],
+                            ItemChange::Initial { .. } => &[],
                         })
+                        .cloned()
                         .collect();
 
                     if !events.is_empty() {
@@ -380,37 +368,23 @@ impl Node {
         self: &Arc<Self>,
         events: &Vec<proto::RecordEvent>,
     ) -> anyhow::Result<()> {
-        debug!("node.commit_events_local 1");
-
         let mut changes = Vec::new();
 
         // First apply events locally
         for record_event in events {
-            debug!(
-                "node.commit_events_local 2: record_event: {:?}",
-                record_event
-            );
-
             // Apply record events to the Node's global records first.
             let record = self
                 .fetch_record_inner(record_event.id, &record_event.bucket_name)
                 .await?;
 
-            debug!("node.commit_events_local 3: record: {:?}", record);
             record.apply_record_event(record_event)?;
-            debug!("node.commit_events_local 4: apply_record_event done");
 
             let record_state = record.to_record_state()?;
-            debug!(
-                "node.commit_events_local 5: record_state: {:?}",
-                record_state
-            );
             // Push the state buffers to storage.
             self.bucket(record_event.bucket_name())
                 .await
                 .set_record(record_event.id(), &record_state)
                 .await?;
-            debug!("node.commit_events_local 6: done");
 
             changes.push(EntityChange {
                 record: record.clone(),
@@ -512,11 +486,7 @@ impl Node {
         self: &Arc<Self>,
         events: &Vec<proto::RecordEvent>,
     ) -> anyhow::Result<()> {
-        debug!("node.commit_events");
-
         self.commit_events_local(events).await?;
-
-        debug!("node.commit_events: done");
 
         // Then propagate to all peers
         let mut futures = Vec::new();
@@ -529,10 +499,8 @@ impl Node {
                 .collect::<Vec<_>>()
         };
 
-        info!("node.commit_events: peer_ids: {:?}", peer_ids);
         // Send commit request to all peers
         for peer_id in peer_ids {
-            info!("node.commit_events: sending to peer {:?}", peer_id);
             futures.push(self.request(
                 peer_id.clone(),
                 proto::NodeRequestBody::CommitEvents(events.to_vec()),
@@ -714,7 +682,7 @@ impl Node {
     ) -> anyhow::Result<ResultSet<R>> {
         let args = args
             .try_into()
-            .map_err(|e| anyhow!("Failed to parse predicate:"))?;
+            .map_err(|_| anyhow!("Failed to parse predicate:"))?;
 
         let predicate = args.predicate;
 
@@ -762,7 +730,7 @@ impl Node {
     {
         let predicate = predicate
             .try_into()
-            .map_err(|e| anyhow!("Failed to parse predicate:"))?;
+            .map_err(|_e| anyhow!("Failed to parse predicate:"))?;
 
         // First, find any durable nodes to subscribe to
         let durable_peer_id = {

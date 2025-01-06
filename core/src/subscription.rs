@@ -7,6 +7,7 @@ pub type Callback = Box<dyn Fn(ChangeSet) + Send + Sync + 'static>;
 
 /// A subscription that can be shared between indexes
 pub struct Subscription {
+    #[allow(unused)]
     pub(crate) id: proto::SubscriptionId,
     pub(crate) predicate: ankql::ast::Predicate,
     pub(crate) callback: Arc<Callback>,

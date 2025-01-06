@@ -8,6 +8,12 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub struct ID(Ulid);
 
+impl std::fmt::Debug for ID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.to_string())
+    }
+}
+
 impl From<ID> for Ulid {
     fn from(id: ID) -> Self {
         id.0
@@ -41,17 +47,9 @@ impl ID {
     }
 }
 
-impl fmt::Debug for ID {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let humanized = crate::human_id::hex(self.0.to_bytes());
-        f.debug_tuple("ID").field(&humanized).finish()
-    }
-}
-
 impl fmt::Display for ID {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        let humanized = crate::human_id::hex(self.0.to_bytes());
-        f.debug_tuple("ID").field(&humanized).finish()
+        write!(f, "{}", self.0.to_string())
     }
 }
 

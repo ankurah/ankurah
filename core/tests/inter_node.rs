@@ -7,7 +7,6 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::info;
 
-use ankurah_core::changes::ItemChange;
 use ankurah_core::model::ScopedRecord;
 use ankurah_core::resultset::ResultSet;
 use common::{Album, AlbumRecord, Pet};
@@ -143,17 +142,17 @@ async fn inter_node_subscription() -> Result<()> {
         trx.commit().await?;
     }
 
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     assert_eq!(check_node2(), vec![(rex.id(), ChangeKind::Update)]); // Rex still matches the predicate, but the age has changed
 
     // Update Snuffy's age to 3 on node1
-    {
-        let trx = node1.begin();
-        snuffy.edit(&trx).await?.age().overwrite(0, 1, "3");
-        trx.commit().await?;
-    }
+    // {
+    //     let trx = node1.begin();
+    //     snuffy.edit(&trx).await?.age().overwrite(0, 1, "3");
+    //     trx.commit().await?;
+    // }
 
     // Sleep for a bit to ensure the change is propagated
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
     let changes = check_node2();

@@ -255,11 +255,11 @@ impl Reactor {
                     // Update record watchers and notify subscription if needed
                     self.update_record_watchers(record, matches, sub_id);
 
-                    info!(
-                        "NOTIFY CHANGE: {} {matches} {did_match} {change:?}",
-                        record.id(),
-                        change = change.clone()
-                    );
+                    // info!(
+                    //     "NOTIFY CHANGE: {} {matches} {did_match} {change:?}",
+                    //     record.id(),
+                    //     change = change.clone()
+                    // );
                     // Determine the change type
                     let new_change = if matches != did_match {
                         // Matching status changed

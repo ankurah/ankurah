@@ -17,6 +17,13 @@ use ulid::Ulid;
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct NodeId(Ulid);
 
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id_str = self.0.to_string();
+        write!(f, "N{}", &id_str[20..])
+    }
+}
+
 impl From<NodeId> for String {
     fn from(node_id: NodeId) -> Self {
         node_id.0.to_string()
@@ -26,8 +33,21 @@ impl From<NodeId> for String {
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct RequestId(Ulid);
 
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id_str = self.0.to_string();
+        write!(f, "R{}", &id_str[20..])
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SubscriptionId(Ulid);
+
+impl std::fmt::Display for SubscriptionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "S-{}", self.0.to_string())
+    }
+}
 
 impl Default for NodeId {
     fn default() -> Self {
@@ -72,6 +92,16 @@ pub struct NodeRequest {
     pub body: NodeRequestBody,
 }
 
+impl std::fmt::Display for NodeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Request({}) {}->{} {}",
+            self.id, self.from, self.to, self.body
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeResponse {
     pub request_id: RequestId,
@@ -80,11 +110,41 @@ pub struct NodeResponse {
     pub body: NodeResponseBody,
 }
 
+impl std::fmt::Display for NodeResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Response({}) {}->{} {}",
+            self.request_id, self.from, self.to, self.body
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RecordEvent {
     pub id: ID,
     pub bucket_name: String,
     pub operations: BTreeMap<String, Vec<Operation>>,
+}
+
+impl std::fmt::Display for RecordEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RecordEvent({} {} {})",
+            self.bucket_name,
+            self.id,
+            self.operations
+                .iter()
+                .map(|(backend, ops)| format!(
+                    "{} => {} bytes",
+                    backend,
+                    ops.iter().map(|op| op.diff.len()).sum::<usize>()
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
 }
 
 impl RecordEvent {
@@ -125,6 +185,39 @@ pub enum NodeRequestBody {
     },
 }
 
+impl std::fmt::Display for NodeRequestBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeRequestBody::CommitEvents(events) => {
+                write!(
+                    f,
+                    "CommitEvents [{}]",
+                    events
+                        .iter()
+                        .map(|e| format!("{}", e))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            NodeRequestBody::FetchRecords {
+                collection,
+                predicate,
+            } => {
+                write!(f, "FetchRecords {collection} {predicate}")
+            }
+            NodeRequestBody::Subscribe {
+                collection,
+                predicate,
+            } => {
+                write!(f, "Subscribe {collection} {predicate}")
+            }
+            NodeRequestBody::Unsubscribe { subscription_id } => {
+                write!(f, "Unsubscribe {subscription_id}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeResponseBody {
     // Response to CommitEvents
@@ -137,6 +230,38 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
+}
+
+impl std::fmt::Display for NodeResponseBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeResponseBody::CommitComplete => write!(f, "CommitComplete"),
+            NodeResponseBody::Fetch(records) => write!(
+                f,
+                "Fetch [{}]",
+                records
+                    .iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            NodeResponseBody::Subscribe {
+                initial,
+                subscription_id,
+            } => write!(
+                f,
+                "Subscribe {} [{}]",
+                subscription_id,
+                initial
+                    .iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            NodeResponseBody::Success => write!(f, "Success"),
+            NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

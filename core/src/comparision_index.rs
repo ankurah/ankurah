@@ -92,28 +92,19 @@ impl ComparisonIndex {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
-        println!("\nChecking value with bytes: {:?}", bytes);
-
         // Check exact matches
         if let Some(subs) = self.eq.get(&bytes) {
-            println!("eq match - subs: {:?}", subs);
             result.extend(subs.iter().cloned());
         }
 
         // Check greater than matches (x > threshold)
-        println!("\ngt index contents: {:?}", self.gt);
-        println!("gt range query: ..{:?}", bytes);
-        for (threshold, subs) in self.gt.range(..bytes.clone()) {
-            println!("gt got threshold: {:?}", threshold);
+        for (_threshold, subs) in self.gt.range(..bytes.clone()) {
             result.extend(subs.iter().cloned());
         }
 
         // Check less than matches (x < threshold)
-        println!("lt index contents: {:?}", self.lt);
         if let Some(pred) = value.successor_bytes() {
-            println!("lt range query: {:?}..", pred);
-            for (threshold, subs) in self.lt.range(pred..) {
-                println!("lt got threshold: {:?}", threshold);
+            for (_threshold, subs) in self.lt.range(pred..) {
                 result.extend(subs.iter().cloned());
             }
         }
@@ -169,10 +160,8 @@ mod tests {
             ast::ComparisonOperator::Equal,
             sub0,
         );
-        // println!("MARK 4: Added = 5 subscription");
 
         // // Test exact match (5)
-        // println!("Testing exact match (5)");
         assert_eq!(index.find_matching(Value::Integer(5)), vec![sub0]);
 
         // Less than 25 ------------------------------------------------------------

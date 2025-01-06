@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use tracing::Level;
 
 use ankurah_core::{

@@ -49,7 +49,6 @@ impl WebsocketClient {
 
         inner.connect()?;
         Effect::new(move |_| {
-            info!("MARK 1");
             //     let connection_state = inner_clone.state.get();
 
             //     match connection_state {
