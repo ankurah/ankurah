@@ -39,25 +39,11 @@ pub const WORDLIST: &[&str; 256] = &[
 
 fn compress(bytes: &[u8], target: usize) -> Vec<u8> {
     let seg_size = bytes.len() / target;
-    bytes
-        .chunks(seg_size)
-        .map(|c| c.iter().fold(0u8, |acc, &x| acc ^ x))
-        .collect::<Vec<u8>>()
+    bytes.chunks(seg_size).map(|c| c.iter().fold(0u8, |acc, &x| acc ^ x)).collect::<Vec<u8>>()
 }
 
 pub fn humanize(bytes: impl AsRef<[u8]>, words_out: usize) -> String {
-    compress(bytes.as_ref(), words_out)
-        .iter()
-        .map(|&x| WORDLIST[x as usize].to_string())
-        .collect::<Vec<String>>()
-        .join("-")
+    compress(bytes.as_ref(), words_out).iter().map(|&x| WORDLIST[x as usize].to_string()).collect::<Vec<String>>().join("-")
 }
 
-pub fn hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|&x| format!("{:x?}", x))
-        .collect::<Vec<String>>()
-        .join("")
-}
+pub fn hex(bytes: impl AsRef<[u8]>) -> String { bytes.as_ref().iter().map(|&x| format!("{:x?}", x)).collect::<Vec<String>>().join("") }

@@ -36,17 +36,14 @@ impl<R> ItemChange<R> {
 
     pub fn events(&self) -> &[RecordEvent] {
         match self {
-            ItemChange::Add { events, .. }
-            | ItemChange::Update { events, .. }
-            | ItemChange::Remove { events, .. } => events,
+            ItemChange::Add { events, .. } | ItemChange::Update { events, .. } | ItemChange::Remove { events, .. } => events,
             _ => &[],
         }
     }
 }
 
 impl<R> std::fmt::Display for ItemChange<R>
-where
-    R: Record,
+where R: Record
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -68,12 +65,7 @@ where
 
 impl std::fmt::Display for EntityChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "EntityChange {}/{}",
-            self.record.bucket_name(),
-            self.record.id()
-        )
+        write!(f, "EntityChange {}/{}", self.record.bucket_name(), self.record.id())
     }
 }
 
@@ -85,48 +77,25 @@ pub struct ChangeSet<R> {
 }
 
 impl<R> From<ChangeSet<Arc<RecordInner>>> for ChangeSet<R>
-where
-    R: Record,
+where R: Record
 {
     fn from(val: ChangeSet<Arc<RecordInner>>) -> Self {
         ChangeSet {
-            resultset: ResultSet {
-                records: val
-                    .resultset
-                    .iter()
-                    .map(|record| R::from_record_inner(record.clone()))
-                    .collect(),
-            },
-            changes: val
-                .changes
-                .into_iter()
-                .map(|change| change.into())
-                .collect(),
+            resultset: ResultSet { records: val.resultset.iter().map(|record| R::from_record_inner(record.clone())).collect() },
+            changes: val.changes.into_iter().map(|change| change.into()).collect(),
         }
     }
 }
 
 impl<R> From<ItemChange<Arc<RecordInner>>> for ItemChange<R>
-where
-    R: Record,
+where R: Record
 {
     fn from(change: ItemChange<Arc<RecordInner>>) -> Self {
         match change {
-            ItemChange::Initial { record } => ItemChange::Initial {
-                record: R::from_record_inner(record),
-            },
-            ItemChange::Add { record, events } => ItemChange::Add {
-                record: R::from_record_inner(record),
-                events,
-            },
-            ItemChange::Update { record, events } => ItemChange::Update {
-                record: R::from_record_inner(record),
-                events,
-            },
-            ItemChange::Remove { record, events } => ItemChange::Remove {
-                record: R::from_record_inner(record),
-                events,
-            },
+            ItemChange::Initial { record } => ItemChange::Initial { record: R::from_record_inner(record) },
+            ItemChange::Add { record, events } => ItemChange::Add { record: R::from_record_inner(record), events },
+            ItemChange::Update { record, events } => ItemChange::Update { record: R::from_record_inner(record), events },
+            ItemChange::Remove { record, events } => ItemChange::Remove { record: R::from_record_inner(record), events },
         }
     }
 }

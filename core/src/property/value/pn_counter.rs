@@ -41,36 +41,21 @@ pub struct PNCounter<I: Integer> {
 
 impl<I: Integer> ProjectedValue for PNCounter<I> {
     type Projected = I;
-    fn projected(&self) -> Self::Projected {
-        self.value()
-    }
+    fn projected(&self) -> Self::Projected { self.value() }
 }
 
 // Starting with basic string type operations
 impl<I: Integer> PNCounter<I> {
     pub fn new(property_name: PropertyName, backend: Arc<PNBackend>) -> Self {
-        Self {
-            property_name,
-            backend: Arc::downgrade(&backend),
-            phantom: PhantomData,
-        }
+        Self { property_name, backend: Arc::downgrade(&backend), phantom: PhantomData }
     }
     pub fn from_backends(property_name: PropertyName, backends: &Backends) -> Self {
         let backend = backends.get::<PNBackend>().unwrap();
         Self::new(property_name, backend)
     }
-    pub fn backend(&self) -> Arc<PNBackend> {
-        self.backend
-            .upgrade()
-            .expect("Expected `PN` property backend to exist")
-    }
-    pub fn value(&self) -> I {
-        I::from_i64(self.backend().get(self.property_name.clone()))
-    }
-    pub fn add(&self, amount: impl Integer) {
-        self.backend()
-            .add(self.property_name.clone(), amount.as_i64());
-    }
+    pub fn backend(&self) -> Arc<PNBackend> { self.backend.upgrade().expect("Expected `PN` property backend to exist") }
+    pub fn value(&self) -> I { I::from_i64(self.backend().get(self.property_name.clone())) }
+    pub fn add(&self, amount: impl Integer) { self.backend().add(self.property_name.clone(), amount.as_i64()); }
 }
 
 impl<I: Integer> InitializeWith<I> for PNCounter<I> {

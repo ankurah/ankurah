@@ -29,12 +29,7 @@ pub struct Album {
 
 // Initialize tracing for tests
 #[ctor::ctor]
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_test_writer()
-        .init();
-}
+fn init_tracing() { tracing_subscriber::fmt().with_max_level(Level::INFO).with_test_writer().init(); }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangeKind {
@@ -56,10 +51,8 @@ impl<R> From<&ItemChange<R>> for ChangeKind {
 }
 
 #[allow(unused)]
-pub fn changeset_watcher<R: Record + Send + Sync + 'static>() -> (
-    Box<dyn Fn(ChangeSet<R>) + Send + Sync>,
-    Box<dyn Fn() -> Vec<(proto::ID, ChangeKind)>>,
-) {
+pub fn changeset_watcher<R: Record + Send + Sync + 'static>(
+) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<(proto::ID, ChangeKind)>>) {
     let (tx, rx) = mpsc::channel();
     let watcher = Box::new(move |changeset: ChangeSet<R>| {
         tx.send(changeset).unwrap();
@@ -67,11 +60,7 @@ pub fn changeset_watcher<R: Record + Send + Sync + 'static>() -> (
 
     let check = Box::new(move || {
         match rx.try_recv() {
-            Ok(changeset) => changeset
-                .changes
-                .iter()
-                .map(|c| (c.record().id(), c.into()))
-                .collect(),
+            Ok(changeset) => changeset.changes.iter().map(|c| (c.record().id(), c.into())).collect(),
             Err(_) => vec![], // Return empty vec instead of panicking
         }
     });

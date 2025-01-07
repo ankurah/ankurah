@@ -17,12 +17,7 @@ pub struct WebSocketPeerSender {
 }
 
 impl WebSocketPeerSender {
-    pub fn new(
-        mut sender: futures_util::stream::SplitSink<
-            axum::extract::ws::WebSocket,
-            axum::extract::ws::Message,
-        >,
-    ) -> Self {
+    pub fn new(mut sender: futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>) -> Self {
         let (tx, mut rx) = mpsc::channel(32);
         use futures_util::SinkExt;
         tokio::spawn(async move {
@@ -37,13 +32,9 @@ impl WebSocketPeerSender {
         Self { tx }
     }
     pub async fn send_message(&self, message: proto::ServerMessage) -> Result<(), SendError> {
-        let data = bincode::serialize(&message)
-            .map_err(|e| SendError::Other(anyhow::anyhow!("Serialization error: {}", e)))?;
+        let data = bincode::serialize(&message).map_err(|e| SendError::Other(anyhow::anyhow!("Serialization error: {}", e)))?;
 
-        self.tx
-            .send(axum::extract::ws::Message::Binary(data))
-            .await
-            .map_err(|_| SendError::Unknown)?;
+        self.tx.send(axum::extract::ws::Message::Binary(data)).await.map_err(|_| SendError::Unknown)?;
 
         Ok(())
     }
@@ -56,7 +47,5 @@ impl PeerSender for WebSocketPeerSender {
         self.send_message(server_message).await
     }
 
-    fn cloned(&self) -> Box<dyn PeerSender> {
-        Box::new(self.clone())
-    }
+    fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

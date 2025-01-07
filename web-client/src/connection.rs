@@ -19,23 +19,13 @@ struct Inner {
 
 impl Inner {
     fn new(node: Arc<Node>, url: String) -> Result<Self, JsValue> {
-        let url = if url.starts_with("ws://") || url.starts_with("wss://") {
-            format!("{}/ws", url)
-        } else {
-            format!("wss://{}/ws", url)
-        };
+        let url = if url.starts_with("ws://") || url.starts_with("wss://") { format!("{}/ws", url) } else { format!("wss://{}/ws", url) };
 
         let ws = WebSocket::new(&url)?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
-        let state =
-            reactive_graph::signal::RwSignal::new(ConnectionState::Connecting { url: url.clone() });
+        let state = reactive_graph::signal::RwSignal::new(ConnectionState::Connecting { url: url.clone() });
 
-        Ok(Self {
-            ws: Arc::new(ws),
-            url,
-            state,
-            node,
-        })
+        Ok(Self { ws: Arc::new(ws), url, state, node })
     }
     fn receive_message(&self, e: MessageEvent) {
         let array_buffer = if let Ok(array_buffer) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
@@ -54,10 +44,7 @@ impl Inner {
             match message {
                 proto::ServerMessage::Presence(presence) => {
                     info!("Received server presence");
-                    self.state.set(ConnectionState::Connected {
-                        url: self.url.clone(),
-                        presence,
-                    });
+                    self.state.set(ConnectionState::Connected { url: self.url.clone(), presence });
                 }
                 proto::ServerMessage::PeerMessage(msg) => {
                     let node = self.node.clone();
@@ -88,10 +75,7 @@ impl Inner {
         info!("Connection opened (event)");
 
         // Send our presence message
-        let presence = proto::Presence {
-            node_id: self.node.id.clone(),
-            durable: self.node.durable,
-        };
+        let presence = proto::Presence { node_id: self.node.id.clone(), durable: self.node.durable };
 
         if let Err(e) = self.send_message(proto::ClientMessage::Presence(presence)) {
             info!("Failed to send presence message: {:?}", e);
@@ -105,24 +89,16 @@ pub struct Connection {
     _callbacks: Arc<SendWrapper<Vec<Box<dyn std::any::Any>>>>,
 }
 impl PartialEq for Connection {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
-    }
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.inner, &other.inner) }
 }
 
 #[async_trait]
 impl PeerSender for Connection {
-    async fn send_message(
-        &self,
-        message: proto::PeerMessage,
-    ) -> Result<(), ankurah_core::connector::SendError> {
-        self.send_message(message)
-            .map_err(|_| ankurah_core::connector::SendError::ConnectionClosed)
+    async fn send_message(&self, message: proto::PeerMessage) -> Result<(), ankurah_core::connector::SendError> {
+        self.send_message(message).map_err(|_| ankurah_core::connector::SendError::ConnectionClosed)
     }
 
-    fn cloned(&self) -> Box<dyn PeerSender> {
-        Box::new(self.clone())
-    }
+    fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 impl Connection {
@@ -140,9 +116,7 @@ impl Connection {
             let inner = inner.clone();
             Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_| {
                 info!("Connection Error");
-                inner.state.set(ConnectionState::Error {
-                    message: "".to_string(),
-                });
+                inner.state.set(ConnectionState::Error { message: "".to_string() });
             }))
         };
 
@@ -162,15 +136,9 @@ impl Connection {
         };
 
         // Set up WebSocket event handlers
-        inner
-            .ws
-            .set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        inner
-            .ws
-            .set_onerror(Some(on_error.as_ref().unchecked_ref()));
-        inner
-            .ws
-            .set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        inner.ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        inner.ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        inner.ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         inner.ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
         on_close.forget();
@@ -189,9 +157,7 @@ impl Connection {
         })
     }
 
-    pub fn state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> {
-        self.inner.state.read_only()
-    }
+    pub fn state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.inner.state.read_only() }
 
     pub fn send_message(&self, message: proto::PeerMessage) -> Result<(), JsValue> {
         let message = proto::ClientMessage::PeerMessage(message);

@@ -5,10 +5,7 @@ use crate::grammar;
 pub enum ParseError {
     SyntaxError(String),
     EmptyExpression,
-    UnexpectedRule {
-        expected: &'static str,
-        got: grammar::Rule,
-    },
+    UnexpectedRule { expected: &'static str, got: grammar::Rule },
     InvalidPredicate(String),
     MissingOperand(&'static str),
 }

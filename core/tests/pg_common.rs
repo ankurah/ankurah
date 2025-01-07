@@ -6,10 +6,7 @@ use bb8_postgres::PostgresConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
-pub async fn create_postgres_container() -> Result<(
-    ContainerAsync<postgres::Postgres>,
-    ankurah_core::storage::Postgres,
-)> {
+pub async fn create_postgres_container() -> Result<(ContainerAsync<postgres::Postgres>, ankurah_core::storage::Postgres)> {
     let container: ContainerAsync<postgres::Postgres> = postgres::Postgres::default()
         .with_db_name("ankurah")
         .with_user("postgres")

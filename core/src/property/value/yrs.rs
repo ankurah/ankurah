@@ -18,37 +18,20 @@ pub struct YrsString {
 
 impl ProjectedValue for YrsString {
     type Projected = String;
-    fn projected(&self) -> Self::Projected {
-        self.value().unwrap_or_default()
-    }
+    fn projected(&self) -> Self::Projected { self.value().unwrap_or_default() }
 }
 
 // Starting with basic string type operations
 impl YrsString {
-    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self {
-        Self {
-            property_name,
-            backend: Arc::downgrade(&backend),
-        }
-    }
+    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self { Self { property_name, backend: Arc::downgrade(&backend) } }
     pub fn from_backends(property_name: PropertyName, backends: &Backends) -> Self {
         let backend = backends.get::<YrsBackend>().unwrap();
         Self::new(property_name, backend)
     }
-    pub fn backend(&self) -> Arc<YrsBackend> {
-        self.backend
-            .upgrade()
-            .expect("Expected `Yrs` property backend to exist")
-    }
-    pub fn value(&self) -> Option<String> {
-        self.backend().get_string(&self.property_name)
-    }
-    pub fn insert(&self, index: u32, value: &str) {
-        self.backend().insert(&self.property_name, index, value);
-    }
-    pub fn delete(&self, index: u32, length: u32) {
-        self.backend().delete(&self.property_name, index, length);
-    }
+    pub fn backend(&self) -> Arc<YrsBackend> { self.backend.upgrade().expect("Expected `Yrs` property backend to exist") }
+    pub fn value(&self) -> Option<String> { self.backend().get_string(&self.property_name) }
+    pub fn insert(&self, index: u32, value: &str) { self.backend().insert(&self.property_name, index, value); }
+    pub fn delete(&self, index: u32, length: u32) { self.backend().delete(&self.property_name, index, length); }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) {
         self.backend().delete(&self.property_name, start, length);
         self.backend().insert(&self.property_name, start, value);

@@ -27,9 +27,7 @@ impl std::fmt::Display for NodeId {
 }
 
 impl From<NodeId> for String {
-    fn from(node_id: NodeId) -> Self {
-        node_id.0.to_string()
-    }
+    fn from(node_id: NodeId) -> Self { node_id.0.to_string() }
 }
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
@@ -46,50 +44,34 @@ impl std::fmt::Display for RequestId {
 pub struct SubscriptionId(Ulid);
 
 impl std::fmt::Display for SubscriptionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "S-{}", self.0.to_string())
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "S-{}", self.0.to_string()) }
 }
 
 impl Default for NodeId {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl NodeId {
-    pub fn new() -> Self {
-        Self(Ulid::new())
-    }
+    pub fn new() -> Self { Self(Ulid::new()) }
 }
 
 impl Default for RequestId {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl RequestId {
-    pub fn new() -> Self {
-        Self(Ulid::new())
-    }
+    pub fn new() -> Self { Self(Ulid::new()) }
 }
 
 impl Default for SubscriptionId {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl SubscriptionId {
-    pub fn new() -> Self {
-        Self(Ulid::new())
-    }
+    pub fn new() -> Self { Self(Ulid::new()) }
 
     /// To be used only for testing
-    pub fn test(id: u64) -> Self {
-        Self(Ulid::from_parts(id, 0))
-    }
+    pub fn test(id: u64) -> Self { Self(Ulid::from_parts(id, 0)) }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -102,11 +84,7 @@ pub struct NodeRequest {
 
 impl std::fmt::Display for NodeRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Request({}) {}->{} {}",
-            self.id, self.from, self.to, self.body
-        )
+        write!(f, "Request({}) {}->{} {}", self.id, self.from, self.to, self.body)
     }
 }
 
@@ -120,11 +98,7 @@ pub struct NodeResponse {
 
 impl std::fmt::Display for NodeResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Response({}) {}->{} {}",
-            self.request_id, self.from, self.to, self.body
-        )
+        write!(f, "Response({}) {}->{} {}", self.request_id, self.from, self.to, self.body)
     }
 }
 
@@ -143,17 +117,11 @@ pub struct RecordEvent {
 pub struct Clock(BTreeSet<ID>);
 
 impl Clock {
-    pub fn new(ids: impl Into<BTreeSet<ID>>) -> Self {
-        Self(ids.into())
-    }
+    pub fn new(ids: impl Into<BTreeSet<ID>>) -> Self { Self(ids.into()) }
 
-    pub fn as_slice(&self) -> &BTreeSet<ID> {
-        &self.0
-    }
+    pub fn as_slice(&self) -> &BTreeSet<ID> { &self.0 }
 
-    pub fn to_strings(&self) -> Vec<String> {
-        self.0.iter().map(|id| id.to_string()).collect()
-    }
+    pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_string()).collect() }
 
     pub fn from_strings(strings: Vec<String>) -> Result<Self, ulid::DecodeError> {
         let ids = strings
@@ -166,17 +134,11 @@ impl Clock {
         Ok(Self(ids))
     }
 
-    pub fn insert(&mut self, id: ID) {
-        self.0.insert(id);
-    }
+    pub fn insert(&mut self, id: ID) { self.0.insert(id); }
 
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
+    pub fn len(&self) -> usize { self.0.len() }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
 }
 
 impl From<Vec<Uuid>> for Clock {
@@ -216,11 +178,7 @@ impl std::fmt::Display for RecordEvent {
             self.parent,
             self.operations
                 .iter()
-                .map(|(backend, ops)| format!(
-                    "{} => {}b",
-                    backend,
-                    ops.iter().map(|op| op.diff.len()).sum::<usize>()
-                ))
+                .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
                 .collect::<Vec<_>>()
                 .join(" ")
         )
@@ -228,15 +186,11 @@ impl std::fmt::Display for RecordEvent {
 }
 
 impl std::fmt::Display for Clock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}]", self.to_strings().join(", "))
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}]", self.to_strings().join(", ")) }
 }
 
 impl RecordEvent {
-    pub fn bucket_name(&self) -> &str {
-        &self.bucket_name
-    }
+    pub fn bucket_name(&self) -> &str { &self.bucket_name }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -257,11 +211,7 @@ impl std::fmt::Display for RecordState {
         write!(
             f,
             "RecordState({})",
-            self.state_buffers
-                .iter()
-                .map(|(backend, buf)| format!("{} => {}b", backend, buf.len()))
-                .collect::<Vec<_>>()
-                .join(" ")
+            self.state_buffers.iter().map(|(backend, buf)| format!("{} => {}b", backend, buf.len())).collect::<Vec<_>>().join(" ")
         )
     }
 }
@@ -271,43 +221,21 @@ pub enum NodeRequestBody {
     // Events to be committed on the remote node
     CommitEvents(Vec<RecordEvent>),
     // Request to fetch records matching a predicate
-    FetchRecords {
-        collection: String,
-        predicate: ast::Predicate,
-    },
-    Subscribe {
-        collection: String,
-        predicate: ast::Predicate,
-    },
-    Unsubscribe {
-        subscription_id: SubscriptionId,
-    },
+    FetchRecords { collection: String, predicate: ast::Predicate },
+    Subscribe { collection: String, predicate: ast::Predicate },
+    Unsubscribe { subscription_id: SubscriptionId },
 }
 
 impl std::fmt::Display for NodeRequestBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeRequestBody::CommitEvents(events) => {
-                write!(
-                    f,
-                    "CommitEvents [{}]",
-                    events
-                        .iter()
-                        .map(|e| format!("{}", e))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
+                write!(f, "CommitEvents [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
             }
-            NodeRequestBody::FetchRecords {
-                collection,
-                predicate,
-            } => {
+            NodeRequestBody::FetchRecords { collection, predicate } => {
                 write!(f, "FetchRecords {collection} {predicate}")
             }
-            NodeRequestBody::Subscribe {
-                collection,
-                predicate,
-            } => {
+            NodeRequestBody::Subscribe { collection, predicate } => {
                 write!(f, "Subscribe {collection} {predicate}")
             }
             NodeRequestBody::Unsubscribe { subscription_id } => {
@@ -323,10 +251,7 @@ pub enum NodeResponseBody {
     CommitComplete,
     // Response to FetchRecords
     Fetch(Vec<(ID, RecordState)>),
-    Subscribe {
-        initial: Vec<(ID, RecordState)>,
-        subscription_id: SubscriptionId,
-    },
+    Subscribe { initial: Vec<(ID, RecordState)>, subscription_id: SubscriptionId },
     Success,
     Error(String),
 }
@@ -335,27 +260,14 @@ impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeResponseBody::CommitComplete => write!(f, "CommitComplete"),
-            NodeResponseBody::Fetch(records) => write!(
-                f,
-                "Fetch [{}]",
-                records
-                    .iter()
-                    .map(|(id, _)| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            NodeResponseBody::Subscribe {
-                initial,
-                subscription_id,
-            } => write!(
+            NodeResponseBody::Fetch(records) => {
+                write!(f, "Fetch [{}]", records.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", "))
+            }
+            NodeResponseBody::Subscribe { initial, subscription_id } => write!(
                 f,
                 "Subscribe {} initial [{}]",
                 subscription_id,
-                initial
-                    .iter()
-                    .map(|(id, state)| format!("{} {}", id, state))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                initial.iter().map(|(id, state)| format!("{} {}", id, state)).collect::<Vec<_>>().join(", ")
             ),
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
@@ -394,8 +306,7 @@ impl TryFrom<JsValue> for Clock {
         if value.is_undefined() || value.is_null() {
             return Ok(Clock::default());
         }
-        let ids: Vec<String> = serde_wasm_bindgen::from_value(value)
-            .map_err(|e| anyhow::anyhow!("Failed to parse clock: {}", e))?;
+        let ids: Vec<String> = serde_wasm_bindgen::from_value(value).map_err(|e| anyhow::anyhow!("Failed to parse clock: {}", e))?;
         Self::from_strings(ids).map_err(|e| anyhow::anyhow!("Failed to parse clock: {}", e))
     }
 }

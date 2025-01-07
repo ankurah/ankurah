@@ -31,15 +31,11 @@ impl<'a> Iterator for EventNames<'a> {
 }
 
 impl<'a> From<&'a str> for EventNames<'a> {
-    fn from(event: &'a str) -> Self {
-        Self::Single(std::iter::once(event))
-    }
+    fn from(event: &'a str) -> Self { Self::Single(std::iter::once(event)) }
 }
 
 impl<'a, const N: usize> From<&'a [&'a str; N]> for EventNames<'a> {
-    fn from(events: &'a [&'a str; N]) -> Self {
-        Self::Multiple(events.iter())
-    }
+    fn from(events: &'a [&'a str; N]) -> Self { Self::Multiple(events.iter()) }
 }
 
 impl CBFuture {
@@ -66,12 +62,7 @@ impl CBFuture {
 
         // Register the same callback for all success events
         for success_event in success_events.into() {
-            target
-                .add_event_listener_with_callback(
-                    success_event,
-                    success_callback.as_ref().unchecked_ref(),
-                )
-                .unwrap();
+            target.add_event_listener_with_callback(success_event, success_callback.as_ref().unchecked_ref()).unwrap();
         }
 
         let error_callback = Closure::wrap(Box::new({
@@ -79,31 +70,21 @@ impl CBFuture {
             move |event: Event| {
                 web_sys::console::error_2(&JsValue::from_str("CB Future error"), &event);
                 if let Some(sender) = sender.borrow_mut().take() {
-                    let _ = sender.send(Err(event
-                        .as_string()
-                        .unwrap_or_else(|| "Unknown error".to_string())));
+                    let _ = sender.send(Err(event.as_string().unwrap_or_else(|| "Unknown error".to_string())));
                 }
             }
         }) as Box<dyn FnMut(_)>);
 
         // Register the same callback for all error events
         for error_event in error_events.into() {
-            target
-                .add_event_listener_with_callback(
-                    error_event,
-                    error_callback.as_ref().unchecked_ref(),
-                )
-                .unwrap();
+            target.add_event_listener_with_callback(error_event, error_callback.as_ref().unchecked_ref()).unwrap();
         }
 
         // Store both callbacks
         callbacks.push((success_callback, target.clone()));
         callbacks.push((error_callback, target.clone()));
 
-        Self {
-            receiver,
-            _callbacks: callbacks,
-        }
+        Self { receiver, _callbacks: callbacks }
     }
 }
 

@@ -9,23 +9,15 @@ pub enum SqlExpr {
 pub struct Sql(Vec<SqlExpr>);
 
 impl Sql {
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
+    pub fn new() -> Self { Self(Vec::new()) }
 
-    pub fn push(&mut self, expr: SqlExpr) {
-        self.0.push(expr);
-    }
+    pub fn push(&mut self, expr: SqlExpr) { self.0.push(expr); }
 
     pub fn arg(&mut self, arg: impl ToSql + Send + Sync + 'static) {
-        self.push(SqlExpr::Argument(
-            Box::new(arg) as Box<dyn ToSql + Send + Sync>
-        ));
+        self.push(SqlExpr::Argument(Box::new(arg) as Box<dyn ToSql + Send + Sync>));
     }
 
-    pub fn sql(&mut self, s: impl AsRef<str>) {
-        self.push(SqlExpr::Sql(s.as_ref().to_owned()));
-    }
+    pub fn sql(&mut self, s: impl AsRef<str>) { self.push(SqlExpr::Sql(s.as_ref().to_owned())); }
 
     pub fn collapse(self) -> (String, Vec<Box<dyn ToSql + Send + Sync>>) {
         let mut counter = 1;
@@ -67,17 +59,11 @@ impl Sql {
         }
     }
 
-    pub fn comparison_op(&mut self, op: &ComparisonOperator) {
-        self.sql(comparison_op_to_sql(op));
-    }
+    pub fn comparison_op(&mut self, op: &ComparisonOperator) { self.sql(comparison_op_to_sql(op)); }
 
     pub fn predicate(&mut self, predicate: &Predicate) {
         match predicate {
-            Predicate::Comparison {
-                left,
-                operator,
-                right,
-            } => {
+            Predicate::Comparison { left, operator, right } => {
                 self.expr(left);
                 self.sql(" ");
                 self.comparison_op(operator);
@@ -126,10 +112,7 @@ mod tests {
     use super::*;
     use ankql::parser::parse_selection;
 
-    fn assert_args<'a, 'b>(
-        args: &Vec<Box<dyn ToSql + Send + Sync>>,
-        expected: &Vec<Box<dyn ToSql + Send + Sync>>,
-    ) {
+    fn assert_args<'a, 'b>(args: &Vec<Box<dyn ToSql + Send + Sync>>, expected: &Vec<Box<dyn ToSql + Send + Sync>>) {
         // TODO: Maybe actually encoding these and comparing bytes?
         assert_eq!(format!("{:?}", args), format!("{:?}", expected));
     }
@@ -160,24 +143,14 @@ mod tests {
 
     #[test]
     fn test_complex_condition() {
-        let predicate =
-            parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= 30 AND age <= 40")
-                .unwrap();
+        let predicate = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= 30 AND age <= 40").unwrap();
 
         let mut sql = Sql::new();
         sql.predicate(&predicate);
         let (sql_string, args) = sql.collapse();
 
-        assert_eq!(
-            sql_string,
-            r#"("name" = $1 OR "name" = $2) AND "age" >= $3 AND "age" <= $4"#
-        );
-        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![
-            Box::new("Alice"),
-            Box::new("Charlie"),
-            Box::new(30),
-            Box::new(40),
-        ];
+        assert_eq!(sql_string, r#"("name" = $1 OR "name" = $2) AND "age" >= $3 AND "age" <= $4"#);
+        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice"), Box::new("Charlie"), Box::new(30), Box::new(40)];
         assert_args(&args, &expected);
     }
 

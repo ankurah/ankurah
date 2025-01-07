@@ -11,6 +11,4 @@ pub use ankurah_proto as proto;
 
 pub use crate::client::WebsocketClient;
 
-pub use crate::connection_state::{
-    ConnectionState, ConnectionStateEnum, ConnectionStateEnumSignal,
-};
+pub use crate::connection_state::{ConnectionState, ConnectionStateEnum, ConnectionStateEnumSignal};

@@ -15,16 +15,11 @@ pub struct LocalProcessSender {
 #[async_trait]
 impl PeerSender for LocalProcessSender {
     async fn send_message(&self, message: proto::PeerMessage) -> Result<(), SendError> {
-        self.sender
-            .send(message)
-            .await
-            .map_err(|_| SendError::ConnectionClosed)?;
+        self.sender.send(message).await.map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
 
-    fn cloned(&self) -> Box<dyn PeerSender> {
-        Box::new(self.clone())
-    }
+    fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 /// connector which establishes one sender between each of the two given nodes
@@ -42,33 +37,21 @@ impl LocalProcessConnection {
         // we have to register the senders with the nodes
         node1
             .register_peer(
-                proto::Presence {
-                    node_id: node2.id.clone(),
-                    durable: node2.durable,
-                },
+                proto::Presence { node_id: node2.id.clone(), durable: node2.durable },
                 Box::new(LocalProcessSender { sender: node2_tx }),
             )
             .await;
         node2
             .register_peer(
-                proto::Presence {
-                    node_id: node1.id.clone(),
-                    durable: node1.durable,
-                },
+                proto::Presence { node_id: node1.id.clone(), durable: node1.durable },
                 Box::new(LocalProcessSender { sender: node1_tx }),
             )
             .await;
 
-        Ok(Self {
-            receiver1_task: Self::setup_receiver(node1, node1_rx),
-            receiver2_task: Self::setup_receiver(node2, node2_rx),
-        })
+        Ok(Self { receiver1_task: Self::setup_receiver(node1, node1_rx), receiver2_task: Self::setup_receiver(node2, node2_rx) })
     }
 
-    fn setup_receiver(
-        node: &Arc<Node>,
-        mut rx: mpsc::Receiver<proto::PeerMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    fn setup_receiver(node: &Arc<Node>, mut rx: mpsc::Receiver<proto::PeerMessage>) -> tokio::task::JoinHandle<()> {
         let node = node.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
