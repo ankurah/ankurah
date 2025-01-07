@@ -8,10 +8,17 @@ use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, strum::Display)]
 pub enum ConnectionState {
     None,
-    Connecting { url: String },
-    Connected { url: String, presence: proto::Presence },
+    Connecting {
+        url: String,
+    },
+    Connected {
+        url: String,
+        presence: proto::Presence,
+    },
     Closed,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 // TODO make a WasmEnum macro to generate this:

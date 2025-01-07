@@ -1,5 +1,7 @@
 use super::comparision_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
+use crate::model::RecordInner;
+use crate::resultset::ResultSet;
 use crate::storage::StorageEngine;
 use crate::subscription::{Subscription, SubscriptionHandle};
 use crate::value::Value;
@@ -22,7 +24,7 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of records
 pub struct Reactor {
     /// Current subscriptions
-    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription>>,
+    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Arc<RecordInner>>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: DashMap<FieldId, ComparisonIndex>,
     /// Index of subscriptions that presently match each record.
@@ -50,7 +52,7 @@ impl Reactor {
         callback: F,
     ) -> anyhow::Result<SubscriptionHandle>
     where
-        F: Fn(ChangeSet) + Send + Sync + 'static,
+        F: Fn(ChangeSet<Arc<RecordInner>>) + Send + Sync + 'static,
     {
         let sub_id = proto::SubscriptionId::new();
 
@@ -96,11 +98,14 @@ impl Reactor {
         if !matching_records.is_empty() {
             (subscription.callback)(ChangeSet {
                 changes: matching_records
-                    .into_iter()
+                    .iter()
                     .map(|record| ItemChange::Initial {
                         record: record.clone(),
                     })
                     .collect(),
+                resultset: ResultSet {
+                    records: matching_records.clone(),
+                },
             });
         }
 
@@ -219,8 +224,10 @@ impl Reactor {
     /// Notify subscriptions about a record change
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
         // Group changes by subscription
-        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange>> =
-            std::collections::HashMap::new();
+        let mut sub_changes: std::collections::HashMap<
+            proto::SubscriptionId,
+            Vec<ItemChange<Arc<RecordInner>>>,
+        > = std::collections::HashMap::new();
 
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
@@ -261,7 +268,7 @@ impl Reactor {
                     //     change = change.clone()
                     // );
                     // Determine the change type
-                    let new_change = if matches != did_match {
+                    let new_change: Option<ItemChange<Arc<RecordInner>>> = if matches != did_match {
                         // Matching status changed
                         Some(if matches {
                             ItemChange::Add {
@@ -296,7 +303,12 @@ impl Reactor {
         // Send batched notifications
         for (sub_id, changes) in sub_changes {
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                (subscription.callback)(ChangeSet { changes });
+                (subscription.callback)(ChangeSet {
+                    resultset: ResultSet {
+                        records: subscription.matching_records.lock().unwrap().clone(),
+                    },
+                    changes,
+                });
             }
         }
     }

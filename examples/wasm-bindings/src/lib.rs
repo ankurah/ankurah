@@ -52,6 +52,15 @@ pub async fn fetch_test_records(client: &WebsocketClient) -> Result<Vec<SessionR
     // .collect()
 }
 
+// pub async fn subscribe_test_records(client: &WebsocketClient) -> Result<JsValue, JsValue> {
+//     unimplemented!()
+//     // client
+//     //     .node()
+//     //     .subscribe(SessionRecord::bucket_name(), "", || {
+//     //         info!("Subscription event");
+//     //     })
+// }
+
 #[wasm_bindgen]
 pub async fn create_test_record(client: &WebsocketClient) -> Result<(), JsValue> {
     let trx = client.node().begin();

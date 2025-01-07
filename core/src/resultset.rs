@@ -8,3 +8,11 @@ impl<T> From<ResultSet<T>> for Vec<T> {
         result_set.records
     }
 }
+
+impl<R> core::ops::Deref for ResultSet<R> {
+    type Target = Vec<R>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.records
+    }
+}

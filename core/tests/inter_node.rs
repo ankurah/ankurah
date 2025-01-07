@@ -9,7 +9,7 @@ use tracing::info;
 
 use ankurah_core::model::ScopedRecord;
 use ankurah_core::resultset::ResultSet;
-use common::{Album, AlbumRecord, Pet};
+use common::{Album, AlbumRecord, Pet, PetRecord};
 
 use common::ChangeKind;
 
@@ -126,7 +126,7 @@ async fn inter_node_subscription() -> Result<()> {
     );
 
     // Set up subscription on node2
-    let (watcher, check_node2) = common::changeset_watcher();
+    let (watcher, check_node2) = common::changeset_watcher::<PetRecord>();
     let _handle = node2
         .subscribe("pet", "name = 'Rex' OR (age > 2 and age < 5)", watcher)
         .await?;

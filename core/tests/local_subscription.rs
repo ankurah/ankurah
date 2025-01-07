@@ -1,3 +1,4 @@
+use ankurah_core::changes::ChangeSet;
 #[cfg(feature = "derive")]
 use ankurah_core::model::Model;
 use ankurah_core::resultset::ResultSet;
@@ -6,7 +7,7 @@ use ankurah_core::{model::ScopedRecord, node::Node};
 use std::sync::{Arc, Mutex};
 
 mod common;
-use common::{Album, AlbumRecord, ChangeKind, Pet};
+use common::{Album, AlbumRecord, ChangeKind, Pet, PetRecord};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -46,10 +47,14 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
     let _handle = client
-        .subscribe(Album::bucket_name(), predicate, move |changeset| {
-            let mut received = received_changesets_clone.lock().unwrap();
-            received.push(changeset);
-        })
+        .subscribe(
+            Album::bucket_name(),
+            predicate,
+            move |changeset: ChangeSet<AlbumRecord>| {
+                let mut received = received_changesets_clone.lock().unwrap();
+                received.push(changeset);
+            },
+        )
         .await?;
 
     // Initial state should have Two Vines and Ask That God
@@ -88,7 +93,7 @@ async fn complex_local_subscription() {
     let node = Arc::new(Node::new_durable(Arc::new(
         SledStorageEngine::new_test().unwrap(),
     )));
-    let (watcher, check) = common::changeset_watcher();
+    let (watcher, check) = common::changeset_watcher::<PetRecord>();
 
     // Subscribe to changes
     let _handle = node

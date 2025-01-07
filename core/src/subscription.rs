@@ -3,15 +3,16 @@ use ankurah_proto as proto;
 use std::sync::{Arc, Mutex};
 
 /// A callback function that receives subscription updates
-pub type Callback = Box<dyn Fn(ChangeSet) + Send + Sync + 'static>;
+pub type Callback<R> = Box<dyn Fn(ChangeSet<R>) + Send + Sync + 'static>;
 
 /// A subscription that can be shared between indexes
-pub struct Subscription {
+pub struct Subscription<R> {
     #[allow(unused)]
     pub(crate) id: proto::SubscriptionId,
     pub(crate) predicate: ankql::ast::Predicate,
-    pub(crate) callback: Arc<Callback>,
+    pub(crate) callback: Arc<Callback<R>>,
     // Track which records currently match this subscription
+    // TODO make this a ResultSet so we can clone it cheaply
     pub(crate) matching_records: Mutex<Vec<Arc<RecordInner>>>,
 }
 

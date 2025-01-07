@@ -2,6 +2,7 @@ use tracing::Level;
 
 use ankurah_core::{
     changes::{ChangeSet, ItemChange},
+    model::Record,
     property::value::YrsString,
 };
 use ankurah_derive::Model;
@@ -43,8 +44,8 @@ pub enum ChangeKind {
     Update,
 }
 
-impl From<&ItemChange> for ChangeKind {
-    fn from(change: &ItemChange) -> Self {
+impl<R> From<&ItemChange<R>> for ChangeKind {
+    fn from(change: &ItemChange<R>) -> Self {
         match change {
             ItemChange::Initial { .. } => ChangeKind::Initial,
             ItemChange::Add { .. } => ChangeKind::Add,
@@ -55,12 +56,12 @@ impl From<&ItemChange> for ChangeKind {
 }
 
 #[allow(unused)]
-pub fn changeset_watcher() -> (
-    Box<dyn Fn(ChangeSet) + Send + Sync>,
+pub fn changeset_watcher<R: Record + Send + Sync + 'static>() -> (
+    Box<dyn Fn(ChangeSet<R>) + Send + Sync>,
     Box<dyn Fn() -> Vec<(proto::ID, ChangeKind)>>,
 ) {
     let (tx, rx) = mpsc::channel();
-    let watcher = Box::new(move |changeset: ChangeSet| {
+    let watcher = Box::new(move |changeset: ChangeSet<R>| {
         tx.send(changeset).unwrap();
     });
 
@@ -69,7 +70,7 @@ pub fn changeset_watcher() -> (
             Ok(changeset) => changeset
                 .changes
                 .iter()
-                .map(|c| (c.record().id, c.into()))
+                .map(|c| (c.record().id(), c.into()))
                 .collect(),
             Err(_) => vec![], // Return empty vec instead of panicking
         }

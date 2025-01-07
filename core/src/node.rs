@@ -742,16 +742,17 @@ impl Node {
     }
 
     /// Subscribe to changes in records matching a predicate
-    pub async fn subscribe<F, P>(
+    pub async fn subscribe<F, P, R>(
         self: &Arc<Self>,
         bucket_name: &str,
         predicate: P,
         callback: F,
     ) -> anyhow::Result<crate::subscription::SubscriptionHandle>
     where
-        F: Fn(crate::changes::ChangeSet) + Send + Sync + 'static,
+        F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
         P: TryInto<ankql::ast::Predicate>,
         P::Error: std::error::Error + Send + Sync + 'static,
+        R: Record,
     {
         let predicate = predicate
             .try_into()
@@ -802,7 +803,9 @@ impl Node {
 
         // Now set up our local subscription
         self.reactor
-            .subscribe(bucket_name, predicate, callback)
+            .subscribe(bucket_name, predicate, move |changeset| {
+                callback(changeset.into());
+            })
             .await
     }
 }
