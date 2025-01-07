@@ -14,7 +14,7 @@ use crate::connection::Connection;
 use reactive_graph::effect::Effect;
 use wasm_bindgen_futures::spawn_local;
 
-const MAX_RECONNECT_DELAY: u64 = 10000;
+// const MAX_RECONNECT_DELAY: u64 = 10000;
 
 struct Inner {
     server_url: String,
@@ -27,7 +27,7 @@ struct Inner {
 #[wasm_bindgen]
 pub struct WebsocketClient {
     inner: Rc<Inner>,
-    owner: reactive_graph::owner::Owner,
+    _owner: reactive_graph::owner::Owner,
 }
 
 /// Client provides a primary handle to speak to the server
@@ -41,15 +41,14 @@ impl WebsocketClient {
             state: reactive_graph::signal::RwSignal::new(ConnectionState::None),
         });
 
-        let current_delay = Rc::new(RefCell::new(0u64));
-        let inner_clone = inner.clone();
+        // let current_delay = Rc::new(RefCell::new(0u64));
+        // let inner_clone = inner.clone();
 
         let owner = reactive_graph::owner::Owner::new();
         owner.set();
 
         inner.connect()?;
         Effect::new(move |_| {
-            info!("MARK 1");
             //     let connection_state = inner_clone.state.get();
 
             //     match connection_state {
@@ -68,7 +67,10 @@ impl WebsocketClient {
             //     }
         });
 
-        Ok(WebsocketClient { inner, owner })
+        Ok(WebsocketClient {
+            inner,
+            _owner: owner,
+        })
     }
 
     pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> {
@@ -142,7 +144,7 @@ impl Inner {
                 self_clone.state.set(connection_state.clone());
 
                 info!("Effect 2.1");
-                if let ConnectionState::Connected { .. } = connection_state {
+                if let ConnectionState::Connected { presence, .. } = connection_state {
                     info!("Effect 2.2");
                     let self_clone = self_clone.clone();
                     let connection = connection.clone();
@@ -150,7 +152,7 @@ impl Inner {
                         info!("Effect 2.3");
                         self_clone
                             .node
-                            .register_peer_sender(Box::new(connection))
+                            .register_peer(presence, Box::new(connection))
                             .await;
                     });
                 }
@@ -159,16 +161,15 @@ impl Inner {
 
         *self.connection.borrow_mut() = Some((connection, owner));
 
-        self.state.set(
-            ConnectionState::Connecting {
-                url: self.server_url.clone(),
-            },
-        );
+        self.state.set(ConnectionState::Connecting {
+            url: self.server_url.clone(),
+        });
 
         info!("Connecting to websocket");
         Ok(())
     }
 
+    #[allow(unused)]
     pub fn reconnect(self: &Rc<Self>, delay: u64) {
         info!("reconnect: removing old connection with delay {}ms", delay);
         self.connection.borrow_mut().take();

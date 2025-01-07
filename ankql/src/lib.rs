@@ -8,6 +8,8 @@
 //! If this pans out, we might someday consider a more complete implementation and ISO/IEC 39075:2024 compliance.
 
 pub mod ast;
+pub mod conversion;
+pub mod error;
 pub mod grammar;
 pub mod parser;
 pub mod selection;

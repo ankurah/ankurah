@@ -118,15 +118,19 @@ impl StorageEngine for SledStorageEngine {
 
 #[async_trait]
 impl StorageBucket for SledStorageBucket {
-    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<bool> {
         let tree = self.tree.clone();
         let binary_state = bincode::serialize(state)?;
         let id_bytes = id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
-        task::spawn_blocking(move || -> anyhow::Result<()> {
-            tree.insert(id_bytes, binary_state)?;
-            Ok(())
+        task::spawn_blocking(move || {
+            let last = tree.insert(id_bytes, binary_state.clone())?;
+            if let Some(last_bytes) = last {
+                Ok(last_bytes != binary_state)
+            } else {
+                Ok(true)
+            }
         })
         .await?
     }

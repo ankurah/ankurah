@@ -28,6 +28,7 @@ ankurah-react-signals = { path = "../react-signals", optional = true }
 reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = ["effects"], optional = true }
 
 # Common dependencies
+dashmap = "6.1.0"
 anyhow = "1.0.89"
 thiserror = "2"
 chrono = { version = "0.4.38", default-features = false }

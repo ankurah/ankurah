@@ -8,9 +8,10 @@ fn main() {
     mount_to_body(|| view! { <App /> })
 }
 
+#[allow(unused)]
 async fn create_client() -> WebsocketClient {
     let storage = IndexedDBStorageEngine::open("test_db").await.unwrap();
-    let node = Arc::new(ankurah_core::Node::new(Box::new(storage)));
+    let node = Arc::new(ankurah_core::Node::new(Arc::new(storage)));
     WebsocketClient::new(node, "localhost:9797").unwrap()
 }
 

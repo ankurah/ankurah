@@ -10,7 +10,7 @@ use crate::{
     storage::{RecordState, StorageBucket, StorageEngine},
 };
 use ankql::selection::filter::evaluate_predicate;
-use ankurah_proto::ID;
+use ankurah_proto::{Clock, ID};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
@@ -74,12 +74,15 @@ impl StorageEngine for Postgres {
             ));
         }
 
-        let mut client = self.pool.get().await?;
+        let client = self.pool.get().await?;
         let mut results = Vec::new();
 
         // For now, fetch all records and filter in memory
         // TODO: Convert predicate to SQL WHERE clause for better performance
-        let query = format!(r#"SELECT "id", "state_buffer" FROM "{}""#, bucket_name);
+        let query = format!(
+            r#"SELECT "id", "state_buffer", "head" FROM "{}""#,
+            bucket_name
+        );
 
         let rows = match client.query(&query, &[]).await {
             Ok(rows) => rows,
@@ -104,7 +107,11 @@ impl StorageEngine for Postgres {
             let id = ID::from_ulid(ulid::Ulid::from(uuid));
 
             let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer)?;
-            let record_state = RecordState { state_buffers };
+
+            let record_state = RecordState {
+                state_buffers,
+                head: row.get::<_, Vec<uuid::Uuid>>(2).into(),
+            };
 
             // Create record to evaluate predicate
             let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
@@ -128,7 +135,7 @@ impl PostgresBucket {
     pub async fn create_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
         // Create the table
         let create_query = format!(
-            r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA)"#,
+            r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#,
             self.bucket_name
         );
 
@@ -175,17 +182,24 @@ impl PostgresParams {
 
 #[async_trait]
 impl StorageBucket for PostgresBucket {
-    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<()> {
+    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<bool> {
         // TODO: Create/Alter table
         let state_buffers = bincode::serialize(&state.state_buffers)?;
         let ulid: ulid::Ulid = id.into();
         let uuid: uuid::Uuid = ulid.into();
 
+        let head_uuids: Vec<uuid::Uuid> = (&state.head).into();
+
         let backends = Backends::from_state_buffers(state)?;
-        let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned()];
+        let mut columns: Vec<String> = vec![
+            "id".to_owned(),
+            "state_buffer".to_owned(),
+            "head".to_owned(),
+        ];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
         params.push(&uuid);
         params.push(&state_buffers);
+        params.push(&head_uuids);
 
         let mut materialized_columns: Vec<String> = Vec::new();
         let mut materialized: Vec<PostgresParams> = Vec::new();
@@ -254,14 +268,19 @@ impl StorageBucket for PostgresBucket {
 
         // be careful with sql injection via bucket name
         let query = format!(
-            r#"INSERT INTO "{}"({}) VALUES({}) ON CONFLICT("id") DO UPDATE SET {}"#,
+            r#"WITH old_state AS (
+                SELECT "head" FROM "{0}" WHERE "id" = $1
+            )
+            INSERT INTO "{0}"({1}) VALUES({2})
+            ON CONFLICT("id") DO UPDATE SET {3}
+            RETURNING (SELECT "head" FROM old_state) as old_head"#,
             self.bucket_name, columns_str, values_str, columns_update_str
         );
 
         let mut client = self.pool.get().await?;
         error!("Running: {}", query);
-        let rows_affected = match client.execute(&query, params.as_slice()).await {
-            Ok(rows_affected) => rows_affected,
+        let row = match client.query_one(&query, params.as_slice()).await {
+            Ok(row) => row,
             Err(err) => {
                 let kind = error_kind(&err);
                 match kind {
@@ -300,8 +319,18 @@ impl StorageBucket for PostgresBucket {
             }
         };
 
-        error!("Rows affected: {}", rows_affected);
-        Ok(())
+        // If this is a new record (no old_head), or if the heads are different, return true
+        let old_head: Option<Vec<uuid::Uuid>> = row.get("old_head");
+        let changed = match old_head {
+            None => true, // New record
+            Some(old_head) => {
+                let old_clock: Clock = old_head.into();
+                old_clock != state.head
+            }
+        };
+
+        error!("Changed: {}", changed);
+        Ok(changed)
     }
 
     async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError> {
@@ -310,7 +339,7 @@ impl StorageBucket for PostgresBucket {
 
         // be careful with sql injection via bucket name
         let query = format!(
-            r#"SELECT "id", "state_buffer" FROM "{}" WHERE "id" = $1"#,
+            r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#,
             self.bucket_name
         );
 
@@ -353,7 +382,8 @@ impl StorageBucket for PostgresBucket {
         let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers)?;
 
         Ok(RecordState {
-            state_buffers: state_buffers,
+            state_buffers,
+            head: row.get::<_, Vec<uuid::Uuid>>("head").into(),
         })
     }
 }

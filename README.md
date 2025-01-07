@@ -13,13 +13,14 @@
   - Basic included data-types: including CRDT text(yrs crate) and primitive types
   - Very basic embedded KV backing store (Sled DB)
   - Basic, single field queries (auto indexed?)
+  - Postgres
+  - Multi-field queries
+  - A robust recursive query AST which can define queries declaratively
 
 - Major Milestone 2 - Stuff we need, but can live without for a bit
 
-  - Postgres, and TiKV Backends
+  - and TiKV Backends
   - Graph Functionality
-  - Multi-field queries
-  - A robust recursive query AST which can define queries declaratively
   - User definable data types
 
 - Major Milestone 3 - Maybe someday...
