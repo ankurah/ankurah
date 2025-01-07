@@ -268,7 +268,13 @@ impl StorageBucket for IndexedDBBucket {
                         .try_into()
                         .map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
                     if old_clock == state.head {
-                        return Ok(false); // No change in head, skip update
+                        // No change in head, skip update
+                        // HACK - we still need to lie and return true because there are good odds the other browser is yours
+                        // and has already updated the record 🤦
+                        // ...andd this breaks subscription notification
+                        // Ideally we'd use the node to check for changes, but we can't assume that the subscriber is keeping the records resident
+                        // and the node is using weak references so they might be freed
+                        return Ok(true);
                     }
                 }
             }
@@ -379,7 +385,7 @@ impl StorageBucket for IndexedDBBucket {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+// #[cfg(target_arch = "wasm32")]
 #[cfg(test)]
 mod tests {
     #![allow(unused)]
@@ -468,7 +474,10 @@ mod tests {
         let id = proto::ID::from_ulid(ulid::Ulid::new());
         let mut state_buffers = std::collections::BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
-        let state = proto::RecordState { state_buffers };
+        let state = proto::RecordState {
+            state_buffers,
+            head: proto::Clock::default(),
+        };
 
         // Set the record
         bucket
@@ -500,7 +509,7 @@ mod tests {
         tracing::info!("Starting test_basic_workflow");
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
         tracing::info!("Storage engine opened");
-        let node = Arc::new(Node::new(Box::new(storage_engine)));
+        let node = Arc::new(Node::new(Arc::new(storage_engine)));
 
         let id;
         {
@@ -545,7 +554,7 @@ mod tests {
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
-        let node = Arc::new(Node::new(Box::new(storage_engine)));
+        let node = Arc::new(Node::new(Arc::new(storage_engine)));
 
         {
             let trx = node.begin();
