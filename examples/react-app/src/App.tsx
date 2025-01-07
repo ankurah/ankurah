@@ -1,7 +1,7 @@
 import styled from 'styled-components';
 import { useAppState } from './AppState'
-import { useSignals, fetch_test_records, create_test_record, SessionRecord } from 'example-wasm-bindings';
-import { useEffect, useState } from 'react';
+import { useSignals, fetch_test_records, create_test_record, SessionRecord, subscribe_test_records } from 'example-wasm-bindings';
+import { useEffect, useMemo, useState } from 'react';
 
 const Table = styled.table`
   width: 100%;
@@ -61,32 +61,34 @@ function App() {
     const appState = useAppState()
     console.log('render 1', { appState });
 
+
     // const [connectionState, setConnectionState] = useState<string | null>(null);
     const connectionState = appState?.client?.connection_state.value?.value();
+    const test_records_signal = useMemo(() => appState?.client ? subscribe_test_records(appState?.client) : null, [appState?.client]);
 
-    const [sessions, setSessions] = useState<SessionRecord[]>([]);
+    // const [sessions, setSessions] = useState<SessionRecord[]>([]);
     console.log('render 2', { connectionState });
 
-    useEffect(() => {
-      if (appState?.client) {
-        fetch_test_records(appState?.client).then((sessions) => {
-          console.log('sessions fetched', sessions);
-          setSessions(sessions);
-        });
-      }
-      const intervalId = setInterval(() => {
-        const client = appState?.client;
-        if (client) {
-          console.log('fetching sessions', client);
-          fetch_test_records(client).then((sessions) => {
-            console.log('sessions fetched', sessions);
-            setSessions(sessions);
-          });
-        }
-      }, 5000);
+    // useEffect(() => {
+    // if (appState?.client) {
+    //   fetch_test_records(appState?.client).then((sessions) => {
+    //     console.log('sessions fetched', sessions);
+    //     setSessions(sessions);
+    //   });
+    // }
+    // const intervalId = setInterval(() => {
+    //   const client = appState?.client;
+    //   if (client) {
+    //     console.log('fetching sessions', client);
+    //     fetch_test_records(client).then((sessions) => {
+    //       console.log('sessions fetched', sessions);
+    //       setSessions(sessions);
+    //     });
+    //   }
+    // }, 5000);
 
-      return () => clearInterval(intervalId);
-    }, [appState?.client]);
+    // return () => clearInterval(intervalId);
+    // }, [appState?.client]);
 
 
 
@@ -123,7 +125,7 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {sessions.map((session) => (
+              {test_records_signal?.value.resultset()?.map((session) => (
                 <Tr key={session.id().as_string()}>
                   <Td>{session.id().as_string()}</Td>
                   <Td>{session.date_connected()}</Td>

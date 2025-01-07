@@ -26,7 +26,7 @@ pub trait Model {
 }
 
 /// A record is an instance of a model which is kept up to date with the latest changes from local and remote edits
-pub trait Record {
+pub trait Record: Clone {
     type Model: Model;
     type ScopedRecord<'trx>: ScopedRecord<'trx>;
     fn id(&self) -> proto::ID {

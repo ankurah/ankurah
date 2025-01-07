@@ -47,14 +47,10 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
     let _handle = client
-        .subscribe(
-            Album::bucket_name(),
-            predicate,
-            move |changeset: ChangeSet<AlbumRecord>| {
-                let mut received = received_changesets_clone.lock().unwrap();
-                received.push(changeset);
-            },
-        )
+        .subscribe(predicate, move |changeset: ChangeSet<AlbumRecord>| {
+            let mut received = received_changesets_clone.lock().unwrap();
+            received.push(changeset);
+        })
         .await?;
 
     // Initial state should have Two Vines and Ask That God
@@ -97,7 +93,7 @@ async fn complex_local_subscription() {
 
     // Subscribe to changes
     let _handle = node
-        .subscribe("pets", "name = 'Rex' OR (age > 2 and age < 5)", watcher)
+        .subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher)
         .await
         .unwrap();
 

@@ -80,7 +80,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         use ankurah_core::derive_deps::wasm_bindgen::prelude::*;
         #[wasm_bindgen]
-        #[derive(Debug)]
+        #[derive(Debug, Clone)]
         pub struct #record_name {
             inner: std::sync::Arc<ankurah_core::model::RecordInner>,
         }

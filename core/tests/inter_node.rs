@@ -128,7 +128,7 @@ async fn inter_node_subscription() -> Result<()> {
     // Set up subscription on node2
     let (watcher, check_node2) = common::changeset_watcher::<PetRecord>();
     let _handle = node2
-        .subscribe("pet", "name = 'Rex' OR (age > 2 and age < 5)", watcher)
+        .subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher)
         .await?;
 
     // Initial state should include Rex

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 pub type Callback<R> = Box<dyn Fn(ChangeSet<R>) + Send + Sync + 'static>;
 
 /// A subscription that can be shared between indexes
-pub struct Subscription<R> {
+pub struct Subscription<R: Clone> {
     #[allow(unused)]
     pub(crate) id: proto::SubscriptionId,
     pub(crate) predicate: ankql::ast::Predicate,

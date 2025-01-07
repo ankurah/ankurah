@@ -744,7 +744,6 @@ impl Node {
     /// Subscribe to changes in records matching a predicate
     pub async fn subscribe<F, P, R>(
         self: &Arc<Self>,
-        bucket_name: &str,
         predicate: P,
         callback: F,
     ) -> anyhow::Result<crate::subscription::SubscriptionHandle>
@@ -754,6 +753,8 @@ impl Node {
         P::Error: std::error::Error + Send + Sync + 'static,
         R: Record,
     {
+        use crate::model::Model;
+        let bucket_name = R::Model::bucket_name();
         let predicate = predicate
             .try_into()
             .map_err(|_e| anyhow!("Failed to parse predicate:"))?;

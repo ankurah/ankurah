@@ -3,7 +3,7 @@ use std::{panic, sync::Arc};
 pub use ankurah_core::Node;
 pub use ankurah_web_client::{indexeddb::IndexedDBStorageEngine, WebsocketClient};
 use example_model::*;
-use tracing::info;
+use tracing::{error, info};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
 const API_SERVER: &str = "ws://localhost:8080";
@@ -30,7 +30,7 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
     Ok(connector)
 }
 
-use ankurah_core::resultset::ResultSet;
+use ankurah_core::{changes::ChangeSet, resultset::ResultSet, WasmSignal};
 #[wasm_bindgen]
 pub async fn fetch_test_records(client: &WebsocketClient) -> Result<Vec<SessionRecord>, JsValue> {
     let sessions: ResultSet<SessionRecord> = client
@@ -52,14 +52,40 @@ pub async fn fetch_test_records(client: &WebsocketClient) -> Result<Vec<SessionR
     // .collect()
 }
 
-// pub async fn subscribe_test_records(client: &WebsocketClient) -> Result<JsValue, JsValue> {
-//     unimplemented!()
-//     // client
-//     //     .node()
-//     //     .subscribe(SessionRecord::bucket_name(), "", || {
-//     //         info!("Subscription event");
-//     //     })
-// }
+#[wasm_bindgen]
+pub fn subscribe_test_records(client: &WebsocketClient) -> Result<TestResultSetSignal, JsValue> {
+    let (signal, rwsignal) =
+        reactive_graph::signal::RwSignal::new(TestResultSet::default()).split();
+
+    let client = client.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        client.ready().await;
+
+        use reactive_graph::traits::Set;
+        match client
+            .node()
+            .subscribe(
+                "date_connected = '2024-01-01'",
+                move |changeset: ChangeSet<SessionRecord>| {
+                    rwsignal.set(TestResultSet(Arc::new(changeset.resultset.clone())));
+                    // let mut received = received_changesets_clone.lock().unwrap();
+                    // received.push(changeset);
+                },
+            )
+            .await
+        {
+            Ok(handle) => {
+                // HACK
+                std::mem::forget(handle);
+            }
+            Err(e) => {
+                error!("Failed to subscribe to changes: {}", e);
+            }
+        }
+    });
+
+    Ok(signal.into())
+}
 
 #[wasm_bindgen]
 pub async fn create_test_record(client: &WebsocketClient) -> Result<(), JsValue> {
@@ -73,4 +99,15 @@ pub async fn create_test_record(client: &WebsocketClient) -> Result<(), JsValue>
         .await;
     trx.commit().await.unwrap();
     Ok(())
+}
+
+#[wasm_bindgen]
+#[derive(WasmSignal, Debug, Clone, Default)]
+pub struct TestResultSet(Arc<ResultSet<SessionRecord>>);
+
+#[wasm_bindgen]
+impl TestResultSet {
+    pub fn resultset(&self) -> Vec<SessionRecord> {
+        self.0.records.iter().cloned().collect()
+    }
 }
