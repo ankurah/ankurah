@@ -16,9 +16,7 @@ pub async fn start() -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub async fn create_client() -> Result<WebsocketClient, JsValue> {
-    let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app")
-        .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
     let node = Arc::new(Node::new(Arc::new(storage_engine)));
     let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797")?;
 
@@ -30,18 +28,14 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
 use ankurah_core::{changes::ChangeSet, resultset::ResultSet, WasmSignal};
 #[wasm_bindgen]
 pub async fn fetch_test_records(client: &WebsocketClient) -> Result<Vec<SessionRecord>, JsValue> {
-    let sessions: ResultSet<SessionRecord> = client
-        .node()
-        .fetch("date_connected = '2024-01-01'")
-        .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let sessions: ResultSet<SessionRecord> =
+        client.node().fetch("date_connected = '2024-01-01'").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
     Ok(sessions.into())
 }
 
 #[wasm_bindgen]
 pub fn subscribe_test_records(client: &WebsocketClient) -> Result<TestResultSetSignal, JsValue> {
-    let (signal, rwsignal) =
-        reactive_graph::signal::RwSignal::new(TestResultSet::default()).split();
+    let (signal, rwsignal) = reactive_graph::signal::RwSignal::new(TestResultSet::default()).split();
 
     let client = client.clone();
     wasm_bindgen_futures::spawn_local(async move {
@@ -50,14 +44,11 @@ pub fn subscribe_test_records(client: &WebsocketClient) -> Result<TestResultSetS
         use reactive_graph::traits::Set;
         match client
             .node()
-            .subscribe(
-                "date_connected = '2024-01-01'",
-                move |changeset: ChangeSet<SessionRecord>| {
-                    rwsignal.set(TestResultSet(Arc::new(changeset.resultset.clone())));
-                    // let mut received = received_changesets_clone.lock().unwrap();
-                    // received.push(changeset);
-                },
-            )
+            .subscribe("date_connected = '2024-01-01'", move |changeset: ChangeSet<SessionRecord>| {
+                rwsignal.set(TestResultSet(Arc::new(changeset.resultset.clone())));
+                // let mut received = received_changesets_clone.lock().unwrap();
+                // received.push(changeset);
+            })
             .await
         {
             Ok(handle) => {
@@ -93,7 +84,5 @@ pub struct TestResultSet(Arc<ResultSet<SessionRecord>>);
 
 #[wasm_bindgen]
 impl TestResultSet {
-    pub fn resultset(&self) -> Vec<SessionRecord> {
-        self.0.records.to_vec()
-    }
+    pub fn resultset(&self) -> Vec<SessionRecord> { self.0.records.to_vec() }
 }

@@ -40,10 +40,7 @@ impl Drop for Inner {
 }
 
 pub fn channel() -> (Sender, Receiver) {
-    let inner = Arc::new(Inner {
-        waker: AtomicWaker::new(),
-        set: AtomicBool::new(false),
-    });
+    let inner = Arc::new(Inner { waker: AtomicWaker::new(), set: AtomicBool::new(false) });
     let rx = Arc::downgrade(&inner);
     (Sender(inner), Receiver(rx))
 }
@@ -74,29 +71,21 @@ impl Stream for Receiver {
 }
 
 impl Hash for Sender {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.0).hash(state)
-    }
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { Arc::as_ptr(&self.0).hash(state) }
 }
 
 impl PartialEq for Sender {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }
 
 impl Eq for Sender {}
 
 impl Hash for Receiver {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        Weak::as_ptr(&self.0).hash(state)
-    }
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { Weak::as_ptr(&self.0).hash(state) }
 }
 
 impl PartialEq for Receiver {
-    fn eq(&self, other: &Self) -> bool {
-        Weak::ptr_eq(&self.0, &other.0)
-    }
+    fn eq(&self, other: &Self) -> bool { Weak::ptr_eq(&self.0, &other.0) }
 }
 
 impl Eq for Receiver {}

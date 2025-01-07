@@ -36,38 +36,24 @@ impl CBStream {
             move |event: Event| {
                 web_sys::console::error_2(&JsValue::from_str("CB Stream error"), &event);
                 if let Some(sender) = sender.borrow().as_ref() {
-                    let _ = sender.unbounded_send(Err(event
-                        .as_string()
-                        .unwrap_or_else(|| "Unknown error".to_string())));
+                    let _ = sender.unbounded_send(Err(event.as_string().unwrap_or_else(|| "Unknown error".to_string())));
                 }
             }
         }) as Box<dyn FnMut(_)>);
 
-        target
-            .add_event_listener_with_callback(
-                success_event,
-                success_callback.as_ref().unchecked_ref(),
-            )
-            .unwrap();
+        target.add_event_listener_with_callback(success_event, success_callback.as_ref().unchecked_ref()).unwrap();
 
-        target
-            .add_event_listener_with_callback(error_event, error_callback.as_ref().unchecked_ref())
-            .unwrap();
+        target.add_event_listener_with_callback(error_event, error_callback.as_ref().unchecked_ref()).unwrap();
 
         callbacks.push((success_callback, target.clone()));
         callbacks.push((error_callback, target.clone()));
 
-        Self {
-            receiver,
-            _callbacks: callbacks,
-        }
+        Self { receiver, _callbacks: callbacks }
     }
 }
 
 impl Stream for CBStream {
     type Item = Result<JsValue, String>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(cx)
-    }
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> { Pin::new(&mut self.receiver).poll_next(cx) }
 }

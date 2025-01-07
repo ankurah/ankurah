@@ -23,11 +23,7 @@ pub trait StorageEngine: Send + Sync {
 
     // Fetch raw record states matching a predicate
     // TODO: Move this to the StorageBucket trait
-    async fn fetch_states(
-        &self,
-        bucket_name: String,
-        predicate: &ankql::ast::Predicate,
-    ) -> Result<Vec<(ID, RecordState)>, RetrievalError>;
+    async fn fetch_states(&self, bucket_name: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, RecordState)>, RetrievalError>;
 }
 
 #[async_trait]
@@ -67,14 +63,10 @@ pub struct Bucket(pub(crate) Arc<dyn StorageBucket>);
 
 /// Storage interface for a collection
 impl Bucket {
-    pub fn new(bucket: Arc<dyn StorageBucket>) -> Self {
-        Self(bucket)
-    }
+    pub fn new(bucket: Arc<dyn StorageBucket>) -> Self { Self(bucket) }
 }
 
 impl std::ops::Deref for Bucket {
     type Target = Arc<dyn StorageBucket>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+    fn deref(&self) -> &Self::Target { &self.0 }
 }

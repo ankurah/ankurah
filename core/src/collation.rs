@@ -27,32 +27,20 @@ pub trait Collatable {
     fn is_maximum(&self) -> bool;
 
     /// Compare two values in the collation order
-    fn compare(&self, other: &Self) -> Ordering {
-        self.to_bytes().cmp(&other.to_bytes())
-    }
+    fn compare(&self, other: &Self) -> Ordering { self.to_bytes().cmp(&other.to_bytes()) }
 
     fn is_in_range(&self, lower: RangeBound<&Self>, upper: RangeBound<&Self>) -> bool {
         match (lower, upper) {
-            (RangeBound::Included(l), RangeBound::Included(u)) => {
-                self.compare(l) != Ordering::Less && self.compare(u) != Ordering::Greater
-            }
-            (RangeBound::Included(l), RangeBound::Excluded(u)) => {
-                self.compare(l) != Ordering::Less && self.compare(u) == Ordering::Less
-            }
+            (RangeBound::Included(l), RangeBound::Included(u)) => self.compare(l) != Ordering::Less && self.compare(u) != Ordering::Greater,
+            (RangeBound::Included(l), RangeBound::Excluded(u)) => self.compare(l) != Ordering::Less && self.compare(u) == Ordering::Less,
             (RangeBound::Excluded(l), RangeBound::Included(u)) => {
                 self.compare(l) == Ordering::Greater && self.compare(u) != Ordering::Greater
             }
-            (RangeBound::Excluded(l), RangeBound::Excluded(u)) => {
-                self.compare(l) == Ordering::Greater && self.compare(u) == Ordering::Less
-            }
-            (RangeBound::Unbounded, RangeBound::Included(u)) => {
-                self.compare(u) != Ordering::Greater
-            }
+            (RangeBound::Excluded(l), RangeBound::Excluded(u)) => self.compare(l) == Ordering::Greater && self.compare(u) == Ordering::Less,
+            (RangeBound::Unbounded, RangeBound::Included(u)) => self.compare(u) != Ordering::Greater,
             (RangeBound::Unbounded, RangeBound::Excluded(u)) => self.compare(u) == Ordering::Less,
             (RangeBound::Included(l), RangeBound::Unbounded) => self.compare(l) != Ordering::Less,
-            (RangeBound::Excluded(l), RangeBound::Unbounded) => {
-                self.compare(l) == Ordering::Greater
-            }
+            (RangeBound::Excluded(l), RangeBound::Unbounded) => self.compare(l) == Ordering::Greater,
             (RangeBound::Unbounded, RangeBound::Unbounded) => true,
         }
     }
@@ -107,11 +95,7 @@ impl Collatable for ast::Literal {
                 if f.is_nan() || (f.is_infinite() && *f > 0.0) {
                     None
                 } else {
-                    let bits = if *f >= 0.0 {
-                        f.to_bits() ^ (1 << 63)
-                    } else {
-                        !f.to_bits()
-                    };
+                    let bits = if *f >= 0.0 { f.to_bits() ^ (1 << 63) } else { !f.to_bits() };
                     let next_bits = bits + 1;
                     Some(next_bits.to_be_bytes().to_vec())
                 }
@@ -147,11 +131,7 @@ impl Collatable for ast::Literal {
                 if f.is_nan() || (f.is_infinite() && *f < 0.0) {
                     None
                 } else {
-                    let bits = if *f >= 0.0 {
-                        f.to_bits() ^ (1 << 63)
-                    } else {
-                        !f.to_bits()
-                    };
+                    let bits = if *f >= 0.0 { f.to_bits() ^ (1 << 63) } else { !f.to_bits() };
                     let prev_bits = bits - 1;
                     Some(prev_bits.to_be_bytes().to_vec())
                 }
@@ -187,9 +167,7 @@ impl Collatable for ast::Literal {
 
 // // Implementation for strings
 impl Collatable for &str {
-    fn to_bytes(&self) -> Vec<u8> {
-        self.as_bytes().to_vec()
-    }
+    fn to_bytes(&self) -> Vec<u8> { self.as_bytes().to_vec() }
 
     fn successor_bytes(&self) -> Option<Vec<u8>> {
         if self.is_maximum() {
@@ -214,9 +192,7 @@ impl Collatable for &str {
         }
     }
 
-    fn is_minimum(&self) -> bool {
-        self.is_empty()
-    }
+    fn is_minimum(&self) -> bool { self.is_empty() }
 
     fn is_maximum(&self) -> bool {
         false // Strings have no theoretical maximum
@@ -246,13 +222,9 @@ impl Collatable for i64 {
         }
     }
 
-    fn is_minimum(&self) -> bool {
-        *self == i64::MIN
-    }
+    fn is_minimum(&self) -> bool { *self == i64::MIN }
 
-    fn is_maximum(&self) -> bool {
-        *self == i64::MAX
-    }
+    fn is_maximum(&self) -> bool { *self == i64::MAX }
 }
 
 // Implementation for floats
@@ -299,13 +271,9 @@ impl Collatable for f64 {
         }
     }
 
-    fn is_minimum(&self) -> bool {
-        *self == f64::NEG_INFINITY
-    }
+    fn is_minimum(&self) -> bool { *self == f64::NEG_INFINITY }
 
-    fn is_maximum(&self) -> bool {
-        *self == f64::INFINITY
-    }
+    fn is_maximum(&self) -> bool { *self == f64::INFINITY }
 }
 
 #[cfg(test)]
@@ -328,14 +296,8 @@ mod tests {
     #[test]
     fn test_integer_collation() {
         let n = 42i64;
-        assert_eq!(
-            i64::from_be_bytes(n.successor_bytes().unwrap().try_into().unwrap()),
-            43
-        );
-        assert_eq!(
-            i64::from_be_bytes(n.predecessor_bytes().unwrap().try_into().unwrap()),
-            41
-        );
+        assert_eq!(i64::from_be_bytes(n.successor_bytes().unwrap().try_into().unwrap()), 43);
+        assert_eq!(i64::from_be_bytes(n.predecessor_bytes().unwrap().try_into().unwrap()), 41);
         assert!(!n.is_minimum());
         assert!(!n.is_maximum());
 

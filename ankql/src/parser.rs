@@ -10,13 +10,7 @@ fn print_tree(pair: Pair<grammar::Rule>, indent: usize) {
     if matches!(pair.as_rule(), grammar::Rule::EOI) {
         return;
     }
-    println!(
-        "{:indent$}{:?}: '{}'",
-        "",
-        pair.as_rule(),
-        pair.as_str().trim(),
-        indent = indent
-    );
+    println!("{:indent$}{:?}: '{}'", "", pair.as_rule(), pair.as_str().trim(), indent = indent);
     for inner in pair.into_inner() {
         print_tree(inner, indent + 2);
     }
@@ -34,22 +28,15 @@ fn debug_print_pairs(pairs: Pairs<grammar::Rule>) {
 /// Parse a selection expression into a predicate AST.
 /// The selection must be a valid boolean expression using AND, OR, and comparison operators.
 pub fn parse_selection(input: &str) -> Result<ast::Predicate, ParseError> {
-    let pairs = grammar::AnkqlParser::parse(grammar::Rule::Selection, input)
-        .map_err(|e| ParseError::SyntaxError(format!("{}", e)))?;
+    let pairs = grammar::AnkqlParser::parse(grammar::Rule::Selection, input).map_err(|e| ParseError::SyntaxError(format!("{}", e)))?;
 
     #[cfg(test)]
     debug_print_pairs(pairs.clone());
 
     // Since Selection is a silent rule (_), we get the Expr directly
-    let expr = pairs
-        .into_iter()
-        .next()
-        .ok_or(ParseError::EmptyExpression)?;
+    let expr = pairs.into_iter().next().ok_or(ParseError::EmptyExpression)?;
     if expr.as_rule() != grammar::Rule::Expr {
-        return Err(ParseError::UnexpectedRule {
-            expected: "Expr",
-            got: expr.as_rule(),
-        });
+        return Err(ParseError::UnexpectedRule { expected: "Expr", got: expr.as_rule() });
     }
 
     parse_expr(expr)
@@ -74,14 +61,9 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, ParseError> {
             | grammar::Rule::LtEq
             | grammar::Rule::Lt
             | grammar::Rule::NotEq => create_comparison(result, op.as_rule(), right)?,
-            grammar::Rule::And | grammar::Rule::Or => {
-                create_logical_op(op.as_rule(), result, right, &mut pairs)?
-            }
+            grammar::Rule::And | grammar::Rule::Or => create_logical_op(op.as_rule(), result, right, &mut pairs)?,
             _ => {
-                return Err(ParseError::UnexpectedRule {
-                    expected: "comparison operator, And, or Or",
-                    got: op.as_rule(),
-                });
+                return Err(ParseError::UnexpectedRule { expected: "comparison operator, And, or Or", got: op.as_rule() });
             }
         };
     }
@@ -90,11 +72,7 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, ParseError> {
 }
 
 /// Create a comparison predicate from a left expression and a right pair
-fn create_comparison(
-    left: ast::Expr,
-    op: grammar::Rule,
-    right: Pair<grammar::Rule>,
-) -> Result<ast::Expr, ParseError> {
+fn create_comparison(left: ast::Expr, op: grammar::Rule, right: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     let right_expr = parse_atomic_expr(right)?;
     let operator = match op {
         grammar::Rule::Eq => ast::ComparisonOperator::Equal,
@@ -104,17 +82,10 @@ fn create_comparison(
         grammar::Rule::Lt => ast::ComparisonOperator::LessThan,
         grammar::Rule::NotEq => ast::ComparisonOperator::NotEqual,
         _ => {
-            return Err(ParseError::UnexpectedRule {
-                expected: "comparison operator",
-                got: op,
-            });
+            return Err(ParseError::UnexpectedRule { expected: "comparison operator", got: op });
         }
     };
-    Ok(ast::Expr::Predicate(ast::Predicate::Comparison {
-        left: Box::new(left),
-        operator,
-        right: Box::new(right_expr),
-    }))
+    Ok(ast::Expr::Predicate(ast::Predicate::Comparison { left: Box::new(left), operator, right: Box::new(right_expr) }))
 }
 
 /// Create a logical operation (AND/OR) from a left expression and a right pair
@@ -136,9 +107,7 @@ fn create_logical_op(
             | grammar::Rule::LtEq
             | grammar::Rule::Lt
             | grammar::Rule::NotEq => {
-                let next_right = rest
-                    .next()
-                    .ok_or(ParseError::MissingOperand("comparison right"))?;
+                let next_right = rest.next().ok_or(ParseError::MissingOperand("comparison right"))?;
                 let next_right_expr = parse_atomic_expr(next_right)?;
                 ast::Predicate::Comparison {
                     left: Box::new(right_expr),
@@ -155,10 +124,7 @@ fn create_logical_op(
                 }
             }
             _ => {
-                return Err(ParseError::UnexpectedRule {
-                    expected: "comparison operator",
-                    got: next_op.as_rule(),
-                });
+                return Err(ParseError::UnexpectedRule { expected: "comparison operator", got: next_op.as_rule() });
             }
         }
     } else {
@@ -179,39 +145,25 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
         grammar::Rule::SingleQuotedString => parse_string_literal(pair),
         grammar::Rule::Unsigned => parse_number(pair),
         grammar::Rule::ExpressionInParentheses => {
-            let inner = pair
-                .into_inner()
-                .next()
-                .ok_or(ParseError::EmptyExpression)?;
+            let inner = pair.into_inner().next().ok_or(ParseError::EmptyExpression)?;
             let pred = parse_expr(inner)?;
             Ok(ast::Expr::Predicate(pred))
         }
-        _ => Err(ParseError::UnexpectedRule {
-            expected: "atomic expression",
-            got: pair.as_rule(),
-        }),
+        _ => Err(ParseError::UnexpectedRule { expected: "atomic expression", got: pair.as_rule() }),
     }
 }
 
 /// Parse an identifier, which can be a simple name or a dotted path
 fn parse_identifier(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     if pair.as_rule() != grammar::Rule::IdentifierWithOptionalContinuation {
-        return Err(ParseError::UnexpectedRule {
-            expected: "IdentifierWithOptionalContinuation",
-            got: pair.as_rule(),
-        });
+        return Err(ParseError::UnexpectedRule { expected: "IdentifierWithOptionalContinuation", got: pair.as_rule() });
     }
 
     let mut ident_parts = pair.into_inner();
-    let ident = ident_parts.next().ok_or(ParseError::InvalidPredicate(
-        "Empty identifier parts".into(),
-    ))?;
+    let ident = ident_parts.next().ok_or(ParseError::InvalidPredicate("Empty identifier parts".into()))?;
 
     if ident.as_rule() != grammar::Rule::Identifier {
-        return Err(ParseError::UnexpectedRule {
-            expected: "Identifier",
-            got: ident.as_rule(),
-        });
+        return Err(ParseError::UnexpectedRule { expected: "Identifier", got: ident.as_rule() });
     }
 
     let collection = ident.as_str().trim().to_string();
@@ -219,31 +171,17 @@ fn parse_identifier(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> 
     // Check if we have a ReferenceContinuation
     if let Some(ref_cont) = ident_parts.next() {
         if ref_cont.as_rule() != grammar::Rule::ReferenceContinuation {
-            return Err(ParseError::UnexpectedRule {
-                expected: "ReferenceContinuation",
-                got: ref_cont.as_rule(),
-            });
+            return Err(ParseError::UnexpectedRule { expected: "ReferenceContinuation", got: ref_cont.as_rule() });
         }
 
         // Get the property name from the ReferenceContinuation
-        let property = ref_cont
-            .into_inner()
-            .next()
-            .ok_or(ParseError::InvalidPredicate(
-                "Empty reference continuation".into(),
-            ))?;
+        let property = ref_cont.into_inner().next().ok_or(ParseError::InvalidPredicate("Empty reference continuation".into()))?;
 
         if property.as_rule() != grammar::Rule::Identifier {
-            return Err(ParseError::UnexpectedRule {
-                expected: "Identifier",
-                got: property.as_rule(),
-            });
+            return Err(ParseError::UnexpectedRule { expected: "Identifier", got: property.as_rule() });
         }
 
-        Ok(ast::Expr::Identifier(ast::Identifier::CollectionProperty(
-            collection,
-            property.as_str().trim().to_string(),
-        )))
+        Ok(ast::Expr::Identifier(ast::Identifier::CollectionProperty(collection, property.as_str().trim().to_string())))
     } else {
         Ok(ast::Expr::Identifier(ast::Identifier::Property(collection)))
     }
@@ -252,17 +190,12 @@ fn parse_identifier(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> 
 /// Parse a string literal, removing the surrounding quotes
 fn parse_string_literal(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     if pair.as_rule() != grammar::Rule::SingleQuotedString {
-        return Err(ParseError::UnexpectedRule {
-            expected: "SingleQuotedString",
-            got: pair.as_rule(),
-        });
+        return Err(ParseError::UnexpectedRule { expected: "SingleQuotedString", got: pair.as_rule() });
     }
 
     let s = pair.as_str();
     if !s.starts_with('\'') || !s.ends_with('\'') {
-        return Err(ParseError::InvalidPredicate(
-            "String literal must be quoted".into(),
-        ));
+        return Err(ParseError::InvalidPredicate("String literal must be quoted".into()));
     }
     let s = &s[1..s.len() - 1];
 
@@ -272,17 +205,10 @@ fn parse_string_literal(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseErr
 /// Parse a number literal
 fn parse_number(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     if pair.as_rule() != grammar::Rule::Unsigned {
-        return Err(ParseError::UnexpectedRule {
-            expected: "Unsigned",
-            got: pair.as_rule(),
-        });
+        return Err(ParseError::UnexpectedRule { expected: "Unsigned", got: pair.as_rule() });
     }
 
-    let num = pair
-        .as_str()
-        .trim()
-        .parse::<i64>()
-        .map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse number: {}", e)))?;
+    let num = pair.as_str().trim().parse::<i64>().map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse number: {}", e)))?;
 
     Ok(ast::Expr::Literal(ast::Literal::Integer(num)))
 }
@@ -298,13 +224,9 @@ mod tests {
         assert_eq!(
             predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property(
-                    "status".to_string()
-                ))),
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::String(
-                    "active".to_string()
-                )))
+                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
             }
         );
     }
@@ -317,20 +239,14 @@ mod tests {
             predicate,
             ast::Predicate::And(
                 Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property(
-                        "user".to_string()
-                    ))),
+                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
                     right: Box::new(ast::Expr::Literal(ast::Literal::Integer(123)))
                 }),
                 Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property(
-                        "status".to_string()
-                    ))),
+                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
-                    right: Box::new(ast::Expr::Literal(ast::Literal::String(
-                        "active".to_string()
-                    )))
+                    right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
                 })
             )
         );
@@ -345,28 +261,20 @@ mod tests {
             ast::Predicate::And(
                 Box::new(ast::Predicate::Or(
                     Box::new(ast::Predicate::Comparison {
-                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property(
-                            "user".to_string()
-                        ))),
+                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
                         right: Box::new(ast::Expr::Literal(ast::Literal::Integer(123)))
                     }),
                     Box::new(ast::Predicate::Comparison {
-                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property(
-                            "user".to_string()
-                        ))),
+                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
                         right: Box::new(ast::Expr::Literal(ast::Literal::Integer(456)))
                     })
                 )),
                 Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property(
-                        "status".to_string()
-                    ))),
+                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
-                    right: Box::new(ast::Expr::Literal(ast::Literal::String(
-                        "active".to_string()
-                    )))
+                    right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
                 })
             )
         );

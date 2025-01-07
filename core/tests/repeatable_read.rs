@@ -21,18 +21,12 @@ pub struct Album {
 
 #[tokio::test]
 async fn repeatable_read() -> Result<()> {
-    let client = Arc::new(Node::new_durable(Arc::new(
-        SledStorageEngine::new_test().unwrap(),
-    )));
+    let client = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     let id;
     {
         let trx = client.begin();
-        let album_rw = trx
-            .create(&Album {
-                name: "I love cats".into(),
-            })
-            .await;
+        let album_rw = trx.create(&Album { name: "I love cats".into() }).await;
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
 
@@ -95,11 +89,7 @@ async fn pg_repeatable_read() -> Result<()> {
     let id;
     {
         let trx = client.begin();
-        let album_rw = trx
-            .create(&Album {
-                name: "I love cats".into(),
-            })
-            .await;
+        let album_rw = trx.create(&Album { name: "I love cats".into() }).await;
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
         trx.commit().await?;

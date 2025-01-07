@@ -9,33 +9,15 @@ use common::{Album, AlbumRecord, ChangeKind, Pet, PetRecord};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Arc::new(Node::new_durable(Arc::new(
-        SledStorageEngine::new_test().unwrap(),
-    )));
+    let client = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     // Create some initial records
     {
         let trx = client.begin();
-        trx.create(&Album {
-            name: "Walking on a Dream".into(),
-            year: "2008".into(),
-        })
-        .await;
-        trx.create(&Album {
-            name: "Ice on the Dune".into(),
-            year: "2013".into(),
-        })
-        .await;
-        trx.create(&Album {
-            name: "Two Vines".into(),
-            year: "2016".into(),
-        })
-        .await;
-        trx.create(&Album {
-            name: "Ask That God".into(),
-            year: "2024".into(),
-        })
-        .await;
+        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
+        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
+        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
+        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
         trx.commit().await?;
     }
 
@@ -84,44 +66,21 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 #[tokio::test]
 async fn complex_local_subscription() {
     // Create a new node
-    let node = Arc::new(Node::new_durable(Arc::new(
-        SledStorageEngine::new_test().unwrap(),
-    )));
+    let node = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
     let (watcher, check) = common::changeset_watcher::<PetRecord>();
 
     // Subscribe to changes
-    let _handle = node
-        .subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher)
-        .await
-        .unwrap();
+    let _handle = node.subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher).await.unwrap();
 
     let (rex, snuffy, jasper);
     {
         // Create some test records
         let trx = node.begin();
-        rex = trx
-            .create(&Pet {
-                name: "Rex".to_string(),
-                age: "1".to_string(),
-            })
-            .await
-            .read();
+        rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await.read();
 
-        snuffy = trx
-            .create(&Pet {
-                name: "Snuffy".to_string(),
-                age: "2".to_string(),
-            })
-            .await
-            .read();
+        snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await.read();
 
-        jasper = trx
-            .create(&Pet {
-                name: "Jasper".to_string(),
-                age: "6".to_string(),
-            })
-            .await
-            .read();
+        jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await.read();
 
         trx.commit().await.unwrap();
     };
@@ -168,13 +127,7 @@ async fn complex_local_subscription() {
     trx.commit().await.unwrap();
 
     // Verify both updates were received as removals
-    assert_eq!(
-        check(),
-        [
-            (snuffy.id(), ChangeKind::Remove),
-            (jasper.id(), ChangeKind::Remove)
-        ]
-    );
+    assert_eq!(check(), [(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]);
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches

@@ -41,17 +41,13 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Unique property backend identifier.
     fn property_backend_name() -> String
-    where
-        Self: Sized;
+    where Self: Sized;
 
     /// Get the latest state buffer for this property backend.
     fn to_state_buffer(&self) -> Result<Vec<u8>>;
     /// Construct a property backend from a state buffer.
-    fn from_state_buffer(
-        state_buffer: &Vec<u8>,
-    ) -> std::result::Result<Self, crate::error::RetrievalError>
-    where
-        Self: Sized;
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
+    where Self: Sized;
 
     /// Retrieve operations applied to this backend since the last time we called this method.
     // TODO: Should this take a precursor id?
@@ -100,10 +96,7 @@ pub struct Backends {
 // This is where this gets a bit tough.
 // PropertyBackends should either have a concrete type of some sort,
 // or if they can take a generic, they should also take a `Vec<u8>`.
-pub fn backend_from_string(
-    name: &str,
-    buffer: Option<&Vec<u8>>,
-) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
+pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
     if name == "yrs" {
         let backend = match buffer {
             Some(buffer) => YrsBackend::from_state_buffer(buffer)?,
@@ -122,18 +115,11 @@ pub fn backend_from_string(
 }
 
 impl Default for Backends {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl Backends {
-    pub fn new() -> Self {
-        Self {
-            backends: Arc::new(Mutex::new(BTreeMap::default())),
-            head: Arc::new(Mutex::new(Clock::default())),
-        }
-    }
+    pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())), head: Arc::new(Mutex::new(Clock::default())) } }
 
     pub fn get<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
         let backend_name = P::property_backend_name();
@@ -147,10 +133,7 @@ impl Backends {
         Ok(backend.downcasted(&backend_name))
     }
 
-    pub fn get_raw(
-        &self,
-        backend_name: String,
-    ) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
+    pub fn get_raw(&self, backend_name: String) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
         let mut backends = self.backends.lock().unwrap();
         if let Some(backend) = backends.get(&backend_name) {
             Ok(backend.clone())
@@ -163,10 +146,7 @@ impl Backends {
 
     pub fn downcasted(&self) -> Vec<BackendDowncasted> {
         let backends = self.backends.lock().unwrap();
-        backends
-            .iter()
-            .map(|(name, backend)| backend.clone().downcasted(name))
-            .collect()
+        backends.iter().map(|(name, backend)| backend.clone().downcasted(name)).collect()
     }
 
     /// Fork the data behind the backends.
@@ -177,10 +157,7 @@ impl Backends {
             forked.insert(name.clone(), backend.fork().into());
         }
 
-        Self {
-            backends: Arc::new(Mutex::new(forked)),
-            head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
-        }
+        Self { backends: Arc::new(Mutex::new(forked)), head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())) }
     }
 
     fn insert(&self, backend_name: String, backend: Arc<dyn PropertyBackend>) {
@@ -195,10 +172,7 @@ impl Backends {
             let state_buffer = backend.to_state_buffer()?;
             state_buffers.insert(name.clone(), state_buffer);
         }
-        Ok(RecordState {
-            state_buffers,
-            head: self.head.lock().unwrap().clone(),
-        })
+        Ok(RecordState { state_buffers, head: self.head.lock().unwrap().clone() })
     }
 
     pub fn from_state_buffers(record_state: &RecordState) -> Result<Self, RetrievalError> {
@@ -221,11 +195,7 @@ impl Backends {
         Ok(operations)
     }
 
-    pub fn apply_operations(
-        &self,
-        backend_name: String,
-        operations: &Vec<Operation>,
-    ) -> Result<()> {
+    pub fn apply_operations(&self, backend_name: String, operations: &Vec<Operation>) -> Result<()> {
         let backend = self.get_raw(backend_name)?;
         backend.apply_operations(operations)?;
         Ok(())

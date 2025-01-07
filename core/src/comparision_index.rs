@@ -19,13 +19,7 @@ pub(crate) struct ComparisonIndex {
 
 impl ComparisonIndex {
     #[allow(unused)]
-    pub fn new() -> Self {
-        Self {
-            eq: HashMap::new(),
-            gt: BTreeMap::new(),
-            lt: BTreeMap::new(),
-        }
-    }
+    pub fn new() -> Self { Self { eq: HashMap::new(), gt: BTreeMap::new(), lt: BTreeMap::new() } }
 
     fn for_entry<F, V>(&mut self, value: V, op: ast::ComparisonOperator, f: F)
     where
@@ -67,21 +61,11 @@ impl ComparisonIndex {
         }
     }
 
-    pub fn add<V: Collatable>(
-        &mut self,
-        value: V,
-        op: ast::ComparisonOperator,
-        sub_id: proto::SubscriptionId,
-    ) {
+    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_id: proto::SubscriptionId) {
         self.for_entry(value, op, |entries| entries.push(sub_id));
     }
 
-    pub fn remove<V: Collatable>(
-        &mut self,
-        value: V,
-        op: ast::ComparisonOperator,
-        sub_id: proto::SubscriptionId,
-    ) {
+    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_id: proto::SubscriptionId) {
         self.for_entry(value, op, |entries| {
             if let Some(pos) = entries.iter().position(|id| *id == sub_id) {
                 entries.remove(pos);
@@ -127,11 +111,7 @@ mod tests {
 
         // Less than 8 ------------------------------------------------------------
         let sub0 = proto::SubscriptionId::test(0);
-        index.add(
-            ast::Literal::Integer(8),
-            ast::ComparisonOperator::LessThan,
-            sub0,
-        );
+        index.add(ast::Literal::Integer(8), ast::ComparisonOperator::LessThan, sub0);
 
         // 8 should match nothing
         assert!(index.find_matching(Value::Integer(8)).is_empty());
@@ -142,11 +122,7 @@ mod tests {
         let sub1 = proto::SubscriptionId::test(1);
 
         // Greater than 20 ------------------------------------------------------------
-        index.add(
-            ast::Literal::Integer(20),
-            ast::ComparisonOperator::GreaterThan,
-            sub1,
-        );
+        index.add(ast::Literal::Integer(20), ast::ComparisonOperator::GreaterThan, sub1);
 
         // 20 should match nothing
         assert!(index.find_matching(Value::Integer(20)).is_empty());
@@ -155,21 +131,13 @@ mod tests {
         assert_eq!(index.find_matching(Value::Integer(21)), vec![sub1]);
 
         // // Add subscriptions for various numeric comparisons
-        index.add(
-            ast::Literal::Integer(5),
-            ast::ComparisonOperator::Equal,
-            sub0,
-        );
+        index.add(ast::Literal::Integer(5), ast::ComparisonOperator::Equal, sub0);
 
         // // Test exact match (5)
         assert_eq!(index.find_matching(Value::Integer(5)), vec![sub0]);
 
         // Less than 25 ------------------------------------------------------------
-        index.add(
-            ast::Literal::Integer(25),
-            ast::ComparisonOperator::LessThan,
-            sub0,
-        );
+        index.add(ast::Literal::Integer(25), ast::ComparisonOperator::LessThan, sub0);
 
         // 22 should match sub0 and sub1 because > 20 and < 25
         assert_eq!(index.find_matching(Value::Integer(22)), vec![sub0, sub1]);

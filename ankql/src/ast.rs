@@ -5,11 +5,7 @@ pub enum Expr {
     Literal(Literal),
     Identifier(Identifier),
     Predicate(Predicate),
-    InfixExpr {
-        left: Box<Expr>,
-        operator: InfixOperator,
-        right: Box<Expr>,
-    },
+    InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,11 +24,7 @@ pub enum Identifier {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
-    Comparison {
-        left: Box<Expr>,
-        operator: ComparisonOperator,
-        right: Box<Expr>,
-    },
+    Comparison { left: Box<Expr>, operator: ComparisonOperator, right: Box<Expr> },
     IsNull(Box<Expr>),
     And(Box<Predicate>, Box<Predicate>),
     Or(Box<Predicate>, Box<Predicate>),

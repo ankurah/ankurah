@@ -24,19 +24,14 @@ pub struct YrsBackend {
 }
 
 impl Default for YrsBackend {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl YrsBackend {
     pub fn new() -> Self {
         let doc = yrs::Doc::new();
         let starting_state = doc.transact().state_vector();
-        Self {
-            doc,
-            previous_state: Arc::new(Mutex::new(starting_state)),
-        }
+        Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) }
     }
 
     pub fn get_string(&self, property_name: impl AsRef<str>) -> Option<String> {
@@ -66,13 +61,9 @@ impl YrsBackend {
 }
 
 impl PropertyBackend for YrsBackend {
-    fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> {
-        self as Arc<dyn Any + Send + Sync + 'static>
-    }
+    fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> { self as Arc<dyn Any + Send + Sync + 'static> }
 
-    fn as_debug(&self) -> &dyn Debug {
-        self as &dyn Debug
-    }
+    fn as_debug(&self) -> &dyn Debug { self as &dyn Debug }
 
     fn fork(&self) -> Box<dyn PropertyBackend> {
         // TODO: Don't do all this just to sever the internal Yrs Arcs
@@ -92,13 +83,9 @@ impl PropertyBackend for YrsBackend {
         unimplemented!()
     }
 
-    fn property_backend_name() -> String {
-        "yrs".to_owned()
-    }
+    fn property_backend_name() -> String { "yrs".to_owned() }
 
-    fn get_property_value_string(&self, property_name: &str) -> Option<String> {
-        self.get_string(property_name)
-    }
+    fn get_property_value_string(&self, property_name: &str) -> Option<String> { self.get_string(property_name) }
 
     fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
         let txn = self.doc.transact();
@@ -109,15 +96,11 @@ impl PropertyBackend for YrsBackend {
         Ok(state_buffer)
     }
 
-    fn from_state_buffer(
-        state_buffer: &Vec<u8>,
-    ) -> std::result::Result<Self, crate::error::RetrievalError> {
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError> {
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
-        let update = yrs::Update::decode_v2(state_buffer)
-            .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
-        txn.apply_update(update)
-            .map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
+        let update = yrs::Update::decode_v2(state_buffer).map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
+        txn.apply_update(update).map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
         txn.commit(); // I just don't trust `Drop` too much
         drop(txn);
         let starting_state = doc.transact().state_vector();
@@ -125,10 +108,7 @@ impl PropertyBackend for YrsBackend {
         // let text = doc.get_or_insert_text("name"); // We only have one field in the yrs doc
         // println!("str: {:?}", text.get_string(&doc.transact()));
 
-        Ok(Self {
-            doc,
-            previous_state: Arc::new(Mutex::new(starting_state)),
-        })
+        Ok(Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) })
     }
 
     fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<Operation>> {

@@ -66,11 +66,7 @@ pub fn use_signals() -> JsValue {
     if store.is_undefined() {
         let new_store = EffectStore::new();
         new_store.start();
-        useSyncExternalStore(
-            &new_store.0.subscribe_fn,
-            &new_store.0.get_snapshot,
-            &new_store.0.get_snapshot,
-        );
+        useSyncExternalStore(&new_store.0.subscribe_fn, &new_store.0.get_snapshot, &new_store.0.get_snapshot);
         // TODO: Check to see if this sets up the finalizer in JS land
         store = JsValue::from(new_store);
         js_sys::Reflect::set(&ref_value, &"current".into(), &store).unwrap();
@@ -83,11 +79,7 @@ pub fn use_signals() -> JsValue {
             use wasm_bindgen::convert::RefFromWasmAbi;
             unsafe { EffectStore::ref_from_abi(ptr_u32) }
         };
-        useSyncExternalStore(
-            &store.0.subscribe_fn,
-            &store.0.get_snapshot,
-            &store.0.get_snapshot,
-        );
+        useSyncExternalStore(&store.0.subscribe_fn, &store.0.get_snapshot, &store.0.get_snapshot);
         store.start();
     };
 
@@ -116,9 +108,7 @@ thread_local! {
 }
 
 impl Default for EffectStore {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl EffectStore {
@@ -140,7 +130,7 @@ impl EffectStore {
                 let Some(mut rx) = rx.borrow_mut().take() else {
                     return JsValue::UNDEFINED;
                 };
-                
+
                 any_spawner::Executor::spawn_local({
                     //     // let value = Arc::clone(&value);
                     let subscriber = tracker.to_any_subscriber();
@@ -172,11 +162,7 @@ impl EffectStore {
             }) as Box<dyn Fn() -> JsValue>)
         };
 
-        let me = Self(Arc::new(Inner {
-            subscribe_fn,
-            get_snapshot,
-            tracker,
-        }));
+        let me = Self(Arc::new(Inner { subscribe_fn, get_snapshot, tracker }));
         me.start();
         me
     }
@@ -184,12 +170,8 @@ impl EffectStore {
 
 #[wasm_bindgen]
 impl EffectStore {
-    pub fn start(&self) {
-        reactive_graph::graph::Observer::set(Some(self.0.tracker.to_any_subscriber()));
-    }
-    pub fn finish(&self) {
-        reactive_graph::graph::Observer::set(None);
-    }
+    pub fn start(&self) { reactive_graph::graph::Observer::set(Some(self.0.tracker.to_any_subscriber())); }
+    pub fn finish(&self) { reactive_graph::graph::Observer::set(None); }
 }
 #[derive(Debug, Clone)]
 pub struct Tracker(Arc<TrackerInner>);
@@ -226,39 +208,25 @@ impl ReactiveNode for TrackerInner {
         false
     }
 
-    fn mark_check(&self) {
-        self.0.write().or_poisoned().notifier.notify();
-    }
+    fn mark_check(&self) { self.0.write().or_poisoned().notifier.notify(); }
 
     fn mark_dirty(&self) {
         let mut lock = self.0.write().or_poisoned();
         lock.dirty = true;
-        lock.version
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        lock.version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         lock.notifier.notify();
     }
 }
 
 impl Subscriber for TrackerInner {
-    fn add_source(&self, source: AnySource) {
-        self.0.write().or_poisoned().sources.insert(source);
-    }
+    fn add_source(&self, source: AnySource) { self.0.write().or_poisoned().sources.insert(source); }
 
-    fn clear_sources(&self, subscriber: &AnySubscriber) {
-        self.0
-            .write()
-            .or_poisoned()
-            .sources
-            .clear_sources(subscriber);
-    }
+    fn clear_sources(&self, subscriber: &AnySubscriber) { self.0.write().or_poisoned().sources.clear_sources(subscriber); }
 }
 
 impl ToAnySubscriber for Tracker {
     fn to_any_subscriber(&self) -> AnySubscriber {
-        AnySubscriber(
-            Arc::as_ptr(&self.0) as usize,
-            Arc::downgrade(&self.0) as Weak<dyn Subscriber + Send + Sync>,
-        )
+        AnySubscriber(Arc::as_ptr(&self.0) as usize, Arc::downgrade(&self.0) as Weak<dyn Subscriber + Send + Sync>)
     }
 }
 

@@ -13,43 +13,19 @@ use common::{Album, AlbumRecord, Pet, PetRecord};
 
 use common::ChangeKind;
 
-pub fn names(resultset: ResultSet<AlbumRecord>) -> Vec<String> {
-    resultset
-        .records
-        .iter()
-        .map(|r| r.name())
-        .collect::<Vec<String>>()
-}
+pub fn names(resultset: ResultSet<AlbumRecord>) -> Vec<String> { resultset.records.iter().map(|r| r.name()).collect::<Vec<String>>() }
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
-    let node1 = Arc::new(Node::new_durable(Arc::new(
-        SledStorageEngine::new_test().unwrap(),
-    )));
+    let node1 = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
     let node2 = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     {
         let trx = node1.begin();
-        trx.create(&Album {
-            name: "Walking on a Dream".into(),
-            year: "2008".into(),
-        })
-        .await;
-        trx.create(&Album {
-            name: "Ice on the Dune".into(),
-            year: "2013".into(),
-        })
-        .await;
-        trx.create(&Album {
-            name: "Two Vines".into(),
-            year: "2016".into(),
-        })
-        .await;
-        trx.create(&Album {
-            name: "Ask That God".into(),
-            year: "2024".into(),
-        })
-        .await;
+        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
+        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
+        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
+        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
         trx.commit().await?;
     };
 
@@ -58,17 +34,7 @@ async fn inter_node_fetch() -> Result<()> {
     assert_eq!(names(node1.fetch(p).await?), ["Walking on a Dream"]);
 
     // But node2 because they arent connected
-    assert_eq!(
-        names(
-            node2
-                .fetch(FetchArgs {
-                    predicate: p.try_into()?,
-                    cached: true
-                })
-                .await?
-        ),
-        [] as [&str; 0]
-    );
+    assert_eq!(names(node2.fetch(FetchArgs { predicate: p.try_into()?, cached: true }).await?), [] as [&str; 0]);
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
@@ -82,9 +48,7 @@ async fn inter_node_fetch() -> Result<()> {
 #[tokio::test]
 async fn inter_node_subscription() -> Result<()> {
     // Create two nodes
-    let node1 = Arc::new(Node::new_durable(Arc::new(
-        SledStorageEngine::new_test().unwrap(),
-    )));
+    let node1 = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
     let node2 = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
     // Connect the nodes
@@ -94,42 +58,20 @@ async fn inter_node_subscription() -> Result<()> {
     // Create initial records on node1
     let (rex, snuffy, jasper) = {
         let trx = node1.begin();
-        let rex = trx
-            .create(&Pet {
-                name: "Rex".to_string(),
-                age: "1".to_string(),
-            })
-            .await;
-        let snuffy = trx
-            .create(&Pet {
-                name: "Snuffy".to_string(),
-                age: "2".to_string(),
-            })
-            .await;
-        let jasper = trx
-            .create(&Pet {
-                name: "Jasper".to_string(),
-                age: "6".to_string(),
-            })
-            .await;
+        let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await;
+        let snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await;
+        let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await;
 
         let read = (rex.read(), snuffy.read(), jasper.read());
         trx.commit().await?;
         read
     };
 
-    info!(
-        "rex: {}, snuffy: {}, jasper: {}",
-        rex.record_inner(),
-        snuffy.record_inner(),
-        jasper.record_inner()
-    );
+    info!("rex: {}, snuffy: {}, jasper: {}", rex.record_inner(), snuffy.record_inner(), jasper.record_inner());
 
     // Set up subscription on node2
     let (watcher, check_node2) = common::changeset_watcher::<PetRecord>();
-    let _handle = node2
-        .subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher)
-        .await?;
+    let _handle = node2.subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher).await?;
 
     // Initial state should include Rex
     assert_eq!(check_node2(), vec![(rex.id(), ChangeKind::Initial)]);
@@ -164,9 +106,7 @@ async fn inter_node_subscription() -> Result<()> {
 #[tokio::test]
 async fn test_client_server_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
-    let server = Arc::new(Node::new_durable(Arc::new(
-        SledStorageEngine::new_test().unwrap(),
-    )));
+    let server = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
     let client_a = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
     let client_b = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
@@ -177,11 +117,7 @@ async fn test_client_server_propagation() -> Result<()> {
     // Create a record on client_a
     {
         let trx = client_a.begin();
-        trx.create(&Album {
-            name: "Origin of Symmetry".into(),
-            year: "2001".into(),
-        })
-        .await;
+        trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
         trx.commit().await?;
     }
 
@@ -204,9 +140,7 @@ async fn test_client_server_propagation() -> Result<()> {
 #[tokio::test]
 async fn test_client_server_subscription_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
-    let server = Arc::new(Node::new_durable(Arc::new(
-        SledStorageEngine::new_test().unwrap(),
-    )));
+    let server = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
     let client_a = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
     let client_b = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
 
@@ -219,22 +153,13 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     let (client_b_watcher, check_client_b) = common::changeset_watcher::<AlbumRecord>();
 
     // Set up subscriptions
-    let _server_sub = server
-        .subscribe("name = 'Origin of Symmetry'", server_watcher)
-        .await?;
-    let _client_b_sub = client_b
-        .subscribe("name = 'Origin of Symmetry'", client_b_watcher)
-        .await?;
+    let _server_sub = server.subscribe("name = 'Origin of Symmetry'", server_watcher).await?;
+    let _client_b_sub = client_b.subscribe("name = 'Origin of Symmetry'", client_b_watcher).await?;
 
     // Create a record on client_a
     let album_id = {
         let trx = client_a.begin();
-        let album = trx
-            .create(&Album {
-                name: "Origin of Symmetry".into(),
-                year: "2001".into(),
-            })
-            .await;
+        let album = trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
         let id = album.id();
         trx.commit().await?;
         id

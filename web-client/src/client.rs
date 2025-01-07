@@ -67,18 +67,11 @@ impl WebsocketClient {
             //     }
         });
 
-        Ok(WebsocketClient {
-            inner,
-            _owner: owner,
-        })
+        Ok(WebsocketClient { inner, _owner: owner })
     }
 
-    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> {
-        self.inner.state.read_only()
-    }
-    pub fn node(&self) -> Arc<Node> {
-        self.inner.node.clone()
-    }
+    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.inner.state.read_only() }
+    pub fn node(&self) -> Arc<Node> { self.inner.node.clone() }
 }
 
 #[wasm_bindgen]
@@ -150,10 +143,7 @@ impl Inner {
                     let connection = connection.clone();
                     spawn_local(async move {
                         info!("Effect 2.3");
-                        self_clone
-                            .node
-                            .register_peer(presence, Box::new(connection))
-                            .await;
+                        self_clone.node.register_peer(presence, Box::new(connection)).await;
                     });
                 }
             });
@@ -161,9 +151,7 @@ impl Inner {
 
         *self.connection.borrow_mut() = Some((connection, owner));
 
-        self.state.set(ConnectionState::Connecting {
-            url: self.server_url.clone(),
-        });
+        self.state.set(ConnectionState::Connecting { url: self.server_url.clone() });
 
         info!("Connecting to websocket");
         Ok(())

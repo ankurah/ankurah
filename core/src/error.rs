@@ -26,29 +26,19 @@ pub enum RetrievalError {
 }
 
 impl RetrievalError {
-    pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self {
-        RetrievalError::StorageError(Box::new(err))
-    }
+    pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::StorageError(Box::new(err)) }
 
-    pub fn future_join(err: impl std::error::Error + Send + Sync + 'static) -> Self {
-        RetrievalError::FutureJoin(Box::new(err))
-    }
+    pub fn future_join(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::FutureJoin(Box::new(err)) }
 }
 
 impl From<bincode::Error> for RetrievalError {
-    fn from(e: bincode::Error) -> Self {
-        RetrievalError::DeserializationError(e)
-    }
+    fn from(e: bincode::Error) -> Self { RetrievalError::DeserializationError(e) }
 }
 
 impl From<ankql::selection::filter::Error> for RetrievalError {
-    fn from(err: ankql::selection::filter::Error) -> Self {
-        RetrievalError::AnkqlFilter(err)
-    }
+    fn from(err: ankql::selection::filter::Error) -> Self { RetrievalError::AnkqlFilter(err) }
 }
 
 impl From<anyhow::Error> for RetrievalError {
-    fn from(err: anyhow::Error) -> Self {
-        RetrievalError::Anyhow(err)
-    }
+    fn from(err: anyhow::Error) -> Self { RetrievalError::Anyhow(err) }
 }

@@ -33,10 +33,7 @@ pub struct FetchArgs {
 impl TryInto<FetchArgs> for &str {
     type Error = ankql::error::ParseError;
     fn try_into(self) -> Result<FetchArgs, Self::Error> {
-        Ok(FetchArgs {
-            predicate: ankql::parser::parse_selection(self)?,
-            cached: false,
-        })
+        Ok(FetchArgs { predicate: ankql::parser::parse_selection(self)?, cached: false })
     }
 }
 
@@ -57,8 +54,7 @@ pub struct Node {
     records: Arc<RwLock<NodeRecords>>,
     // peer_connections: Vec<PeerConnection>,
     peer_connections: tokio::sync::RwLock<BTreeMap<proto::NodeId, PeerState>>,
-    pending_requests:
-        tokio::sync::RwLock<BTreeMap<proto::RequestId, oneshot::Sender<proto::NodeResponseBody>>>,
+    pending_requests: tokio::sync::RwLock<BTreeMap<proto::RequestId, oneshot::Sender<proto::NodeResponseBody>>>,
 
     /// The reactor for handling subscriptions
     reactor: Arc<Reactor>,
@@ -96,14 +92,7 @@ impl Node {
 
     pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         let mut peer_connections = self.peer_connections.write().await;
-        peer_connections.insert(
-            presence.node_id,
-            PeerState {
-                sender,
-                durable: presence.durable,
-                subscriptions: BTreeMap::new(),
-            },
-        );
+        peer_connections.insert(presence.node_id, PeerState { sender, durable: presence.durable, subscriptions: BTreeMap::new() });
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
     pub async fn deregister_peer(&self, node_id: proto::NodeId) {
@@ -111,58 +100,34 @@ impl Node {
         peer_connections.remove(&node_id);
     }
 
-    pub async fn request(
-        &self,
-        node_id: proto::NodeId,
-        request_body: proto::NodeRequestBody,
-    ) -> anyhow::Result<proto::NodeResponseBody> {
+    pub async fn request(&self, node_id: proto::NodeId, request_body: proto::NodeRequestBody) -> anyhow::Result<proto::NodeResponseBody> {
         let (response_tx, response_rx) = oneshot::channel::<proto::NodeResponseBody>();
         let request_id = proto::RequestId::new();
 
         // Store the response channel
-        self.pending_requests
-            .write()
-            .await
-            .insert(request_id.clone(), response_tx);
+        self.pending_requests.write().await.insert(request_id.clone(), response_tx);
 
-        let request = proto::NodeRequest {
-            id: request_id,
-            to: node_id.clone(),
-            from: self.id.clone(),
-            body: request_body,
-        };
+        let request = proto::NodeRequest { id: request_id, to: node_id.clone(), from: self.id.clone(), body: request_body };
 
         {
             // Get the peer connection
 
             let peer_connections = self.peer_connections.read().await;
-            let connection = peer_connections
-                .get(&node_id)
-                .ok_or_else(|| anyhow!("No connection to peer"))?
-                .sender
-                .cloned();
+            let connection = peer_connections.get(&node_id).ok_or_else(|| anyhow!("No connection to peer"))?.sender.cloned();
 
             drop(peer_connections);
 
             // Send the request
-            connection
-                .send_message(proto::PeerMessage::Request(request))
-                .await
-                .map_err(|_| anyhow!("Failed to send request"))?;
+            connection.send_message(proto::PeerMessage::Request(request)).await.map_err(|_| anyhow!("Failed to send request"))?;
         }
 
         // Wait for response
-        let response = response_rx
-            .await
-            .map_err(|_| anyhow!("Failed to receive response"))?;
+        let response = response_rx.await.map_err(|_| anyhow!("Failed to receive response"))?;
 
         Ok(response)
     }
 
-    pub async fn handle_message(
-        self: &Arc<Self>,
-        message: proto::PeerMessage,
-    ) -> anyhow::Result<()> {
+    pub async fn handle_message(self: &Arc<Self>, message: proto::PeerMessage) -> anyhow::Result<()> {
         match message {
             proto::PeerMessage::Request(request) => {
                 info!("{} {request}", self.id);
@@ -174,17 +139,12 @@ impl Node {
                 // double check to make sure we have a connection to the peer based on the node id
                 if let Some(sender) = {
                     let peer_connections = self.peer_connections.read().await;
-                    peer_connections
-                        .get(&request.from)
-                        .map(|c| c.sender.cloned())
+                    peer_connections.get(&request.from).map(|c| c.sender.cloned())
                 } {
                     let from = request.from.clone();
                     let request_id = request.id.clone();
                     if request.to != self.id {
-                        warn!(
-                            "{} received message from {} but is not the intended recipient",
-                            self.id, request.from
-                        );
+                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
                     }
 
                     let body = match self.handle_request(request).await {
@@ -204,24 +164,15 @@ impl Node {
             }
             proto::PeerMessage::Response(response) => {
                 info!("{} {response}", self.id);
-                if let Some(tx) = self
-                    .pending_requests
-                    .write()
-                    .await
-                    .remove(&response.request_id)
-                {
-                    tx.send(response.body)
-                        .map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                if let Some(tx) = self.pending_requests.write().await.remove(&response.request_id) {
+                    tx.send(response.body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
         }
         Ok(())
     }
 
-    async fn handle_request(
-        self: &Arc<Self>,
-        request: proto::NodeRequest,
-    ) -> anyhow::Result<proto::NodeResponseBody> {
+    async fn handle_request(self: &Arc<Self>, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
         match request.body {
             proto::NodeRequestBody::CommitEvents(events) => {
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
@@ -232,24 +183,12 @@ impl Node {
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::FetchRecords {
-                collection: bucket_name,
-                predicate,
-            } => {
-                let states: Vec<_> = self
-                    .storage_engine
-                    .fetch_states(bucket_name, &predicate)
-                    .await?
-                    .into_iter()
-                    .collect();
+            proto::NodeRequestBody::FetchRecords { collection: bucket_name, predicate } => {
+                let states: Vec<_> = self.storage_engine.fetch_states(bucket_name, &predicate).await?.into_iter().collect();
                 Ok(proto::NodeResponseBody::Fetch(states))
             }
-            proto::NodeRequestBody::Subscribe {
-                collection: bucket_name,
-                predicate,
-            } => {
-                self.handle_subscribe_request(request.from, bucket_name, predicate)
-                    .await
+            proto::NodeRequestBody::Subscribe { collection: bucket_name, predicate } => {
+                self.handle_subscribe_request(request.from, bucket_name, predicate).await
             }
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
                 // Remove and drop the subscription handle
@@ -269,10 +208,7 @@ impl Node {
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
         // First fetch initial state
-        let states = self
-            .storage_engine
-            .fetch_states(bucket_name.clone(), &predicate)
-            .await?;
+        let states = self.storage_engine.fetch_states(bucket_name.clone(), &predicate).await?;
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
@@ -285,15 +221,9 @@ impl Node {
                         .changes
                         .iter()
                         .flat_map(|change| match change {
-                            ItemChange::Add {
-                                events: updates, ..
-                            }
-                            | ItemChange::Update {
-                                events: updates, ..
-                            }
-                            | ItemChange::Remove {
-                                events: updates, ..
-                            } => &updates[..],
+                            ItemChange::Add { events: updates, .. }
+                            | ItemChange::Update { events: updates, .. }
+                            | ItemChange::Remove { events: updates, .. } => &updates[..],
                             ItemChange::Initial { .. } => &[],
                         })
                         .cloned()
@@ -303,9 +233,7 @@ impl Node {
                         let node = node.clone();
                         let peer_id = peer_id.clone();
                         tokio::spawn(async move {
-                            let _ = node
-                                .request(peer_id, proto::NodeRequestBody::CommitEvents(events))
-                                .await;
+                            let _ = node.request(peer_id, proto::NodeRequestBody::CommitEvents(events)).await;
                         });
                     }
                 })
@@ -316,17 +244,10 @@ impl Node {
         // Store the subscription handle
         let mut peer_connections = self.peer_connections.write().await;
         if let Some(peer_state) = peer_connections.get_mut(&peer_id) {
-            peer_state
-                .subscriptions
-                .entry(handle.id)
-                .or_insert_with(Vec::new)
-                .push(handle);
+            peer_state.subscriptions.entry(handle.id).or_insert_with(Vec::new).push(handle);
         }
 
-        Ok(proto::NodeResponseBody::Subscribe {
-            initial: states,
-            subscription_id,
-        })
+        Ok(proto::NodeResponseBody::Subscribe { initial: states, subscription_id })
     }
 
     pub async fn bucket(&self, name: &str) -> Bucket {
@@ -339,24 +260,18 @@ impl Node {
         let collection = Bucket::new(self.storage_engine.bucket(name).await.unwrap());
 
         let mut collections = self.collections.write().await;
-        assert!(collections
-            .insert(name.to_string(), collection.clone())
-            .is_none());
+        assert!(collections.insert(name.to_string(), collection.clone()).is_none());
         drop(collections);
 
         collection
     }
 
-    pub fn next_record_id(&self) -> proto::ID {
-        proto::ID::new()
-    }
+    pub fn next_record_id(&self) -> proto::ID { proto::ID::new() }
 
     /// Begin a transaction.
     ///
     /// This is the main way to edit records.
-    pub fn begin(self: &Arc<Self>) -> Transaction {
-        Transaction::new(self.clone())
-    }
+    pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(self.clone()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
@@ -369,34 +284,22 @@ impl Node {
     //     Ok(result)
     // }
 
-    pub async fn commit_events_local(
-        self: &Arc<Self>,
-        events: &Vec<proto::RecordEvent>,
-    ) -> anyhow::Result<()> {
+    pub async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::RecordEvent>) -> anyhow::Result<()> {
         let mut changes = Vec::new();
 
         // First apply events locally
         for record_event in events {
             // Apply record events to the Node's global records first.
-            let record = self
-                .fetch_record_inner(record_event.record_id, &record_event.bucket_name)
-                .await?;
+            let record = self.fetch_record_inner(record_event.record_id, &record_event.bucket_name).await?;
 
             record.apply_record_event(record_event)?;
 
             let record_state = record.to_record_state()?;
             // Push the state buffers to storage.
-            let changed = self
-                .bucket(record_event.bucket_name())
-                .await
-                .set_record(record_event.record_id, &record_state)
-                .await?;
+            let changed = self.bucket(record_event.bucket_name()).await.set_record(record_event.record_id, &record_state).await?;
 
             if changed {
-                changes.push(EntityChange {
-                    record: record.clone(),
-                    events: vec![record_event.clone()],
-                });
+                changes.push(EntityChange { record: record.clone(), events: vec![record_event.clone()] });
             }
         }
         self.reactor.notify_change(changes);
@@ -490,29 +393,16 @@ impl Node {
     // }
 
     /// Apply events to local state buffer and broadcast to peers.
-    pub async fn commit_events(
-        self: &Arc<Self>,
-        events: &Vec<proto::RecordEvent>,
-    ) -> anyhow::Result<()> {
+    pub async fn commit_events(self: &Arc<Self>, events: &Vec<proto::RecordEvent>) -> anyhow::Result<()> {
         self.commit_events_local(events).await?;
 
         // Then propagate to all peers
         let mut futures = Vec::new();
-        let peer_ids = {
-            self.peer_connections
-                .read()
-                .await
-                .iter()
-                .map(|(peer_id, _)| peer_id.clone())
-                .collect::<Vec<_>>()
-        };
+        let peer_ids = { self.peer_connections.read().await.iter().map(|(peer_id, _)| peer_id.clone()).collect::<Vec<_>>() };
 
         // Send commit request to all peers
         for peer_id in peer_ids {
-            futures.push(self.request(
-                peer_id.clone(),
-                proto::NodeRequestBody::CommitEvents(events.to_vec()),
-            ));
+            futures.push(self.request(peer_id.clone(), proto::NodeRequestBody::CommitEvents(events.to_vec())));
         }
 
         // // Wait for all peers to confirm
@@ -533,16 +423,8 @@ impl Node {
     /// so when they hand out read records, they have to work immediately.
     /// TODO: Discuss. The upside is that you can call .read() on a ScopedRecord. The downside is that the behavior is inconsistent
     /// between newly created records and records that are created in a transaction scope.
-    pub(crate) async fn insert_record(
-        self: &Arc<Self>,
-        record: Arc<RecordInner>,
-    ) -> anyhow::Result<()> {
-        match self
-            .records
-            .write()
-            .await
-            .entry((record.id, record.bucket_name.clone()))
-        {
+    pub(crate) async fn insert_record(self: &Arc<Self>, record: Arc<RecordInner>) -> anyhow::Result<()> {
+        match self.records.write().await.entry((record.id, record.bucket_name.clone())) {
             Entry::Vacant(entry) => {
                 entry.insert(Arc::downgrade(&record));
                 Ok(())
@@ -582,11 +464,7 @@ impl Node {
         }
     }
 
-    pub(crate) async fn fetch_record_from_node(
-        &self,
-        id: proto::ID,
-        bucket_name: &str,
-    ) -> Option<Arc<RecordInner>> {
+    pub(crate) async fn fetch_record_from_node(&self, id: proto::ID, bucket_name: &str) -> Option<Arc<RecordInner>> {
         let records = self.records.read().await;
         if let Some(record) = records.get(&(id, bucket_name.to_string())) {
             record.upgrade()
@@ -615,11 +493,7 @@ impl Node {
     // }
 
     /// Fetch a record.
-    pub async fn fetch_record_inner(
-        &self,
-        id: proto::ID,
-        bucket_name: &str,
-    ) -> Result<Arc<RecordInner>, RetrievalError> {
+    pub async fn fetch_record_inner(&self, id: proto::ID, bucket_name: &str) -> Result<Arc<RecordInner>, RetrievalError> {
         debug!("fetch_record {:?}-{:?}", id, bucket_name);
 
         if let Some(local) = self.fetch_record_from_node(id, bucket_name).await {
@@ -636,9 +510,7 @@ impl Node {
                 // let scoped_record = RecordInner::new(id, bucket_name.to_string());
                 // let ref_record = Arc::new(scoped_record);
                 // Revisit this
-                let record = self
-                    .assert_record(bucket_name, id, &proto::RecordState::default())
-                    .await?;
+                let record = self.assert_record(bucket_name, id, &proto::RecordState::default()).await?;
                 Ok(record)
             }
             Err(e) => Err(e),
@@ -672,10 +544,7 @@ impl Node {
         match self
             .request(
                 peer_id.clone(),
-                proto::NodeRequestBody::FetchRecords {
-                    collection: collection_name.to_string(),
-                    predicate: predicate.clone(),
-                },
+                proto::NodeRequestBody::FetchRecords { collection: collection_name.to_string(), predicate: predicate.clone() },
             )
             .await
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
@@ -685,11 +554,7 @@ impl Node {
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for (id, state) in states {
-                    raw_bucket
-                        .0
-                        .set_record(id, &state)
-                        .await
-                        .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    raw_bucket.0.set_record(id, &state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
             }
@@ -699,20 +564,13 @@ impl Node {
             }
             _ => {
                 debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other(
-                    "Unexpected response type".to_string(),
-                ))
+                Err(RetrievalError::Other("Unexpected response type".to_string()))
             }
         }
     }
 
-    pub async fn fetch<R: Record>(
-        self: &Arc<Self>,
-        args: impl TryInto<FetchArgs>,
-    ) -> anyhow::Result<ResultSet<R>> {
-        let args = args
-            .try_into()
-            .map_err(|_| anyhow!("Failed to parse predicate:"))?;
+    pub async fn fetch<R: Record>(self: &Arc<Self>, args: impl TryInto<FetchArgs>) -> anyhow::Result<ResultSet<R>> {
+        let args = args.try_into().map_err(|_| anyhow!("Failed to parse predicate:"))?;
 
         let predicate = args.predicate;
 
@@ -731,10 +589,7 @@ impl Node {
         }
 
         // Fetch raw states from storage
-        let states = self
-            .storage_engine
-            .fetch_states(collection_name.to_string(), &predicate)
-            .await?;
+        let states = self.storage_engine.fetch_states(collection_name.to_string(), &predicate).await?;
 
         // Convert states to records
         let mut records = Vec::new();
@@ -747,11 +602,7 @@ impl Node {
     }
 
     /// Subscribe to changes in records matching a predicate
-    pub async fn subscribe<F, P, R>(
-        self: &Arc<Self>,
-        predicate: P,
-        callback: F,
-    ) -> anyhow::Result<crate::subscription::SubscriptionHandle>
+    pub async fn subscribe<F, P, R>(self: &Arc<Self>, predicate: P, callback: F) -> anyhow::Result<crate::subscription::SubscriptionHandle>
     where
         F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
         P: TryInto<ankql::ast::Predicate>,
@@ -760,42 +611,25 @@ impl Node {
     {
         use crate::model::Model;
         let bucket_name = R::Model::bucket_name();
-        let predicate = predicate
-            .try_into()
-            .map_err(|_e| anyhow!("Failed to parse predicate:"))?;
+        let predicate = predicate.try_into().map_err(|_e| anyhow!("Failed to parse predicate:"))?;
 
         // First, find any durable nodes to subscribe to
         let durable_peer_id = {
             let peer_connections = self.peer_connections.read().await;
-            peer_connections
-                .iter()
-                .find(|(_, state)| state.durable)
-                .map(|(id, _)| id.clone())
+            peer_connections.iter().find(|(_, state)| state.durable).map(|(id, _)| id.clone())
         };
 
         // If we have a durable node, send a subscription request to it
         if let Some(peer_id) = durable_peer_id {
             match self
-                .request(
-                    peer_id,
-                    proto::NodeRequestBody::Subscribe {
-                        collection: bucket_name.to_string(),
-                        predicate: predicate.clone(),
-                    },
-                )
+                .request(peer_id, proto::NodeRequestBody::Subscribe { collection: bucket_name.to_string(), predicate: predicate.clone() })
                 .await?
             {
-                proto::NodeResponseBody::Subscribe {
-                    initial,
-                    subscription_id: _,
-                } => {
+                proto::NodeResponseBody::Subscribe { initial, subscription_id: _ } => {
                     // Apply initial states to our storage
                     let raw_bucket = self.bucket(bucket_name).await;
                     for (id, state) in initial {
-                        raw_bucket
-                            .set_record(id, &state)
-                            .await
-                            .map_err(|e| anyhow!("Failed to set record: {:?}", e))?;
+                        raw_bucket.set_record(id, &state).await.map_err(|e| anyhow!("Failed to set record: {:?}", e))?;
                     }
                 }
                 proto::NodeResponseBody::Error(e) => {

@@ -15,9 +15,7 @@ use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 impl From<&str> for FieldId {
-    fn from(val: &str) -> Self {
-        FieldId(val.to_string())
-    }
+    fn from(val: &str) -> Self { FieldId(val.to_string()) }
 }
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of records
@@ -36,12 +34,7 @@ pub struct Reactor {
 
 impl Reactor {
     pub fn new(storage: Arc<dyn StorageEngine>) -> Arc<Self> {
-        Arc::new(Self {
-            subscriptions: DashMap::new(),
-            index_watchers: DashMap::new(),
-            record_watchers: DashMap::new(),
-            storage,
-        })
+        Arc::new(Self { subscriptions: DashMap::new(), index_watchers: DashMap::new(), record_watchers: DashMap::new(), storage })
     }
 
     pub async fn subscribe<F>(
@@ -59,10 +52,7 @@ impl Reactor {
         self.add_index_watchers(sub_id, &predicate);
 
         // Find initial matching records
-        let states = self
-            .storage
-            .fetch_states(bucket_name.to_string(), &predicate)
-            .await?;
+        let states = self.storage.fetch_states(bucket_name.to_string(), &predicate).await?;
         let mut matching_records = Vec::new();
 
         // Convert states to RecordInner and filter by predicate
@@ -75,10 +65,7 @@ impl Reactor {
                 matching_records.push(record.clone());
 
                 // Set up record watchers
-                self.record_watchers
-                    .entry(record.id())
-                    .or_default()
-                    .push(sub_id);
+                self.record_watchers.entry(record.id()).or_default().push(sub_id);
             }
         }
 
@@ -96,15 +83,8 @@ impl Reactor {
         // Call callback with initial state
         if !matching_records.is_empty() {
             (subscription.callback)(ChangeSet {
-                changes: matching_records
-                    .iter()
-                    .map(|record| ItemChange::Initial {
-                        record: record.clone(),
-                    })
-                    .collect(),
-                resultset: ResultSet {
-                    records: matching_records.clone(),
-                },
+                changes: matching_records.iter().map(|record| ItemChange::Initial { record: record.clone() }).collect(),
+                resultset: ResultSet { records: matching_records.clone() },
             });
         }
 
@@ -112,23 +92,12 @@ impl Reactor {
     }
 
     fn recurse_predicate<F>(&self, predicate: &ast::Predicate, f: F)
-    where
-        F: Fn(
-                dashmap::Entry<FieldId, ComparisonIndex>,
-                FieldId,
-                &ast::Literal,
-                &ast::ComparisonOperator,
-            ) + Copy,
-    {
+    where F: Fn(dashmap::Entry<FieldId, ComparisonIndex>, FieldId, &ast::Literal, &ast::ComparisonOperator) + Copy {
         use ankql::ast::{Expr, Identifier, Predicate};
         match predicate {
-            Predicate::Comparison {
-                left,
-                operator,
-                right,
-            } => {
-                if let (Expr::Identifier(field), Expr::Literal(literal))
-                | (Expr::Literal(literal), Expr::Identifier(field)) = (&**left, &**right)
+            Predicate::Comparison { left, operator, right } => {
+                if let (Expr::Identifier(field), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Identifier(field)) =
+                    (&**left, &**right)
                 {
                     let field_name = match field {
                         Identifier::Property(name) => name.clone(),
@@ -155,19 +124,14 @@ impl Reactor {
 
     fn add_index_watchers(&self, sub_id: proto::SubscriptionId, predicate: &ast::Predicate) {
         self.recurse_predicate(predicate, |entry, _field_id, literal, operator| {
-            entry
-                .or_default()
-                .add((*literal).clone(), operator.clone(), sub_id);
+            entry.or_default().add((*literal).clone(), operator.clone(), sub_id);
         });
     }
 
     fn remove_index_watchers(&self, sub_id: proto::SubscriptionId, predicate: &ast::Predicate) {
         self.recurse_predicate(
             predicate,
-            |entry: dashmap::Entry<FieldId, ComparisonIndex>,
-             _field_id,
-             literal: &ast::Literal,
-             operator| {
+            |entry: dashmap::Entry<FieldId, ComparisonIndex>, _field_id, literal: &ast::Literal, operator| {
                 if let dashmap::Entry::Occupied(mut index) = entry {
                     let literal = (*literal).clone();
                     index.get_mut().remove(literal, operator.clone(), sub_id);
@@ -193,12 +157,7 @@ impl Reactor {
     }
 
     /// Update record watchers when a record's matching status changes
-    fn update_record_watchers(
-        &self,
-        record: &Arc<crate::model::RecordInner>,
-        matching: bool,
-        sub_id: proto::SubscriptionId,
-    ) {
+    fn update_record_watchers(&self, record: &Arc<crate::model::RecordInner>, matching: bool, sub_id: proto::SubscriptionId) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
             let mut records = subscription.matching_records.lock().unwrap();
             let mut watchers = self.record_watchers.entry(record.id()).or_default();
@@ -223,10 +182,8 @@ impl Reactor {
     /// Notify subscriptions about a record change
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
         // Group changes by subscription
-        let mut sub_changes: std::collections::HashMap<
-            proto::SubscriptionId,
-            Vec<ItemChange<Arc<RecordInner>>>,
-        > = std::collections::HashMap::new();
+        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Arc<RecordInner>>>> =
+            std::collections::HashMap::new();
 
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
@@ -235,8 +192,7 @@ impl Reactor {
             for index_ref in self.index_watchers.iter() {
                 // Get the field value from the record
                 if let Some(field_value) = change.record.value(&index_ref.key().0) {
-                    possibly_interested_subs
-                        .extend(index_ref.find_matching(Value::String(field_value)));
+                    possibly_interested_subs.extend(index_ref.find_matching(Value::String(field_value)));
                 }
             }
 
@@ -245,18 +201,9 @@ impl Reactor {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
                     let record = &change.record;
                     // Use evaluate_predicate directly on the record instead of fetch_records
-                    let matches = ankql::selection::filter::evaluate_predicate(
-                        &**record,
-                        &subscription.predicate,
-                    )
-                    .unwrap_or(false);
+                    let matches = ankql::selection::filter::evaluate_predicate(&**record, &subscription.predicate).unwrap_or(false);
 
-                    let did_match = subscription
-                        .matching_records
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|r| r.id() == record.id());
+                    let did_match = subscription.matching_records.lock().unwrap().iter().any(|r| r.id() == record.id());
 
                     // Update record watchers and notify subscription if needed
                     self.update_record_watchers(record, matches, sub_id);
@@ -270,22 +217,13 @@ impl Reactor {
                     let new_change: Option<ItemChange<Arc<RecordInner>>> = if matches != did_match {
                         // Matching status changed
                         Some(if matches {
-                            ItemChange::Add {
-                                record: record.clone(),
-                                events: change.events.clone(),
-                            }
+                            ItemChange::Add { record: record.clone(), events: change.events.clone() }
                         } else {
-                            ItemChange::Remove {
-                                record: record.clone(),
-                                events: change.events.clone(),
-                            }
+                            ItemChange::Remove { record: record.clone(), events: change.events.clone() }
                         })
                     } else if matches {
                         // Record still matches but was updated
-                        Some(ItemChange::Update {
-                            record: record.clone(),
-                            events: change.events.clone(),
-                        })
+                        Some(ItemChange::Update { record: record.clone(), events: change.events.clone() })
                     } else {
                         // Record didn't match before and still doesn't match
                         None
@@ -303,9 +241,7 @@ impl Reactor {
         for (sub_id, changes) in sub_changes {
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
                 (subscription.callback)(ChangeSet {
-                    resultset: ResultSet {
-                        records: subscription.matching_records.lock().unwrap().clone(),
-                    },
+                    resultset: ResultSet { records: subscription.matching_records.lock().unwrap().clone() },
                     changes,
                 });
             }

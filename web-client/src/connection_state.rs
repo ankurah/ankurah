@@ -8,31 +8,20 @@ use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, strum::Display)]
 pub enum ConnectionState {
     None,
-    Connecting {
-        url: String,
-    },
-    Connected {
-        url: String,
-        presence: proto::Presence,
-    },
+    Connecting { url: String },
+    Connected { url: String, presence: proto::Presence },
     Closed,
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 // TODO make a WasmEnum macro to generate this:
 
 impl From<ConnectionState> for ConnectionStateEnum {
-    fn from(val: ConnectionState) -> Self {
-        ConnectionStateEnum(val)
-    }
+    fn from(val: ConnectionState) -> Self { ConnectionStateEnum(val) }
 }
 impl std::ops::Deref for ConnectionStateEnum {
     type Target = ConnectionState;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 #[wasm_bindgen]

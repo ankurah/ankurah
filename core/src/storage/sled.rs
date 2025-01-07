@@ -21,9 +21,7 @@ pub struct SledStorageEngine {
 
 impl SledStorageEngine {
     pub fn with_homedir_folder(folder_name: &str) -> anyhow::Result<Self> {
-        let dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get home directory"))?
-            .join(folder_name);
+        let dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Failed to get home directory"))?.join(folder_name);
 
         Self::with_path(dir)
     }
@@ -36,16 +34,10 @@ impl SledStorageEngine {
     }
 
     // Open the storage engine without any specific column families
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_homedir_folder(".ankurah")
-    }
+    pub fn new() -> anyhow::Result<Self> { Self::with_homedir_folder(".ankurah") }
 
     pub fn new_test() -> anyhow::Result<Self> {
-        let db = Config::new()
-            .temporary(true)
-            .flush_every_ms(None)
-            .open()
-            .unwrap();
+        let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
 
         Ok(Self { db })
     }
@@ -63,11 +55,7 @@ impl StorageEngine for SledStorageEngine {
         Ok(Arc::new(SledStorageBucket { tree }))
     }
 
-    async fn fetch_states(
-        &self,
-        bucket_name: String,
-        predicate: &ankql::ast::Predicate,
-    ) -> Result<Vec<(ID, RecordState)>, RetrievalError> {
+    async fn fetch_states(&self, bucket_name: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, RecordState)>, RetrievalError> {
         let tree = self.db.open_tree(&bucket_name)?;
         let bucket = SledStorageBucket { tree };
 
@@ -82,19 +70,11 @@ impl StorageEngine for SledStorageEngine {
             // For now, do a full table scan
             for item in bucket.tree.iter() {
                 let (key_bytes, value_bytes) = item?;
-                let id = ID::from_ulid(ulid::Ulid::from_bytes(
-                    key_bytes
-                        .as_ref()
-                        .try_into()
-                        .map_err(RetrievalError::storage)?,
-                ));
+                let id = ID::from_ulid(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into().map_err(RetrievalError::storage)?));
 
                 // Skip if we've already seen this ID
                 if seen_ids.contains(&id) {
-                    println!(
-                        "SledStorageEngine: Skipping duplicate record with ID: {:?}",
-                        id
-                    );
+                    println!("SledStorageEngine: Skipping duplicate record with ID: {:?}", id);
                     continue;
                 }
 
@@ -146,11 +126,9 @@ impl StorageBucket for SledStorageBucket {
         let id_bytes = id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
-        let result = task::spawn_blocking(move || -> Result<Option<sled::IVec>, sled::Error> {
-            tree.get(id_bytes)
-        })
-        .await
-        .map_err(|e| RetrievalError::StorageError(Box::new(e)))?;
+        let result = task::spawn_blocking(move || -> Result<Option<sled::IVec>, sled::Error> { tree.get(id_bytes) })
+            .await
+            .map_err(|e| RetrievalError::StorageError(Box::new(e)))?;
 
         match result? {
             Some(ivec) => {
@@ -163,7 +141,5 @@ impl StorageBucket for SledStorageBucket {
 }
 
 impl From<sled::Error> for RetrievalError {
-    fn from(err: sled::Error) -> Self {
-        RetrievalError::StorageError(Box::new(err))
-    }
+    fn from(err: sled::Error) -> Self { RetrievalError::StorageError(Box::new(err)) }
 }

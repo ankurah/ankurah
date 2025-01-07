@@ -22,10 +22,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let field_active_values = fields
         .iter()
         .map(|f| {
-            let active_value = f
-                .attrs
-                .iter()
-                .find(|attr| attr.path().get_ident() == Some(&active_value_ident));
+            let active_value = f.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_value_ident));
             match active_value {
                 Some(active_value) => active_value.parse_args::<syn::Ident>().unwrap(),
                 // TODO: Better error, should include which field ident and an example on how to use.
@@ -45,10 +42,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             None => format_ident!("field_{}", index),
         })
         .collect::<Vec<_>>();
-    let field_name_strs = fields
-        .iter()
-        .map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase())
-        .collect::<Vec<_>>();
+    let field_name_strs = fields.iter().map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase()).collect::<Vec<_>>();
     let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
     /*let field_indices = fields
     .iter()

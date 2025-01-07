@@ -32,31 +32,14 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> &'static str {
 
 pub fn generate_selection_sql(predicate: &Predicate) -> String {
     match predicate {
-        Predicate::Comparison {
-            left,
-            operator,
-            right,
-        } => {
-            format!(
-                "{} {} {}",
-                generate_expr_sql(left),
-                comparison_op_to_sql(operator),
-                generate_expr_sql(right)
-            )
+        Predicate::Comparison { left, operator, right } => {
+            format!("{} {} {}", generate_expr_sql(left), comparison_op_to_sql(operator), generate_expr_sql(right))
         }
         Predicate::And(left, right) => {
-            format!(
-                "{} AND {}",
-                generate_selection_sql(left),
-                generate_selection_sql(right)
-            )
+            format!("{} AND {}", generate_selection_sql(left), generate_selection_sql(right))
         }
         Predicate::Or(left, right) => {
-            format!(
-                "({} OR {})",
-                generate_selection_sql(left),
-                generate_selection_sql(right)
-            )
+            format!("({} OR {})", generate_selection_sql(left), generate_selection_sql(right))
         }
         Predicate::Not(pred) => format!("NOT ({})", generate_selection_sql(pred)),
         Predicate::IsNull(expr) => format!("{} IS NULL", generate_expr_sql(expr)),
@@ -84,14 +67,9 @@ mod tests {
 
     #[test]
     fn test_complex_condition() {
-        let predicate =
-            parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'")
-                .unwrap();
+        let predicate = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
         let sql = generate_selection_sql(&predicate);
-        assert_eq!(
-            sql,
-            r#"("name" = 'Alice' OR "name" = 'Charlie') AND "age" >= '30' AND "age" <= '40'"#
-        );
+        assert_eq!(sql, r#"("name" = 'Alice' OR "name" = 'Charlie') AND "age" >= '30' AND "age" <= '40'"#);
     }
 
     #[test]

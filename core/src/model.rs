@@ -18,8 +18,7 @@ pub trait Model {
     type Record: Record;
     type ScopedRecord<'trx>: ScopedRecord<'trx>;
     fn bucket_name() -> &'static str
-    where
-        Self: Sized;
+    where Self: Sized;
     fn create_record(&self, id: proto::ID) -> RecordInner;
 }
 
@@ -27,15 +26,9 @@ pub trait Model {
 pub trait Record: Clone {
     type Model: Model;
     type ScopedRecord<'trx>: ScopedRecord<'trx>;
-    fn id(&self) -> proto::ID {
-        self.record_inner().id()
-    }
-    fn backends(&self) -> &Backends {
-        self.record_inner().backends()
-    }
-    fn bucket_name() -> &'static str {
-        <Self::Model as Model>::bucket_name()
-    }
+    fn id(&self) -> proto::ID { self.record_inner().id() }
+    fn backends(&self) -> &Backends { self.record_inner().backends() }
+    fn bucket_name() -> &'static str { <Self::Model as Model>::bucket_name() }
     fn to_model(&self) -> Self::Model;
     fn record_inner(&self) -> &Arc<RecordInner>;
     fn from_record_inner(inner: Arc<RecordInner>) -> Self;
@@ -43,13 +36,7 @@ pub trait Record: Clone {
 
 impl std::fmt::Display for RecordInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "RecordInner({}/{}) = {}",
-            self.bucket_name,
-            self.id,
-            self.head.lock().unwrap()
-        )
+        write!(f, "RecordInner({}/{}) = {}", self.bucket_name, self.id, self.head.lock().unwrap())
     }
 }
 
@@ -66,37 +53,19 @@ pub struct RecordInner {
 }
 
 impl RecordInner {
-    pub fn id(&self) -> proto::ID {
-        self.id
-    }
+    pub fn id(&self) -> proto::ID { self.id }
 
-    pub fn bucket_name(&self) -> &str {
-        &self.bucket_name
-    }
+    pub fn bucket_name(&self) -> &str { &self.bucket_name }
 
-    pub fn backends(&self) -> &Backends {
-        &self.backends
-    }
+    pub fn backends(&self) -> &Backends { &self.backends }
 
-    pub fn to_record_state(&self) -> Result<RecordState> {
-        self.backends.to_state_buffers()
-    }
+    pub fn to_record_state(&self) -> Result<RecordState> { self.backends.to_state_buffers() }
 
     // used by the Model macro
     pub fn create(id: proto::ID, bucket_name: &str, backends: Backends) -> Self {
-        Self {
-            id,
-            bucket_name: bucket_name.to_string(),
-            backends,
-            head: Arc::new(Mutex::new(Clock::default())),
-            upstream: None,
-        }
+        Self { id, bucket_name: bucket_name.to_string(), backends, head: Arc::new(Mutex::new(Clock::default())), upstream: None }
     }
-    pub fn from_record_state(
-        id: proto::ID,
-        bucket_name: &str,
-        record_state: &RecordState,
-    ) -> Result<Self, RetrievalError> {
+    pub fn from_record_state(id: proto::ID, bucket_name: &str, record_state: &RecordState) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(record_state)?;
 
         Ok(Self {
@@ -137,8 +106,7 @@ impl RecordInner {
 
     pub fn apply_record_event(&self, event: &RecordEvent) -> Result<()> {
         for (backend_name, operations) in &event.operations {
-            self.backends
-                .apply_operations((*backend_name).to_owned(), operations)?;
+            self.backends.apply_operations((*backend_name).to_owned(), operations)?;
         }
         info!("Apply record event {}", event);
         *self.head.lock().unwrap() = Clock::new([event.id]);
@@ -165,21 +133,14 @@ impl RecordInner {
 }
 
 impl Filterable for RecordInner {
-    fn collection(&self) -> &str {
-        self.bucket_name()
-    }
+    fn collection(&self) -> &str { self.bucket_name() }
 
     /// TODO Implement this as a typecasted value. eg value<T> -> Option<Result<T>>
     /// where None is returned if the property is not found, and Err is returned if the property is found but is not able to be typecasted
     /// to the requested type. (need to think about the rust type system here more)
     fn value(&self, name: &str) -> Option<String> {
         // Iterate through backends to find one that has this property
-        self.backends
-            .backends
-            .lock()
-            .unwrap()
-            .values()
-            .find_map(|backend| backend.get_property_value_string(name))
+        self.backends.backends.lock().unwrap().values().find_map(|backend| backend.get_property_value_string(name))
     }
 }
 
@@ -188,24 +149,15 @@ impl Filterable for RecordInner {
 pub trait ScopedRecord<'rec> {
     type Model: Model;
     type Record: Record;
-    fn id(&self) -> proto::ID {
-        self.record_inner().id
-    }
-    fn bucket_name() -> &'static str {
-        <Self::Model as Model>::bucket_name()
-    }
-    fn backends(&self) -> &Backends {
-        &self.record_inner().backends
-    }
+    fn id(&self) -> proto::ID { self.record_inner().id }
+    fn bucket_name() -> &'static str { <Self::Model as Model>::bucket_name() }
+    fn backends(&self) -> &Backends { &self.record_inner().backends }
 
     fn record_inner(&self) -> &Arc<RecordInner>;
     fn new(inner: &'rec Arc<RecordInner>) -> Self
-    where
-        Self: Sized;
+    where Self: Sized;
 
-    fn record_state(&self) -> anyhow::Result<RecordState> {
-        self.record_inner().to_record_state()
-    }
+    fn record_state(&self) -> anyhow::Result<RecordState> { self.record_inner().to_record_state() }
 
     // fn record_event(&self) -> anyhow::Result<Option<RecordEvent>> {
     //     self.record_inner().commit()

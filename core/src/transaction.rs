@@ -23,26 +23,11 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new(node: Arc<Node>) -> Self {
-        Self {
-            node,
-            records: AppendOnlyVec::new(),
-            implicit: true,
-            consumed: false,
-        }
-    }
+    pub fn new(node: Arc<Node>) -> Self { Self { node, records: AppendOnlyVec::new(), implicit: true, consumed: false } }
 
     /// Fetch a record already in the transaction.
-    pub async fn get_record(
-        &self,
-        id: ID,
-        bucket_name: &'static str,
-    ) -> Result<&Arc<RecordInner>, RetrievalError> {
-        if let Some(record) = self
-            .records
-            .iter()
-            .find(|record| record.id() == id && record.bucket_name() == bucket_name)
-        {
+    pub async fn get_record(&self, id: ID, bucket_name: &'static str) -> Result<&Arc<RecordInner>, RetrievalError> {
+        if let Some(record) = self.records.iter().find(|record| record.id() == id && record.bucket_name() == bucket_name) {
             return Ok(record);
         }
 
@@ -55,10 +40,7 @@ impl Transaction {
         &self.records[index]
     }
 
-    pub async fn create<'rec, 'trx: 'rec, M: Model>(
-        &'trx self,
-        model: &M,
-    ) -> M::ScopedRecord<'rec> {
+    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::ScopedRecord<'rec> {
         let id = self.node.next_record_id();
         let new_record = Arc::new(model.create_record(id));
         let record_ref = self.add_record(new_record);
@@ -76,9 +58,7 @@ impl Transaction {
     }
 
     #[must_use]
-    pub async fn commit(mut self) -> anyhow::Result<()> {
-        self.commit_mut_ref().await
-    }
+    pub async fn commit(mut self) -> anyhow::Result<()> { self.commit_mut_ref().await }
 
     #[must_use]
     // only because Drop is &mut self not mut self

@@ -57,11 +57,7 @@ impl Collatable for Value {
                 if f.is_nan() || (f.is_infinite() && *f > 0.0) {
                     None
                 } else {
-                    let bits = if *f >= 0.0 {
-                        f.to_bits() ^ (1 << 63)
-                    } else {
-                        !f.to_bits()
-                    };
+                    let bits = if *f >= 0.0 { f.to_bits() ^ (1 << 63) } else { !f.to_bits() };
                     let next_bits = bits + 1;
                     Some(next_bits.to_be_bytes().to_vec())
                 }
@@ -97,11 +93,7 @@ impl Collatable for Value {
                 if f.is_nan() || (f.is_infinite() && *f < 0.0) {
                     None
                 } else {
-                    let bits = if *f >= 0.0 {
-                        f.to_bits() ^ (1 << 63)
-                    } else {
-                        !f.to_bits()
-                    };
+                    let bits = if *f >= 0.0 { f.to_bits() ^ (1 << 63) } else { !f.to_bits() };
                     let prev_bits = bits - 1;
                     Some(prev_bits.to_be_bytes().to_vec())
                 }

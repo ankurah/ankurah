@@ -14,9 +14,7 @@ use tracing::info;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent,
-};
+use web_sys::{Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent};
 
 pub struct IndexedDBStorageEngine {
     // We need SendWrapper because despite the ability to declare an async trait as ?Send,
@@ -49,16 +47,13 @@ impl IndexedDBStorageEngine {
             .map_err(|e| anyhow::anyhow!("IndexedDB error: {:?}", e))?
             .ok_or_else(|| anyhow::anyhow!("IndexedDB not available"))?;
 
-        let open_request: IdbOpenDbRequest = idb
-            .open_with_u32(name, 1)
-            .map_err(|e| anyhow::anyhow!("Failed to open DB: {:?}", e))?;
+        let open_request: IdbOpenDbRequest = idb.open_with_u32(name, 1).map_err(|e| anyhow::anyhow!("Failed to open DB: {:?}", e))?;
 
         let mut callbacks: Vec<Box<dyn Any>> = Vec::new();
         let promise = js_sys::Promise::new(&mut |resolve: Function, reject: Function| {
             let onupgradeneeded = Closure::wrap(Box::new(move |event: IdbVersionChangeEvent| {
                 let target: IdbRequest = event.target().unwrap().unchecked_into();
-                let db: SendWrapper<IdbDatabase> =
-                    SendWrapper::new(target.result().unwrap().unchecked_into());
+                let db: SendWrapper<IdbDatabase> = SendWrapper::new(target.result().unwrap().unchecked_into());
 
                 // Create records store with index on collection
                 let store = match db.create_object_store("records") {
@@ -98,16 +93,10 @@ impl IndexedDBStorageEngine {
         });
 
         let db = SendWrapper::new(
-            JsFuture::from(promise)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to open database: {:?}", e))?
-                .unchecked_into::<IdbDatabase>(),
+            JsFuture::from(promise).await.map_err(|e| anyhow::anyhow!("Failed to open database: {:?}", e))?.unchecked_into::<IdbDatabase>(),
         );
 
-        Ok(Self {
-            db,
-            _callbacks: SendWrapper::new(callbacks),
-        })
+        Ok(Self { db, _callbacks: SendWrapper::new(callbacks) })
     }
 
     pub async fn cleanup(name: &str) -> anyhow::Result<()> {
@@ -117,16 +106,11 @@ impl IndexedDBStorageEngine {
             .map_err(|e| anyhow::anyhow!("IndexedDB error: {:?}", e))?
             .ok_or_else(|| anyhow::anyhow!("IndexedDB not available"))?;
 
-        let delete_request = idb
-            .delete_database(name)
-            .map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
+        let delete_request = idb.delete_database(name).map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
 
-        let future =
-            crate::cb_future::CBFuture::new(&delete_request, &["success", "blocked"], "error");
+        let future = crate::cb_future::CBFuture::new(&delete_request, &["success", "blocked"], "error");
 
-        future
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
+        future.await.map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
 
         Ok(())
     }
@@ -135,10 +119,7 @@ impl IndexedDBStorageEngine {
 #[async_trait]
 impl StorageEngine for IndexedDBStorageEngine {
     async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>> {
-        Ok(Arc::new(IndexedDBBucket {
-            db: self.db.clone(),
-            name: name.to_owned(),
-        }))
+        Ok(Arc::new(IndexedDBBucket { db: self.db.clone(), name: name.to_owned() }))
     }
 
     async fn fetch_states(
@@ -147,25 +128,16 @@ impl StorageEngine for IndexedDBStorageEngine {
         predicate: &ankql::ast::Predicate,
     ) -> Result<Vec<(proto::ID, proto::RecordState)>, RetrievalError> {
         SendWrapper::new(async move {
-            let transaction = self
-                .db
-                .transaction_with_str("records")
-                .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+            let transaction = self.db.transaction_with_str("records").map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
 
-            let store = transaction
-                .object_store("records")
-                .map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+            let store = transaction.object_store("records").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
 
-            let index = store
-                .index("by_collection")
-                .map_err(|_e| anyhow::anyhow!("Failed to get collection index"))?;
+            let index = store.index("by_collection").map_err(|_e| anyhow::anyhow!("Failed to get collection index"))?;
 
-            let key_range = web_sys::IdbKeyRange::only(&(&bucket_name).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
+            let key_range =
+                web_sys::IdbKeyRange::only(&(&bucket_name).into()).map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
 
-            let request = index
-                .open_cursor_with_range(&key_range)
-                .map_err(|_e| anyhow::anyhow!("Failed to open cursor"))?;
+            let request = index.open_cursor_with_range(&key_range).map_err(|_e| anyhow::anyhow!("Failed to open cursor"))?;
 
             let mut records = Vec::new();
             let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
@@ -178,44 +150,27 @@ impl StorageEngine for IndexedDBStorageEngine {
                     break;
                 }
 
-                let cursor: web_sys::IdbCursorWithValue = cursor_result
-                    .dyn_into()
-                    .map_err(|_| anyhow::anyhow!("Failed to cast cursor"))?;
+                let cursor: web_sys::IdbCursorWithValue = cursor_result.dyn_into().map_err(|_| anyhow::anyhow!("Failed to cast cursor"))?;
 
-                let record = cursor
-                    .value()
-                    .map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
+                let record = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
 
-                let id_str = js_sys::Reflect::get(&record, &"id".into())
-                    .map_err(|_e| anyhow::anyhow!("Failed to get record id"))?;
-                let id = proto::ID::from_ulid(
-                    ulid::Ulid::from_string(&id_str.as_string().unwrap())
-                        .map_err(RetrievalError::storage)?,
-                );
+                let id_str = js_sys::Reflect::get(&record, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get record id"))?;
+                let id = proto::ID::from_ulid(ulid::Ulid::from_string(&id_str.as_string().unwrap()).map_err(RetrievalError::storage)?);
 
-                let state_buffer = js_sys::Reflect::get(&record, &"state_buffer".into())
-                    .map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
-                let array: js_sys::Uint8Array = state_buffer
-                    .dyn_into()
-                    .map_err(|_e| anyhow::anyhow!("Failed to convert state buffer"))?;
+                let state_buffer =
+                    js_sys::Reflect::get(&record, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
+                let array: js_sys::Uint8Array = state_buffer.dyn_into().map_err(|_e| anyhow::anyhow!("Failed to convert state buffer"))?;
 
                 let mut buffer = vec![0; array.length() as usize];
                 array.copy_to(&mut buffer);
 
-                let state_buffers: std::collections::BTreeMap<String, Vec<u8>> =
-                    bincode::deserialize(&buffer)?;
+                let state_buffers: std::collections::BTreeMap<String, Vec<u8>> = bincode::deserialize(&buffer)?;
 
                 // Get the head array
-                let head_data = js_sys::Reflect::get(&record, &"head".into())
-                    .map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
-                let head: proto::Clock = head_data
-                    .try_into()
-                    .map_err(|e| anyhow::anyhow!("Failed to deserialize head: {}", e))?;
+                let head_data = js_sys::Reflect::get(&record, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
+                let head: proto::Clock = head_data.try_into().map_err(|e| anyhow::anyhow!("Failed to deserialize head: {}", e))?;
 
-                let record_state = proto::RecordState {
-                    state_buffers,
-                    head,
-                };
+                let record_state = proto::RecordState { state_buffers, head };
 
                 // Create record to evaluate predicate
                 let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
@@ -225,9 +180,7 @@ impl StorageEngine for IndexedDBStorageEngine {
                     records.push((id, record_state));
                 }
 
-                cursor
-                    .continue_()
-                    .map_err(|_e| anyhow::anyhow!("Failed to advance cursor"))?;
+                cursor.continue_().map_err(|_e| anyhow::anyhow!("Failed to advance cursor"))?;
             }
 
             Ok(records)
@@ -246,13 +199,9 @@ impl StorageBucket for IndexedDBBucket {
                 .transaction_with_str_and_mode("records", web_sys::IdbTransactionMode::Readwrite)
                 .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
 
-            let store = transaction
-                .object_store("records")
-                .map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+            let store = transaction.object_store("records").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
 
-            let old_request = store
-                .get(&id.as_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
+            let old_request = store.get(&id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
 
             crate::cb_future::CBFuture::new(&old_request, "success", "error")
                 .await
@@ -262,12 +211,9 @@ impl StorageBucket for IndexedDBBucket {
 
             // Check if the record changed
             if !old_record.is_undefined() && !old_record.is_null() {
-                let old_head = js_sys::Reflect::get(&old_record, &"head".into())
-                    .map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
+                let old_head = js_sys::Reflect::get(&old_record, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
                 if !old_head.is_undefined() && !old_head.is_null() {
-                    let old_clock: proto::Clock = old_head
-                        .try_into()
-                        .map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
+                    let old_clock: proto::Clock = old_head.try_into().map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
                     if old_clock == state.head {
                         // No change in head, skip update
                         // HACK - we still need to lie and return true because there are good odds the other browser is yours
@@ -289,30 +235,21 @@ impl StorageBucket for IndexedDBBucket {
 
             // Store state_buffers
             let state_buffer = bincode::serialize(&state.state_buffers)?;
-            js_sys::Reflect::set(
-                &record,
-                &"state_buffer".into(),
-                &js_sys::Uint8Array::from(&state_buffer[..]).into(),
-            )
-            .map_err(|_e| anyhow::anyhow!("Failed to set data on record"))?;
+            js_sys::Reflect::set(&record, &"state_buffer".into(), &js_sys::Uint8Array::from(&state_buffer[..]).into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set data on record"))?;
 
             js_sys::Reflect::set(&record, &"head".into(), &(&(state.head)).into())
                 .map_err(|_e| anyhow::anyhow!("Failed to set head on record"))?;
 
             // Put the record in the store
-            let request = store
-                .put_with_key(&record, &id.as_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
+            let request =
+                store.put_with_key(&record, &id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
 
             let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
-            request_fut
-                .await
-                .map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
+            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
 
             let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
-            trx_fut
-                .await
-                .map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
+            trx_fut.await.map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
 
             Ok(true) // Record was updated
         })
@@ -322,24 +259,23 @@ impl StorageBucket for IndexedDBBucket {
     async fn get_record(&self, id: proto::ID) -> Result<proto::RecordState, RetrievalError> {
         SendWrapper::new(async move {
             // Create transaction and get object store
-            let transaction = self.db.transaction_with_str("records").map_err(|_e| {
-                RetrievalError::StorageError(anyhow::anyhow!("Failed to create transaction").into())
-            })?;
+            let transaction = self
+                .db
+                .transaction_with_str("records")
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to create transaction").into()))?;
 
-            let store = transaction.object_store("records").map_err(|_e| {
-                RetrievalError::StorageError(anyhow::anyhow!("Failed to get object store").into())
-            })?;
+            let store = transaction
+                .object_store("records")
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get object store").into()))?;
 
             // Get the record
-            let request = store.get(&id.as_string().into()).map_err(|_e| {
-                RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 1").into())
-            })?;
+            let request = store
+                .get(&id.as_string().into())
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 1").into()))?;
 
             crate::cb_future::CBFuture::new(&request, "success", "error")
                 .await
-                .map_err(|_e| {
-                    RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 2").into())
-                })?;
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 2").into()))?;
 
             let result = request.result().unwrap();
 
@@ -349,17 +285,14 @@ impl StorageBucket for IndexedDBBucket {
             }
 
             // Get the data from the JS object
-            let record: web_sys::js_sys::Object = result.dyn_into().map_err(|_e| {
-                RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 3").into())
-            })?;
+            let record: web_sys::js_sys::Object =
+                result.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 3").into()))?;
 
-            let data = js_sys::Reflect::get(&record, &"state_buffer".into()).map_err(|_e| {
-                RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 4").into())
-            })?;
+            let data = js_sys::Reflect::get(&record, &"state_buffer".into())
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 4").into()))?;
 
-            let array: js_sys::Uint8Array = data.dyn_into().map_err(|_e| {
-                RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 5").into())
-            })?;
+            let array: js_sys::Uint8Array =
+                data.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 5").into()))?;
 
             let mut buffer = vec![0; array.length() as usize];
             array.copy_to(&mut buffer);
@@ -368,19 +301,13 @@ impl StorageBucket for IndexedDBBucket {
             let state_buffers = bincode::deserialize(&buffer)?;
 
             // Get the head array
-            let head_data = js_sys::Reflect::get(&record, &"head".into()).map_err(|_e| {
-                RetrievalError::StorageError(anyhow::anyhow!("Failed to get head").into())
-            })?;
-            let head: proto::Clock = head_data.try_into().map_err(|e| {
-                RetrievalError::StorageError(
-                    anyhow::anyhow!("Failed to deserialize head: {}", e).into(),
-                )
-            })?;
+            let head_data = js_sys::Reflect::get(&record, &"head".into())
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get head").into()))?;
+            let head: proto::Clock = head_data
+                .try_into()
+                .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to deserialize head: {}", e).into()))?;
 
-            Ok(proto::RecordState {
-                state_buffers,
-                head,
-            })
+            Ok(proto::RecordState { state_buffers, head })
         })
         .await
     }
@@ -424,11 +351,7 @@ mod tests {
         let result = IndexedDBStorageEngine::open(&db_name).await;
         tracing::info!("Open result: {:?}", result.is_ok());
 
-        assert!(
-            result.is_ok(),
-            "Failed to open database: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "Failed to open database: {:?}", result.err());
 
         let engine = result.unwrap();
         tracing::info!("Successfully opened database: {}", engine.db.name());
@@ -438,11 +361,7 @@ mod tests {
         tracing::info!("Attempting to reopen database 'test_db'");
         let result2 = IndexedDBStorageEngine::open(&db_name).await;
 
-        assert!(
-            result2.is_ok(),
-            "Failed to reopen database: {:?}",
-            result2.err()
-        );
+        assert!(result2.is_ok(), "Failed to reopen database: {:?}", result2.err());
         tracing::info!("Test completed successfully");
 
         // Drop both engine instances
@@ -452,9 +371,7 @@ mod tests {
         }
 
         // Cleanup
-        IndexedDBStorageEngine::cleanup(&db_name)
-            .await
-            .expect("Failed to cleanup database");
+        IndexedDBStorageEngine::cleanup(&db_name).await.expect("Failed to cleanup database");
     }
 
     #[wasm_bindgen_test]
@@ -462,29 +379,18 @@ mod tests {
         setup().await.expect("Failed to setup test");
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
-        let engine = IndexedDBStorageEngine::open(&db_name)
-            .await
-            .expect("Failed to open database");
+        let engine = IndexedDBStorageEngine::open(&db_name).await.expect("Failed to open database");
 
-        let bucket = engine
-            .bucket("albums")
-            .await
-            .expect("Failed to create bucket");
+        let bucket = engine.bucket("albums").await.expect("Failed to create bucket");
 
         // Create a test record
         let id = proto::ID::from_ulid(ulid::Ulid::new());
         let mut state_buffers = std::collections::BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
-        let state = proto::RecordState {
-            state_buffers,
-            head: proto::Clock::default(),
-        };
+        let state = proto::RecordState { state_buffers, head: proto::Clock::default() };
 
         // Set the record
-        bucket
-            .set_record(id.clone(), &state)
-            .await
-            .expect("Failed to set record");
+        bucket.set_record(id.clone(), &state).await.expect("Failed to set record");
 
         // Get the record back
         let retrieved_state = bucket.get_record(id).await.expect("Failed to get record 6");
@@ -497,9 +403,7 @@ mod tests {
         drop(engine);
 
         // Cleanup
-        IndexedDBStorageEngine::cleanup(&db_name)
-            .await
-            .expect("Failed to cleanup database");
+        IndexedDBStorageEngine::cleanup(&db_name).await.expect("Failed to cleanup database");
     }
 
     #[wasm_bindgen_test]
@@ -517,16 +421,8 @@ mod tests {
             tracing::info!("Creating transaction");
             let trx = node.begin();
             tracing::info!("Transaction created");
-            let album = trx
-                .create(&Album {
-                    name: "The rest of the owl".to_owned(),
-                    year: "2024".to_owned(),
-                })
-                .await;
-            assert_eq!(
-                album.name().value(),
-                Some("The rest of the owl".to_string())
-            );
+            let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await;
+            assert_eq!(album.name().value(), Some("The rest of the owl".to_string()));
 
             id = album.id();
             tracing::info!("Album created");
@@ -560,42 +456,21 @@ mod tests {
         {
             let trx = node.begin();
 
-            trx.create(&Album {
-                name: "Walking on a Dream".into(),
-                year: "2008".into(),
-            })
-            .await;
+            trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
 
-            trx.create(&Album {
-                name: "Ice on the Dune".into(),
-                year: "2013".into(),
-            })
-            .await;
+            trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
 
-            trx.create(&Album {
-                name: "Two Vines".into(),
-                year: "2016".into(),
-            })
-            .await;
+            trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
 
-            trx.create(&Album {
-                name: "Ask That God".into(),
-                year: "2024".into(),
-            })
-            .await;
+            trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
 
             trx.commit().await?;
         }
 
-        let albums: ankurah_core::resultset::ResultSet<AlbumRecord> =
-            node.fetch("name = 'Walking on a Dream'").await?;
+        let albums: ankurah_core::resultset::ResultSet<AlbumRecord> = node.fetch("name = 'Walking on a Dream'").await?;
 
         assert_eq!(
-            albums
-                .records
-                .iter()
-                .map(|active_record| active_record.name())
-                .collect::<Vec<String>>(),
+            albums.records.iter().map(|active_record| active_record.name()).collect::<Vec<String>>(),
             vec!["Walking on a Dream".to_string()]
         );
 
