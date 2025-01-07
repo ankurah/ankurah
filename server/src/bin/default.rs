@@ -11,10 +11,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
     // Initialize storage engine
-    let storage = SledStorageEngine::with_homedir_folder(".syncra")?;
-
-    // Create the node
-    let node = Arc::new(Node::new(Box::new(storage)));
+    let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
+    let node = Arc::new(Node::new_durable(Arc::new(storage)));
 
     // Create and start the websocket server
     let server = WebsocketServer::new(node);

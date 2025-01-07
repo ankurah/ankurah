@@ -1,4 +1,4 @@
-use ankurah_proto::{Operation, RecordState};
+use ankurah_proto::{Clock, Operation, RecordState};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -6,7 +6,6 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
-
 
 use crate::storage::Materialized;
 
@@ -95,6 +94,7 @@ pub enum BackendDowncasted {
 #[derive(Debug)]
 pub struct Backends {
     pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
+    pub head: Arc<Mutex<Clock>>,
 }
 
 // This is where this gets a bit tough.
@@ -131,6 +131,7 @@ impl Backends {
     pub fn new() -> Self {
         Self {
             backends: Arc::new(Mutex::new(BTreeMap::default())),
+            head: Arc::new(Mutex::new(Clock::default())),
         }
     }
 
@@ -178,6 +179,7 @@ impl Backends {
 
         Self {
             backends: Arc::new(Mutex::new(forked)),
+            head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
         }
     }
 
@@ -193,7 +195,10 @@ impl Backends {
             let state_buffer = backend.to_state_buffer()?;
             state_buffers.insert(name.clone(), state_buffer);
         }
-        Ok(RecordState { state_buffers })
+        Ok(RecordState {
+            state_buffers,
+            head: self.head.lock().unwrap().clone(),
+        })
     }
 
     pub fn from_state_buffers(record_state: &RecordState) -> Result<Self, RetrievalError> {
@@ -202,6 +207,7 @@ impl Backends {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
+        *backends.head.lock().unwrap() = record_state.head.clone();
         Ok(backends)
     }
 
@@ -222,6 +228,16 @@ impl Backends {
     ) -> Result<()> {
         let backend = self.get_raw(backend_name)?;
         backend.apply_operations(operations)?;
+        Ok(())
+    }
+
+    /// HACK - this should be based on a play forward of events
+    pub fn apply_state(&self, state: &RecordState) -> Result<(), RetrievalError> {
+        let mut backends = self.backends.lock().unwrap();
+        for (name, state_buffer) in &state.state_buffers {
+            let backend = backend_from_string(name, Some(state_buffer))?;
+            backends.insert(name.to_owned(), backend);
+        }
         Ok(())
     }
 }

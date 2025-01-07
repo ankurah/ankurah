@@ -60,7 +60,6 @@ impl IndexedDBStorageEngine {
                 let db: SendWrapper<IdbDatabase> =
                     SendWrapper::new(target.result().unwrap().unchecked_into());
 
-                tracing::info!("Creating records store");
                 // Create records store with index on collection
                 let store = match db.create_object_store("records") {
                     Ok(store) => store,
@@ -203,7 +202,18 @@ impl StorageEngine for IndexedDBStorageEngine {
 
                 let state_buffers: std::collections::BTreeMap<String, Vec<u8>> =
                     bincode::deserialize(&buffer)?;
-                let record_state = proto::RecordState { state_buffers };
+
+                // Get the head array
+                let head_data = js_sys::Reflect::get(&record, &"head".into())
+                    .map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
+                let head: proto::Clock = head_data
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize head: {}", e))?;
+
+                let record_state = proto::RecordState {
+                    state_buffers,
+                    head,
+                };
 
                 // Create record to evaluate predicate
                 let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
@@ -226,27 +236,47 @@ impl StorageEngine for IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageBucket for IndexedDBBucket {
-    async fn set_record(&self, id: proto::ID, state: &proto::RecordState) -> anyhow::Result<()> {
+    async fn set_record(&self, id: proto::ID, state: &proto::RecordState) -> anyhow::Result<bool> {
         SendWrapper::new(async move {
-            tracing::info!("MARK 1: Starting record set operation");
-            // Serialize the state
-            let state_buffer = bincode::serialize(&state.state_buffers)?;
-            tracing::info!(
-                "MARK 2: State serialized, buffer size: {}",
-                state_buffer.len()
-            );
-
-            // Create transaction and get object store
+            // Get the old record if it exists to check for changes
             let transaction = self
                 .db
                 .transaction_with_str_and_mode("records", web_sys::IdbTransactionMode::Readwrite)
                 .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
-            tracing::info!("MARK 3: Transaction created");
 
             let store = transaction
                 .object_store("records")
                 .map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
-            tracing::info!("MARK 4: Object store obtained");
+
+            let old_request = store
+                .get(&id.as_string().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
+
+            crate::cb_future::CBFuture::new(&old_request, "success", "error")
+                .await
+                .map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
+
+            let old_record: JsValue = old_request.result().unwrap();
+
+            // Check if the record changed
+            if !old_record.is_undefined() && !old_record.is_null() {
+                let old_head = js_sys::Reflect::get(&old_record, &"head".into())
+                    .map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
+                if !old_head.is_undefined() && !old_head.is_null() {
+                    let old_clock: proto::Clock = old_head
+                        .try_into()
+                        .map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
+                    if old_clock == state.head {
+                        // No change in head, skip update
+                        // HACK - we still need to lie and return true because there are good odds the other browser is yours
+                        // and has already updated the record 🤦
+                        // ...andd this breaks subscription notification
+                        // Ideally we'd use the node to check for changes, but we can't assume that the subscriber is keeping the records resident
+                        // and the node is using weak references so they might be freed
+                        return Ok(true);
+                    }
+                }
+            }
 
             // Create a JS object to store our data
             let record = js_sys::Object::new();
@@ -254,33 +284,35 @@ impl StorageBucket for IndexedDBBucket {
                 .map_err(|_e| anyhow::anyhow!("Failed to set id on record"))?;
             js_sys::Reflect::set(&record, &"collection".into(), &self.name.clone().into())
                 .map_err(|_e| anyhow::anyhow!("Failed to set collection on record"))?;
+
+            // Store state_buffers
+            let state_buffer = bincode::serialize(&state.state_buffers)?;
             js_sys::Reflect::set(
                 &record,
                 &"state_buffer".into(),
                 &js_sys::Uint8Array::from(&state_buffer[..]).into(),
             )
             .map_err(|_e| anyhow::anyhow!("Failed to set data on record"))?;
-            tracing::info!("MARK 5: Record object created and populated");
+
+            js_sys::Reflect::set(&record, &"head".into(), &(&(state.head)).into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set head on record"))?;
 
             // Put the record in the store
             let request = store
                 .put_with_key(&record, &id.as_string().into())
                 .map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
-            tracing::info!("MARK 6: Put request created");
 
             let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
             request_fut
                 .await
                 .map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
-            tracing::info!("MARK 7: Put request completed");
 
             let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
             trx_fut
                 .await
                 .map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
-            tracing::info!("MARK 8: Transaction completed successfully");
 
-            Ok(())
+            Ok(true) // Record was updated
         })
         .await
     }
@@ -333,13 +365,26 @@ impl StorageBucket for IndexedDBBucket {
             // Deserialize the state
             let state_buffers = bincode::deserialize(&buffer)?;
 
-            Ok(proto::RecordState { state_buffers })
+            // Get the head array
+            let head_data = js_sys::Reflect::get(&record, &"head".into()).map_err(|_e| {
+                RetrievalError::StorageError(anyhow::anyhow!("Failed to get head").into())
+            })?;
+            let head: proto::Clock = head_data.try_into().map_err(|e| {
+                RetrievalError::StorageError(
+                    anyhow::anyhow!("Failed to deserialize head: {}", e).into(),
+                )
+            })?;
+
+            Ok(proto::RecordState {
+                state_buffers,
+                head,
+            })
         })
         .await
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+// #[cfg(target_arch = "wasm32")]
 #[cfg(test)]
 mod tests {
     #![allow(unused)]
@@ -428,7 +473,10 @@ mod tests {
         let id = proto::ID::from_ulid(ulid::Ulid::new());
         let mut state_buffers = std::collections::BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
-        let state = proto::RecordState { state_buffers };
+        let state = proto::RecordState {
+            state_buffers,
+            head: proto::Clock::default(),
+        };
 
         // Set the record
         bucket
@@ -460,7 +508,7 @@ mod tests {
         tracing::info!("Starting test_basic_workflow");
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
         tracing::info!("Storage engine opened");
-        let node = Arc::new(Node::new(Box::new(storage_engine)));
+        let node = Arc::new(Node::new(Arc::new(storage_engine)));
 
         let id;
         {
@@ -505,7 +553,7 @@ mod tests {
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
-        let node = Arc::new(Node::new(Box::new(storage_engine)));
+        let node = Arc::new(Node::new(Arc::new(storage_engine)));
 
         {
             let trx = node.begin();
