@@ -1,5 +1,11 @@
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
-import init_bindings, * as bindings from 'example-wasm-bindings';
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import init_bindings, * as bindings from "example-wasm-bindings";
 
 interface AppState {
   client: bindings.WebsocketClient | null;
@@ -9,7 +15,9 @@ const AppState = createContext<AppState | null>(null);
 
 export const useAppState = () => useContext(AppState);
 
-export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({
+  children,
+}) => {
   const isFirstMount = useRef(true);
   const [appState, setAppState] = useState<AppState | null>(null);
 
@@ -23,9 +31,5 @@ export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     });
   });
 
-  return (
-    <AppState.Provider value={appState}>
-      {children}
-    </AppState.Provider>
-  );
+  return <AppState.Provider value={appState}>{children}</AppState.Provider>;
 };

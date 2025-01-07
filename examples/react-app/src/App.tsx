@@ -1,7 +1,13 @@
-import styled from 'styled-components';
-import { useAppState } from './AppState'
-import { useSignals, fetch_test_records, create_test_record, SessionRecord, subscribe_test_records } from 'example-wasm-bindings';
-import { useEffect, useMemo, useState } from 'react';
+import styled from "styled-components";
+import { useAppState } from "./AppState";
+import {
+  useSignals,
+  fetch_test_records,
+  create_test_record,
+  SessionRecord,
+  subscribe_test_records,
+} from "example-wasm-bindings";
+import { useEffect, useMemo, useState } from "react";
 
 const Table = styled.table`
   width: 100%;
@@ -58,16 +64,19 @@ function App() {
   const c = useSignals();
 
   try {
-    const appState = useAppState()
-    console.log('render 1', { appState });
-
+    const appState = useAppState();
+    console.log("render 1", { appState });
 
     // const [connectionState, setConnectionState] = useState<string | null>(null);
     const connectionState = appState?.client?.connection_state.value?.value();
-    const test_records_signal = useMemo(() => appState?.client ? subscribe_test_records(appState?.client) : null, [appState?.client]);
+    const test_records_signal = useMemo(
+      () =>
+        appState?.client ? subscribe_test_records(appState?.client) : null,
+      [appState?.client],
+    );
 
     // const [sessions, setSessions] = useState<SessionRecord[]>([]);
-    console.log('render 2', { connectionState });
+    console.log("render 2", { connectionState });
 
     // useEffect(() => {
     // if (appState?.client) {
@@ -90,31 +99,31 @@ function App() {
     // return () => clearInterval(intervalId);
     // }, [appState?.client]);
 
-
-
     const handleButtonPress = () => {
       if (appState?.client) {
         create_test_record(appState.client).then(() => {
-          console.log('Session created');
+          console.log("Session created");
         });
       } else {
-        console.log('Client not ready');
+        console.log("Client not ready");
       }
-    }
+    };
 
     return (
       <Container>
         <h1>Ankurah Example App</h1>
         <Card>
-          <div className="connection-status" style={{ textAlign: 'center' }}>
+          <div className="connection-status" style={{ textAlign: "center" }}>
             Connection State: {connectionState}
           </div>
-          <div style={{ textAlign: 'center', margin: '20px 0' }}>
+          <div style={{ textAlign: "center", margin: "20px 0" }}>
             <button onClick={handleButtonPress} disabled={!appState?.client}>
               Create Test Record
             </button>
           </div>
-          <div style={{ textAlign: 'center', marginBottom: '10px' }}>Sessions:</div>
+          <div style={{ textAlign: "center", marginBottom: "10px" }}>
+            Sessions:
+          </div>
           <Table>
             <thead>
               <tr>
@@ -137,10 +146,10 @@ function App() {
           </Table>
         </Card>
       </Container>
-    )
+    );
   } finally {
     c.finish();
   }
 }
 
-export default App
+export default App;
