@@ -44,6 +44,39 @@ impl<R> ItemChange<R> {
     }
 }
 
+impl<R> std::fmt::Display for ItemChange<R>
+where
+    R: Record,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemChange::Initial { record } => {
+                write!(f, "Initial {}/{}", R::bucket_name(), record.id())
+            }
+            ItemChange::Add { record, .. } => {
+                write!(f, "Add {}/{}", R::bucket_name(), record.id())
+            }
+            ItemChange::Update { record, .. } => {
+                write!(f, "Update {}/{}", R::bucket_name(), record.id())
+            }
+            ItemChange::Remove { record, .. } => {
+                write!(f, "Remove {}/{}", R::bucket_name(), record.id())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for EntityChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EntityChange {}/{}",
+            self.record.bucket_name(),
+            self.record.id()
+        )
+    }
+}
+
 /// A set of changes to the record set
 #[derive(Debug)]
 pub struct ChangeSet<R> {

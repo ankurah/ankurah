@@ -160,3 +160,97 @@ async fn inter_node_subscription() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_client_server_propagation() -> Result<()> {
+    // Create server (durable) and two client nodes
+    let server = Arc::new(Node::new_durable(Arc::new(
+        SledStorageEngine::new_test().unwrap(),
+    )));
+    let client_a = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let client_b = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+
+    // Connect both clients to the server
+    let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
+    let _conn_b = LocalProcessConnection::new(&client_b, &server).await?;
+
+    // Create a record on client_a
+    {
+        let trx = client_a.begin();
+        trx.create(&Album {
+            name: "Origin of Symmetry".into(),
+            year: "2001".into(),
+        })
+        .await;
+        trx.commit().await?;
+    }
+
+    // Wait for propagation
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Verify record is queryable on server
+    let query = "name = 'Origin of Symmetry'";
+    assert_eq!(names(server.fetch(query).await?), ["Origin of Symmetry"]);
+
+    // Wait for propagation to client_b
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Verify record is queryable on client_b
+    assert_eq!(names(client_b.fetch(query).await?), ["Origin of Symmetry"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_server_subscription_propagation() -> Result<()> {
+    // Create server (durable) and two client nodes
+    let server = Arc::new(Node::new_durable(Arc::new(
+        SledStorageEngine::new_test().unwrap(),
+    )));
+    let client_a = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+    let client_b = Arc::new(Node::new(Arc::new(SledStorageEngine::new_test().unwrap())));
+
+    // Connect both clients to the server
+    let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
+    let _conn_b = LocalProcessConnection::new(&client_b, &server).await?;
+
+    // Set up watchers for server and client_b
+    let (server_watcher, check_server) = common::changeset_watcher::<AlbumRecord>();
+    let (client_b_watcher, check_client_b) = common::changeset_watcher::<AlbumRecord>();
+
+    // Set up subscriptions
+    let _server_sub = server
+        .subscribe("name = 'Origin of Symmetry'", server_watcher)
+        .await?;
+    let _client_b_sub = client_b
+        .subscribe("name = 'Origin of Symmetry'", client_b_watcher)
+        .await?;
+
+    // Create a record on client_a
+    let album_id = {
+        let trx = client_a.begin();
+        let album = trx
+            .create(&Album {
+                name: "Origin of Symmetry".into(),
+                year: "2001".into(),
+            })
+            .await;
+        let id = album.id();
+        trx.commit().await?;
+        id
+    };
+
+    // Wait for propagation to server
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Check server received the change
+    assert_eq!(check_server(), vec![(album_id, ChangeKind::Add)]);
+
+    // Wait for propagation to client_b
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Check client_b received the change
+    assert_eq!(check_client_b(), vec![(album_id, ChangeKind::Add)]);
+
+    Ok(())
+}
