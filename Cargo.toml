@@ -1,3 +1,14 @@
 [workspace]
-members = ["core", "derive", "server", "proto", "web-client", "examples/wasm-bindings", "examples/model", "examples/leptos-app", "react-signals", "ankql"]
+members = [
+    "core",
+    "derive",
+    "server",
+    "proto",
+    "web-client",
+    "examples/wasm-bindings",
+    "examples/model",
+    "examples/leptos-app",
+    "react-signals",
+    "ankql",
+]
 resolver = "2"

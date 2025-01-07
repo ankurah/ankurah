@@ -1,5 +1,5 @@
 [package]
-name = "example-wasm-bindings"
+name    = "example-wasm-bindings"
 version = "0.1.0"
 edition = "2021"
 
@@ -16,8 +16,12 @@ wasm-logger = "0.2.0"
 tracing = "0.1.40"
 tracing-wasm = "0.2.1"
 console_error_panic_hook = "0.1.7"
-any_spawner = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", version = "0.2.0", features = ["wasm-bindgen"] }
-reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = ["effects"] }
+any_spawner = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", version = "0.2.0", features = [
+    "wasm-bindgen",
+] }
+reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = [
+    "effects",
+] }
 
-[package.metadata.wasm-pack.profile.dev.wasm-bindgen]
-dwarf-debug-info = true
+    [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
+    dwarf-debug-info = true

@@ -1,0 +1,7 @@
+[formatting]
+column_width   = 100
+indent_string  = "    "
+indent_tables  = true
+align_entries  = true
+align_comments = true
+compact_arrays = true

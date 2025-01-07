@@ -1,9 +1,9 @@
-max_width = 140
+max_width            = 140
 use_small_heuristics = "Max"
-fn_single_line = true
-chain_width = 140
-struct_lit_width = 140
+fn_single_line       = true
+chain_width          = 140
+struct_lit_width     = 140
 struct_variant_width = 140
-array_width = 140
-where_single_line = true
-control_brace_style = "AlwaysSameLine"
+array_width          = 140
+where_single_line    = true
+control_brace_style  = "AlwaysSameLine"

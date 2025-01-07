@@ -1,5 +1,5 @@
 [package]
-name = "ankurah-derive"
+name    = "ankurah-derive"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,5 +8,5 @@ proc-macro = true
 
 [dependencies]
 proc-macro2 = "1.0.88"
-quote = "1.0.37"
-syn = "2.0.79"
+quote       = "1.0.37"
+syn         = "2.0.79"
