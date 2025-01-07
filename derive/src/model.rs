@@ -63,17 +63,17 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn bucket_name() -> &'static str {
                 #name_str
             }
-            fn to_record_inner(&self, id: ankurah_core::derive_deps::ankurah_proto::ID) -> ankurah_core::model::RecordInner {
+            fn create_record(&self, id: ::ankurah_core::derive_deps::ankurah_proto::ID) -> ankurah_core::model::RecordInner {
                 use ankurah_core::property::InitializeWith;
 
                 let backends = ankurah_core::property::Backends::new();
                 #(
                     #field_active_values::initialize_with(&backends, #field_name_strs.into(), &self.#field_names);
                 )*
-                ankurah_core::model::RecordInner::from_backends(
+                ankurah_core::model::RecordInner::create(
                     id,
                     #name_str,
-                    backends,
+                    backends
                 )
             }
         }
@@ -133,8 +133,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         pub struct #scoped_record_name<'rec> {
             // TODO: Invert Record and ScopedRecord so that ScopedRecord has an internal Record, and Record has id,backends, field projections
             //parent: RecordParent<#name>,
-
-            inner: &'rec ankurah_core::model::RecordInner,
+            inner: &'rec std::sync::Arc<ankurah_core::model::RecordInner>,
 
             // Field projections
             #(#field_visibility #field_names: #field_active_values,)*
@@ -145,11 +144,11 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             type Model = #name;
             type Record = #record_name;
 
-            fn record_inner(&self) -> &ankurah_core::model::RecordInner {
+            fn record_inner(&self) -> &std::sync::Arc<ankurah_core::model::RecordInner> {
                 &self.inner
             }
 
-            fn from_record_inner(inner: &'rec ankurah_core::model::RecordInner) -> Self {
+            fn new(inner: &'rec std::sync::Arc<ankurah_core::model::RecordInner>) -> Self {
                 use ankurah_core::model::ScopedRecord;
                 assert_eq!(inner.bucket_name(), Self::bucket_name());
                 #(

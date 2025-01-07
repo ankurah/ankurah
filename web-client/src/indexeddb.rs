@@ -15,7 +15,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent,
+    Event, IdbDatabase, IdbFactory, IdbIndexParameters, IdbObjectStore, IdbOpenDbRequest,
+    IdbRequest, IdbVersionChangeEvent,
 };
 
 pub struct IndexedDBStorageEngine {
@@ -202,7 +203,18 @@ impl StorageEngine for IndexedDBStorageEngine {
 
                 let state_buffers: std::collections::BTreeMap<String, Vec<u8>> =
                     bincode::deserialize(&buffer)?;
-                let record_state = proto::RecordState { state_buffers };
+
+                // Get the head array
+                let head_data = js_sys::Reflect::get(&record, &"head".into())
+                    .map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
+                let head: proto::Clock = head_data
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize head: {}", e))?;
+
+                let record_state = proto::RecordState {
+                    state_buffers,
+                    head,
+                };
 
                 // Create record to evaluate predicate
                 let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
@@ -227,9 +239,7 @@ impl StorageEngine for IndexedDBStorageEngine {
 impl StorageBucket for IndexedDBBucket {
     async fn set_record(&self, id: proto::ID, state: &proto::RecordState) -> anyhow::Result<bool> {
         SendWrapper::new(async move {
-            // Serialize the state
-            let state_buffer = bincode::serialize(&state.state_buffers)?;
-            // Create transaction and get object store
+            // Get the old record if it exists to check for changes
             let transaction = self
                 .db
                 .transaction_with_str_and_mode("records", web_sys::IdbTransactionMode::Readwrite)
@@ -239,18 +249,48 @@ impl StorageBucket for IndexedDBBucket {
                 .object_store("records")
                 .map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
 
+            let old_request = store
+                .get(&id.as_string().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
+
+            crate::cb_future::CBFuture::new(&old_request, "success", "error")
+                .await
+                .map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
+
+            let old_record: JsValue = old_request.result().unwrap();
+
+            // Check if the record changed
+            if !old_record.is_undefined() && !old_record.is_null() {
+                let old_head = js_sys::Reflect::get(&old_record, &"head".into())
+                    .map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
+                if !old_head.is_undefined() && !old_head.is_null() {
+                    let old_clock: proto::Clock = old_head
+                        .try_into()
+                        .map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
+                    if old_clock == state.head {
+                        return Ok(false); // No change in head, skip update
+                    }
+                }
+            }
+
             // Create a JS object to store our data
             let record = js_sys::Object::new();
             js_sys::Reflect::set(&record, &"id".into(), &id.as_string().into())
                 .map_err(|_e| anyhow::anyhow!("Failed to set id on record"))?;
             js_sys::Reflect::set(&record, &"collection".into(), &self.name.clone().into())
                 .map_err(|_e| anyhow::anyhow!("Failed to set collection on record"))?;
+
+            // Store state_buffers
+            let state_buffer = bincode::serialize(&state.state_buffers)?;
             js_sys::Reflect::set(
                 &record,
                 &"state_buffer".into(),
                 &js_sys::Uint8Array::from(&state_buffer[..]).into(),
             )
             .map_err(|_e| anyhow::anyhow!("Failed to set data on record"))?;
+
+            js_sys::Reflect::set(&record, &"head".into(), &(&(state.head)).into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set head on record"))?;
 
             // Put the record in the store
             let request = store
@@ -267,7 +307,7 @@ impl StorageBucket for IndexedDBBucket {
                 .await
                 .map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
 
-            Ok(())
+            Ok(true) // Record was updated
         })
         .await
     }
@@ -320,7 +360,20 @@ impl StorageBucket for IndexedDBBucket {
             // Deserialize the state
             let state_buffers = bincode::deserialize(&buffer)?;
 
-            Ok(proto::RecordState { state_buffers })
+            // Get the head array
+            let head_data = js_sys::Reflect::get(&record, &"head".into()).map_err(|_e| {
+                RetrievalError::StorageError(anyhow::anyhow!("Failed to get head").into())
+            })?;
+            let head: proto::Clock = head_data.try_into().map_err(|e| {
+                RetrievalError::StorageError(
+                    anyhow::anyhow!("Failed to deserialize head: {}", e).into(),
+                )
+            })?;
+
+            Ok(proto::RecordState {
+                state_buffers,
+                head,
+            })
         })
         .await
     }

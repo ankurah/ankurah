@@ -11,7 +11,7 @@ async fn basic_where_clause() -> Result<()> {
         SledStorageEngine::new_test().unwrap(),
     )));
 
-    let id = {
+    let _id = {
         let trx = client.begin();
         let id = trx
             .create(&Album {

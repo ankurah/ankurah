@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use ulid::Ulid;
+use uuid::Uuid;
+use wasm_bindgen::prelude::*;
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct NodeId(Ulid);
@@ -124,18 +126,88 @@ impl std::fmt::Display for NodeResponse {
 pub struct RecordEvent {
     pub id: ID,
     pub bucket_name: String,
+    pub record_id: ID,
     pub operations: BTreeMap<String, Vec<Operation>>,
     /// The set of concurrent events (usually only one) which is the precursor of this event
-    pub parent: BTreeSet<ID>,
+    pub parent: Clock,
+}
+
+/// S set of event ids which create a dag of events
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct Clock(BTreeSet<ID>);
+
+impl Clock {
+    pub fn new(ids: impl Into<BTreeSet<ID>>) -> Self {
+        Self(ids.into())
+    }
+
+    pub fn as_slice(&self) -> &BTreeSet<ID> {
+        &self.0
+    }
+
+    pub fn to_strings(&self) -> Vec<String> {
+        self.0.iter().map(|id| id.to_string()).collect()
+    }
+
+    pub fn from_strings(strings: Vec<String>) -> Result<Self, ulid::DecodeError> {
+        let ids = strings
+            .into_iter()
+            .map(|s| {
+                let ulid = Ulid::from_string(&s)?;
+                Ok(ID::from_ulid(ulid))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(Self(ids))
+    }
+
+    pub fn insert(&mut self, id: ID) {
+        self.0.insert(id);
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Vec<Uuid>> for Clock {
+    fn from(uuids: Vec<Uuid>) -> Self {
+        let ids = uuids
+            .into_iter()
+            .map(|uuid| {
+                let ulid = Ulid::from(uuid);
+                ID::from_ulid(ulid)
+            })
+            .collect();
+        Self(ids)
+    }
+}
+
+impl From<&Clock> for Vec<Uuid> {
+    fn from(clock: &Clock) -> Self {
+        clock
+            .0
+            .iter()
+            .map(|id| {
+                let ulid: Ulid = (*id).into();
+                ulid.into()
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Display for RecordEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RecordEvent({} {} {})",
-            self.bucket_name,
+            "RecordEvent({} {}/{} {} {})",
             self.id,
+            self.bucket_name,
+            self.record_id,
+            self.parent,
             self.operations
                 .iter()
                 .map(|(backend, ops)| format!(
@@ -149,13 +221,15 @@ impl std::fmt::Display for RecordEvent {
     }
 }
 
+impl std::fmt::Display for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}]", self.to_strings().join(", "))
+    }
+}
+
 impl RecordEvent {
     pub fn bucket_name(&self) -> &str {
         &self.bucket_name
-    }
-
-    pub fn id(&self) -> ID {
-        self.id
     }
 }
 
@@ -169,7 +243,7 @@ pub struct RecordState {
     /// The current accumulated state of the record inclusive of all events up to this point
     pub state_buffers: BTreeMap<String, Vec<u8>>,
     /// The set of concurrent events (usually only one) which have been applied to the record state above
-    pub head: BTreeSet<ID>,
+    pub head: Clock,
 }
 
 impl std::fmt::Display for RecordState {
@@ -305,4 +379,25 @@ pub enum ServerMessage {
 pub struct Presence {
     pub node_id: NodeId,
     pub durable: bool,
+}
+
+impl TryFrom<JsValue> for Clock {
+    type Error = anyhow::Error;
+
+    fn try_from(value: JsValue) -> Result<Self, Self::Error> {
+        if value.is_undefined() || value.is_null() {
+            return Ok(Clock::default());
+        }
+        let ids: Vec<String> = serde_wasm_bindgen::from_value(value)
+            .map_err(|e| anyhow::anyhow!("Failed to parse clock: {}", e))?;
+        Self::from_strings(ids).map_err(|e| anyhow::anyhow!("Failed to parse clock: {}", e))
+    }
+}
+
+impl Into<JsValue> for &Clock {
+    fn into(self) -> JsValue {
+        let strings = self.to_strings();
+        // This should not be able to fail
+        serde_wasm_bindgen::to_value(&strings).expect("Failed to serialize clock")
+    }
 }

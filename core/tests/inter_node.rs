@@ -90,40 +90,39 @@ async fn inter_node_subscription() -> Result<()> {
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
 
+    use ankurah_core::model::Record;
     // Create initial records on node1
-    let (rex, snuffy, jasper);
-    {
+    let (rex, snuffy, jasper) = {
         let trx = node1.begin();
-        rex = trx
+        let rex = trx
             .create(&Pet {
                 name: "Rex".to_string(),
                 age: "1".to_string(),
             })
-            .await
-            .read();
-        snuffy = trx
+            .await;
+        let snuffy = trx
             .create(&Pet {
                 name: "Snuffy".to_string(),
                 age: "2".to_string(),
             })
-            .await
-            .read();
-        jasper = trx
+            .await;
+        let jasper = trx
             .create(&Pet {
                 name: "Jasper".to_string(),
                 age: "6".to_string(),
             })
-            .await
-            .read();
+            .await;
 
+        let read = (rex.read(), snuffy.read(), jasper.read());
         trx.commit().await?;
-    }
+        read
+    };
 
     info!(
-        "rex: {:?}, snuffy: {:?}, jasper: {:?}",
-        rex.id(),
-        snuffy.id(),
-        jasper.id()
+        "rex: {}, snuffy: {}, jasper: {}",
+        rex.record_inner(),
+        snuffy.record_inner(),
+        jasper.record_inner()
     );
 
     // Set up subscription on node2
@@ -146,7 +145,6 @@ async fn inter_node_subscription() -> Result<()> {
     assert_eq!(check_node2(), vec![(rex.id(), ChangeKind::Update)]); // Rex still matches the predicate, but the age has changed
 
     // short circuit to simplify debugging
-    return Ok(());
     // Update Snuffy's age to 3 on node1
     {
         let trx = node1.begin();

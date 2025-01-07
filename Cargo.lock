@@ -109,7 +109,9 @@ dependencies = [
  "bytes",
  "chrono",
  "serde",
+ "serde-wasm-bindgen",
  "ulid",
+ "uuid",
  "wasm-bindgen",
 ]
 
@@ -178,11 +180,13 @@ dependencies = [
  "reactive_graph",
  "send_wrapper",
  "serde",
+ "serde-wasm-bindgen",
  "strum",
  "thiserror 2.0.9",
  "tracing",
  "tracing-wasm",
  "ulid",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -2833,6 +2837,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "serde_derive"
 version = "1.0.217"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3841,6 +3856,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8c5f0a0af699448548ad1a2fbf920fb4bee257eae39953ba95cb84891a0446a"
 dependencies = [
  "getrandom",
+ "serde",
 ]
 
 [[package]]

@@ -374,7 +374,7 @@ impl Node {
         for record_event in events {
             // Apply record events to the Node's global records first.
             let record = self
-                .fetch_record_inner(record_event.id, &record_event.bucket_name)
+                .fetch_record_inner(record_event.record_id, &record_event.bucket_name)
                 .await?;
 
             record.apply_record_event(record_event)?;
@@ -384,7 +384,7 @@ impl Node {
             let changed = self
                 .bucket(record_event.bucket_name())
                 .await
-                .set_record(record_event.id(), &record_state)
+                .set_record(record_event.record_id, &record_state)
                 .await?;
 
             if changed {
@@ -521,6 +521,29 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    /// This should be called only by the transaction commit for newly created records
+    /// This is necessary because records created in a transaction scope have no upstream
+    /// so when they hand out read records, they have to work immediately.
+    /// TODO: Discuss. The upside is that you can call .read() on a ScopedRecord. The downside is that the behavior is inconsistent
+    /// between newly created records and records that are created in a transaction scope.
+    pub(crate) async fn insert_record(
+        self: &Arc<Self>,
+        record: Arc<RecordInner>,
+    ) -> anyhow::Result<()> {
+        match self
+            .records
+            .write()
+            .await
+            .entry((record.id, record.bucket_name.clone()))
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::downgrade(&record));
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(anyhow!("Record already exists")),
+        }
     }
 
     /// Register a RecordInner with the node, with the intention of preventing duplicate resident records.

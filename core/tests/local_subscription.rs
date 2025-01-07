@@ -1,14 +1,12 @@
 #[cfg(feature = "derive")]
 use ankurah_core::model::Model;
-use ankurah_core::property::YrsString;
 use ankurah_core::resultset::ResultSet;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};
-use ankurah_derive::Model;
 use std::sync::{Arc, Mutex};
 
 mod common;
-use common::{Album, AlbumRecord, ChangeKind, Pet, PetRecord};
+use common::{Album, AlbumRecord, ChangeKind, Pet};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

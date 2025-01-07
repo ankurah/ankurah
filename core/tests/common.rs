@@ -54,6 +54,7 @@ impl From<&ItemChange> for ChangeKind {
     }
 }
 
+#[allow(unused)]
 pub fn changeset_watcher() -> (
     Box<dyn Fn(ChangeSet) + Send + Sync>,
     Box<dyn Fn() -> Vec<(proto::ID, ChangeKind)>>,

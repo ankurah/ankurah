@@ -16,7 +16,7 @@ use append_only_vec::AppendOnlyVec;
 pub struct Transaction {
     pub(crate) node: Arc<Node>, // only here for committing records to storage engine
 
-    records: AppendOnlyVec<RecordInner>,
+    records: AppendOnlyVec<Arc<RecordInner>>,
 
     // markers
     implicit: bool,
@@ -34,32 +34,24 @@ impl Transaction {
     }
 
     /// Fetch a record already in the transaction.
-    pub fn fetch_record_from_transaction(
+    pub async fn get_record(
         &self,
         id: ID,
         bucket_name: &'static str,
-    ) -> Option<&RecordInner> {
-        self.records
+    ) -> Result<&Arc<RecordInner>, RetrievalError> {
+        if let Some(record) = self
+            .records
             .iter()
-            .find(|&record| record.id() == id && record.bucket_name() == bucket_name)
-    }
-
-    /// Fetch a record.
-    pub async fn fetch_record(
-        &self,
-        id: ID,
-        bucket_name: &'static str,
-    ) -> Result<&RecordInner, RetrievalError> {
-        if let Some(local) = self.fetch_record_from_transaction(id, bucket_name) {
-            return Ok(local);
+            .find(|record| record.id() == id && record.bucket_name() == bucket_name)
+        {
+            return Ok(record);
         }
 
-        let record_inner = self.node.fetch_record_inner(id, bucket_name).await?;
-        let record_ref = self.add_record(record_inner.snapshot());
-        Ok(record_ref)
+        let upstream = self.node.fetch_record_inner(id, bucket_name).await?;
+        Ok(self.add_record(upstream.snapshot()))
     }
 
-    pub fn add_record(&self, record: RecordInner) -> &RecordInner {
+    fn add_record(&self, record: Arc<RecordInner>) -> &Arc<RecordInner> {
         let index = self.records.push(record);
         &self.records[index]
     }
@@ -69,9 +61,9 @@ impl Transaction {
         model: &M,
     ) -> M::ScopedRecord<'rec> {
         let id = self.node.next_record_id();
-        let record_inner = model.to_record_inner(id);
-        let record_ref = self.add_record(record_inner);
-        <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref)
+        let new_record = Arc::new(model.create_record(id));
+        let record_ref = self.add_record(new_record);
+        <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::new(record_ref)
     }
 
     pub async fn edit<'rec, 'trx: 'rec, M: Model>(
@@ -79,8 +71,9 @@ impl Transaction {
         id: impl Into<ID>,
     ) -> Result<M::ScopedRecord<'rec>, crate::error::RetrievalError> {
         let id = id.into();
-        let record_ref = self.fetch_record(id, M::bucket_name()).await?;
-        Ok(<M::ScopedRecord<'rec> as ScopedRecord<'rec>>::from_record_inner(record_ref))
+        let record = self.get_record(id, M::bucket_name()).await?;
+
+        Ok(<M::ScopedRecord<'rec> as ScopedRecord<'rec>>::new(record))
     }
 
     #[must_use]
@@ -96,7 +89,12 @@ impl Transaction {
         // this should probably be done in parallel, but microoptimizations
         let mut record_events = Vec::new();
         for record in self.records.iter() {
-            if let Some(record_event) = record.get_record_event()? {
+            if let Some(record_event) = record.commit()? {
+                if let Some(upstream) = &record.upstream {
+                    upstream.apply_record_event(&record_event)?;
+                } else {
+                    self.node.insert_record(record.clone()).await?;
+                }
                 record_events.push(record_event);
             }
         }
