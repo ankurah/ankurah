@@ -17,7 +17,7 @@ use crate::{
     subscription::SubscriptionHandle,
     transaction::Transaction,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
@@ -179,8 +179,13 @@ impl Node {
                         .map(|c| c.sender.cloned())
                 } {
                     let from = request.from.clone();
-                    let to = request.to.clone();
                     let request_id = request.id.clone();
+                    if request.to != self.id {
+                        warn!(
+                            "{} received message from {} but is not the intended recipient",
+                            self.id, request.from
+                        );
+                    }
 
                     let body = match self.handle_request(request).await {
                         Ok(result) => result,

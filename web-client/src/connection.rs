@@ -1,6 +1,6 @@
 use crate::connection_state::ConnectionState;
 use ankurah_core::{connector::PeerSender, Node};
-use ankurah_proto::{self as proto, Presence};
+use ankurah_proto::{self as proto};
 use async_trait::async_trait;
 use js_sys::Uint8Array;
 use reactive_graph::prelude::*;

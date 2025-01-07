@@ -15,8 +15,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Event, IdbDatabase, IdbFactory, IdbIndexParameters, IdbObjectStore, IdbOpenDbRequest,
-    IdbRequest, IdbVersionChangeEvent,
+    Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent,
 };
 
 pub struct IndexedDBStorageEngine {

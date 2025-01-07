@@ -6,8 +6,6 @@ use example_model::*;
 use tracing::{error, info};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
-const API_SERVER: &str = "ws://localhost:8080";
-
 #[wasm_bindgen(start)]
 pub async fn start() -> Result<(), JsValue> {
     tracing_wasm::set_as_global_default();

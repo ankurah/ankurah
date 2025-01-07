@@ -119,8 +119,8 @@ async fn main() -> Result<()> {
         );
 
         let album_id = album.id();
-        let from_scoped_album = trx.edit::<Album>(&album).await?;
-        let from_id = trx.edit::<Album>(album_id).await?;
+        // let from_scoped_album = trx.edit::<Album>(&album).await?;
+        // let from_id = trx.edit::<Album>(album_id).await?;
 
         trx.commit().await?;
 
