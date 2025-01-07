@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
 
     // Initialize storage engine
     let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
-    let node = Arc::new(Node::new(Arc::new(storage)));
+    let node = Arc::new(Node::new_durable(Arc::new(storage)));
 
     // Create and start the websocket server
     let server = WebsocketServer::new(node);

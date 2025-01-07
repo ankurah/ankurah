@@ -32,13 +32,13 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
 
 use ankurah_core::resultset::ResultSet;
 #[wasm_bindgen]
-pub async fn fetch_test_records(client: &WebsocketClient) -> Vec<SessionRecord> {
+pub async fn fetch_test_records(client: &WebsocketClient) -> Result<Vec<SessionRecord>, JsValue> {
     let sessions: ResultSet<SessionRecord> = client
         .node()
         .fetch("date_connected = '2024-01-01'")
         .await
-        .unwrap();
-    sessions.into()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    Ok(sessions.into())
 
     // .into_iter()
     // .map(|r| {
