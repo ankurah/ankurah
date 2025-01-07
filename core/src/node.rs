@@ -307,7 +307,7 @@ impl Node {
                 .await?
         };
 
-        let subscription_id = handle.id.clone();
+        let subscription_id = handle.id;
         // Store the subscription handle
         let mut peer_connections = self.peer_connections.write().await;
         if let Some(peer_state) = peer_connections.get_mut(&peer_id) {
@@ -625,7 +625,7 @@ impl Node {
         let raw_bucket = self.bucket(bucket_name).await;
         match raw_bucket.0.get_record(id).await {
             Ok(record_state) => {
-                return Ok(self.assert_record(bucket_name, id, &record_state).await?);
+                return self.assert_record(bucket_name, id, &record_state).await;
             }
             Err(RetrievalError::NotFound(id)) => {
                 // let scoped_record = RecordInner::new(id, bucket_name.to_string());

@@ -10,7 +10,6 @@ use ankql::selection::filter::Filterable;
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::info;
 
 use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

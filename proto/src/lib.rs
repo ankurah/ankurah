@@ -75,6 +75,12 @@ impl RequestId {
     }
 }
 
+impl Default for SubscriptionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SubscriptionId {
     pub fn new() -> Self {
         Self(Ulid::new())
@@ -347,7 +353,7 @@ impl std::fmt::Display for NodeResponseBody {
                 subscription_id,
                 initial
                     .iter()
-                    .map(|(id, state)| format!("{} {}", id.to_string(), state))
+                    .map(|(id, state)| format!("{} {}", id, state))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -394,9 +400,9 @@ impl TryFrom<JsValue> for Clock {
     }
 }
 
-impl Into<JsValue> for &Clock {
-    fn into(self) -> JsValue {
-        let strings = self.to_strings();
+impl From<&Clock> for JsValue {
+    fn from(val: &Clock) -> Self {
+        let strings = val.to_strings();
         // This should not be able to fail
         serde_wasm_bindgen::to_value(&strings).expect("Failed to serialize clock")
     }

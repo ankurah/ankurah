@@ -25,7 +25,6 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
     let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797")?;
 
     info!("Waiting for client to connect");
-    let state = connector.connection_state();
 
     Ok(connector)
 }
@@ -39,17 +38,6 @@ pub async fn fetch_test_records(client: &WebsocketClient) -> Result<Vec<SessionR
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     Ok(sessions.into())
-
-    // .into_iter()
-    // .map(|r| {
-    //     format!(
-    //         "Date: {}, IP: {}, Node: {}",
-    //         r.date_connected(),
-    //         r.ip_address(),
-    //         r.node_id()
-    //     )
-    // })
-    // .collect()
 }
 
 #[wasm_bindgen]
@@ -108,6 +96,6 @@ pub struct TestResultSet(Arc<ResultSet<SessionRecord>>);
 #[wasm_bindgen]
 impl TestResultSet {
     pub fn resultset(&self) -> Vec<SessionRecord> {
-        self.0.records.iter().cloned().collect()
+        self.0.records.to_vec()
     }
 }

@@ -84,20 +84,20 @@ pub struct ChangeSet<R> {
     pub changes: Vec<ItemChange<R>>,
 }
 
-impl<R> Into<ChangeSet<R>> for ChangeSet<Arc<RecordInner>>
+impl<R> From<ChangeSet<Arc<RecordInner>>> for ChangeSet<R>
 where
     R: Record,
 {
-    fn into(self) -> ChangeSet<R> {
+    fn from(val: ChangeSet<Arc<RecordInner>>) -> Self {
         ChangeSet {
             resultset: ResultSet {
-                records: self
+                records: val
                     .resultset
                     .iter()
                     .map(|record| R::from_record_inner(record.clone()))
                     .collect(),
             },
-            changes: self
+            changes: val
                 .changes
                 .into_iter()
                 .map(|change| change.into())

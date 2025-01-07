@@ -1,4 +1,3 @@
-use ankurah_core::connector::PeerSender;
 use ankurah_proto as proto;
 use anyhow::Result;
 use axum::extract::{connect_info::ConnectInfo, State};

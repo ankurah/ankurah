@@ -1,6 +1,4 @@
 use ankurah_core::changes::ChangeSet;
-#[cfg(feature = "derive")]
-use ankurah_core::model::Model;
 use ankurah_core::resultset::ResultSet;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::ScopedRecord, node::Node};

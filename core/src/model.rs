@@ -1,13 +1,11 @@
 use ankurah_proto::{self as proto, Clock};
 use proto::{RecordEvent, RecordState};
-use tracing::debug;
 use tracing::info;
 // use futures_signals::signal::Signal;
 
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::Node;
 use crate::{error::RetrievalError, property::Backends};
 
 use anyhow::Result;
@@ -99,7 +97,7 @@ impl RecordInner {
         bucket_name: &str,
         record_state: &RecordState,
     ) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(&record_state)?;
+        let backends = Backends::from_state_buffers(record_state)?;
 
         Ok(Self {
             id,

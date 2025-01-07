@@ -6,7 +6,6 @@ use crate::{
     model::{RecordInner, ScopedRecord},
     Model, Node,
 };
-use tracing::debug;
 
 use append_only_vec::AppendOnlyVec;
 
