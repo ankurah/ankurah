@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::{
     error::RetrievalError,
-    model::{RecordInner, ScopedRecord},
+    model::{Entity, Mutable},
     Model, Node,
 };
 
@@ -13,9 +13,9 @@ use append_only_vec::AppendOnlyVec;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 pub struct Transaction {
-    pub(crate) node: Arc<Node>, // only here for committing records to storage engine
+    pub(crate) node: Arc<Node>, // only here for committing entities to storage engine
 
-    records: AppendOnlyVec<Arc<RecordInner>>,
+    entities: AppendOnlyVec<Arc<Entity>>,
 
     // markers
     implicit: bool,
@@ -23,38 +23,35 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new(node: Arc<Node>) -> Self { Self { node, records: AppendOnlyVec::new(), implicit: true, consumed: false } }
+    pub fn new(node: Arc<Node>) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
 
-    /// Fetch a record already in the transaction.
-    pub async fn get_record(&self, id: ID, bucket_name: &'static str) -> Result<&Arc<RecordInner>, RetrievalError> {
-        if let Some(record) = self.records.iter().find(|record| record.id() == id && record.bucket_name() == bucket_name) {
-            return Ok(record);
+    /// Fetch an entity already in the transaction.
+    pub async fn get_entity(&self, id: ID, collection: &'static str) -> Result<&Arc<Entity>, RetrievalError> {
+        if let Some(entity) = self.entities.iter().find(|entity| entity.id() == id && entity.collection() == collection) {
+            return Ok(entity);
         }
 
-        let upstream = self.node.fetch_record_inner(id, bucket_name).await?;
-        Ok(self.add_record(upstream.snapshot()))
+        let upstream = self.node.fetch_entity(id, collection).await?;
+        Ok(self.add_entity(upstream.snapshot()))
     }
 
-    fn add_record(&self, record: Arc<RecordInner>) -> &Arc<RecordInner> {
-        let index = self.records.push(record);
-        &self.records[index]
+    fn add_entity(&self, entity: Arc<Entity>) -> &Arc<Entity> {
+        let index = self.entities.push(entity);
+        &self.entities[index]
     }
 
-    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::ScopedRecord<'rec> {
-        let id = self.node.next_record_id();
-        let new_record = Arc::new(model.create_record(id));
-        let record_ref = self.add_record(new_record);
-        <M::ScopedRecord<'rec> as ScopedRecord<'rec>>::new(record_ref)
+    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec> {
+        let id = self.node.next_entity_id();
+        let new_entity = Arc::new(model.create_entity(id));
+        let entity_ref = self.add_entity(new_entity);
+        <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
     }
 
-    pub async fn edit<'rec, 'trx: 'rec, M: Model>(
-        &'trx self,
-        id: impl Into<ID>,
-    ) -> Result<M::ScopedRecord<'rec>, crate::error::RetrievalError> {
+    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<ID>) -> Result<M::Mutable<'rec>, crate::error::RetrievalError> {
         let id = id.into();
-        let record = self.get_record(id, M::bucket_name()).await?;
+        let entity = self.get_entity(id, M::collection()).await?;
 
-        Ok(<M::ScopedRecord<'rec> as ScopedRecord<'rec>>::new(record))
+        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
     }
 
     #[must_use]
@@ -66,18 +63,18 @@ impl Transaction {
         tracing::debug!("trx.commit");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
-        let mut record_events = Vec::new();
-        for record in self.records.iter() {
-            if let Some(record_event) = record.commit()? {
-                if let Some(upstream) = &record.upstream {
-                    upstream.apply_record_event(&record_event)?;
+        let mut entity_events = Vec::new();
+        for entity in self.entities.iter() {
+            if let Some(entity_event) = entity.commit()? {
+                if let Some(upstream) = &entity.upstream {
+                    upstream.apply_event(&entity_event)?;
                 } else {
-                    self.node.insert_record(record.clone()).await?;
+                    self.node.insert_entity(entity.clone()).await?;
                 }
-                record_events.push(record_event);
+                entity_events.push(entity_event);
             }
         }
-        self.node.commit_events(&record_events).await?;
+        self.node.commit_events(&entity_events).await?;
 
         Ok(())
     }
@@ -88,16 +85,16 @@ impl Transaction {
     }
 
     // TODO: Implement delete functionality after core query/edit operations are stable
-    // For now, "removal" from result sets is handled by edits that cause records to no longer match queries
+    // For now, "removal" from result sets is handled by edits that cause entities to no longer match queries
     /*
     pub async fn delete<'rec, 'trx: 'rec, M: Model>(
         &'trx self,
         id: impl Into<ID>,
     ) -> Result<(), crate::error::RetrievalError> {
         let id = id.into();
-        let record = self.fetch_record(id, M::bucket_name()).await?;
-        let record = Arc::new(record.clone());
-        self.node.delete_record(record).await?;
+        let entity = self.fetch_entity(id, M::collection()).await?;
+        let entity = Arc::new(entity.clone());
+        self.node.delete_entity(entity).await?;
         Ok(())
     }
     */

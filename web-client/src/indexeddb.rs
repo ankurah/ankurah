@@ -1,7 +1,7 @@
 use ankql::selection::filter::evaluate_predicate;
 use ankurah_core::error::RetrievalError;
-use ankurah_core::model::RecordInner;
-use ankurah_core::storage::{StorageBucket, StorageEngine};
+use ankurah_core::model::Entity;
+use ankurah_core::storage::{StorageCollection, StorageEngine};
 use ankurah_proto as proto;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use web_sys::{Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbV
 
 pub struct IndexedDBStorageEngine {
     // We need SendWrapper because despite the ability to declare an async trait as ?Send,
-    // we can't actually define StorageEngine and StorageBucket as optionally Send or !Send.
+    // we can't actually define StorageEngine and StorageCollection as optionally Send or !Send.
     // This appears not to be an issue with the macro, but rather the inability to add supplemental bindings on Generic associated types?
     // A lot of time could be potentially burned on this, so we're just going to use SendWrapper for now.
     // See this thread for more information
@@ -55,8 +55,8 @@ impl IndexedDBStorageEngine {
                 let target: IdbRequest = event.target().unwrap().unchecked_into();
                 let db: SendWrapper<IdbDatabase> = SendWrapper::new(target.result().unwrap().unchecked_into());
 
-                // Create records store with index on collection
-                let store = match db.create_object_store("records") {
+                // Create entities store with index on collection
+                let store = match db.create_object_store("entities") {
                     Ok(store) => store,
                     Err(e) => {
                         tracing::warn!("Error creating store (may already exist): {:?}", e);
@@ -118,28 +118,28 @@ impl IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageEngine for IndexedDBStorageEngine {
-    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>> {
+    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageCollection>> {
         Ok(Arc::new(IndexedDBBucket { db: self.db.clone(), name: name.to_owned() }))
     }
 
     async fn fetch_states(
         &self,
-        bucket_name: String,
+        collection: String,
         predicate: &ankql::ast::Predicate,
-    ) -> Result<Vec<(proto::ID, proto::RecordState)>, RetrievalError> {
+    ) -> Result<Vec<(proto::ID, proto::State)>, RetrievalError> {
         SendWrapper::new(async move {
-            let transaction = self.db.transaction_with_str("records").map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+            let transaction = self.db.transaction_with_str("entities").map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
 
-            let store = transaction.object_store("records").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+            let store = transaction.object_store("entities").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
 
             let index = store.index("by_collection").map_err(|_e| anyhow::anyhow!("Failed to get collection index"))?;
 
             let key_range =
-                web_sys::IdbKeyRange::only(&(&bucket_name).into()).map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
+                web_sys::IdbKeyRange::only(&(&collection).into()).map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
 
             let request = index.open_cursor_with_range(&key_range).map_err(|_e| anyhow::anyhow!("Failed to open cursor"))?;
 
-            let mut records = Vec::new();
+            let mut tuples = Vec::new();
             let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
 
             while let Some(result) = stream.next().await {
@@ -152,13 +152,13 @@ impl StorageEngine for IndexedDBStorageEngine {
 
                 let cursor: web_sys::IdbCursorWithValue = cursor_result.dyn_into().map_err(|_| anyhow::anyhow!("Failed to cast cursor"))?;
 
-                let record = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
+                let entity = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
 
-                let id_str = js_sys::Reflect::get(&record, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get record id"))?;
+                let id_str = js_sys::Reflect::get(&entity, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get entity id"))?;
                 let id = proto::ID::from_ulid(ulid::Ulid::from_string(&id_str.as_string().unwrap()).map_err(RetrievalError::storage)?);
 
                 let state_buffer =
-                    js_sys::Reflect::get(&record, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
+                    js_sys::Reflect::get(&entity, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
                 let array: js_sys::Uint8Array = state_buffer.dyn_into().map_err(|_e| anyhow::anyhow!("Failed to convert state buffer"))?;
 
                 let mut buffer = vec![0; array.length() as usize];
@@ -167,59 +167,59 @@ impl StorageEngine for IndexedDBStorageEngine {
                 let state_buffers: std::collections::BTreeMap<String, Vec<u8>> = bincode::deserialize(&buffer)?;
 
                 // Get the head array
-                let head_data = js_sys::Reflect::get(&record, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
+                let head_data = js_sys::Reflect::get(&entity, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
                 let head: proto::Clock = head_data.try_into().map_err(|e| anyhow::anyhow!("Failed to deserialize head: {}", e))?;
 
-                let record_state = proto::RecordState { state_buffers, head };
+                let entity_state = proto::State { state_buffers, head };
 
-                // Create record to evaluate predicate
-                let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
+                // Create entity to evaluate predicate
+                let entity = Entity::from_state(id, &collection, &entity_state)?;
 
                 // Apply predicate filter
-                if evaluate_predicate(&record_inner, predicate)? {
-                    records.push((id, record_state));
+                if evaluate_predicate(&entity, predicate)? {
+                    tuples.push((id, entity_state));
                 }
 
                 cursor.continue_().map_err(|_e| anyhow::anyhow!("Failed to advance cursor"))?;
             }
 
-            Ok(records)
+            Ok(tuples)
         })
         .await
     }
 }
 
 #[async_trait]
-impl StorageBucket for IndexedDBBucket {
-    async fn set_record(&self, id: proto::ID, state: &proto::RecordState) -> anyhow::Result<bool> {
+impl StorageCollection for IndexedDBBucket {
+    async fn set_state(&self, id: proto::ID, state: &proto::State) -> anyhow::Result<bool> {
         SendWrapper::new(async move {
-            // Get the old record if it exists to check for changes
+            // Get the old entity if it exists to check for changes
             let transaction = self
                 .db
-                .transaction_with_str_and_mode("records", web_sys::IdbTransactionMode::Readwrite)
+                .transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readwrite)
                 .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
 
-            let store = transaction.object_store("records").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+            let store = transaction.object_store("entities").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
 
-            let old_request = store.get(&id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
+            let old_request = store.get(&id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to get old entity"))?;
 
             crate::cb_future::CBFuture::new(&old_request, "success", "error")
                 .await
-                .map_err(|_e| anyhow::anyhow!("Failed to get old record"))?;
+                .map_err(|_e| anyhow::anyhow!("Failed to get old entity"))?;
 
-            let old_record: JsValue = old_request.result().unwrap();
+            let old_entity: JsValue = old_request.result().unwrap();
 
-            // Check if the record changed
-            if !old_record.is_undefined() && !old_record.is_null() {
-                let old_head = js_sys::Reflect::get(&old_record, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
+            // Check if the entity changed
+            if !old_entity.is_undefined() && !old_entity.is_null() {
+                let old_head = js_sys::Reflect::get(&old_entity, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
                 if !old_head.is_undefined() && !old_head.is_null() {
                     let old_clock: proto::Clock = old_head.try_into().map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
                     if old_clock == state.head {
                         // No change in head, skip update
                         // HACK - we still need to lie and return true because there are good odds the other browser is yours
-                        // and has already updated the record 🤦
+                        // and has already updated the entity 🤦
                         // ...andd this breaks subscription notification
-                        // Ideally we'd use the node to check for changes, but we can't assume that the subscriber is keeping the records resident
+                        // Ideally we'd use the node to check for changes, but we can't assume that the subscriber is keeping the entities resident
                         // and the node is using weak references so they might be freed
                         return Ok(true);
                     }
@@ -227,72 +227,72 @@ impl StorageBucket for IndexedDBBucket {
             }
 
             // Create a JS object to store our data
-            let record = js_sys::Object::new();
-            js_sys::Reflect::set(&record, &"id".into(), &id.as_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set id on record"))?;
-            js_sys::Reflect::set(&record, &"collection".into(), &self.name.clone().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set collection on record"))?;
+            let entity = js_sys::Object::new();
+            js_sys::Reflect::set(&entity, &"id".into(), &id.as_string().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set id on entity"))?;
+            js_sys::Reflect::set(&entity, &"collection".into(), &self.name.clone().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set collection on entity"))?;
 
             // Store state_buffers
             let state_buffer = bincode::serialize(&state.state_buffers)?;
-            js_sys::Reflect::set(&record, &"state_buffer".into(), &js_sys::Uint8Array::from(&state_buffer[..]).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set data on record"))?;
+            js_sys::Reflect::set(&entity, &"state_buffer".into(), &js_sys::Uint8Array::from(&state_buffer[..]).into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set data on entity"))?;
 
-            js_sys::Reflect::set(&record, &"head".into(), &(&(state.head)).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set head on record"))?;
+            js_sys::Reflect::set(&entity, &"head".into(), &(&(state.head)).into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set head on entity"))?;
 
-            // Put the record in the store
+            // Put the entity in the store
             let request =
-                store.put_with_key(&record, &id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
+                store.put_with_key(&entity, &id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to put entity in store"))?;
 
             let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
-            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put record in store"))?;
+            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put entity in store"))?;
 
             let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
             trx_fut.await.map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
 
-            Ok(true) // Record was updated
+            Ok(true) // It was updated
         })
         .await
     }
 
-    async fn get_record(&self, id: proto::ID) -> Result<proto::RecordState, RetrievalError> {
+    async fn get_state(&self, id: proto::ID) -> Result<proto::State, RetrievalError> {
         SendWrapper::new(async move {
             // Create transaction and get object store
             let transaction = self
                 .db
-                .transaction_with_str("records")
+                .transaction_with_str("entities")
                 .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to create transaction").into()))?;
 
             let store = transaction
-                .object_store("records")
+                .object_store("entities")
                 .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get object store").into()))?;
 
-            // Get the record
+            // Get the entity
             let request = store
                 .get(&id.as_string().into())
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 1").into()))?;
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 1").into()))?;
 
             crate::cb_future::CBFuture::new(&request, "success", "error")
                 .await
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 2").into()))?;
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 2").into()))?;
 
             let result = request.result().unwrap();
 
-            // Check if the record exists
+            // Check if the entity exists
             if result.is_undefined() || result.is_null() {
                 return Err(RetrievalError::NotFound(id));
             }
 
             // Get the data from the JS object
-            let record: web_sys::js_sys::Object =
-                result.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 3").into()))?;
+            let entity: web_sys::js_sys::Object =
+                result.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 3").into()))?;
 
-            let data = js_sys::Reflect::get(&record, &"state_buffer".into())
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 4").into()))?;
+            let data = js_sys::Reflect::get(&entity, &"state_buffer".into())
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 4").into()))?;
 
             let array: js_sys::Uint8Array =
-                data.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get record 5").into()))?;
+                data.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 5").into()))?;
 
             let mut buffer = vec![0; array.length() as usize];
             array.copy_to(&mut buffer);
@@ -301,13 +301,13 @@ impl StorageBucket for IndexedDBBucket {
             let state_buffers = bincode::deserialize(&buffer)?;
 
             // Get the head array
-            let head_data = js_sys::Reflect::get(&record, &"head".into())
+            let head_data = js_sys::Reflect::get(&entity, &"head".into())
                 .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get head").into()))?;
             let head: proto::Clock = head_data
                 .try_into()
                 .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to deserialize head: {}", e).into()))?;
 
-            Ok(proto::RecordState { state_buffers, head })
+            Ok(proto::State { state_buffers, head })
         })
         .await
     }
@@ -320,7 +320,7 @@ mod tests {
 
     use super::*;
     use ankurah_core::property::value::YrsString;
-    use ankurah_core::{model::ScopedRecord, node::Node};
+    use ankurah_core::{model::Mutable, node::Node};
     use ankurah_derive::Model;
     use serde::{Deserialize, Serialize};
     use wasm_bindgen_test::*;
@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn test_set_and_get_record() {
+    async fn test_set_and_get_entity() {
         setup().await.expect("Failed to setup test");
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
@@ -383,17 +383,17 @@ mod tests {
 
         let bucket = engine.bucket("albums").await.expect("Failed to create bucket");
 
-        // Create a test record
+        // Create a test entity
         let id = proto::ID::from_ulid(ulid::Ulid::new());
         let mut state_buffers = std::collections::BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
-        let state = proto::RecordState { state_buffers, head: proto::Clock::default() };
+        let state = proto::State { state_buffers, head: proto::Clock::default() };
 
-        // Set the record
-        bucket.set_record(id.clone(), &state).await.expect("Failed to set record");
+        // Set the entity
+        bucket.set_state(id.clone(), &state).await.expect("Failed to set entity");
 
-        // Get the record back
-        let retrieved_state = bucket.get_record(id).await.expect("Failed to get record 6");
+        // Get the entity back
+        let retrieved_state = bucket.get_state(id).await.expect("Failed to get entity 6");
         tracing::info!("Retrieved state: {:?}", retrieved_state);
 
         assert_eq!(state.state_buffers, retrieved_state.state_buffers);
@@ -431,8 +431,8 @@ mod tests {
             tracing::info!("Transaction committed");
         }
 
-        // Retrieve the record
-        let album_ro: AlbumRecord = node.get_record(id).await?;
+        // Retrieve the entity
+        let album_ro: AlbumView = node.get_entity(id).await?;
         assert_eq!(album_ro.name(), "The rest of the owl");
         assert_eq!(album_ro.year(), "2024");
 
@@ -467,10 +467,10 @@ mod tests {
             trx.commit().await?;
         }
 
-        let albums: ankurah_core::resultset::ResultSet<AlbumRecord> = node.fetch("name = 'Walking on a Dream'").await?;
+        let albums: ankurah_core::resultset::ResultSet<AlbumView> = node.fetch("name = 'Walking on a Dream'").await?;
 
         assert_eq!(
-            albums.records.iter().map(|active_record| active_record.name()).collect::<Vec<String>>(),
+            albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(),
             vec!["Walking on a Dream".to_string()]
         );
 

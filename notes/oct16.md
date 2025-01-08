@@ -1,4 +1,4 @@
-Production-usable event-sourced ORM which uses an off the shelf database for storage - Creating records - Setting records - Deleting records - Relationships?
+Production-usable event-sourced ORM which uses an off the shelf database for storage - Creating entities - Setting entities - Deleting entities - Relationships?
 Rust structs for data modeling - Alter database based on this? Making rust structs the ground truth for data layout. - Derive macros to set up relationships?
 Signals pattern for notifications - Per storage source implementation?
 WASM Bindings for client-side use
@@ -29,7 +29,7 @@ state BINARY // this contains all state necessary to reconstitute a yrs::Doc, or
 
 CREATE TABLE album_events (
 id ULID
-record_id ULID,
+entity_id ULID,
 user_id ULID,
 precursors ARRAY<ULID>,
 operations BINARY serde serialized Vec<TypeModuleOp>
@@ -38,8 +38,8 @@ operations BINARY serde serialized Vec<TypeModuleOp>
 op1 <- op2 <- op3 <- op4
 \- opQ <- opR /
 
-#kvstore mechanics for record-based storage
-bucket1 uses pkey as the key and contains the serialized record as the value
+#kvstore mechanics for entity-based storage
+bucket1 uses pkey as the key and contains the serialized entity as the value
 other buckets define indexes:
 
 - bucket2 uses the collated name as the key and the pkey as the value

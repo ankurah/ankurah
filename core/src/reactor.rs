@@ -1,6 +1,6 @@
 use super::comparision_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
-use crate::model::RecordInner;
+use crate::model::Entity;
 use crate::resultset::ResultSet;
 use crate::storage::StorageEngine;
 use crate::subscription::{Subscription, SubscriptionHandle};
@@ -18,73 +18,73 @@ impl From<&str> for FieldId {
     fn from(val: &str) -> Self { FieldId(val.to_string()) }
 }
 
-/// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of records
+/// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor {
     /// Current subscriptions
-    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Arc<RecordInner>>>>,
+    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Arc<Entity>>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: DashMap<FieldId, ComparisonIndex>,
-    /// Index of subscriptions that presently match each record.
-    /// This is used to quickly find all subscriptions that need to be notified when a record changes.
+    /// Index of subscriptions that presently match each entity.
+    /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
-    record_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
+    entity_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
     /// Reference to the storage engine
     storage: Arc<dyn StorageEngine>,
 }
 
 impl Reactor {
     pub fn new(storage: Arc<dyn StorageEngine>) -> Arc<Self> {
-        Arc::new(Self { subscriptions: DashMap::new(), index_watchers: DashMap::new(), record_watchers: DashMap::new(), storage })
+        Arc::new(Self { subscriptions: DashMap::new(), index_watchers: DashMap::new(), entity_watchers: DashMap::new(), storage })
     }
 
     pub async fn subscribe<F>(
         self: &Arc<Self>,
-        bucket_name: &str,
+        collection: &str,
         predicate: ast::Predicate,
         callback: F,
     ) -> anyhow::Result<SubscriptionHandle>
     where
-        F: Fn(ChangeSet<Arc<RecordInner>>) + Send + Sync + 'static,
+        F: Fn(ChangeSet<Arc<Entity>>) + Send + Sync + 'static,
     {
         let sub_id = proto::SubscriptionId::new();
 
         // Start watching the relevant indexes
         self.add_index_watchers(sub_id, &predicate);
 
-        // Find initial matching records
-        let states = self.storage.fetch_states(bucket_name.to_string(), &predicate).await?;
-        let mut matching_records = Vec::new();
+        // Find initial matching entities
+        let states = self.storage.fetch_states(collection.to_string(), &predicate).await?;
+        let mut matching_entities = Vec::new();
 
-        // Convert states to RecordInner and filter by predicate
+        // Convert states to Entity and filter by predicate
         for (id, state) in states {
-            let record = crate::model::RecordInner::from_record_state(id, bucket_name, &state)?;
-            let record = Arc::new(record);
+            let entity = crate::model::Entity::from_state(id, collection, &state)?;
+            let entity = Arc::new(entity);
 
-            // Evaluate predicate for each record
-            if ankql::selection::filter::evaluate_predicate(&*record, &predicate).unwrap_or(false) {
-                matching_records.push(record.clone());
+            // Evaluate predicate for each entity
+            if ankql::selection::filter::evaluate_predicate(&*entity, &predicate).unwrap_or(false) {
+                matching_entities.push(entity.clone());
 
-                // Set up record watchers
-                self.record_watchers.entry(record.id()).or_default().push(sub_id);
+                // Set up entity watchers
+                self.entity_watchers.entry(entity.id()).or_default().push(sub_id);
             }
         }
 
-        // Create subscription with initial matching records
+        // Create subscription with initial matching entities
         let subscription = Arc::new(Subscription {
             id: sub_id,
             predicate,
             callback: Arc::new(Box::new(callback)),
-            matching_records: std::sync::Mutex::new(matching_records.clone()),
+            matching_entities: std::sync::Mutex::new(matching_entities.clone()),
         });
 
         // Store subscription
         self.subscriptions.insert(sub_id, subscription.clone());
 
         // Call callback with initial state
-        if !matching_records.is_empty() {
+        if !matching_entities.is_empty() {
             (subscription.callback)(ChangeSet {
-                changes: matching_records.iter().map(|record| ItemChange::Initial { record: record.clone() }).collect(),
-                resultset: ResultSet { records: matching_records.clone() },
+                changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
+                resultset: ResultSet { items: matching_entities.clone() },
             });
         }
 
@@ -146,32 +146,32 @@ impl Reactor {
             // Remove from index watchers
             self.remove_index_watchers(sub_id, &subscription.predicate);
 
-            // Remove from record watchers using subscription's matching_records
-            let matching = subscription.matching_records.lock().unwrap();
-            for record in matching.iter() {
-                if let Some(mut watchers) = self.record_watchers.get_mut(&record.id()) {
+            // Remove from entity watchers using subscription's matching_entities
+            let matching = subscription.matching_entities.lock().unwrap();
+            for entity in matching.iter() {
+                if let Some(mut watchers) = self.entity_watchers.get_mut(&entity.id()) {
                     watchers.retain(|&id| id != sub_id);
                 }
             }
         }
     }
 
-    /// Update record watchers when a record's matching status changes
-    fn update_record_watchers(&self, record: &Arc<crate::model::RecordInner>, matching: bool, sub_id: proto::SubscriptionId) {
+    /// Update entity watchers when an entity's matching status changes
+    fn update_entity_watchers(&self, entity: &Arc<crate::model::Entity>, matching: bool, sub_id: proto::SubscriptionId) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
-            let mut records = subscription.matching_records.lock().unwrap();
-            let mut watchers = self.record_watchers.entry(record.id()).or_default();
+            let mut entities = subscription.matching_entities.lock().unwrap();
+            let mut watchers = self.entity_watchers.entry(entity.id()).or_default();
 
-            // TODO - we can't just use the matching flag, because we need to know if the record was in the set before
+            // TODO - we can't just use the matching flag, because we need to know if the entity was in the set before
             // or after calling notify_change
-            let did_match = records.iter().any(|r| r.id() == record.id());
+            let did_match = entities.iter().any(|r| r.id() == entity.id());
             match (did_match, matching) {
                 (false, true) => {
-                    records.push(record.clone());
+                    entities.push(entity.clone());
                     watchers.push(sub_id);
                 }
                 (true, false) => {
-                    records.retain(|r| r.id() != record.id());
+                    entities.retain(|r| r.id() != entity.id());
                     watchers.retain(|&id| id != sub_id);
                 }
                 _ => {} // No change needed
@@ -179,10 +179,10 @@ impl Reactor {
         }
     }
 
-    /// Notify subscriptions about a record change
+    /// Notify subscriptions about an entity change
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
         // Group changes by subscription
-        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Arc<RecordInner>>>> =
+        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Arc<Entity>>>> =
             std::collections::HashMap::new();
 
         for change in &changes {
@@ -190,8 +190,8 @@ impl Reactor {
 
             // Find subscriptions that might be interested based on index watchers
             for index_ref in self.index_watchers.iter() {
-                // Get the field value from the record
-                if let Some(field_value) = change.record.value(&index_ref.key().0) {
+                // Get the field value from the entity
+                if let Some(field_value) = change.entity.value(&index_ref.key().0) {
                     possibly_interested_subs.extend(index_ref.find_matching(Value::String(field_value)));
                 }
             }
@@ -199,33 +199,33 @@ impl Reactor {
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                    let record = &change.record;
-                    // Use evaluate_predicate directly on the record instead of fetch_records
-                    let matches = ankql::selection::filter::evaluate_predicate(&**record, &subscription.predicate).unwrap_or(false);
+                    let entity = &change.entity;
+                    // Use evaluate_predicate directly on the entity instead of fetch_entities
+                    let matches = ankql::selection::filter::evaluate_predicate(&**entity, &subscription.predicate).unwrap_or(false);
 
-                    let did_match = subscription.matching_records.lock().unwrap().iter().any(|r| r.id() == record.id());
+                    let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id() == entity.id());
 
-                    // Update record watchers and notify subscription if needed
-                    self.update_record_watchers(record, matches, sub_id);
+                    // Update entity watchers and notify subscription if needed
+                    self.update_entity_watchers(entity, matches, sub_id);
 
                     // info!(
                     //     "NOTIFY CHANGE: {} {matches} {did_match} {change:?}",
-                    //     record.id(),
+                    //     entity.id(),
                     //     change = change.clone()
                     // );
                     // Determine the change type
-                    let new_change: Option<ItemChange<Arc<RecordInner>>> = if matches != did_match {
+                    let new_change: Option<ItemChange<Arc<Entity>>> = if matches != did_match {
                         // Matching status changed
                         Some(if matches {
-                            ItemChange::Add { record: record.clone(), events: change.events.clone() }
+                            ItemChange::Add { item: entity.clone(), events: change.events.clone() }
                         } else {
-                            ItemChange::Remove { record: record.clone(), events: change.events.clone() }
+                            ItemChange::Remove { item: entity.clone(), events: change.events.clone() }
                         })
                     } else if matches {
-                        // Record still matches but was updated
-                        Some(ItemChange::Update { record: record.clone(), events: change.events.clone() })
+                        // Entity still matches but was updated
+                        Some(ItemChange::Update { item: entity.clone(), events: change.events.clone() })
                     } else {
-                        // Record didn't match before and still doesn't match
+                        // Entity didn't match before and still doesn't match
                         None
                     };
 
@@ -241,7 +241,7 @@ impl Reactor {
         for (sub_id, changes) in sub_changes {
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
                 (subscription.callback)(ChangeSet {
-                    resultset: ResultSet { records: subscription.matching_records.lock().unwrap().clone() },
+                    resultset: ResultSet { items: subscription.matching_entities.lock().unwrap().clone() },
                     changes,
                 });
             }

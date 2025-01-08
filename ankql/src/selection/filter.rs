@@ -1,4 +1,4 @@
-//! Filter records based on a predicate. This is necessary for cases where we are scanning over a set of data
+//! Filter items based on a predicate. This is necessary for cases where we are scanning over a set of data
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
 use crate::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
@@ -20,7 +20,7 @@ pub trait Filterable {
     fn value(&self, name: &str) -> Option<String>;
 }
 
-fn evaluate_expr<R: Filterable>(record: &R, expr: &Expr) -> Result<String, Error> {
+fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<String, Error> {
     match expr {
         Expr::Literal(lit) => Ok(match lit {
             Literal::String(s) => s.clone(),
@@ -29,23 +29,23 @@ fn evaluate_expr<R: Filterable>(record: &R, expr: &Expr) -> Result<String, Error
             Literal::Boolean(b) => b.to_string(),
         }),
         Expr::Identifier(id) => match id {
-            Identifier::Property(name) => record.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone())),
+            Identifier::Property(name) => item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone())),
             Identifier::CollectionProperty(collection, name) => {
-                if collection != record.collection() {
-                    return Err(Error::CollectionMismatch { expected: collection.clone(), actual: record.collection().to_string() });
+                if collection != item.collection() {
+                    return Err(Error::CollectionMismatch { expected: collection.clone(), actual: item.collection().to_string() });
                 }
-                record.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone()))
+                item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone()))
             }
         },
         _ => unimplemented!("Only literal and identifier expressions are supported"),
     }
 }
 
-pub fn evaluate_predicate<R: Filterable>(record: &R, predicate: &Predicate) -> Result<bool, Error> {
+pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Result<bool, Error> {
     match predicate {
         Predicate::Comparison { left, operator, right } => {
-            let left_val = evaluate_expr(record, left)?;
-            let right_val = evaluate_expr(record, right)?;
+            let left_val = evaluate_expr(item, left)?;
+            let right_val = evaluate_expr(item, right)?;
 
             Ok(match operator {
                 ComparisonOperator::Equal => left_val == right_val,
@@ -57,10 +57,10 @@ pub fn evaluate_predicate<R: Filterable>(record: &R, predicate: &Predicate) -> R
                 _ => unimplemented!("Only basic comparison operators are supported"),
             })
         }
-        Predicate::And(left, right) => Ok(evaluate_predicate(record, left)? && evaluate_predicate(record, right)?),
-        Predicate::Or(left, right) => Ok(evaluate_predicate(record, left)? || evaluate_predicate(record, right)?),
-        Predicate::Not(pred) => Ok(!evaluate_predicate(record, pred)?),
-        Predicate::IsNull(expr) => Ok(evaluate_expr(record, expr).is_err()),
+        Predicate::And(left, right) => Ok(evaluate_predicate(item, left)? && evaluate_predicate(item, right)?),
+        Predicate::Or(left, right) => Ok(evaluate_predicate(item, left)? || evaluate_predicate(item, right)?),
+        Predicate::Not(pred) => Ok(!evaluate_predicate(item, pred)?),
+        Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr).is_err()),
     }
 }
 
@@ -92,10 +92,10 @@ where
     type Item = FilterResult<R>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|record| match evaluate_predicate(&record, &self.predicate) {
-            Ok(true) => FilterResult::Pass(record),
-            Ok(false) => FilterResult::Skip(record),
-            Err(e) => FilterResult::Error(record, e),
+        self.iter.next().map(|item| match evaluate_predicate(&item, &self.predicate) {
+            Ok(true) => FilterResult::Pass(item),
+            Ok(false) => FilterResult::Skip(item),
+            Err(e) => FilterResult::Error(item, e),
         })
     }
 }
@@ -106,12 +106,12 @@ mod tests {
     use crate::parser::parse_selection;
 
     #[derive(Debug, Clone, PartialEq)]
-    struct TestRecord {
+    struct TestItem {
         name: String,
         age: String,
     }
 
-    impl Filterable for TestRecord {
+    impl Filterable for TestItem {
         fn collection(&self) -> &str { "users" }
 
         fn value(&self, name: &str) -> Option<String> {
@@ -123,65 +123,65 @@ mod tests {
         }
     }
 
-    impl TestRecord {
+    impl TestItem {
         fn new(name: &str, age: &str) -> Self { Self { name: name.to_string(), age: age.to_string() } }
     }
 
     #[test]
     fn test_simple_equality() {
-        let records = vec![TestRecord::new("Alice", "30"), TestRecord::new("Bob", "25"), TestRecord::new("Charlie", "35")];
+        let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "25"), TestItem::new("Charlie", "35")];
 
         let predicate = parse_selection("name = 'Alice'").unwrap();
-        let results: Vec<_> = FilterIterator::new(records.into_iter(), predicate).collect();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
 
         assert_eq!(
             results,
             vec![
-                FilterResult::Pass(TestRecord::new("Alice", "30")),
-                FilterResult::Skip(TestRecord::new("Bob", "25")),
-                FilterResult::Skip(TestRecord::new("Charlie", "35")),
+                FilterResult::Pass(TestItem::new("Alice", "30")),
+                FilterResult::Skip(TestItem::new("Bob", "25")),
+                FilterResult::Skip(TestItem::new("Charlie", "35")),
             ]
         );
     }
 
     #[test]
     fn test_and_condition() {
-        let records = vec![TestRecord::new("Alice", "30"), TestRecord::new("Bob", "30"), TestRecord::new("Charlie", "35")];
+        let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "30"), TestItem::new("Charlie", "35")];
 
         let predicate = parse_selection("name = 'Alice' AND age = '30'").unwrap();
-        let results: Vec<_> = FilterIterator::new(records.into_iter(), predicate).collect();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
 
         assert_eq!(
             results,
             vec![
-                FilterResult::Pass(TestRecord::new("Alice", "30")),
-                FilterResult::Skip(TestRecord::new("Bob", "30")),
-                FilterResult::Skip(TestRecord::new("Charlie", "35")),
+                FilterResult::Pass(TestItem::new("Alice", "30")),
+                FilterResult::Skip(TestItem::new("Bob", "30")),
+                FilterResult::Skip(TestItem::new("Charlie", "35")),
             ]
         );
     }
 
     #[test]
     fn test_complex_condition() {
-        let records = vec![
-            TestRecord::new("Alice", "20"),
-            TestRecord::new("Bob", "25"),
-            TestRecord::new("Charlie", "30"),
-            TestRecord::new("David", "35"),
-            TestRecord::new("Eve", "40"),
+        let items = vec![
+            TestItem::new("Alice", "20"),
+            TestItem::new("Bob", "25"),
+            TestItem::new("Charlie", "30"),
+            TestItem::new("David", "35"),
+            TestItem::new("Eve", "40"),
         ];
 
         let predicate = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
-        let results: Vec<_> = FilterIterator::new(records.into_iter(), predicate).collect();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
 
         assert_eq!(
             results,
             vec![
-                FilterResult::Skip(TestRecord::new("Alice", "20")),
-                FilterResult::Skip(TestRecord::new("Bob", "25")),
-                FilterResult::Pass(TestRecord::new("Charlie", "30")),
-                FilterResult::Skip(TestRecord::new("David", "35")),
-                FilterResult::Skip(TestRecord::new("Eve", "40")),
+                FilterResult::Skip(TestItem::new("Alice", "20")),
+                FilterResult::Skip(TestItem::new("Bob", "25")),
+                FilterResult::Pass(TestItem::new("Charlie", "30")),
+                FilterResult::Skip(TestItem::new("David", "35")),
+                FilterResult::Skip(TestItem::new("Eve", "40")),
             ]
         );
     }

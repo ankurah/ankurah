@@ -1,17 +1,17 @@
 use ankurah_core::changes::ChangeSet;
 use ankurah_core::resultset::ResultSet;
 use ankurah_core::storage::SledStorageEngine;
-use ankurah_core::{model::ScopedRecord, node::Node};
+use ankurah_core::{model::Mutable, node::Node};
 use std::sync::{Arc, Mutex};
 
 mod common;
-use common::{Album, AlbumRecord, ChangeKind, Pet, PetRecord};
+use common::{Album, AlbumView, ChangeKind, Pet, PetView};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
 
-    // Create some initial records
+    // Create some initial entities
     {
         let trx = client.begin();
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
@@ -27,7 +27,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
     let _handle = client
-        .subscribe(predicate, move |changeset: ChangeSet<AlbumRecord>| {
+        .subscribe(predicate, move |changeset: ChangeSet<AlbumView>| {
             let mut received = received_changesets_clone.lock().unwrap();
             received.push(changeset);
         })
@@ -42,11 +42,11 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
         // TODO: Add more specific assertions about the changes
     }
 
-    // Update a record
+    // Update an entity
     {
         let trx = client.begin();
-        let albums: ResultSet<AlbumRecord> = client.fetch("name = 'Ice on the Dune'").await?;
-        let album = albums.records[0].edit(&trx).await?;
+        let albums: ResultSet<AlbumView> = client.fetch("name = 'Ice on the Dune'").await?;
+        let album = albums.items[0].edit(&trx).await?;
         album.year().overwrite(0, 4, "2020");
         trx.commit().await?;
     }
@@ -67,14 +67,14 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 async fn complex_local_subscription() {
     // Create a new node
     let node = Arc::new(Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap())));
-    let (watcher, check) = common::changeset_watcher::<PetRecord>();
+    let (watcher, check) = common::changeset_watcher::<PetView>();
 
     // Subscribe to changes
     let _handle = node.subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher).await.unwrap();
 
     let (rex, snuffy, jasper);
     {
-        // Create some test records
+        // Create some test entities
         let trx = node.begin();
         rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await.read();
 

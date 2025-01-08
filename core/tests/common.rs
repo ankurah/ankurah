@@ -2,7 +2,7 @@ use tracing::Level;
 
 use ankurah_core::{
     changes::{ChangeSet, ItemChange},
-    model::Record,
+    model::View,
     property::value::YrsString,
 };
 use ankurah_derive::Model;
@@ -51,7 +51,7 @@ impl<R> From<&ItemChange<R>> for ChangeKind {
 }
 
 #[allow(unused)]
-pub fn changeset_watcher<R: Record + Send + Sync + 'static>(
+pub fn changeset_watcher<R: View + Send + Sync + 'static>(
 ) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<(proto::ID, ChangeKind)>>) {
     let (tx, rx) = mpsc::channel();
     let watcher = Box::new(move |changeset: ChangeSet<R>| {
@@ -60,7 +60,7 @@ pub fn changeset_watcher<R: Record + Send + Sync + 'static>(
 
     let check = Box::new(move || {
         match rx.try_recv() {
-            Ok(changeset) => changeset.changes.iter().map(|c| (c.record().id(), c.into())).collect(),
+            Ok(changeset) => changeset.changes.iter().map(|c| (c.entity().id(), c.into())).collect(),
             Err(_) => vec![], // Return empty vec instead of panicking
         }
     });

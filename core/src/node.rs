@@ -10,10 +10,10 @@ use crate::{
     changes::{EntityChange, ItemChange},
     connector::PeerSender,
     error::RetrievalError,
-    model::{Record, RecordInner},
+    model::{Entity, View},
     reactor::Reactor,
     resultset::ResultSet,
-    storage::{Bucket, StorageEngine},
+    storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
     transaction::Transaction,
 };
@@ -37,21 +37,14 @@ impl TryInto<FetchArgs> for &str {
     }
 }
 
-/// Manager for all records and their properties on this client.
+/// A participant in the Ankurah network, and primary place where queries are initiated
 pub struct Node {
     pub id: proto::NodeId,
     pub durable: bool,
-    /// Ground truth local state for records.
-    ///
-    /// Things like `postgres`, `sled`, `TKiV`.
     storage_engine: Arc<dyn StorageEngine>,
-    // Storage for each collection
-    collections: RwLock<BTreeMap<String, Bucket>>,
+    collections: RwLock<BTreeMap<String, StorageCollectionWrapper>>,
 
-    // TODO: Something other than an a Mutex/Rwlock?.
-    // We mostly need the mutable access to clean up records we don't care about anymore.
-    //records: Arc<RwLock<BTreeMap<(ID, &'static str), Weak<dyn ScopedRecord>>>>,
-    records: Arc<RwLock<NodeRecords>>,
+    entities: Arc<RwLock<EntityMap>>,
     // peer_connections: Vec<PeerConnection>,
     peer_connections: tokio::sync::RwLock<BTreeMap<proto::NodeId, PeerState>>,
     pending_requests: tokio::sync::RwLock<BTreeMap<proto::RequestId, oneshot::Sender<proto::NodeResponseBody>>>,
@@ -60,7 +53,7 @@ pub struct Node {
     reactor: Arc<Reactor>,
 }
 
-type NodeRecords = BTreeMap<(proto::ID, String), Weak<RecordInner>>;
+type EntityMap = BTreeMap<(proto::ID, String), Weak<Entity>>;
 
 impl Node {
     pub fn new(engine: Arc<dyn StorageEngine>) -> Self {
@@ -69,7 +62,7 @@ impl Node {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
-            records: Arc::new(RwLock::new(BTreeMap::new())),
+            entities: Arc::new(RwLock::new(BTreeMap::new())),
             peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
             reactor,
@@ -82,7 +75,7 @@ impl Node {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
-            records: Arc::new(RwLock::new(BTreeMap::new())),
+            entities: Arc::new(RwLock::new(BTreeMap::new())),
             peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
             reactor,
@@ -183,12 +176,12 @@ impl Node {
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::FetchRecords { collection: bucket_name, predicate } => {
-                let states: Vec<_> = self.storage_engine.fetch_states(bucket_name, &predicate).await?.into_iter().collect();
+            proto::NodeRequestBody::Fetch { collection, predicate } => {
+                let states: Vec<_> = self.storage_engine.fetch_states(collection, &predicate).await?.into_iter().collect();
                 Ok(proto::NodeResponseBody::Fetch(states))
             }
-            proto::NodeRequestBody::Subscribe { collection: bucket_name, predicate } => {
-                self.handle_subscribe_request(request.from, bucket_name, predicate).await
+            proto::NodeRequestBody::Subscribe { collection, predicate } => {
+                self.handle_subscribe_request(request.from, collection, predicate).await
             }
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
                 // Remove and drop the subscription handle
@@ -204,18 +197,18 @@ impl Node {
     async fn handle_subscribe_request(
         self: &Arc<Self>,
         peer_id: proto::NodeId,
-        bucket_name: String,
+        collection: String,
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
         // First fetch initial state
-        let states = self.storage_engine.fetch_states(bucket_name.clone(), &predicate).await?;
+        let states = self.storage_engine.fetch_states(collection.clone(), &predicate).await?;
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
         let handle = {
             let peer_id = peer_id.clone();
             self.reactor
-                .subscribe(&bucket_name, predicate, move |changeset| {
+                .subscribe(&collection, predicate, move |changeset| {
                     // When changes occur, send them to the peer as CommitEvents
                     let events: Vec<_> = changeset
                         .changes
@@ -250,14 +243,14 @@ impl Node {
         Ok(proto::NodeResponseBody::Subscribe { initial: states, subscription_id })
     }
 
-    pub async fn bucket(&self, name: &str) -> Bucket {
+    pub async fn bucket(&self, name: &str) -> StorageCollectionWrapper {
         let collections = self.collections.read().await;
         if let Some(store) = collections.get(name) {
             return store.clone();
         }
         drop(collections);
 
-        let collection = Bucket::new(self.storage_engine.bucket(name).await.unwrap());
+        let collection = StorageCollectionWrapper::new(self.storage_engine.bucket(name).await.unwrap());
 
         let mut collections = self.collections.write().await;
         assert!(collections.insert(name.to_string(), collection.clone()).is_none());
@@ -266,11 +259,11 @@ impl Node {
         collection
     }
 
-    pub fn next_record_id(&self) -> proto::ID { proto::ID::new() }
+    pub fn next_entity_id(&self) -> proto::ID { proto::ID::new() }
 
     /// Begin a transaction.
     ///
-    /// This is the main way to edit records.
+    /// This is the main way to edit Entities.
     pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(self.clone()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
@@ -284,22 +277,22 @@ impl Node {
     //     Ok(result)
     // }
 
-    pub async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::RecordEvent>) -> anyhow::Result<()> {
+    pub async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::Event>) -> anyhow::Result<()> {
         let mut changes = Vec::new();
 
         // First apply events locally
-        for record_event in events {
-            // Apply record events to the Node's global records first.
-            let record = self.fetch_record_inner(record_event.record_id, &record_event.bucket_name).await?;
+        for event in events {
+            // Apply Events to the Node's registered Entities first.
+            let entity = self.fetch_entity(event.entity_id, &event.collection).await?;
 
-            record.apply_record_event(record_event)?;
+            entity.apply_event(event)?;
 
-            let record_state = record.to_record_state()?;
+            let state = entity.to_state()?;
             // Push the state buffers to storage.
-            let changed = self.bucket(record_event.bucket_name()).await.set_record(record_event.record_id, &record_state).await?;
+            let changed = self.bucket(event.collection()).await.set_state(event.entity_id, &state).await?;
 
             if changed {
-                changes.push(EntityChange { record: record.clone(), events: vec![record_event.clone()] });
+                changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });
             }
         }
         self.reactor.notify_change(changes);
@@ -307,93 +300,8 @@ impl Node {
         Ok(())
     }
 
-    // /// Create a new record and notify subscribers
-    // pub(crate) async fn create_record(
-    //     self: &Arc<Self>,
-    //     record: Arc<RecordInner>,
-    // ) -> anyhow::Result<()> {
-    //     // Store the record
-    //     let record_state = record.to_record_state()?;
-    //     self.bucket(record.bucket_name())
-    //         .await
-    //         .set_record(record.id(), &record_state)
-    //         .await?;
-
-    //     // Add to node's records
-    //     let _ = self.add_record(&record).await;
-
-    //     // Notify subscribers about the creation
-    //     let change = RecordChange {
-    //         record: record.clone(),
-    //         updates: vec![], // The record was just created, so no updates yet
-    //         kind: ChangeKind::Add,
-    //     };
-    //     let changeset = ChangeSet {
-    //         changes: vec![change],
-    //     };
-    //     self.reactor.notify_change(changeset);
-
-    //     Ok(())
-    // }
-
-    // /// Delete a record and notify subscribers
-    // pub(crate) async fn delete_record(
-    //     self: &Arc<Self>,
-    //     record: Arc<RecordInner>,
-    // ) -> anyhow::Result<()> {
-    //     // Remove from storage
-    //     self.bucket(record.bucket_name())
-    //         .await
-    //         .delete_record(record.id())
-    //         .await?;
-
-    //     // Remove from node's records
-    //     let mut records = self.records.write().await;
-    //     records.remove(&(record.id(), record.bucket_name().to_string()));
-
-    //     // Notify subscribers
-    //     let change = RecordChange {
-    //         record: record.clone(),
-    //         updates: vec![],
-    //         kind: ChangeKind::Remove,
-    //     };
-    //     let changeset = ChangeSet {
-    //         changes: vec![change],
-    //     };
-    //     self.reactor.notify_change(changeset);
-
-    //     Ok(())
-    // }
-
-    /// Update a record and notify subscribers
-    // pub(crate) async fn update_record(
-    //     self: &Arc<Self>,
-    //     record: Arc<RecordInner>,
-    //     events: Vec<proto::RecordEvent>,
-    // ) -> anyhow::Result<()> {
-    //     // Store the record
-    //     let record_state = record.to_record_state()?;
-    //     self.bucket(record.bucket_name())
-    //         .await
-    //         .set_record(record.id(), &record_state)
-    //         .await?;
-
-    //     // Notify subscribers
-    //     let change = RecordChange {
-    //         record: record.clone(),
-    //         updates: events,
-    //         kind: ChangeKind::Edit,
-    //     };
-    //     let changeset = ChangeSet {
-    //         changes: vec![change],
-    //     };
-    //     self.reactor.notify_change(changeset);
-
-    //     Ok(())
-    // }
-
     /// Apply events to local state buffer and broadcast to peers.
-    pub async fn commit_events(self: &Arc<Self>, events: &Vec<proto::RecordEvent>) -> anyhow::Result<()> {
+    pub async fn commit_events(self: &Arc<Self>, events: &Vec<proto::Event>) -> anyhow::Result<()> {
         self.commit_events_local(events).await?;
 
         // Then propagate to all peers
@@ -418,113 +326,108 @@ impl Node {
         Ok(())
     }
 
-    /// This should be called only by the transaction commit for newly created records
-    /// This is necessary because records created in a transaction scope have no upstream
-    /// so when they hand out read records, they have to work immediately.
-    /// TODO: Discuss. The upside is that you can call .read() on a ScopedRecord. The downside is that the behavior is inconsistent
-    /// between newly created records and records that are created in a transaction scope.
-    pub(crate) async fn insert_record(self: &Arc<Self>, record: Arc<RecordInner>) -> anyhow::Result<()> {
-        match self.records.write().await.entry((record.id, record.bucket_name.clone())) {
+    /// This should be called only by the transaction commit for newly created Entities
+    /// This is necessary because Entities created in a transaction scope have no upstream
+    /// so when they hand out read Entities, they have to work immediately.
+    /// TODO: Discuss. The upside is that you can call .read() on a Mutable. The downside is that the behavior is inconsistent
+    /// between newly created Entities and Entities that are created in a transaction scope.
+    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Arc<Entity>) -> anyhow::Result<()> {
+        match self.entities.write().await.entry((entity.id, entity.collection.clone())) {
             Entry::Vacant(entry) => {
-                entry.insert(Arc::downgrade(&record));
+                entry.insert(Arc::downgrade(&entity));
                 Ok(())
             }
-            Entry::Occupied(_) => Err(anyhow!("Record already exists")),
+            Entry::Occupied(_) => Err(anyhow!("Entity already exists")),
         }
     }
 
-    /// Register a RecordInner with the node, with the intention of preventing duplicate resident records.
-    /// Returns true if the record was already present.
-    /// Note that this does not actually store the record in the storage engine.
+    /// Register a Entity with the node, with the intention of preventing duplicate resident entities.
+    /// Returns true if the Entity was already present.
+    /// Note that this does not actually store the entity in the storage engine.
     #[must_use]
-    pub(crate) async fn assert_record(
-        &self,
-        collection: &str,
-        id: proto::ID,
-        state: &proto::RecordState,
-    ) -> Result<Arc<RecordInner>, RetrievalError> {
-        let mut records = self.records.write().await;
+    pub(crate) async fn assert_entity(&self, collection: &str, id: proto::ID, state: &proto::State) -> Result<Arc<Entity>, RetrievalError> {
+        let mut entities = self.entities.write().await;
 
-        match records.entry((id, collection.to_string())) {
+        match entities.entry((id, collection.to_string())) {
             Entry::Occupied(mut entry) => {
-                if let Some(record) = entry.get().upgrade() {
-                    record.apply_record_state(state)?;
-                    Ok(record)
+                if let Some(entity) = entry.get().upgrade() {
+                    entity.apply_state(state)?;
+                    Ok(entity)
                 } else {
-                    let record = Arc::new(RecordInner::from_record_state(id, collection, state)?);
-                    entry.insert(Arc::downgrade(&record));
-                    Ok(record)
+                    let entity = Arc::new(Entity::from_state(id, collection, state)?);
+                    entry.insert(Arc::downgrade(&entity));
+                    Ok(entity)
                 }
             }
             Entry::Vacant(entry) => {
-                let record = Arc::new(RecordInner::from_record_state(id, collection, state)?);
-                entry.insert(Arc::downgrade(&record));
-                Ok(record)
+                let entity = Arc::new(Entity::from_state(id, collection, state)?);
+                entry.insert(Arc::downgrade(&entity));
+                Ok(entity)
             }
         }
     }
 
-    pub(crate) async fn fetch_record_from_node(&self, id: proto::ID, bucket_name: &str) -> Option<Arc<RecordInner>> {
-        let records = self.records.read().await;
-        if let Some(record) = records.get(&(id, bucket_name.to_string())) {
-            record.upgrade()
+    pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection: &str) -> Option<Arc<Entity>> {
+        let entities = self.entities.read().await;
+        if let Some(entity) = entities.get(&(id, collection.to_string())) {
+            entity.upgrade()
         } else {
             None
         }
     }
 
-    /// Grab the record state if it exists and create a new [`RecordInner`] based on that.
-    // pub(crate) async fn fetch_record_from_storage(
+    /// Grab the entity state if it exists and create a new [`Entity`] based on that.
+    // pub(crate) async fn fetch_entity_from_storage(
     //     &self,
     //     id: proto::ID,
-    //     bucket_name: &str,
-    // ) -> Result<RecordInner, RetrievalError> {
-    //     match self.get_record_state(id, bucket_name).await {
-    //         Ok(record_state) => {
-    //             // info!("fetched record state: {:?}", record_state);
-    //             RecordInner::from_record_state(id, bucket_name, &record_state)
+    //     collection: &str,
+    // ) -> Result<Entity, RetrievalError> {
+    //     match self.get_entity_state(id, collection).await {
+    //         Ok(entity_state) => {
+    //             // info!("fetched entity state: {:?}", entity_state);
+    //             Entity::from_entity_state(id, collection, &entity_state)
     //         }
     //         Err(RetrievalError::NotFound(id)) => {
-    //             // info!("ID not found, creating new record");
-    //             Ok(RecordInner::new(id, bucket_name.to_string()))
+    //             // info!("ID not found, creating new entity");
+    //             Ok(Entity::new(id, collection.to_string()))
     //         }
     //         Err(err) => Err(err),
     //     }
     // }
 
-    /// Fetch a record.
-    pub async fn fetch_record_inner(&self, id: proto::ID, bucket_name: &str) -> Result<Arc<RecordInner>, RetrievalError> {
-        debug!("fetch_record {:?}-{:?}", id, bucket_name);
+    /// Fetch an entity.
+    pub async fn fetch_entity(&self, id: proto::ID, collection: &str) -> Result<Arc<Entity>, RetrievalError> {
+        debug!("fetch_entity {:?}-{:?}", id, collection);
 
-        if let Some(local) = self.fetch_record_from_node(id, bucket_name).await {
+        if let Some(local) = self.fetch_entity_from_node(id, collection).await {
             return Ok(local);
         }
-        debug!("fetch_record 2");
+        debug!("fetch_entity 2");
 
-        let raw_bucket = self.bucket(bucket_name).await;
-        match raw_bucket.0.get_record(id).await {
-            Ok(record_state) => {
-                return self.assert_record(bucket_name, id, &record_state).await;
+        let raw_bucket = self.bucket(collection).await;
+        match raw_bucket.0.get_state(id).await {
+            Ok(entity_state) => {
+                return self.assert_entity(collection, id, &entity_state).await;
             }
             Err(RetrievalError::NotFound(id)) => {
-                // let scoped_record = RecordInner::new(id, bucket_name.to_string());
-                // let ref_record = Arc::new(scoped_record);
+                // let scoped_entity = Entity::new(id, collection.to_string());
+                // let ref_entity = Arc::new(scoped_entity);
                 // Revisit this
-                let record = self.assert_record(bucket_name, id, &proto::RecordState::default()).await?;
-                Ok(record)
+                let entity = self.assert_entity(collection, id, &proto::State::default()).await?;
+                Ok(entity)
             }
             Err(e) => Err(e),
         }
     }
 
-    pub async fn get_record<R: Record>(&self, id: proto::ID) -> Result<R, RetrievalError> {
+    pub async fn get_entity<R: View>(&self, id: proto::ID) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        let collection_name = R::Model::bucket_name();
-        let record_inner = self.fetch_record_inner(id, collection_name).await?;
-        Ok(R::from_record_inner(record_inner))
+        let collection_name = R::Model::collection();
+        let entity = self.fetch_entity(id, collection_name).await?;
+        Ok(R::from_entity(entity))
     }
 
-    /// Fetch records from the first available durable peer.
+    /// Fetch entities from the first available durable peer.
     async fn fetch_from_peer(
         self: &Arc<Self>,
         collection_name: &str,
@@ -544,7 +447,7 @@ impl Node {
         match self
             .request(
                 peer_id.clone(),
-                proto::NodeRequestBody::FetchRecords { collection: collection_name.to_string(), predicate: predicate.clone() },
+                proto::NodeRequestBody::Fetch { collection: collection_name.to_string(), predicate: predicate.clone() },
             )
             .await
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
@@ -554,7 +457,7 @@ impl Node {
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for (id, state) in states {
-                    raw_bucket.0.set_record(id, &state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    raw_bucket.0.set_state(id, &state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
             }
@@ -569,13 +472,13 @@ impl Node {
         }
     }
 
-    pub async fn fetch<R: Record>(self: &Arc<Self>, args: impl TryInto<FetchArgs>) -> anyhow::Result<ResultSet<R>> {
+    pub async fn fetch<R: View>(self: &Arc<Self>, args: impl TryInto<FetchArgs>) -> anyhow::Result<ResultSet<R>> {
         let args = args.try_into().map_err(|_| anyhow!("Failed to parse predicate:"))?;
 
         let predicate = args.predicate;
 
         use crate::model::Model;
-        let collection_name = R::Model::bucket_name();
+        let collection_name = R::Model::collection();
 
         if !self.durable {
             // Fetch from peers and commit first response
@@ -591,26 +494,26 @@ impl Node {
         // Fetch raw states from storage
         let states = self.storage_engine.fetch_states(collection_name.to_string(), &predicate).await?;
 
-        // Convert states to records
-        let mut records = Vec::new();
+        // Convert states to entities
+        let mut entities = Vec::new();
         for (id, state) in states {
-            let record = self.assert_record(collection_name, id, &state).await?;
-            records.push(R::from_record_inner(record));
+            let entity = self.assert_entity(collection_name, id, &state).await?;
+            entities.push(R::from_entity(entity));
         }
 
-        Ok(ResultSet { records })
+        Ok(ResultSet { items: entities })
     }
 
-    /// Subscribe to changes in records matching a predicate
+    /// Subscribe to changes in entities matching a predicate
     pub async fn subscribe<F, P, R>(self: &Arc<Self>, predicate: P, callback: F) -> anyhow::Result<crate::subscription::SubscriptionHandle>
     where
         F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
         P: TryInto<ankql::ast::Predicate>,
         P::Error: std::error::Error + Send + Sync + 'static,
-        R: Record,
+        R: View,
     {
         use crate::model::Model;
-        let bucket_name = R::Model::bucket_name();
+        let collection = R::Model::collection();
         let predicate = predicate.try_into().map_err(|_e| anyhow!("Failed to parse predicate:"))?;
 
         // First, find any durable nodes to subscribe to
@@ -622,14 +525,14 @@ impl Node {
         // If we have a durable node, send a subscription request to it
         if let Some(peer_id) = durable_peer_id {
             match self
-                .request(peer_id, proto::NodeRequestBody::Subscribe { collection: bucket_name.to_string(), predicate: predicate.clone() })
+                .request(peer_id, proto::NodeRequestBody::Subscribe { collection: collection.to_string(), predicate: predicate.clone() })
                 .await?
             {
                 proto::NodeResponseBody::Subscribe { initial, subscription_id: _ } => {
                     // Apply initial states to our storage
-                    let raw_bucket = self.bucket(bucket_name).await;
+                    let raw_bucket = self.bucket(collection).await;
                     for (id, state) in initial {
-                        raw_bucket.set_record(id, &state).await.map_err(|e| anyhow!("Failed to set record: {:?}", e))?;
+                        raw_bucket.set_state(id, &state).await.map_err(|e| anyhow!("Failed to set entity: {:?}", e))?;
                     }
                 }
                 proto::NodeResponseBody::Error(e) => {
@@ -643,7 +546,7 @@ impl Node {
 
         // Now set up our local subscription
         self.reactor
-            .subscribe(bucket_name, predicate, move |changeset| {
+            .subscribe(collection, predicate, move |changeset| {
                 callback(changeset.into());
             })
             .await
