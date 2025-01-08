@@ -23,7 +23,7 @@ pub struct PNBackend {
 pub struct PNValue {
     // TODO: Maybe use something aside from i64 for the base?
     pub value: i64,
-    // TODO: replace with precursor record?
+    // TODO: replace with precursor entity?
     pub previous_value: i64,
 }
 

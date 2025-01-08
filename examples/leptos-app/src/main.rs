@@ -34,13 +34,13 @@ fn App() -> impl IntoView {
 
 //     spawn_local(async move {
 //         loop {
-//             sessions.set(client.fetch_example_records().await);
+//             sessions.set(client.fetch_example_r_ecords().await);
 //             sleep(Duration::from_secs(5)).await;
 //         }
 //     });
-//     let create_record = move |_| {
+//     let create_entity = move |_| {
 //         spawn_local(async move {
-//             if let Ok(_) = create_test_record(&client).await {
+//             if let Ok(_) = create_test_entity(&client).await {
 //                 log!("Session created");
 //                 sessions_resource.refetch();
 //             }
@@ -57,8 +57,8 @@ fn App() -> impl IntoView {
 //                 </div>
 
 //                 <div class="button-container">
-//                     <button on:click=create_record>
-//                         "Create Test Record"
+//                     <button on:click=create_entity>
+//                         "Create"
 //                     </button>
 //                 </div>
 

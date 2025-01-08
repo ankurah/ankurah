@@ -1,13 +1,13 @@
 pub mod human_id;
 pub mod message;
-// pub mod record;
-pub mod record_id;
+// pub mod entity;
+pub mod entity_id;
 
 pub use human_id::*;
 pub use message::*;
-// pub use record::*;
+// pub use entity::*;
 use ankql::ast;
-pub use record_id::ID;
+pub use entity_id::ID;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -103,10 +103,10 @@ impl std::fmt::Display for NodeResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RecordEvent {
+pub struct Event {
     pub id: ID,
-    pub bucket_name: String,
-    pub record_id: ID,
+    pub collection: String,
+    pub entity_id: ID,
     pub operations: BTreeMap<String, Vec<Operation>>,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
@@ -167,14 +167,14 @@ impl From<&Clock> for Vec<Uuid> {
     }
 }
 
-impl std::fmt::Display for RecordEvent {
+impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RecordEvent({} {}/{} {} {})",
+            "Event({} {}/{} {} {})",
             self.id,
-            self.bucket_name,
-            self.record_id,
+            self.collection,
+            self.entity_id,
             self.parent,
             self.operations
                 .iter()
@@ -189,8 +189,8 @@ impl std::fmt::Display for Clock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}]", self.to_strings().join(", ")) }
 }
 
-impl RecordEvent {
-    pub fn bucket_name(&self) -> &str { &self.bucket_name }
+impl Event {
+    pub fn collection(&self) -> &str { &self.collection }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -199,18 +199,18 @@ pub struct Operation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct RecordState {
-    /// The current accumulated state of the record inclusive of all events up to this point
+pub struct State {
+    /// The current accumulated state of the entity inclusive of all events up to this point
     pub state_buffers: BTreeMap<String, Vec<u8>>,
-    /// The set of concurrent events (usually only one) which have been applied to the record state above
+    /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,
 }
 
-impl std::fmt::Display for RecordState {
+impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RecordState({})",
+            "State({})",
             self.state_buffers.iter().map(|(backend, buf)| format!("{} => {}b", backend, buf.len())).collect::<Vec<_>>().join(" ")
         )
     }
@@ -219,9 +219,9 @@ impl std::fmt::Display for RecordState {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeRequestBody {
     // Events to be committed on the remote node
-    CommitEvents(Vec<RecordEvent>),
-    // Request to fetch records matching a predicate
-    FetchRecords { collection: String, predicate: ast::Predicate },
+    CommitEvents(Vec<Event>),
+    // Request to fetch entities matching a predicate
+    Fetch { collection: String, predicate: ast::Predicate },
     Subscribe { collection: String, predicate: ast::Predicate },
     Unsubscribe { subscription_id: SubscriptionId },
 }
@@ -232,8 +232,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::CommitEvents(events) => {
                 write!(f, "CommitEvents [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
             }
-            NodeRequestBody::FetchRecords { collection, predicate } => {
-                write!(f, "FetchRecords {collection} {predicate}")
+            NodeRequestBody::Fetch { collection, predicate } => {
+                write!(f, "Fetch {collection} {predicate}")
             }
             NodeRequestBody::Subscribe { collection, predicate } => {
                 write!(f, "Subscribe {collection} {predicate}")
@@ -249,9 +249,8 @@ impl std::fmt::Display for NodeRequestBody {
 pub enum NodeResponseBody {
     // Response to CommitEvents
     CommitComplete,
-    // Response to FetchRecords
-    Fetch(Vec<(ID, RecordState)>),
-    Subscribe { initial: Vec<(ID, RecordState)>, subscription_id: SubscriptionId },
+    Fetch(Vec<(ID, State)>),
+    Subscribe { initial: Vec<(ID, State)>, subscription_id: SubscriptionId },
     Success,
     Error(String),
 }
@@ -260,8 +259,8 @@ impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeResponseBody::CommitComplete => write!(f, "CommitComplete"),
-            NodeResponseBody::Fetch(records) => {
-                write!(f, "Fetch [{}]", records.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", "))
+            NodeResponseBody::Fetch(tuples) => {
+                write!(f, "Fetch [{}]", tuples.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::Subscribe { initial, subscription_id } => write!(
                 f,

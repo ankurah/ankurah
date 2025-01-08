@@ -3,7 +3,7 @@ use std::fmt;
 use ulid::Ulid;
 
 use wasm_bindgen::prelude::*;
-// TODO - split out the different id types. Presently there's a lot of not-records that are using this type for their ID
+// TODO - split out the different id types. Presently there's a lot of not-entities that are using this type for their ID
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
 #[wasm_bindgen]
 pub struct ID(Ulid);

@@ -2,7 +2,7 @@
 use ulid::Ulid;
 
 // IMPORTANT: All of the datastructures in here must understand the particulars of the schema dynamically
-// Not using the Model/Record structs themselves.
+// Not using the Model/View/Mutable structs themselves.
 // This is because the Node must operate without access to the Model structs definitions.
 
 // Actually creating/accessing them does require generics, but that's part of the API, not the internals.

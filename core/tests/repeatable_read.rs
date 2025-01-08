@@ -1,6 +1,6 @@
 use ankurah_core::property::value::YrsString;
 use ankurah_core::storage::SledStorageEngine;
-use ankurah_core::{model::ScopedRecord, node::Node};
+use ankurah_core::{model::Mutable, node::Node};
 use ankurah_derive::Model;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ pub struct Album {
     // We will leave the door open to backend specific projected newtypes in the future, but we will not have the active value types in the model.
     // Implication: we will still need to have a native type to active type lookup in the Model macro for now.
     // We have the option of adding override attributes to switch backends in the future.
-    // We will initially only use Model structs for initial construction of the record (or a property group thereof) but we may later consider
+    // We will initially only use Model structs for initial construction of the entity (or a property group thereof) but we may later consider
     // using them for per-property group retrieval binding, but preferably only via an immutable borrow.
     #[active_value(YrsString)]
     pub name: String,
@@ -30,7 +30,7 @@ async fn repeatable_read() -> Result<()> {
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
 
-        println!("{:?}", album_rw.record_state());
+        println!("{:?}", album_rw.state());
 
         trx.commit().await?;
     }
@@ -38,8 +38,8 @@ async fn repeatable_read() -> Result<()> {
     println!("_____________");
     println!("REFETCHING");
     println!("_____________");
-    // TODO: implement ScopedRecord.read() -> Record
-    let album_ro: AlbumRecord = client.get_record(id).await?;
+    // TODO: implement Mutable.read() -> View
+    let album_ro: AlbumView = client.get_entity(id).await?;
 
     println!("_____________");
     println!("name: {:?}", album_ro.name());
@@ -95,8 +95,8 @@ async fn pg_repeatable_read() -> Result<()> {
         trx.commit().await?;
     }
 
-    // TODO: implement ScopedRecord.read() -> Record
-    let album_ro: AlbumRecord = client.get_record(id).await?;
+    // TODO: implement Mutable.read() -> View
+    let album_ro: AlbumView = client.get_entity(id).await?;
 
     let trx2 = client.begin();
     let album_rw2 = album_ro.edit(&trx2).await?;

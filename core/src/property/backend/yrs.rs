@@ -16,7 +16,7 @@ use crate::{
     storage::Materialized,
 };
 
-/// Stores one or more properties of a record
+/// Stores one or more properties of an entity
 #[derive(Debug, Clone)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,

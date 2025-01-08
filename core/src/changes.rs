@@ -1,40 +1,39 @@
 use crate::{
-    model::{Record, RecordInner},
+    model::{Entity, View},
     resultset::ResultSet,
 };
-use ankurah_proto::RecordEvent;
+use ankurah_proto::Event;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
-    pub record: Arc<RecordInner>,
-    pub events: Vec<RecordEvent>,
+    pub entity: Arc<Entity>,
+    pub events: Vec<Event>,
 }
 
-/// Represents a change in the record set
 #[derive(Debug, Clone)]
-pub enum ItemChange<R> {
-    /// Initial retrieval of a record upon subscription
-    Initial { record: R },
-    /// A new record was added OR changed such that it now matches the subscription
-    Add { record: R, events: Vec<RecordEvent> },
-    /// A record that previously matched the subscription has changed in a way that has not changed the matching condition
-    Update { record: R, events: Vec<RecordEvent> },
-    /// A record that previously matched the subscription has changed in a way that no longer matches the subscription
-    Remove { record: R, events: Vec<RecordEvent> },
+pub enum ItemChange<I> {
+    /// Initial retrieval of an item upon subscription
+    Initial { item: I },
+    /// A new item was added OR changed such that it now matches the subscription
+    Add { item: I, events: Vec<Event> },
+    /// A item that previously matched the subscription has changed in a way that has not changed the matching condition
+    Update { item: I, events: Vec<Event> },
+    /// A item that previously matched the subscription has changed in a way that no longer matches the subscription
+    Remove { item: I, events: Vec<Event> },
 }
 
-impl<R> ItemChange<R> {
-    pub fn record(&self) -> &R {
+impl<I> ItemChange<I> {
+    pub fn entity(&self) -> &I {
         match self {
-            ItemChange::Initial { record }
-            | ItemChange::Add { record, .. }
-            | ItemChange::Update { record, .. }
-            | ItemChange::Remove { record, .. } => record,
+            ItemChange::Initial { item }
+            | ItemChange::Add { item, .. }
+            | ItemChange::Update { item, .. }
+            | ItemChange::Remove { item, .. } => item,
         }
     }
 
-    pub fn events(&self) -> &[RecordEvent] {
+    pub fn events(&self) -> &[Event] {
         match self {
             ItemChange::Add { events, .. } | ItemChange::Update { events, .. } | ItemChange::Remove { events, .. } => events,
             _ => &[],
@@ -42,22 +41,22 @@ impl<R> ItemChange<R> {
     }
 }
 
-impl<R> std::fmt::Display for ItemChange<R>
-where R: Record
+impl<I> std::fmt::Display for ItemChange<I>
+where I: View
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ItemChange::Initial { record } => {
-                write!(f, "Initial {}/{}", R::bucket_name(), record.id())
+            ItemChange::Initial { item } => {
+                write!(f, "Initial {}/{}", I::collection(), item.id())
             }
-            ItemChange::Add { record, .. } => {
-                write!(f, "Add {}/{}", R::bucket_name(), record.id())
+            ItemChange::Add { item, .. } => {
+                write!(f, "Add {}/{}", I::collection(), item.id())
             }
-            ItemChange::Update { record, .. } => {
-                write!(f, "Update {}/{}", R::bucket_name(), record.id())
+            ItemChange::Update { item, .. } => {
+                write!(f, "Update {}/{}", I::collection(), item.id())
             }
-            ItemChange::Remove { record, .. } => {
-                write!(f, "Remove {}/{}", R::bucket_name(), record.id())
+            ItemChange::Remove { item, .. } => {
+                write!(f, "Remove {}/{}", I::collection(), item.id())
             }
         }
     }
@@ -65,37 +64,36 @@ where R: Record
 
 impl std::fmt::Display for EntityChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityChange {}/{}", self.record.bucket_name(), self.record.id())
+        write!(f, "EntityChange {}/{}", self.entity.collection(), self.entity.id())
     }
 }
 
-/// A set of changes to the record set
 #[derive(Debug)]
 pub struct ChangeSet<R> {
     pub resultset: crate::resultset::ResultSet<R>,
     pub changes: Vec<ItemChange<R>>,
 }
 
-impl<R> From<ChangeSet<Arc<RecordInner>>> for ChangeSet<R>
-where R: Record
+impl<I> From<ChangeSet<Arc<Entity>>> for ChangeSet<I>
+where I: View
 {
-    fn from(val: ChangeSet<Arc<RecordInner>>) -> Self {
+    fn from(val: ChangeSet<Arc<Entity>>) -> Self {
         ChangeSet {
-            resultset: ResultSet { records: val.resultset.iter().map(|record| R::from_record_inner(record.clone())).collect() },
+            resultset: ResultSet { items: val.resultset.iter().map(|item| I::from_entity(item.clone())).collect() },
             changes: val.changes.into_iter().map(|change| change.into()).collect(),
         }
     }
 }
 
-impl<R> From<ItemChange<Arc<RecordInner>>> for ItemChange<R>
-where R: Record
+impl<I> From<ItemChange<Arc<Entity>>> for ItemChange<I>
+where I: View
 {
-    fn from(change: ItemChange<Arc<RecordInner>>) -> Self {
+    fn from(change: ItemChange<Arc<Entity>>) -> Self {
         match change {
-            ItemChange::Initial { record } => ItemChange::Initial { record: R::from_record_inner(record) },
-            ItemChange::Add { record, events } => ItemChange::Add { record: R::from_record_inner(record), events },
-            ItemChange::Update { record, events } => ItemChange::Update { record: R::from_record_inner(record), events },
-            ItemChange::Remove { record, events } => ItemChange::Remove { record: R::from_record_inner(record), events },
+            ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item) },
+            ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item), events },
+            ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item), events },
+            ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item), events },
         }
     }
 }

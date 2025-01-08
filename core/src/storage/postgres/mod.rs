@@ -6,7 +6,7 @@ use crate::{
         backend::{BackendDowncasted, PropertyBackend},
         Backends,
     },
-    storage::{RecordState, StorageBucket, StorageEngine},
+    storage::{State, StorageCollection, StorageEngine},
 };
 
 use futures_util::TryStreamExt;
@@ -29,8 +29,8 @@ impl Postgres {
 
     // TODO: newtype this to `BucketName(&str)` with a constructor that
     // only accepts a subset of characters.
-    pub fn sane_name(bucket_name: &str) -> bool {
-        for char in bucket_name.chars() {
+    pub fn sane_name(collection: &str) -> bool {
+        for char in collection.chars() {
             match char {
                 char if char.is_alphanumeric() => {}
                 char if char.is_numeric() => {}
@@ -45,12 +45,12 @@ impl Postgres {
 
 #[async_trait]
 impl StorageEngine for Postgres {
-    async fn bucket(&self, name: &str) -> anyhow::Result<std::sync::Arc<dyn StorageBucket>> {
+    async fn bucket(&self, name: &str) -> anyhow::Result<std::sync::Arc<dyn StorageCollection>> {
         if !Postgres::sane_name(name) {
             return Err(anyhow::anyhow!("bucket name must only contain valid characters"));
         }
 
-        let bucket = PostgresBucket { pool: self.pool.clone(), bucket_name: name.to_owned() };
+        let bucket = PostgresBucket { pool: self.pool.clone(), collection: name.to_owned() };
 
         // Try to create the table if it doesn't exist
         let mut client = self.pool.get().await?;
@@ -59,8 +59,8 @@ impl StorageEngine for Postgres {
         Ok(Arc::new(bucket))
     }
 
-    async fn fetch_states(&self, bucket_name: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, RecordState)>, RetrievalError> {
-        if !Postgres::sane_name(&bucket_name) {
+    async fn fetch_states(&self, collection: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
+        if !Postgres::sane_name(&collection) {
             return Err(RetrievalError::InvalidBucketName);
         }
 
@@ -74,9 +74,9 @@ impl StorageEngine for Postgres {
         let (sql, args) = ankql_sql.collapse();
 
         let filtered_query = if args.len() > 0 {
-            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE {}"#, bucket_name.as_str(), sql,)
+            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE {}"#, collection.as_str(), sql,)
         } else {
-            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}""#, bucket_name.as_str())
+            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}""#, collection.as_str())
         };
 
         eprintln!("Running: {}", filtered_query);
@@ -96,7 +96,7 @@ impl StorageEngine for Postgres {
                 let kind = error_kind(&err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
-                        if table == bucket_name {
+                        if table == collection {
                             // Table doesn't exist yet, return empty results
                             return Ok(Vec::new());
                         }
@@ -115,16 +115,16 @@ impl StorageEngine for Postgres {
 
             let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer)?;
 
-            let record_state = RecordState { state_buffers, head: row.get::<_, Vec<uuid::Uuid>>(2).into() };
+            let entity_state = State { state_buffers, head: row.get::<_, Vec<uuid::Uuid>>(2).into() };
 
-            results.push((id, record_state));
+            results.push((id, entity_state));
 
-            // Create record to evaluate predicate
-            //let record_inner = RecordInner::from_record_state(id, bucket_name, &record_state)?;
+            // Create entity to evaluate predicate
+            //let entity = Entity::from_entity_state(id, collection, &entity_state)?;
 
             // Apply predicate filter
-            /*if evaluate_predicate(&record_inner, predicate)? {
-                results.push((id, record_state));
+            /*if evaluate_predicate(&entity, predicate)? {
+                results.push((id, entity_state));
             }*/
         }
 
@@ -134,13 +134,13 @@ impl StorageEngine for Postgres {
 
 pub struct PostgresBucket {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
-    bucket_name: String,
+    collection: String,
 }
 
 impl PostgresBucket {
     pub async fn create_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
         // Create the table
-        let create_query = format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.bucket_name);
+        let create_query = format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.collection);
 
         error!("Running: {}", create_query);
         client.execute(&create_query, &[]).await?;
@@ -154,7 +154,7 @@ impl PostgresBucket {
     ) -> anyhow::Result<()> {
         for (column, datatype) in missing {
             if Postgres::sane_name(&column) {
-                let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.bucket_name, column, datatype,);
+                let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.collection, column, datatype,);
                 error!("Running: {}", alter_query);
                 client.execute(&alter_query, &[]).await?;
             }
@@ -181,8 +181,8 @@ impl PostgresParams {
 }
 
 #[async_trait]
-impl StorageBucket for PostgresBucket {
-    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<bool> {
+impl StorageCollection for PostgresBucket {
+    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
         // TODO: Create/Alter table
         let state_buffers = bincode::serialize(&state.state_buffers)?;
         let ulid: ulid::Ulid = id.into();
@@ -261,7 +261,7 @@ impl StorageBucket for PostgresBucket {
             INSERT INTO "{0}"({1}) VALUES({2})
             ON CONFLICT("id") DO UPDATE SET {3}
             RETURNING (SELECT "head" FROM old_state) as old_head"#,
-            self.bucket_name, columns_str, values_str, columns_update_str
+            self.collection, columns_str, values_str, columns_update_str
         );
 
         let mut client = self.pool.get().await?;
@@ -272,20 +272,20 @@ impl StorageBucket for PostgresBucket {
                 let kind = error_kind(&err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
-                        if table == self.bucket_name {
+                        if table == self.collection {
                             self.create_table(&mut *client).await?;
-                            return self.set_record(id, state).await; // retry
+                            return self.set_state(id, state).await; // retry
                         }
                     }
                     ErrorKind::UndefinedColumn { table, column } => {
                         // TODO: We should check the definition of this and add all
                         // needed columns rather than recursively doing it.
-                        if table == self.bucket_name {
+                        if table == self.collection {
                             let index = materialized_columns.iter().enumerate().find(|(_, name)| **name == column).map(|(index, _)| index);
                             if let Some(index) = index {
                                 let param = &materialized[index];
                                 self.add_missing_columns(&mut client, vec![(column, param.postgres_type())]).await?;
-                                return self.set_record(id, state).await; // retry
+                                return self.set_state(id, state).await; // retry
                             } else {
                                 error!("column '{}' not found in materialized", column);
                             }
@@ -298,10 +298,10 @@ impl StorageBucket for PostgresBucket {
             }
         };
 
-        // If this is a new record (no old_head), or if the heads are different, return true
+        // If this is a new entity (no old_head), or if the heads are different, return true
         let old_head: Option<Vec<uuid::Uuid>> = row.get("old_head");
         let changed = match old_head {
-            None => true, // New record
+            None => true, // New entity
             Some(old_head) => {
                 let old_clock: Clock = old_head.into();
                 old_clock != state.head
@@ -312,12 +312,12 @@ impl StorageBucket for PostgresBucket {
         Ok(changed)
     }
 
-    async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError> {
+    async fn get_state(&self, id: ID) -> Result<State, RetrievalError> {
         let ulid: ulid::Ulid = id.into();
         let uuid: uuid::Uuid = ulid.into();
 
         // be careful with sql injection via bucket name
-        let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.bucket_name);
+        let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.collection);
 
         let mut client = match self.pool.get().await {
             Ok(client) => client,
@@ -336,7 +336,7 @@ impl StorageBucket for PostgresBucket {
                         return Err(RetrievalError::NotFound(id));
                     }
                     ErrorKind::UndefinedTable { table } => {
-                        if self.bucket_name == table {
+                        if self.collection == table {
                             self.create_table(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
                             return Err(RetrievalError::NotFound(id));
                         }
@@ -355,7 +355,7 @@ impl StorageBucket for PostgresBucket {
         let serialized_buffers: Vec<u8> = row.get("state_buffer");
         let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers)?;
 
-        Ok(RecordState { state_buffers, head: row.get::<_, Vec<uuid::Uuid>>("head").into() })
+        Ok(State { state_buffers, head: row.get::<_, Vec<uuid::Uuid>>("head").into() })
     }
 }
 

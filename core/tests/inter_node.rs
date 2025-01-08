@@ -7,13 +7,13 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::info;
 
-use ankurah_core::model::ScopedRecord;
+use ankurah_core::model::Mutable;
 use ankurah_core::resultset::ResultSet;
-use common::{Album, AlbumRecord, Pet, PetRecord};
+use common::{Album, AlbumView, Pet, PetView};
 
 use common::ChangeKind;
 
-pub fn names(resultset: ResultSet<AlbumRecord>) -> Vec<String> { resultset.records.iter().map(|r| r.name()).collect::<Vec<String>>() }
+pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.iter().map(|r| r.name()).collect::<Vec<String>>() }
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
@@ -39,7 +39,7 @@ async fn inter_node_fetch() -> Result<()> {
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
 
-    // Now node2 should now successfully fetch the record
+    // Now node2 should now successfully fetch the entity
     assert_eq!(names(node2.fetch(p).await?), ["Walking on a Dream"]);
 
     Ok(())
@@ -54,8 +54,8 @@ async fn inter_node_subscription() -> Result<()> {
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
 
-    use ankurah_core::model::Record;
-    // Create initial records on node1
+    use ankurah_core::model::View;
+    // Create initial entities on node1
     let (rex, snuffy, jasper) = {
         let trx = node1.begin();
         let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await;
@@ -67,10 +67,10 @@ async fn inter_node_subscription() -> Result<()> {
         read
     };
 
-    info!("rex: {}, snuffy: {}, jasper: {}", rex.record_inner(), snuffy.record_inner(), jasper.record_inner());
+    info!("rex: {}, snuffy: {}, jasper: {}", rex.entity(), snuffy.entity(), jasper.entity());
 
     // Set up subscription on node2
-    let (watcher, check_node2) = common::changeset_watcher::<PetRecord>();
+    let (watcher, check_node2) = common::changeset_watcher::<PetView>();
     let _handle = node2.subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher).await?;
 
     // Initial state should include Rex
@@ -114,7 +114,7 @@ async fn test_client_server_propagation() -> Result<()> {
     let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
     let _conn_b = LocalProcessConnection::new(&client_b, &server).await?;
 
-    // Create a record on client_a
+    // Create an entity on client_a
     {
         let trx = client_a.begin();
         trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
@@ -124,14 +124,14 @@ async fn test_client_server_propagation() -> Result<()> {
     // Wait for propagation
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Verify record is queryable on server
+    // Verify entity is queryable on server
     let query = "name = 'Origin of Symmetry'";
     assert_eq!(names(server.fetch(query).await?), ["Origin of Symmetry"]);
 
     // Wait for propagation to client_b
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Verify record is queryable on client_b
+    // Verify entity is queryable on client_b
     assert_eq!(names(client_b.fetch(query).await?), ["Origin of Symmetry"]);
 
     Ok(())
@@ -149,14 +149,14 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     let _conn_b = LocalProcessConnection::new(&client_b, &server).await?;
 
     // Set up watchers for server and client_b
-    let (server_watcher, check_server) = common::changeset_watcher::<AlbumRecord>();
-    let (client_b_watcher, check_client_b) = common::changeset_watcher::<AlbumRecord>();
+    let (server_watcher, check_server) = common::changeset_watcher::<AlbumView>();
+    let (client_b_watcher, check_client_b) = common::changeset_watcher::<AlbumView>();
 
     // Set up subscriptions
     let _server_sub = server.subscribe("name = 'Origin of Symmetry'", server_watcher).await?;
     let _client_b_sub = client_b.subscribe("name = 'Origin of Symmetry'", client_b_watcher).await?;
 
-    // Create a record on client_a
+    // Create an entity on client_a
     let album_id = {
         let trx = client_a.begin();
         let album = trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;

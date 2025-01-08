@@ -1,4 +1,4 @@
-use ankurah_proto::{RecordState, ID};
+use ankurah_proto::{State, ID};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::{
     error::RetrievalError,
-    model::RecordInner,
-    storage::{StorageBucket, StorageEngine},
+    model::Entity,
+    storage::{StorageCollection, StorageEngine},
 };
 
 use ankql::selection::filter::evaluate_predicate;
@@ -43,26 +43,26 @@ impl SledStorageEngine {
     }
 }
 
-pub struct SledStorageBucket {
+pub struct SledStorageCollection {
     pub tree: sled::Tree,
 }
 
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
-    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageBucket>> {
+    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageCollection>> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
         let tree = self.db.open_tree(name)?;
-        Ok(Arc::new(SledStorageBucket { tree }))
+        Ok(Arc::new(SledStorageCollection { tree }))
     }
 
-    async fn fetch_states(&self, bucket_name: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, RecordState)>, RetrievalError> {
-        let tree = self.db.open_tree(&bucket_name)?;
-        let bucket = SledStorageBucket { tree };
+    async fn fetch_states(&self, collection: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
+        let tree = self.db.open_tree(&collection)?;
+        let bucket = SledStorageCollection { tree };
 
         let predicate = predicate.clone();
 
         // Use spawn_blocking for the full scan operation
-        task::spawn_blocking(move || -> Result<Vec<(ID, RecordState)>, RetrievalError> {
+        task::spawn_blocking(move || -> Result<Vec<(ID, State)>, RetrievalError> {
             let mut results = Vec::new();
             let mut seen_ids = HashSet::new();
             // println!("SledStorageEngine: Starting fetch_states scan");
@@ -74,20 +74,20 @@ impl StorageEngine for SledStorageEngine {
 
                 // Skip if we've already seen this ID
                 if seen_ids.contains(&id) {
-                    println!("SledStorageEngine: Skipping duplicate record with ID: {:?}", id);
+                    println!("SledStorageEngine: Skipping duplicate entity with ID: {:?}", id);
                     continue;
                 }
 
-                let record_state: RecordState = bincode::deserialize(&value_bytes)?;
+                let entity_state: State = bincode::deserialize(&value_bytes)?;
 
-                // Create record to evaluate predicate
-                let record_inner = RecordInner::from_record_state(id, &bucket_name, &record_state)?;
+                // Create entity to evaluate predicate
+                let entity = Entity::from_state(id, &collection, &entity_state)?;
 
                 // Apply predicate filter
-                if evaluate_predicate(&record_inner, &predicate)? {
-                    // println!("SledStorageEngine: Found matching record with ID: {:?}", id);
+                if evaluate_predicate(&entity, &predicate)? {
+                    // println!("SledStorageEngine: Found matching entity with ID: {:?}", id);
                     seen_ids.insert(id);
-                    results.push((id, record_state));
+                    results.push((id, entity_state));
                 }
             }
 
@@ -103,8 +103,8 @@ impl StorageEngine for SledStorageEngine {
 }
 
 #[async_trait]
-impl StorageBucket for SledStorageBucket {
-    async fn set_record(&self, id: ID, state: &RecordState) -> anyhow::Result<bool> {
+impl StorageCollection for SledStorageCollection {
+    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
         let tree = self.tree.clone();
         let binary_state = bincode::serialize(state)?;
         let id_bytes = id.to_bytes();
@@ -121,7 +121,7 @@ impl StorageBucket for SledStorageBucket {
         .await?
     }
 
-    async fn get_record(&self, id: ID) -> Result<RecordState, RetrievalError> {
+    async fn get_state(&self, id: ID) -> Result<State, RetrievalError> {
         let tree = self.tree.clone();
         let id_bytes = id.to_bytes();
 
@@ -132,8 +132,8 @@ impl StorageBucket for SledStorageBucket {
 
         match result? {
             Some(ivec) => {
-                let record_state = bincode::deserialize(&ivec)?;
-                Ok(record_state)
+                let entity_state = bincode::deserialize(&ivec)?;
+                Ok(entity_state)
             }
             None => Err(RetrievalError::NotFound(id)),
         }

@@ -78,7 +78,7 @@ impl StateSync for YrsString {
         txn.apply_update(update)?;
         Ok(())
     }
-    /// Retrieve the current state of the field, suitable for storing in the materialized record
+    /// Retrieve the current state of the field, suitable for storing in the materialized entity
     fn state(&self) -> Vec<u8> {
         let yrs = self.backend();
         let txn = yrs.doc.transact();

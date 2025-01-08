@@ -1,4 +1,4 @@
-use ankurah_proto::{Clock, Operation, RecordState};
+use ankurah_proto::{Clock, Operation, State};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -62,7 +62,7 @@ pub enum BackendDowncasted {
     Unknown(Arc<dyn Any>),
 }
 
-// impl RecordEvent {
+// impl Event {
 //     pub fn push(&mut self, property_backend: &'static str, operation: Operation) {
 //         match self.operations.entry(property_backend.to_owned()) {
 //             Entry::Occupied(mut entry) => {
@@ -86,7 +86,7 @@ pub enum BackendDowncasted {
 //     }
 // }
 
-/// Holds the property backends inside of records.
+/// Holds the property backends inside of entities.
 #[derive(Debug)]
 pub struct Backends {
     pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
@@ -165,23 +165,23 @@ impl Backends {
         backends.insert(backend_name, backend);
     }
 
-    pub fn to_state_buffers(&self) -> Result<RecordState> {
+    pub fn to_state_buffers(&self) -> Result<State> {
         let backends = self.backends.lock().expect("Backends lock failed");
         let mut state_buffers = BTreeMap::default();
         for (name, backend) in &*backends {
             let state_buffer = backend.to_state_buffer()?;
             state_buffers.insert(name.clone(), state_buffer);
         }
-        Ok(RecordState { state_buffers, head: self.head.lock().unwrap().clone() })
+        Ok(State { state_buffers, head: self.head.lock().unwrap().clone() })
     }
 
-    pub fn from_state_buffers(record_state: &RecordState) -> Result<Self, RetrievalError> {
+    pub fn from_state_buffers(entity_state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::new();
-        for (name, state_buffer) in &record_state.state_buffers {
+        for (name, state_buffer) in &entity_state.state_buffers {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
-        *backends.head.lock().unwrap() = record_state.head.clone();
+        *backends.head.lock().unwrap() = entity_state.head.clone();
         Ok(backends)
     }
 
@@ -202,7 +202,7 @@ impl Backends {
     }
 
     /// HACK - this should be based on a play forward of events
-    pub fn apply_state(&self, state: &RecordState) -> Result<(), RetrievalError> {
+    pub fn apply_state(&self, state: &State) -> Result<(), RetrievalError> {
         let mut backends = self.backends.lock().unwrap();
         for (name, state_buffer) in &state.state_buffers {
             let backend = backend_from_string(name, Some(state_buffer))?;
