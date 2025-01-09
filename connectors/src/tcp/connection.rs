@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -44,12 +43,6 @@ pub enum ConnectionError {
     Closed,
 }
 
-/// A request that's waiting for a response
-struct PendingRequest {
-    response_tx: mpsc::Sender<Frame>,
-    sent_at: Instant,
-}
-
 /// Connection state for credit-based flow control
 #[derive(Debug)]
 struct FlowControl {
@@ -78,10 +71,8 @@ pub struct Connection<S> {
     stream: Framed<S, FrameCodec>,
     /// Flow control state
     flow: Arc<Mutex<FlowControl>>,
-    /// Last message number used
-    last_msgno: Arc<Mutex<u32>>,
-    /// Pending requests waiting for responses
-    pending: Arc<Mutex<HashMap<u32, PendingRequest>>>,
+    /// Last stream ID used
+    last_stream: Arc<Mutex<u32>>,
     /// Channel for receiving frames to send
     send_rx: mpsc::Receiver<Frame>,
     /// Channel for sending frames to be sent
@@ -102,8 +93,7 @@ where S: AsyncRead + AsyncWrite + Unpin
         let conn = Self {
             stream: FrameCodec.framed(stream),
             flow: Arc::new(Mutex::new(FlowControl::new())),
-            last_msgno: Arc::new(Mutex::new(0)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            last_stream: Arc::new(Mutex::new(0)),
             send_rx,
             send_tx,
             last_received: Instant::now(),
@@ -119,66 +109,58 @@ where S: AsyncRead + AsyncWrite + Unpin
         self.send_tx.clone()
     }
 
-    /// Get the next message number if credits are available
-    fn next_msgno(&self) -> Option<u32> {
+    /// Get the next stream ID if credits are available
+    fn next_stream(&self) -> Option<u32> {
         let mut flow = self.flow.lock().unwrap();
         if !flow.has_credit() {
             debug!("No credits available for sending");
             return None;
         }
         flow.consume_credit();
-        let mut msgno = self.last_msgno.lock().unwrap();
-        *msgno = msgno.wrapping_add(1);
-        trace!("Generated new message number: {}", *msgno);
-        Some(*msgno)
+        let mut stream = self.last_stream.lock().unwrap();
+        *stream = stream.wrapping_add(1);
+        trace!("Generated new stream ID: {}", *stream);
+        Some(*stream)
     }
 
-    /// Send a request and wait for a response
-    pub async fn request(&self, payload: impl Into<Bytes>) -> Result<Frame, ConnectionError> {
-        let msgno = self.next_msgno().ok_or_else(|| {
-            debug!("Failed to get message number - no credits available");
+    /// Start a new stream with headers
+    pub async fn start_stream(&self, headers: impl Into<Bytes>) -> Result<u32, ConnectionError> {
+        let stream_id = self.next_stream().ok_or_else(|| {
+            debug!("Failed to get stream ID - no credits available");
             ConnectionError::Protocol("No send credits available".into())
         })?;
 
-        info!("Sending request with message number {}", msgno);
-        let (tx, mut rx) = mpsc::channel(1);
-        {
-            let mut pending = self.pending.lock().unwrap();
-            debug!("Adding pending request {} to waiting requests map", msgno);
-            pending.insert(msgno, PendingRequest { response_tx: tx, sent_at: Instant::now() });
-            debug!("Current pending requests count: {}", pending.len());
-        }
+        info!("Starting stream {}", stream_id);
+        let frame = Frame::header(stream_id, headers);
+        debug!("Created header frame: {:?}", frame);
 
-        let request = Frame::request(msgno, payload);
-        debug!("Created request frame: {:?}", request);
-
-        debug!("Sending request frame to connection");
-        if let Err(e) = self.send_tx.send(request).await {
-            error!("Failed to send request frame: {}", e);
+        debug!("Sending header frame to connection");
+        if let Err(e) = self.send_tx.send(frame).await {
+            error!("Failed to send header frame: {}", e);
             return Err(e.into());
         }
-        debug!("Successfully sent request frame");
+        debug!("Successfully sent header frame");
 
-        debug!("Waiting for response to message {}", msgno);
-        match rx.recv().await {
-            Some(frame) => {
-                debug!("Received response for message {}: {:?}", msgno, frame);
-                Ok(frame)
-            }
-            None => {
-                error!("Channel closed while waiting for response to message {}", msgno);
-                Err(ConnectionError::Closed)
-            }
-        }
+        Ok(stream_id)
     }
 
-    /// Send a push message (no response expected)
-    pub async fn push(&self, payload: impl Into<Bytes>) -> Result<(), ConnectionError> {
-        debug!("Sending push message");
-        let frame = Frame::push(payload);
-        trace!("Created push frame: {:?}", frame);
+    /// Send body data on an existing stream
+    pub async fn send_body(&self, stream_id: u32, data: impl Into<Bytes>) -> Result<(), ConnectionError> {
+        debug!("Sending body data on stream {}", stream_id);
+        let frame = Frame::body(stream_id, data);
+        trace!("Created body frame: {:?}", frame);
         self.send_tx.send(frame).await?;
-        debug!("Push message sent successfully");
+        debug!("Body data sent successfully");
+        Ok(())
+    }
+
+    /// End a stream
+    pub async fn end_stream(&self, stream_id: u32, trailer: impl Into<Bytes>) -> Result<(), ConnectionError> {
+        debug!("Ending stream {}", stream_id);
+        let frame = Frame::end(stream_id, trailer);
+        trace!("Created end frame: {:?}", frame);
+        self.send_tx.send(frame).await?;
+        debug!("Stream ended successfully");
         Ok(())
     }
 
@@ -188,24 +170,6 @@ where S: AsyncRead + AsyncWrite + Unpin
         self.last_received = Instant::now();
 
         match frame.frame_type {
-            FrameType::Res | FrameType::Err => {
-                info!("Processing response frame for message {}", frame.msgno);
-                if let Some(request) = self.pending.lock().unwrap().remove(&frame.msgno) {
-                    let elapsed = request.sent_at.elapsed();
-                    let msgno = frame.msgno;
-                    info!("Found pending request for message {}, elapsed time: {:?}", msgno, elapsed);
-
-                    // Use blocking send instead of try_send
-                    if let Err(e) = request.response_tx.blocking_send(frame) {
-                        error!("Failed to send response to waiting request {}: {}", msgno, e);
-                    } else {
-                        debug!("Successfully sent response to waiting request {}", msgno);
-                    }
-                } else {
-                    warn!("Received response for unknown request: {} (no pending request found)", frame.msgno);
-                }
-            }
-
             FrameType::Credit => {
                 if let Some(credits) = frame.get_credits() {
                     debug!("Received {} credits", credits);
@@ -217,27 +181,24 @@ where S: AsyncRead + AsyncWrite + Unpin
                 debug!("Received pause frame - pausing flow control");
                 self.flow.lock().unwrap().pause();
             }
-
             FrameType::Ping => {
-                debug!("Received ping frame {}, sending pong", frame.msgno);
-                let pong = Frame::pong(frame.msgno);
+                debug!("Received ping frame on stream {}, sending pong", frame.stream);
+                let pong = Frame::pong(frame.stream);
                 if let Err(e) = self.send_tx.try_send(pong) {
-                    warn!("Failed to send pong for ping {}: {}", frame.msgno, e);
+                    warn!("Failed to send pong for ping {}: {}", frame.stream, e);
                 } else {
-                    debug!("Successfully sent pong for ping {}", frame.msgno);
+                    debug!("Successfully sent pong for ping {}", frame.stream);
                 }
             }
             FrameType::Pong => {
                 debug!("Received pong frame, clearing last_ping");
                 self.last_ping = None;
             }
-
             FrameType::Close => {
                 info!("Received close frame, initiating connection shutdown");
             }
-
             _ => {
-                debug!("Received frame of type {:?}, payload size: {}", frame.frame_type, frame.payload.len());
+                debug!("Received frame of type {:?} on stream {}, payload size: {}", frame.frame_type, frame.stream, frame.payload.len());
             }
         }
 
@@ -282,6 +243,11 @@ where S: AsyncRead + AsyncWrite + Unpin
     /// Close the connection cleanly
     pub async fn close(mut self) -> Result<(), ConnectionError> {
         info!("Initiating connection close");
+
+        // Send close frame
+        debug!("Sending close frame");
+        self.stream.send(Frame::close()).await?;
+        self.stream.flush().await?;
 
         // Close the send channel to prevent new frames
         debug!("Dropping send channel");

@@ -4,8 +4,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 // Framing modeled loosely after BEEP
 
-const MAX_FRAME_SIZE: usize = 1024 * 1024 * 16; // 16MB max frame size
-const HEADER_SIZE: usize = 9; // 4 bytes msgno + 1 byte type + 4 bytes length
+const MAX_FRAME_SIZE: usize = 128 * 1024; // 128KB max frame size
+const HEADER_SIZE: usize = 9; // 4 bytes stream + 1 byte type + 4 bytes length
 
 #[derive(Debug, Error)]
 pub enum FrameError {
@@ -19,16 +19,16 @@ pub enum FrameError {
     InvalidFrameType(u8),
 }
 
-/// Frame types for basic request/response and push patterns
+/// Frame types for streaming data with flow control
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameType {
-    /// Push message (no response expected)
-    Push = 0,
-    /// Request message (response expected)
-    Req = 1,
-    /// Response to a request
-    Res = 2,
+    /// Start of stream with headers
+    Header = 0,
+    /// Body data
+    Body = 1,
+    /// End of stream
+    End = 2,
     /// Error response
     Err = 3,
     /// Keepalive ping
@@ -54,9 +54,9 @@ impl TryFrom<u8> for FrameType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(FrameType::Push),
-            1 => Ok(FrameType::Req),
-            2 => Ok(FrameType::Res),
+            0 => Ok(FrameType::Header),
+            1 => Ok(FrameType::Body),
+            2 => Ok(FrameType::End),
             3 => Ok(FrameType::Err),
             4 => Ok(FrameType::Ping),
             5 => Ok(FrameType::Pong),
@@ -74,11 +74,11 @@ impl TryFrom<u8> for FrameType {
 /// A frame in our protocol
 #[derive(Debug, Clone)]
 pub struct Frame {
-    /// Message number for request/response matching
-    /// - For Push: 0
-    /// - For Req: new sequence number
-    /// - For Res/Err: sequence number of the request
-    pub msgno: u32,
+    /// Stream identifier for multiplexing
+    /// - For Header: new stream ID
+    /// - For Body/End/Err: existing stream ID
+    /// - For control frames: 0
+    pub stream: u32,
     /// Frame type
     pub frame_type: FrameType,
     /// Payload data
@@ -87,25 +87,27 @@ pub struct Frame {
 
 impl Frame {
     /// Create a new frame
-    pub fn new(frame_type: FrameType, msgno: u32, payload: impl Into<Bytes>) -> Self { Self { frame_type, msgno, payload: payload.into() } }
+    pub fn new(frame_type: FrameType, stream: u32, payload: impl Into<Bytes>) -> Self {
+        Self { frame_type, stream, payload: payload.into() }
+    }
 
-    /// Create a push message (no response expected)
-    pub fn push(payload: impl Into<Bytes>) -> Self { Self::new(FrameType::Push, 0, payload) }
+    /// Create a header frame to start a stream
+    pub fn header(stream: u32, payload: impl Into<Bytes>) -> Self { Self::new(FrameType::Header, stream, payload) }
 
-    /// Create a request message
-    pub fn request(msgno: u32, payload: impl Into<Bytes>) -> Self { Self::new(FrameType::Req, msgno, payload) }
+    /// Create a body frame
+    pub fn body(stream: u32, payload: impl Into<Bytes>) -> Self { Self::new(FrameType::Body, stream, payload) }
 
-    /// Create a response message
-    pub fn response(msgno: u32, payload: impl Into<Bytes>) -> Self { Self::new(FrameType::Res, msgno, payload) }
+    /// Create an end frame
+    pub fn end(stream: u32, payload: impl Into<Bytes>) -> Self { Self::new(FrameType::End, stream, payload) }
 
-    /// Create an error response
-    pub fn error(msgno: u32, payload: impl Into<Bytes>) -> Self { Self::new(FrameType::Err, msgno, payload) }
+    /// Create an error frame
+    pub fn error(stream: u32, payload: impl Into<Bytes>) -> Self { Self::new(FrameType::Err, stream, payload) }
 
     /// Create a ping message
-    pub fn ping(msgno: u32) -> Self { Self::new(FrameType::Ping, msgno, Bytes::new()) }
+    pub fn ping(stream: u32) -> Self { Self::new(FrameType::Ping, stream, Bytes::new()) }
 
     /// Create a pong message (response to ping)
-    pub fn pong(msgno: u32) -> Self { Self::new(FrameType::Pong, msgno, Bytes::new()) }
+    pub fn pong(stream: u32) -> Self { Self::new(FrameType::Pong, stream, Bytes::new()) }
 
     /// Create a credit frame granting more send credits
     /// The payload contains the number of additional messages that can be sent
@@ -150,7 +152,7 @@ impl Decoder for FrameCodec {
         }
 
         // Read frame header without consuming
-        let msgno = (&src[..4]).get_u32();
+        let stream = (&src[..4]).get_u32();
         let frame_type = FrameType::try_from(src[4])?;
         let len = (&src[5..9]).get_u32() as usize;
 
@@ -170,7 +172,7 @@ impl Decoder for FrameCodec {
         // Extract payload
         let payload = src.split_to(len).freeze();
 
-        Ok(Some(Frame { msgno, frame_type, payload }))
+        Ok(Some(Frame { stream, frame_type, payload }))
     }
 }
 
@@ -187,7 +189,7 @@ impl Encoder<Frame> for FrameCodec {
         dst.reserve(HEADER_SIZE + payload_len);
 
         // Write header
-        dst.put_u32(item.msgno);
+        dst.put_u32(item.stream);
         dst.put_u8(item.frame_type as u8);
         dst.put_u32(payload_len as u32);
 
@@ -205,33 +207,33 @@ mod tests {
     #[test]
     fn test_frame_type_conversion() {
         // Valid conversions
-        assert_eq!(FrameType::try_from(0).unwrap(), FrameType::Push);
-        assert_eq!(FrameType::try_from(1).unwrap(), FrameType::Req);
-        assert_eq!(FrameType::try_from(2).unwrap(), FrameType::Res);
+        assert_eq!(FrameType::try_from(0).unwrap(), FrameType::Header);
+        assert_eq!(FrameType::try_from(1).unwrap(), FrameType::Body);
+        assert_eq!(FrameType::try_from(2).unwrap(), FrameType::End);
         assert_eq!(FrameType::try_from(4).unwrap(), FrameType::Ping);
         assert_eq!(FrameType::try_from(5).unwrap(), FrameType::Pong);
         assert_eq!(FrameType::try_from(8).unwrap(), FrameType::Close);
 
         // Invalid conversion
-        assert!(matches!(FrameType::try_from(9), Err(FrameError::InvalidFrameType(9))));
+        assert!(matches!(FrameType::try_from(12), Err(FrameError::InvalidFrameType(12))));
     }
 
     #[test]
     fn test_frame_construction() {
-        let push = Frame::push(Vec::from(&b"event"[..]));
-        assert_eq!(push.frame_type, FrameType::Push);
-        assert_eq!(push.msgno, 0);
-        assert_eq!(&push.payload[..], b"event");
+        let header = Frame::header(1, Vec::from(&b"headers"[..]));
+        assert_eq!(header.frame_type, FrameType::Header);
+        assert_eq!(header.stream, 1);
+        assert_eq!(&header.payload[..], b"headers");
 
-        let req = Frame::request(42, Vec::from(&b"request"[..]));
-        assert_eq!(req.frame_type, FrameType::Req);
-        assert_eq!(req.msgno, 42);
-        assert_eq!(&req.payload[..], b"request");
+        let body = Frame::body(1, Vec::from(&b"data"[..]));
+        assert_eq!(body.frame_type, FrameType::Body);
+        assert_eq!(body.stream, 1);
+        assert_eq!(&body.payload[..], b"data");
 
-        let res = Frame::response(42, Vec::from(&b"response"[..]));
-        assert_eq!(res.frame_type, FrameType::Res);
-        assert_eq!(res.msgno, 42);
-        assert_eq!(&res.payload[..], b"response");
+        let end = Frame::end(1, Vec::from(&b"trailer"[..]));
+        assert_eq!(end.frame_type, FrameType::End);
+        assert_eq!(end.stream, 1);
+        assert_eq!(&end.payload[..], b"trailer");
     }
 
     #[test]
@@ -240,7 +242,7 @@ mod tests {
         let mut buf = BytesMut::new();
 
         // Create and encode a frame
-        let frame = Frame::request(42, Vec::from(&b"test payload"[..]));
+        let frame = Frame::header(1, Vec::from(&b"test payload"[..]));
         codec.encode(frame, &mut buf).unwrap();
 
         // Verify encoded size
@@ -248,8 +250,8 @@ mod tests {
 
         // Decode it back
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.frame_type, FrameType::Req);
-        assert_eq!(decoded.msgno, 42);
+        assert_eq!(decoded.frame_type, FrameType::Header);
+        assert_eq!(decoded.stream, 1);
         assert_eq!(&decoded.payload[..], b"test payload");
 
         // Buffer should be empty now
@@ -257,71 +259,39 @@ mod tests {
     }
 
     #[test]
-    fn test_push_encode_decode() {
+    fn test_stream_sequence() {
         let mut codec = FrameCodec;
         let mut buf = BytesMut::new();
 
-        // Create and encode a push frame
-        let frame = Frame::push(Vec::from(&b"event data"[..]));
-        codec.encode(frame, &mut buf).unwrap();
+        // Header
+        let header = Frame::header(1, Vec::from(&b"headers"[..]));
+        codec.encode(header, &mut buf).unwrap();
 
-        // Decode and verify
-        let decoded = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.frame_type, FrameType::Push);
-        assert_eq!(decoded.msgno, 0);
-        assert_eq!(&decoded.payload[..], b"event data");
-    }
+        // Body
+        let body = Frame::body(1, Vec::from(&b"data"[..]));
+        codec.encode(body, &mut buf).unwrap();
 
-    #[test]
-    fn test_request_response() {
-        let mut codec = FrameCodec;
-        let mut buf = BytesMut::new();
+        // End
+        let end = Frame::end(1, Vec::from(&b"trailer"[..]));
+        codec.encode(end, &mut buf).unwrap();
 
-        // Request
-        let request = Frame::request(1, Vec::from(&b"request"[..]));
-        codec.encode(request, &mut buf).unwrap();
+        // Decode header
+        let decoded_header = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded_header.frame_type, FrameType::Header);
+        assert_eq!(decoded_header.stream, 1);
+        assert_eq!(&decoded_header.payload[..], b"headers");
 
-        // Response
-        let response = Frame::response(1, Vec::from(&b"response"[..]));
-        codec.encode(response, &mut buf).unwrap();
+        // Decode body
+        let decoded_body = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded_body.frame_type, FrameType::Body);
+        assert_eq!(decoded_body.stream, 1);
+        assert_eq!(&decoded_body.payload[..], b"data");
 
-        // Decode request
-        let decoded_req = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded_req.frame_type, FrameType::Req);
-        assert_eq!(decoded_req.msgno, 1);
-        assert_eq!(&decoded_req.payload[..], b"request");
-
-        // Decode response
-        let decoded_res = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded_res.frame_type, FrameType::Res);
-        assert_eq!(decoded_res.msgno, 1); // Same as request
-        assert_eq!(&decoded_res.payload[..], b"response");
-    }
-
-    #[test]
-    fn test_keepalive() {
-        let mut codec = FrameCodec;
-        let mut buf = BytesMut::new();
-
-        // Ping with sequence 1
-        let ping = Frame::ping(1);
-        codec.encode(ping, &mut buf).unwrap();
-
-        // Pong response with same sequence
-        let pong = Frame::pong(1);
-        codec.encode(pong, &mut buf).unwrap();
-
-        // Decode ping
-        let decoded_ping = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded_ping.frame_type, FrameType::Ping);
-        assert_eq!(decoded_ping.msgno, 1);
-        assert!(decoded_ping.payload.is_empty());
-
-        // Decode pong
-        let decoded_pong = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded_pong.frame_type, FrameType::Pong);
-        assert_eq!(decoded_pong.msgno, 1); // Same as ping
-        assert!(decoded_pong.payload.is_empty());
+        // Decode end
+        let decoded_end = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded_end.frame_type, FrameType::End);
+        assert_eq!(decoded_end.stream, 1);
+        assert_eq!(&decoded_end.payload[..], b"trailer");
     }
 
     #[test]
@@ -355,7 +325,7 @@ mod tests {
         assert_eq!(frame.get_credits(), Some(42));
 
         // Test non-credit frame
-        let frame = Frame::push(Bytes::new());
+        let frame = Frame::header(1, Bytes::new());
         assert_eq!(frame.get_credits(), None);
     }
 
@@ -365,10 +335,10 @@ mod tests {
         let mut buf = BytesMut::new();
 
         // Encode a frame
-        let frame = Frame::request(1, Vec::from(&b"test"[..]));
+        let frame = Frame::header(1, Vec::from(&b"test"[..]));
         codec.encode(frame, &mut buf).unwrap();
 
-        // Test with partial header (just msgno)
+        // Test with partial header (just stream)
         let mut partial_buf = BytesMut::from(&buf[..4]);
         assert!(codec.decode(&mut partial_buf).unwrap().is_none());
 
@@ -378,8 +348,8 @@ mod tests {
 
         // Test with complete frame
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.frame_type, FrameType::Req);
-        assert_eq!(decoded.msgno, 1);
+        assert_eq!(decoded.frame_type, FrameType::Header);
+        assert_eq!(decoded.stream, 1);
         assert_eq!(&decoded.payload[..], b"test");
     }
 
@@ -390,15 +360,15 @@ mod tests {
 
         // Try to encode a frame that's too large
         let large_payload = vec![0u8; MAX_FRAME_SIZE + 1];
-        let frame = Frame::request(1, large_payload);
+        let frame = Frame::header(1, large_payload);
         assert!(matches!(
             codec.encode(frame, &mut buf),
             Err(FrameError::FrameTooLarge { size }) if size > MAX_FRAME_SIZE
         ));
 
         // Try to decode a frame that claims to be too large
-        buf.put_u32(1); // msgno
-        buf.put_u8(FrameType::Push as u8);
+        buf.put_u32(1); // stream
+        buf.put_u8(FrameType::Header as u8);
         buf.put_u32((MAX_FRAME_SIZE + 1) as u32);
         assert!(matches!(
             codec.decode(&mut buf),
@@ -412,7 +382,7 @@ mod tests {
         let mut buf = BytesMut::new();
 
         // Create a credit frame with truncated payload
-        buf.put_u32(0); // msgno
+        buf.put_u32(0); // stream
         buf.put_u8(FrameType::Credit as u8);
         buf.put_u32(2); // payload length of 2 (too short for credits)
         buf.put_u16(0); // incomplete credit value
@@ -429,9 +399,9 @@ mod tests {
 
         // Test various frame types with empty payloads
         let frames = vec![
-            Frame::push(Bytes::new()),
-            Frame::request(1, Bytes::new()),
-            Frame::response(1, Bytes::new()),
+            Frame::header(1, Bytes::new()),
+            Frame::body(1, Bytes::new()),
+            Frame::end(1, Bytes::new()),
             Frame::error(1, Bytes::new()),
             Frame::ping(1),
             Frame::pong(1),
@@ -447,17 +417,43 @@ mod tests {
         for expected in frames {
             let decoded = codec.decode(&mut buf).unwrap().unwrap();
             assert_eq!(decoded.frame_type, expected.frame_type);
-            assert_eq!(decoded.msgno, expected.msgno);
+            assert_eq!(decoded.stream, expected.stream);
             assert!(decoded.payload.is_empty());
         }
     }
 
     #[test]
-    fn test_message_number_boundaries() {
+    fn test_keepalive() {
         let mut codec = FrameCodec;
         let mut buf = BytesMut::new();
 
-        // Test boundary values for message numbers
+        // Ping with stream 1
+        let ping = Frame::ping(1);
+        codec.encode(ping, &mut buf).unwrap();
+
+        // Pong response with same stream
+        let pong = Frame::pong(1);
+        codec.encode(pong, &mut buf).unwrap();
+
+        // Decode ping
+        let decoded_ping = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded_ping.frame_type, FrameType::Ping);
+        assert_eq!(decoded_ping.stream, 1);
+        assert!(decoded_ping.payload.is_empty());
+
+        // Decode pong
+        let decoded_pong = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded_pong.frame_type, FrameType::Pong);
+        assert_eq!(decoded_pong.stream, 1);
+        assert!(decoded_pong.payload.is_empty());
+    }
+
+    #[test]
+    fn test_stream_boundaries() {
+        let mut codec = FrameCodec;
+        let mut buf = BytesMut::new();
+
+        // Test boundary values for stream IDs
         let test_cases = vec![
             0u32,         // Min value
             1,            // Common case
@@ -466,27 +462,36 @@ mod tests {
         ];
 
         // Encode all frames
-        for &msgno in &test_cases {
-            // Create and encode a request
-            let request = Frame::request(msgno, Vec::from(&b"test"[..]));
-            codec.encode(request, &mut buf).unwrap();
+        for &stream_id in &test_cases {
+            // Create and encode a header
+            let header = Frame::header(stream_id, Vec::from(&b"test"[..]));
+            codec.encode(header, &mut buf).unwrap();
 
-            // Create and encode a response
-            let response = Frame::response(msgno, Vec::from(&b"test"[..]));
-            codec.encode(response, &mut buf).unwrap();
+            // Create and encode a body
+            let body = Frame::body(stream_id, Vec::from(&b"test"[..]));
+            codec.encode(body, &mut buf).unwrap();
+
+            // Create and encode an end
+            let end = Frame::end(stream_id, Vec::from(&b"test"[..]));
+            codec.encode(end, &mut buf).unwrap();
         }
 
         // Decode and verify all frames
-        for &msgno in &test_cases {
-            // Verify request
+        for &stream_id in &test_cases {
+            // Verify header
             let decoded = codec.decode(&mut buf).unwrap().unwrap();
-            assert_eq!(decoded.frame_type, FrameType::Req);
-            assert_eq!(decoded.msgno, msgno);
+            assert_eq!(decoded.frame_type, FrameType::Header);
+            assert_eq!(decoded.stream, stream_id);
 
-            // Verify response
+            // Verify body
             let decoded = codec.decode(&mut buf).unwrap().unwrap();
-            assert_eq!(decoded.frame_type, FrameType::Res);
-            assert_eq!(decoded.msgno, msgno);
+            assert_eq!(decoded.frame_type, FrameType::Body);
+            assert_eq!(decoded.stream, stream_id);
+
+            // Verify end
+            let decoded = codec.decode(&mut buf).unwrap().unwrap();
+            assert_eq!(decoded.frame_type, FrameType::End);
+            assert_eq!(decoded.stream, stream_id);
         }
     }
 }
