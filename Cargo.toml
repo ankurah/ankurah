@@ -9,6 +9,6 @@ members = [
     "examples/model",
     "examples/leptos-app",
     "react-signals",
-    "ankql",
+    "ankql", "connectors",
 ]
 resolver = "2"

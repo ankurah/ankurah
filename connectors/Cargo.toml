@@ -1,0 +1,42 @@
+[package]
+name = "ankurah-connectors"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["tcp"]
+tcp = [
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:futures-util",
+    "dep:bytes",
+    "dep:tokio-util",
+    "dep:webpki-roots",
+]
+
+[dependencies]
+# TCP feature dependencies
+tokio = { version = "1.40.0", features = ["full"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2.1", optional = true }
+futures-util = { version = "0.3.30", optional = true }
+bytes = { version = "1.5", optional = true }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# Common dependencies
+thiserror = "2.0"
+tracing = "0.1.40"
+anyhow = "1.0.79"
+ankurah-core = { path = "../core" }
+ankurah-proto = { path = "../proto" }
+bincode = "1.3"
+rcgen = "0.13"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+tokio = { version = "1.40.0", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
