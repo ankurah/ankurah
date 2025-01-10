@@ -37,6 +37,10 @@ impl TryInto<FetchArgs> for &str {
     }
 }
 
+impl From<ankql::error::ParseError> for RetrievalError {
+    fn from(e: ankql::error::ParseError) -> Self { RetrievalError::ParseError(e) }
+}
+
 /// A participant in the Ankurah network, and primary place where queries are initiated
 pub struct Node {
     pub id: proto::NodeId,
@@ -472,8 +476,16 @@ impl Node {
         }
     }
 
-    pub async fn fetch<R: View>(self: &Arc<Self>, args: impl TryInto<FetchArgs>) -> anyhow::Result<ResultSet<R>> {
-        let args = args.try_into().map_err(|_| anyhow!("Failed to parse predicate:"))?;
+    pub async fn get<R: View>(self: &Arc<Self>, id: proto::ID) -> Result<R, RetrievalError> {
+        let entity = self.fetch_entity(id, R::collection()).await?;
+        Ok(R::from_entity(entity))
+    }
+
+    pub async fn fetch<R: View>(
+        self: &Arc<Self>,
+        args: impl TryInto<FetchArgs, Error = impl Into<RetrievalError>>,
+    ) -> Result<ResultSet<R>, RetrievalError> {
+        let args: FetchArgs = args.try_into().map_err(|e| e.into())?;
 
         let predicate = args.predicate;
 

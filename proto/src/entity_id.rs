@@ -20,6 +20,11 @@ impl Default for ID {
     fn default() -> Self { Self::new() }
 }
 
+impl TryFrom<String> for ID {
+    type Error = ulid::DecodeError;
+    fn try_from(id: String) -> Result<Self, Self::Error> { Ok(Self::from_ulid(Ulid::from_string(&id)?)) }
+}
+
 impl ID {
     pub fn new() -> Self { ID(Ulid::new()) }
 

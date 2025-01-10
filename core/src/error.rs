@@ -1,8 +1,12 @@
+use std::convert::Infallible;
+
 use ankurah_proto::ID;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum RetrievalError {
+    #[error("Parse error: {0}")]
+    ParseError(ankql::error::ParseError),
     #[error("ID {0:?} not found")]
     NotFound(ID),
     #[error("Storage error: {0}")]
@@ -41,4 +45,8 @@ impl From<ankql::selection::filter::Error> for RetrievalError {
 
 impl From<anyhow::Error> for RetrievalError {
     fn from(err: anyhow::Error) -> Self { RetrievalError::Anyhow(err) }
+}
+
+impl From<Infallible> for RetrievalError {
+    fn from(_: Infallible) -> Self { unreachable!() }
 }
