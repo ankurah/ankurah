@@ -13,9 +13,7 @@ use ankurah_proto as proto;
 
 #[derive(Debug, Clone, Model)]
 pub struct Pet {
-    #[active_value(YrsString)]
     pub name: String,
-    #[active_value(YrsString)]
     pub age: String,
 }
 
