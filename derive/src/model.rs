@@ -1,35 +1,27 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
 pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let name = input.ident;
+    let name = input.ident.clone();
     let name_str = name.to_string().to_lowercase();
     let view_name = format_ident!("{}View", name);
     let mutable_name = format_ident!("{}Mut", name);
 
-    let fields = match input.data {
-        Data::Struct(ref data) => match data.fields {
-            Fields::Named(ref fields) => &fields.named,
-            _ => panic!("Only named fields are supported"),
+    let fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => &fields.named,
+            fields => return syn::Error::new_spanned(fields, "Only named fields are supported").to_compile_error().into(),
         },
-        _ => panic!("Only structs are supported"),
+        _ => return syn::Error::new_spanned(&name, "Only structs are supported").to_compile_error().into(),
     };
 
-    let active_value_ident = format_ident!("active_value");
-    let field_active_values = fields
-        .iter()
-        .map(|f| {
-            let active_value = f.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_value_ident));
-            match active_value {
-                Some(active_value) => active_value.parse_args::<syn::Ident>().unwrap(),
-                // TODO: Better error, should include which field ident and an example on how to use.
-                None => panic!("All fields need an active value attribute"),
-            }
-        })
-        .collect::<Vec<_>>();
+    let field_active_types = match fields.iter().map(get_active_type).collect::<Result<Vec<_>, _>>() {
+        Ok(values) => values,
+        Err(e) => return e.to_compile_error().into(),
+    };
 
     let field_visibility = fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
 
@@ -62,7 +54,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
                 let backends = ankurah_core::property::Backends::new();
                 #(
-                    #field_active_values::initialize_with(&backends, #field_name_strs.into(), &self.#field_names);
+                    #field_active_types::initialize_with(&backends, #field_name_strs.into(), &self.#field_names);
                 )*
                 ankurah_core::model::Entity::create(
                     id,
@@ -118,7 +110,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             #(
                 #field_visibility fn #field_names(&self) -> #field_types {
                     use ankurah_core::property::ProjectedValue;
-                    #field_active_values::from_backends(#field_name_strs.into(), self.entity.backends()).projected()
+                    #field_active_types::from_backends(#field_name_strs.into(), self.entity.backends()).projected()
                 }
             )*
         }
@@ -129,7 +121,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             entity: &'rec std::sync::Arc<ankurah_core::model::Entity>,
 
             // Field projections
-            #(#field_visibility #field_names: #field_active_values,)*
+            #(#field_visibility #field_names: #field_active_types,)*
             // TODO: Add fields for tracking changes and operation count
         }
 
@@ -145,7 +137,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 use ankurah_core::model::Mutable;
                 assert_eq!(entity.collection(), Self::collection());
                 #(
-                    let #field_names_avoid_conflicts = #field_active_values::from_backends(#field_name_strs.into(), entity.backends());
+                    let #field_names_avoid_conflicts = #field_active_types::from_backends(#field_name_strs.into(), entity.backends());
                 )*
                 Self {
                     entity,
@@ -156,7 +148,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         impl<'rec> #mutable_name<'rec> {
             #(
-                #field_visibility fn #field_names(&self) -> &#field_active_values {
+                #field_visibility fn #field_names(&self) -> &#field_active_types {
                     &self.#field_names
                 }
             )*
@@ -177,4 +169,53 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     .into();
 
     expanded
+}
+
+static ACTIVE_TYPE_MOD_PREFIX: &str = "::ankurah_core::property::value";
+fn get_active_type(field: &syn::Field) -> Result<syn::Path, syn::Error> {
+    let active_value_ident = format_ident!("active_value");
+
+    // First check if there's an explicit attribute
+    if let Some(active_value) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_value_ident)) {
+        let value_str = if let Ok(value) = active_value.parse_args::<syn::Ident>() {
+            value.to_string()
+        } else {
+            let value = active_value
+                .parse_args::<syn::Path>()
+                .map_err(|_| syn::Error::new_spanned(active_value, "Expected an identifier or path for active_value"))?;
+            quote!(#value).to_string()
+        };
+
+        if !value_str.contains("::") {
+            let path = format!("{}::{}", ACTIVE_TYPE_MOD_PREFIX, value_str);
+            return syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(active_value, "Failed to parse active_value path"));
+        }
+        return syn::parse_str(&value_str).map_err(|_| syn::Error::new_spanned(active_value, "Failed to parse active_value path"));
+    }
+
+    // Check for exact type matches and provide default Active types
+    let type_str = if let Type::Path(type_path) = &field.ty {
+        let path_str = quote!(#type_path).to_string().replace(" ", "");
+        match path_str.as_str() {
+            "String" | "std::string::String" => {
+                let path = format!("{}::YrsString", ACTIVE_TYPE_MOD_PREFIX);
+                return syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"));
+            }
+            // Add more default mappings here as needed
+            _ => path_str,
+        }
+    } else {
+        format!("{:?}", &field.ty)
+    };
+
+    // If we get here, we don't have a supported default Active type
+    let field_name = field.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "unnamed".to_string());
+
+    Err(syn::Error::new_spanned(
+        &field.ty,
+        format!(
+            "No active value type found for field '{}' (type: {}). Please specify using #[active_value(Type)] attribute",
+            field_name, type_str
+        ),
+    ))
 }
