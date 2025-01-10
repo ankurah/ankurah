@@ -79,7 +79,7 @@ pub async fn create_test_entity(client: &WebsocketClient) -> Result<(), JsValue>
 }
 
 #[wasm_bindgen]
-#[derive(WasmSignal, Debug, Clone, Default)]
+#[derive(WasmSignal, Clone, Default)]
 pub struct TestResultSet(Arc<ResultSet<SessionView>>);
 
 #[wasm_bindgen]

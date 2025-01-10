@@ -46,7 +46,7 @@ impl Transaction {
         let entity_ref = self.add_entity(new_entity);
         <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
     }
-
+    // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
     pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<ID>) -> Result<M::Mutable<'rec>, crate::error::RetrievalError> {
         let id = id.into();
         let entity = self.get_entity(id, M::collection()).await?;

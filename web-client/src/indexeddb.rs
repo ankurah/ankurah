@@ -327,9 +327,9 @@ mod tests {
 
     #[derive(Model, Debug, Serialize, Deserialize)]
     pub struct Album {
-        #[active_value(YrsString)]
+        #[active_type(YrsString)]
         name: String,
-        #[active_value(YrsString)]
+        #[active_type(YrsString)]
         year: String,
     }
 

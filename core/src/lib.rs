@@ -20,6 +20,8 @@ pub use node::Node;
 #[cfg(feature = "derive")]
 pub use ankurah_derive::*;
 
+pub use ankurah_proto::ID;
+
 // TODO move this somewhere else - it's a dependency of the signal derive macro
 pub trait GetSignalValue: reactive_graph::traits::Get {
     fn cloned(&self) -> Box<dyn GetSignalValue<Value = Self::Value>>;

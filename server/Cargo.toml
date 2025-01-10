@@ -7,7 +7,7 @@ edition = "2021"
 ankurah-proto      = { path = "../proto" }
 ankurah-core       = { path = "../core" }
 anyhow             = "1.0.86"
-axum               = { version = "0.7.5", features = ["ws"] }
+axum               = { version = "0.8", features = ["ws"] }
 bincode            = "1.3.3"
 bytes              = { version = "1.6.0", features = ["serde"] }
 chrono             = { version = "0.4.38", features = ["serde"] }
@@ -22,8 +22,8 @@ dirs               = "5.0.1"
 serde_json         = "1.0"
 html-escape        = "0.2.13"
 once_cell          = "1.11.0"
-axum-extra         = { version = "0.9.3", features = ["typed-header"] }
+axum-extra         = { version = "0.10", features = ["typed-header"] }
 futures-util       = "0.3.30"
-tower              = "0.4.13"
-tower-http         = { version = "0.5.2", features = ["trace"] }
+tower              = "0.5"
+tower-http         = { version = "0.6", features = ["trace"] }
 async-trait        = "0.1"

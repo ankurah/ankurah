@@ -34,7 +34,7 @@ impl WebSocketPeerSender {
     pub async fn send_message(&self, message: proto::ServerMessage) -> Result<(), SendError> {
         let data = bincode::serialize(&message).map_err(|e| SendError::Other(anyhow::anyhow!("Serialization error: {}", e)))?;
 
-        self.tx.send(axum::extract::ws::Message::Binary(data)).await.map_err(|_| SendError::Unknown)?;
+        self.tx.send(axum::extract::ws::Message::Binary(data.into())).await.map_err(|_| SendError::Unknown)?;
 
         Ok(())
     }

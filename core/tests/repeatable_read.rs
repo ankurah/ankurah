@@ -15,7 +15,7 @@ pub struct Album {
     // We have the option of adding override attributes to switch backends in the future.
     // We will initially only use Model structs for initial construction of the entity (or a property group thereof) but we may later consider
     // using them for per-property group retrieval binding, but preferably only via an immutable borrow.
-    #[active_value(YrsString)]
+    #[active_type(YrsString)]
     pub name: String,
 }
 
