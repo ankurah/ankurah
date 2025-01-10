@@ -68,7 +68,7 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
     let presence = proto::ServerMessage::Presence(proto::Presence { node_id: node.id.clone(), durable: node.durable });
     use futures_util::SinkExt;
     if let Ok(data) = bincode::serialize(&presence) {
-        if sender.send(Message::Binary(data)).await.is_ok() {
+        if sender.send(Message::Binary(data.into())).await.is_ok() {
             println!("Sent presence to {who}");
         } else {
             println!("Could not send presence to {who}!");

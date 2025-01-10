@@ -11,7 +11,7 @@ use tracing::{info, Level};
 
 #[derive(Model, Debug, Serialize, Deserialize)] // This line now uses the Model derive macro
 pub struct Album {
-    #[active_value(YrsString)]
+    #[active_type(YrsString)]
     pub name: String,
 }
 

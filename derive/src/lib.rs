@@ -3,7 +3,7 @@ mod wasm_signal;
 
 use proc_macro::TokenStream;
 
-#[proc_macro_derive(Model, attributes(serde, active_value))]
+#[proc_macro_derive(Model, attributes(active_type, ephemeral, model))]
 pub fn derive_model(input: TokenStream) -> TokenStream { model::derive_model_impl(input) }
 
 #[proc_macro_derive(WasmSignal)]

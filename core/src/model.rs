@@ -23,13 +23,12 @@ pub trait Model {
 }
 
 /// A read only view of an Entity which offers typed accessors
-pub trait View: Clone {
+pub trait View {
     type Model: Model;
     type Mutable<'trx>: Mutable<'trx>;
     fn id(&self) -> proto::ID { self.entity().id() }
     fn backends(&self) -> &Backends { self.entity().backends() }
     fn collection() -> &'static str { <Self::Model as Model>::collection() }
-    fn to_model(&self) -> Self::Model;
     fn entity(&self) -> &Arc<Entity>;
     fn from_entity(inner: Arc<Entity>) -> Self;
 }

@@ -10,37 +10,52 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let view_name = format_ident!("{}View", name);
     let mutable_name = format_ident!("{}Mut", name);
 
-    let fields = match &input.data {
-        Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) => &fields.named,
+    let clone_derive = if !get_model_flag(&input.attrs, "no_clone") {
+        quote! { #[derive(Clone)] }
+    } else {
+        quote! {}
+    };
+
+    let fields = match input.data {
+        Data::Struct(data) => match data.fields {
+            Fields::Named(fields) => fields.named,
             fields => return syn::Error::new_spanned(fields, "Only named fields are supported").to_compile_error().into(),
         },
         _ => return syn::Error::new_spanned(&name, "Only structs are supported").to_compile_error().into(),
     };
 
-    let field_active_types = match fields.iter().map(get_active_type).collect::<Result<Vec<_>, _>>() {
+    // Split fields into active and ephemeral
+    let mut active_fields = Vec::new();
+    let mut ephemeral_fields = Vec::new();
+    for field in fields.into_iter() {
+        if get_model_flag(&field.attrs, "ephemeral") {
+            ephemeral_fields.push(field);
+        } else {
+            active_fields.push(field);
+        }
+    }
+
+    let active_field_visibility = active_fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
+    let active_field_names = active_fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
+    let active_field_name_strs = active_fields.iter().map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase()).collect::<Vec<_>>();
+    let projected_field_types = active_fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
+    let active_field_types = match active_fields.iter().map(get_active_type).collect::<Result<Vec<_>, _>>() {
         Ok(values) => values,
         Err(e) => return e.to_compile_error().into(),
     };
 
-    let field_visibility = fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
+    let ephemeral_field_names = ephemeral_fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
+    let ephemeral_field_types = ephemeral_fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
+    let ephemeral_field_visibility = ephemeral_fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
 
-    let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
-    let field_names_avoid_conflicts = fields
-        .iter()
-        .enumerate()
-        .map(|(index, f)| match &f.ident {
-            Some(ident) => format_ident!("field_{}", ident),
-            None => format_ident!("field_{}", index),
-        })
-        .collect::<Vec<_>>();
-    let field_name_strs = fields.iter().map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase()).collect::<Vec<_>>();
-    let field_types = fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
-    /*let field_indices = fields
-    .iter()
-    .enumerate()
-    .map(|(index, _)| index)
-    .collect::<Vec<_>>();*/
+    let wasm_attributes = if cfg!(feature = "wasm") {
+        quote! {
+            use ankurah_core::derive_deps::wasm_bindgen::prelude::*;
+            #[wasm_bindgen]
+        }
+    } else {
+        quote! {}
+    };
 
     let expanded: proc_macro::TokenStream = quote! {
         impl ankurah_core::model::Model for #name {
@@ -54,7 +69,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
                 let backends = ankurah_core::property::Backends::new();
                 #(
-                    #field_active_types::initialize_with(&backends, #field_name_strs.into(), &self.#field_names);
+                    #active_field_types::initialize_with(&backends, #active_field_name_strs.into(), &self.#active_field_names);
                 )*
                 ankurah_core::model::Entity::create(
                     id,
@@ -64,22 +79,28 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
         }
 
-        use ankurah_core::derive_deps::wasm_bindgen::prelude::*;
-        #[wasm_bindgen]
-        #[derive(Debug, Clone)]
+        #wasm_attributes
+        #clone_derive
         pub struct #view_name {
             entity: std::sync::Arc<ankurah_core::model::Entity>,
+            #(
+                #ephemeral_field_visibility #ephemeral_field_names: #ephemeral_field_types,
+            )*
         }
 
         impl ankurah_core::model::View for #view_name {
             type Model = #name;
             type Mutable<'rec> = #mutable_name<'rec>;
 
-            fn to_model(&self) -> Self::Model {
-                #name {
-                    #( #field_names: self.#field_names(), )*
-                }
-            }
+            // THINK ABOUT: to_model is the only thing that forces a clone requirement
+            // Even though most Models will be clonable, maybe we shouldn't force it?
+            // Also: nothing seems to be using this. Maybe it could be opt in
+            // fn to_model(&self) -> Self::Model {
+            //     #name {
+            //         #( #active_field_names: self.#active_field_names(), )*
+            //         #( #ephemeral_field_names: self.#ephemeral_field_names.clone(), )*
+            //     }
+            // }
 
             fn entity(&self) -> &std::sync::Arc<ankurah_core::model::Entity> {
                 &self.entity
@@ -90,6 +111,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 assert_eq!(Self::collection(), entity.collection());
                 #view_name {
                     entity,
+                    #(
+                        #ephemeral_field_names: Default::default(),
+                    )*
                 }
             }
         }
@@ -98,31 +122,33 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         impl #view_name {
             pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah_core::error::RetrievalError> {
                 use ankurah_core::model::View;
+                // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                 trx.edit::<#name>(self.id()).await
             }
         }
 
-        #[wasm_bindgen]
+        #wasm_attributes
         impl #view_name {
             pub fn id(&self) -> ankurah_core::derive_deps::ankurah_proto::ID {
-              self.entity.id.clone()
+                self.entity.id.clone()
             }
             #(
-                #field_visibility fn #field_names(&self) -> #field_types {
+                #active_field_visibility fn #active_field_names(&self) -> #projected_field_types {
                     use ankurah_core::property::ProjectedValue;
-                    #field_active_types::from_backends(#field_name_strs.into(), self.entity.backends()).projected()
+                    #active_field_types::from_backends(#active_field_name_strs.into(), self.entity.backends()).projected()
                 }
             )*
+            // #(
+            //     #ephemeral_field_visibility fn #ephemeral_field_names(&self) -> &#ephemeral_field_types {
+            //         &self.#ephemeral_field_names
+            //     }
+            // )*
         }
 
         #[derive(Debug)]
         pub struct #mutable_name<'rec> {
-            // TODO: Invert View and Mutable so that Mutable has an internal View, and View has id,backends, field projections
             entity: &'rec std::sync::Arc<ankurah_core::model::Entity>,
-
-            // Field projections
-            #(#field_visibility #field_names: #field_active_types,)*
-            // TODO: Add fields for tracking changes and operation count
+            #(#active_field_visibility #active_field_names: #active_field_types,)*
         }
 
         impl<'rec> ankurah_core::model::Mutable<'rec> for #mutable_name<'rec> {
@@ -136,20 +162,20 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn new(entity: &'rec std::sync::Arc<ankurah_core::model::Entity>) -> Self {
                 use ankurah_core::model::Mutable;
                 assert_eq!(entity.collection(), Self::collection());
-                #(
-                    let #field_names_avoid_conflicts = #field_active_types::from_backends(#field_name_strs.into(), entity.backends());
-                )*
                 Self {
                     entity,
-                    #( #field_names: #field_names_avoid_conflicts, )*
+                    #( #active_field_names: #active_field_types::from_backends(#active_field_name_strs.into(), entity.backends()), )*
                 }
             }
         }
 
         impl<'rec> #mutable_name<'rec> {
+            pub fn id(&self) -> ankurah_core::derive_deps::ankurah_proto::ID {
+                self.entity.id.clone()
+            }
             #(
-                #field_visibility fn #field_names(&self) -> &#field_active_types {
-                    &self.#field_names
+                #active_field_visibility fn #active_field_names(&self) -> &#active_field_types {
+                    &self.#active_field_names
                 }
             )*
         }
@@ -173,24 +199,24 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
 static ACTIVE_TYPE_MOD_PREFIX: &str = "::ankurah_core::property::value";
 fn get_active_type(field: &syn::Field) -> Result<syn::Path, syn::Error> {
-    let active_value_ident = format_ident!("active_value");
+    let active_type_ident = format_ident!("active_type");
 
     // First check if there's an explicit attribute
-    if let Some(active_value) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_value_ident)) {
-        let value_str = if let Ok(value) = active_value.parse_args::<syn::Ident>() {
+    if let Some(active_type) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_type_ident)) {
+        let value_str = if let Ok(value) = active_type.parse_args::<syn::Ident>() {
             value.to_string()
         } else {
-            let value = active_value
+            let value = active_type
                 .parse_args::<syn::Path>()
-                .map_err(|_| syn::Error::new_spanned(active_value, "Expected an identifier or path for active_value"))?;
+                .map_err(|_| syn::Error::new_spanned(active_type, "Expected an identifier or path for active_type"))?;
             quote!(#value).to_string()
         };
 
         if !value_str.contains("::") {
             let path = format!("{}::{}", ACTIVE_TYPE_MOD_PREFIX, value_str);
-            return syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(active_value, "Failed to parse active_value path"));
+            return syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(active_type, "Failed to parse active_type path"));
         }
-        return syn::parse_str(&value_str).map_err(|_| syn::Error::new_spanned(active_value, "Failed to parse active_value path"));
+        return syn::parse_str(&value_str).map_err(|_| syn::Error::new_spanned(active_type, "Failed to parse active_type path"));
     }
 
     // Check for exact type matches and provide default Active types
@@ -214,8 +240,15 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Path, syn::Error> {
     Err(syn::Error::new_spanned(
         &field.ty,
         format!(
-            "No active value type found for field '{}' (type: {}). Please specify using #[active_value(Type)] attribute",
+            "No active value type found for field '{}' (type: {}). Please specify using #[active_type(Type)] attribute",
             field_name, type_str
         ),
     ))
+}
+
+fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().segments.iter().any(|seg| seg.ident == "model")
+            && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).map_or(false, |ident| ident == flag_name)
+    })
 }

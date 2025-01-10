@@ -19,9 +19,9 @@ pub struct Pet {
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Album {
-    #[active_value(YrsString)]
+    #[active_type(YrsString)]
     pub name: String,
-    #[active_value(YrsString)]
+    #[active_type(YrsString)]
     pub year: String,
 }
 

@@ -6,12 +6,12 @@ pub struct Album {
     pub name: String,
 }
 
-#[derive(Model, Debug, Serialize, Deserialize)]
+#[derive(Model, Clone, Debug)]
 pub struct Session {
-    #[active_value(YrsString)]
+    #[active_type(YrsString)]
     pub date_connected: String,
-    #[active_value(YrsString)]
+    #[active_type(YrsString)]
     pub ip_address: String,
-    #[active_value(YrsString)]
+    #[active_type(YrsString)]
     pub node_id: String,
 }
