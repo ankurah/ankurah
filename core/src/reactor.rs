@@ -119,6 +119,7 @@ impl Reactor {
                 self.recurse_predicate(pred, f);
             }
             Predicate::IsNull(_) => {}
+            Predicate::Empty => {}
         }
     }
 

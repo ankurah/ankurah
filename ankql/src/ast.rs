@@ -29,6 +29,7 @@ pub enum Predicate {
     And(Box<Predicate>, Box<Predicate>),
     Or(Box<Predicate>, Box<Predicate>),
     Not(Box<Predicate>),
+    Empty,
 }
 
 impl std::fmt::Display for Predicate {
