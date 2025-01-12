@@ -36,6 +36,10 @@ impl YrsString {
         self.backend().delete(&self.property_name, start, length);
         self.backend().insert(&self.property_name, start, value);
     }
+    pub fn replace(&self, value: &str) {
+        self.backend().delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32);
+        self.backend().insert(&self.property_name, 0, value);
+    }
 }
 
 impl InitializeWith<String> for YrsString {

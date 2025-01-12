@@ -1,3 +1,5 @@
+use anyhow::anyhow;
+use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use ulid::Ulid;
@@ -31,6 +33,15 @@ impl ID {
     pub fn from_ulid(ulid: Ulid) -> Self { ID(ulid) }
 
     pub fn to_bytes(&self) -> [u8; 16] { self.0.to_bytes() }
+
+    pub fn from_base64(base64_string: &str) -> Result<Self, anyhow::Error> {
+        let decoded = general_purpose::URL_SAFE.decode(base64_string).map_err(|e| anyhow!("SessionId: Invalid Base64: {e}"))?;
+        let bytes: [u8; 16] = decoded[..].try_into().map_err(|_| anyhow!("SessionId: Invalid length"))?;
+
+        Ok(ID(Ulid::from_bytes(bytes)))
+    }
+
+    pub fn to_base64(&self) -> String { general_purpose::URL_SAFE.encode(self.0.to_bytes()) }
 }
 
 #[wasm_bindgen]
