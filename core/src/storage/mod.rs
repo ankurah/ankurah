@@ -6,14 +6,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::RetrievalError;
 use ankurah_proto::{State, ID};
 
-#[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
+#[cfg(feature = "postgres")]
 mod postgres;
-#[cfg(not(target_arch = "wasm32"))]
+
+#[cfg(feature = "sled")]
 pub mod sled;
 
 #[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
 pub use postgres::Postgres;
-#[cfg(not(target_arch = "wasm32"))]
+
+#[cfg(feature = "sled")]
 pub use sled::SledStorageEngine;
 
 #[async_trait]
