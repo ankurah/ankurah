@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 ankurah-core = { path = "../../core", features = ["derive", "wasm"] }
 ankurah-web-client = { path = "../../web-client", features = ["react"] }
-example-model = { path = "../model" }
+example-model = { path = "../model", features = ["wasm"] }
 wasm-bindgen = "0.2.84"
 wasm-bindgen-futures = "0.4.42"
 wasm-logger = "0.2.0"
