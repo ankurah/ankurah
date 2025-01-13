@@ -64,7 +64,7 @@ where I: View
 
 impl std::fmt::Display for EntityChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityChange {}/{}", self.entity.collection(), self.entity.id())
+        write!(f, "EntityChange {}/{}", self.entity.collection, self.entity.id)
     }
 }
 

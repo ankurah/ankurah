@@ -1,4 +1,4 @@
-use ankurah_proto::{State, ID};
+use ankurah_proto::{CollectionId, State, ID};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -49,14 +49,18 @@ pub struct SledStorageCollection {
 
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
-    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageCollection>> {
+    async fn collection(&self, id: &CollectionId) -> anyhow::Result<Arc<dyn StorageCollection>> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
-        let tree = self.db.open_tree(name)?;
+        let tree = self.db.open_tree(id.as_str())?;
         Ok(Arc::new(SledStorageCollection { tree }))
     }
 
-    async fn fetch_states(&self, collection: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
-        let tree = self.db.open_tree(&collection)?;
+    async fn fetch_states(
+        &self,
+        collection_id: CollectionId,
+        predicate: &ankql::ast::Predicate,
+    ) -> Result<Vec<(ID, State)>, RetrievalError> {
+        let tree = self.db.open_tree(collection_id.as_str())?;
         let bucket = SledStorageCollection { tree };
 
         let predicate = predicate.clone();
@@ -81,7 +85,7 @@ impl StorageEngine for SledStorageEngine {
                 let entity_state: State = bincode::deserialize(&value_bytes)?;
 
                 // Create entity to evaluate predicate
-                let entity = Entity::from_state(id, &collection, &entity_state)?;
+                let entity = Entity::from_state(id, collection_id.clone(), &entity_state)?;
 
                 // Apply predicate filter
                 if evaluate_predicate(&entity, &predicate)? {

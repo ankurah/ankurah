@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::RetrievalError;
-use ankurah_proto::{State, ID};
+use ankurah_proto::{CollectionId, State, ID};
 
 #[cfg(feature = "postgres")]
 mod postgres;
@@ -21,11 +21,15 @@ pub use sled::SledStorageEngine;
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
     // Opens and/or creates a storage bucket.
-    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageCollection>>;
+    async fn collection(&self, id: &CollectionId) -> anyhow::Result<Arc<dyn StorageCollection>>;
 
     // Fetch raw entity states matching a predicate
     // TODO: Move this to the StorageCollection trait
-    async fn fetch_states(&self, collection: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError>;
+    async fn fetch_states(
+        &self,
+        collection_id: CollectionId,
+        predicate: &ankql::ast::Predicate,
+    ) -> Result<Vec<(ID, State)>, RetrievalError>;
 }
 
 #[async_trait]
