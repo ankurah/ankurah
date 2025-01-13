@@ -1,4 +1,4 @@
-use ankurah_proto::ID;
+use ankurah_proto as proto;
 use std::sync::Arc;
 
 use crate::{
@@ -26,8 +26,8 @@ impl Transaction {
     pub fn new(node: Arc<Node>) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
 
     /// Fetch an entity already in the transaction.
-    pub async fn get_entity(&self, id: ID, collection: &'static str) -> Result<&Arc<Entity>, RetrievalError> {
-        if let Some(entity) = self.entities.iter().find(|entity| entity.id() == id && entity.collection() == collection) {
+    pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
+        if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
             return Ok(entity);
         }
 
@@ -47,9 +47,12 @@ impl Transaction {
         <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
     }
     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
-    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<ID>) -> Result<M::Mutable<'rec>, crate::error::RetrievalError> {
+    pub async fn edit<'rec, 'trx: 'rec, M: Model>(
+        &'trx self,
+        id: impl Into<proto::ID>,
+    ) -> Result<M::Mutable<'rec>, crate::error::RetrievalError> {
         let id = id.into();
-        let entity = self.get_entity(id, M::collection()).await?;
+        let entity = self.get_entity(id, &M::collection()).await?;
 
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
     }

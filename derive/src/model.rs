@@ -61,8 +61,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         impl ankurah_core::model::Model for #name {
             type View = #view_name;
             type Mutable<'rec> = #mutable_name<'rec>;
-            fn collection() -> &'static str {
-                #name_str
+            fn collection() -> ankurah_core::derive_deps::ankurah_proto::CollectionId {
+                #name_str.into()
             }
             fn create_entity(&self, id: ::ankurah_core::derive_deps::ankurah_proto::ID) -> ankurah_core::model::Entity {
                 use ankurah_core::property::InitializeWith;
@@ -73,7 +73,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 )*
                 ankurah_core::model::Entity::create(
                     id,
-                    #name_str,
+                    Self::collection(),
                     backends
                 )
             }
@@ -108,7 +108,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
             fn from_entity(entity: std::sync::Arc<ankurah_core::model::Entity>) -> Self {
                 use ankurah_core::model::View;
-                assert_eq!(Self::collection(), entity.collection());
+                assert_eq!(Self::collection(), entity.collection);
                 #view_name {
                     entity,
                     #(
@@ -161,7 +161,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
             fn new(entity: &'rec std::sync::Arc<ankurah_core::model::Entity>) -> Self {
                 use ankurah_core::model::Mutable;
-                assert_eq!(entity.collection(), Self::collection());
+                assert_eq!(entity.collection, Self::collection());
                 Self {
                     entity,
                     #( #active_field_names: #active_field_types::from_backends(#active_field_name_strs.into(), entity.backends()), )*

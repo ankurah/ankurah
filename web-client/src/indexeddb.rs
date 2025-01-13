@@ -30,7 +30,7 @@ pub struct IndexedDBStorageEngine {
 #[derive(Debug)]
 pub struct IndexedDBBucket {
     db: SendWrapper<IdbDatabase>,
-    name: String,
+    collection_id: proto::CollectionId,
 }
 
 impl IndexedDBStorageEngine {
@@ -118,13 +118,13 @@ impl IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageEngine for IndexedDBStorageEngine {
-    async fn bucket(&self, name: &str) -> anyhow::Result<Arc<dyn StorageCollection>> {
-        Ok(Arc::new(IndexedDBBucket { db: self.db.clone(), name: name.to_owned() }))
+    async fn collection(&self, collection_id: &proto::CollectionId) -> anyhow::Result<Arc<dyn StorageCollection>> {
+        Ok(Arc::new(IndexedDBBucket { db: self.db.clone(), collection_id: collection_id.clone() }))
     }
 
     async fn fetch_states(
         &self,
-        collection: String,
+        collection_id: proto::CollectionId,
         predicate: &ankql::ast::Predicate,
     ) -> Result<Vec<(proto::ID, proto::State)>, RetrievalError> {
         SendWrapper::new(async move {
@@ -134,8 +134,8 @@ impl StorageEngine for IndexedDBStorageEngine {
 
             let index = store.index("by_collection").map_err(|_e| anyhow::anyhow!("Failed to get collection index"))?;
 
-            let key_range =
-                web_sys::IdbKeyRange::only(&(&collection).into()).map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
+            let key_range = web_sys::IdbKeyRange::only(&(&collection_id).as_str().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
 
             let request = index.open_cursor_with_range(&key_range).map_err(|_e| anyhow::anyhow!("Failed to open cursor"))?;
 
@@ -173,7 +173,7 @@ impl StorageEngine for IndexedDBStorageEngine {
                 let entity_state = proto::State { state_buffers, head };
 
                 // Create entity to evaluate predicate
-                let entity = Entity::from_state(id, &collection, &entity_state)?;
+                let entity = Entity::from_state(id, collection_id.clone(), &entity_state)?;
 
                 // Apply predicate filter
                 if evaluate_predicate(&entity, predicate)? {
@@ -230,7 +230,7 @@ impl StorageCollection for IndexedDBBucket {
             let entity = js_sys::Object::new();
             js_sys::Reflect::set(&entity, &"id".into(), &id.as_string().into())
                 .map_err(|_e| anyhow::anyhow!("Failed to set id on entity"))?;
-            js_sys::Reflect::set(&entity, &"collection".into(), &self.name.clone().into())
+            js_sys::Reflect::set(&entity, &"collection".into(), &self.collection_id.as_str().into())
                 .map_err(|_e| anyhow::anyhow!("Failed to set collection on entity"))?;
 
             // Store state_buffers
@@ -381,7 +381,7 @@ mod tests {
         let db_name = format!("test_db_{}", ulid::Ulid::new());
         let engine = IndexedDBStorageEngine::open(&db_name).await.expect("Failed to open database");
 
-        let bucket = engine.bucket("albums").await.expect("Failed to create bucket");
+        let bucket = engine.collection(&"albums".into()).await.expect("Failed to create bucket");
 
         // Create a test entity
         let id = proto::ID::from_ulid(ulid::Ulid::new());

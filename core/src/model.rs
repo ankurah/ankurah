@@ -1,5 +1,4 @@
-use ankurah_proto::{self as proto, Clock};
-use proto::{Event, State};
+use ankurah_proto::{Clock, CollectionId, Event, State, ID};
 use tracing::info;
 // use futures_signals::signal::Signal;
 
@@ -17,18 +16,17 @@ use ankql::selection::filter::Filterable;
 pub trait Model {
     type View: View;
     type Mutable<'trx>: Mutable<'trx>;
-    fn collection() -> &'static str
-    where Self: Sized;
-    fn create_entity(&self, id: proto::ID) -> Entity;
+    fn collection() -> CollectionId;
+    fn create_entity(&self, id: ID) -> Entity;
 }
 
 /// A read only view of an Entity which offers typed accessors
 pub trait View {
     type Model: Model;
     type Mutable<'trx>: Mutable<'trx>;
-    fn id(&self) -> proto::ID { self.entity().id() }
+    fn id(&self) -> ID { self.entity().id }
     fn backends(&self) -> &Backends { self.entity().backends() }
-    fn collection() -> &'static str { <Self::Model as Model>::collection() }
+    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Arc<Entity>;
     fn from_entity(inner: Arc<Entity>) -> Self;
 }
@@ -42,30 +40,26 @@ impl std::fmt::Display for Entity {
 /// An entity represents a unique thing within a collection
 #[derive(Debug)]
 pub struct Entity {
-    pub id: proto::ID,
-    pub collection: String,
+    pub id: ID,
+    pub collection: CollectionId,
     backends: Backends,
     head: Arc<Mutex<Clock>>,
     pub upstream: Option<Arc<Entity>>,
 }
 
 impl Entity {
-    pub fn id(&self) -> proto::ID { self.id }
-
-    pub fn collection(&self) -> &str { &self.collection }
-
     pub fn backends(&self) -> &Backends { &self.backends }
 
     pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
 
     // used by the Model macro
-    pub fn create(id: proto::ID, collection: &str, backends: Backends) -> Self {
-        Self { id, collection: collection.to_string(), backends, head: Arc::new(Mutex::new(Clock::default())), upstream: None }
+    pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
+        Self { id, collection, backends, head: Arc::new(Mutex::new(Clock::default())), upstream: None }
     }
-    pub fn from_state(id: proto::ID, collection: &str, state: &State) -> Result<Self, RetrievalError> {
+    pub fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(state)?;
 
-        Ok(Self { id, collection: collection.to_string(), backends, head: Arc::new(Mutex::new(state.head.clone())), upstream: None })
+        Ok(Self { id, collection, backends, head: Arc::new(Mutex::new(state.head.clone())), upstream: None })
     }
 
     /// Collect an event which contains all operations for all backends since the last time they were collected
@@ -78,9 +72,9 @@ impl Entity {
         } else {
             let event = {
                 let event = Event {
-                    id: proto::ID::new(),
-                    entity_id: self.id(),
-                    collection: self.collection().to_string(),
+                    id: ID::new(),
+                    entity_id: self.id.clone(),
+                    collection: self.collection.clone(),
                     operations,
                     parent: self.head.lock().unwrap().clone(),
                 };
@@ -114,8 +108,8 @@ impl Entity {
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
     pub fn snapshot(self: &Arc<Self>) -> Arc<Self> {
         Arc::new(Self {
-            id: self.id(),
-            collection: self.collection().to_string(),
+            id: self.id.clone(),
+            collection: self.collection.clone(),
             backends: self.backends.fork(),
             head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
             upstream: Some(self.clone()),
@@ -124,7 +118,7 @@ impl Entity {
 }
 
 impl Filterable for Entity {
-    fn collection(&self) -> &str { self.collection() }
+    fn collection(&self) -> &str { self.collection.as_str() }
 
     /// TODO Implement this as a typecasted value. eg value<T> -> Option<Result<T>>
     /// where None is returned if the property is not found, and Err is returned if the property is found but is not able to be typecasted
@@ -140,8 +134,8 @@ impl Filterable for Entity {
 pub trait Mutable<'rec> {
     type Model: Model;
     type View: View;
-    fn id(&self) -> proto::ID { self.entity().id }
-    fn collection() -> &'static str { <Self::Model as Model>::collection() }
+    fn id(&self) -> ID { self.entity().id }
+    fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn backends(&self) -> &Backends { &self.entity().backends }
 
     fn entity(&self) -> &Arc<Entity>;

@@ -91,7 +91,7 @@ impl Sql {
                 self.expr(expr);
                 self.sql(" IS NULL");
             }
-            Predicate::Empty => {
+            Predicate::True => {
                 self.sql("TRUE");
             }
         }

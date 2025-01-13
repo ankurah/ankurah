@@ -30,6 +30,27 @@ impl From<NodeId> for String {
     fn from(node_id: NodeId) -> Self { node_id.0.to_string() }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CollectionId(String);
+impl From<&str> for CollectionId {
+    fn from(val: &str) -> Self { CollectionId(val.to_string()) }
+}
+
+impl From<CollectionId> for String {
+    fn from(collection_id: CollectionId) -> Self { collection_id.0 }
+}
+impl AsRef<str> for CollectionId {
+    fn as_ref(&self) -> &str { &self.0 }
+}
+
+impl CollectionId {
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl std::fmt::Display for CollectionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+}
+
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct RequestId(Ulid);
 
@@ -105,7 +126,7 @@ impl std::fmt::Display for NodeResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
     pub id: ID,
-    pub collection: String,
+    pub collection: CollectionId,
     pub entity_id: ID,
     pub operations: BTreeMap<String, Vec<Operation>>,
     /// The set of concurrent events (usually only one) which is the precursor of this event
@@ -189,10 +210,6 @@ impl std::fmt::Display for Clock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}]", self.to_strings().join(", ")) }
 }
 
-impl Event {
-    pub fn collection(&self) -> &str { &self.collection }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Operation {
     pub diff: Vec<u8>,
@@ -221,8 +238,8 @@ pub enum NodeRequestBody {
     // Events to be committed on the remote node
     CommitEvents(Vec<Event>),
     // Request to fetch entities matching a predicate
-    Fetch { collection: String, predicate: ast::Predicate },
-    Subscribe { collection: String, predicate: ast::Predicate },
+    Fetch { collection: CollectionId, predicate: ast::Predicate },
+    Subscribe { collection: CollectionId, predicate: ast::Predicate },
     Unsubscribe { subscription_id: SubscriptionId },
 }
 

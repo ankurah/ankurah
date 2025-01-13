@@ -9,6 +9,7 @@ pub type Callback<R> = Box<dyn Fn(ChangeSet<R>) + Send + Sync + 'static>;
 pub struct Subscription<R: Clone> {
     #[allow(unused)]
     pub(crate) id: proto::SubscriptionId,
+    pub(crate) collection_id: proto::CollectionId,
     pub(crate) predicate: ankql::ast::Predicate,
     pub(crate) callback: Arc<Callback<R>>,
     // Track which entities currently match this subscription

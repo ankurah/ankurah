@@ -13,7 +13,7 @@ use futures_util::TryStreamExt;
 
 pub mod predicate;
 
-use ankurah_proto::{Clock, ID};
+use ankurah_proto::{Clock, CollectionId, ID};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
@@ -45,12 +45,12 @@ impl Postgres {
 
 #[async_trait]
 impl StorageEngine for Postgres {
-    async fn bucket(&self, name: &str) -> anyhow::Result<std::sync::Arc<dyn StorageCollection>> {
-        if !Postgres::sane_name(name) {
+    async fn collection(&self, collection_id: &CollectionId) -> anyhow::Result<std::sync::Arc<dyn StorageCollection>> {
+        if !Postgres::sane_name(collection_id.as_str()) {
             return Err(anyhow::anyhow!("bucket name must only contain valid characters"));
         }
 
-        let bucket = PostgresBucket { pool: self.pool.clone(), collection: name.to_owned() };
+        let bucket = PostgresBucket { pool: self.pool.clone(), collection_id: collection_id.clone() };
 
         // Try to create the table if it doesn't exist
         let mut client = self.pool.get().await?;
@@ -59,8 +59,8 @@ impl StorageEngine for Postgres {
         Ok(Arc::new(bucket))
     }
 
-    async fn fetch_states(&self, collection: String, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
-        if !Postgres::sane_name(&collection) {
+    async fn fetch_states(&self, collection: CollectionId, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
+        if !Postgres::sane_name(&collection.as_str()) {
             return Err(RetrievalError::InvalidBucketName);
         }
 
@@ -96,7 +96,7 @@ impl StorageEngine for Postgres {
                 let kind = error_kind(&err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
-                        if table == collection {
+                        if table == collection.as_str() {
                             // Table doesn't exist yet, return empty results
                             return Ok(Vec::new());
                         }
@@ -134,13 +134,14 @@ impl StorageEngine for Postgres {
 
 pub struct PostgresBucket {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
-    collection: String,
+    collection_id: CollectionId,
 }
 
 impl PostgresBucket {
     pub async fn create_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
         // Create the table
-        let create_query = format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.collection);
+        let create_query =
+            format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.collection_id.as_str());
 
         error!("Running: {}", create_query);
         client.execute(&create_query, &[]).await?;
@@ -154,7 +155,7 @@ impl PostgresBucket {
     ) -> anyhow::Result<()> {
         for (column, datatype) in missing {
             if Postgres::sane_name(&column) {
-                let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.collection, column, datatype,);
+                let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.collection_id.as_str(), column, datatype,);
                 error!("Running: {}", alter_query);
                 client.execute(&alter_query, &[]).await?;
             }
@@ -261,7 +262,10 @@ impl StorageCollection for PostgresBucket {
             INSERT INTO "{0}"({1}) VALUES({2})
             ON CONFLICT("id") DO UPDATE SET {3}
             RETURNING (SELECT "head" FROM old_state) as old_head"#,
-            self.collection, columns_str, values_str, columns_update_str
+            self.collection_id.as_str(),
+            columns_str,
+            values_str,
+            columns_update_str
         );
 
         let mut client = self.pool.get().await?;
@@ -272,7 +276,7 @@ impl StorageCollection for PostgresBucket {
                 let kind = error_kind(&err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
-                        if table == self.collection {
+                        if table == self.collection_id.as_str() {
                             self.create_table(&mut *client).await?;
                             return self.set_state(id, state).await; // retry
                         }
@@ -280,7 +284,7 @@ impl StorageCollection for PostgresBucket {
                     ErrorKind::UndefinedColumn { table, column } => {
                         // TODO: We should check the definition of this and add all
                         // needed columns rather than recursively doing it.
-                        if table == self.collection {
+                        if table == self.collection_id.as_str() {
                             let index = materialized_columns.iter().enumerate().find(|(_, name)| **name == column).map(|(index, _)| index);
                             if let Some(index) = index {
                                 let param = &materialized[index];
@@ -317,7 +321,7 @@ impl StorageCollection for PostgresBucket {
         let uuid: uuid::Uuid = ulid.into();
 
         // be careful with sql injection via bucket name
-        let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.collection);
+        let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.collection_id.as_str());
 
         let mut client = match self.pool.get().await {
             Ok(client) => client,
@@ -336,7 +340,7 @@ impl StorageCollection for PostgresBucket {
                         return Err(RetrievalError::NotFound(id));
                     }
                     ErrorKind::UndefinedTable { table } => {
-                        if self.collection == table {
+                        if self.collection_id.as_str() == table {
                             self.create_table(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
                             return Err(RetrievalError::NotFound(id));
                         }

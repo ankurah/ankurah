@@ -1,4 +1,4 @@
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
@@ -46,7 +46,7 @@ pub struct Node {
     pub id: proto::NodeId,
     pub durable: bool,
     storage_engine: Arc<dyn StorageEngine>,
-    collections: RwLock<BTreeMap<String, StorageCollectionWrapper>>,
+    collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
 
     entities: Arc<RwLock<EntityMap>>,
     // peer_connections: Vec<PeerConnection>,
@@ -57,7 +57,7 @@ pub struct Node {
     reactor: Arc<Reactor>,
 }
 
-type EntityMap = BTreeMap<(proto::ID, String), Weak<Entity>>;
+type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 
 impl Node {
     pub fn new(engine: Arc<dyn StorageEngine>) -> Self {
@@ -201,18 +201,18 @@ impl Node {
     async fn handle_subscribe_request(
         self: &Arc<Self>,
         peer_id: proto::NodeId,
-        collection: String,
+        collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
         // First fetch initial state
-        let states = self.storage_engine.fetch_states(collection.clone(), &predicate).await?;
+        let states = self.storage_engine.fetch_states(collection_id.clone(), &predicate).await?;
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
         let handle = {
             let peer_id = peer_id.clone();
             self.reactor
-                .subscribe(&collection, predicate, move |changeset| {
+                .subscribe(&collection_id, predicate, move |changeset| {
                     // When changes occur, send them to the peer as CommitEvents
                     let events: Vec<_> = changeset
                         .changes
@@ -247,17 +247,17 @@ impl Node {
         Ok(proto::NodeResponseBody::Subscribe { initial: states, subscription_id })
     }
 
-    pub async fn bucket(&self, name: &str) -> StorageCollectionWrapper {
+    pub async fn collection(&self, id: &CollectionId) -> StorageCollectionWrapper {
         let collections = self.collections.read().await;
-        if let Some(store) = collections.get(name) {
+        if let Some(store) = collections.get(id) {
             return store.clone();
         }
         drop(collections);
 
-        let collection = StorageCollectionWrapper::new(self.storage_engine.bucket(name).await.unwrap());
+        let collection = StorageCollectionWrapper::new(self.storage_engine.collection(id).await.unwrap());
 
         let mut collections = self.collections.write().await;
-        assert!(collections.insert(name.to_string(), collection.clone()).is_none());
+        assert!(collections.insert(id.clone(), collection.clone()).is_none());
         drop(collections);
 
         collection
@@ -293,7 +293,7 @@ impl Node {
 
             let state = entity.to_state()?;
             // Push the state buffers to storage.
-            let changed = self.bucket(event.collection()).await.set_state(event.entity_id, &state).await?;
+            let changed = self.collection(&event.collection).await.set_state(event.entity_id, &state).await?;
 
             if changed {
                 changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });
@@ -349,31 +349,36 @@ impl Node {
     /// Returns true if the Entity was already present.
     /// Note that this does not actually store the entity in the storage engine.
     #[must_use]
-    pub(crate) async fn assert_entity(&self, collection: &str, id: proto::ID, state: &proto::State) -> Result<Arc<Entity>, RetrievalError> {
+    pub(crate) async fn assert_entity(
+        &self,
+        collection_id: &CollectionId,
+        id: proto::ID,
+        state: &proto::State,
+    ) -> Result<Arc<Entity>, RetrievalError> {
         let mut entities = self.entities.write().await;
 
-        match entities.entry((id, collection.to_string())) {
+        match entities.entry((id, collection_id.clone())) {
             Entry::Occupied(mut entry) => {
                 if let Some(entity) = entry.get().upgrade() {
                     entity.apply_state(state)?;
                     Ok(entity)
                 } else {
-                    let entity = Arc::new(Entity::from_state(id, collection, state)?);
+                    let entity = Arc::new(Entity::from_state(id, collection_id.clone(), state)?);
                     entry.insert(Arc::downgrade(&entity));
                     Ok(entity)
                 }
             }
             Entry::Vacant(entry) => {
-                let entity = Arc::new(Entity::from_state(id, collection, state)?);
+                let entity = Arc::new(Entity::from_state(id, collection_id.clone(), state)?);
                 entry.insert(Arc::downgrade(&entity));
                 Ok(entity)
             }
         }
     }
 
-    pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection: &str) -> Option<Arc<Entity>> {
+    pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection_id: &CollectionId) -> Option<Arc<Entity>> {
         let entities = self.entities.read().await;
-        if let Some(entity) = entities.get(&(id, collection.to_string())) {
+        if let Some(entity) = entities.get(&(id, collection_id.clone())) {
             entity.upgrade()
         } else {
             None
@@ -400,7 +405,7 @@ impl Node {
     // }
 
     /// Fetch an entity.
-    pub async fn fetch_entity(&self, id: proto::ID, collection: &str) -> Result<Arc<Entity>, RetrievalError> {
+    pub async fn fetch_entity(&self, id: proto::ID, collection: &CollectionId) -> Result<Arc<Entity>, RetrievalError> {
         debug!("fetch_entity {:?}-{:?}", id, collection);
 
         if let Some(local) = self.fetch_entity_from_node(id, collection).await {
@@ -408,7 +413,7 @@ impl Node {
         }
         debug!("fetch_entity 2");
 
-        let raw_bucket = self.bucket(collection).await;
+        let raw_bucket = self.collection(collection).await;
         match raw_bucket.0.get_state(id).await {
             Ok(entity_state) => {
                 return self.assert_entity(collection, id, &entity_state).await;
@@ -426,15 +431,15 @@ impl Node {
 
     pub async fn get_entity<R: View>(&self, id: proto::ID) -> Result<R, RetrievalError> {
         use crate::model::Model;
-        let collection_name = R::Model::collection();
-        let entity = self.fetch_entity(id, collection_name).await?;
+        let collection_id = R::Model::collection();
+        let entity = self.fetch_entity(id, &collection_id).await?;
         Ok(R::from_entity(entity))
     }
 
     /// Fetch entities from the first available durable peer.
     async fn fetch_from_peer(
         self: &Arc<Self>,
-        collection_name: &str,
+        collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
     ) -> anyhow::Result<(), RetrievalError> {
         // Get first durable peer
@@ -449,15 +454,12 @@ impl Node {
         };
 
         match self
-            .request(
-                peer_id.clone(),
-                proto::NodeRequestBody::Fetch { collection: collection_name.to_string(), predicate: predicate.clone() },
-            )
+            .request(peer_id.clone(), proto::NodeRequestBody::Fetch { collection: collection_id.clone(), predicate: predicate.clone() })
             .await
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
         {
             proto::NodeResponseBody::Fetch(states) => {
-                let raw_bucket = self.bucket(collection_name).await;
+                let raw_bucket = self.collection(collection_id).await;
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for (id, state) in states {
@@ -477,7 +479,7 @@ impl Node {
     }
 
     pub async fn get<R: View>(self: &Arc<Self>, id: proto::ID) -> Result<R, RetrievalError> {
-        let entity = self.fetch_entity(id, R::collection()).await?;
+        let entity = self.fetch_entity(id, &R::collection()).await?;
         Ok(R::from_entity(entity))
     }
 
@@ -490,11 +492,11 @@ impl Node {
         let predicate = args.predicate;
 
         use crate::model::Model;
-        let collection_name = R::Model::collection();
+        let collection_id = R::Model::collection();
 
         if !self.durable {
             // Fetch from peers and commit first response
-            match self.fetch_from_peer(collection_name, &predicate).await {
+            match self.fetch_from_peer(&collection_id, &predicate).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if args.cached => (),
                 Err(e) => {
@@ -504,12 +506,12 @@ impl Node {
         }
 
         // Fetch raw states from storage
-        let states = self.storage_engine.fetch_states(collection_name.to_string(), &predicate).await?;
+        let states = self.storage_engine.fetch_states(collection_id.clone(), &predicate).await?;
 
         // Convert states to entities
         let mut entities = Vec::new();
         for (id, state) in states {
-            let entity = self.assert_entity(collection_name, id, &state).await?;
+            let entity = self.assert_entity(&collection_id, id, &state).await?;
             entities.push(R::from_entity(entity));
         }
 
@@ -525,7 +527,7 @@ impl Node {
         R: View,
     {
         use crate::model::Model;
-        let collection = R::Model::collection();
+        let collection_id = R::Model::collection();
         let predicate = predicate.try_into().map_err(|_e| anyhow!("Failed to parse predicate:"))?;
 
         // First, find any durable nodes to subscribe to
@@ -537,12 +539,12 @@ impl Node {
         // If we have a durable node, send a subscription request to it
         if let Some(peer_id) = durable_peer_id {
             match self
-                .request(peer_id, proto::NodeRequestBody::Subscribe { collection: collection.to_string(), predicate: predicate.clone() })
+                .request(peer_id, proto::NodeRequestBody::Subscribe { collection: collection_id.clone(), predicate: predicate.clone() })
                 .await?
             {
                 proto::NodeResponseBody::Subscribe { initial, subscription_id: _ } => {
                     // Apply initial states to our storage
-                    let raw_bucket = self.bucket(collection).await;
+                    let raw_bucket = self.collection(&collection_id).await;
                     for (id, state) in initial {
                         raw_bucket.set_state(id, &state).await.map_err(|e| anyhow!("Failed to set entity: {:?}", e))?;
                     }
@@ -558,7 +560,8 @@ impl Node {
 
         // Now set up our local subscription
         self.reactor
-            .subscribe(collection, predicate, move |changeset| {
+            .subscribe(&collection_id, predicate, move |changeset| {
+                info!("Node notified");
                 callback(changeset.into());
             })
             .await
