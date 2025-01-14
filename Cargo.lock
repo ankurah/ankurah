@@ -54,13 +54,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah"
+version = "0.1.0"
+dependencies = [
+ "ankql",
+ "ankurah-connector-local-process",
+ "ankurah-core",
+ "ankurah-derive",
+ "ankurah-proto",
+ "ankurah-react-signals",
+ "ankurah-storage-sled",
+ "js-sys",
+ "reactive_graph",
+ "tokio",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "ankurah-connector-local-process"
+version = "0.1.0"
+dependencies = [
+ "ankurah-core",
+ "ankurah-proto",
+ "anyhow",
+ "async-trait",
+ "tokio",
+]
+
+[[package]]
 name = "ankurah-core"
 version = "0.1.0"
 dependencies = [
  "ankql",
  "ankurah-derive",
  "ankurah-proto",
- "ankurah-react-signals",
  "anyhow",
  "append-only-vec",
  "async-trait",
@@ -68,26 +95,20 @@ dependencies = [
  "bb8-postgres",
  "bincode",
  "chrono",
- "ctor",
  "dashmap",
- "dirs 6.0.0",
+ "dirs",
  "futures",
  "futures-signals",
  "futures-util",
- "js-sys",
- "reactive_graph",
+ "rand",
  "serde",
  "sled",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.11",
  "tokio",
  "tokio-postgres",
  "tracing",
- "tracing-subscriber",
  "ulid",
  "uuid",
- "wasm-bindgen",
  "yrs",
 ]
 
@@ -98,6 +119,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "ankurah-example-server"
+version = "0.1.0"
+dependencies = [
+ "ankurah",
+ "ankurah-storage-sled",
+ "ankurah-websocket-server",
+ "anyhow",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -134,39 +168,64 @@ dependencies = [
 ]
 
 [[package]]
-name = "ankurah-server"
+name = "ankurah-storage-indexeddb-wasm"
 version = "0.1.0"
 dependencies = [
+ "ankql",
+ "ankurah",
+ "ankurah-core",
+ "ankurah-derive",
+ "ankurah-proto",
+ "any_spawner",
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "console_error_panic_hook",
+ "futures",
+ "gloo-timers",
+ "js-sys",
+ "reactive_graph",
+ "send_wrapper",
+ "serde",
+ "serde-wasm-bindgen",
+ "strum",
+ "thiserror 2.0.11",
+ "tracing",
+ "tracing-wasm",
+ "ulid",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "wasm-logger",
+ "web-sys",
+]
+
+[[package]]
+name = "ankurah-storage-postgres"
+version = "0.1.0"
+
+[[package]]
+name = "ankurah-storage-sled"
+version = "0.1.0"
+dependencies = [
+ "ankql",
  "ankurah-core",
  "ankurah-proto",
  "anyhow",
  "async-trait",
- "axum",
- "axum-extra",
- "base64 0.22.1",
  "bincode",
- "bytes",
- "chrono",
- "dirs 5.0.1",
- "futures-util",
- "html-escape",
- "once_cell",
- "serde",
- "serde_json",
+ "dirs",
  "sled",
  "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
  "ulid",
 ]
 
 [[package]]
-name = "ankurah-web-client"
+name = "ankurah-websocket-client-wasm"
 version = "0.1.0"
 dependencies = [
- "ankql",
+ "ankurah",
  "ankurah-core",
  "ankurah-derive",
  "ankurah-proto",
@@ -194,6 +253,25 @@ dependencies = [
  "wasm-bindgen-test",
  "wasm-logger",
  "web-sys",
+]
+
+[[package]]
+name = "ankurah-websocket-server"
+version = "0.1.0"
+dependencies = [
+ "ankurah-core",
+ "ankurah-proto",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "bincode",
+ "futures-util",
+ "serde",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
 ]
 
 [[package]]
@@ -843,32 +921,11 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.4.6",
- "windows-sys 0.48.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -879,7 +936,7 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.0",
+ "redox_users",
  "windows-sys 0.59.0",
 ]
 
@@ -1006,7 +1063,7 @@ dependencies = [
 name = "example-model"
 version = "0.1.0"
 dependencies = [
- "ankurah-core",
+ "ankurah",
  "serde",
  "wasm-bindgen",
 ]
@@ -1015,8 +1072,9 @@ dependencies = [
 name = "example-wasm-bindings"
 version = "0.1.0"
 dependencies = [
- "ankurah-core",
- "ankurah-web-client",
+ "ankurah",
+ "ankurah-storage-indexeddb-wasm",
+ "ankurah-websocket-client-wasm",
  "any_spawner",
  "console_error_panic_hook",
  "example-model",
@@ -1806,8 +1864,9 @@ dependencies = [
 name = "leptos-example"
 version = "0.1.0"
 dependencies = [
- "ankurah-core",
- "ankurah-web-client",
+ "ankurah",
+ "ankurah-storage-indexeddb-wasm",
+ "ankurah-websocket-client-wasm",
  "console_error_panic_hook",
  "example-model",
  "leptos",
@@ -2601,17 +2660,6 @@ dependencies = [
 
 [[package]]
 name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom",
- "libredox",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "redox_users"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd6f9d3d47bdd2ad6945c5015a226ec6155d0bcdfd8f7cd29f86b71f8de99d2b"
@@ -3307,6 +3355,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b4a531f812dedf1f0d844e69884d76fd7dd9b1967abc89550c6d270b2b55b9c"
 dependencies = [
  "testcontainers",
+]
+
+[[package]]
+name = "tests"
+version = "0.1.0"
+dependencies = [
+ "ankql",
+ "ankurah",
+ "ankurah-connector-local-process",
+ "ankurah-react-signals",
+ "ankurah-storage-sled",
+ "anyhow",
+ "ctor",
+ "js-sys",
+ "reactive_graph",
+ "serde",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
 ]
 
 [[package]]

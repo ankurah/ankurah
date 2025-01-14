@@ -16,7 +16,7 @@ use ulid::Ulid;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash)]
 pub struct NodeId(Ulid);
 
 #[derive(Debug)]
@@ -76,7 +76,7 @@ impl std::fmt::Display for CollectionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
 }
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash)]
 pub struct RequestId(Ulid);
 
 impl std::fmt::Display for RequestId {
@@ -311,21 +311,15 @@ impl std::fmt::Display for NodeResponseBody {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum PeerMessage {
+pub enum NodeMessage {
     Request(NodeRequest),
     Response(NodeResponse),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ClientMessage {
+pub enum Message {
     Presence(Presence),
-    PeerMessage(PeerMessage),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ServerMessage {
-    Presence(Presence),
-    PeerMessage(PeerMessage),
+    PeerMessage(NodeMessage),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

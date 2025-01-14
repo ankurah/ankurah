@@ -1,4 +1,4 @@
-use ankurah_core::Model;
+use ankurah::Model;
 
 pub struct Album {
     pub name: String,

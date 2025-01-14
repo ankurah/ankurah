@@ -1,0 +1,38 @@
+[package]
+name        = "ankurah"
+version     = "0.1.0"
+edition     = "2024"
+description = "A distributed, observable data synchronization framework"
+license     = "MIT"
+repository  = "https://github.com/ankurah/ankurah"
+
+[features]
+react = ["dep:ankurah-react-signals", "wasm"]
+wasm = [
+    "derive",
+    "ankurah-derive?/wasm",
+    "dep:wasm-bindgen",
+    "dep:js-sys",
+    "dep:ankurah-react-signals",
+    "dep:reactive_graph",
+]
+derive = ["dep:ankurah-derive"]
+
+[dependencies]
+ankurah-core   = { path = "../core", version = "0.1.0" }
+ankurah-proto  = { path = "../proto", version = "0.1.0" }
+ankurah-derive = { path = "../derive", version = "0.1.0", optional = true }
+ankql          = { path = "../ankql", version = "0.1.0" }
+
+# Dependencies needed for derive macros
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+ankurah-react-signals = { path = "../react-signals", optional = true }
+reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = [
+    "effects",
+], optional = true }
+
+[dev-dependencies]
+ankurah-storage-sled            = { path = "../storage/sled" }
+tokio                           = { version = "1.40", features = ["full"] }
+ankurah-connector-local-process = { path = "../connectors/local-process" }

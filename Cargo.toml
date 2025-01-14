@@ -2,13 +2,16 @@
 members = [
     "core",
     "derive",
-    "server",
     "proto",
-    "web-client",
     "examples/wasm-bindings",
     "examples/model",
     "examples/leptos-app",
+    "examples/server",
     "react-signals",
     "ankql",
+    "connectors/*",
+    "storage/*",
+    "tests",
+    "ankurah",
 ]
 resolver = "2"

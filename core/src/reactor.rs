@@ -217,7 +217,7 @@ impl Reactor {
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
 
-            info!("watchers: {:?}", self.index_watchers);
+            info!("index watchers: {:?}", self.index_watchers);
             // Find subscriptions that might be interested based on index watchers
             for index_ref in self.index_watchers.iter() {
                 // Get the field value from the entity
@@ -229,6 +229,7 @@ impl Reactor {
                 }
             }
 
+            info!("wildcard watchers: {:?}", self.wildcard_watchers);
             // Also check wildcard watchers for this collection
             if let Some(watchers) = self.wildcard_watchers.get(&change.entity.collection) {
                 for watcher in watchers.iter() {

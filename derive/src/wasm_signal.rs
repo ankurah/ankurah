@@ -17,32 +17,32 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
     // Generate the code
     let expanded = quote! {
 
-        use ::ankurah_core::derive_deps::reactive_graph::traits::Get;
-        #[::ankurah_core::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
-        pub struct #wrapper_name(Box<dyn ::ankurah_core::derive_deps::GetSignalValue<Value = #name>>);
+        use ::ankurah::derive_deps::reactive_graph::traits::Get;
+        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+        pub struct #wrapper_name(Box<dyn ::ankurah::derive_deps::GetSignalValue<Value = #name>>);
 
-        impl <T> From<T> for #wrapper_name  where T: ::ankurah_core::GetSignalValue<Value = #name> + 'static{
+        impl <T> From<T> for #wrapper_name  where T: ::ankurah::GetSignalValue<Value = #name> + 'static{
             fn from(value: T) -> Self {
                 #wrapper_name(Box::new(value))
             }
         }
-        // use ::ankurah_core::derive_deps::wasm_bindgen::prelude::wasm_bindgen;
-        #[::ankurah_core::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+        // use ::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen;
+        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         impl #wrapper_name {
 
             #[wasm_bindgen(js_name = "subscribe")]
-            pub fn subscribe(&self, callback: ::ankurah_core::derive_deps::js_sys::Function) -> ::ankurah_core::derive_deps::ankurah_react_signals::Subscription {
-                use ::ankurah_core::GetSignalValue;
+            pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::derive_deps::ankurah_react_signals::Subscription {
+                use ::ankurah::GetSignalValue;
                 let signal : Box<dyn GetSignalValue<Value = #name>> = self.0.cloned(); // Now using the cloned() method from GetSignalValue
                 // leave this commented out for now
-                let effect = ::ankurah_core::derive_deps::reactive_graph::effect::Effect::new(move |_| {
+                let effect = ::ankurah::derive_deps::reactive_graph::effect::Effect::new(move |_| {
                     let value = signal.get();
                     callback
-                        .call1(&::ankurah_core::derive_deps::wasm_bindgen::JsValue::NULL, &value.into())
+                        .call1(&::ankurah::derive_deps::wasm_bindgen::JsValue::NULL, &value.into())
                         .unwrap();
                 });
 
-                ::ankurah_core::derive_deps::ankurah_react_signals::Subscription::new(effect)
+                ::ankurah::derive_deps::ankurah_react_signals::Subscription::new(effect)
             }
 
             #[wasm_bindgen(getter)]

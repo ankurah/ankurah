@@ -57,10 +57,12 @@ impl From<Infallible> for RetrievalError {
 pub enum RequestError {
     #[error("Peer not connected")]
     PeerNotConnected,
+    #[error("Connection lost")]
+    ConnectionLost,
     #[error("Send error: {0}")]
     SendError(SendError),
-    #[error("Receive error")]
-    RecvError,
+    #[error("Internal channel closed")]
+    InternalChannelClosed,
 }
 
 impl From<SendError> for RequestError {
