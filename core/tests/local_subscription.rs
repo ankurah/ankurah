@@ -1,11 +1,11 @@
-use ankurah_core::changes::ChangeSet;
+use ankurah_core::changes::{ChangeKind, ChangeSet};
 use ankurah_core::resultset::ResultSet;
 use ankurah_core::storage::SledStorageEngine;
 use ankurah_core::{model::Mutable, node::Node};
 use std::sync::{Arc, Mutex};
 
 mod common;
-use common::{Album, AlbumView, ChangeKind, Pet, PetView};
+use common::{Album, AlbumView, Pet, PetView};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

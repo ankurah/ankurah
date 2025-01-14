@@ -19,6 +19,31 @@ use wasm_bindgen::prelude::*;
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
 pub struct NodeId(Ulid);
 
+#[derive(Debug)]
+pub enum DecodeError {
+    NotStringValue,
+    InvalidBase64(base64::DecodeError),
+    InvalidLength,
+    InvalidUlid,
+    InvalidFallback,
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::NotStringValue => write!(f, "Not a string value"),
+            DecodeError::InvalidBase64(e) => write!(f, "Invalid Base64: {}", e),
+            DecodeError::InvalidLength => write!(f, "Invalid Length"),
+            DecodeError::InvalidUlid => write!(f, "Invalid ULID"),
+            DecodeError::InvalidFallback => write!(f, "Invalid Fallback"),
+            DecodeError::Other(e) => write!(f, "Other: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
 impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let id_str = self.0.to_string();
@@ -144,14 +169,8 @@ impl Clock {
 
     pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_string()).collect() }
 
-    pub fn from_strings(strings: Vec<String>) -> Result<Self, ulid::DecodeError> {
-        let ids = strings
-            .into_iter()
-            .map(|s| {
-                let ulid = Ulid::from_string(&s)?;
-                Ok(ID::from_ulid(ulid))
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
+    pub fn from_strings(strings: Vec<String>) -> Result<Self, DecodeError> {
+        let ids = strings.into_iter().map(|s| s.try_into()).collect::<Result<BTreeSet<_>, _>>()?;
         Ok(Self(ids))
     }
 
@@ -316,14 +335,15 @@ pub struct Presence {
 }
 
 impl TryFrom<JsValue> for Clock {
-    type Error = anyhow::Error;
+    type Error = DecodeError;
 
     fn try_from(value: JsValue) -> Result<Self, Self::Error> {
         if value.is_undefined() || value.is_null() {
             return Ok(Clock::default());
         }
-        let ids: Vec<String> = serde_wasm_bindgen::from_value(value).map_err(|e| anyhow::anyhow!("Failed to parse clock: {}", e))?;
-        Self::from_strings(ids).map_err(|e| anyhow::anyhow!("Failed to parse clock: {}", e))
+        let ids: Vec<String> =
+            serde_wasm_bindgen::from_value(value).map_err(|e| DecodeError::Other(anyhow::anyhow!("Failed to parse clock: {}", e)))?;
+        Self::from_strings(ids)
     }
 }
 

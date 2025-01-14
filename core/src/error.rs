@@ -3,6 +3,8 @@ use std::convert::Infallible;
 use ankurah_proto::ID;
 use thiserror::Error;
 
+use crate::connector::SendError;
+
 #[derive(Error, Debug)]
 pub enum RetrievalError {
     #[error("Parse error: {0}")]
@@ -49,4 +51,18 @@ impl From<anyhow::Error> for RetrievalError {
 
 impl From<Infallible> for RetrievalError {
     fn from(_: Infallible) -> Self { unreachable!() }
+}
+
+#[derive(Error, Debug)]
+pub enum RequestError {
+    #[error("Peer not connected")]
+    PeerNotConnected,
+    #[error("Send error: {0}")]
+    SendError(SendError),
+    #[error("Receive error")]
+    RecvError,
+}
+
+impl From<SendError> for RequestError {
+    fn from(err: SendError) -> Self { RequestError::SendError(err) }
 }

@@ -155,7 +155,7 @@ impl StorageEngine for IndexedDBStorageEngine {
                 let entity = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
 
                 let id_str = js_sys::Reflect::get(&entity, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get entity id"))?;
-                let id = proto::ID::from_ulid(ulid::Ulid::from_string(&id_str.as_string().unwrap()).map_err(RetrievalError::storage)?);
+                let id: proto::ID = id_str.try_into().map_err(|_e| anyhow::anyhow!("Failed to convert id to proto::ID"))?;
 
                 let state_buffer =
                     js_sys::Reflect::get(&entity, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
@@ -384,7 +384,7 @@ mod tests {
         let bucket = engine.collection(&"albums".into()).await.expect("Failed to create bucket");
 
         // Create a test entity
-        let id = proto::ID::from_ulid(ulid::Ulid::new());
+        let id = proto::ID::new();
         let mut state_buffers = std::collections::BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
         let state = proto::State { state_buffers, head: proto::Clock::default() };
