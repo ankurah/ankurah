@@ -1,0 +1,13 @@
+[package]
+name    = "ankurah-example-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ankurah                  = { path = "../../ankurah" }
+ankurah-websocket-server = { path = "../../connectors/websocket-server" }
+ankurah-storage-sled     = { path = "../../storage/sled" }
+tracing                  = "0.1"
+tracing-subscriber       = "0.3"
+tokio                    = { version = "1.38", features = ["rt-multi-thread"] }
+anyhow                   = "1.0"

@@ -50,7 +50,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
     let wasm_attributes = if cfg!(feature = "wasm") {
         quote! {
-            use ankurah_core::derive_deps::wasm_bindgen::prelude::*;
+            use ankurah::derive_deps::wasm_bindgen::prelude::*;
             #[wasm_bindgen]
         }
     } else {
@@ -58,20 +58,20 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     };
 
     let expanded: proc_macro::TokenStream = quote! {
-        impl ankurah_core::model::Model for #name {
+        impl ::ankurah::model::Model for #name {
             type View = #view_name;
             type Mutable<'rec> = #mutable_name<'rec>;
-            fn collection() -> ankurah_core::derive_deps::ankurah_proto::CollectionId {
+            fn collection() -> ankurah::derive_deps::ankurah_proto::CollectionId {
                 #name_str.into()
             }
-            fn create_entity(&self, id: ::ankurah_core::derive_deps::ankurah_proto::ID) -> ankurah_core::model::Entity {
-                use ankurah_core::property::InitializeWith;
+            fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::model::Entity {
+                use ankurah::property::InitializeWith;
 
-                let backends = ankurah_core::property::Backends::new();
+                let backends = ankurah::property::Backends::new();
                 #(
                     #active_field_types::initialize_with(&backends, #active_field_name_strs.into(), &self.#active_field_names);
                 )*
-                ankurah_core::model::Entity::create(
+                ::ankurah::model::Entity::create(
                     id,
                     Self::collection(),
                     backends
@@ -82,13 +82,13 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         #wasm_attributes
         #clone_derive
         pub struct #view_name {
-            entity: std::sync::Arc<ankurah_core::model::Entity>,
+            entity: std::sync::Arc<::ankurah::model::Entity>,
             #(
                 #ephemeral_field_visibility #ephemeral_field_names: #ephemeral_field_types,
             )*
         }
 
-        impl ankurah_core::model::View for #view_name {
+        impl ::ankurah::model::View for #view_name {
             type Model = #name;
             type Mutable<'rec> = #mutable_name<'rec>;
 
@@ -102,12 +102,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             //     }
             // }
 
-            fn entity(&self) -> &std::sync::Arc<ankurah_core::model::Entity> {
+            fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
                 &self.entity
             }
 
-            fn from_entity(entity: std::sync::Arc<ankurah_core::model::Entity>) -> Self {
-                use ankurah_core::model::View;
+            fn from_entity(entity: std::sync::Arc<::ankurah::model::Entity>) -> Self {
+                use ::ankurah::model::View;
                 assert_eq!(Self::collection(), entity.collection);
                 #view_name {
                     entity,
@@ -120,8 +120,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         // TODO wasm-bindgen this
         impl #view_name {
-            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah_core::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah_core::error::RetrievalError> {
-                use ankurah_core::model::View;
+            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::RetrievalError> {
+                use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                 trx.edit::<#name>(self.id()).await
             }
@@ -129,12 +129,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         #wasm_attributes
         impl #view_name {
-            pub fn id(&self) -> ankurah_core::derive_deps::ankurah_proto::ID {
+            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
                 self.entity.id.clone()
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> #projected_field_types {
-                    use ankurah_core::property::ProjectedValue;
+                    use ankurah::property::ProjectedValue;
                     #active_field_types::from_backends(#active_field_name_strs.into(), self.entity.backends()).projected()
                 }
             )*
@@ -147,20 +147,20 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         #[derive(Debug)]
         pub struct #mutable_name<'rec> {
-            entity: &'rec std::sync::Arc<ankurah_core::model::Entity>,
+            entity: &'rec std::sync::Arc<::ankurah::model::Entity>,
             #(#active_field_visibility #active_field_names: #active_field_types,)*
         }
 
-        impl<'rec> ankurah_core::model::Mutable<'rec> for #mutable_name<'rec> {
+        impl<'rec> ::ankurah::model::Mutable<'rec> for #mutable_name<'rec> {
             type Model = #name;
             type View = #view_name;
 
-            fn entity(&self) -> &std::sync::Arc<ankurah_core::model::Entity> {
+            fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
                 &self.entity
             }
 
-            fn new(entity: &'rec std::sync::Arc<ankurah_core::model::Entity>) -> Self {
-                use ankurah_core::model::Mutable;
+            fn new(entity: &'rec std::sync::Arc<::ankurah::model::Entity>) -> Self {
+                use ::ankurah::model::Mutable;
                 assert_eq!(entity.collection, Self::collection());
                 Self {
                     entity,
@@ -170,7 +170,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         }
 
         impl<'rec> #mutable_name<'rec> {
-            pub fn id(&self) -> ankurah_core::derive_deps::ankurah_proto::ID {
+            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
                 self.entity.id.clone()
             }
             #(
@@ -180,15 +180,15 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             )*
         }
 
-        impl<'a> Into<ankurah_core::derive_deps::ankurah_proto::ID> for &'a #view_name {
-            fn into(self) -> ankurah_core::derive_deps::ankurah_proto::ID {
-                ankurah_core::model::View::id(self)
+        impl<'a> Into<ankurah::derive_deps::ankurah_proto::ID> for &'a #view_name {
+            fn into(self) -> ankurah::derive_deps::ankurah_proto::ID {
+                ankurah::View::id(self)
             }
         }
 
-        impl<'a, 'rec> Into<ankurah_core::derive_deps::ankurah_proto::ID> for &'a #mutable_name<'rec> {
-            fn into(self) -> ankurah_core::derive_deps::ankurah_proto::ID {
-                ankurah_core::model::Mutable::id(self)
+        impl<'a, 'rec> Into<ankurah::derive_deps::ankurah_proto::ID> for &'a #mutable_name<'rec> {
+            fn into(self) -> ankurah::derive_deps::ankurah_proto::ID {
+                ::ankurah::model::Mutable::id(self)
             }
         }
     }
@@ -197,7 +197,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     expanded
 }
 
-static ACTIVE_TYPE_MOD_PREFIX: &str = "::ankurah_core::property::value";
+static ACTIVE_TYPE_MOD_PREFIX: &str = "::ankurah::property::value";
 fn get_active_type(field: &syn::Field) -> Result<syn::Path, syn::Error> {
     let active_type_ident = format_ident!("active_type");
 

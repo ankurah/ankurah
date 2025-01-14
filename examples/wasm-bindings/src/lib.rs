@@ -1,7 +1,8 @@
 use std::{panic, sync::Arc};
 
-pub use ankurah_core::Node;
-pub use ankurah_web_client::{indexeddb::IndexedDBStorageEngine, WebsocketClient};
+pub use ankurah::Node;
+pub use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
+pub use ankurah_websocket_client_wasm::WebsocketClient;
 use example_model::*;
 use tracing::{error, info};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
@@ -17,7 +18,7 @@ pub async fn start() -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub async fn create_client() -> Result<WebsocketClient, JsValue> {
     let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let node = Arc::new(Node::new(Arc::new(storage_engine)));
+    let node = Node::new(Arc::new(storage_engine));
     let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797")?;
 
     info!("Waiting for client to connect");
@@ -25,7 +26,7 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
     Ok(connector)
 }
 
-use ankurah_core::{changes::ChangeSet, resultset::ResultSet, WasmSignal};
+use ankurah::{changes::ChangeSet, ResultSet, WasmSignal};
 #[wasm_bindgen]
 pub async fn fetch_test_items(client: &WebsocketClient) -> Result<Vec<SessionView>, JsValue> {
     let sessions: ResultSet<SessionView> =

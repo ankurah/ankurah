@@ -1,0 +1,12 @@
+[package]
+name    = "ankurah-connector-local-process"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ankurah-core  = { path = "../../core" }
+ankurah-proto = { path = "../../proto" }
+
+tokio       = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+anyhow      = "1.0"

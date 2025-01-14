@@ -9,7 +9,8 @@ leptos = { git = "https://github.com/synestheticsystems/leptos", branch = "react
     "csr",
     "nightly",
 ] }
-ankurah-web-client = { path = "../../web-client" }
-ankurah-core = { path = "../../core" }
+ankurah-websocket-client-wasm = { path = "../../connectors/websocket-client-wasm" }
+ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm" }
+ankurah = { path = "../../ankurah" }
 example-model = { path = "../model" }
 send_wrapper = "0.6.0"

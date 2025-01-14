@@ -1,5 +1,7 @@
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
+use dashmap::{DashMap, DashSet};
+use rand::prelude::*;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
     sync::{Arc, Weak},
@@ -50,8 +52,9 @@ pub struct Node {
 
     entities: Arc<RwLock<EntityMap>>,
     // peer_connections: Vec<PeerConnection>,
-    peer_connections: tokio::sync::RwLock<BTreeMap<proto::NodeId, PeerState>>,
-    pending_requests: tokio::sync::RwLock<BTreeMap<proto::RequestId, oneshot::Sender<proto::NodeResponseBody>>>,
+    peer_connections: DashMap<proto::NodeId, PeerState>,
+    durable_peers: DashSet<proto::NodeId>,
+    pending_requests: DashMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 
     /// The reactor for handling subscriptions
     reactor: Arc<Reactor>,
@@ -60,41 +63,48 @@ pub struct Node {
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 
 impl Node {
-    pub fn new(engine: Arc<dyn StorageEngine>) -> Self {
+    pub fn new(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
         let reactor = Reactor::new(engine.clone());
-        Self {
+        Arc::new(Self {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             entities: Arc::new(RwLock::new(BTreeMap::new())),
-            peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
-            pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
+            peer_connections: DashMap::new(),
+            durable_peers: DashSet::new(),
+            pending_requests: DashMap::new(),
             reactor,
             durable: false,
-        }
+        })
     }
-    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Self {
+    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
         let reactor = Reactor::new(engine.clone());
-        Self {
+        Arc::new(Self {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             entities: Arc::new(RwLock::new(BTreeMap::new())),
-            peer_connections: tokio::sync::RwLock::new(BTreeMap::new()),
-            pending_requests: tokio::sync::RwLock::new(BTreeMap::new()),
+            peer_connections: DashMap::new(),
+            durable_peers: DashSet::new(),
+            pending_requests: DashMap::new(),
             reactor,
             durable: true,
-        }
+        })
     }
 
     pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
-        let mut peer_connections = self.peer_connections.write().await;
-        peer_connections.insert(presence.node_id, PeerState { sender, durable: presence.durable, subscriptions: BTreeMap::new() });
+        info!("Registering peer {}", presence.node_id);
+        self.peer_connections
+            .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: BTreeMap::new() });
+        if presence.durable {
+            self.durable_peers.insert(presence.node_id);
+        }
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
     pub async fn deregister_peer(&self, node_id: proto::NodeId) {
-        let mut peer_connections = self.peer_connections.write().await;
-        peer_connections.remove(&node_id);
+        info!("Deregistering peer {}", node_id);
+        self.peer_connections.remove(&node_id);
+        self.durable_peers.remove(&node_id);
     }
 
     pub async fn request(
@@ -102,35 +112,30 @@ impl Node {
         node_id: proto::NodeId,
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError> {
-        let (response_tx, response_rx) = oneshot::channel::<proto::NodeResponseBody>();
+        let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
         // Store the response channel
-        self.pending_requests.write().await.insert(request_id.clone(), response_tx);
+        self.pending_requests.insert(request_id.clone(), response_tx);
 
         let request = proto::NodeRequest { id: request_id, to: node_id.clone(), from: self.id.clone(), body: request_body };
 
         {
             // Get the peer connection
 
-            let peer_connections = self.peer_connections.read().await;
-            let connection = peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?.sender.cloned();
-
-            drop(peer_connections);
+            let connection = { self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?.sender.cloned() };
 
             // Send the request
-            connection.send_message(proto::PeerMessage::Request(request)).await?;
+            connection.send_message(proto::NodeMessage::Request(request)).await?;
         }
 
         // Wait for response
-        let response = response_rx.await.map_err(|_| RequestError::RecvError)?;
-
-        Ok(response)
+        response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
-    pub async fn handle_message(self: &Arc<Self>, message: proto::PeerMessage) -> anyhow::Result<()> {
+    pub async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
-            proto::PeerMessage::Request(request) => {
+            proto::NodeMessage::Request(request) => {
                 info!("Received Request {} {request}", self.id);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
@@ -138,10 +143,7 @@ impl Node {
                 // which would lend itself to spawning a task here and making this function synchronous.
 
                 // double check to make sure we have a connection to the peer based on the node id
-                if let Some(sender) = {
-                    let peer_connections = self.peer_connections.read().await;
-                    peer_connections.get(&request.from).map(|c| c.sender.cloned())
-                } {
+                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
                     let from = request.from.clone();
                     let request_id = request.id.clone();
                     if request.to != self.id {
@@ -153,20 +155,19 @@ impl Node {
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                     };
                     let _result = sender
-                        .send_message(proto::PeerMessage::Response(proto::NodeResponse {
+                        .send_message(proto::NodeMessage::Response(proto::NodeResponse {
                             request_id,
                             from: self.id.clone(),
                             to: from,
                             body,
                         }))
                         .await;
-                    // TODO - do something with this error. Should probably send it to a log file
                 }
             }
-            proto::PeerMessage::Response(response) => {
+            proto::NodeMessage::Response(response) => {
                 info!("{} {response}", self.id);
-                if let Some(tx) = self.pending_requests.write().await.remove(&response.request_id) {
-                    tx.send(response.body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
+                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
         }
@@ -193,8 +194,7 @@ impl Node {
             }
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
                 // Remove and drop the subscription handle
-                let mut peer_connections = self.peer_connections.write().await;
-                if let Some(peer_state) = peer_connections.get_mut(&request.from) {
+                if let Some(mut peer_state) = self.peer_connections.get_mut(&request.from) {
                     peer_state.subscriptions.remove(&subscription_id);
                 }
                 Ok(proto::NodeResponseBody::Success)
@@ -243,8 +243,7 @@ impl Node {
 
         let subscription_id = handle.id;
         // Store the subscription handle
-        let mut peer_connections = self.peer_connections.write().await;
-        if let Some(peer_state) = peer_connections.get_mut(&peer_id) {
+        if let Some(mut peer_state) = self.peer_connections.get_mut(&peer_id) {
             peer_state.subscriptions.entry(handle.id).or_insert_with(Vec::new).push(handle);
         }
 
@@ -313,23 +312,22 @@ impl Node {
         self.commit_events_local(events).await?;
 
         // Then propagate to all peers
-        let mut futures = Vec::new();
-        let peer_ids = { self.peer_connections.read().await.iter().map(|(peer_id, _)| peer_id.clone()).collect::<Vec<_>>() };
+        let peer_ids: Vec<_> = self.peer_connections.iter().map(|i| i.key().clone()).collect();
 
-        // Send commit request to all peers
-        for peer_id in peer_ids {
-            futures.push(self.request(peer_id.clone(), proto::NodeRequestBody::CommitEvents(events.to_vec())));
-        }
-
-        // // Wait for all peers to confirm
-        for future in futures {
-            match future.await {
-                Ok(proto::NodeResponseBody::CommitComplete) => Ok(()),
-                Ok(proto::NodeResponseBody::Error(e)) => Err(anyhow!(e)),
-                Ok(_) => Err(anyhow!("Unexpected response type")),
-                Err(e) => Err(e.into()),
-            }?;
-        }
+        futures::future::join_all(peer_ids.iter().map(|peer_id| {
+            let events = events.clone();
+            async move {
+                match self.request(peer_id.clone(), proto::NodeRequestBody::CommitEvents(events)).await {
+                    Ok(proto::NodeResponseBody::CommitComplete) => {
+                        info!("Peer {} confirmed commit", peer_id)
+                    }
+                    Ok(proto::NodeResponseBody::Error(e)) => warn!("Peer {} error: {}", peer_id, e),
+                    Ok(_) => warn!("Peer {} unexpected response type", peer_id),
+                    Err(_) => warn!("Peer {} internal channel closed", peer_id),
+                }
+            }
+        }))
+        .await;
 
         Ok(())
     }
@@ -446,16 +444,7 @@ impl Node {
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
     ) -> anyhow::Result<(), RetrievalError> {
-        // Get first durable peer
-        let peer_id = {
-            self.peer_connections
-                .read()
-                .await
-                .iter()
-                .find(|(_, state)| state.durable)
-                .map(|(id, _)| id.clone())
-                .ok_or(RetrievalError::NoDurablePeers)?
-        };
+        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self
             .request(peer_id.clone(), proto::NodeRequestBody::Fetch { collection: collection_id.clone(), predicate: predicate.clone() })
@@ -535,10 +524,7 @@ impl Node {
         let predicate = predicate.try_into().map_err(|_e| anyhow!("Failed to parse predicate:"))?;
 
         // First, find any durable nodes to subscribe to
-        let durable_peer_id = {
-            let peer_connections = self.peer_connections.read().await;
-            peer_connections.iter().find(|(_, state)| state.durable).map(|(id, _)| id.clone())
-        };
+        let durable_peer_id = self.get_durable_peer_random();
 
         // If we have a durable node, send a subscription request to it
         if let Some(peer_id) = durable_peer_id {
@@ -571,4 +557,15 @@ impl Node {
             .await?;
         Ok(handle)
     }
+
+    /// Get a random durable peer node ID
+    pub fn get_durable_peer_random(&self) -> Option<proto::NodeId> {
+        let mut rng = rand::thread_rng();
+        // Convert to Vec since DashSet iterator doesn't support random selection
+        let peers: Vec<_> = self.durable_peers.iter().collect();
+        peers.choose(&mut rng).map(|i| i.key().clone())
+    }
+
+    /// Get all durable peer node IDs
+    pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }

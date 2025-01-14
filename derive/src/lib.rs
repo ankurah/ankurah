@@ -6,5 +6,6 @@ use proc_macro::TokenStream;
 #[proc_macro_derive(Model, attributes(active_type, ephemeral, model))]
 pub fn derive_model(input: TokenStream) -> TokenStream { model::derive_model_impl(input) }
 
+#[cfg(feature = "wasm")]
 #[proc_macro_derive(WasmSignal)]
 pub fn derive_wasm_signal(input: TokenStream) -> TokenStream { wasm_signal::derive_wasm_signal_impl(input) }

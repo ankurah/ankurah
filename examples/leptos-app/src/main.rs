@@ -1,5 +1,6 @@
-use ankurah_web_client::indexeddb::IndexedDBStorageEngine;
-use ankurah_web_client::WebsocketClient;
+use ankurah::Node;
+use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
+use ankurah_websocket_client_wasm::WebsocketClient;
 use leptos::prelude::*;
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ fn main() {
 #[allow(unused)]
 async fn create_client() -> WebsocketClient {
     let storage = IndexedDBStorageEngine::open("test_db").await.unwrap();
-    let node = Arc::new(ankurah_core::Node::new(Arc::new(storage)));
+    let node = Node::new(Arc::new(storage));
     WebsocketClient::new(node, "localhost:9797").unwrap()
 }
 

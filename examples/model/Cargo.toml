@@ -5,9 +5,9 @@ edition = "2021"
 
 [features]
 default = ["wasm"]
-wasm    = ["dep:wasm-bindgen", "ankurah-core/wasm"]
+wasm    = ["dep:wasm-bindgen", "ankurah/wasm"]
 
 [dependencies]
-ankurah-core = { path = "../../core", features = ["derive"] }
+ankurah      = { path = "../../ankurah", features = ["derive"] }
 serde        = { version = "1.0", features = ["derive"] }
 wasm-bindgen = { version = "0.2", optional = true }

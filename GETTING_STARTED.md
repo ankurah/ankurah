@@ -21,8 +21,7 @@ This project is in early development. To explore the current features, follow th
 
 - **Start the Server** (keep this running):
   ```bash
-  # From the root directory of the repository
-  cargo watch -x 'run --bin ankurah-server'
+  cargo run -p ankurah-example-server
   ```
 
 ## React Example App
@@ -33,7 +32,7 @@ This project is in early development. To explore the current features, follow th
 
    ```bash
    cd examples/wasm-bindings
-   cargo watch -s 'wasm-pack build --target web --debug'
+   'wasm-pack build --target web --debug'
    ```
 
 2. **Install Bun** (npm/node might work, but Bun is faster):

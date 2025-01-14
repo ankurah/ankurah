@@ -5,17 +5,7 @@ version     = "0.1.0"
 edition     = "2021"
 
 [features]
-default = ["derive"]
-wasm = ["derive", "ankurah-derive?/wasm"]
-derive = [
-    "dep:ankurah-derive",
-    "dep:wasm-bindgen",
-    "dep:js-sys",
-    "dep:ankurah-react-signals",
-    "dep:reactive_graph",
-]
-postgres = ["dep:tokio-postgres", "dep:bb8", "dep:bb8-postgres"]
-sled = ["dep:sled", "dep:dirs"]
+default = []
 
 [dependencies]
 # Internal dependencies
@@ -23,15 +13,7 @@ ankurah-derive = { path = "../derive", optional = true }
 ankql          = { path = "../ankql" }
 ankurah-proto  = { path = "../proto" }
 
-# Dependencies needed for derive macros
-wasm-bindgen = { version = "0.2", optional = true }
-js-sys = { version = "0.3", optional = true }
-ankurah-react-signals = { path = "../react-signals", optional = true }
-reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = [
-    "effects",
-], optional = true }
-
-# Common dependencies
+rand            = "0.8"
 dashmap         = "6.1"
 anyhow          = "1.0"
 thiserror       = "2"
@@ -55,16 +37,3 @@ dirs            = { version = "6.0", optional = true }
 sled            = { version = "0.34", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.40", features = ["full"] }
-sled = "0.34"
-ankurah-derive = { path = "../derive" }
-tracing-subscriber = "0.3"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11.4", features = ["postgres"] }
-ctor = "0.2"
-wasm-bindgen = "0"
-js-sys = "0"
-ankurah-react-signals = { path = "../react-signals" }
-reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = [
-    "effects",
-] }
