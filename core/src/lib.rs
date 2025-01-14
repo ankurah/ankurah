@@ -20,6 +20,7 @@ pub use node::Node;
 #[cfg(feature = "derive")]
 pub use ankurah_derive::*;
 
+pub use ankurah_proto as proto;
 pub use ankurah_proto::ID;
 
 // TODO move this somewhere else - it's a dependency of the signal derive macro

@@ -1,5 +1,6 @@
 mod common;
 
+use ankurah_core::changes::ChangeKind;
 use ankurah_core::connector::local_process::LocalProcessConnection;
 use ankurah_core::node::{FetchArgs, Node};
 use ankurah_core::storage::SledStorageEngine;
@@ -10,8 +11,6 @@ use tracing::info;
 use ankurah_core::model::Mutable;
 use ankurah_core::resultset::ResultSet;
 use common::{Album, AlbumView, Pet, PetView};
-
-use common::ChangeKind;
 
 pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.iter().map(|r| r.name()).collect::<Vec<String>>() }
 

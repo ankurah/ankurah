@@ -39,6 +39,7 @@ impl<I> ItemChange<I> {
             _ => &[],
         }
     }
+    pub fn kind(&self) -> ChangeKind { ChangeKind::from(self) }
 }
 
 impl<I> std::fmt::Display for ItemChange<I>
@@ -74,6 +75,16 @@ pub struct ChangeSet<R> {
     pub changes: Vec<ItemChange<R>>,
 }
 
+impl<I> std::fmt::Display for ChangeSet<I>
+where I: View
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // print the number of results in the resultset, and then display each change
+        let results = self.resultset.items.len();
+        write!(f, "ChangeSet({results} results): {}", self.changes.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "))
+    }
+}
+
 impl<I> From<ChangeSet<Arc<Entity>>> for ChangeSet<I>
 where I: View
 {
@@ -94,6 +105,25 @@ where I: View
             ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item), events },
             ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item), events },
             ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item), events },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeKind {
+    Initial,
+    Add,
+    Remove,
+    Update,
+}
+
+impl<R> From<&ItemChange<R>> for ChangeKind {
+    fn from(change: &ItemChange<R>) -> Self {
+        match change {
+            ItemChange::Initial { .. } => ChangeKind::Initial,
+            ItemChange::Add { .. } => ChangeKind::Add,
+            ItemChange::Remove { .. } => ChangeKind::Remove,
+            ItemChange::Update { .. } => ChangeKind::Update,
         }
     }
 }

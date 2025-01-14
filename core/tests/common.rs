@@ -1,7 +1,7 @@
 use tracing::Level;
 
 use ankurah_core::{
-    changes::{ChangeSet, ItemChange},
+    changes::{ChangeKind, ChangeSet},
     model::View,
     property::value::YrsString,
 };
@@ -28,25 +28,6 @@ pub struct Album {
 // Initialize tracing for tests
 #[ctor::ctor]
 fn init_tracing() { tracing_subscriber::fmt().with_max_level(Level::INFO).with_test_writer().init(); }
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChangeKind {
-    Initial,
-    Add,
-    Remove,
-    Update,
-}
-
-impl<R> From<&ItemChange<R>> for ChangeKind {
-    fn from(change: &ItemChange<R>) -> Self {
-        match change {
-            ItemChange::Initial { .. } => ChangeKind::Initial,
-            ItemChange::Add { .. } => ChangeKind::Add,
-            ItemChange::Remove { .. } => ChangeKind::Remove,
-            ItemChange::Update { .. } => ChangeKind::Update,
-        }
-    }
-}
 
 #[allow(unused)]
 pub fn changeset_watcher<R: View + Send + Sync + 'static>(

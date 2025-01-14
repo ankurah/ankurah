@@ -9,7 +9,7 @@ use tokio::sync::{oneshot, RwLock};
 use crate::{
     changes::{EntityChange, ItemChange},
     connector::PeerSender,
-    error::RetrievalError,
+    error::{RequestError, RetrievalError},
     model::{Entity, View},
     reactor::Reactor,
     resultset::ResultSet,
@@ -97,7 +97,11 @@ impl Node {
         peer_connections.remove(&node_id);
     }
 
-    pub async fn request(&self, node_id: proto::NodeId, request_body: proto::NodeRequestBody) -> anyhow::Result<proto::NodeResponseBody> {
+    pub async fn request(
+        &self,
+        node_id: proto::NodeId,
+        request_body: proto::NodeRequestBody,
+    ) -> Result<proto::NodeResponseBody, RequestError> {
         let (response_tx, response_rx) = oneshot::channel::<proto::NodeResponseBody>();
         let request_id = proto::RequestId::new();
 
@@ -110,16 +114,16 @@ impl Node {
             // Get the peer connection
 
             let peer_connections = self.peer_connections.read().await;
-            let connection = peer_connections.get(&node_id).ok_or_else(|| anyhow!("No connection to peer"))?.sender.cloned();
+            let connection = peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?.sender.cloned();
 
             drop(peer_connections);
 
             // Send the request
-            connection.send_message(proto::PeerMessage::Request(request)).await.map_err(|_| anyhow!("Failed to send request"))?;
+            connection.send_message(proto::PeerMessage::Request(request)).await?;
         }
 
         // Wait for response
-        let response = response_rx.await.map_err(|_| anyhow!("Failed to receive response"))?;
+        let response = response_rx.await.map_err(|_| RequestError::RecvError)?;
 
         Ok(response)
     }
@@ -127,7 +131,7 @@ impl Node {
     pub async fn handle_message(self: &Arc<Self>, message: proto::PeerMessage) -> anyhow::Result<()> {
         match message {
             proto::PeerMessage::Request(request) => {
-                info!("{} {request}", self.id);
+                info!("Received Request {} {request}", self.id);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
                 // I think we want timeouts to be handled by the node, not the connector,
@@ -323,7 +327,7 @@ impl Node {
                 Ok(proto::NodeResponseBody::CommitComplete) => Ok(()),
                 Ok(proto::NodeResponseBody::Error(e)) => Err(anyhow!(e)),
                 Ok(_) => Err(anyhow!("Unexpected response type")),
-                Err(e) => Err(e),
+                Err(e) => Err(e.into()),
             }?;
         }
 
@@ -557,13 +561,14 @@ impl Node {
                 }
             }
         }
-
         // Now set up our local subscription
-        self.reactor
+        let handle = self
+            .reactor
             .subscribe(&collection_id, predicate, move |changeset| {
                 info!("Node notified");
                 callback(changeset.into());
             })
-            .await
+            .await?;
+        Ok(handle)
     }
 }
