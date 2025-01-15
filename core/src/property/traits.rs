@@ -1,9 +1,16 @@
 use anyhow::Result;
 
-use crate::property::{backend::Backends, PropertyName};
+use crate::{
+    model::Entity,
+    property::PropertyName,
+};
 
 pub trait InitializeWith<T> {
-    fn initialize_with(backends: &Backends, property_name: PropertyName, value: &T) -> Self;
+    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
+}
+
+pub trait FromEntity {
+    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
 }
 
 pub trait StateSync {

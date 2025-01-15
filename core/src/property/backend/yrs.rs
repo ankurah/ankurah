@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use ankurah_proto::Clock;
 use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
@@ -111,9 +112,7 @@ impl PropertyBackend for YrsBackend {
         Ok(Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) })
     }
 
-    fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<Operation>> {
-        let mut operations = Vec::new();
-
+    fn to_operations(&self) -> anyhow::Result<Vec<Operation>> {
         let mut previous_state = self.previous_state.lock().unwrap();
 
         let txn = self.doc.transact_mut();
@@ -121,13 +120,13 @@ impl PropertyBackend for YrsBackend {
         *previous_state = txn.state_vector();
 
         if !diff.is_empty() {
-            operations.push(Operation { diff })
+            return Ok(vec![Operation { diff }]);
         }
 
-        Ok(operations)
+        Ok(vec![])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()> {
+    fn apply_operations(&self, _current_head: &Clock, _event_head: &Clock, operations: &Vec<Operation>) -> anyhow::Result<()> {
         // println!("apply operations: {:?}", operations);
         for operation in operations {
             self.apply_update(&operation.diff)?;

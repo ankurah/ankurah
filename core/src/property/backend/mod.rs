@@ -50,9 +50,8 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     where Self: Sized;
 
     /// Retrieve operations applied to this backend since the last time we called this method.
-    // TODO: Should this take a precursor id?
-    fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<Operation>>;
-    fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()>;
+    fn to_operations(&self) -> anyhow::Result<Vec<Operation>>;
+    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_precursors: &Clock) -> anyhow::Result<()>;
 }
 
 pub enum BackendDowncasted {
@@ -195,10 +194,15 @@ impl Backends {
         Ok(operations)
     }
 
-    pub fn apply_operations(&self, backend_name: String, operations: &Vec<Operation>, head: &Clock) -> Result<()> {
+    pub fn apply_operations(
+        &self,
+        backend_name: String,
+        operations: &Vec<Operation>,
+        current_head: &Clock,
+        event_precursors: &Clock,
+    ) -> Result<()> {
         let backend = self.get_raw(backend_name)?;
-        backend.apply_operations(operations)?;
-        *self.head.lock().unwrap() = head.clone();
+        backend.apply_operations(operations, current_head, event_precursors)?;
         Ok(())
     }
 
