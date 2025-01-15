@@ -1,4 +1,4 @@
-use ankurah_proto::{CollectionId, State, ID};
+use ankurah_proto::{CollectionId, Event, State, ID};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -44,26 +44,63 @@ impl SledStorageEngine {
 }
 
 pub struct SledStorageCollection {
-    pub tree: sled::Tree,
+    pub name: String,
+    pub state: sled::Tree,
+    pub events: sled::Tree,
 }
 
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
-    async fn collection(&self, id: &CollectionId) -> anyhow::Result<Arc<dyn StorageCollection>> {
+    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
         let tree = self.db.open_tree(id.as_str())?;
-        Ok(Arc::new(SledStorageCollection { tree }))
+        let state = self.db.open_tree(crate::storage::state_name(id.as_str()))?;
+        let events = self.db.open_tree(crate::storage::event_name(id.as_str()))?;
+        Ok(Arc::new(SledStorageCollection { name: id.as_str().to_owned(), state, events }))
+    }
+}
+
+#[async_trait]
+impl StorageCollection for SledStorageCollection {
+    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
+        let tree = self.state.clone();
+        let binary_state = bincode::serialize(state)?;
+        let id_bytes = id.to_bytes();
+
+        // Use spawn_blocking since sled operations are not async
+        task::spawn_blocking(move || {
+            let last = tree.insert(id_bytes, binary_state.clone())?;
+            if let Some(last_bytes) = last {
+                Ok(last_bytes != binary_state)
+            } else {
+                Ok(true)
+            }
+        })
+        .await?
     }
 
-    async fn fetch_states(
-        &self,
-        collection_id: CollectionId,
-        predicate: &ankql::ast::Predicate,
-    ) -> Result<Vec<(ID, State)>, RetrievalError> {
-        let tree = self.db.open_tree(collection_id.as_str()).map_err(SledRetrievalError::StorageError)?;
-        let bucket = SledStorageCollection { tree };
+    async fn get_state(&self, id: ID) -> Result<State, RetrievalError> {
+        let tree = self.state.clone();
+        let id_bytes = id.to_bytes();
 
+        // Use spawn_blocking since sled operations are not async
+        let result = task::spawn_blocking(move || -> Result<Option<sled::IVec>, sled::Error> { tree.get(id_bytes) })
+            .await
+            .map_err(|e| SledRetrievalError::StorageError(Box::new(e)))?;
+
+        match result.map_err(SledRetrievalError::StorageError)? {
+            Some(ivec) => {
+                let entity_state = bincode::deserialize(&ivec)?;
+                Ok(entity_state)
+            }
+            None => Err(SledRetrievalError::NotFound(id).into()),
+        }
+    }
+
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
         let predicate = predicate.clone();
+        let name = self.name.clone();
+        let copied_state = self.state.iter().collect::<Vec<_>>();
 
         // Use spawn_blocking for the full scan operation
         task::spawn_blocking(move || -> Result<Vec<(ID, State)>, RetrievalError> {
@@ -72,7 +109,7 @@ impl StorageEngine for SledStorageEngine {
             // println!("SledStorageEngine: Starting fetch_states scan");
 
             // For now, do a full table scan
-            for item in bucket.tree.iter() {
+            for item in copied_state {
                 let (key_bytes, value_bytes) = item.map_err(SledRetrievalError::StorageError)?;
                 let id = ID::from_ulid(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into().map_err(RetrievalError::storage)?));
 
@@ -104,18 +141,20 @@ impl StorageEngine for SledStorageEngine {
         .await
         .map_err(RetrievalError::future_join)?
     }
-}
 
-#[async_trait]
-impl StorageCollection for SledStorageCollection {
-    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
-        let tree = self.tree.clone();
-        let binary_state = bincode::serialize(state)?;
-        let id_bytes = id.to_bytes();
+    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool> {
+        // Maybe it is worthwhile for us to separate the events table into
+        // `collection-entityid` names until we have indices?
+        let events = self.events.clone();
+
+        // TODO: Shorten `Event` struct to not include `id`/`collection`
+        // since we can infer that based on key/tree respectively
+        let binary_state = bincode::serialize(entity_event)?;
+        let id_bytes = entity_event.id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
-            let last = tree.insert(id_bytes, binary_state.clone())?;
+            let last = events.insert(id_bytes, binary_state.clone())?;
             if let Some(last_bytes) = last {
                 Ok(last_bytes != binary_state)
             } else {
@@ -125,22 +164,19 @@ impl StorageCollection for SledStorageCollection {
         .await?
     }
 
-    async fn get_state(&self, id: ID) -> Result<State, RetrievalError> {
-        let tree = self.tree.clone();
-        let id_bytes = id.to_bytes();
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, crate::error::RetrievalError> {
+        let mut matching_events = Vec::new();
 
-        // Use spawn_blocking since sled operations are not async
-        let result = task::spawn_blocking(move || -> Result<Option<sled::IVec>, sled::Error> { tree.get(id_bytes) })
-            .await
-            .map_err(|e| SledRetrievalError::Other(Box::new(e)))?;
-
-        match result.map_err(SledRetrievalError::StorageError)? {
-            Some(ivec) => {
-                let entity_state = bincode::deserialize(&ivec)?;
-                Ok(entity_state)
+        // full events table scan searching for matching entity ids
+        for event_data in self.events.iter() {
+            let (_key, data) = event_data?;
+            let event: Event = bincode::deserialize(&data)?;
+            if entity_id == event.entity_id {
+                matching_events.push(event);
             }
-            None => Err(SledRetrievalError::NotFound(id).into()),
         }
+
+        Ok(matching_events)
     }
 }
 

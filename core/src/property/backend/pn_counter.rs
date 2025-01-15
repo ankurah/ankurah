@@ -6,6 +6,8 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use ankurah_proto::Clock;
+
 use crate::{
     property::{
         backend::{Operation, PropertyBackend},
@@ -97,7 +99,7 @@ impl PropertyBackend for PNBackend {
         Ok(Self { values: Arc::new(RwLock::new(values)) })
     }
 
-    fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<Operation>> {
+    fn to_operations(&self) -> anyhow::Result<Vec<Operation>> {
         let values = self.values.read().unwrap();
         let diffs = values.iter().map(|(key, value)| (key, value.diff())).collect::<BTreeMap<_, _>>();
 
@@ -105,7 +107,7 @@ impl PropertyBackend for PNBackend {
         Ok(vec![Operation { diff: serialized_diffs }])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> anyhow::Result<()> {
+    fn apply_operations(&self, _current_head: &Clock, _event_head: &Clock, operations: &Vec<Operation>) -> anyhow::Result<()> {
         for operation in operations {
             let diffs = bincode::deserialize::<BTreeMap<PropertyName, i64>>(&operation.diff)?;
 

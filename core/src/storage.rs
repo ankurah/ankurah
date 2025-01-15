@@ -4,20 +4,16 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::RetrievalError;
-use ankurah_proto::{CollectionId, State, ID};
+use ankurah_proto::{CollectionId, Event, State, ID};
+
+pub fn state_name(name: &str) -> String { format!("{}_state", name) }
+
+pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
-    // Opens and/or creates a storage bucket.
+    // Opens and/or creates a storage collection.
     async fn collection(&self, id: &CollectionId) -> anyhow::Result<Arc<dyn StorageCollection>>;
-
-    // Fetch raw entity states matching a predicate
-    // TODO: Move this to the StorageCollection trait
-    async fn fetch_states(
-        &self,
-        collection_id: CollectionId,
-        predicate: &ankql::ast::Predicate,
-    ) -> Result<Vec<(ID, State)>, RetrievalError>;
 }
 
 #[async_trait]
@@ -28,6 +24,9 @@ pub trait StorageCollection: Send + Sync {
     async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool>;
     async fn get_state(&self, id: ID) -> Result<State, RetrievalError>;
 
+    // Fetch raw entity states matching a predicate
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError>;
+
     async fn set_states(&self, entities: Vec<(ID, &State)>) -> anyhow::Result<()> {
         for (id, state) in entities {
             self.set_state(id, state).await?;
@@ -36,8 +35,8 @@ pub trait StorageCollection: Send + Sync {
     }
 
     // TODO:
-    // fn add_event(&self, entity_event: &Event) -> anyhow::Result<()>;
-    // fn get_events(&self, id: ID) -> Result<Vec<Event>, crate::error::RetrievalError>;
+    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool>;
+    async fn get_events(&self, id: ID) -> Result<Vec<Event>, crate::error::RetrievalError>;
 }
 
 #[derive(Serialize, Deserialize)]

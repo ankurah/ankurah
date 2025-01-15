@@ -3,11 +3,14 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use crate::property::{
-    backend::{Backends, PNBackend},
-    traits::InitializeWith,
-    value::ProjectedValue,
-    PropertyName,
+use crate::{
+    model::Entity,
+    property::{
+        backend::PNBackend,
+        traits::{FromEntity, InitializeWith},
+        value::ProjectedValue,
+        PropertyName,
+    },
 };
 
 pub trait Integer: Copy {
@@ -33,7 +36,7 @@ macro_rules! impl_integer {
 impl_integer!(u8, u16, u32, u64, i8, i16, i32, i64);
 
 #[derive(Debug)]
-pub struct PNCounter<I: Integer> {
+pub struct PNCounter<I> {
     pub property_name: PropertyName,
     pub backend: Weak<PNBackend>,
     phantom: PhantomData<I>,
@@ -45,22 +48,28 @@ impl<I: Integer> ProjectedValue for PNCounter<I> {
 }
 
 // Starting with basic string type operations
-impl<I: Integer> PNCounter<I> {
+impl<I> PNCounter<I> {
     pub fn new(property_name: PropertyName, backend: Arc<PNBackend>) -> Self {
         Self { property_name, backend: Arc::downgrade(&backend), phantom: PhantomData }
     }
-    pub fn from_backends(property_name: PropertyName, backends: &Backends) -> Self {
-        let backend = backends.get::<PNBackend>().unwrap();
-        Self::new(property_name, backend)
-    }
     pub fn backend(&self) -> Arc<PNBackend> { self.backend.upgrade().expect("Expected `PN` property backend to exist") }
-    pub fn value(&self) -> I { I::from_i64(self.backend().get(self.property_name.clone())) }
     pub fn add(&self, amount: impl Integer) { self.backend().add(self.property_name.clone(), amount.as_i64()); }
 }
 
+impl<I: Integer> PNCounter<I> {
+    pub fn value(&self) -> I { I::from_i64(self.backend().get(self.property_name.clone())) }
+}
+
+impl<I> FromEntity for PNCounter<I> {
+    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+        let backend = entity.backends().get::<PNBackend>().unwrap();
+        Self::new(property_name, backend)
+    }
+}
+
 impl<I: Integer> InitializeWith<I> for PNCounter<I> {
-    fn initialize_with(backends: &Backends, property_name: PropertyName, value: &I) -> Self {
-        let new = Self::from_backends(property_name, backends);
+    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &I) -> Self {
+        let new = Self::from_entity(property_name, entity);
         new.add(*value);
         new
     }

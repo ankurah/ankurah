@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use ankurah_core::{
     error::RetrievalError,
@@ -14,14 +14,13 @@ use futures_util::TryStreamExt;
 
 pub mod predicate;
 
-use ankurah_proto::{Clock, CollectionId, ID};
+use ankurah_proto::{Clock, CollectionId, Event, ID};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
 use tracing::{error, info};
 
 pub struct Postgres {
-    // TODO: the rest of the owl
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
 }
 
@@ -46,90 +45,19 @@ impl Postgres {
 
 #[async_trait]
 impl StorageEngine for Postgres {
-    async fn collection(&self, collection_id: &CollectionId) -> anyhow::Result<std::sync::Arc<dyn StorageCollection>> {
-        if !Postgres::sane_name(collection_id.as_str()) {
-            return Err(anyhow::anyhow!("bucket name must only contain valid characters"));
+    async fn collection(&self, collection_id: &CollectionId) -> Result<std::sync::Arc<dyn StorageCollection>, RetrievalError> {
+        if !Postgres::sane_name(collection_id) {
+            return Err(RetrievalError::InvalidBucketName);
         }
 
         let bucket = PostgresBucket { pool: self.pool.clone(), collection_id: collection_id.clone() };
 
         // Try to create the table if it doesn't exist
-        let mut client = self.pool.get().await?;
-        bucket.create_table(&mut client).await?;
+        let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
+        bucket.create_event_table(&mut client).await?;
+        bucket.create_state_table(&mut client).await?;
 
         Ok(Arc::new(bucket))
-    }
-
-    async fn fetch_states(&self, collection: CollectionId, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
-        if !Postgres::sane_name(&collection.as_str()) {
-            return Err(RetrievalError::InvalidBucketName);
-        }
-
-        let client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
-
-        let mut results = Vec::new();
-
-        let mut ankql_sql = predicate::Sql::new();
-        ankql_sql.predicate(&predicate);
-
-        let (sql, args) = ankql_sql.collapse();
-
-        let filtered_query = if args.len() > 0 {
-            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE {}"#, collection.as_str(), sql,)
-        } else {
-            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}""#, collection.as_str())
-        };
-
-        eprintln!("Running: {}", filtered_query);
-        // `query_raw` fixes 2 problems here
-        // - `query` only takes `&[&dyn ToSql + Sync]`... and rust can't coerce
-        //   `&[&dyn ToSql + Send + Sync]` for reasons unknown to me.
-        // - It gives us a `RowStream` instead of a `Vec<Row>`, which means
-        //   we can return rows as they come instead of waiting for all of them
-        //   in the future.
-        //   (... I believe? Don't quote me on this)
-        let rows = match client.query_raw(&filtered_query, args).await {
-            Ok(stream) => match stream.try_collect::<Vec<_>>().await {
-                Ok(rows) => rows,
-                Err(err) => return Err(RetrievalError::StorageError(err.into())),
-            },
-            Err(err) => {
-                let kind = error_kind(&err);
-                match kind {
-                    ErrorKind::UndefinedTable { table } => {
-                        if table == collection.as_str() {
-                            // Table doesn't exist yet, return empty results
-                            return Ok(Vec::new());
-                        }
-                    }
-                    _ => {}
-                }
-
-                return Err(RetrievalError::StorageError(err.into()));
-            }
-        };
-
-        for row in rows {
-            let uuid: uuid::Uuid = row.get(0);
-            let state_buffer: Vec<u8> = row.get(1);
-            let id = ID::from_ulid(ulid::Ulid::from(uuid));
-
-            let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer)?;
-
-            let entity_state = State { state_buffers, head: row.get::<_, Vec<uuid::Uuid>>(2).into() };
-
-            results.push((id, entity_state));
-
-            // Create entity to evaluate predicate
-            //let entity = Entity::from_entity_state(id, collection, &entity_state)?;
-
-            // Apply predicate filter
-            /*if evaluate_predicate(&entity, predicate)? {
-                results.push((id, entity_state));
-            }*/
-        }
-
-        Ok(results)
     }
 }
 
@@ -139,10 +67,24 @@ pub struct PostgresBucket {
 }
 
 impl PostgresBucket {
-    pub async fn create_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
-        // Create the table
-        let create_query =
-            format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.collection_id.as_str());
+    pub fn state_table(&self) -> String {
+        format!("{}_state", self.collection_id.as_str())
+    }
+
+    pub fn event_table(&self) -> String {
+        format!("{}_event", self.collection_id.as_str())
+    }
+
+    pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
+        let create_query = format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "entity_id" UUID, "operations" bytea, "parent" UUID[])"#, self.event_table());
+
+        error!("Running: {}", create_query);
+        client.execute(&create_query, &[]).await?;
+        Ok(())
+    }
+
+    pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
+        let create_query = format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.state_table());
 
         error!("Running: {}", create_query);
         client.execute(&create_query, &[]).await?;
@@ -156,7 +98,7 @@ impl PostgresBucket {
     ) -> anyhow::Result<()> {
         for (column, datatype) in missing {
             if Postgres::sane_name(&column) {
-                let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.collection_id.as_str(), column, datatype,);
+                let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.state_table(), column, datatype,);
                 error!("Running: {}", alter_query);
                 client.execute(&alter_query, &[]).await?;
             }
@@ -263,10 +205,7 @@ impl StorageCollection for PostgresBucket {
             INSERT INTO "{0}"({1}) VALUES({2})
             ON CONFLICT("id") DO UPDATE SET {3}
             RETURNING (SELECT "head" FROM old_state) as old_head"#,
-            self.collection_id.as_str(),
-            columns_str,
-            values_str,
-            columns_update_str
+            self.state_table(), columns_str, values_str, columns_update_str
         );
 
         let mut client = self.pool.get().await?;
@@ -277,15 +216,15 @@ impl StorageCollection for PostgresBucket {
                 let kind = error_kind(&err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
-                        if table == self.collection_id.as_str() {
-                            self.create_table(&mut *client).await?;
+                        if table == self.state_table() {
+                            self.create_state_table(&mut *client).await?;
                             return self.set_state(id, state).await; // retry
                         }
                     }
                     ErrorKind::UndefinedColumn { table, column } => {
                         // TODO: We should check the definition of this and add all
                         // needed columns rather than recursively doing it.
-                        if table == self.collection_id.as_str() {
+                        if table == self.state_table() {
                             let index = materialized_columns.iter().enumerate().find(|(_, name)| **name == column).map(|(index, _)| index);
                             if let Some(index) = index {
                                 let param = &materialized[index];
@@ -322,7 +261,7 @@ impl StorageCollection for PostgresBucket {
         let uuid: uuid::Uuid = ulid.into();
 
         // be careful with sql injection via bucket name
-        let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.collection_id.as_str());
+        let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.state_table());
 
         let mut client = match self.pool.get().await {
             Ok(client) => client,
@@ -341,8 +280,8 @@ impl StorageCollection for PostgresBucket {
                         return Err(RetrievalError::NotFound(id));
                     }
                     ErrorKind::UndefinedTable { table } => {
-                        if self.collection_id.as_str() == table {
-                            self.create_table(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
+                        if table == self.state_table() {
+                            self.create_state_table(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
                             return Err(RetrievalError::NotFound(id));
                         }
                     }
@@ -361,6 +300,167 @@ impl StorageCollection for PostgresBucket {
         let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers)?;
 
         Ok(State { state_buffers, head: row.get::<_, Vec<uuid::Uuid>>("head").into() })
+    }
+
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
+        let client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
+
+        let mut results = Vec::new();
+
+        let mut ankql_sql = predicate::Sql::new();
+        ankql_sql.predicate(&predicate);
+
+        let (sql, args) = ankql_sql.collapse();
+
+        let filtered_query = if args.len() > 0 {
+            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE {}"#, self.state_table(), sql,)
+        } else {
+            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}""#, self.state_table())
+        };
+
+        eprintln!("Running: {}", filtered_query);
+        // `query_raw` fixes 2 problems here
+        // - `query` only takes `&[&dyn ToSql + Sync]`... and rust can't coerce
+        //   `&[&dyn ToSql + Send + Sync]` for reasons unknown to me.
+        // - It gives us a `RowStream` instead of a `Vec<Row>`, which means
+        //   we can return rows as they come instead of waiting for all of them
+        //   in the future.
+        //   (... I believe? Don't quote me on this)
+        let rows = match client.query_raw(&filtered_query, args).await {
+            Ok(stream) => match stream.try_collect::<Vec<_>>().await {
+                Ok(rows) => rows,
+                Err(err) => return Err(RetrievalError::StorageError(err.into())),
+            },
+            Err(err) => {
+                let kind = error_kind(&err);
+                match kind {
+                    ErrorKind::UndefinedTable { table } => {
+                        if table == self.state_table() {
+                            // Table doesn't exist yet, return empty results
+                            return Ok(Vec::new());
+                        }
+                    }
+                    _ => {}
+                }
+
+                return Err(RetrievalError::StorageError(err.into()));
+            }
+        };
+
+        for row in rows {
+            let uuid: uuid::Uuid = row.get(0);
+            let state_buffer: Vec<u8> = row.get(1);
+            let id = ID::from_ulid(ulid::Ulid::from(uuid));
+
+            let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer)?;
+
+            let entity_state = State { state_buffers, head: row.get::<_, Vec<uuid::Uuid>>(2).into() };
+
+            results.push((id, entity_state));
+
+            // Create entity to evaluate predicate
+            //let entity = Entity::from_entity_state(id, collection, &entity_state)?;
+
+            // Apply predicate filter
+            /*if evaluate_predicate(&entity, predicate)? {
+                results.push((id, entity_state));
+            }*/
+        }
+
+        Ok(results)
+    }
+
+    /// Postgres Event Table:
+    /// {bucket_name}_event
+    /// event_id uuid, // `ID`/`ULID`
+    /// entity_id uuid, // `ID`/`ULID`
+    /// operations bytea, // `Vec<Operation>`
+    /// clock bytea, // `Clock`
+    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool> { 
+        let event_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.id));
+        let entity_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.entity_id));
+        let operations = bincode::serialize(&entity_event.operations)?;
+        let parent_uuids: Vec<uuid::Uuid> = (&entity_event.parent).into();
+
+        // Does it even matter if this conflicts?
+        // One peers event should match any duplicates, so taking the first
+        // event we receive from a peer should be fine.
+        let query = format!(
+            r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent") VALUES($1, $2, $3, $4)"#,
+            self.event_table(),
+        );
+
+        let mut client = self.pool.get().await?;
+        error!("Running: {}", query);
+        let affected = match client.execute(&query, &[&event_id, &entity_id, &operations, &parent_uuids]).await {
+            Ok(affected) => affected,
+            Err(err) => {
+                let kind = error_kind(&err);
+                match kind {
+                    ErrorKind::UndefinedTable { table } => {
+                        if table == self.event_table() {
+                            self.create_event_table(&mut *client).await?;
+                            return self.add_event(entity_event).await; // retry
+                        }
+                    }
+                    _ => {}
+                }
+
+                return Err(err.into());
+            }
+        };
+
+        Ok(affected > 0)
+    }
+
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, crate::error::RetrievalError> { 
+        let query = format!(
+            r#"SELECT "id", "operations", "head" FROM "{0}" WHERE "entity_id" = $1"#,
+            self.event_table(),
+        );
+
+        let entity_uuid = uuid::Uuid::from(ulid::Ulid::from(entity_id));
+
+        let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
+        error!("Running: {}", query);
+        let rows = match client.query(&query, &[&entity_uuid]).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                let kind = error_kind(&err);
+                match kind {
+                    ErrorKind::UndefinedTable { table } => {
+                        if table == self.event_table() {
+                            self.create_event_table(&mut *client).await?;
+                            return Ok(Vec::new());
+                        }
+                    }
+                    _ => {}
+                }
+
+                return Err(err.into());
+            }
+        };
+
+        let mut events = Vec::new();
+        for row in rows {
+            let event_id: uuid::Uuid = row.get("id");
+            let event_id = ID::from_ulid(event_id.into());
+            let operations_binary: Vec<u8> = row.get("operations");
+            let operations = bincode::deserialize(&operations_binary)?;
+            let parent: Vec<uuid::Uuid> = row.get("parent");
+            let parent  = parent.into_iter().map(|uuid| ID::from_ulid(uuid.into())).collect::<BTreeSet<_>>();
+            let clock = Clock::new(parent);
+
+            events.push(Event {
+                id: event_id,
+                collection: self.collection.clone(),
+                entity_id: entity_id,
+                operations: operations,
+                parent: clock,
+            })
+        }
+
+        Ok(events)
     }
 }
 
