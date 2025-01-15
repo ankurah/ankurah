@@ -5,6 +5,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use ankurah_proto::{Clock, Operation};
+use serde::{Deserialize, Serialize};
+
 use crate::{
     property::{backend::PropertyBackend, PropertyName},
     storage::Materialized,
@@ -12,8 +15,12 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct LWWBackend {
-    // TODO: store a timestamp/precursor id at time of setting value (or maybe when we commit?).
     values: Arc<RwLock<BTreeMap<PropertyName, Vec<u8>>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LWWDiff {
+    data: BTreeMap<PropertyName, Vec<u8>>,
 }
 
 impl Default for LWWBackend {
@@ -23,7 +30,7 @@ impl Default for LWWBackend {
 impl LWWBackend {
     pub fn new() -> LWWBackend { Self { values: Arc::new(RwLock::new(BTreeMap::default())) } }
 
-    pub fn set(&mut self, property_name: PropertyName, value: Vec<u8>) {
+    pub fn set(&self, property_name: PropertyName, value: Vec<u8>) {
         let mut values = self.values.write().unwrap();
         match values.entry(property_name) {
             Entry::Occupied(mut entry) => {
@@ -75,9 +82,35 @@ impl PropertyBackend for LWWBackend {
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
-    fn to_operations(&self /*precursor: ULID*/) -> anyhow::Result<Vec<super::Operation>> { todo!() }
+    fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
+        let values = self.values.read().unwrap();
 
-    fn apply_operations(&self, _operations: &Vec<super::Operation>) -> anyhow::Result<()> { todo!() }
+        let mut map = BTreeMap::<&PropertyName, &Vec<u8>>::default();
+        for (property_name, value) in &*values {
+            map.insert(property_name, value);
+        }
+
+        let serialized_diff = bincode::serialize(&map)?;
+        Ok(vec![Operation { diff: serialized_diff }])
+    }
+
+    fn apply_operations(&self, current_head: &Clock, event_head: &Clock, operations: &Vec<Operation>) -> anyhow::Result<()> {
+        let mut values = self.values.write().unwrap();
+
+        // TODO: Figure out this comparison
+        /*
+        if current_head < event_head {
+            for operation in operations {
+                let map: BTreeMap<PropertyName, Vec<u8>> = bincode::deserialize(operation.diff())?;
+                for (property_name, diff) in &map {
+                    values.insert(property_name, diff);
+                }
+            }
+        }
+        */
+
+        Ok(())
+    }
 
     fn get_property_value_string(&self, property_name: &str) -> Option<String> {
         self.values.read().unwrap().get(property_name).map(|v| String::from_utf8_lossy(v).to_string())

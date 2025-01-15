@@ -192,7 +192,8 @@ impl Node {
                 }
             }
             proto::NodeRequestBody::Fetch { collection, predicate } => {
-                let states: Vec<_> = self.storage_engine.fetch_states(collection, &predicate).await?.into_iter().collect();
+                let storage_collection = self.collection(&collection).await?;
+                let states: Vec<_> = storage_collection.fetch_states(&predicate).await?.into_iter().collect();
                 Ok(proto::NodeResponseBody::Fetch(states))
             }
             proto::NodeRequestBody::Subscribe { collection, predicate } => {
@@ -215,7 +216,8 @@ impl Node {
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
         // First fetch initial state
-        let states = self.storage_engine.fetch_states(collection_id.clone(), &predicate).await?;
+        let storage_collection = self.collection(&collection).await?;
+        let states = storage_collection.fetch_states(&predicate).await?;
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
@@ -273,7 +275,7 @@ impl Node {
         }
         drop(collections);
 
-        collection
+        Ok(collection)
     }
 
     pub fn next_entity_id(&self) -> proto::ID { proto::ID::new() }
@@ -427,7 +429,7 @@ impl Node {
         debug!("fetch_entity 2");
 
         let raw_bucket = self.collection(collection).await;
-        match raw_bucket.0.get_state(id).await {
+        match raw_bucket.get_state(id).await {
             Ok(entity_state) => {
                 return self.assert_entity(collection, id, &entity_state).await;
             }
@@ -467,7 +469,7 @@ impl Node {
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for (id, state) in states {
-                    raw_bucket.0.set_state(id, &state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    raw_bucket.set_state(id, &state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
             }
@@ -510,7 +512,8 @@ impl Node {
         }
 
         // Fetch raw states from storage
-        let states = self.storage_engine.fetch_states(collection_id.clone(), &predicate).await?;
+        let storage_collection = self.collection(collection_id).await;
+        let states = storage_collection.fetch_states(&predicate).await?;
 
         // Convert states to entities
         let mut entities = Vec::new();
@@ -545,7 +548,7 @@ impl Node {
             {
                 proto::NodeResponseBody::Subscribe { initial, subscription_id: _ } => {
                     // Apply initial states to our storage
-                    let raw_bucket = self.collection(&collection_id).await;
+                    let raw_bucket = self.collection(&collection).await;
                     for (id, state) in initial {
                         raw_bucket.set_state(id, &state).await.map_err(|e| anyhow!("Failed to set entity: {:?}", e))?;
                     }

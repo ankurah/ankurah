@@ -67,15 +67,16 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::model::Entity {
                 use ankurah::property::InitializeWith;
 
-                let backends = ankurah::property::Backends::new();
-                #(
-                    #active_field_types::initialize_with(&backends, #active_field_name_strs.into(), &self.#active_field_names);
-                )*
-                ::ankurah::model::Entity::create(
+                let backends = ankurah_core::property::Backends::new();
+                let entity = ankurah_core::model::Entity::create(
                     id,
                     Self::collection(),
                     backends
-                )
+                );
+                #(
+                    #field_active_values::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
+                )*
+                entity
             }
         }
 
@@ -133,9 +134,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self.entity.id.clone()
             }
             #(
-                #active_field_visibility fn #active_field_names(&self) -> #projected_field_types {
-                    use ankurah::property::ProjectedValue;
-                    #active_field_types::from_backends(#active_field_name_strs.into(), self.entity.backends()).projected()
+                #active_field_visibility fn #active_field_names(&self) -> #field_types {
+                    use ankurah_core::property::{ProjectedValue, FromEntity};
+                    #field_active_values::from_entity(#active_field_name_strs.into(), self.entity.as_ref()).projected()
                 }
             )*
             // #(
@@ -160,8 +161,14 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
 
             fn new(entity: &'rec std::sync::Arc<::ankurah::model::Entity>) -> Self {
-                use ::ankurah::model::Mutable;
-                assert_eq!(entity.collection, Self::collection());
+                use ankurah_core::{
+                    model::Mutable,
+                    property::FromEntity,
+                };
+                assert_eq!(entity.collection(), Self::collection());
+                #(
+                    let #field_names_avoid_conflicts = #field_active_values::from_entity(#field_name_strs.into(), entity);
+                )*
                 Self {
                     entity,
                     #( #active_field_names: #active_field_types::from_backends(#active_field_name_strs.into(), entity.backends()), )*
