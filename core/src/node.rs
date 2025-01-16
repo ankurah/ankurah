@@ -65,8 +65,10 @@ type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 impl Node {
     pub fn new(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
         let reactor = Reactor::new(engine.clone());
+        let id = proto::NodeId::new();
+        info!("Node {} created", id);
         Arc::new(Self {
-            id: proto::NodeId::new(),
+            id,
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             entities: Arc::new(RwLock::new(BTreeMap::new())),
@@ -93,7 +95,7 @@ impl Node {
     }
 
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
-        info!("Registering peer {}", presence.node_id);
+        info!("Node {} register peer {}", self.id, presence.node_id);
         self.peer_connections
             .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: BTreeMap::new() });
         if presence.durable {
@@ -102,7 +104,7 @@ impl Node {
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
     pub fn deregister_peer(&self, node_id: proto::NodeId) {
-        info!("Deregistering peer {}", node_id);
+        info!("Node {} deregister peer {}", self.id, node_id);
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);
     }
@@ -568,4 +570,10 @@ impl Node {
 
     /// Get all durable peer node IDs
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        info!("Node {} dropped", self.id);
+    }
 }
