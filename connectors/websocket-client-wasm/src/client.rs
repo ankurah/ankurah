@@ -36,7 +36,7 @@ pub(crate) struct ClientInner {
 /// Client provides a primary handle to speak to the server
 impl WebsocketClient {
     pub fn new(node: Arc<Node>, server_url: &str) -> Result<WebsocketClient, JsValue> {
-        info!("Creating new websocket client");
+        info!("Created new websocket client for node {}", node.id);
         let inner = Arc::new(ClientInner {
             server_url: server_url.to_string(),
             node,
@@ -136,6 +136,12 @@ impl ClientInner {
             info!("reconnect: reconnecting");
             self2.connect().expect("Failed to reconnect");
         });
+    }
+}
+
+impl std::ops::Drop for ClientInner {
+    fn drop(&mut self) {
+        info!("Websocket client inner dropped for node {}", self.node.id);
     }
 }
 

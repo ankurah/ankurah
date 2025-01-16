@@ -130,7 +130,10 @@ impl Connection {
                             {
                                 self.node.register_peer(
                                     server_presence.clone(),
-                                    Box::new(WebSocketPeerSender { recipient_node_id: server_presence.node_id, inner: self.0.clone() }),
+                                    Box::new(WebSocketPeerSender {
+                                        recipient_node_id: server_presence.node_id,
+                                        ws: SendWrapper::new(self.ws.clone()),
+                                    }),
                                 );
                                 let presence = proto::Presence { node_id: self.node.id.clone(), durable: self.node.durable };
                                 // Send our presence message
@@ -173,11 +176,11 @@ impl Connection {
         self.ws.send_with_array_buffer(&array.buffer())?;
         Ok(())
     }
-    fn deregister(&self, node: Arc<Node>, server_presence: proto::Presence) { node.deregister_peer(server_presence.node_id); }
 }
 
 impl ConnectionInner {
     fn disconnect(&self) {
+        info!("Websocket disconnected from node {} to {}", self.node.id, self.url);
         self.ws.set_onmessage(None);
         self.ws.set_onerror(None);
         self.ws.set_onclose(None);
@@ -185,6 +188,9 @@ impl ConnectionInner {
         // Close the WebSocket connection with a normal closure (code 1000)
         let _ = self.ws.close();
         self._callbacks.lock().unwrap().take();
+        if let ConnectionState::Connected { server_presence, .. } = &*self.state.read().unwrap() {
+            self.node.deregister_peer(server_presence.node_id.clone());
+        }
     }
 }
 impl Drop for ConnectionInner {
@@ -201,7 +207,7 @@ impl PartialEq for Connection {
 #[derive(Clone)]
 struct WebSocketPeerSender {
     recipient_node_id: proto::NodeId,
-    inner: Arc<SendWrapper<ConnectionInner>>,
+    ws: SendWrapper<Arc<WebSocket>>,
 }
 
 #[async_trait]
@@ -215,7 +221,7 @@ impl PeerSender for WebSocketPeerSender {
 
         let array = Uint8Array::new_with_length(data.len() as u32);
         array.copy_from(&data);
-        match self.inner.ws.send_with_array_buffer(&array.buffer()) {
+        match self.ws.send_with_array_buffer(&array.buffer()) {
             Ok(_) => Ok(()),
             Err(e) => {
                 info!("Connection failed to send message: {:?}", e);
