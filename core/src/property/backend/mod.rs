@@ -195,9 +195,10 @@ impl Backends {
         Ok(operations)
     }
 
-    pub fn apply_operations(&self, backend_name: String, operations: &Vec<Operation>) -> Result<()> {
+    pub fn apply_operations(&self, backend_name: String, operations: &Vec<Operation>, head: &Clock) -> Result<()> {
         let backend = self.get_raw(backend_name)?;
         backend.apply_operations(operations)?;
+        *self.head.lock().unwrap() = head.clone();
         Ok(())
     }
 
@@ -208,6 +209,7 @@ impl Backends {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
+        *self.head.lock().unwrap() = state.head.clone();
         Ok(())
     }
 }

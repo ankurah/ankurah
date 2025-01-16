@@ -130,7 +130,7 @@ pub struct NodeRequest {
 
 impl std::fmt::Display for NodeRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Request({}) {}->{} {}", self.id, self.from, self.to, self.body)
+        write!(f, "Request {} from {}->{}: {}", self.id, self.from, self.to, self.body)
     }
 }
 
@@ -246,7 +246,8 @@ impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "State({})",
+            "State(clock {} buffers {})",
+            self.head,
             self.state_buffers.iter().map(|(backend, buf)| format!("{} => {}b", backend, buf.len())).collect::<Vec<_>>().join(" ")
         )
     }
