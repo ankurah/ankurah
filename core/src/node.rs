@@ -138,7 +138,7 @@ impl Node {
     pub async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
             proto::NodeMessage::Request(request) => {
-                info!("Received Request {} {request}", self.id);
+                info!("Node {} received request {}", self.id, request);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
                 // I think we want timeouts to be handled by the node, not the connector,
@@ -167,7 +167,7 @@ impl Node {
                 }
             }
             proto::NodeMessage::Response(response) => {
-                info!("{} {response}", self.id);
+                info!("Node {} received response {}", self.id, response);
                 if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
@@ -287,6 +287,7 @@ impl Node {
     // }
 
     pub async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::Event>) -> anyhow::Result<()> {
+        info!("Node {} committing events {}", self.id, events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","));
         let mut changes = Vec::new();
 
         // First apply events locally
@@ -410,7 +411,7 @@ impl Node {
 
     /// Fetch an entity.
     pub async fn fetch_entity(&self, id: proto::ID, collection: &CollectionId) -> Result<Arc<Entity>, RetrievalError> {
-        debug!("fetch_entity {:?}-{:?}", id, collection);
+        info!("fetch_entity {:?}-{:?}", id, collection);
 
         if let Some(local) = self.fetch_entity_from_node(id, collection).await {
             return Ok(local);

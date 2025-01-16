@@ -90,11 +90,15 @@ impl Entity {
     }
 
     pub fn apply_event(&self, event: &Event) -> Result<()> {
+        let head = Clock::new([event.id]);
         for (backend_name, operations) in &event.operations {
-            self.backends.apply_operations((*backend_name).to_owned(), operations)?;
+            // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
+            self.backends.apply_operations((*backend_name).to_owned(), operations, &head)?;
         }
+        // TODO figure out how to test this
         info!("Apply event {}", event);
-        *self.head.lock().unwrap() = Clock::new([event.id]);
+        *self.head.lock().unwrap() = head;
+        info!("Apply event MARK 2 new head {}", self.head.lock().unwrap());
 
         Ok(())
     }
