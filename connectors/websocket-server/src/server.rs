@@ -1,19 +1,19 @@
 use ankurah_proto as proto;
 use anyhow::Result;
-use axum::extract::{State, connect_info::ConnectInfo};
+use axum::extract::{connect_info::ConnectInfo, State};
 use axum::{
-    Router,
     extract::ws::{WebSocket, WebSocketUpgrade},
     response::IntoResponse,
     routing::get,
+    Router,
 };
-use axum_extra::{TypedHeader, headers};
+use axum_extra::{headers, TypedHeader};
 use bincode::deserialize;
 use futures_util::StreamExt;
 use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
-use tracing::{Level, info, warn};
+use tracing::{info, warn, Level};
 
 use ankurah_core::node::Node;
 
@@ -85,7 +85,7 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
     // Clean up peer registration if we had registered one
     if let Connection::Established(peer_sender) = conn {
         use ankurah_core::connector::PeerSender;
-        node.deregister_peer(peer_sender.recipient_node_id()).await;
+        node.deregister_peer(peer_sender.recipient_node_id());
     }
 
     println!("Websocket context {who} destroyed");
@@ -108,7 +108,7 @@ async fn process_message(msg: axum::extract::ws::Message, who: SocketAddr, state
                                     // Register peer sender for this client
                                     let sender = WebSocketClientSender::new(presence.node_id.clone(), sender);
 
-                                    node.register_peer(presence, Box::new(sender.clone())).await;
+                                    node.register_peer(presence, Box::new(sender.clone()));
                                     *state = Connection::Established(sender);
                                 }
                             }

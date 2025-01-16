@@ -6,41 +6,103 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use js_sys::Uint8Array;
 use send_wrapper::SendWrapper;
-use std::sync::RwLock;
 use std::sync::{Arc, Weak};
+use std::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use wasm_bindgen::prelude::*;
-use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
+use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
-struct Inner {
+#[derive(Clone)]
+pub struct Connection(Arc<SendWrapper<ConnectionInner>>);
+
+pub struct ConnectionInner {
     ws: Arc<WebSocket>,
     url: String,
     state: RwLock<ConnectionState>,
     node: Arc<Node>,
     client: Weak<ClientInner>,
+    _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
+}
+impl std::ops::Deref for Connection {
+    type Target = ConnectionInner;
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl Inner {
-    fn new(node: Arc<Node>, url: String, client: Weak<ClientInner>) -> Result<Self, JsValue> {
+impl Connection {
+    pub fn new(node: Arc<Node>, url: String, client: Weak<ClientInner>) -> Result<Self, JsValue> {
         let url = if url.starts_with("ws://") || url.starts_with("wss://") { format!("{}/ws", url) } else { format!("wss://{}/ws", url) };
 
         let ws = WebSocket::new(&url)?;
         ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+
         let state = RwLock::new(ConnectionState::Connecting { url: url.clone() });
 
-        Ok(Self { ws: Arc::new(ws), url, state, node, client })
+        let me = Connection(Arc::new(SendWrapper::new(ConnectionInner {
+            ws: Arc::new(ws),
+            url,
+            state,
+            node,
+            client,
+            _callbacks: Mutex::new(None),
+        })));
+
+        let on_message = {
+            let me = me.clone();
+            Closure::<dyn Fn(MessageEvent)>::wrap(Box::new(move |e| me.receive_message(e)))
+        };
+
+        let on_error = {
+            let me = me.clone();
+            Closure::<dyn FnMut(ErrorEvent)>::wrap(Box::new(move |e| me.handle_error(e)))
+        };
+
+        let on_close = {
+            let me = me.clone();
+            Closure::<dyn FnMut(CloseEvent)>::wrap(Box::new(move |e: CloseEvent| me.handle_close(e)))
+        };
+
+        let on_open = {
+            let me = me.clone();
+            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |e| me.handle_open(e)))
+        };
+
+        // Set up WebSocket event handlers
+        me.ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        me.ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        me.ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        me.ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+
+        *me._callbacks.lock().unwrap() = Some(vec![Box::new(on_message), Box::new(on_error), Box::new(on_close), Box::new(on_open)]);
+
+        Ok(me)
     }
 
-    fn set_state(&self, new_state: ConnectionState) {
+    fn set_state(&self, new_state: ConnectionState) -> bool {
         if let Ok(mut state) = self.state.write() {
             *state = new_state.clone();
         }
         if let Some(client) = self.client.upgrade() {
-            client.handle_state_change(new_state);
+            client.handle_state_change(&self, new_state)
+        } else {
+            false
         }
     }
 
     fn get_state(&self) -> ConnectionState { self.state.read().map(|state| state.clone()).unwrap_or(ConnectionState::None) }
+
+    fn handle_open(&self, e: Event) {
+        info!("Connection opened (event): {:?}", e);
+    }
+    fn handle_close(&self, e: CloseEvent) {
+        info!("Connection closed: {}", e.code());
+        self.set_state(ConnectionState::Closed);
+    }
+
+    fn handle_error(&self, _e: ErrorEvent) {
+        info!("Connection error");
+        // TODO - figure out how to get the error message. e.message() crashes because it's expected to be a string, but it's null
+        self.set_state(ConnectionState::Error { message: "Connection error".to_string() });
+    }
 
     fn receive_message(&self, e: MessageEvent) {
         let array_buffer = if let Ok(array_buffer) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
@@ -57,12 +119,37 @@ impl Inner {
 
         if let Ok(message) = bincode::deserialize::<proto::Message>(&data) {
             match message {
-                proto::Message::Presence(presence) => {
-                    info!("Received server presence");
-                    self.set_state(ConnectionState::Connected { url: self.url.clone(), presence });
+                proto::Message::Presence(server_presence) => {
+                    let state = { self.state.read().unwrap().clone() };
+                    match state {
+                        ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
+                        ConnectionState::Connecting { .. } => {
+                            info!("Received server presence, {server_presence:?}");
+                            if self
+                                .set_state(ConnectionState::Connected { url: self.url.clone(), server_presence: server_presence.clone() })
+                            {
+                                self.node.register_peer(
+                                    server_presence.clone(),
+                                    Box::new(WebSocketPeerSender { recipient_node_id: server_presence.node_id, inner: self.0.clone() }),
+                                );
+                                let presence = proto::Presence { node_id: self.node.id.clone(), durable: self.node.durable };
+                                // Send our presence message
+                                if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
+                                    info!("Failed to send presence message: {:?}", e);
+                                }
+                            }
+                        }
+                        _ => {
+                            warn!("Sanity error: received server presence while not in connecting state");
+                            self.disconnect();
+                            self.set_state(ConnectionState::Error { message: "Received server presence, but not connected".to_string() });
+                        }
+                    }
                 }
                 proto::Message::PeerMessage(msg) => {
                     let node = self.node.clone();
+                    // TODO: determine the performance implications of spawning a new task for each message
+                    // versus using a channel to send messages to the node.
                     wasm_bindgen_futures::spawn_local(async move {
                         if let Err(e) = node.handle_message(msg).await {
                             info!("Error handling message: {:?}", e);
@@ -86,41 +173,39 @@ impl Inner {
         self.ws.send_with_array_buffer(&array.buffer())?;
         Ok(())
     }
+    fn deregister(&self, node: Arc<Node>, server_presence: proto::Presence) { node.deregister_peer(server_presence.node_id); }
+}
 
-    fn handle_open(&self) {
-        info!("Connection opened (event)");
-
-        // Send our presence message
-        let presence = proto::Presence { node_id: self.node.id.clone(), durable: self.node.durable };
-
-        if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
-            info!("Failed to send presence message: {:?}", e);
-        }
+impl ConnectionInner {
+    fn disconnect(&self) {
+        self.ws.set_onmessage(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        self.ws.set_onopen(None);
+        // Close the WebSocket connection with a normal closure (code 1000)
+        let _ = self.ws.close();
+        self._callbacks.lock().unwrap().take();
+    }
+}
+impl Drop for ConnectionInner {
+    fn drop(&mut self) {
+        // Clean up WebSocket event handlers
+        self.disconnect();
     }
 }
 
-#[derive(Clone)]
-pub struct Connection {
-    inner: Arc<SendWrapper<Inner>>,
-    _callbacks: Arc<SendWrapper<Vec<Box<dyn std::any::Any>>>>,
-}
-
 impl PartialEq for Connection {
-    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.inner, &other.inner) }
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }
 
 #[derive(Clone)]
-pub struct WSClientPeerSender {
-    inner: Arc<SendWrapper<WebSocketInner>>,
-}
-
-struct WebSocketInner {
-    ws: Arc<WebSocket>,
-    node_id: proto::NodeId,
+struct WebSocketPeerSender {
+    recipient_node_id: proto::NodeId,
+    inner: Arc<SendWrapper<ConnectionInner>>,
 }
 
 #[async_trait]
-impl PeerSender for WSClientPeerSender {
+impl PeerSender for WebSocketPeerSender {
     async fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
         let message = proto::Message::PeerMessage(message);
         let data = bincode::serialize(&message).map_err(|e| {
@@ -130,77 +215,16 @@ impl PeerSender for WSClientPeerSender {
 
         let array = Uint8Array::new_with_length(data.len() as u32);
         array.copy_from(&data);
-        self.inner.ws.send_with_array_buffer(&array.buffer()).map_err(|_| ankurah_core::connector::SendError::ConnectionClosed)?;
-        Ok(())
+        match self.inner.ws.send_with_array_buffer(&array.buffer()) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                info!("Connection failed to send message: {:?}", e);
+                Err(ankurah_core::connector::SendError::ConnectionClosed)
+            }
+        }
     }
 
-    fn recipient_node_id(&self) -> proto::NodeId { self.inner.node_id.clone() }
+    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id.clone() }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
-}
-
-impl Connection {
-    pub(crate) fn new(server_url: String, my_node: Arc<Node>, client: Weak<ClientInner>) -> Result<Connection, JsValue> {
-        let inner = Arc::new(SendWrapper::new(Inner::new(my_node, server_url, client)?));
-
-        let on_message = {
-            let inner = inner.clone();
-            Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |e: MessageEvent| {
-                inner.receive_message(e);
-            }))
-        };
-
-        let on_error = {
-            let inner = inner.clone();
-            Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_| {
-                info!("Connection Error");
-                inner.set_state(ConnectionState::Error { message: "".to_string() });
-            }))
-        };
-
-        let on_close = {
-            let inner = inner.clone();
-            Closure::<dyn FnMut(CloseEvent)>::wrap(Box::new(move |e: CloseEvent| {
-                info!("Connection closed: {}", e.code());
-                inner.set_state(ConnectionState::Closed);
-            }))
-        };
-
-        let on_open = {
-            let inner = inner.clone();
-            Closure::<dyn FnMut()>::wrap(Box::new(move || {
-                inner.handle_open();
-            }))
-        };
-
-        // Set up WebSocket event handlers
-        inner.ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-        inner.ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-        inner.ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-        inner.ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-
-        Ok(Connection {
-            inner,
-            _callbacks: Arc::new(SendWrapper::new(vec![Box::new(on_message), Box::new(on_error), Box::new(on_close), Box::new(on_open)])),
-        })
-    }
-
-    pub fn state(&self) -> ConnectionState { self.inner.get_state() }
-
-    pub fn create_peer_sender(&self, node_id: proto::NodeId) -> WSClientPeerSender {
-        WSClientPeerSender { inner: Arc::new(SendWrapper::new(WebSocketInner { ws: self.inner.ws.clone(), node_id })) }
-    }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        // Clean up WebSocket event handlers
-        self.inner.ws.set_onmessage(None);
-        self.inner.ws.set_onerror(None);
-        self.inner.ws.set_onclose(None);
-        self.inner.ws.set_onopen(None);
-
-        // Close the WebSocket connection with a normal closure (code 1000)
-        let _ = self.inner.ws.close();
-    }
 }

@@ -1,4 +1,4 @@
-use ankurah_proto::{CollectionId, ID, State};
+use ankurah_proto::{CollectionId, State, ID};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -116,7 +116,11 @@ impl StorageCollection for SledStorageCollection {
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
             let last = tree.insert(id_bytes, binary_state.clone())?;
-            if let Some(last_bytes) = last { Ok(last_bytes != binary_state) } else { Ok(true) }
+            if let Some(last_bytes) = last {
+                Ok(last_bytes != binary_state)
+            } else {
+                Ok(true)
+            }
         })
         .await?
     }

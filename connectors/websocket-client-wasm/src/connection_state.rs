@@ -9,7 +9,7 @@ use ankurah_proto as proto;
 pub enum ConnectionState {
     None,
     Connecting { url: String },
-    Connected { url: String, presence: proto::Presence },
+    Connected { url: String, server_presence: proto::Presence },
     Closed,
     Error { message: String },
 }
@@ -40,17 +40,4 @@ impl ConnectionStateEnum {
         }
         .to_string()
     }
-    //     // pub fn url(&self) -> Option<String> {
-    //     //     match &self.0 {
-    //     //         ConnectionState::Connecting { url } => Some(url.clone()),
-    //     //         ConnectionState::Connected { url, .. } => Some(url.clone()),
-    //     //         _ => None,
-    //     //     }
-    //     // }
-    //     // pub fn node_id(&self) -> Option<proto::NodeId> {
-    //     //     match &self.0 {
-    //     //         ConnectionState::Connected { node_id, .. } => Some(node_id.clone()),
-    //     //         _ => None,
-    //     //     }
-    //     // }
 }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
 mod pg_common;
-use ankurah_core::node::Node;
+use ankurah::Node;
 
 #[tokio::test]
 async fn test_postgres() -> Result<()> {

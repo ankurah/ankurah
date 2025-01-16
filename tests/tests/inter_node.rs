@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah::{FetchArgs, ID, Mutable, Node, ResultSet, changes::ChangeKind};
+use ankurah::{changes::ChangeKind, FetchArgs, Mutable, Node, ResultSet, ID};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;

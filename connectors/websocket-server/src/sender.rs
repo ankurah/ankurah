@@ -12,10 +12,10 @@ use tracing::info;
 #[derive(Clone)]
 pub struct WebSocketClientSender {
     tx: mpsc::Sender<axum::extract::ws::Message>,
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 struct Inner {
-    pub node_id: proto::NodeId,
+    pub(crate) recipient_node_id: proto::NodeId,
     handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
@@ -34,8 +34,7 @@ impl WebSocketClientSender {
                 }
             }
         });
-
-        Self { tx, inner: Arc::new(Inner { node_id, handle: Arc::new(handle) }) }
+        Self { tx, inner: Arc::new(Inner { recipient_node_id: node_id, handle: Arc::new(handle) }) }
     }
     pub async fn send_message(&self, message: proto::Message) -> Result<(), SendError> {
         let data = bincode::serialize(&message).map_err(|e| SendError::Other(anyhow::anyhow!("Serialization error: {}", e)))?;
@@ -52,7 +51,7 @@ impl PeerSender for WebSocketClientSender {
         let server_message = proto::Message::PeerMessage(message);
         self.send_message(server_message).await
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.inner.node_id.clone() }
+    fn recipient_node_id(&self) -> proto::NodeId { self.inner.recipient_node_id.clone() }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
@@ -64,7 +63,7 @@ impl PeerSender for WebSocketClientSender {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        info!("Dropping WebSocketPeerSender Inner for {}", self.node_id);
+        info!("Dropping WebSocketPeerSender Inner for {}", self.recipient_node_id);
         self.handle.abort();
     }
 }

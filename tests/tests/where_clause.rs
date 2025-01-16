@@ -21,9 +21,10 @@ async fn basic_where_clause() -> Result<()> {
 
     let albums: ankurah::ResultSet<AlbumView> = client.fetch("name = 'Walking on a Dream'").await?;
 
-    assert_eq!(albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(), vec![
-        "Walking on a Dream".to_string()
-    ]);
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string()]
+    );
 
     Ok(())
 }
@@ -50,20 +51,21 @@ async fn pg_basic_where_clause() -> Result<()> {
     };
 
     // The next step is to make this work:
-    let albums: ankurah_core::resultset::ResultSet<AlbumView> = client.fetch("name = 'Walking on a Dream'").await?;
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch("name = 'Walking on a Dream'").await?;
 
-    assert_eq!(albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(), vec![
-        "Walking on a Dream".to_string()
-    ]);
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string()]
+    );
 
-    let albums: ankurah_core::resultset::ResultSet<AlbumView> = client.fetch("year = '2008'").await?;
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch("year = '2008'").await?;
 
-    assert_eq!(albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(), vec![
-        "Walking on a Dream".to_string(),
-        "Death Magnetic".to_string()
-    ]);
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string(), "Death Magnetic".to_string()]
+    );
 
-    let albums: ankurah_core::resultset::ResultSet<AlbumView> = client.fetch("name = 'Walking on a Dream' AND year = '1800'").await?;
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch("name = 'Walking on a Dream' AND year = '1800'").await?;
 
     assert_eq!(albums.items.iter().map(|active_entity| active_entity.name()).count(), 0,);
 

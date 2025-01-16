@@ -92,16 +92,16 @@ impl Node {
         })
     }
 
-    pub async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
+    pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Registering peer {}", presence.node_id);
         self.peer_connections
             .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: BTreeMap::new() });
         if presence.durable {
-            self.durable_peers.insert(presence.node_id);
+            self.durable_peers.insert(presence.node_id.clone());
         }
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
-    pub async fn deregister_peer(&self, node_id: proto::NodeId) {
+    pub fn deregister_peer(&self, node_id: proto::NodeId) {
         info!("Deregistering peer {}", node_id);
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);

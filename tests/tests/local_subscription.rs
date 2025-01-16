@@ -1,6 +1,6 @@
 use ankurah::{
-    Mutable, Node, ResultSet,
     changes::{ChangeKind, ChangeSet},
+    Mutable, Node, ResultSet,
 };
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::{Arc, Mutex};

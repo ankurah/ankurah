@@ -1,7 +1,11 @@
 [package]
 name    = "tests"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[features]
+default  = ["postgres"]
+postgres = ["ankurah-storage-postgres", "tokio-postgres", "bb8", "bb8-postgres"]
 
 [dependencies]
 anyhow = "1.0"
@@ -10,6 +14,10 @@ ankql = { path = "../ankql" }
 ankurah = { path = "../ankurah", features = ["derive"] }
 ankurah-storage-sled = { path = "../storage/sled" }
 ankurah-connector-local-process = { path = "../connectors/local-process" }
+tokio-postgres = { version = "0.7", optional = true }
+ankurah-storage-postgres = { path = "../storage/postgres", optional = true }
+bb8 = { version = "0.9", optional = true }
+bb8-postgres = { version = "0.9", optional = true }
 tokio = { version = "1.40", features = ["full"] }
 tracing-subscriber = "0.3"
 testcontainers = "0.23"

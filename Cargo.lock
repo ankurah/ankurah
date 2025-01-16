@@ -51,6 +51,7 @@ dependencies = [
  "pest_derive",
  "serde",
  "thiserror 2.0.11",
+ "tracing",
 ]
 
 [[package]]
@@ -204,6 +205,21 @@ dependencies = [
 [[package]]
 name = "ankurah-storage-postgres"
 version = "0.1.0"
+dependencies = [
+ "ankql",
+ "ankurah-core",
+ "ankurah-proto",
+ "anyhow",
+ "async-trait",
+ "bb8",
+ "bb8-postgres",
+ "bincode",
+ "futures-util",
+ "tokio-postgres",
+ "tracing",
+ "ulid",
+ "uuid",
+]
 
 [[package]]
 name = "ankurah-storage-sled"
@@ -3365,8 +3381,11 @@ dependencies = [
  "ankurah",
  "ankurah-connector-local-process",
  "ankurah-react-signals",
+ "ankurah-storage-postgres",
  "ankurah-storage-sled",
  "anyhow",
+ "bb8",
+ "bb8-postgres",
  "ctor",
  "js-sys",
  "reactive_graph",
@@ -3374,6 +3393,7 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",

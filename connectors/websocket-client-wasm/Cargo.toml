@@ -69,12 +69,6 @@ tracing-wasm = "0.2"
 thiserror = "2.0.9"
 strum = { version = "0.26.3", features = ["derive"] }
 
-# [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# tokio = { version = "1.39.0", features = ["full"] }
-# tracing-subscriber = "0.3"
-# ankurah-server = { path = "../server" }
-
-#[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 

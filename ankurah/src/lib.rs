@@ -99,7 +99,7 @@ pub use ankurah_proto as proto;
 pub use proto::ID;
 // Re-export commonly used types
 pub use ankurah_core::{
-    Model, changes, error,
+    changes, error,
     event::Event,
     model,
     model::Mutable,
@@ -107,7 +107,9 @@ pub use ankurah_core::{
     node::{FetchArgs, Node},
     property,
     resultset::ResultSet,
-    storage, transaction,
+    storage,
+    subscription::SubscriptionHandle,
+    transaction, Model,
 };
 
 // TODO move this somewhere else - it's a dependency of the signal derive macro
@@ -144,7 +146,7 @@ pub mod derive_deps {
     pub use ::js_sys;
     #[cfg(feature = "react")]
     pub use ::reactive_graph; // Why does this fail with a Sized error: `the trait `GetSignalValue` cannot be made into an object the trait cannot be made into an object because it requires `Self: Sized``
-    // pub use reactive_graph::traits::Get as GetSignalValue; // and this one works fine?
+                              // pub use reactive_graph::traits::Get as GetSignalValue; // and this one works fine?
     pub use ::ankurah_proto;
     #[cfg(feature = "react")]
     pub use ::wasm_bindgen;

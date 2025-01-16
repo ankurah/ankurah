@@ -11,8 +11,8 @@ use send_wrapper::SendWrapper;
 use std::any::Any;
 use std::sync::Arc;
 use tracing::info;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent};
 
@@ -466,9 +466,10 @@ mod tests {
 
         let albums: ankurah_core::resultset::ResultSet<AlbumView> = node.fetch("name = 'Walking on a Dream'").await?;
 
-        assert_eq!(albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(), vec![
-            "Walking on a Dream".to_string()
-        ]);
+        assert_eq!(
+            albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(),
+            vec!["Walking on a Dream".to_string()]
+        );
 
         // Drop the node to close the connection
         drop(node);

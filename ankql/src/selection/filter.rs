@@ -3,6 +3,7 @@
 
 use crate::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
 use thiserror::Error;
+use tracing::info;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum Error {
