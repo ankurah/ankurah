@@ -17,7 +17,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
     // Generate the code
     let expanded = quote! {
 
-        use ::ankurah::derive_deps::reactive_graph::traits::Get;
+
         #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         pub struct #wrapper_name(Box<dyn ::ankurah::derive_deps::GetSignalValue<Value = #name>>);
 
@@ -36,6 +36,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
                 let signal : Box<dyn GetSignalValue<Value = #name>> = self.0.cloned(); // Now using the cloned() method from GetSignalValue
                 // leave this commented out for now
                 let effect = ::ankurah::derive_deps::reactive_graph::effect::Effect::new(move |_| {
+                    use ::ankurah::derive_deps::reactive_graph::traits::Get;
                     let value = signal.get();
                     callback
                         .call1(&::ankurah::derive_deps::wasm_bindgen::JsValue::NULL, &value.into())
@@ -47,6 +48,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
             #[wasm_bindgen(getter)]
             pub fn value(&self) -> #name {
+                use ::ankurah::derive_deps::reactive_graph::traits::Get;
                 self.0.get()
             }
         }

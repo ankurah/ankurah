@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use ankurah_proto::ID;
+use ankurah_proto::{DecodeError, ID};
 use thiserror::Error;
 
 use crate::connector::SendError;
@@ -29,6 +29,8 @@ pub enum RetrievalError {
     FutureJoin(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("{0}")]
     Anyhow(anyhow::Error),
+    #[error("Decode error: {0}")]
+    DecodeError(DecodeError),
 }
 
 impl RetrievalError {
@@ -67,4 +69,8 @@ pub enum RequestError {
 
 impl From<SendError> for RequestError {
     fn from(err: SendError) -> Self { RequestError::SendError(err) }
+}
+
+impl From<DecodeError> for RetrievalError {
+    fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(err) }
 }

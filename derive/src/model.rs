@@ -95,12 +95,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             // THINK ABOUT: to_model is the only thing that forces a clone requirement
             // Even though most Models will be clonable, maybe we shouldn't force it?
             // Also: nothing seems to be using this. Maybe it could be opt in
-            // fn to_model(&self) -> Self::Model {
-            //     #name {
-            //         #( #active_field_names: self.#active_field_names(), )*
-            //         #( #ephemeral_field_names: self.#ephemeral_field_names.clone(), )*
-            //     }
-            // }
+            fn to_model(&self) -> Self::Model {
+                #name {
+                    #( #active_field_names: self.#active_field_names(), )*
+                    #( #ephemeral_field_names: self.#ephemeral_field_names.clone(), )*
+                }
+            }
 
             fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
                 &self.entity
