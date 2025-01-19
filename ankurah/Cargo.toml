@@ -25,12 +25,10 @@ ankurah-derive = { path = "../derive", version = "0.1.0", optional = true }
 ankql          = { path = "../ankql", version = "0.1.0" }
 
 # Dependencies needed for derive macros
-wasm-bindgen = { version = "0.2", optional = true }
-js-sys = { version = "0.3", optional = true }
+wasm-bindgen          = { version = "0.2", optional = true }
+js-sys                = { version = "0.3", optional = true }
 ankurah-react-signals = { path = "../react-signals", optional = true }
-reactive_graph = { version = "0.1.4", features = [
-    "effects",
-], optional = true }
+reactive_graph        = { version = "0.1.4", features = ["effects"], optional = true }
 
 [dev-dependencies]
 ankurah-storage-sled            = { path = "../storage/sled" }
