@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ankurah-core  = { path = "../../core" }
-ankurah-proto = { path = "../../proto" }
+ankurah-core  = { path = "../../core", version = "0.1.0" }
+ankurah-proto = { path = "../../proto", version = "0.1.0" }
 
 tokio       = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
