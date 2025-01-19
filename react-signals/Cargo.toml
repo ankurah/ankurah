@@ -10,10 +10,10 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 ankurah-derive = { path = "../derive", version = "0.1.0" }
-reactive_graph = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
+reactive_graph = { version = "0.1.4", features = [
     "effects",
 ] }
-any_spawner = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
+any_spawner = { version = "0.2.0", features = [
     "wasm-bindgen",
 ] }
 log = "0.4.22"

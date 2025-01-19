@@ -28,7 +28,7 @@ ankql          = { path = "../ankql", version = "0.1.0" }
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 ankurah-react-signals = { path = "../react-signals", optional = true }
-reactive_graph = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
+reactive_graph = { version = "0.1.4", features = [
     "effects",
 ], optional = true }
 

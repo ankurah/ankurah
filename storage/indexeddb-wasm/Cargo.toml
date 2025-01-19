@@ -48,10 +48,10 @@ web-sys = { version = "0.3.76", features = [
 ] }
 gloo-timers = { version = "0.3.0", features = ["futures"] }
 bincode = "1.3.3"
-reactive_graph = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
+reactive_graph = { version = "0.1.4", features = [
     "effects",
 ] }
-any_spawner = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", version = "0.2.0", features = [
+any_spawner = { version = "0.2.0", features = [
     "wasm-bindgen",
 ] }
 console_error_panic_hook = "0.1.7"
