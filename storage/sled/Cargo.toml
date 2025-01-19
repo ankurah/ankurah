@@ -1,7 +1,9 @@
 [package]
-name    = "ankurah-storage-sled"
-version = "0.1.0"
-edition = "2021"
+name        = "ankurah-storage-sled"
+version     = "0.1.0"
+edition     = "2021"
+description = "Ankurah storage engine using Sled"
+license     = "MIT OR Apache-2.0"
 
 [dependencies]
 ankurah-proto = { path = "../../proto", version = "0.1.0" }

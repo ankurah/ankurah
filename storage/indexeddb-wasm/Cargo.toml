@@ -2,6 +2,8 @@
 name    = "ankurah-storage-indexeddb-wasm"
 version = "0.1.0"
 edition = "2021"
+description = "Ankurah storage engine using IndexedDB in the browser"
+license = "MIT OR Apache-2.0"
 
 [features]
 default = []
