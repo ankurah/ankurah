@@ -3,6 +3,8 @@ name    = "ankurah-websocket-client-wasm"
 version = "0.1.0"
 authors = ["Daniel Norman <daniel@danielnorman.net>"]
 edition = "2021"
+description = "Ankurah WebSocket Client - A WebSocket client for Ankurah"
+license = "MIT OR Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

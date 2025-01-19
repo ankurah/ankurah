@@ -2,9 +2,10 @@
 name        = "ankurah"
 version     = "0.1.0"
 edition     = "2021"
-description = "An observable data binding and state management framework"
-license     = "MIT"
+description = "Observable, event-driven state management for native and web"
+license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/ankurah/ankurah"
+readme      = "../README.md"
 
 [features]
 react = ["dep:ankurah-react-signals", "wasm"]
