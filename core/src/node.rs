@@ -39,6 +39,10 @@ impl TryInto<FetchArgs> for &str {
     }
 }
 
+impl Into<FetchArgs> for ankql::ast::Predicate {
+    fn into(self) -> FetchArgs { FetchArgs { predicate: self, cached: false } }
+}
+
 impl From<ankql::error::ParseError> for RetrievalError {
     fn from(e: ankql::error::ParseError) -> Self { RetrievalError::ParseError(e) }
 }

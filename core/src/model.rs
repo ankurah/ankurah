@@ -29,6 +29,7 @@ pub trait View {
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Arc<Entity>;
     fn from_entity(inner: Arc<Entity>) -> Self;
+    fn to_model(&self) -> Self::Model;
 }
 
 impl std::fmt::Display for Entity {
@@ -141,7 +142,6 @@ pub trait Mutable<'rec> {
     fn id(&self) -> ID { self.entity().id }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn backends(&self) -> &Backends { &self.entity().backends }
-
     fn entity(&self) -> &Arc<Entity>;
     fn new(inner: &'rec Arc<Entity>) -> Self
     where Self: Sized;
