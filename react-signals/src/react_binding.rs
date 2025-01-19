@@ -5,7 +5,7 @@ use std::{
 
 use futures::StreamExt;
 use or_poisoned::OrPoisoned;
-use reactive_graph::graph::{AnySource, AnySubscriber, ReactiveNode, SourceSet, Subscriber};
+use reactive_graph::graph::{AnySource, AnySubscriber, ReactiveNode, Subscriber};
 use std::sync::Weak;
 
 use wasm_bindgen::prelude::*;
@@ -58,18 +58,18 @@ extern "C" {
 /// # Note
 /// This implementation follows the pattern used by Preact Signals, adapted for
 /// WebAssembly-based signal integration with React
-#[wasm_bindgen(js_name = useSignals)]
-pub fn use_signals() -> JsValue {
+#[wasm_bindgen(js_name = withSignals)]
+pub fn with_signals(f: &js_sys::Function) -> JsValue {
     let ref_value = useRef();
 
     let mut store = js_sys::Reflect::get(&ref_value, &"current".into()).unwrap();
     if store.is_undefined() {
         let new_store = EffectStore::new();
-        new_store.start();
         useSyncExternalStore(&new_store.0.subscribe_fn, &new_store.0.get_snapshot, &new_store.0.get_snapshot);
         // TODO: Check to see if this sets up the finalizer in JS land
-        store = JsValue::from(new_store);
+        store = JsValue::from(new_store.clone());
         js_sys::Reflect::set(&ref_value, &"current".into(), &store).unwrap();
+        new_store.with_observer(f)
     } else {
         let ptr = js_sys::Reflect::get(&store, &JsValue::from_str("__wbg_ptr")).unwrap();
         let store = {
@@ -80,13 +80,9 @@ pub fn use_signals() -> JsValue {
             unsafe { EffectStore::ref_from_abi(ptr_u32) }
         };
         useSyncExternalStore(&store.0.subscribe_fn, &store.0.get_snapshot, &store.0.get_snapshot);
-        store.start();
-    };
-
-    store
+        store.with_observer(f)
+    }
 }
-
-// DO NOT CHANGE ANYTHING ABOVE THIS LINE (except to add imports)
 
 #[derive(Clone)]
 #[wasm_bindgen]
@@ -119,7 +115,7 @@ impl EffectStore {
         let tracker = Tracker(Arc::new(TrackerInner(RwLock::new(TrackerState {
             dirty: false,
             notifier: sender,
-            sources: SourceSet::new(),
+            sources: Vec::new(),
             version: version.clone(),
         }))));
         let rx = RefCell::new(Some(rx));
@@ -162,16 +158,19 @@ impl EffectStore {
             }) as Box<dyn Fn() -> JsValue>)
         };
 
-        let me = Self(Arc::new(Inner { subscribe_fn, get_snapshot, tracker }));
-        me.start();
-        me
+        Self(Arc::new(Inner { subscribe_fn, get_snapshot, tracker }))
     }
 }
 
 #[wasm_bindgen]
 impl EffectStore {
-    pub fn start(&self) { reactive_graph::graph::Observer::set(Some(self.0.tracker.to_any_subscriber())); }
-    pub fn finish(&self) { reactive_graph::graph::Observer::set(None); }
+    // pub fn start(&self) { reactive_graph::graph::Observer::set(Some(self.0.tracker.to_any_subscriber())); }
+    // pub fn finish(&self) { reactive_graph::graph::Observer::set(None); }
+
+    pub fn with_observer(&self, f: &js_sys::Function) -> JsValue {
+        use reactive_graph::graph::WithObserver;
+        self.0.tracker.to_any_subscriber().with_observer(|| f.call0(&JsValue::NULL).unwrap_or(JsValue::UNDEFINED))
+    }
 }
 #[derive(Debug, Clone)]
 pub struct Tracker(Arc<TrackerInner>);
@@ -183,7 +182,7 @@ pub struct TrackerInner(RwLock<TrackerState>);
 struct TrackerState {
     dirty: bool,
     notifier: crate::effect::channel::Sender,
-    sources: SourceSet,
+    sources: Vec<AnySource>,
     version: Arc<AtomicU64>,
 }
 
@@ -219,9 +218,9 @@ impl ReactiveNode for TrackerInner {
 }
 
 impl Subscriber for TrackerInner {
-    fn add_source(&self, source: AnySource) { self.0.write().or_poisoned().sources.insert(source); }
+    fn add_source(&self, source: AnySource) { self.0.write().or_poisoned().sources.push(source); }
 
-    fn clear_sources(&self, subscriber: &AnySubscriber) { self.0.write().or_poisoned().sources.clear_sources(subscriber); }
+    fn clear_sources(&self, subscriber: &AnySubscriber) { self.0.write().or_poisoned().sources.clear(); }
 }
 
 impl ToAnySubscriber for Tracker {

@@ -1,7 +1,7 @@
 import styled from "styled-components";
 import { useAppState } from "./AppState";
 import {
-  useSignals,
+  withSignals,
   fetch_test_items,
   create_test_entity,
   SessionView,
@@ -61,9 +61,9 @@ const Card = styled.div`
 `;
 
 function App() {
-  const c = useSignals();
-
-  try {
+  // Temporary fix - this should be done differently
+  return withSignals(() => {
+    // try {
     const appState = useAppState();
     console.log("render 1", { appState });
 
@@ -146,9 +146,8 @@ function App() {
         </Card>
       </Container>
     );
-  } finally {
-    c.finish();
-  }
+    // } catch ;
+  })
 }
 
 export default App;

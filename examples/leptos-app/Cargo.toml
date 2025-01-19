@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 console_error_panic_hook = "0.1.7"
-leptos = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
+leptos = { version = "0.7.4", features = [
     "csr",
     "nightly",
 ] }
