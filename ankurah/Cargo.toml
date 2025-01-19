@@ -2,7 +2,7 @@
 name        = "ankurah"
 version     = "0.1.0"
 edition     = "2021"
-description = "A distributed, observable data synchronization framework"
+description = "An observable data binding and state management framework"
 license     = "MIT"
 repository  = "https://github.com/ankurah/ankurah"
 
@@ -28,7 +28,7 @@ ankql          = { path = "../ankql", version = "0.1.0" }
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 ankurah-react-signals = { path = "../react-signals", optional = true }
-reactive_graph = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = [
+reactive_graph = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
     "effects",
 ], optional = true }
 

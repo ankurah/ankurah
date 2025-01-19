@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 console_error_panic_hook = "0.1.7"
-leptos = { git = "https://github.com/synestheticsystems/leptos", branch = "reactive_graph_pub_items", features = [
+leptos = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
     "csr",
     "nightly",
 ] }
