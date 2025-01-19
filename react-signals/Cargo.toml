@@ -9,7 +9,7 @@ futures-signals = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-ankurah-derive = { path = "../derive" }
+ankurah-derive = { path = "../derive", version = "0.1.0" }
 reactive_graph = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
     "effects",
 ] }

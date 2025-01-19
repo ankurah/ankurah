@@ -9,6 +9,6 @@ default = ["wasm"]
 wasm    = ["dep:wasm-bindgen", "ankurah/wasm"]
 
 [dependencies]
-ankurah      = { path = "../../ankurah", features = ["derive"] }
+ankurah      = { path = "../../ankurah", features = ["derive"], version = "0.1.0" }
 serde        = { version = "1.0", features = ["derive"] }
 wasm-bindgen = { version = "0.2", optional = true }
