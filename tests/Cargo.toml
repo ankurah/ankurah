@@ -10,12 +10,12 @@ postgres = ["ankurah-storage-postgres", "tokio-postgres", "bb8", "bb8-postgres"]
 [dependencies]
 anyhow = "1.0"
 tracing = "0.1"
-ankql = { path = "../ankql" }
-ankurah = { path = "../ankurah", features = ["derive"] }
-ankurah-storage-sled = { path = "../storage/sled" }
-ankurah-connector-local-process = { path = "../connectors/local-process" }
+ankql = { path = "../ankql", version = "0.1.0" }
+ankurah = { path = "../ankurah", features = ["derive"], version = "0.1.0" }
+ankurah-storage-sled = { path = "../storage/sled", version = "0.1.0" }
+ankurah-connector-local-process = { path = "../connectors/local-process", version = "0.1.0" }
 tokio-postgres = { version = "0.7", optional = true }
-ankurah-storage-postgres = { path = "../storage/postgres", optional = true }
+ankurah-storage-postgres = { path = "../storage/postgres", optional = true, version = "0.1.0" }
 bb8 = { version = "0.9", optional = true }
 bb8-postgres = { version = "0.9", optional = true }
 tokio = { version = "1.40", features = ["full"] }
@@ -25,7 +25,7 @@ testcontainers-modules = { version = "0.11.4", features = ["postgres"] }
 ctor = "0.2"
 wasm-bindgen = "0"
 js-sys = "0"
-ankurah-react-signals = { path = "../react-signals" }
+ankurah-react-signals = { path = "../react-signals", version = "0.1.0" }
 reactive_graph = { git = "https://github.com/ankurah/leptos", branch = "reactive_graph_pub_items", features = [
     "effects",
 ] }

@@ -9,9 +9,9 @@ default = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive = { path = "../derive", optional = true }
-ankql          = { path = "../ankql" }
-ankurah-proto  = { path = "../proto" }
+ankurah-derive = { path = "../derive", optional = true, version = "0.1.0" }
+ankql          = { path = "../ankql", version = "0.1.0" }
+ankurah-proto  = { path = "../proto", version = "0.1.0" }
 
 rand            = "0.8"
 dashmap         = "6.1"
