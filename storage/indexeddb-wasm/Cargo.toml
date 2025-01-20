@@ -65,7 +65,7 @@ strum = { version = "0.26.3", features = ["derive"] }
 #[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-ankurah           = { path = "../../ankurah", features = ["derive", "wasm"], version = "0.1.0" }
+ankurah           = { path = "../../ankurah", features = ["derive", "wasm"], version = "0.1" }
 
 
     [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
