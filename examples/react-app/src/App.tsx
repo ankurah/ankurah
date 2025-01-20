@@ -2,12 +2,10 @@ import styled from "styled-components";
 import { useAppState } from "./AppState";
 import {
   withSignals,
-  fetch_test_items,
   create_test_entity,
-  SessionView,
   subscribe_test_items,
 } from "example-wasm-bindings";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
 const Table = styled.table`
   width: 100%;
@@ -61,42 +59,19 @@ const Card = styled.div`
 `;
 
 function App() {
-  // Temporary fix - this should be done differently
+  // Temporary hack - see https://github.com/ankurah/ankurah/issues/33
   return withSignals(() => {
-    // try {
+    // eslint-disable-next-line react-hooks/rules-of-hooks
     const appState = useAppState();
     console.log("render 1", { appState });
 
     // const [connectionState, setConnectionState] = useState<string | null>(null);
     const connectionState = appState?.client?.connection_state.value?.value();
+    // eslint-disable-next-line react-hooks/rules-of-hooks
     const test_items_signal = useMemo(
       () => (appState?.client ? subscribe_test_items(appState?.client) : null),
       [appState?.client],
     );
-
-    // const [sessions, setSessions] = useState<SessionView[]>([]);
-    console.log("render 2", { connectionState });
-
-    // useEffect(() => {
-    // if (appState?.client) {
-    //   fetch_test_items(appState?.client).then((sessions) => {
-    //     console.log('sessions fetched', sessions);
-    //     setSessions(sessions);
-    //   });
-    // }
-    // const intervalId = setInterval(() => {
-    //   const client = appState?.client;
-    //   if (client) {
-    //     console.log('fetching sessions', client);
-    //     fetch_test_items(client).then((sessions) => {
-    //       console.log('sessions fetched', sessions);
-    //       setSessions(sessions);
-    //     });
-    //   }
-    // }, 5000);
-
-    // return () => clearInterval(intervalId);
-    // }, [appState?.client]);
 
     const handleButtonPress = () => {
       if (appState?.client) {
@@ -146,8 +121,7 @@ function App() {
         </Card>
       </Container>
     );
-    // } catch ;
-  });
+  }) as JSX.Element;
 }
 
 export default App;
