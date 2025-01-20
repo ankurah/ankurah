@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ankql",
  "ankurah-connector-local-process",
