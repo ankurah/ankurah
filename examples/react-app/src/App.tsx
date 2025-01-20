@@ -147,7 +147,7 @@ function App() {
       </Container>
     );
     // } catch ;
-  })
+  });
 }
 
 export default App;
