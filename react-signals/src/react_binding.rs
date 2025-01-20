@@ -41,16 +41,14 @@ extern "C" {
 /// # Usage
 ///
 /// ```typescript
-/// import { useSignals } from 'example-wasm-bindings';
+/// import { withSignals } from 'example-wasm-bindings';
 ///
 /// function MyComponent() {
-///     const controller = useSignals();
-///     
-///     try {
+///     // withSignals is a temporary hack. Signal management will change soon
+///     withSignals(() => {
 ///         // Your component logic here
 ///         return <div>{my_signal.value}</div>;
-///     } finally {
-///         controller.finish();
+///     });
 ///     }
 /// }
 /// ```
