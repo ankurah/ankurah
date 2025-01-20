@@ -1,9 +1,9 @@
 [package]
-name    = "ankql"
-version = "0.1.0"
-edition = "2021"
+name        = "ankql"
+version     = "0.1.0"
+edition     = "2021"
 description = "Ankurah Query Language - Aspirational query language for Ankurah in the style of Open Cypher and GQL (ISO/IEC 39075:2024)"
-license = "MIT OR Apache-2.0"
+license     = "MIT OR Apache-2.0"
 
 [dependencies]
 pest        = { version = "2.7.15", features = ["pretty-print"] }
