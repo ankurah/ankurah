@@ -1,6 +1,6 @@
 [package]
 name        = "ankurah-react-signals"
-version     = "0.1.0"
+version     = "0.1.3"
 edition     = "2021"
 description = "Observe ankurah state with signals in react"
 license     = "MIT OR Apache-2.0"

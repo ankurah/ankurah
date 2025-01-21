@@ -1,6 +1,6 @@
 [package]
 name        = "ankurah"
-version     = "0.1.2"
+version     = "0.1.3"
 edition     = "2021"
 description = "Observable, event-driven state management for native and web"
 license     = "MIT OR Apache-2.0"
