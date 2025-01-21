@@ -7,11 +7,11 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ankurah = { path = "../../ankurah", features = ["derive", "wasm"], version = "0.1" }
+ankurah = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.1.3" }
 ankurah-websocket-client-wasm = { path = "../../connectors/websocket-client-wasm", features = [
     "react",
-], version = "0.1.0" }
-ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm", version = "0.1.0" }
+], version = "^0.1.1" }
+ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm", version = "^0.1.1" }
 example-model = { path = "../model", features = ["wasm"], version = "0.1.0" }
 wasm-bindgen = "0.2.84"
 wasm-bindgen-futures = "0.4.42"

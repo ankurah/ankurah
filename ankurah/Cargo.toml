@@ -1,6 +1,6 @@
 [package]
 name        = "ankurah"
-version     = "0.1.2"
+version     = "0.1.3"
 edition     = "2021"
 description = "Observable, event-driven state management for native and web"
 license     = "MIT OR Apache-2.0"
@@ -20,15 +20,15 @@ wasm = [
 derive = ["dep:ankurah-derive"]
 
 [dependencies]
-ankurah-core   = { path = "../core", version = "0.1.0" }
-ankurah-proto  = { path = "../proto", version = "0.1.0" }
-ankurah-derive = { path = "../derive", version = "0.1.0", optional = true }
-ankql          = { path = "../ankql", version = "0.1.0" }
+ankurah-core   = { path = "../core", version = "^0.1.1" }
+ankurah-proto  = { path = "../proto", version = "^0.1.1" }
+ankurah-derive = { path = "../derive", version = "^0.1.1", optional = true }
+ankql          = { path = "../ankql", version = "^0.1.1" }
 
 # Dependencies needed for derive macros
 wasm-bindgen          = { version = "0.2", optional = true }
 js-sys                = { version = "0.3", optional = true }
-ankurah-react-signals = { path = "../react-signals", optional = true, version = "0.1.0" }
+ankurah-react-signals = { path = "../react-signals", optional = true, version = "^0.1.1" }
 reactive_graph        = { version = "0.1.4", features = ["effects"], optional = true }
 
 [dev-dependencies]
