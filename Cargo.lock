@@ -181,6 +181,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-signals"
+version = "0.5.1"
+
+[[package]]
 name = "ankurah-storage-indexeddb-wasm"
 version = "0.5.1"
 dependencies = [

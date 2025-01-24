@@ -1,0 +1,11 @@
+[package]
+name    = "ankurah-signals"
+version = "0.5.1"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.40", features = ["sync"] }
+
+[dev-dependencies]
+tokio      = { version = "1.40", features = ["sync", "macros", "rt", "time"] }
+tokio-test = "0.4"
