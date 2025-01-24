@@ -124,7 +124,7 @@ impl Entity {
         let head = Clock::new([event.id]);
         for (backend_name, operations) in &event.operations {
             // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
-            self.backends.apply_operations((*backend_name).to_owned(), operations, &head)?;
+            self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent)?;
         }
         // TODO figure out how to test this
         info!("Apply event {}", event);

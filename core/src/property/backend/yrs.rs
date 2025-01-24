@@ -126,7 +126,7 @@ impl PropertyBackend for YrsBackend {
         Ok(vec![])
     }
 
-    fn apply_operations(&self, _current_head: &Clock, _event_head: &Clock, operations: &Vec<Operation>) -> anyhow::Result<()> {
+    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> anyhow::Result<()> {
         // println!("apply operations: {:?}", operations);
         for operation in operations {
             self.apply_update(&operation.diff)?;
