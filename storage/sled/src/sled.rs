@@ -43,8 +43,12 @@ impl SledStorageEngine {
     }
 }
 
+pub fn state_name(name: &str) -> String { format!("{}_state", name) }
+
+pub fn event_name(name: &str) -> String { format!("{}_event", name) }
+
 pub struct SledStorageCollection {
-    pub name: String,
+    pub collection_id: CollectionId,
     pub state: sled::Tree,
     pub events: sled::Tree,
 }
@@ -53,10 +57,9 @@ pub struct SledStorageCollection {
 impl StorageEngine for SledStorageEngine {
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
-        let tree = self.db.open_tree(id.as_str())?;
-        let state = self.db.open_tree(crate::storage::state_name(id.as_str()))?;
-        let events = self.db.open_tree(crate::storage::event_name(id.as_str()))?;
-        Ok(Arc::new(SledStorageCollection { name: id.as_str().to_owned(), state, events }))
+        let state = self.db.open_tree(state_name(id.as_str())).map_err(|err| SledRetrievalError::StorageError(err))?;
+        let events = self.db.open_tree(event_name(id.as_str())).map_err(|err| SledRetrievalError::StorageError(err))?;
+        Ok(Arc::new(SledStorageCollection { collection_id: id.to_owned(), state, events }))
     }
 }
 
@@ -86,7 +89,7 @@ impl StorageCollection for SledStorageCollection {
         // Use spawn_blocking since sled operations are not async
         let result = task::spawn_blocking(move || -> Result<Option<sled::IVec>, sled::Error> { tree.get(id_bytes) })
             .await
-            .map_err(|e| SledRetrievalError::StorageError(Box::new(e)))?;
+            .map_err(|e| SledRetrievalError::Other(Box::new(e)))?;
 
         match result.map_err(SledRetrievalError::StorageError)? {
             Some(ivec) => {
@@ -99,7 +102,7 @@ impl StorageCollection for SledStorageCollection {
 
     async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
         let predicate = predicate.clone();
-        let name = self.name.clone();
+        let collection_id = self.collection_id.clone();
         let copied_state = self.state.iter().collect::<Vec<_>>();
 
         // Use spawn_blocking for the full scan operation
@@ -164,12 +167,12 @@ impl StorageCollection for SledStorageCollection {
         .await?
     }
 
-    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, crate::error::RetrievalError> {
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> {
         let mut matching_events = Vec::new();
 
         // full events table scan searching for matching entity ids
         for event_data in self.events.iter() {
-            let (_key, data) = event_data?;
+            let (_key, data) = event_data.map_err(|err| SledRetrievalError::StorageError(err))?;
             let event: Event = bincode::deserialize(&data)?;
             if entity_id == event.entity_id {
                 matching_events.push(event);

@@ -123,78 +123,11 @@ impl IndexedDBStorageEngine {
 impl StorageEngine for IndexedDBStorageEngine {
     async fn collection(&self, collection_id: &proto::CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         Ok(Arc::new(IndexedDBBucket {
-            collection_id: collection_id,
             db: self.db.clone(),
             collection_id: collection_id.clone(),
             mutex: tokio::sync::Mutex::new(()),
             invocation_count: AtomicUsize::new(0),
         }))
-    }
-
-    async fn fetch_states(
-        &self,
-        collection_id: proto::CollectionId,
-        predicate: &ankql::ast::Predicate,
-    ) -> Result<Vec<(proto::ID, proto::State)>, RetrievalError> {
-        SendWrapper::new(async move {
-            let transaction = self.db.transaction_with_str("entities").map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
-
-            let store = transaction.object_store("entities").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
-
-            let index = store.index("by_collection").map_err(|_e| anyhow::anyhow!("Failed to get collection index"))?;
-
-            let key_range = web_sys::IdbKeyRange::only(&(&collection_id).as_str().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
-
-            let request = index.open_cursor_with_range(&key_range).map_err(|_e| anyhow::anyhow!("Failed to open cursor"))?;
-
-            let mut tuples = Vec::new();
-            let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
-
-            while let Some(result) = stream.next().await {
-                let cursor_result = result.map_err(|e| anyhow::anyhow!("Cursor error: {}", e))?;
-
-                // Check if we've reached the end
-                if cursor_result.is_null() || cursor_result.is_undefined() {
-                    break;
-                }
-
-                let cursor: web_sys::IdbCursorWithValue = cursor_result.dyn_into().map_err(|_| anyhow::anyhow!("Failed to cast cursor"))?;
-
-                let entity = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
-
-                let id_str = js_sys::Reflect::get(&entity, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get entity id"))?;
-                let id: proto::ID = id_str.try_into().map_err(|_e| anyhow::anyhow!("Failed to convert id to proto::ID"))?;
-
-                let state_buffer =
-                    js_sys::Reflect::get(&entity, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
-                let array: js_sys::Uint8Array = state_buffer.dyn_into().map_err(|_e| anyhow::anyhow!("Failed to convert state buffer"))?;
-
-                let mut buffer = vec![0; array.length() as usize];
-                array.copy_to(&mut buffer);
-
-                let state_buffers: std::collections::BTreeMap<String, Vec<u8>> = bincode::deserialize(&buffer)?;
-
-                // Get the head array
-                let head_data = js_sys::Reflect::get(&entity, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
-                let head: proto::Clock = head_data.try_into().map_err(|e| anyhow::anyhow!("Failed to deserialize head: {}", e))?;
-
-                let entity_state = proto::State { state_buffers, head };
-
-                // Create entity to evaluate predicate
-                let entity = Entity::from_state(id, collection_id.clone(), &entity_state)?;
-
-                // Apply predicate filter
-                if evaluate_predicate(&entity, predicate)? {
-                    tuples.push((id, entity_state));
-                }
-
-                cursor.continue_().map_err(|_e| anyhow::anyhow!("Failed to advance cursor"))?;
-            }
-
-            Ok(tuples)
-        })
-        .await
     }
 }
 
@@ -337,7 +270,7 @@ impl StorageCollection for IndexedDBBucket {
     }
 
     async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(proto::ID, proto::State)>, RetrievalError> {
-        let collection = self.name.clone();
+        let collection_id = self.collection_id.clone();
         SendWrapper::new(async move {
             let transaction = self.db.transaction_with_str("entities").map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
 
@@ -345,8 +278,8 @@ impl StorageCollection for IndexedDBBucket {
 
             let index = store.index("by_collection").map_err(|_e| anyhow::anyhow!("Failed to get collection index"))?;
 
-            let key_range =
-                web_sys::IdbKeyRange::only(&(&collection).into()).map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
+            let key_range = web_sys::IdbKeyRange::only(&(&collection_id).as_str().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
 
             let request = index.open_cursor_with_range(&key_range).map_err(|_e| anyhow::anyhow!("Failed to open cursor"))?;
 
@@ -366,7 +299,7 @@ impl StorageCollection for IndexedDBBucket {
                 let entity = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
 
                 let id_str = js_sys::Reflect::get(&entity, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get entity id"))?;
-                let id = proto::ID::from_ulid(ulid::Ulid::from_string(&id_str.as_string().unwrap()).map_err(RetrievalError::storage)?);
+                let id: proto::ID = id_str.try_into().map_err(|_e| anyhow::anyhow!("Failed to convert id to proto::ID"))?;
 
                 let state_buffer =
                     js_sys::Reflect::get(&entity, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
@@ -384,7 +317,7 @@ impl StorageCollection for IndexedDBBucket {
                 let entity_state = proto::State { state_buffers, head };
 
                 // Create entity to evaluate predicate
-                let entity = Entity::from_state(id, collection.clone(), &entity_state)?;
+                let entity = Entity::from_state(id, collection_id.clone(), &entity_state)?;
 
                 // Apply predicate filter
                 if evaluate_predicate(&entity, predicate)? {

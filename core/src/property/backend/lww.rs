@@ -94,10 +94,11 @@ impl PropertyBackend for LWWBackend {
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
-    fn apply_operations(&self, current_head: &Clock, event_head: &Clock, operations: &Vec<Operation>) -> anyhow::Result<()> {
+    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> anyhow::Result<()> {
         let mut values = self.values.write().unwrap();
 
         // TODO: Figure out this comparison
+        // This'll probably require looking at the events table. 
         /*
         if current_head < event_head {
             for operation in operations {

@@ -192,7 +192,7 @@ impl Node {
                 }
             }
             proto::NodeRequestBody::Fetch { collection, predicate } => {
-                let storage_collection = self.collection(&collection).await?;
+                let storage_collection = self.collection(&collection).await;
                 let states: Vec<_> = storage_collection.fetch_states(&predicate).await?.into_iter().collect();
                 Ok(proto::NodeResponseBody::Fetch(states))
             }
@@ -216,7 +216,7 @@ impl Node {
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
         // First fetch initial state
-        let storage_collection = self.collection(&collection).await?;
+        let storage_collection = self.collection(&collection_id).await;
         let states = storage_collection.fetch_states(&predicate).await?;
 
         // Set up subscription that forwards changes to the peer
@@ -271,7 +271,7 @@ impl Node {
         assert!(collections.insert(id.clone(), collection.clone()).is_none());
         drop(collections);
 
-        Ok(collection)
+        collection
     }
 
     pub fn next_entity_id(&self) -> proto::ID { proto::ID::new() }
@@ -508,7 +508,7 @@ impl Node {
         }
 
         // Fetch raw states from storage
-        let storage_collection = self.collection(collection_id).await;
+        let storage_collection = self.collection(&collection_id).await;
         let states = storage_collection.fetch_states(&predicate).await?;
 
         // Convert states to entities
@@ -544,7 +544,7 @@ impl Node {
             {
                 proto::NodeResponseBody::Subscribe { initial, subscription_id: _ } => {
                     // Apply initial states to our storage
-                    let raw_bucket = self.collection(&collection).await;
+                    let raw_bucket = self.collection(&collection_id).await;
                     for (id, state) in initial {
                         raw_bucket.set_state(id, &state).await.map_err(|e| anyhow!("Failed to set entity: {:?}", e))?;
                     }

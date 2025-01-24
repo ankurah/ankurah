@@ -74,7 +74,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                     backends
                 );
                 #(
-                    #field_active_values::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
+                    #active_field_types::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
                 )*
                 entity
             }
@@ -134,9 +134,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self.entity.id.clone()
             }
             #(
-                #active_field_visibility fn #active_field_names(&self) -> #field_types {
+                #active_field_visibility fn #active_field_names(&self) -> #active_field_types {
                     use ankurah_core::property::{ProjectedValue, FromEntity};
-                    #field_active_values::from_entity(#active_field_name_strs.into(), self.entity.as_ref()).projected()
+                    #active_field_types::from_entity(#active_field_name_strs.into(), self.entity.as_ref()).projected()
                 }
             )*
             // #(
@@ -166,12 +166,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                     property::FromEntity,
                 };
                 assert_eq!(entity.collection(), Self::collection());
-                #(
-                    let #field_names_avoid_conflicts = #field_active_values::from_entity(#field_name_strs.into(), entity);
-                )*
                 Self {
                     entity,
-                    #( #active_field_names: #active_field_types::from_backends(#active_field_name_strs.into(), entity.backends()), )*
+                    #( #active_field_names: #active_field_types::from_entity(#active_field_name_strs.into(), entity), )*
                 }
             }
         }
