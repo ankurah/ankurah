@@ -46,7 +46,7 @@ impl Postgres {
 #[async_trait]
 impl StorageEngine for Postgres {
     async fn collection(&self, collection_id: &CollectionId) -> Result<std::sync::Arc<dyn StorageCollection>, RetrievalError> {
-        if !Postgres::sane_name(collection_id) {
+        if !Postgres::sane_name(collection_id.as_str()) {
             return Err(RetrievalError::InvalidBucketName);
         }
 
@@ -413,7 +413,7 @@ impl StorageCollection for PostgresBucket {
         Ok(affected > 0)
     }
 
-    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, crate::error::RetrievalError> { 
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> { 
         let query = format!(
             r#"SELECT "id", "operations", "head" FROM "{0}" WHERE "entity_id" = $1"#,
             self.event_table(),
@@ -437,7 +437,7 @@ impl StorageCollection for PostgresBucket {
                     _ => {}
                 }
 
-                return Err(err.into());
+                return Err(RetrievalError::storage(err));
             }
         };
 
@@ -453,7 +453,7 @@ impl StorageCollection for PostgresBucket {
 
             events.push(Event {
                 id: event_id,
-                collection: self.collection.clone(),
+                collection: self.collection_id.clone(),
                 entity_id: entity_id,
                 operations: operations,
                 parent: clock,
@@ -524,7 +524,3 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
 pub struct MissingMaterialized {
     pub name: String,
 }
-
-// impl From<tokio_postgres::Error> for RetrievalError {
-//     fn from(err: tokio_postgres::Error) -> Self { RetrievalError::StorageError(Box::new(err)) }
-// }
