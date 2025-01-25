@@ -49,6 +49,10 @@ pub struct Entity {
 }
 
 impl Entity {
+    pub fn collection(&self) -> CollectionId {
+        self.collection.clone()
+    }
+    
     pub fn backends(&self) -> &Backends { &self.backends }
 
     pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
