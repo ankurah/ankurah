@@ -10,7 +10,7 @@ mod tests {
     use pest::*;
 
     #[test]
-    fn test_literal_comparision() {
+    fn test_literal_comparison() {
         let parser = AnkqlParser::parse(Rule::Selection, "a.foo = b.foo").unwrap();
         println!("{:#?}", parser);
         parses_to! {
@@ -28,7 +28,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identifier_comparision() {
+    fn test_identifier_comparison() {
         let parser = AnkqlParser::parse(Rule::Selection, "a.foo = b.foo").unwrap();
         println!("{:#?}", parser);
         parses_to! {

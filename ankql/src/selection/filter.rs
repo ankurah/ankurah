@@ -17,7 +17,7 @@ pub enum Error {
 pub trait Filterable {
     fn collection(&self) -> &str;
     // TODO figure out how to make this generic so we can perform typecast eligibity checking
-    // and perform the actual typecast for comparisions
+    // and perform the actual typecast for comparisons
     fn value(&self, name: &str) -> Option<String>;
 }
 

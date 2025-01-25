@@ -1,6 +1,6 @@
 pub mod changes;
 pub mod collation;
-pub mod comparision_index;
+pub mod comparison_index;
 pub mod connector;
 pub mod error;
 pub mod event;

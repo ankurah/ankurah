@@ -1,4 +1,4 @@
-use super::comparision_index::ComparisonIndex;
+use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::model::Entity;
 use crate::resultset::ResultSet;
