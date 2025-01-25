@@ -1,25 +1,25 @@
 use crate::{
-    Stateful, Value, WithValue,
-    observer::{ObserverSet, ValueObserverSet},
+    Stateful, Subscriber, Value, WithValue SubscriberSet
 };
+use crate {}
 use std::sync::{Arc, RwLock};
 
 /// Read-only signal
 pub struct Read<T> {
     value: Arc<RwLock<T>>,
-    observers: ObserverSet,
-    value_observers: ValueObserverSet<T>,
+    upstream_sub: SubscriptionHandle,
 }
 
 impl<T> Read<T> {
     pub(crate) fn new<S>(upstream: &S) -> Self
-    where S: Stateful<T> + Observable<T> {
+    where S: Stateful<T> + SharedInner<T> {
         // clone the state and become an observer of upstream
         let state = upstream.state();
-        let observers = ObserverSet::new();
-        // ???
-        Self { state: upstream.state().clone(), observers: ObserverSet::new(), value_observers: ValueObserverSet::new() }
-        unimplemented!()
+
+        let subscribers = SubscriberSet::new();
+        let upstream_sub = upstream.subscribe(Subscriber::Nested(subscribers));
+        Self { state: upstream.state().clone(), upstream_sub }
+    }
     }
 
     // fn track_observer(&self) {

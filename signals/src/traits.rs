@@ -1,5 +1,7 @@
 use std::sync::{Arc, RwLock};
 
+use crate::SubscriberSet;
+
 pub(crate) trait Stateful<T> {
     fn state(&self) -> Arc<RwLock<T>>;
 
@@ -16,10 +18,6 @@ pub trait WithValue<T> {
     fn with_value<R>(&self, f: impl Fn(&T) -> R) -> R;
 }
 
-pub trait Notify: Send + Sync {
-    fn notify(&self);
-}
-
-pub trait Subscribe<T> {
-    fn subscribe(&self, f: impl Fn(&T) + Send + Sync + 'static);
+pub trait SharedInner<T> {
+    fn subscriber_set(&self) -> SubscriberSet<T>;
 }

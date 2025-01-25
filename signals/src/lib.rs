@@ -62,6 +62,7 @@ mod memo;
 mod mutable;
 mod observer;
 mod read;
+mod subscription;
 mod traits;
 
 pub use map::*;

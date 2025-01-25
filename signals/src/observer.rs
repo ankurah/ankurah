@@ -1,30 +1,6 @@
 use crate::Notify;
 use std::sync::{Arc, RwLock, Weak};
 
-#[derive(Default)]
-pub struct ValueObserverSet<T>(RwLock<Vec<Weak<ValueObserver<T>>>>);
-
-/// A value observer is an observer that wants to be notified of changes to a value with a borrow of the value
-struct ValueObserver<T> {
-    callback: Box<dyn Fn(&T) + Send + Sync>,
-}
-
-impl<T> ValueObserver<T> {
-    fn notify(&self, value: &T) { (self.callback)(value); }
-}
-
-impl<T> ValueObserverSet<T> {
-    pub(crate) fn new() -> Self { Self(RwLock::new(Vec::new())) }
-    pub(crate) fn notify(&self, value: &T) {
-        let observers = self.0.read().unwrap();
-        for observer in observers.iter() {
-            if let Some(observer) = observer.upgrade() {
-                observer.notify(value);
-            }
-        }
-    }
-}
-
 pub struct ObserverSet(RwLock<Vec<Weak<ObserverInner>>>);
 
 pub struct Observer(Arc<ObserverInner>);
