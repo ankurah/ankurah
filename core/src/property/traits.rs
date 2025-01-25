@@ -1,9 +1,6 @@
 use anyhow::Result;
 
-use crate::{
-    model::Entity,
-    property::PropertyName,
-};
+use crate::{model::Entity, property::PropertyName};
 
 pub trait InitializeWith<T> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
