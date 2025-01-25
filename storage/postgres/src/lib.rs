@@ -1,4 +1,7 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use ankurah_core::{
     error::RetrievalError,
@@ -67,16 +70,13 @@ pub struct PostgresBucket {
 }
 
 impl PostgresBucket {
-    pub fn state_table(&self) -> String {
-        format!("{}_state", self.collection_id.as_str())
-    }
+    pub fn state_table(&self) -> String { format!("{}_state", self.collection_id.as_str()) }
 
-    pub fn event_table(&self) -> String {
-        format!("{}_event", self.collection_id.as_str())
-    }
+    pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
 
     pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
-        let create_query = format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "entity_id" UUID, "operations" bytea, "parent" UUID[])"#, self.event_table());
+        let create_query =
+            format!(r#"CREATE TABLE "{}"("id" UUID UNIQUE, "entity_id" UUID, "operations" bytea, "parent" UUID[])"#, self.event_table());
 
         error!("Running: {}", create_query);
         client.execute(&create_query, &[]).await?;
@@ -205,7 +205,10 @@ impl StorageCollection for PostgresBucket {
             INSERT INTO "{0}"({1}) VALUES({2})
             ON CONFLICT("id") DO UPDATE SET {3}
             RETURNING (SELECT "head" FROM old_state) as old_head"#,
-            self.state_table(), columns_str, values_str, columns_update_str
+            self.state_table(),
+            columns_str,
+            values_str,
+            columns_update_str
         );
 
         let mut client = self.pool.get().await?;
@@ -376,7 +379,7 @@ impl StorageCollection for PostgresBucket {
     /// entity_id uuid, // `ID`/`ULID`
     /// operations bytea, // `Vec<Operation>`
     /// clock bytea, // `Clock`
-    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool> { 
+    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool> {
         let event_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.id));
         let entity_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.entity_id));
         let operations = bincode::serialize(&entity_event.operations)?;
@@ -385,10 +388,7 @@ impl StorageCollection for PostgresBucket {
         // Does it even matter if this conflicts?
         // One peers event should match any duplicates, so taking the first
         // event we receive from a peer should be fine.
-        let query = format!(
-            r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent") VALUES($1, $2, $3, $4)"#,
-            self.event_table(),
-        );
+        let query = format!(r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent") VALUES($1, $2, $3, $4)"#, self.event_table(),);
 
         let mut client = self.pool.get().await?;
         error!("Running: {}", query);
@@ -413,11 +413,8 @@ impl StorageCollection for PostgresBucket {
         Ok(affected > 0)
     }
 
-    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> { 
-        let query = format!(
-            r#"SELECT "id", "operations", "head" FROM "{0}" WHERE "entity_id" = $1"#,
-            self.event_table(),
-        );
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> {
+        let query = format!(r#"SELECT "id", "operations", "head" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
 
         let entity_uuid = uuid::Uuid::from(ulid::Ulid::from(entity_id));
 
@@ -448,7 +445,7 @@ impl StorageCollection for PostgresBucket {
             let operations_binary: Vec<u8> = row.get("operations");
             let operations = bincode::deserialize(&operations_binary)?;
             let parent: Vec<uuid::Uuid> = row.get("parent");
-            let parent  = parent.into_iter().map(|uuid| ID::from_ulid(uuid.into())).collect::<BTreeSet<_>>();
+            let parent = parent.into_iter().map(|uuid| ID::from_ulid(uuid.into())).collect::<BTreeSet<_>>();
             let clock = Clock::new(parent);
 
             events.push(Event {

@@ -98,7 +98,7 @@ impl PropertyBackend for LWWBackend {
         let mut values = self.values.write().unwrap();
 
         // TODO: Figure out this comparison
-        // This'll probably require looking at the events table. 
+        // This'll probably require looking at the events table.
         /*
         if current_head < event_head {
             for operation in operations {
