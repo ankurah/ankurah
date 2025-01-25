@@ -68,14 +68,15 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 use ankurah::property::InitializeWith;
 
                 let backends = ankurah::property::Backends::new();
-                #(
-                    #active_field_types::initialize_with(&backends, #active_field_name_strs.into(), &self.#active_field_names);
-                )*
-                ::ankurah::model::Entity::create(
+                let entity = ankurah::model::Entity::create(
                     id,
                     Self::collection(),
                     backends
-                )
+                );
+                #(
+                    #active_field_types::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
+                )*
+                entity
             }
         }
 
@@ -134,8 +135,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> #projected_field_types {
-                    use ankurah::property::ProjectedValue;
-                    #active_field_types::from_backends(#active_field_name_strs.into(), self.entity.backends()).projected()
+                    use ankurah::property::{ProjectedValue, FromEntity};
+                    #active_field_types::from_entity(#active_field_name_strs.into(), self.entity.as_ref()).projected()
                 }
             )*
             // #(
@@ -160,11 +161,14 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
 
             fn new(entity: &'rec std::sync::Arc<::ankurah::model::Entity>) -> Self {
-                use ::ankurah::model::Mutable;
-                assert_eq!(entity.collection, Self::collection());
+                use ankurah::{
+                    model::Mutable,
+                    property::FromEntity,
+                };
+                assert_eq!(entity.collection(), Self::collection());
                 Self {
                     entity,
-                    #( #active_field_names: #active_field_types::from_backends(#active_field_name_strs.into(), entity.backends()), )*
+                    #( #active_field_names: #active_field_types::from_entity(#active_field_name_strs.into(), entity), )*
                 }
             }
         }

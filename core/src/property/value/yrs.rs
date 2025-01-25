@@ -1,10 +1,13 @@
 use std::sync::{Arc, Weak};
 
-use crate::property::{
-    backend::{Backends, YrsBackend},
-    traits::InitializeWith,
-    value::ProjectedValue,
-    PropertyName,
+use crate::{
+    model::Entity,
+    property::{
+        backend::YrsBackend,
+        traits::{FromEntity, InitializeWith},
+        value::ProjectedValue,
+        PropertyName,
+    },
 };
 
 #[derive(Debug)]
@@ -24,10 +27,6 @@ impl ProjectedValue for YrsString {
 // Starting with basic string type operations
 impl YrsString {
     pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self { Self { property_name, backend: Arc::downgrade(&backend) } }
-    pub fn from_backends(property_name: PropertyName, backends: &Backends) -> Self {
-        let backend = backends.get::<YrsBackend>().unwrap();
-        Self::new(property_name, backend)
-    }
     pub fn backend(&self) -> Arc<YrsBackend> { self.backend.upgrade().expect("Expected `Yrs` property backend to exist") }
     pub fn value(&self) -> Option<String> { self.backend().get_string(&self.property_name) }
     pub fn insert(&self, index: u32, value: &str) { self.backend().insert(&self.property_name, index, value); }
@@ -42,9 +41,16 @@ impl YrsString {
     }
 }
 
+impl FromEntity for YrsString {
+    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+        let backend = entity.backends().get::<YrsBackend>().unwrap();
+        Self::new(property_name, backend)
+    }
+}
+
 impl InitializeWith<String> for YrsString {
-    fn initialize_with(backends: &Backends, property_name: PropertyName, value: &String) -> Self {
-        let new_string = Self::from_backends(property_name, backends);
+    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &String) -> Self {
+        let new_string = Self::from_entity(property_name, entity);
         new_string.insert(0, value);
         new_string
     }

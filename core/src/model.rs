@@ -49,6 +49,8 @@ pub struct Entity {
 }
 
 impl Entity {
+    pub fn collection(&self) -> CollectionId { self.collection.clone() }
+
     pub fn backends(&self) -> &Backends { &self.backends }
 
     pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
@@ -90,11 +92,41 @@ impl Entity {
         }
     }
 
+    /*
+        entity1: [], head: [],
+        event1: ["blah"], precursors: [],
+        entity1: ["blah"], head: [event1],
+
+        event2: [], precursor: [event1],
+        event3: [], precursor: [event1],
+        event4: [], precursor: [event2, event3],
+        [event4] == [event4, event3, event2, event1]
+
+        enum ClockOrder {
+            Descends,
+            Concurrent,
+            IsDescendedBy,
+            Divergent,
+            ComparisonBudgetExceeded,
+        }
+
+        impl Clock {
+            pub async fn compare(&self, other: &Self, node: &Node) -> ClockOrdering {
+
+            }
+        }
+    */
+
     pub fn apply_event(&self, event: &Event) -> Result<()> {
+        /*
+           case A: event precursor descends the current head, then set entity clock to singleton of event id
+           case B: event precursor is concurrent to the current head, push event id to event head clock.
+           case C: event precursor is descended by the current head
+        */
         let head = Clock::new([event.id]);
         for (backend_name, operations) in &event.operations {
             // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
-            self.backends.apply_operations((*backend_name).to_owned(), operations, &head)?;
+            self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent)?;
         }
         // TODO figure out how to test this
         info!("Apply event {}", event);

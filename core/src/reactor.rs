@@ -68,12 +68,13 @@ impl Reactor {
         self.manage_watchers_recurse(collection_id, &predicate, sub_id, WatcherOp::Add);
 
         // Find initial matching entities
-        let states = self.storage.fetch_states(collection_id.clone(), &predicate).await?;
+        let storage_collection = self.storage.collection(collection_id).await?;
+        let states = storage_collection.fetch_states(&predicate).await?;
         let mut matching_entities = Vec::new();
 
         // Convert states to Entity and filter by predicate
         for (id, state) in states {
-            let entity = crate::model::Entity::from_state(id, collection_id.clone(), &state)?;
+            let entity = crate::model::Entity::from_state(id, collection_id.to_owned(), &state)?;
             let entity = Arc::new(entity);
 
             // Evaluate predicate for each entity
