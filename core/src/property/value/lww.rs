@@ -38,7 +38,6 @@ impl<T> FromEntity for LWW<T> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         Self { property_name: property_name, backend: entity.backends().get::<LWWBackend>().unwrap(), phantom: PhantomData }
     }
-
 }
 
 impl<T> InitializeWith<T> for LWW<T>
