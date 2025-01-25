@@ -67,8 +67,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::model::Entity {
                 use ankurah::property::InitializeWith;
 
-                let backends = ankurah_core::property::Backends::new();
-                let entity = ankurah_core::model::Entity::create(
+                let backends = ankurah::property::Backends::new();
+                let entity = ankurah::model::Entity::create(
                     id,
                     Self::collection(),
                     backends
@@ -134,8 +134,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self.entity.id.clone()
             }
             #(
-                #active_field_visibility fn #active_field_names(&self) -> #active_field_types {
-                    use ankurah_core::property::{ProjectedValue, FromEntity};
+                #active_field_visibility fn #active_field_names(&self) -> #projected_field_types {
+                    use ankurah::property::{ProjectedValue, FromEntity};
                     #active_field_types::from_entity(#active_field_name_strs.into(), self.entity.as_ref()).projected()
                 }
             )*
@@ -161,7 +161,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             }
 
             fn new(entity: &'rec std::sync::Arc<::ankurah::model::Entity>) -> Self {
-                use ankurah_core::{
+                use ankurah::{
                     model::Mutable,
                     property::FromEntity,
                 };
