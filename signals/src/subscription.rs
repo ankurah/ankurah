@@ -10,6 +10,12 @@ pub struct SubscriptionHandle {
     id: SubscriptionId,
 }
 
+impl std::ops::Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        // unsubscribe
+    }
+}
+
 pub struct SubscriptionId(usize);
 #[derive(Default)]
 pub struct SubscriberSet<T>(RwLock<BTreeMap<SubscriptionId, Subscriber<T>>>);

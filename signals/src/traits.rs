@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use crate::SubscriberSet;
+use crate::subscription::SubscriberSet;
 
 pub(crate) trait Stateful<T> {
     fn state(&self) -> Arc<RwLock<T>>;

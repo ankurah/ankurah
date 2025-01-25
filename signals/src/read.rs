@@ -1,7 +1,7 @@
 use crate::{
-    Stateful, Subscriber, Value, WithValue SubscriberSet
+    Stateful, Subscriber, Value, WithValue, SubscriberSet, SubscriptionHandle
 };
-use crate {}
+
 use std::sync::{Arc, RwLock};
 
 /// Read-only signal
