@@ -1,17 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock, Weak};
 
-pub trait Subscribe<T> {
-    fn subscribe(&self, f: impl Fn(&T) + Send + Sync + 'static) -> SubscriptionHandle;
-}
-
-pub trait Notify: Send + Sync {
-    fn notify(&self);
-}
-
-pub trait NotifyValue<T>: Send + Sync {
-    fn notify(&self, value: &T);
-}
+use crate::traits::{Notify, NotifyValue};
 
 pub struct SubscriptionHandle {
     id: SubscriptionId,
@@ -34,6 +24,15 @@ pub enum Subscriber<T> {
     Value(Weak<dyn NotifyValue<T>>),
     // So we can unsubscribe a nested subscriber set when the child is dropped
     // Nested(SubscriberSet<T>),
+}
+
+impl<T> Into<Subscriber<T>> for Box<dyn Fn(&T)> {
+    fn into(self) -> Subscriber<T> { Subscriber::Callback(self) }
+}
+
+// any type that implements Notify can be used as a subscriber
+impl<T> Into<Subscriber<T>> for Box<dyn Notify> {
+    fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&self)) }
 }
 
 impl<T> PartialEq for Subscriber<T> {

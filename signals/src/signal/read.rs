@@ -1,6 +1,6 @@
-use crate::{Stateful, Subscriber, SubscriberSet, SubscriptionHandle, Value, WithValue};
-
 use std::sync::{Arc, RwLock};
+
+use crate::{subscription::SubscriberSet, traits::Signal};
 
 /// Read-only signal
 pub struct Read<T> {
@@ -9,10 +9,6 @@ pub struct Read<T> {
 }
 
 impl<T> Read<T> {
-    pub fn get(&self) -> T {
-        // TODO - if there's a current global observer, add it to our subscriber set
-        self.value.read().unwrap().clone()
-    }
     // fn track_observer(&self) {
     //     if let Some(observer) = GLOBAL_OBSERVER.read().unwrap().as_ref() {
     //         let mut observers = self.observers.write().unwrap();
@@ -41,9 +37,11 @@ impl<T> Read<T> {
     // }
 }
 
-impl<T: Clone> Stateful<T> for Read<T> {
-    fn state(&self) -> Arc<RwLock<T>> { self.value.clone() }
-}
+impl<T> Signal<T> for Read<T> {}
+
+// impl<T: Clone> Stateful<T> for Read<T> {
+//     fn state(&self) -> Arc<RwLock<T>> { self.value.clone() }
+// }
 
 impl<T: std::fmt::Display> std::fmt::Display for Read<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.with_value(|v| write!(f, "{}", v)) }
