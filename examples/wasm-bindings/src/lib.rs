@@ -22,7 +22,6 @@ lazy_static! {
 pub async fn start() -> Result<(), JsValue> {
     tracing_wasm::set_as_global_default();
     panic::set_hook(Box::new(console_error_panic_hook::hook));
-    let _ = any_spawner::Executor::init_wasm_bindgen();
 
     let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
     let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());

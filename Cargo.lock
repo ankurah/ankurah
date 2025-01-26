@@ -64,10 +64,9 @@ dependencies = [
  "ankurah-core",
  "ankurah-derive",
  "ankurah-proto",
- "ankurah-react-signals",
+ "ankurah-signals",
  "ankurah-storage-sled",
  "js-sys",
- "reactive_graph",
  "serde",
  "serde_json",
  "tokio",
@@ -169,13 +168,11 @@ name = "ankurah-react-signals"
 version = "0.5.1"
 dependencies = [
  "ankurah-derive",
- "any_spawner",
+ "ankurah-signals",
  "futures",
- "futures-signals",
  "js-sys",
  "log",
  "or_poisoned",
- "reactive_graph",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]
@@ -183,6 +180,9 @@ dependencies = [
 [[package]]
 name = "ankurah-signals"
 version = "0.5.1"
+dependencies = [
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "ankurah-storage-indexeddb-wasm"
@@ -193,7 +193,6 @@ dependencies = [
  "ankurah-core",
  "ankurah-derive",
  "ankurah-proto",
- "any_spawner",
  "anyhow",
  "async-trait",
  "bincode",
@@ -202,7 +201,6 @@ dependencies = [
  "gloo-timers",
  "js-sys",
  "lazy_static",
- "reactive_graph",
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
@@ -264,7 +262,7 @@ dependencies = [
  "ankql",
  "ankurah",
  "ankurah-connector-local-process",
- "ankurah-react-signals",
+ "ankurah-signals",
  "ankurah-storage-postgres",
  "ankurah-storage-sled",
  "anyhow",
@@ -274,7 +272,6 @@ dependencies = [
  "ctor",
  "itertools",
  "js-sys",
- "reactive_graph",
  "serde",
  "serde_json",
  "testcontainers",
@@ -296,7 +293,6 @@ dependencies = [
  "ankurah-derive",
  "ankurah-proto",
  "ankurah-react-signals",
- "any_spawner",
  "anyhow",
  "async-trait",
  "bincode",
@@ -305,7 +301,6 @@ dependencies = [
  "getrandom 0.3.2",
  "gloo-timers",
  "js-sys",
- "reactive_graph",
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
@@ -399,7 +394,6 @@ checksum = "41058deaa38c9d9dd933d6d238d825227cffa668e2839b52879f6619c63eee3b"
 dependencies = [
  "futures",
  "thiserror 2.0.12",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -1024,13 +1018,11 @@ dependencies = [
  "ankurah",
  "ankurah-storage-indexeddb-wasm",
  "ankurah-websocket-client-wasm",
- "any_spawner",
  "console_error_panic_hook",
  "example-model",
  "getrandom 0.3.2",
  "lazy_static",
  "once_cell",
- "reactive_graph",
  "send_wrapper",
  "tokio",
  "tracing",

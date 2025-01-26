@@ -19,8 +19,6 @@ wasm-logger = "0.2.0"
 tracing = "0.1.40"
 tracing-wasm = "0.2.1"
 console_error_panic_hook = "0.1.7"
-any_spawner = { version = "0.2.0", features = ["wasm-bindgen"] }
-reactive_graph = { version = "0.1.4", features = ["effects"] }
 send_wrapper = { version = "0.6.0" }
 tokio = { version = "1.39.0", features = ["sync"] }
 lazy_static = "1.4.0"
@@ -29,5 +27,5 @@ once_cell = "1.19.0"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 ###### 
 
-    [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
-    dwarf-debug-info = true
+[package.metadata.wasm-pack.profile.dev.wasm-bindgen]
+dwarf-debug-info = true
