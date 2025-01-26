@@ -1,4 +1,4 @@
-use crate::{observer::Observer, traits::Signal};
+use crate::{Renderer, Subscriber, observer::Observer, traits::Signal};
 use std::{
     ops::Deref,
     sync::{Arc, RwLock, RwLockReadGuard},
@@ -39,20 +39,51 @@ impl<T: Clone> Value<T> {
 //     fn into(self) -> T { self.0.read().unwrap().clone() }
 // }
 
-static CURRENT_CONTEXT: RwLock<Option<Observer>> = RwLock::new(None);
+static CURRENT_CONTEXT: RwLock<Option<ObserverContext>> = RwLock::new(None);
 pub struct CurrentContext {}
 
 impl CurrentContext {
     /// Subscribes the current context to a signal
     pub fn track<S: Signal<T>, T>(signal: &S) {
         if let Some(observer) = CURRENT_CONTEXT.read().unwrap().as_ref() {
-            signal.subscribe(observer);
+            signal.subscribe(observer.subscriber());
         }
     }
 
     /// Sets an observer as the current context
-    pub fn set(current: &Observer) { *CURRENT_CONTEXT.write().unwrap() = Some(current.clone()); }
+    pub fn set(current: impl Into<ObserverContext>) {
+        let current: ObserverContext = current.into();
+        current.clear();
+        *CURRENT_CONTEXT.write().unwrap() = Some(current);
+    }
 
     /// Resets the current context to no observer
     pub fn unset() { *CURRENT_CONTEXT.write().unwrap() = None; }
+}
+
+pub enum ObserverContext {
+    Renderer(Renderer),
+    Observer(Observer),
+}
+
+impl ObserverContext {
+    pub fn clear(&self) {
+        match self {
+            ObserverContext::Renderer(renderer) => renderer.clear(),
+            ObserverContext::Observer(observer) => observer.clear(),
+        }
+    }
+    pub fn subscriber<T>(&self) -> Subscriber<T> {
+        match self {
+            ObserverContext::Renderer(renderer) => renderer.subscriber(),
+            ObserverContext::Observer(observer) => observer.subscriber(),
+        }
+    }
+}
+
+impl Into<ObserverContext> for Renderer {
+    fn into(self) -> ObserverContext { ObserverContext::Renderer(self) }
+}
+impl Into<ObserverContext> for Observer {
+    fn into(self) -> ObserverContext { ObserverContext::Observer(self) }
 }

@@ -19,10 +19,10 @@ A reactive signals library for ankurah
 ```rust
 use ankurah_signals::*;
 
-let signal = MutableSignal::new(42);
+let signal = Mut::new(42);
 // cant subscribe to a mutable signal
-signal.read().subscribe(|value| println!("Read value: {}", value));
-signal.map(|value| *value * 2).subscribe(|value| println!("Mapped value: {value}"));
+signal.read().subscribe(|value: &i32| println!("Read value: {}", value));
+// signal.map(|value| *value * 2).subscribe(|value| println!("Mapped value: {value}"));
 signal.set(43);
 // Should print:
 // Read value: 42
@@ -34,21 +34,18 @@ signal.set(43);
 
 ```rust
 use ankurah_signals::*;
-use std::sync::Arc;
 
-let name = MutableSignal::new("Buffy".to_string());
-let age = MutableSignal::new(29);
-let retired = age.map(|age| *age > 65);
-let render = {
+let name = Mut::new("Buffy".to_string());
+let age = Mut::new(29);
+// let retired = age.map(|age| *age > 65);
+let renderer = {
     let name = name.read();
     let age = age.read();
-    Arc::new(move || println!("name: {name}, age: {age}, retired: {retired}"))
+    Renderer::new(move || println!("name: {name}, age: {age}"))
 };
-let observer = Observer::new(render.clone());
-observer.set(); // sets the global observer
-render(); // call the render function the first time. any values read will be subscribed by the observer
+
+renderer.render();
 // name: Buffy, age: 29, retired: false
-observer.unset(); // un-sets the global observer
 
 // observer is still listening to all three signals
 age.set(70); // So render gets called (but only ONCE, not twice)

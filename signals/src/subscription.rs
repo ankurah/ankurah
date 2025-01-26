@@ -1,23 +1,43 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::traits::{Notify, NotifyValue};
 
-pub struct SubscriptionHandle {
+trait Unsubscriber<'a>: Send + Sync {
+    fn unsubscribe(&self);
+}
+
+struct SetUnsubscriber<T> {
+    set: Weak<SubscriberSetInner<T>>,
     id: SubscriptionId,
 }
 
-impl std::ops::Drop for SubscriptionHandle {
-    fn drop(&mut self) {
-        // unsubscribe
+impl<'a, T> Unsubscriber<'a> for SetUnsubscriber<T> {
+    fn unsubscribe(&self) {
+        if let Some(set) = self.set.upgrade() {
+            set.unsubscribe(self.id);
+        }
     }
+}
+
+pub struct SubscriptionHandle<'a> {
+    unsubscriber: Box<dyn Unsubscriber<'a> + 'a>,
+}
+
+impl<'a> Drop for SubscriptionHandle<'a> {
+    fn drop(&mut self) { self.unsubscriber.unsubscribe(); }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubscriptionId(usize);
 
-#[derive(Default)]
-pub struct SubscriberSet<T>(Arc<RwLock<BTreeMap<SubscriptionId, Subscriber<T>>>>);
+pub struct SubscriberSet<T>(Arc<SubscriberSetInner<T>>);
+
+pub struct SubscriberSetInner<T> {
+    active: Mutex<Vec<(SubscriptionId, Subscriber<T>)>>,
+    pending: Mutex<Vec<(SubscriptionId, Subscriber<T>)>>,
+    next_id: AtomicUsize,
+}
 
 impl<T> Clone for SubscriberSet<T> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
@@ -26,70 +46,62 @@ impl<T> Clone for SubscriberSet<T> {
 /// A value observer is an observer that wants to be notified of changes to a value with a borrow of the value
 pub enum Subscriber<T> {
     Callback(Box<dyn Fn(&T) + Send + Sync>),
-    Notify(Weak<dyn Notify>),
-    Value(Weak<dyn NotifyValue<T>>),
+    Notify(Box<dyn Notify>),
+    Value(Box<dyn NotifyValue<T>>),
 }
 
-impl<T> Into<Subscriber<T>> for Box<dyn Fn(&T) + Send + Sync> {
-    fn into(self) -> Subscriber<T> { Subscriber::Callback(self) }
+impl<T, F> From<F> for Subscriber<T>
+where F: Fn(&T) + Send + Sync + 'static
+{
+    fn from(f: F) -> Self { Subscriber::Callback(Box::new(f)) }
 }
 
 impl<T> Into<Subscriber<T>> for Box<dyn Notify> {
-    fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&Arc::from(self))) }
-}
-
-impl<T> Into<Subscriber<T>> for Arc<dyn Notify> {
-    fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&self)) }
-}
-
-impl<T> From<&Arc<dyn Notify>> for Subscriber<T> {
-    fn from(notify: &Arc<dyn Notify>) -> Self { Subscriber::Notify(Arc::downgrade(notify)) }
-}
-
-impl<T> PartialEq for Subscriber<T> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Subscriber::Callback(_), Subscriber::Callback(_)) => true,
-            (Subscriber::Notify(a), Subscriber::Notify(b)) => Weak::ptr_eq(a, b),
-            (Subscriber::Value(a), Subscriber::Value(b)) => Weak::ptr_eq(a, b),
-            _ => false,
-        }
-    }
+    fn into(self) -> Subscriber<T> { Subscriber::Notify(self) }
 }
 
 impl<T> SubscriberSet<T> {
-    pub fn new() -> Self { Self(Arc::new(RwLock::new(BTreeMap::new()))) }
-
-    pub fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionHandle {
-        let mut subscribers = self.0.write().unwrap();
-        let id = SubscriptionId(subscribers.len());
-        println!("DEBUG: Adding subscription with id {}", id.0);
-        subscribers.insert(id, subscriber.into());
-        SubscriptionHandle { id }
+    pub fn new() -> Self {
+        Self(Arc::new(SubscriberSetInner { active: Mutex::new(Vec::new()), pending: Mutex::new(Vec::new()), next_id: AtomicUsize::new(0) }))
     }
+}
 
-    pub fn notify(&self, value: &T) {
-        println!("DEBUG: Notifying subscribers");
-        let subscribers = self.0.read().unwrap();
-        for (id, subscriber) in subscribers.iter() {
-            println!("DEBUG: Notifying subscriber {}", id.0);
-            match subscriber {
-                Subscriber::Callback(callback) => callback(value),
-                Subscriber::Notify(notify) => {
-                    println!("DEBUG: Attempting to upgrade weak reference for subscriber {}", id.0);
-                    if let Some(notify) = notify.upgrade() {
-                        println!("DEBUG: Successfully upgraded weak reference for subscriber {}", id.0);
-                        notify.notify();
-                    } else {
-                        println!("DEBUG: Failed to upgrade weak reference for subscriber {}", id.0);
-                    }
-                }
-                Subscriber::Value(notify) => {
-                    if let Some(notify) = notify.upgrade() {
-                        notify.notify(value);
-                    }
-                }
+impl<T> std::ops::Deref for SubscriberSet<T> {
+    type Target = Arc<SubscriberSetInner<T>>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<T> SubscriberSetInner<T> {
+    pub fn subscribe<'a, S: Into<Subscriber<T>>>(self: &'a Arc<Self>, subscriber: S) -> SubscriptionHandle<'a> {
+        let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        match self.active.try_lock() {
+            Ok(mut active) => {
+                active.push((id, subscriber.into()));
+            }
+            Err(_) => {
+                self.pending.lock().unwrap().push((id, subscriber.into()));
             }
         }
+        SubscriptionHandle { unsubscriber: Box::new(SetUnsubscriber { set: Arc::downgrade(self), id }) }
+    }
+    pub fn unsubscribe(self: &Arc<Self>, id: SubscriptionId) {
+        let mut active = self.active.lock().unwrap();
+        active.retain(|(id, _)| id != id);
+    }
+
+    pub fn notify(self: &Arc<Self>, value: &T) {
+        let mut active = self.active.lock().unwrap();
+
+        // Notify all current subscribers
+        for (id, subscriber) in active.iter() {
+            match subscriber {
+                Subscriber::Callback(callback) => callback(value),
+                Subscriber::Notify(notify) => notify.notify(),
+                Subscriber::Value(notify) => notify.notify(value),
+            }
+        }
+
+        // Merge in any pending subscribers - no need for read check
+        active.extend(self.pending.lock().unwrap().drain(..));
     }
 }
