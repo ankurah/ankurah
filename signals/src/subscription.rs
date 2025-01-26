@@ -1,9 +1,16 @@
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock, Weak};
+
 pub trait Subscribe<T> {
     fn subscribe(&self, f: impl Fn(&T) + Send + Sync + 'static) -> SubscriptionHandle;
 }
 
 pub trait Notify: Send + Sync {
     fn notify(&self);
+}
+
+pub trait NotifyValue<T>: Send + Sync {
+    fn notify(&self, value: &T);
 }
 
 pub struct SubscriptionHandle {
@@ -17,15 +24,16 @@ impl std::ops::Drop for SubscriptionHandle {
 }
 
 pub struct SubscriptionId(usize);
-#[derive(Default)]
-pub struct SubscriberSet<T>(RwLock<BTreeMap<SubscriptionId, Subscriber<T>>>);
+#[derive(Default, Clone)]
+pub struct SubscriberSet<T>(Arc<RwLock<BTreeMap<SubscriptionId, Subscriber<T>>>>);
 
 /// A value observer is an observer that wants to be notified of changes to a value with a borrow of the value
 pub enum Subscriber<T> {
     Callback(Box<dyn Fn(&T)>),
     Notify(Weak<dyn Notify>),
+    Value(Weak<dyn NotifyValue<T>>),
     // So we can unsubscribe a nested subscriber set when the child is dropped
-    Nested(SubscriberSet<T>),
+    // Nested(SubscriberSet<T>),
 }
 
 impl<T> PartialEq for Subscriber<T> {

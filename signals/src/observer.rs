@@ -1,7 +1,4 @@
-use crate::Notify;
 use std::sync::{Arc, RwLock, Weak};
-
-pub struct ObserverSet(RwLock<Vec<Weak<ObserverInner>>>);
 
 pub struct Observer(Arc<ObserverInner>);
 struct ObserverInner {

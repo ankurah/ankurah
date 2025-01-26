@@ -1,6 +1,6 @@
 use ankurah_signals::*;
 mod common;
-use common::changeset_watcher;
+use common::change_watcher;
 use std::sync::Arc;
 
 // #[test]
@@ -25,40 +25,31 @@ use std::sync::Arc;
 
 #[test]
 fn test_observer() {
-    let name = Mut::new("Buffy".to_string());
-    let age = Mut::new(29);
-    let retired = age.map(|age| *age > 65);
+    let name: Mut<&str> = Mut::new("Buffy");
+    let age: Mut<u32> = Mut::new(29);
+    let retired: Map<u32, bool> = age.map(|age| *age > 65);
 
-    let (watcher, check) = changeset_watcher();
+    let (watcher, check) = change_watcher();
     let render = {
-        println!("Creating render closure");
         let name = name.read();
         let age = age.read();
+
         Arc::new(move || {
-            println!("Render called");
             let msg = format!("name: {name}, age: {age}, retired: {retired}");
-            println!("Formatted: {msg}");
+            println!("Render: {msg}");
             watcher(msg)
         })
     };
 
     let observer = Observer::new(render.clone());
-    println!("Setting observer");
     observer.set();
-    println!("Calling render");
-    render();
-    println!("Unsetting observer");
+    render(); // initial render 
     observer.unset();
 
-    println!("Checking first result");
-    let result = check();
-    println!("First result: {:?}", result);
-    assert_eq!(result, vec!["name: Buffy, age: 29, retired: false".to_string(),]);
+    assert_eq!(check(), ["name: Buffy, age: 29, retired: false"]); // got initial render
+    assert_eq!(check(), []); // no changes
 
-    println!("Setting age to 70");
     age.set(70);
-    println!("Checking second result");
-    let result = check();
-    println!("Second result: {:?}", result);
-    assert_eq!(result, vec!["name: Buffy, age: 70, retired: true".to_string(),]);
+
+    assert_eq!(check(), ["name: Buffy, age: 70, retired: true"]);
 }

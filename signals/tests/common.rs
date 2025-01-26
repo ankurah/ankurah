@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 #[allow(unused)]
-pub fn changeset_watcher<T: Send + Sync + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
+pub fn change_watcher<T: Send + Sync + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
     let changes = Arc::new(Mutex::new(Vec::new()));
     let watcher = {
         let changes = changes.clone();

@@ -70,4 +70,3 @@ pub use memo::*;
 pub use mutable::*;
 pub use observer::*;
 pub use read::*;
-pub use traits::*;

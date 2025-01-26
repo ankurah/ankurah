@@ -1,20 +1,16 @@
-use crate::{
-    Notify, Stateful,
-    observer::{ObserverSet, ValueObserverSet},
-};
+use crate::observer::ObserverSet;
+use crate::traits::Stateful;
 use std::marker::PhantomData;
 use std::sync::{Arc, Weak};
 
 /// A signal that is a map of another signal
-/// Stateless. Does not keep upstream signal alive
-pub struct MapSignal<I, O: 'static, F: Fn(&I) -> O> {
-    _upstream: PhantomData<I>,
+/// Stateless.
+pub struct Map<I, O: 'static, F: Fn(&I) -> O> {
     map_function: Arc<F>,
     observers: ObserverSet,
-    value_observers: ValueObserverSet<O>,
 }
 
-impl<I, O: 'static, F> MapSignal<I, O, F>
+impl<I, O: 'static, F> Map<I, O, F>
 where F: Fn(&I) -> O + Send + Sync + 'static
 {
     pub(crate) fn new<S>(upstream: &S, f: F) -> Self
@@ -51,13 +47,13 @@ where F: Fn(&I) -> O + Send + Sync + 'static
     }
 }
 
-impl<I, O: Clone + 'static, F> Stateful<O> for MapSignal<I, O, F>
+impl<I, O: Clone + 'static, F> Stateful<O> for Map<I, O, F>
 where F: Fn(&I) -> O + Send + Sync + 'static
 {
     fn value(&self) -> O { self.with_value(|v| v.clone()) }
 }
 
-impl<I, O: std::fmt::Display + 'static, F> std::fmt::Display for MapSignal<I, O, F>
+impl<I, O: std::fmt::Display + 'static, F> std::fmt::Display for Map<I, O, F>
 where F: Fn(&I) -> O + Send + Sync + 'static
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.with_value(|v| write!(f, "{}", v)) }
