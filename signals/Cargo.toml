@@ -3,4 +3,9 @@ name    = "ankurah-signals"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+wasm = ["wasm-bindgen"]
+react = ["wasm"]
+
 [dependencies]
+wasm-bindgen = { version = "0.2", optional = true }

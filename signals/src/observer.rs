@@ -13,7 +13,10 @@ pub struct RendererInner {
 
 /// An Observer automatically subscribes to all signals whose values are gotten while it is the current context
 /// It calls the callback without contextualizing itself
+
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Observer(Arc<ObserverInner>);
+
 pub struct ObserverInner {
     callback: Box<dyn Fn() + Send + Sync>,
     subscription_handles: RwLock<Vec<SubscriptionHandle<'static>>>,
@@ -47,6 +50,16 @@ impl Observer {
     pub fn new<F: Fn() + Send + Sync + 'static>(callback: Arc<F>) -> Self {
         Self(Arc::new(ObserverInner { callback: Box::new(move || callback()), subscription_handles: RwLock::new(vec![]) }))
     }
+}
+
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+impl Observer {
+    #[wasm_bindgen(constructor)]
+    pub fn new_js(callback: &js_sys::Function) -> Self {
+        Self(Arc::new(ObserverInner { callback: Box::new(move || callback()), subscription_handles: RwLock::new(vec![]) }))
+    }
+    pub fn start(&self) { CurrentContext::set(self.clone()); }
+    pub fn finish(&self) { CurrentContext::unset(); }
 }
 
 impl std::ops::Deref for Observer {

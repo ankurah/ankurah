@@ -1,8 +1,9 @@
 use std::{
     cell::RefCell,
-    sync::{atomic::AtomicU64, Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicU64},
 };
 
+use crate::Observer;
 use futures::StreamExt;
 use or_poisoned::OrPoisoned;
 use reactive_graph::graph::{AnySource, AnySubscriber, ReactiveNode, Subscriber};
@@ -20,18 +21,6 @@ extern "C" {
     ) -> JsValue;
 }
 
-// Substantially an homage to https://github.com/preactjs/signals/blob/main/packages/react/runtime/src/auto.ts
-// TODO need to get fancier with this, probably by hooking into the react internals, similar technique to preact-signals
-// For now it works, but the render cycle start/finish is thrashy:
-// INFO react-signals/src/react_binding.rs:65 effectstore new
-// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:95 effectstore finish
-// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:95 effectstore finish
-// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:91 effectstore start
-// example_wasm_bindings_bg.wasm:0x78592 INFO react-signals/src/react_binding.rs:95 effectstore finish
-
 /// Creates a subscription to track signal usage within a React component.
 ///
 /// This hook enables automatic re-rendering of React components when signals they access are updated.
@@ -45,10 +34,12 @@ extern "C" {
 ///
 /// function MyComponent() {
 ///     // withSignals is a temporary hack. Signal management will change soon
-///     withSignals(() => {
+///     let s = useSignals();
+///     try {
 ///         // Your component logic here
 ///         return <div>{my_signal.value}</div>;
-///     });
+///     } finally {
+///         s.finish();
 ///     }
 /// }
 /// ```
@@ -56,13 +47,13 @@ extern "C" {
 /// # Note
 /// This implementation follows the pattern used by Preact Signals, adapted for
 /// WebAssembly-based signal integration with React
-#[wasm_bindgen(js_name = withSignals)]
-pub fn with_signals(f: &js_sys::Function) -> JsValue {
+#[wasm_bindgen(js_name = useSignals)]
+pub fn use_signals(f: &js_sys::Function) -> JsValue {
     let ref_value = useRef();
 
     let mut store = js_sys::Reflect::get(&ref_value, &"current".into()).unwrap();
     if store.is_undefined() {
-        let new_store = EffectStore::new();
+        let new_store = Observer::new(f);
         useSyncExternalStore(&new_store.0.subscribe_fn, &new_store.0.get_snapshot, &new_store.0.get_snapshot);
         // TODO: Check to see if this sets up the finalizer in JS land
         store = JsValue::from(new_store.clone());
@@ -125,8 +116,7 @@ impl EffectStore {
                     return JsValue::UNDEFINED;
                 };
 
-                any_spawner::Executor::spawn_local({
-                    //     // let value = Arc::clone(&value);
+                wasm_bindgen_futures::spawn_local({
                     let subscriber = tracker.to_any_subscriber();
 
                     async move {

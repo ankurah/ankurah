@@ -60,8 +60,14 @@ mod signal;
 mod subscription;
 mod traits;
 
+#[cfg(feature = "wasm")]
+mod react;
+
 pub use core::*;
 pub use observer::*;
 pub use signal::*;
 pub use subscription::*;
 pub use traits::*;
+
+#[cfg(feature = "wasm")]
+pub use react::*;

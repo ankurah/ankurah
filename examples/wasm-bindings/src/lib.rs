@@ -11,7 +11,6 @@ use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 pub async fn start() -> Result<(), JsValue> {
     tracing_wasm::set_as_global_default();
     panic::set_hook(Box::new(console_error_panic_hook::hook));
-    let _ = any_spawner::Executor::init_wasm_bindgen();
     Ok(())
 }
 

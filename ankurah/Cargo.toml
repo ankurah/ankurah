@@ -8,14 +8,13 @@ repository  = "https://github.com/ankurah/ankurah"
 readme      = "../README.md"
 
 [features]
-react = ["dep:ankurah-react-signals", "wasm"]
+react = ["dep:ankurah-signals/react", "wasm"]
 wasm = [
     "derive",
     "ankurah-derive?/wasm",
     "dep:wasm-bindgen",
     "dep:js-sys",
-    "dep:ankurah-react-signals",
-    "dep:reactive_graph",
+    "dep:ankurah-signals/wasm",
 ]
 derive = ["dep:ankurah-derive"]
 
@@ -28,8 +27,7 @@ ankql          = { path = "../ankql", version = "^0.1.1" }
 # Dependencies needed for derive macros
 wasm-bindgen          = { version = "0.2", optional = true }
 js-sys                = { version = "0.3", optional = true }
-ankurah-react-signals = { path = "../react-signals", optional = true, version = "^0.1.1" }
-reactive_graph        = { version = "0.1.4", features = ["effects"], optional = true }
+ankurah-signals = { path = "../react-signals", optional = true, version = "^0.1.0" }
 
 [dev-dependencies]
 ankurah-storage-sled            = { path = "../storage/sled" }
