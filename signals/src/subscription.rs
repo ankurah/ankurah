@@ -13,26 +13,37 @@ impl std::ops::Drop for SubscriptionHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubscriptionId(usize);
-#[derive(Default, Clone)]
+
+#[derive(Default)]
 pub struct SubscriberSet<T>(Arc<RwLock<BTreeMap<SubscriptionId, Subscriber<T>>>>);
+
+impl<T> Clone for SubscriberSet<T> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
 
 /// A value observer is an observer that wants to be notified of changes to a value with a borrow of the value
 pub enum Subscriber<T> {
-    Callback(Box<dyn Fn(&T)>),
+    Callback(Box<dyn Fn(&T) + Send + Sync>),
     Notify(Weak<dyn Notify>),
     Value(Weak<dyn NotifyValue<T>>),
-    // So we can unsubscribe a nested subscriber set when the child is dropped
-    // Nested(SubscriberSet<T>),
 }
 
-impl<T> Into<Subscriber<T>> for Box<dyn Fn(&T)> {
+impl<T> Into<Subscriber<T>> for Box<dyn Fn(&T) + Send + Sync> {
     fn into(self) -> Subscriber<T> { Subscriber::Callback(self) }
 }
 
-// any type that implements Notify can be used as a subscriber
 impl<T> Into<Subscriber<T>> for Box<dyn Notify> {
+    fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&Arc::from(self))) }
+}
+
+impl<T> Into<Subscriber<T>> for Arc<dyn Notify> {
     fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&self)) }
+}
+
+impl<T> From<&Arc<dyn Notify>> for Subscriber<T> {
+    fn from(notify: &Arc<dyn Notify>) -> Self { Subscriber::Notify(Arc::downgrade(notify)) }
 }
 
 impl<T> PartialEq for Subscriber<T> {
@@ -40,35 +51,37 @@ impl<T> PartialEq for Subscriber<T> {
         match (self, other) {
             (Subscriber::Callback(_), Subscriber::Callback(_)) => true,
             (Subscriber::Notify(a), Subscriber::Notify(b)) => Weak::ptr_eq(a, b),
+            (Subscriber::Value(a), Subscriber::Value(b)) => Weak::ptr_eq(a, b),
             _ => false,
         }
     }
 }
 
 impl<T> SubscriberSet<T> {
-    pub(crate) fn new() -> Self { Self(Arc::new(RwLock::new(Vec::new()))) }
-    pub fn subscribe(&self, subscriber: Subscriber<T>) {
+    pub(crate) fn new() -> Self { Self(Arc::new(RwLock::new(BTreeMap::new()))) }
+
+    pub fn subscribe(&self, subscriber: impl Into<Subscriber<T>>) -> SubscriptionHandle {
         let mut subscribers = self.0.write().unwrap();
-        if !subscribers.contains(&subscriber) {
-            subscribers.push(subscriber);
-        }
+        let id = SubscriptionId(subscribers.len());
+        subscribers.insert(id, subscriber.into());
+        SubscriptionHandle { id }
     }
-    // pub fn unsubscribe(&self, subscriber: &Subscriber<T>) {
-    // not sure how we want to handle unsusubscribing a closure. Maybe take a subscriber handle instead of a Subscriber<T> ?
-    //     let mut subscribers = self.0.write().unwrap();
-    //     subscribers.remove(subscriber);
-    // }
+
     pub(crate) fn notify(&self, value: &T) {
-        let observers = self.0.read().unwrap();
-        for observer in observers.iter() {
-            match observer {
+        let subscribers = self.0.read().unwrap();
+        for (_, subscriber) in subscribers.iter() {
+            match subscriber {
                 Subscriber::Callback(f) => f(value),
                 Subscriber::Notify(w) => {
                     if let Some(n) = w.upgrade() {
                         n.notify();
                     }
                 }
-                Subscriber::Nested(nested) => nested.notify(value),
+                Subscriber::Value(w) => {
+                    if let Some(n) = w.upgrade() {
+                        n.notify(value);
+                    }
+                }
             }
         }
     }

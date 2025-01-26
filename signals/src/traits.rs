@@ -33,3 +33,11 @@ pub trait Notify: Send + Sync {
 pub trait NotifyValue<T>: Send + Sync {
     fn notify(&self, value: &T);
 }
+
+pub trait CloneableNotify: Notify {
+    fn clone_box(&self) -> Box<dyn CloneableNotify>;
+}
+
+impl<T: Notify + Clone + 'static> CloneableNotify for T {
+    fn clone_box(&self) -> Box<dyn CloneableNotify> { Box::new(self.clone()) }
+}

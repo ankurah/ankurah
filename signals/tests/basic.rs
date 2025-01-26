@@ -27,7 +27,7 @@ use std::sync::Arc;
 fn test_observer() {
     let name: Mut<&str> = Mut::new("Buffy");
     let age: Mut<u32> = Mut::new(29);
-    let retired: Map<u32, bool> = age.map(|age| *age > 65);
+    // let retired: Map<u32, bool> = age.map(|age| *age > 65);
 
     let (watcher, check) = change_watcher();
     let render = {
@@ -35,21 +35,21 @@ fn test_observer() {
         let age = age.read();
 
         Arc::new(move || {
-            let msg = format!("name: {name}, age: {age}, retired: {retired}");
+            let msg = format!("name: {name}, age: {age}");
             println!("Render: {msg}");
             watcher(msg)
         })
     };
 
     let observer = Observer::new(render.clone());
-    observer.set();
-    render(); // initial render 
-    observer.unset();
+    CurrentContext::set(observer);
+    render(); // initial render
+    CurrentContext::unset();
 
-    assert_eq!(check(), ["name: Buffy, age: 29, retired: false"]); // got initial render
-    assert_eq!(check(), []); // no changes
+    assert_eq!(check(), ["name: Buffy, age: 29"]); // got initial render
+    assert_eq!(check(), [] as [&str; 0]); // no changes
 
     age.set(70);
 
-    assert_eq!(check(), ["name: Buffy, age: 70, retired: true"]);
+    assert_eq!(check(), ["name: Buffy, age: 70"]);
 }

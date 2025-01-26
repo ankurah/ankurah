@@ -1,6 +1,6 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
-use crate::traits::Notify;
+use crate::{subscription::Subscriber, traits::Notify};
 
 pub struct Observer(Arc<Inner>);
 struct Inner {
@@ -22,4 +22,14 @@ impl Observer {
 
 impl Notify for Observer {
     fn notify(&self) { (self.0.callback)(); }
+}
+impl Notify for Inner {
+    fn notify(&self) { (self.callback)(); }
+}
+
+impl<T> Into<Subscriber<T>> for Observer {
+    fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&self.0) as Weak<dyn Notify>) }
+}
+impl<T> Into<Subscriber<T>> for &Observer {
+    fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&self.0) as Weak<dyn Notify>) }
 }
