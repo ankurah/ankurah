@@ -13,7 +13,10 @@ pub struct Read<T> {
 }
 
 impl<T> Read<T> {
-    fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R { self.value.with(f) }
+    fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        CurrentContext::track(self);
+        self.value.with(f)
+    }
 }
 
 impl<T> Clone for Read<T> {
@@ -32,5 +35,5 @@ impl<T> Signal<T> for Read<T> {
 }
 
 impl<T: std::fmt::Display> std::fmt::Display for Read<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.value.with(|v| write!(f, "{}", v)) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.with(|v| write!(f, "{}", v)) }
 }

@@ -21,10 +21,16 @@ impl Observer {
 }
 
 impl Notify for Observer {
-    fn notify(&self) { (self.0.callback)(); }
+    fn notify(&self) {
+        println!("DEBUG: Observer notified");
+        (self.0.callback)();
+    }
 }
 impl Notify for Inner {
-    fn notify(&self) { (self.callback)(); }
+    fn notify(&self) {
+        println!("DEBUG: Inner observer notified");
+        (self.callback)();
+    }
 }
 
 impl<T> Into<Subscriber<T>> for Observer {
@@ -32,4 +38,8 @@ impl<T> Into<Subscriber<T>> for Observer {
 }
 impl<T> Into<Subscriber<T>> for &Observer {
     fn into(self) -> Subscriber<T> { Subscriber::Notify(Arc::downgrade(&self.0) as Weak<dyn Notify>) }
+}
+
+impl Clone for Observer {
+    fn clone(&self) -> Self { Self(Arc::clone(&self.0)) }
 }

@@ -58,28 +58,35 @@ impl<T> PartialEq for Subscriber<T> {
 }
 
 impl<T> SubscriberSet<T> {
-    pub(crate) fn new() -> Self { Self(Arc::new(RwLock::new(BTreeMap::new()))) }
+    pub fn new() -> Self { Self(Arc::new(RwLock::new(BTreeMap::new()))) }
 
-    pub fn subscribe(&self, subscriber: impl Into<Subscriber<T>>) -> SubscriptionHandle {
+    pub fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionHandle {
         let mut subscribers = self.0.write().unwrap();
         let id = SubscriptionId(subscribers.len());
+        println!("DEBUG: Adding subscription with id {}", id.0);
         subscribers.insert(id, subscriber.into());
         SubscriptionHandle { id }
     }
 
-    pub(crate) fn notify(&self, value: &T) {
+    pub fn notify(&self, value: &T) {
+        println!("DEBUG: Notifying subscribers");
         let subscribers = self.0.read().unwrap();
-        for (_, subscriber) in subscribers.iter() {
+        for (id, subscriber) in subscribers.iter() {
+            println!("DEBUG: Notifying subscriber {}", id.0);
             match subscriber {
-                Subscriber::Callback(f) => f(value),
-                Subscriber::Notify(w) => {
-                    if let Some(n) = w.upgrade() {
-                        n.notify();
+                Subscriber::Callback(callback) => callback(value),
+                Subscriber::Notify(notify) => {
+                    println!("DEBUG: Attempting to upgrade weak reference for subscriber {}", id.0);
+                    if let Some(notify) = notify.upgrade() {
+                        println!("DEBUG: Successfully upgraded weak reference for subscriber {}", id.0);
+                        notify.notify();
+                    } else {
+                        println!("DEBUG: Failed to upgrade weak reference for subscriber {}", id.0);
                     }
                 }
-                Subscriber::Value(w) => {
-                    if let Some(n) = w.upgrade() {
-                        n.notify(value);
+                Subscriber::Value(notify) => {
+                    if let Some(notify) = notify.upgrade() {
+                        notify.notify(value);
                     }
                 }
             }

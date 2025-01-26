@@ -9,7 +9,13 @@ pub struct Mut<T> {
 impl<T> Mut<T> {
     pub fn new(value: T) -> Self { Self { value: Value::new(value), subscribers: SubscriberSet::new() } }
 
-    pub fn set(&self, value: T) { self.value.set_with(value, |value| self.subscribers.notify(value)) }
+    pub fn set(&self, value: T) {
+        println!("DEBUG: Setting new value");
+        self.value.set_with(value, |value| {
+            println!("DEBUG: Notifying subscribers of new value");
+            self.subscribers.notify(value)
+        })
+    }
 
     /// Calls a closure with a borrow of the current value
     /// not tracked by the current context

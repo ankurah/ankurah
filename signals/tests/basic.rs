@@ -35,14 +35,14 @@ fn test_observer() {
         let age = age.read();
 
         Arc::new(move || {
-            let msg = format!("name: {name}, age: {age}");
+            let msg = format!("name: {}, age: {}", name.get(), age.get());
             println!("Render: {msg}");
             watcher(msg)
         })
     };
 
     let observer = Observer::new(render.clone());
-    CurrentContext::set(observer);
+    CurrentContext::set(&observer);
     render(); // initial render
     CurrentContext::unset();
 

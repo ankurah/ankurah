@@ -51,7 +51,7 @@ impl CurrentContext {
     }
 
     /// Sets an observer as the current context
-    pub fn set(current: Observer) { *CURRENT_CONTEXT.write().unwrap() = Some(current); }
+    pub fn set(current: &Observer) { *CURRENT_CONTEXT.write().unwrap() = Some(current.clone()); }
 
     /// Resets the current context to no observer
     pub fn unset() { *CURRENT_CONTEXT.write().unwrap() = None; }
