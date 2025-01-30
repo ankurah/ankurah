@@ -266,7 +266,11 @@ impl Node {
         let collection = StorageCollectionWrapper::new(self.storage_engine.collection(id).await.unwrap());
 
         let mut collections = self.collections.write().await;
-        assert!(collections.insert(id.clone(), collection.clone()).is_none());
+
+        // We might have raced with another node to create this collection
+        if let Entry::Vacant(entry) = collections.entry(id.clone()) {
+            entry.insert(collection.clone());
+        }
         drop(collections);
 
         collection
