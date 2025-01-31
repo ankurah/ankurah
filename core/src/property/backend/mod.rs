@@ -2,6 +2,7 @@ use ankurah_proto::{Clock, Operation, State};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
+use std::sync::MutexGuard;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -13,6 +14,7 @@ pub mod lww;
 pub mod pn_counter;
 pub mod yrs;
 use crate::error::RetrievalError;
+use crate::Node;
 pub use lww::LWWBackend;
 pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -51,7 +53,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Retrieve operations applied to this backend since the last time we called this method.
     fn to_operations(&self) -> anyhow::Result<Vec<Operation>>;
-    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_precursors: &Clock) -> anyhow::Result<()>;
+    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_precursors: &Clock, node: &Node) -> anyhow::Result<()>;
 }
 
 pub enum BackendDowncasted {
@@ -108,6 +110,12 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
             None => LWWBackend::new(),
         };
         Ok(Arc::new(backend))
+    } else if name == "pn" {
+        let backend = match buffer {
+            Some(buffer) => PNBackend::from_state_buffer(buffer)?,
+            None => PNBackend::new(),
+        };
+        Ok(Arc::new(backend))
     } else {
         panic!("unknown backend: {:?}", name);
     }
@@ -119,6 +127,10 @@ impl Default for Backends {
 
 impl Backends {
     pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())), head: Arc::new(Mutex::new(Clock::default())) } }
+
+    fn backends_lock(&self) -> MutexGuard<BTreeMap<String, Arc<dyn PropertyBackend>>> {
+        self.backends.lock().expect("other thread panicked, panic here too")
+    }
 
     pub fn get<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
         let backend_name = P::property_backend_name();
@@ -133,7 +145,7 @@ impl Backends {
     }
 
     pub fn get_raw(&self, backend_name: String) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
-        let mut backends = self.backends.lock().unwrap();
+        let mut backends = self.backends_lock();
         if let Some(backend) = backends.get(&backend_name) {
             Ok(backend.clone())
         } else {
@@ -144,13 +156,13 @@ impl Backends {
     }
 
     pub fn downcasted(&self) -> Vec<BackendDowncasted> {
-        let backends = self.backends.lock().unwrap();
+        let backends = self.backends_lock();
         backends.iter().map(|(name, backend)| backend.clone().downcasted(name)).collect()
     }
 
     /// Fork the data behind the backends.
     pub fn fork(&self) -> Backends {
-        let backends = self.backends.lock().unwrap();
+        let backends = self.backends_lock();
         let mut forked = BTreeMap::new();
         for (name, backend) in &*backends {
             forked.insert(name.clone(), backend.fork().into());
@@ -160,12 +172,12 @@ impl Backends {
     }
 
     fn insert(&self, backend_name: String, backend: Arc<dyn PropertyBackend>) {
-        let mut backends = self.backends.lock().expect("Backends lock failed");
+        let mut backends = self.backends_lock();
         backends.insert(backend_name, backend);
     }
 
     pub fn to_state_buffers(&self) -> Result<State> {
-        let backends = self.backends.lock().expect("Backends lock failed");
+        let backends = self.backends_lock();
         let mut state_buffers = BTreeMap::default();
         for (name, backend) in &*backends {
             let state_buffer = backend.to_state_buffer()?;
@@ -185,7 +197,7 @@ impl Backends {
     }
 
     pub fn to_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>> {
-        let backends = self.backends.lock().unwrap();
+        let backends = self.backends_lock();
         let mut operations = BTreeMap::<String, Vec<Operation>>::new();
         for (name, backend) in &*backends {
             operations.insert(name.clone(), backend.to_operations()?);
@@ -200,15 +212,16 @@ impl Backends {
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_precursors: &Clock,
+        node: &Node,
     ) -> Result<()> {
         let backend = self.get_raw(backend_name)?;
-        backend.apply_operations(operations, current_head, event_precursors)?;
+        backend.apply_operations(operations, current_head, event_precursors, node)?;
         Ok(())
     }
 
     /// HACK - this should be based on a play forward of events
     pub fn apply_state(&self, state: &State) -> Result<(), RetrievalError> {
-        let mut backends = self.backends.lock().unwrap();
+        let mut backends = self.backends_lock();
         for (name, state_buffer) in &state.state_buffers {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);

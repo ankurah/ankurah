@@ -96,11 +96,11 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             // THINK ABOUT: to_model is the only thing that forces a clone requirement
             // Even though most Models will be clonable, maybe we shouldn't force it?
             // Also: nothing seems to be using this. Maybe it could be opt in
-            fn to_model(&self) -> Self::Model {
-                #name {
-                    #( #active_field_names: self.#active_field_names(), )*
+            fn to_model(&self) -> Result<Self::Model, ankurah::property::PropertyError> {
+                Ok(#name {
+                    #( #active_field_names: self.#active_field_names()?, )*
                     #( #ephemeral_field_names: self.#ephemeral_field_names.clone(), )*
-                }
+                })
             }
 
             fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
@@ -134,9 +134,10 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 self.entity.id.clone()
             }
             #(
-                #active_field_visibility fn #active_field_names(&self) -> #projected_field_types {
-                    use ankurah::property::{ProjectedValue, FromEntity};
-                    #active_field_types::from_entity(#active_field_name_strs.into(), self.entity.as_ref()).projected()
+                #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
+                    use ankurah::property::{FromActiveType, FromEntity};
+                    let active_result = #active_field_types::from_entity(#active_field_name_strs.into(), self.entity.as_ref());
+                    #projected_field_types::from_active(active_result)
                 }
             )*
             // #(
@@ -202,29 +203,16 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 }
 
 static ACTIVE_TYPE_MOD_PREFIX: &str = "::ankurah::property::value";
-fn get_active_type(field: &syn::Field) -> Result<syn::Path, syn::Error> {
+fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
     let active_type_ident = format_ident!("active_type");
 
     // First check if there's an explicit attribute
     if let Some(active_type) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_type_ident)) {
-        let value_str = if let Ok(value) = active_type.parse_args::<syn::Ident>() {
-            value.to_string()
-        } else {
-            let value = active_type
-                .parse_args::<syn::Path>()
-                .map_err(|_| syn::Error::new_spanned(active_type, "Expected an identifier or path for active_type"))?;
-            quote!(#value).to_string()
-        };
-
-        if !value_str.contains("::") {
-            let path = format!("{}::{}", ACTIVE_TYPE_MOD_PREFIX, value_str);
-            return syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(active_type, "Failed to parse active_type path"));
-        }
-        return syn::parse_str(&value_str).map_err(|_| syn::Error::new_spanned(active_type, "Failed to parse active_type path"));
+        return active_type.parse_args::<syn::Type>();
     }
 
     // Check for exact type matches and provide default Active types
-    let type_str = if let Type::Path(type_path) = &field.ty {
+    if let Type::Path(type_path) = &field.ty {
         let path_str = quote!(#type_path).to_string().replace(" ", "");
         match path_str.as_str() {
             "String" | "std::string::String" => {
@@ -232,14 +220,13 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Path, syn::Error> {
                 return syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"));
             }
             // Add more default mappings here as needed
-            _ => path_str,
+            _ => {},
         }
-    } else {
-        format!("{:?}", &field.ty)
     };
 
     // If we get here, we don't have a supported default Active type
     let field_name = field.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "unnamed".to_string());
+    let type_str = format!("{:?}", &field.ty);
 
     Err(syn::Error::new_spanned(
         &field.ty,

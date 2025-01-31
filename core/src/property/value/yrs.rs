@@ -4,8 +4,7 @@ use crate::{
     model::Entity,
     property::{
         backend::YrsBackend,
-        traits::{FromEntity, InitializeWith},
-        value::ProjectedValue,
+        traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},
         PropertyName,
     },
 };
@@ -17,11 +16,6 @@ pub struct YrsString {
     // but its got a lifetime of 'doc and that requires some refactoring
     pub property_name: PropertyName,
     pub backend: Weak<YrsBackend>,
-}
-
-impl ProjectedValue for YrsString {
-    type Projected = String;
-    fn projected(&self) -> Self::Projected { self.value().unwrap_or_default() }
 }
 
 // Starting with basic string type operations
@@ -43,10 +37,24 @@ impl YrsString {
 
 impl FromEntity for YrsString {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
-        let backend = entity.backends().get::<YrsBackend>().unwrap();
+        let backend = entity.backends().get::<YrsBackend>().expect("YrsBackend should exist");
         Self::new(property_name, backend)
     }
 }
+
+impl<S> FromActiveType<YrsString> for S
+where 
+    S: From<String>,
+{
+    fn from_active(active: YrsString) -> Result<Self, PropertyError>
+    where Self: Sized {
+        match active.value() {
+            Some(value) => Ok(S::from(value)),
+            None => Err(PropertyError::Missing),
+        }
+    }
+}
+
 
 impl InitializeWith<String> for YrsString {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &String) -> Self {
