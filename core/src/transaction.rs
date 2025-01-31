@@ -98,7 +98,7 @@ impl Transaction {
         for entity in self.entities.iter() {
             if let Some(entity_event) = entity.commit()? {
                 if let Some(upstream) = &entity.upstream {
-                    upstream.apply_event(&entity_event)?;
+                    upstream.apply_event(&self.node, &entity_event)?;
                 } else {
                     self.node.insert_entity(entity.clone()).await?;
                 }

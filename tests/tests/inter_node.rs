@@ -9,7 +9,7 @@ use tracing::info;
 
 use common::{Album, AlbumView, Pet, PetView};
 
-pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.iter().map(|r| r.name()).collect::<Vec<String>>() }
+pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.iter().map(|r| r.name().unwrap()).collect::<Vec<String>>() }
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
