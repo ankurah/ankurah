@@ -1,4 +1,3 @@
-
 #![cfg(feature = "postgres")]
 mod common;
 use anyhow::Result;
