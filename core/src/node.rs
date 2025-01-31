@@ -309,7 +309,9 @@ impl Node {
 
             let state = entity.to_state()?;
             // Push the state buffers to storage.
-            let changed = self.collection(&event.collection).await.set_state(event.entity_id, &state).await?;
+            let collection = self.collection(&event.collection).await;
+            collection.add_event(&event).await?;
+            let changed = collection.set_state(event.entity_id, &state).await?;
 
             if changed {
                 changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });

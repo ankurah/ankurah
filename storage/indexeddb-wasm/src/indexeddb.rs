@@ -332,8 +332,8 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn add_event(&self, entity_event: &ankurah_proto::Event) -> anyhow::Result<bool> { todo!() }
-    async fn get_events(&self, id: ankurah_proto::ID) -> Result<Vec<ankurah_proto::Event>, ankurah_core::error::RetrievalError> { todo!() }
+    async fn add_event(&self, entity_event: &ankurah_proto::Event) -> anyhow::Result<bool> { Ok(false) }
+    async fn get_events(&self, id: ankurah_proto::ID) -> Result<Vec<ankurah_proto::Event>, ankurah_core::error::RetrievalError> { Ok(vec![]) }
 }
 
 // #[cfg(target_arch = "wasm32")]
