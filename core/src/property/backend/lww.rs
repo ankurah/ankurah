@@ -5,12 +5,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{Clock, Operation};
+use ankurah_proto::{Clock, ClockOrdering, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    property::{backend::PropertyBackend, PropertyName},
-    storage::Materialized,
+    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName},
+    storage::Materialized, Node,
 };
 
 #[derive(Clone, Debug)]
@@ -94,21 +94,19 @@ impl PropertyBackend for LWWBackend {
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> anyhow::Result<()> {
+    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_head: &Clock, node: &Node) -> anyhow::Result<()> {
         let mut values = self.values.write().unwrap();
 
         // TODO: Figure out this comparison
         // This'll probably require looking at the events table.
-        /*
-        if current_head < event_head {
+        if compare_clocks(&current_head, &event_head, &node) == ClockOrdering::Child {
             for operation in operations {
-                let map: BTreeMap<PropertyName, Vec<u8>> = bincode::deserialize(operation.diff())?;
-                for (property_name, diff) in &map {
+                let map: BTreeMap<PropertyName, Vec<u8>> = bincode::deserialize(&operation.diff)?;
+                for (property_name, diff) in map {
                     values.insert(property_name, diff);
                 }
             }
         }
-        */
 
         Ok(())
     }

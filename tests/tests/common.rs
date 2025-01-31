@@ -1,9 +1,7 @@
 use tracing::Level;
 
 use ankurah::{
-    changes::{ChangeKind, ChangeSet},
-    model::View,
-    proto, Model,
+    changes::{ChangeKind, ChangeSet}, model::View, property::{value::{PNCounter, LWW}, YrsString}, proto, Model
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{mpsc, Arc, Mutex};

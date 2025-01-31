@@ -110,6 +110,7 @@ dependencies = [
  "tracing",
  "ulid",
  "uuid",
+ "wasm-bindgen",
  "yrs",
 ]
 

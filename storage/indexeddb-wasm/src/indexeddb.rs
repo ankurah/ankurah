@@ -625,8 +625,8 @@ mod tests {
 
         // Retrieve the entity
         let album_ro: AlbumView = node.get_entity(id).await?;
-        assert_eq!(album_ro.name(), "The rest of the owl");
-        assert_eq!(album_ro.year(), "2024");
+        assert_eq!(album_ro.name().unwrap(), "The rest of the owl");
+        assert_eq!(album_ro.year().unwrap(), "2024");
 
         // Drop the node to close the connection
         drop(node);
@@ -662,7 +662,7 @@ mod tests {
         let albums: ankurah_core::resultset::ResultSet<AlbumView> = node.fetch("name = 'Walking on a Dream'").await?;
 
         assert_eq!(
-            albums.items.iter().map(|active_entity| active_entity.name()).collect::<Vec<String>>(),
+            albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
             vec!["Walking on a Dream".to_string()]
         );
 

@@ -4,16 +4,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::Entity,
-    property::{backend::LWWBackend, traits::FromEntity, InitializeWith, PropertyName},
+    property::{backend::LWWBackend, traits::{FromActiveType, FromEntity, PropertyError}, InitializeWith, PropertyName},
 };
-
-use super::ProjectedValue;
 
 pub struct LWW<T> {
     pub property_name: PropertyName,
     pub backend: Arc<LWWBackend>,
 
     phantom: PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for LWW<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LWW")
+            .field("property_name", &self.property_name)
+            .finish()
+    }
 }
 
 impl<T> LWW<T>
@@ -24,19 +30,32 @@ where T: Serialize + for<'a> Deserialize<'a>
         self.backend.set(self.property_name.clone(), value);
         Ok(())
     }
-}
 
-impl<T> ProjectedValue for LWW<T> {
-    type Projected = T;
-    fn projected(&self) -> Self::Projected {
-        //self.value()
-        todo!()
+    pub fn get(&self) -> Result<T, PropertyError> {
+        match self.backend.get(self.property_name.clone()) {
+            Some(bytes) => {
+                bincode::deserialize::<T>(&bytes)
+                    .map_err(|err| PropertyError::DeserializeError(err))
+            }
+            None => Err(PropertyError::Missing)
+        }
     }
 }
 
 impl<T> FromEntity for LWW<T> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
-        Self { property_name: property_name, backend: entity.backends().get::<LWWBackend>().unwrap(), phantom: PhantomData }
+        let backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
+        Self { property_name: property_name, backend: backend, phantom: PhantomData }
+    }
+}
+
+impl<T> FromActiveType<LWW<T>> for T
+where 
+    T: serde::Serialize + for<'de> serde::Deserialize<'de>
+{
+    fn from_active(active: LWW<T>) -> Result<Self, PropertyError>
+    where Self: Sized {
+        active.get()
     }
 }
 

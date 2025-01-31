@@ -7,8 +7,7 @@ use crate::{
     model::Entity,
     property::{
         backend::PNBackend,
-        traits::{FromEntity, InitializeWith},
-        value::ProjectedValue,
+        traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},
         PropertyName,
     },
 };
@@ -42,11 +41,6 @@ pub struct PNCounter<I> {
     phantom: PhantomData<I>,
 }
 
-impl<I: Integer> ProjectedValue for PNCounter<I> {
-    type Projected = I;
-    fn projected(&self) -> Self::Projected { self.value() }
-}
-
 // Starting with basic string type operations
 impl<I> PNCounter<I> {
     pub fn new(property_name: PropertyName, backend: Arc<PNBackend>) -> Self {
@@ -62,10 +56,21 @@ impl<I: Integer> PNCounter<I> {
 
 impl<I> FromEntity for PNCounter<I> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
-        let backend = entity.backends().get::<PNBackend>().unwrap();
+        let backend = entity.backends().get::<PNBackend>().expect("PNBackend should exist");
         Self::new(property_name, backend)
     }
 }
+
+impl<I> FromActiveType<PNCounter<I>> for I
+where 
+    I: Integer,
+{
+    fn from_active(active: PNCounter<I>) -> Result<Self, PropertyError>
+    where Self: Sized {
+        Ok(active.value())
+    }
+}
+
 
 impl<I: Integer> InitializeWith<I> for PNCounter<I> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &I) -> Self {
