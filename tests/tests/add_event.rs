@@ -30,10 +30,9 @@ async fn add_event_postgres() -> Result<()> {
     album2.name.insert(3, "o) ");
     trx2.commit().await?;
 
-    let albums = node.collection("album").await?;
-    albums.get_events();
-
-    std::thread::sleep(std::time::Duration::from_secs(300));
+    let albums = node.collection(&"album".into()).await;
+    let events = albums.get_events(album_id).await?;
+    assert_eq!(events.len(), 3);
 
     Ok(())
 }
