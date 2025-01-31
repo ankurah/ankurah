@@ -414,7 +414,7 @@ impl StorageCollection for PostgresBucket {
     }
 
     async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> {
-        let query = format!(r#"SELECT "id", "operations", "head" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
+        let query = format!(r#"SELECT "id", "operations", "parent" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
 
         let entity_uuid = uuid::Uuid::from(ulid::Ulid::from(entity_id));
 
