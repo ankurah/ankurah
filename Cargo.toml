@@ -13,5 +13,6 @@ members = [
     "storage/*",
     "tests",
     "ankurah",
+    "bclock",
 ]
 resolver = "2"
