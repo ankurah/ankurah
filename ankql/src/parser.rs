@@ -49,21 +49,56 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, ParseError> {
 
     // Parse the first value
     let first = pairs.next().ok_or(ParseError::MissingOperand("first"))?;
+
+    // handle unary operators which have precedence over infix operators
+    if first.as_rule() == grammar::Rule::UnaryNot {
+        let next: Pair<'_, grammar::Rule> = pairs.next().ok_or(ParseError::EmptyExpression)?;
+
+        return Ok(ast::Predicate::Not(Box::new(match next.as_rule() {
+            grammar::Rule::ExpressionInParentheses => {
+                //
+                parse_expr(next.into_inner().next().ok_or(ParseError::EmptyExpression)?)?
+            }
+            _ => {
+                // TODO
+                return Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses", got: next.as_rule() });
+            }
+        })));
+    }
+
     let mut result = parse_atomic_expr(first)?;
 
-    // Process operator-value pairs
+    // Handle postfix and infix operators
     while let Some(op) = pairs.next() {
-        let right = pairs.next().ok_or(ParseError::MissingOperand("right"))?;
-        result = match op.as_rule() {
-            grammar::Rule::Eq
-            | grammar::Rule::GtEq
-            | grammar::Rule::Gt
-            | grammar::Rule::LtEq
-            | grammar::Rule::Lt
-            | grammar::Rule::NotEq => create_comparison(result, op.as_rule(), right)?,
-            grammar::Rule::And | grammar::Rule::Or => create_logical_op(op.as_rule(), result, right, &mut pairs)?,
+        match op.as_rule() {
+            grammar::Rule::IsNullPostfix => {
+                // Check if this is "IS NULL" or "IS NOT NULL" by looking at inner rules
+                let mut is_not = false;
+                for inner in op.into_inner() {
+                    if inner.as_rule() == grammar::Rule::NotFlag {
+                        is_not = true;
+                        break;
+                    }
+                }
+
+                let is_null = ast::Expr::Predicate(ast::Predicate::IsNull(Box::new(result)));
+                result = if is_not { ast::Expr::Predicate(ast::Predicate::Not(Box::new(is_null.try_into()?))) } else { is_null };
+            }
             _ => {
-                return Err(ParseError::UnexpectedRule { expected: "comparison operator, And, or Or", got: op.as_rule() });
+                // infix operators DO have a right operand
+                let right = pairs.next().ok_or(ParseError::MissingOperand("right"))?;
+                result = match op.as_rule() {
+                    grammar::Rule::Eq
+                    | grammar::Rule::GtEq
+                    | grammar::Rule::Gt
+                    | grammar::Rule::LtEq
+                    | grammar::Rule::Lt
+                    | grammar::Rule::NotEq => create_comparison(result, op.as_rule(), right)?,
+                    grammar::Rule::And | grammar::Rule::Or => create_logical_op(op.as_rule(), result, right, &mut pairs)?,
+                    _ => {
+                        return Err(ParseError::UnexpectedRule { expected: "comparison operator, And, or Or", got: op.as_rule() });
+                    }
+                }
             }
         };
     }
@@ -277,6 +312,49 @@ mod tests {
                     right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
                 })
             )
+        );
+    }
+
+    #[test]
+    fn test_parse_selection_status_is_null() {
+        let input = r#"status IS NULL"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(predicate, ast::Predicate::IsNull(Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string())))));
+    }
+
+    #[test]
+    fn test_parse_selection_status_is_not_null() {
+        let input = r#"status IS NOT NULL"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(
+            predicate,
+            ast::Predicate::Not(Box::new(ast::Predicate::IsNull(Box::new(ast::Expr::Identifier(ast::Identifier::Property(
+                "status".to_string()
+            ))))))
+        );
+    }
+
+    #[test]
+    fn unary_not_parenthesized() {
+        let input = r#"NOT (status = 'active')"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(
+            predicate,
+            ast::Predicate::Not(Box::new(ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+            }))
+        );
+    }
+
+    #[test]
+    fn unary_not_unparenthesized() {
+        // currently we don't support this - mostly because I'm not totally sure of the precedence rules, or how to parse it. lol
+        let input = r#"NOT status = 'active'"#;
+        matches!(
+            parse_selection(input),
+            Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses", got: grammar::Rule::ExpressionInParentheses })
         );
     }
 }
