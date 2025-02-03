@@ -130,7 +130,10 @@ impl Entity {
         }
         // TODO figure out how to test this
         info!("Apply event {}", event);
-        *self.head.lock().unwrap() = head;
+
+        *self.head.lock().unwrap() = head.clone();
+        // Hack
+        *self.backends.head.lock().unwrap() = head;
         info!("Apply event MARK 2 new head {}", self.head.lock().unwrap());
 
         Ok(())
