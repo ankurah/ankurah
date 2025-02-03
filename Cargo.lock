@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "ankql"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "env_logger",
  "log",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ankql",
  "ankurah-derive",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-derive"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-indexeddb-wasm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ankql",
  "ankurah",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-sled"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ankql",
  "ankurah-core",
