@@ -62,6 +62,7 @@ pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Res
         Predicate::Not(pred) => Ok(!evaluate_predicate(item, pred)?),
         Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr).is_err()),
         Predicate::True => Ok(true),
+        Predicate::False => Ok(false),
     }
 }
 

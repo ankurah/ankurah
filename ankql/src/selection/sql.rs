@@ -43,7 +43,8 @@ pub fn generate_selection_sql(predicate: &Predicate) -> String {
         }
         Predicate::Not(pred) => format!("NOT ({})", generate_selection_sql(pred)),
         Predicate::IsNull(expr) => format!("{} IS NULL", generate_expr_sql(expr)),
-        Predicate::True => "".to_string(),
+        Predicate::True => "TRUE".to_string(),
+        Predicate::False => "FALSE".to_string(),
     }
 }
 
