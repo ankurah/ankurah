@@ -71,6 +71,20 @@ impl IndexedDBStorageEngine {
                 if let Err(e) = store.create_index_with_str("by_collection", "collection") {
                     tracing::error!("Failed to create collection index: {:?}", e);
                 }
+
+                // Create events store with index on entity_id
+                let events_store = match db.create_object_store("events") {
+                    Ok(store) => store,
+                    Err(e) => {
+                        tracing::warn!("Error creating events store (may already exist): {:?}", e);
+                        return;
+                    }
+                };
+
+                // Create index on entity_id field for efficient event lookups
+                if let Err(e) = events_store.create_index_with_str("by_entity_id", "entity_id") {
+                    tracing::error!("Failed to create entity_id index: {:?}", e);
+                }
             }) as Box<dyn FnMut(_)>);
 
             let onsuccess = Closure::wrap(Box::new(move |event: Event| {
@@ -332,9 +346,165 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn add_event(&self, entity_event: &ankurah_proto::Event) -> anyhow::Result<bool> { Ok(false) }
+    async fn add_event(&self, entity_event: &ankurah_proto::Event) -> anyhow::Result<bool> {
+        let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        info!("IndexedDBBucket({}) add_event({invocation})", self.collection_id);
+        let _lock = self.mutex.lock().await;
+        info!("IndexedDBBucket({}) add_event({invocation}) LOCKED", self.collection_id);
+
+        SendWrapper::new(async move {
+            let transaction = self
+                .db
+                .transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite)
+                .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+
+            let store = transaction.object_store("events").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+
+            // Create a JS object to store the event data
+            let event_obj = js_sys::Object::new();
+
+            // Convert IDs to UUIDs for consistent storage
+            let event_id = ulid::Ulid::from(entity_event.id);
+            let event_uuid = uuid::Uuid::from(event_id);
+            let entity_id = ulid::Ulid::from(entity_event.entity_id);
+            let entity_uuid = uuid::Uuid::from(entity_id);
+
+            js_sys::Reflect::set(&event_obj, &"id".into(), &event_uuid.to_string().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set id on event"))?;
+            js_sys::Reflect::set(&event_obj, &"entity_id".into(), &entity_uuid.to_string().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set entity_id on event"))?;
+
+            // Serialize operations
+            let operations = bincode::serialize(&entity_event.operations)?;
+            js_sys::Reflect::set(&event_obj, &"operations".into(), &js_sys::Uint8Array::from(&operations[..]).into())
+                .map_err(|_e| anyhow::anyhow!("Failed to set operations on event"))?;
+
+            // Convert parent clock to UUIDs and then to a JS array of strings
+            let parent_uuids: Vec<uuid::Uuid> = (&entity_event.parent).into();
+            let parent_array = js_sys::Array::new();
+            for uuid in parent_uuids {
+                let js_str = wasm_bindgen::JsValue::from_str(&uuid.to_string());
+                parent_array.push(&js_str);
+            }
+            js_sys::Reflect::set(&event_obj, &"parent".into(), &parent_array)
+                .map_err(|_e| anyhow::anyhow!("Failed to set parent on event"))?;
+
+            // Store the event
+            let request = store
+                .put_with_key(&event_obj, &event_uuid.to_string().into())
+                .map_err(|_e| anyhow::anyhow!("Failed to put event in store"))?;
+
+            let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
+            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put event in store"))?;
+
+            let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
+            trx_fut.await.map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
+
+            Ok(true)
+        })
+        .await
+    }
+
     async fn get_events(&self, id: ankurah_proto::ID) -> Result<Vec<ankurah_proto::Event>, ankurah_core::error::RetrievalError> {
-        Ok(vec![])
+        SendWrapper::new(async move {
+            let transaction = self
+                .db
+                .transaction_with_str("events")
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to create transaction").into()))?;
+
+            let store = transaction
+                .object_store("events")
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get object store").into()))?;
+
+            let index = store
+                .index("by_entity_id")
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity_id index").into()))?;
+
+            // Convert ID to UUID for lookup
+            let entity_id = ulid::Ulid::from(id);
+            let entity_uuid = uuid::Uuid::from(entity_id);
+
+            let key_range = web_sys::IdbKeyRange::only(&entity_uuid.to_string().into())
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to create key range").into()))?;
+
+            let request = index
+                .open_cursor_with_range(&key_range)
+                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to open cursor").into()))?;
+
+            let mut events = Vec::new();
+            let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
+
+            while let Some(result) = stream.next().await {
+                let cursor_result = result.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Cursor error: {}", e).into()))?;
+
+                // Check if we've reached the end
+                if cursor_result.is_null() || cursor_result.is_undefined() {
+                    break;
+                }
+
+                let cursor: web_sys::IdbCursorWithValue =
+                    cursor_result.dyn_into().map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("Failed to cast cursor").into()))?;
+
+                let event_obj = cursor
+                    .value()
+                    .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get cursor value: {:?}", e).into()))?;
+
+                // Get operations
+                let operations_data = js_sys::Reflect::get(&event_obj, &"operations".into())
+                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get operations").into()))?;
+                let array: js_sys::Uint8Array = operations_data
+                    .dyn_into()
+                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert operations").into()))?;
+                let mut buffer = vec![0; array.length() as usize];
+                array.copy_to(&mut buffer);
+                let operations = bincode::deserialize(&buffer)?;
+
+                // Get parent clock from JS array of UUID strings
+                let parent_data = js_sys::Reflect::get(&event_obj, &"parent".into())
+                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get parent").into()))?;
+                let parent_array: js_sys::Array = parent_data
+                    .dyn_into()
+                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert parent to array").into()))?;
+                let mut parent_uuids = Vec::new();
+                for i in 0..parent_array.length() {
+                    let uuid_str: String = parent_array
+                        .get(i)
+                        .as_string()
+                        .ok_or_else(|| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert UUID string").into()))?;
+                    let uuid = uuid::Uuid::parse_str(&uuid_str)
+                        .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to parse UUID: {}", e).into()))?;
+                    parent_uuids.push(uuid);
+                }
+                let parent = parent_uuids
+                    .into_iter()
+                    .map(|uuid| ankurah_proto::ID::from_ulid(uuid.into()))
+                    .collect::<std::collections::BTreeSet<_>>();
+                let parent_clock = ankurah_proto::Clock::new(parent);
+
+                // Get event ID
+                let event_id_str = js_sys::Reflect::get(&event_obj, &"id".into())
+                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get event id").into()))?;
+                let event_id_str: String = event_id_str
+                    .try_into()
+                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert event id to string").into()))?;
+                let event_uuid = uuid::Uuid::parse_str(&event_id_str)
+                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to parse event UUID").into()))?;
+                let event_id = ankurah_proto::ID::from_ulid(event_uuid.into());
+
+                events.push(ankurah_proto::Event {
+                    id: event_id,
+                    collection: self.collection_id.clone(),
+                    entity_id: id,
+                    operations,
+                    parent: parent_clock,
+                });
+
+                cursor.continue_().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to advance cursor").into()))?;
+            }
+
+            Ok(events)
+        })
+        .await
     }
 }
 
