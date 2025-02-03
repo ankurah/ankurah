@@ -3408,6 +3408,7 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "tracing-subscriber",
+ "ulid",
  "wasm-bindgen",
 ]
 
