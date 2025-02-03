@@ -28,3 +28,4 @@ js-sys                          = "0"
 ankurah-react-signals           = { path = "../react-signals", version = "^0.1.1" }
 reactive_graph                  = { version = "0.1.4", features = ["effects"] }
 serde                           = { version = "1.0", features = ["derive"] }
+ulid                            = "1.1"

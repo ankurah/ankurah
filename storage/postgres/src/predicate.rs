@@ -94,6 +94,9 @@ impl Sql {
             Predicate::True => {
                 self.sql("TRUE");
             }
+            Predicate::False => {
+                self.sql("FALSE");
+            }
         }
     }
 }
@@ -167,6 +170,17 @@ mod tests {
 
         assert_eq!(sql_string, r#""person"."name" = $1"#);
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice")];
+        assert_args(&args, &expected);
+    }
+
+    #[test]
+    fn test_false_predicate() {
+        let mut sql = Sql::new();
+        sql.predicate(&Predicate::False);
+        let (sql_string, args) = sql.collapse();
+
+        assert_eq!(sql_string, "FALSE");
+        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![];
         assert_args(&args, &expected);
     }
 }

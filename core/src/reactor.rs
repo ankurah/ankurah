@@ -165,6 +165,9 @@ impl Reactor {
                     }
                 }
             }
+            Predicate::False => {
+                unimplemented!("Not sure how to implement this")
+            }
         }
     }
 
