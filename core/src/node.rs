@@ -15,8 +15,9 @@ use crate::{
     model::{Entity, View},
     reactor::Reactor,
     resultset::ResultSet,
-    storage::{StorageCollectionWrapper, StorageEngine},
+    storage::StorageCollectionWrapper,
     subscription::SubscriptionHandle,
+    traits::{Context, PolicyAgent, StorageEngine},
     transaction::Transaction,
 };
 use tracing::{debug, info, warn};
@@ -48,7 +49,9 @@ impl From<ankql::error::ParseError> for RetrievalError {
 }
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
-pub struct Node {
+pub struct Node<Ctx: Context, PA>
+where PA: PolicyAgent<Context = Ctx>
+{
     pub id: proto::NodeId,
     pub durable: bool,
     storage_engine: Arc<dyn StorageEngine>,
@@ -62,12 +65,13 @@ pub struct Node {
 
     /// The reactor for handling subscriptions
     reactor: Arc<Reactor>,
+    policy_agent: PA,
 }
 
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 
-impl Node {
-    pub fn new(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+impl<C: Context + 'static, PA: PolicyAgent<Context = C> + Send + Sync + 'static> Node<C, PA> {
+    pub fn new(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Arc<Self> {
         let reactor = Reactor::new(engine.clone());
         let id = proto::NodeId::new();
         info!("Node {} created", id);
@@ -80,10 +84,11 @@ impl Node {
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
             reactor,
+            policy_agent,
             durable: false,
         })
     }
-    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+    pub fn new_durable(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Arc<Self> {
         let reactor = Reactor::new(engine.clone());
         Arc::new(Self {
             id: proto::NodeId::new(),
@@ -94,6 +99,7 @@ impl Node {
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
             reactor,
+            policy_agent,
             durable: true,
         })
     }
@@ -493,6 +499,7 @@ impl Node {
 
     pub async fn fetch<R: View>(
         self: &Arc<Self>,
+        context: &C,
         args: impl TryInto<FetchArgs, Error = impl Into<RetrievalError>>,
     ) -> Result<ResultSet<R>, RetrievalError> {
         let args: FetchArgs = args.try_into().map_err(|e| e.into())?;
@@ -528,11 +535,16 @@ impl Node {
     }
 
     /// Subscribe to changes in entities matching a predicate
-    pub async fn subscribe<F, P, R>(self: &Arc<Self>, predicate: P, callback: F) -> anyhow::Result<crate::subscription::SubscriptionHandle>
+    pub async fn subscribe<F, IntoPred, R>(
+        self: &Arc<Self>,
+        context: &C,
+        predicate: IntoPred,
+        callback: F,
+    ) -> anyhow::Result<crate::subscription::SubscriptionHandle>
     where
         F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
-        P: TryInto<ankql::ast::Predicate>,
-        P::Error: std::error::Error + Send + Sync + 'static,
+        IntoPred: TryInto<ankql::ast::Predicate>,
+        IntoPred::Error: std::error::Error + Send + Sync + 'static,
         R: View,
     {
         use crate::model::Model;
@@ -586,7 +598,7 @@ impl Node {
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }
 
-impl Drop for Node {
+impl<C: Context, P: PolicyAgent<Context = C>> Drop for Node<C, P> {
     fn drop(&mut self) {
         info!("Node {} dropped", self.id);
     }

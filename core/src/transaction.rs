@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::{
     error::RetrievalError,
     model::{Entity, Mutable},
+    traits::{Context, PolicyAgent},
     Model, Node,
 };
 
@@ -12,8 +13,8 @@ use append_only_vec::AppendOnlyVec;
 // Q. When do we want unified vs individual property storage for TypeEngine operations?
 // A. When we start to care about differentiating possible recipients for different properties.
 
-pub struct Transaction {
-    pub(crate) node: Arc<Node>, // only here for committing entities to storage engine
+pub struct Transaction<Ctx: Context, PA: PolicyAgent<Context = Ctx>> {
+    pub(crate) node: Arc<Node<Ctx, PA>>, // only here for committing entities to storage engine
 
     entities: AppendOnlyVec<Arc<Entity>>,
 
@@ -22,8 +23,8 @@ pub struct Transaction {
     consumed: bool,
 }
 
-impl Transaction {
-    pub fn new(node: Arc<Node>) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
+impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Transaction<Ctx, PA> {
+    pub fn new(node: Arc<Node<Ctx, PA>>) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
 
     /// Fetch an entity already in the transaction.
     pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
@@ -103,7 +104,7 @@ impl Transaction {
     */
 }
 
-impl Drop for Transaction {
+impl<Ctx: Context, PA: PolicyAgent<Context = Ctx>> Drop for Transaction<Ctx, PA> {
     fn drop(&mut self) {
         if self.implicit && !self.consumed {
             // Since we can't make drop async, we'll need to block on the commit
