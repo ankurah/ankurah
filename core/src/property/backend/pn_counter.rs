@@ -13,7 +13,7 @@ use crate::{
         backend::{Operation, PropertyBackend},
         PropertyName,
     },
-    storage::Materialized,
+    storage::Materialized, Node,
 };
 
 #[derive(Debug)]
@@ -107,7 +107,7 @@ impl PropertyBackend for PNBackend {
         Ok(vec![Operation { diff: serialized_diffs }])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> anyhow::Result<()> {
+    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock, _node: &Node) -> anyhow::Result<()> {
         for operation in operations {
             let diffs = bincode::deserialize::<BTreeMap<PropertyName, i64>>(&operation.diff)?;
 

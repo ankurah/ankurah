@@ -162,6 +162,14 @@ pub struct Event {
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct Clock(BTreeSet<ID>);
 
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClockOrdering {
+    Parent,
+    Child,
+    Sibling,
+    Unrelated,
+}
+
 impl Clock {
     pub fn new(ids: impl Into<BTreeSet<ID>>) -> Self { Self(ids.into()) }
 
@@ -179,6 +187,7 @@ impl Clock {
     pub fn len(&self) -> usize { self.0.len() }
 
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
+
 }
 
 impl From<Vec<Uuid>> for Clock {
