@@ -1,13 +1,15 @@
-use ankurah_core::Node;
+use ankurah_core::{
+    node::Node,
+    traits::{Context as AnkurahContext, PolicyAgent},
+};
 
 use crate::connection_state::*;
 use gloo_timers::future::sleep;
 use reactive_graph::prelude::*;
-use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, RwLock};
+use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
 use tracing::info;
@@ -18,32 +20,67 @@ use wasm_bindgen_futures::spawn_local;
 
 const MAX_RECONNECT_DELAY: u64 = 10000;
 
+// Type-erased wrapper for wasm_bindgen
 #[derive(Clone)]
 #[wasm_bindgen]
 pub struct WebsocketClient {
-    inner: Arc<ClientInner>,
+    inner: Arc<dyn WebsocketClientInner>,
 }
 
-pub(crate) struct ClientInner {
+trait WebsocketClientInner: Send + Sync {
+    fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState>;
+    fn ready(&self) -> Pin<Box<dyn Future<Output = Result<(), String>>>>;
+    fn js_connection_state(&self) -> ConnectionStateEnumSignal;
+}
+
+pub(crate) struct WebsocketClientImpl<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> {
     server_url: String,
-    connection: RefCell<Option<Connection>>,
+    connection: RwLock<Option<Connection<Ctx, PA>>>,
     state: reactive_graph::signal::RwSignal<ConnectionState>,
-    node: Arc<Node>,
-    reconnect_delay: RefCell<u64>,
-    pending_ready_wakers: RefCell<Vec<Waker>>,
+    node: Arc<Node<Ctx, PA>>,
+    reconnect_delay: RwLock<u64>,
+    pending_ready_wakers: RwLock<Vec<Waker>>,
 }
 
-/// Client provides a primary handle to speak to the server
+impl<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Clone for WebsocketClientImpl<Ctx, PA> {
+    fn clone(&self) -> Self {
+        Self {
+            server_url: self.server_url.clone(),
+            connection: RwLock::new(None),
+            state: self.state.clone(),
+            node: self.node.clone(),
+            reconnect_delay: RwLock::new(*self.reconnect_delay.read().unwrap()),
+            pending_ready_wakers: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+impl<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> WebsocketClientInner
+    for WebsocketClientImpl<Ctx, PA>
+{
+    fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.state.read_only() }
+
+    fn ready(&self) -> Pin<Box<dyn Future<Output = Result<(), String>>>> { Box::pin(ReadyFuture { client: Arc::new(self.clone()) }) }
+
+    fn js_connection_state(&self) -> ConnectionStateEnumSignal {
+        let state = self.state.read_only();
+        reactive_graph::computed::Memo::new(move |_| state.get().into()).into()
+    }
+}
+
 impl WebsocketClient {
-    pub fn new(node: Arc<Node>, server_url: &str) -> Result<WebsocketClient, JsValue> {
+    pub fn new<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static>(
+        node: Arc<Node<Ctx, PA>>,
+        server_url: &str,
+    ) -> Result<WebsocketClient, JsValue> {
         info!("Created new websocket client for node {}", node.id);
-        let inner = Arc::new(ClientInner {
+        let inner = Arc::new(WebsocketClientImpl {
             server_url: server_url.to_string(),
             node,
-            connection: RefCell::new(None),
+            connection: RwLock::new(None),
             state: reactive_graph::signal::RwSignal::new(ConnectionState::None),
-            reconnect_delay: RefCell::new(0),
-            pending_ready_wakers: RefCell::new(Vec::new()),
+            reconnect_delay: RwLock::new(0),
+            pending_ready_wakers: RwLock::new(Vec::new()),
         });
 
         inner.connect()?;
@@ -51,30 +88,22 @@ impl WebsocketClient {
         Ok(WebsocketClient { inner })
     }
 
-    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.inner.state.read_only() }
-    pub fn node(&self) -> Arc<Node> { self.inner.node.clone() }
+    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.inner.connection_state() }
 }
 
 #[wasm_bindgen]
 impl WebsocketClient {
-    // resolves when we have a connected state
-    pub async fn ready(&self) -> Result<(), String> {
-        // If we're already connected, the future will resolve immediately
-        ReadyFuture { client: self.inner.clone() }.await.map_err(|_| "unreachable".to_string())
-    }
+    pub async fn ready(&self) -> Result<(), String> { self.inner.ready().await }
 
     #[wasm_bindgen(getter, js_name = "connection_state")]
-    pub fn js_connection_state(&self) -> ConnectionStateEnumSignal {
-        let state = self.inner.state.read_only();
-        reactive_graph::computed::Memo::new(move |_| state.get().into()).into()
-    }
+    pub fn js_connection_state(&self) -> ConnectionStateEnumSignal { self.inner.js_connection_state() }
 }
 
-impl ClientInner {
-    pub(crate) fn handle_state_change(self: &Arc<Self>, connection: &Connection, new_state: ConnectionState) -> bool {
+impl<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> WebsocketClientImpl<Ctx, PA> {
+    pub(crate) fn handle_state_change(self: &Arc<Self>, connection: &Connection<Ctx, PA>, new_state: ConnectionState) -> bool {
         // we are only interested in state changes for the current connection
         {
-            let c = self.connection.borrow();
+            let c = self.connection.read().unwrap();
             let Some(existing_connection) = c.as_ref() else {
                 return false;
             };
@@ -90,9 +119,9 @@ impl ClientInner {
         info!("State changed: {:?}", new_state);
         match new_state {
             ConnectionState::Connected { .. } => {
-                *self.reconnect_delay.borrow_mut() = 0;
+                *self.reconnect_delay.write().unwrap() = 0;
                 // Wake all pending futures
-                let wakers = std::mem::take(&mut *self.pending_ready_wakers.borrow_mut());
+                let wakers = std::mem::take(&mut *self.pending_ready_wakers.write().unwrap());
                 for waker in wakers {
                     waker.wake();
                 }
@@ -104,11 +133,11 @@ impl ClientInner {
             ConnectionState::Closed | ConnectionState::Error { .. } => {
                 // Clear the existing connection before attempting to reconnect
                 {
-                    *self.connection.borrow_mut() = None;
+                    *self.connection.write().unwrap() = None;
                 }
 
-                let next_delay = (*self.reconnect_delay.borrow() + 500).min(MAX_RECONNECT_DELAY);
-                *self.reconnect_delay.borrow_mut() = next_delay;
+                let next_delay = (*self.reconnect_delay.read().unwrap() + 500).min(MAX_RECONNECT_DELAY);
+                *self.reconnect_delay.write().unwrap() = next_delay;
                 self.reconnect(next_delay);
             }
         }
@@ -119,7 +148,7 @@ impl ClientInner {
         let connection = Connection::new(self.node.clone(), self.server_url.clone(), Arc::downgrade(self))?;
 
         info!("Connecting to {}", self.server_url);
-        *self.connection.borrow_mut() = Some(connection);
+        *self.connection.write().unwrap() = Some(connection);
         self.state.set(ConnectionState::Connecting { url: self.server_url.clone() });
 
         info!("Connecting to websocket");
@@ -139,24 +168,26 @@ impl ClientInner {
     }
 }
 
-impl std::ops::Drop for ClientInner {
+impl<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> std::ops::Drop
+    for WebsocketClientImpl<Ctx, PA>
+{
     fn drop(&mut self) {
         info!("Websocket client inner dropped for node {}", self.node.id);
     }
 }
 
-pub struct ReadyFuture {
-    pub(crate) client: Arc<ClientInner>,
+pub struct ReadyFuture<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> {
+    pub(crate) client: Arc<WebsocketClientImpl<Ctx, PA>>,
 }
 
-impl Future for ReadyFuture {
-    type Output = Result<(), ()>;
+impl<Ctx: AnkurahContext + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Future for ReadyFuture<Ctx, PA> {
+    type Output = Result<(), String>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         if let ConnectionState::Connected { .. } = self.client.state.get() {
             Poll::Ready(Ok(()))
         } else {
-            self.client.pending_ready_wakers.borrow_mut().push(cx.waker().clone());
+            self.client.pending_ready_wakers.write().unwrap().push(cx.waker().clone());
             Poll::Pending
         }
     }

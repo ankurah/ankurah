@@ -15,16 +15,20 @@ use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::{info, warn, Level};
 
-use ankurah_core::node::Node;
+use ankurah_core::{
+    connector::PeerSender,
+    node::Node,
+    traits::{Context, PolicyAgent},
+};
 
 use super::state::Connection;
 
-pub struct WebsocketServer {
-    node: Arc<Node>,
+pub struct WebsocketServer<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> {
+    node: Arc<Node<Ctx, PA>>,
 }
 
-impl WebsocketServer {
-    pub fn new(node: Arc<Node>) -> Self { Self { node } }
+impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> WebsocketServer<Ctx, PA> {
+    pub fn new(node: Arc<Node<Ctx, PA>>) -> Self { Self { node } }
 
     pub async fn run(&self, bind_address: &str) -> Result<()> {
         let app = Router::new().route("/ws", get(ws_handler)).with_state(self.node.clone()).layer(
@@ -47,11 +51,11 @@ impl WebsocketServer {
     }
 }
 
-async fn ws_handler(
+async fn ws_handler<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static>(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(node): State<Arc<Node>>,
+    State(node): State<Arc<Node<Ctx, PA>>>,
 ) -> impl IntoResponse {
     info!("Upgrading connection");
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
@@ -59,7 +63,11 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
 }
 
-async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
+async fn handle_socket<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static>(
+    socket: WebSocket,
+    who: SocketAddr,
+    node: Arc<Node<Ctx, PA>>,
+) {
     println!("Connected to {}", who);
 
     let (sender, mut receiver) = socket.split();
@@ -84,14 +92,18 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
 
     // Clean up peer registration if we had registered one
     if let Connection::Established(peer_sender) = conn {
-        use ankurah_core::connector::PeerSender;
         node.deregister_peer(peer_sender.recipient_node_id());
     }
 
     println!("Websocket context {who} destroyed");
 }
 
-async fn process_message(msg: axum::extract::ws::Message, who: SocketAddr, state: &mut Connection, node: Arc<Node>) -> ControlFlow<(), ()> {
+async fn process_message<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static>(
+    msg: axum::extract::ws::Message,
+    who: SocketAddr,
+    state: &mut Connection,
+    node: Arc<Node<Ctx, PA>>,
+) -> ControlFlow<(), ()> {
     match msg {
         axum::extract::ws::Message::Binary(d) => {
             println!(">>> {} sent {} bytes", who, d.len());
