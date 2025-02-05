@@ -1,4 +1,4 @@
-use crate::traits::{StorageCollection, StorageEngine};
+use crate::traits::StorageCollection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

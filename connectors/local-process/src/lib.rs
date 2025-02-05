@@ -1,10 +1,13 @@
-use ankurah_proto as proto;
+use ankurah_core::{
+    connector::{PeerSender, SendError},
+    node::Node,
+    proto,
+    traits::{Context, PolicyAgent},
+};
+
 use async_trait::async_trait;
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
-
-use ankurah_core::connector::{PeerSender, SendError};
-use ankurah_core::node::Node;
 
 #[derive(Clone)]
 /// Sender for local process connection
@@ -26,18 +29,18 @@ impl PeerSender for LocalProcessSender {
 }
 
 /// connector which establishes one sender between each of the two given nodes
-pub struct LocalProcessConnection {
+pub struct LocalProcessConnection<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> {
     receiver1_task: tokio::task::JoinHandle<()>,
     receiver2_task: tokio::task::JoinHandle<()>,
-    node1: Weak<Node>,
-    node2: Weak<Node>,
+    node1: Weak<Node<Ctx, PA>>,
+    node2: Weak<Node<Ctx, PA>>,
     node1_id: proto::NodeId,
     node2_id: proto::NodeId,
 }
 
-impl LocalProcessConnection {
+impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> LocalProcessConnection<Ctx, PA> {
     /// Create a new LocalConnector and establish connection between the nodes
-    pub async fn new(node1: &Arc<Node>, node2: &Arc<Node>) -> anyhow::Result<Self> {
+    pub async fn new(node1: &Arc<Node<Ctx, PA>>, node2: &Arc<Node<Ctx, PA>>) -> anyhow::Result<Self> {
         let (node1_tx, node1_rx) = mpsc::channel(100);
         let (node2_tx, node2_rx) = mpsc::channel(100);
 
@@ -64,7 +67,7 @@ impl LocalProcessConnection {
         })
     }
 
-    fn setup_receiver(node: &Arc<Node>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
+    fn setup_receiver(node: &Arc<Node<Ctx, PA>>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
         let node = node.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
@@ -74,7 +77,7 @@ impl LocalProcessConnection {
     }
 }
 
-impl Drop for LocalProcessConnection {
+impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Drop for LocalProcessConnection<Ctx, PA> {
     fn drop(&mut self) {
         self.receiver1_task.abort();
         self.receiver2_task.abort();

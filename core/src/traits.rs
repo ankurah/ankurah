@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Optional trait that allows storage operations to be scoped to a specific namespace.
+/// For multitenancy or otherwise. Presumably the Context will implement this trait.
 /// Storage engines may implement namespace-aware storage to partition data.
 pub trait Namespace {
     /// Returns the namespace for this context, if any
@@ -40,7 +41,9 @@ pub trait PolicyAgent {
     fn can_communicate_with_node(&self, context: &Self::Context, node_id: &NodeId) -> AccessResult;
 }
 
-/// Just a marker trait for now
+/// Represents the user session - or whatever other context the PolicyAgent
+/// Needs to perform it's evaluation. Just a marker trait for now but maybe
+/// we'll need to add some methods to it in the future.
 pub trait Context {}
 
 #[async_trait]

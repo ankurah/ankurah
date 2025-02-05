@@ -289,7 +289,7 @@ impl<C: Context + 'static, PA: PolicyAgent<Context = C> + Send + Sync + 'static>
     /// Begin a transaction.
     ///
     /// This is the main way to edit Entities.
-    pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(self.clone()) }
+    pub fn begin(self: &Arc<Self>) -> Transaction<C, PA> { Transaction::new(self.clone()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
