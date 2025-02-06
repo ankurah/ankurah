@@ -1,5 +1,5 @@
-use ankurah_proto as proto;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use ankurah_proto::{self as proto, SubscriptionId};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::collation::Collatable;
 use ankql::ast;
@@ -30,6 +30,13 @@ impl ComparisonIndex {
             ast::ComparisonOperator::Equal => {
                 let entry = self.eq.entry(value.to_bytes()).or_default();
                 f(entry);
+            }
+            ast::ComparisonOperator::NotEqual => {
+                let mut values: Vec<SubscriptionId> = self.eq.clone().into_values().flatten().collect();
+                let matches: HashSet<_> = self.eq.entry(value.to_bytes()).or_default().iter().collect();
+                values.retain(|x| !matches.contains(x));
+                
+                f(&mut values);
             }
             ast::ComparisonOperator::GreaterThan => {
                 let entry = self.gt.entry(value.to_bytes()).or_default();
