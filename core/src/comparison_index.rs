@@ -35,7 +35,6 @@ impl ComparisonIndex {
                 let mut values: Vec<SubscriptionId> = self.eq.clone().into_values().flatten().collect();
                 let matches: HashSet<_> = self.eq.entry(value.to_bytes()).or_default().iter().collect();
                 values.retain(|x| !matches.contains(x));
-                
                 f(&mut values);
             }
             ast::ComparisonOperator::GreaterThan => {
