@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-ankurah                  = { path = "../../ankurah", version = "^0.1.4" }
+ankurah                  = { path = "../../ankurah", version = "^0.1.5" }
 ankurah-websocket-server = { path = "../../connectors/websocket-server", version = "^0.1.1" }
 ankurah-storage-sled     = { path = "../../storage/sled", version = "^0.1.2" }
 tracing                  = "0.1"
