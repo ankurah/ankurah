@@ -1,6 +1,6 @@
 [package]
 name        = "ankurah"
-version     = "0.1.4"
+version     = "0.1.5"
 edition     = "2021"
 description = "Observable, event-driven state management for native and web"
 license     = "MIT OR Apache-2.0"
@@ -20,7 +20,7 @@ wasm = [
 derive = ["dep:ankurah-derive"]
 
 [dependencies]
-ankurah-core   = { path = "../core", version = "^0.1.1" }
+ankurah-core   = { path = "../core", version = "^0.1.3" }
 ankurah-proto  = { path = "../proto", version = "^0.1.1" }
 ankurah-derive = { path = "../derive", version = "^0.1.1", optional = true }
 ankql          = { path = "../ankql", version = "^0.1.1" }
