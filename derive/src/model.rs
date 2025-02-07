@@ -38,11 +38,14 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let active_field_visibility = active_fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
     let active_field_names = active_fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
     let active_field_name_strs = active_fields.iter().map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase()).collect::<Vec<_>>();
-    let projected_field_types = active_fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
+    let projected_field_types = active_fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>();
     let active_field_types = match active_fields.iter().map(get_active_type).collect::<Result<Vec<_>, _>>() {
         Ok(values) => values,
         Err(e) => return e.to_compile_error().into(),
     };
+
+    let projected_field_types_turbofish = projected_field_types.iter().map(as_turbofish).collect::<Vec<_>>();
+    let active_field_types_turbofish = active_field_types.iter().map(as_turbofish).collect::<Vec<_>>();
 
     let ephemeral_field_names = ephemeral_fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
     let ephemeral_field_types = ephemeral_fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
@@ -74,7 +77,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                     backends
                 );
                 #(
-                    #active_field_types::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
+                    #active_field_types_turbofish::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
                 )*
                 entity
             }
@@ -136,8 +139,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             #(
                 #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                     use ankurah::property::{FromActiveType, FromEntity};
-                    let active_result = #active_field_types::from_entity(#active_field_name_strs.into(), self.entity.as_ref());
-                    #projected_field_types::from_active(active_result)
+                    let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), self.entity.as_ref());
+                    #projected_field_types_turbofish::from_active(active_result)
                 }
             )*
             // #(
@@ -169,7 +172,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 assert_eq!(entity.collection(), Self::collection());
                 Self {
                     entity,
-                    #( #active_field_names: #active_field_types::from_entity(#active_field_name_strs.into(), entity), )*
+                    #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), entity), )*
                 }
             }
         }
@@ -242,4 +245,28 @@ fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
         attr.path().segments.iter().any(|seg| seg.ident == "model")
             && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).map_or(false, |ident| ident == flag_name)
     })
+}
+
+
+fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {
+    if let syn::Type::Path(path) = type_path {
+        let mut without_generics = path.clone();
+        let mut generics = syn::PathArguments::None;
+        if let Some(last_segment) = without_generics.path.segments.last_mut() {
+            generics = last_segment.arguments.clone();
+            last_segment.arguments = syn::PathArguments::None;
+        }
+
+        if let syn::PathArguments::AngleBracketed(generics) = generics {
+            quote! {
+                #without_generics::#generics
+            }
+        } else {
+            quote! {
+                #without_generics
+            }
+        }
+    } else {
+        unimplemented!()
+    }
 }
