@@ -20,10 +20,12 @@ pub enum Visibility {
 pub struct Video {
     #[active_type(YrsString)]
     pub title: String,
-    #[active_type(LWW::<Visibility>)]
+    #[active_type(LWW<Visibility>)]
     pub visibility: Visibility,
-    #[active_type(PNCounter::<i32>)]
+    #[active_type(PNCounter<i32>)]
     pub views: i32,
+    #[active_type(LWW<Option<String>>)]
+    pub attribution: Option<String>,
 }
 
 #[tokio::test]
@@ -31,7 +33,7 @@ async fn property_backends() -> Result<()> {
     let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
 
     let trx = client.begin();
-    let cat_video = trx.create(&Video { title: "Cat video #2918".into(), visibility: Visibility::Public, views: 0 }).await;
+    let cat_video = trx.create(&Video { title: "Cat video #2918".into(), visibility: Visibility::Public, views: 0, attribution: None }).await;
     let id = cat_video.id();
     //cat_video.views.add(2); // FIXME: applying twice for some reason
     cat_video.visibility.set(&Visibility::Unlisted)?;
