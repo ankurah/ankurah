@@ -22,7 +22,12 @@ impl AccessResult {
 }
 
 /// A policy agent that allows all operations
+#[derive(Clone)]
 pub struct PermissiveAgent {}
+
+impl PermissiveAgent {
+    pub fn new() -> Self { Self {} }
+}
 
 impl PolicyAgent for PermissiveAgent {
     type Context = DefaultContext;
@@ -44,5 +49,10 @@ impl PolicyAgent for PermissiveAgent {
 
 /// A default context that is used when no context is needed
 pub struct DefaultContext {}
+pub static DEFAULT_CONTEXT: DefaultContext = DefaultContext {};
+
+impl DefaultContext {
+    pub fn new() -> Self { Self {} }
+}
 
 impl Context for DefaultContext {}

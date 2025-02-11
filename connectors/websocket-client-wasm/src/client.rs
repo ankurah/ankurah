@@ -27,7 +27,7 @@ pub struct WebsocketClient {
     inner: Arc<dyn WebsocketClientInner>,
 }
 
-trait WebsocketClientInner: Send + Sync {
+pub(crate) trait WebsocketClientInner: Send + Sync {
     fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState>;
     fn ready(&self) -> Pin<Box<dyn Future<Output = Result<(), String>>>>;
     fn js_connection_state(&self) -> ConnectionStateEnumSignal;
