@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+use quote::{format_ident, quote, ToTokens};
+use syn::{parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DeriveInput, Fields, Type};
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
 pub fn derive_model_impl(input: TokenStream) -> TokenStream {
@@ -210,8 +210,9 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
     let active_type_ident = format_ident!("active_type");
 
     // First check if there's an explicit attribute
-    if let Some(active_type) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_type_ident)) {
-        return active_type.parse_args::<syn::Type>();
+    if let Some(active_type_attr) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_type_ident)) {
+        let active_type = active_type_attr.parse_args::<syn::Type>()?;
+        return Ok(ActiveFieldType::convert_type_with_projected(&active_type, &field.ty));
     }
 
     // Check for exact type matches and provide default Active types
@@ -247,6 +248,78 @@ fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
     })
 }
 
+// Parse the active field type 
+struct ActiveFieldType {
+    pub base: syn::Type,
+    pub generics: Option<syn::AngleBracketedGenericArguments>,
+}
+
+impl ActiveFieldType {
+    pub fn convert_type_with_projected(ty: &syn::Type, projected: &syn::Type) -> syn::Type {
+        let mut base = Self::from_type(ty);
+        base.with_projected(projected);
+        base.as_type()
+    }
+
+    pub fn from_type(ty: &syn::Type) -> Self {
+        if let syn::Type::Path(path) = ty {
+            if let Some(last_segment) = path.path.segments.last() {
+                if let syn::PathArguments::AngleBracketed(generics) = &last_segment.arguments {
+                    return Self {
+                        base: ty.clone(),
+                        generics: Some(generics.clone()),
+                    };
+                }
+            }
+        }
+
+        return Self {
+            base: ty.clone(),
+            generics: None,
+        };
+    }
+
+    pub fn with_projected(&mut self, ty: &syn::Type) {
+        let mut generics = match &self.generics {
+            Some(generics) => generics.clone(),
+            None => {
+                AngleBracketedGenericArguments {
+                    colon2_token: None,
+                    lt_token: Default::default(),
+                    args: Punctuated::default(),
+                    gt_token: Default::default(),
+                }
+            }
+        };
+
+        // Replace inferred `_` with projected
+        if let Some(last @ syn::GenericArgument::Type(syn::Type::Infer(_))) = generics.args.last_mut() {
+            *last = syn::GenericArgument::Type(ty.clone());
+        } else {
+            // Otherwise just push to the end.
+            generics.args.push(syn::GenericArgument::Type(ty.clone()));
+        }
+
+        self.generics = Some(generics);
+    }
+
+    pub fn as_type(&self) -> syn::Type {
+        let mut new_type = self.base.clone();
+        let syn::Type::Path(ref mut path) = new_type else {
+            unimplemented!("Non-path types aren't supported for active types");
+        };
+
+        let Some(last_segment) = path.path.segments.last_mut() else {
+            unreachable!("Need at least a single segment for type paths...?");
+        };
+
+        if let Some(generics) = &self.generics {
+            last_segment.arguments = syn::PathArguments::AngleBracketed(generics.clone());
+        }
+
+        new_type
+    }
+}
 
 fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {
     if let syn::Type::Path(path) = type_path {
