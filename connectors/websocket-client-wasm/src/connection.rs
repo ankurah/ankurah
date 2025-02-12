@@ -1,4 +1,4 @@
-use crate::client::WebsocketClientInner;
+use crate::client::ClientInner;
 use crate::connection_state::ConnectionState;
 use ankurah_core::{connector::PeerSender, traits::NodeConnector};
 use ankurah_proto::{self as proto};
@@ -12,28 +12,24 @@ use tracing::{info, warn};
 use wasm_bindgen::prelude::*;
 use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
+#[derive(Clone)]
 pub struct Connection(Arc<SendWrapper<ConnectionInner>>);
-
-impl Clone for Connection {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
-}
 
 pub struct ConnectionInner {
     ws: Arc<WebSocket>,
     url: String,
     state: RwLock<ConnectionState>,
     node: Arc<dyn NodeConnector>,
-    client: Weak<dyn WebsocketClientInner>,
+    client: Weak<ClientInner>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
-
 impl std::ops::Deref for Connection {
     type Target = ConnectionInner;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl Connection {
-    pub fn new(node: Arc<dyn NodeConnector>, url: String, client: Weak<dyn WebsocketClientInner>) -> Result<Self, JsValue> {
+    pub fn new(node: Arc<dyn NodeConnector>, url: String, client: Weak<ClientInner>) -> Result<Self, JsValue> {
         let url = if url.starts_with("ws://") || url.starts_with("wss://") { format!("{}/ws", url) } else { format!("wss://{}/ws", url) };
 
         let ws = WebSocket::new(&url)?;
@@ -139,7 +135,7 @@ impl Connection {
                                         ws: SendWrapper::new(self.ws.clone()),
                                     }),
                                 );
-                                let presence = proto::Presence { node_id: self.node.id.clone(), durable: self.node.durable };
+                                let presence = proto::Presence { node_id: self.node.id(), durable: self.node.durable() };
                                 // Send our presence message
                                 if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
                                     info!("Failed to send presence message: {:?}", e);
@@ -184,7 +180,7 @@ impl Connection {
 
 impl ConnectionInner {
     fn disconnect(&self) {
-        info!("Websocket disconnected from node {} to {}", self.node.id, self.url);
+        info!("Websocket disconnected from node {} to {}", self.node.id(), self.url);
         self.ws.set_onmessage(None);
         self.ws.set_onerror(None);
         self.ws.set_onclose(None);

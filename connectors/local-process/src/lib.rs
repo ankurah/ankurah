@@ -1,13 +1,10 @@
-use ankurah_core::{
-    connector::{PeerSender, SendError},
-    node::Node,
-    proto,
-    traits::{Context, NodeConnector, PolicyAgent},
-};
-
+use ankurah_proto as proto;
 use async_trait::async_trait;
 use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
+
+use ankurah_core::connector::{PeerSender, SendError};
+use ankurah_core::traits::NodeConnector;
 
 #[derive(Clone)]
 /// Sender for local process connection

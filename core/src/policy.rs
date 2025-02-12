@@ -30,7 +30,7 @@ impl PermissiveAgent {
 }
 
 impl PolicyAgent for PermissiveAgent {
-    type Context = DefaultContext;
+    type Context = &'static DefaultContext;
 
     fn can_access_collection(&self, _context: &Self::Context, _collection: &CollectionId) -> AccessResult { AccessResult::Allow }
 
@@ -48,6 +48,7 @@ impl PolicyAgent for PermissiveAgent {
 }
 
 /// A default context that is used when no context is needed
+
 pub struct DefaultContext {}
 pub static DEFAULT_CONTEXT: DefaultContext = DefaultContext {};
 
@@ -55,4 +56,4 @@ impl DefaultContext {
     pub fn new() -> Self { Self {} }
 }
 
-impl Context for DefaultContext {}
+impl Context for &'static DefaultContext {}
