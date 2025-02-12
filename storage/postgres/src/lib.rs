@@ -183,7 +183,8 @@ impl StorageCollection for PostgresBucket {
                         materialized.push(PostgresParams::Number(data));
                     }
                 }
-                _ => {}            }
+                _ => {}
+            }
         }
 
         columns.extend(materialized_columns.clone());

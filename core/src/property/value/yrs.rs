@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    sync::{Arc, Weak}
+    sync::{Arc, Weak},
 };
 
 use crate::{
@@ -24,7 +24,9 @@ pub struct YrsString<Projected> {
 
 // Starting with basic string type operations
 impl<Projected> YrsString<Projected> {
-    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self { Self { property_name, backend: Arc::downgrade(&backend), phantom: PhantomData, } }
+    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self {
+        Self { property_name, backend: Arc::downgrade(&backend), phantom: PhantomData }
+    }
     pub fn backend(&self) -> Arc<YrsBackend> { self.backend.upgrade().expect("Expected `Yrs` property backend to exist") }
     pub fn value(&self) -> Option<String> { self.backend().get_string(&self.property_name) }
     pub fn insert(&self, index: u32, value: &str) { self.backend().insert(&self.property_name, index, value); }

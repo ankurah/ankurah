@@ -14,7 +14,8 @@ use crate::{
         backend::{Operation, PropertyBackend},
         PropertyName,
     },
-    storage::Materialized, Node,
+    storage::Materialized,
+    Node,
 };
 
 /// Stores one or more properties of an entity
@@ -126,7 +127,13 @@ impl PropertyBackend for YrsBackend {
         Ok(vec![])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock, _node: &Node) -> anyhow::Result<()> {
+    fn apply_operations(
+        &self,
+        operations: &Vec<Operation>,
+        _current_head: &Clock,
+        _event_head: &Clock,
+        _node: &Node,
+    ) -> anyhow::Result<()> {
         // println!("apply operations: {:?}", operations);
         for operation in operations {
             self.apply_update(&operation.diff)?;

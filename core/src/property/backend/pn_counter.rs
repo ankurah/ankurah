@@ -13,7 +13,8 @@ use crate::{
         backend::{Operation, PropertyBackend},
         PropertyName,
     },
-    storage::Materialized, Node,
+    storage::Materialized,
+    Node,
 };
 
 #[derive(Debug)]
@@ -42,9 +43,7 @@ impl Default for PNBackend {
 impl PNBackend {
     pub fn new() -> PNBackend { Self { values: Arc::new(RwLock::new(BTreeMap::default())) } }
 
-    pub fn get(&self, property_name: PropertyName) -> i64 {
-        self.get_optional(property_name).unwrap_or(0)
-    }
+    pub fn get(&self, property_name: PropertyName) -> i64 { self.get_optional(property_name).unwrap_or(0) }
 
     pub fn get_optional(&self, property_name: PropertyName) -> Option<i64> {
         let values = self.values.read().unwrap();
@@ -111,7 +110,13 @@ impl PropertyBackend for PNBackend {
         Ok(vec![Operation { diff: serialized_diffs }])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock, _node: &Node) -> anyhow::Result<()> {
+    fn apply_operations(
+        &self,
+        operations: &Vec<Operation>,
+        _current_head: &Clock,
+        _event_head: &Clock,
+        _node: &Node,
+    ) -> anyhow::Result<()> {
         for operation in operations {
             let diffs = bincode::deserialize::<BTreeMap<PropertyName, i64>>(&operation.diff)?;
 
