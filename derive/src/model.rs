@@ -224,13 +224,14 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
                     let yrs = syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"))?;
                     active_type = Some(yrs);
                 }
-                _ => { // Everything else should use `LWW`` by default.
+                _ => {
+                    // Everything else should use `LWW`` by default.
                     // TODO: Return a list of compile_error! for these types to specify
                     // that these need to be `Serialize + for<'de> Deserialize<'de>``
                     let path = format!("{}::LWW", ACTIVE_TYPE_MOD_PREFIX);
                     let lww = syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"))?;
                     active_type = Some(lww);
-                },
+                }
             }
         };
     }
@@ -259,7 +260,7 @@ fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
     })
 }
 
-// Parse the active field type 
+// Parse the active field type
 struct ActiveFieldType {
     pub base: syn::Type,
     pub generics: Option<syn::AngleBracketedGenericArguments>,
@@ -276,31 +277,23 @@ impl ActiveFieldType {
         if let syn::Type::Path(path) = ty {
             if let Some(last_segment) = path.path.segments.last() {
                 if let syn::PathArguments::AngleBracketed(generics) = &last_segment.arguments {
-                    return Self {
-                        base: ty.clone(),
-                        generics: Some(generics.clone()),
-                    };
+                    return Self { base: ty.clone(), generics: Some(generics.clone()) };
                 }
             }
         }
 
-        return Self {
-            base: ty.clone(),
-            generics: None,
-        };
+        return Self { base: ty.clone(), generics: None };
     }
 
     pub fn with_projected(&mut self, ty: &syn::Type) {
         let mut generics = match &self.generics {
             Some(generics) => generics.clone(),
-            None => {
-                AngleBracketedGenericArguments {
-                    colon2_token: None,
-                    lt_token: Default::default(),
-                    args: Punctuated::default(),
-                    gt_token: Default::default(),
-                }
-            }
+            None => AngleBracketedGenericArguments {
+                colon2_token: None,
+                lt_token: Default::default(),
+                args: Punctuated::default(),
+                gt_token: Default::default(),
+            },
         };
 
         // Replace inferred `_` with projected

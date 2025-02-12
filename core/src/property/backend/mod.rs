@@ -53,7 +53,13 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Retrieve operations applied to this backend since the last time we called this method.
     fn to_operations(&self) -> anyhow::Result<Vec<Operation>>;
-    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_precursors: &Clock, node: &Node) -> anyhow::Result<()>;
+    fn apply_operations(
+        &self,
+        operations: &Vec<Operation>,
+        current_head: &Clock,
+        event_precursors: &Clock,
+        node: &Node,
+    ) -> anyhow::Result<()>;
 }
 
 pub enum BackendDowncasted {

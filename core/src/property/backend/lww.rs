@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     property::{backend::PropertyBackend, traits::compare_clocks, PropertyName},
-    storage::Materialized, Node,
+    storage::Materialized,
+    Node,
 };
 
 #[derive(Clone, Debug)]

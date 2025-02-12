@@ -21,15 +21,11 @@ pub enum PropertyError {
 }
 
 impl Into<wasm_bindgen::JsValue> for PropertyError {
-    fn into(self) -> wasm_bindgen::JsValue {
-        wasm_bindgen::JsValue::from_str(&self.to_string())
-    }
+    fn into(self) -> wasm_bindgen::JsValue { wasm_bindgen::JsValue::from_str(&self.to_string()) }
 }
 
 impl From<RetrievalError> for PropertyError {
-    fn from(retrieval: RetrievalError) -> Self {
-        PropertyError::RetrievalError(retrieval)
-    }
+    fn from(retrieval: RetrievalError) -> Self { PropertyError::RetrievalError(retrieval) }
 }
 
 pub trait FromEntity {
