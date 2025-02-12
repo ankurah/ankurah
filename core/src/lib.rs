@@ -6,6 +6,7 @@ pub mod error;
 pub mod event;
 pub mod model;
 pub mod node;
+pub mod policy;
 pub mod property;
 pub mod reactor;
 pub mod resultset;

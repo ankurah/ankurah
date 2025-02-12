@@ -1,4 +1,4 @@
-use ankurah::Node;
+use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use ankurah_websocket_server::WebsocketServer;
 use anyhow::Result;
@@ -12,10 +12,10 @@ async fn main() -> Result<()> {
 
     // Initialize storage engine
     let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
-    let node = Node::new_durable(Arc::new(storage));
+    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
 
     // Create and start the websocket server
-    let server = WebsocketServer::new(node);
+    let mut server = WebsocketServer::new(node);
     server.run("0.0.0.0:9797").await?;
 
     Ok(())

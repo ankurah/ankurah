@@ -1,6 +1,7 @@
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
-    Mutable, Node, ResultSet,
+    policy::DEFAULT_CONTEXT as c,
+    Mutable, Node, PermissiveAgent, ResultSet,
 };
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::{Arc, Mutex};
@@ -10,11 +11,11 @@ use common::{Album, AlbumView, Pet, PetView};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Create some initial entities
     {
-        let trx = client.begin();
+        let trx = client.begin(c);
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
         trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
         trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
@@ -45,7 +46,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 
     // Update an entity
     {
-        let trx = client.begin();
+        let trx = client.begin(c);
         let albums: ResultSet<AlbumView> = client.fetch("name = 'Ice on the Dune'").await?;
         let album = albums.items[0].edit(&trx).await?;
         album.year().overwrite(0, 4, "2020");
@@ -67,7 +68,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 #[tokio::test]
 async fn complex_local_subscription() {
     // Create a new node
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let (watcher, check) = common::changeset_watcher::<PetView>();
 
     // Subscribe to changes
@@ -76,7 +77,7 @@ async fn complex_local_subscription() {
     let (rex, snuffy, jasper);
     {
         // Create some test entities
-        let trx = node.begin();
+        let trx = node.begin(c);
         rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await.read();
 
         snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await.read();
@@ -91,7 +92,7 @@ async fn complex_local_subscription() {
 
     {
         // Update Rex's age to 7
-        let trx = node.begin();
+        let trx = node.begin(c);
         rex.edit(&trx).await.unwrap().age().overwrite(0, 1, "7");
         trx.commit().await.unwrap();
     }
@@ -101,7 +102,7 @@ async fn complex_local_subscription() {
 
     {
         // Update Snuffy's age to 3
-        let trx = node.begin();
+        let trx = node.begin(c);
         snuffy.edit(&trx).await.unwrap().age().overwrite(0, 1, "3");
         trx.commit().await.unwrap();
     }
@@ -111,7 +112,7 @@ async fn complex_local_subscription() {
 
     // Update Jasper's age to 4
     {
-        let trx = node.begin();
+        let trx = node.begin(c);
         jasper.edit(&trx).await.unwrap().age().overwrite(0, 1, "4");
         trx.commit().await.unwrap();
     }
@@ -120,7 +121,7 @@ async fn complex_local_subscription() {
     assert_eq!(check(), vec![vec![(jasper.id(), ChangeKind::Add)]]);
 
     // Update Snuffy and Jasper to ages outside the range
-    let trx = node.begin();
+    let trx = node.begin(c);
     let snuffy_edit = snuffy.edit(&trx).await.unwrap();
     snuffy_edit.age().overwrite(0, 1, "5");
     let jasper_edit = jasper.edit(&trx).await.unwrap();
@@ -132,7 +133,7 @@ async fn complex_local_subscription() {
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches
-    let trx = node.begin();
+    let trx = node.begin(c);
     let rex_edit = rex.edit(&trx).await.unwrap();
     rex_edit.name().overwrite(0, 3, "NotRex");
     trx.commit().await.unwrap();

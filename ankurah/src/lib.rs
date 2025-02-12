@@ -70,7 +70,7 @@
 //! ## Example: Inter-Node Subscription
 //!
 //! ```rust
-//! # use ankurah::{Node,Model};
+//! # use ankurah::{Node,Model,PermissiveAgent, policy::DEFAULT_CONTEXT as c};
 //! # use ankurah_storage_sled::SledStorageEngine;
 //! # use ankurah_connector_local_process::LocalProcessConnection;
 //! # use std::sync::Arc;
@@ -83,8 +83,8 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create server and client nodes
-//!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?));
-//!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?));
+//!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+//!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 //!
 //!     // Connect nodes using local process connection
 //!     let _conn = LocalProcessConnection::new(&server, &client).await?;
@@ -96,7 +96,7 @@
 //!     }).await?;
 //!
 //!     // Create a new album on the server
-//!     let trx = server.begin();
+//!     let trx = server.begin(c);
 //!     trx.create(&Album {
 //!         name: "Origin of Symmetry".into(),
 //!         year: "2001".into(),
@@ -133,6 +133,7 @@ pub use ankurah_core::{
     model::Mutable,
     model::View,
     node::{FetchArgs, Node},
+    policy::{self, PermissiveAgent},
     property,
     resultset::ResultSet,
     storage,

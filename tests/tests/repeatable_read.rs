@@ -1,6 +1,5 @@
-use ankurah::property::value::YrsString;
 use ankurah::Model;
-use ankurah::{Mutable, Node};
+use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -21,11 +20,11 @@ pub struct Album {
 
 #[tokio::test]
 async fn repeatable_read() -> Result<()> {
-    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let id;
     {
-        let trx = client.begin();
+        let trx = client.begin(c);
         let album_rw = trx.create(&Album { name: "I love cats".into() }).await;
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
@@ -45,10 +44,10 @@ async fn repeatable_read() -> Result<()> {
     println!("name: {:?}", album_ro.name());
     println!("_____________");
 
-    let trx2 = client.begin();
+    let trx2 = client.begin(c);
     let album_rw2 = album_ro.edit(&trx2).await?;
 
-    let trx3 = client.begin();
+    let trx3 = client.begin(c);
     let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu
@@ -84,11 +83,11 @@ mod pg_common;
 #[tokio::test]
 async fn pg_repeatable_read() -> Result<()> {
     let (_container, postgres) = pg_common::create_postgres_container().await?;
-    let client = Node::new_durable(Arc::new(postgres));
+    let client = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
 
     let id;
     {
-        let trx = client.begin();
+        let trx = client.begin(c);
         let album_rw = trx.create(&Album { name: "I love cats".into() }).await;
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
@@ -98,10 +97,10 @@ async fn pg_repeatable_read() -> Result<()> {
     // TODO: implement Mutable.read() -> View
     let album_ro: AlbumView = client.get_entity(id).await?;
 
-    let trx2 = client.begin();
+    let trx2 = client.begin(c);
     let album_rw2 = album_ro.edit(&trx2).await?;
 
-    let trx3 = client.begin();
+    let trx3 = client.begin(c);
     let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu
@@ -134,11 +133,11 @@ async fn pg_repeatable_read() -> Result<()> {
 #[tokio::test]
 async fn pg_events() -> Result<()> {
     let (_container, postgres) = pg_common::create_postgres_container().await?;
-    let client = Node::new_durable(Arc::new(postgres));
+    let client = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
 
     let id;
     {
-        let trx = client.begin();
+        let trx = client.begin(c);
         let album_rw = trx.create(&Album { name: "I love cats".into() }).await;
         assert_eq!(album_rw.name().value(), Some("I love cats".to_string()));
         id = album_rw.id();
@@ -148,10 +147,10 @@ async fn pg_events() -> Result<()> {
     // TODO: implement Mutable.read() -> View
     let album_ro: AlbumView = client.get_entity(id).await?;
 
-    let trx2 = client.begin();
+    let trx2 = client.begin(c);
     let album_rw2 = album_ro.edit(&trx2).await?;
 
-    let trx3 = client.begin();
+    let trx3 = client.begin(c);
     let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu

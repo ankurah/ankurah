@@ -1,3 +1,5 @@
+use ankurah::policy::PolicyAgent;
+use ankurah_core::connector::NodeComms;
 use ankurah_core::Node;
 
 use crate::connection_state::*;
@@ -28,18 +30,18 @@ pub(crate) struct ClientInner {
     server_url: String,
     connection: RefCell<Option<Connection>>,
     state: reactive_graph::signal::RwSignal<ConnectionState>,
-    node: Node,
+    node: Box<dyn NodeComms>,
     reconnect_delay: RefCell<u64>,
     pending_ready_wakers: RefCell<Vec<Waker>>,
 }
 
 /// Client provides a primary handle to speak to the server
 impl WebsocketClient {
-    pub fn new(node: Node, server_url: &str) -> Result<WebsocketClient, JsValue> {
+    pub fn new<PA: PolicyAgent + Send + Sync + 'static>(node: Node<PA>, server_url: &str) -> Result<WebsocketClient, JsValue> {
         info!("Created new websocket client for node {}", node.id);
         let inner = Arc::new(ClientInner {
             server_url: server_url.to_string(),
-            node,
+            node: Box::new(node),
             connection: RefCell::new(None),
             state: reactive_graph::signal::RwSignal::new(ConnectionState::None),
             reconnect_delay: RefCell::new(0),
@@ -52,7 +54,6 @@ impl WebsocketClient {
     }
 
     pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.inner.state.read_only() }
-    pub fn node(&self) -> Node { self.inner.node.clone() }
 }
 
 #[wasm_bindgen]
@@ -116,7 +117,7 @@ impl ClientInner {
     }
 
     pub fn connect(self: &Arc<Self>) -> Result<(), JsValue> {
-        let connection = Connection::new(self.node.clone(), self.server_url.clone(), Arc::downgrade(self))?;
+        let connection = Connection::new(self.node.cloned(), self.server_url.clone(), Arc::downgrade(self))?;
 
         info!("Connecting to {}", self.server_url);
         *self.connection.borrow_mut() = Some(connection);
@@ -141,7 +142,7 @@ impl ClientInner {
 
 impl std::ops::Drop for ClientInner {
     fn drop(&mut self) {
-        info!("Websocket client inner dropped for node {}", self.node.id);
+        info!("Websocket client inner dropped for node {}", self.node.id());
     }
 }
 

@@ -15,19 +15,22 @@ use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::{info, warn, Level};
 
-use ankurah_core::node::Node;
+use ankurah_core::{node::Node, policy::PolicyAgent};
 
 use super::state::Connection;
 
-pub struct WebsocketServer {
-    node: Node,
+pub struct WebsocketServer<PA: PolicyAgent> {
+    node: Option<Node<PA>>,
 }
 
-impl WebsocketServer {
-    pub fn new(node: Node) -> Self { Self { node } }
+impl<PA: PolicyAgent + Send + Sync + 'static> WebsocketServer<PA> {
+    pub fn new(node: Node<PA>) -> Self { Self { node: Some(node) } }
 
-    pub async fn run(&self, bind_address: &str) -> Result<()> {
-        let app = Router::new().route("/ws", get(ws_handler)).with_state(self.node.clone()).layer(
+    pub async fn run(&mut self, bind_address: &str) -> Result<()> {
+        let Some(node) = self.node.take() else {
+            return Err(anyhow::anyhow!("Already been run"));
+        };
+        let app = Router::new().route("/ws", get(ws_handler)).with_state(node).layer(
             ServiceBuilder::new()
                 .layer(
                     TraceLayer::new_for_http()
@@ -47,11 +50,11 @@ impl WebsocketServer {
     }
 }
 
-async fn ws_handler(
+async fn ws_handler<PA: PolicyAgent + Send + Sync + 'static>(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(node): State<Node>,
+    State(node): State<Node<PA>>,
 ) -> impl IntoResponse {
     info!("Upgrading connection");
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
@@ -59,7 +62,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
 }
 
-async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Node) {
+async fn handle_socket<PA: PolicyAgent + Send + Sync + 'static>(socket: WebSocket, who: SocketAddr, node: Node<PA>) {
     println!("Connected to {}", who);
 
     let (sender, mut receiver) = socket.split();
@@ -91,7 +94,12 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Node) {
     println!("Websocket context {who} destroyed");
 }
 
-async fn process_message(msg: axum::extract::ws::Message, who: SocketAddr, state: &mut Connection, node: Node) -> ControlFlow<(), ()> {
+async fn process_message<PA: PolicyAgent + Send + Sync + 'static>(
+    msg: axum::extract::ws::Message,
+    who: SocketAddr,
+    state: &mut Connection,
+    node: Node<PA>,
+) -> ControlFlow<(), ()> {
     match msg {
         axum::extract::ws::Message::Binary(d) => {
             println!(">>> {} sent {} bytes", who, d.len());
