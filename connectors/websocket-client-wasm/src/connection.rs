@@ -1,6 +1,6 @@
 use crate::client::ClientInner;
 use crate::connection_state::ConnectionState;
-use ankurah_core::{connector::PeerSender, Node};
+use ankurah_core::{connector::PeerSender, traits::NodeConnector};
 use ankurah_proto::{self as proto};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ pub struct ConnectionInner {
     ws: Arc<WebSocket>,
     url: String,
     state: RwLock<ConnectionState>,
-    node: Arc<Node>,
+    node: Arc<dyn NodeConnector>,
     client: Weak<ClientInner>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
@@ -29,7 +29,7 @@ impl std::ops::Deref for Connection {
 }
 
 impl Connection {
-    pub fn new(node: Arc<Node>, url: String, client: Weak<ClientInner>) -> Result<Self, JsValue> {
+    pub fn new(node: Arc<dyn NodeConnector>, url: String, client: Weak<ClientInner>) -> Result<Self, JsValue> {
         let url = if url.starts_with("ws://") || url.starts_with("wss://") { format!("{}/ws", url) } else { format!("wss://{}/ws", url) };
 
         let ws = WebSocket::new(&url)?;
@@ -135,7 +135,7 @@ impl Connection {
                                         ws: SendWrapper::new(self.ws.clone()),
                                     }),
                                 );
-                                let presence = proto::Presence { node_id: self.node.id.clone(), durable: self.node.durable };
+                                let presence = proto::Presence { node_id: self.node.id(), durable: self.node.durable() };
                                 // Send our presence message
                                 if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
                                     info!("Failed to send presence message: {:?}", e);
@@ -180,7 +180,7 @@ impl Connection {
 
 impl ConnectionInner {
     fn disconnect(&self) {
-        info!("Websocket disconnected from node {} to {}", self.node.id, self.url);
+        info!("Websocket disconnected from node {} to {}", self.node.id(), self.url);
         self.ws.set_onmessage(None);
         self.ws.set_onerror(None);
         self.ws.set_onclose(None);
@@ -193,6 +193,7 @@ impl ConnectionInner {
         }
     }
 }
+
 impl Drop for ConnectionInner {
     fn drop(&mut self) {
         // Clean up WebSocket event handlers

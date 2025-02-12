@@ -137,7 +137,7 @@ pub use ankurah_core::{
     resultset::ResultSet,
     storage,
     subscription::SubscriptionHandle,
-    transaction, Model,
+    traits, transaction, Model,
 };
 
 // TODO move this somewhere else - it's a dependency of the signal derive macro

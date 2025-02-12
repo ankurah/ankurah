@@ -11,6 +11,7 @@ pub mod reactor;
 pub mod resultset;
 pub mod storage;
 pub mod subscription;
+pub mod traits;
 pub mod transaction;
 pub mod value;
 pub use model::Model;

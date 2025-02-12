@@ -1,4 +1,4 @@
-use ankurah_core::Node;
+use ankurah_core::traits::NodeConnector;
 
 use crate::connection_state::*;
 use gloo_timers::future::sleep;
@@ -28,15 +28,15 @@ pub(crate) struct ClientInner {
     server_url: String,
     connection: RefCell<Option<Connection>>,
     state: reactive_graph::signal::RwSignal<ConnectionState>,
-    node: Arc<Node>,
+    node: Arc<dyn NodeConnector>,
     reconnect_delay: RefCell<u64>,
     pending_ready_wakers: RefCell<Vec<Waker>>,
 }
 
 /// Client provides a primary handle to speak to the server
 impl WebsocketClient {
-    pub fn new(node: Arc<Node>, server_url: &str) -> Result<WebsocketClient, JsValue> {
-        info!("Created new websocket client for node {}", node.id);
+    pub fn new(node: Arc<dyn NodeConnector>, server_url: &str) -> Result<WebsocketClient, JsValue> {
+        info!("Created new websocket client for node {}", node.id());
         let inner = Arc::new(ClientInner {
             server_url: server_url.to_string(),
             node,
@@ -52,7 +52,7 @@ impl WebsocketClient {
     }
 
     pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.inner.state.read_only() }
-    pub fn node(&self) -> Arc<Node> { self.inner.node.clone() }
+    pub fn node(&self) -> Arc<dyn NodeConnector> { self.inner.node.clone() }
 }
 
 #[wasm_bindgen]
@@ -141,7 +141,7 @@ impl ClientInner {
 
 impl std::ops::Drop for ClientInner {
     fn drop(&mut self) {
-        info!("Websocket client inner dropped for node {}", self.node.id);
+        info!("Websocket client inner dropped for node {}", self.node.id());
     }
 }
 

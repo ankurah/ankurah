@@ -1,5 +1,6 @@
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
+use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
 use rand::prelude::*;
 use std::{
@@ -17,6 +18,7 @@ use crate::{
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
+    traits::NodeConnector,
     transaction::Transaction,
 };
 use tracing::{debug, info, warn};
@@ -98,21 +100,6 @@ impl Node {
         })
     }
 
-    pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
-        info!("Node {} register peer {}", self.id, presence.node_id);
-        self.peer_connections
-            .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: BTreeMap::new() });
-        if presence.durable {
-            self.durable_peers.insert(presence.node_id.clone());
-        }
-        // TODO send hello message to the peer, including present head state for all relevant collections
-    }
-    pub fn deregister_peer(&self, node_id: proto::NodeId) {
-        info!("Node {} deregister peer {}", self.id, node_id);
-        self.peer_connections.remove(&node_id);
-        self.durable_peers.remove(&node_id);
-    }
-
     pub async fn request(
         &self,
         node_id: proto::NodeId,
@@ -137,47 +124,6 @@ impl Node {
 
         // Wait for response
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
-    }
-
-    pub async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
-        match message {
-            proto::NodeMessage::Request(request) => {
-                info!("Node {} received request {}", self.id, request);
-                // TODO: Should we spawn a task here and make handle_message synchronous?
-                // I think this depends on how we want to handle timeouts.
-                // I think we want timeouts to be handled by the node, not the connector,
-                // which would lend itself to spawning a task here and making this function synchronous.
-
-                // double check to make sure we have a connection to the peer based on the node id
-                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
-                    let from = request.from.clone();
-                    let request_id = request.id.clone();
-                    if request.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
-                    }
-
-                    let body = match self.handle_request(request).await {
-                        Ok(result) => result,
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                    };
-                    let _result = sender
-                        .send_message(proto::NodeMessage::Response(proto::NodeResponse {
-                            request_id,
-                            from: self.id.clone(),
-                            to: from,
-                            body,
-                        }))
-                        .await;
-                }
-            }
-            proto::NodeMessage::Response(response) => {
-                info!("Node {} received response {}", self.id, response);
-                if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
-                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
-                }
-            }
-        }
-        Ok(())
     }
 
     async fn handle_request(self: &Arc<Self>, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
@@ -589,5 +535,68 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         info!("Node {} dropped", self.id);
+    }
+}
+
+#[async_trait]
+impl NodeConnector for Arc<Node> {
+    fn id(&self) -> proto::NodeId { self.id.clone() }
+
+    fn durable(&self) -> bool { self.durable }
+
+    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
+        info!("Node {} register peer {}", self.id, presence.node_id);
+        self.peer_connections
+            .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: BTreeMap::new() });
+        if presence.durable {
+            self.durable_peers.insert(presence.node_id.clone());
+        }
+    }
+
+    fn deregister_peer(&self, node_id: proto::NodeId) {
+        info!("Node {} deregister peer {}", self.id, node_id);
+        self.peer_connections.remove(&node_id);
+        self.durable_peers.remove(&node_id);
+    }
+
+    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+        match message {
+            proto::NodeMessage::Request(request) => {
+                info!("Node {} received request {}", self.id, request);
+                // TODO: Should we spawn a task here and make handle_message synchronous?
+                // I think this depends on how we want to handle timeouts.
+                // I think we want timeouts to be handled by the node, not the connector,
+                // which would lend itself to spawning a task here and making this function synchronous.
+
+                // double check to make sure we have a connection to the peer based on the node id
+                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
+                    let from = request.from.clone();
+                    let request_id = request.id.clone();
+                    if request.to != self.id {
+                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
+                    }
+
+                    let body = match self.handle_request(request).await {
+                        Ok(result) => result,
+                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                    };
+                    let _result = sender
+                        .send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                            request_id,
+                            from: self.id.clone(),
+                            to: from,
+                            body,
+                        }))
+                        .await;
+                }
+            }
+            proto::NodeMessage::Response(response) => {
+                info!("Node {} received response {}", self.id, response);
+                if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
+                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                }
+            }
+        }
+        Ok(())
     }
 }
