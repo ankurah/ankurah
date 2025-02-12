@@ -6,7 +6,7 @@ use ankurah::{
     proto, Model,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Model)]
 pub struct Pet {

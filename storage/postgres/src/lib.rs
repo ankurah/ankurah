@@ -9,7 +9,7 @@ use ankurah_core::{
         backend::{BackendDowncasted, PropertyBackend},
         Backends,
     },
-    storage::{StorageCollection, StorageEngine},
+    traits::{StorageCollection, StorageEngine},
 };
 use ankurah_proto::State;
 

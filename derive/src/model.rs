@@ -121,6 +121,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         // TODO wasm-bindgen this
         impl #view_name {
+            // TODO - determine if we want transaction to be internally dyn over PA::Context / Node
             pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::RetrievalError> {
                 use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct

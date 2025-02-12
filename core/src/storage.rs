@@ -1,42 +1,16 @@
+use crate::traits::StorageCollection;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+// pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
-use crate::error::RetrievalError;
-use ankurah_proto::{CollectionId, Event, State, ID};
+// pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 
-pub fn state_name(name: &str) -> String { format!("{}_state", name) }
-
-pub fn event_name(name: &str) -> String { format!("{}_event", name) }
-
-#[async_trait]
-pub trait StorageEngine: Send + Sync {
-    // Opens and/or creates a storage collection.
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
-}
-
-#[async_trait]
-pub trait StorageCollection: Send + Sync {
-    // TODO - implement merge_states based on event history.
-    // Consider whether to play events forward from a prior checkpoint (probably this)
-    // or maybe to require PropertyBackends to be able to merge states.
-    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool>;
-    async fn get_state(&self, id: ID) -> Result<State, RetrievalError>;
-
-    // Fetch raw entity states matching a predicate
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError>;
-
-    async fn set_states(&self, entities: Vec<(ID, &State)>) -> anyhow::Result<()> {
-        for (id, state) in entities {
-            self.set_state(id, state).await?;
-        }
-        Ok(())
-    }
-
-    // TODO:
-    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool>;
-    async fn get_events(&self, id: ID) -> Result<Vec<Event>, crate::error::RetrievalError>;
+/// Optional trait that allows storage operations to be scoped to a specific namespace.
+/// Storage engines may implement namespace-aware storage to partition data.
+pub trait Namespace {
+    /// Returns the namespace for this context, if any
+    fn namespace(&self) -> Option<&str>;
 }
 
 #[derive(Serialize, Deserialize)]

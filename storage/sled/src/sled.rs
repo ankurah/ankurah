@@ -8,7 +8,7 @@ use std::sync::Arc;
 use ankurah_core::{
     error::RetrievalError,
     model::Entity,
-    storage::{StorageCollection, StorageEngine},
+    traits::{StorageCollection, StorageEngine},
 };
 
 use ankql::selection::filter::evaluate_predicate;

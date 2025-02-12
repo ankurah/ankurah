@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah::{changes::ChangeKind, FetchArgs, Mutable, Node, ResultSet, ID};
+use ankurah::{changes::ChangeKind, FetchArgs, Mutable, Node, PermissiveAgent, ResultSet, DEFAULT_CONTEXT as c, ID};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -13,8 +13,8 @@ pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.i
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
-    let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
-    let node2 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node2 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     {
         let trx = node1.begin();
@@ -27,16 +27,16 @@ async fn inter_node_fetch() -> Result<()> {
 
     let p = "name = 'Walking on a Dream'";
     // Should already be on node1
-    assert_eq!(names(node1.fetch(p).await?), ["Walking on a Dream"]);
+    assert_eq!(names(node1.fetch(&c, p).await?), ["Walking on a Dream"]);
 
     // But node2 because they arent connected
-    assert_eq!(names(node2.fetch(FetchArgs { predicate: p.try_into()?, cached: true }).await?), [] as [&str; 0]);
+    assert_eq!(names(node2.fetch(&c, FetchArgs { predicate: p.try_into()?, cached: true }).await?), [] as [&str; 0]);
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
 
     // Now node2 should now successfully fetch the entity
-    assert_eq!(names(node2.fetch(p).await?), ["Walking on a Dream"]);
+    assert_eq!(names(node2.fetch(&c, p).await?), ["Walking on a Dream"]);
 
     Ok(())
 }
