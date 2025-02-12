@@ -75,6 +75,15 @@ async fn pg_property_backends() -> Result<()> {
         attribution: None,
     }).await;
 
+
+    let cat_video2 = trx.create(&Video {
+        title: "Cat video #9000".into(),
+        description: None,
+        visibility: Visibility::Unlisted,
+        views: 5120,
+        attribution: Some("That guy".into()),
+    }).await;
+
     let id = cat_video.id();
     //cat_video.views.add(2); // FIXME: applying twice for some reason
     cat_video.visibility.set(&Visibility::Unlisted)?;
