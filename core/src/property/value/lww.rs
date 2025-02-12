@@ -7,14 +7,20 @@ use crate::{
     property::{backend::LWWBackend, traits::{FromActiveType, FromEntity, PropertyError}, InitializeWith, PropertyName},
 };
 
-pub struct LWW<T> {
+pub struct LWW<T>
+where 
+    T: serde::Serialize + for<'de> serde::Deserialize<'de>
+{
     pub property_name: PropertyName,
     pub backend: Arc<LWWBackend>,
 
     phantom: PhantomData<T>,
 }
 
-impl<T> std::fmt::Debug for LWW<T> {
+impl<T> std::fmt::Debug for LWW<T> 
+where 
+    T: serde::Serialize + for<'de> serde::Deserialize<'de>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LWW")
             .field("property_name", &self.property_name)
@@ -42,7 +48,10 @@ where T: Serialize + for<'a> Deserialize<'a>
     }
 }
 
-impl<T> FromEntity for LWW<T> {
+impl<T> FromEntity for LWW<T> 
+where 
+    T: serde::Serialize + for<'de> serde::Deserialize<'de>
+{
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
         Self { property_name: property_name, backend: backend, phantom: PhantomData }
