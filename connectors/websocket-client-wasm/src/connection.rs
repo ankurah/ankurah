@@ -1,10 +1,6 @@
 use crate::client::WebsocketClientInner;
 use crate::connection_state::ConnectionState;
-use ankurah_core::{
-    connector::PeerSender,
-    node::Node,
-    traits::{Context, PolicyAgent},
-};
+use ankurah_core::{connector::PeerSender, traits::NodeConnector};
 use ankurah_proto::{self as proto};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -16,10 +12,9 @@ use tracing::{info, warn};
 use wasm_bindgen::prelude::*;
 use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
 
-pub struct Connection<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static>(
-    Arc<SendWrapper<ConnectionInner<Ctx, PA>>>,
-);
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Clone for Connection<Ctx, PA> {
+pub struct Connection(Arc<SendWrapper<ConnectionInner>>);
+
+impl Clone for Connection {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
@@ -27,18 +22,18 @@ pub struct ConnectionInner {
     ws: Arc<WebSocket>,
     url: String,
     state: RwLock<ConnectionState>,
-    node: Arc<Node<Ctx, PA>>,
+    node: Arc<dyn NodeConnector>,
     client: Weak<dyn WebsocketClientInner>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
 
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> std::ops::Deref for Connection<Ctx, PA> {
-    type Target = ConnectionInner<Ctx, PA>;
+impl std::ops::Deref for Connection {
+    type Target = ConnectionInner;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Connection<Ctx, PA> {
-    pub fn new(node: Arc<Node<Ctx, PA>>, url: String, client: Weak<ClientInner<Ctx, PA>>) -> Result<Self, JsValue> {
+impl Connection {
+    pub fn new(node: Arc<dyn NodeConnector>, url: String, client: Weak<dyn WebsocketClientInner>) -> Result<Self, JsValue> {
         let url = if url.starts_with("ws://") || url.starts_with("wss://") { format!("{}/ws", url) } else { format!("wss://{}/ws", url) };
 
         let ws = WebSocket::new(&url)?;
@@ -187,7 +182,7 @@ impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'sta
     }
 }
 
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> ConnectionInner<Ctx, PA> {
+impl ConnectionInner {
     fn disconnect(&self) {
         info!("Websocket disconnected from node {} to {}", self.node.id, self.url);
         self.ws.set_onmessage(None);
@@ -203,14 +198,14 @@ impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'sta
     }
 }
 
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Drop for ConnectionInner<Ctx, PA> {
+impl Drop for ConnectionInner {
     fn drop(&mut self) {
         // Clean up WebSocket event handlers
         self.disconnect();
     }
 }
 
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> PartialEq for Connection<Ctx, PA> {
+impl PartialEq for Connection {
     fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }
 
@@ -221,7 +216,7 @@ struct WebSocketPeerSender {
 }
 
 #[async_trait]
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> PeerSender for WebSocketPeerSender {
+impl PeerSender for WebSocketPeerSender {
     async fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
         let message = proto::Message::PeerMessage(message);
         let data = bincode::serialize(&message).map_err(|e| {

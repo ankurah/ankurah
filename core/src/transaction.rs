@@ -13,18 +13,22 @@ use append_only_vec::AppendOnlyVec;
 // Q. When do we want unified vs individual property storage for TypeEngine operations?
 // A. When we start to care about differentiating possible recipients for different properties.
 
-pub struct Transaction<Ctx: Context, PA: PolicyAgent<Context = Ctx>> {
-    pub(crate) node: Arc<Node<Ctx, PA>>, // only here for committing entities to storage engine
+pub struct Transaction<PA: PolicyAgent> {
+    pub(crate) node: Arc<Node<PA>>, // only here for committing entities to storage engine
 
     entities: AppendOnlyVec<Arc<Entity>>,
 
     // markers
     implicit: bool,
     consumed: bool,
+
+    context: PA::Context,
 }
 
-impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'static> Transaction<Ctx, PA> {
-    pub fn new(node: Arc<Node<Ctx, PA>>) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
+impl<PA: PolicyAgent + Send + Sync + 'static> Transaction<PA> {
+    pub fn new(node: Arc<Node<PA>>, context: &PA::Context) -> Self {
+        Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false, context: context.clone() }
+    }
 
     /// Fetch an entity already in the transaction.
     pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
@@ -104,7 +108,7 @@ impl<Ctx: Context + 'static, PA: PolicyAgent<Context = Ctx> + Send + Sync + 'sta
     */
 }
 
-impl<Ctx: Context, PA: PolicyAgent<Context = Ctx>> Drop for Transaction<Ctx, PA> {
+impl<PA: PolicyAgent> Drop for Transaction<PA> {
     fn drop(&mut self) {
         if self.implicit && !self.consumed {
             // Since we can't make drop async, we'll need to block on the commit

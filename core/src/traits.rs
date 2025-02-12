@@ -1,9 +1,11 @@
+use crate::connector::PeerSender;
 use crate::{
     error::RetrievalError,
     policy::AccessResult,
     proto::{CollectionId, Event, NodeId, State, ID},
 };
 use ankql::ast::Predicate;
+use ankurah_proto as proto;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -44,7 +46,7 @@ pub trait PolicyAgent {
 /// Represents the user session - or whatever other context the PolicyAgent
 /// Needs to perform it's evaluation. Just a marker trait for now but maybe
 /// we'll need to add some methods to it in the future.
-pub trait Context {}
+pub trait Context: Clone + Send + Sync + 'static {}
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
@@ -73,4 +75,25 @@ pub trait StorageCollection: Send + Sync {
     // TODO:
     async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool>;
     async fn get_events(&self, id: ID) -> Result<Vec<Event>, crate::error::RetrievalError>;
+}
+
+/// A trait representing the connector-specific functionality of a Node
+/// This allows connectors to interact with nodes without needing to know about
+/// PolicyAgent and Context generics
+#[async_trait]
+pub trait NodeConnector: Send + Sync {
+    /// Get the node's ID
+    fn id(&self) -> proto::NodeId;
+
+    /// Whether this node is durable (persists data)
+    fn durable(&self) -> bool;
+
+    /// Register a new peer connection
+    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>);
+
+    /// Deregister a peer connection
+    fn deregister_peer(&self, node_id: proto::NodeId);
+
+    /// Handle an incoming message from a peer
+    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
 }

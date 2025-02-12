@@ -18,6 +18,7 @@ pub mod value;
 
 pub use model::Model;
 pub use node::Node;
+pub use traits::NodeConnector;
 
 pub use ankurah_proto as proto;
 pub use ankurah_proto::ID;
