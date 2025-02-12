@@ -1,4 +1,4 @@
-use ankurah::Node;
+use ankurah::{policy::PermissiveAgent, Node};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use ankurah_websocket_client_wasm::WebsocketClient;
 use leptos::prelude::*;
@@ -12,7 +12,7 @@ fn main() {
 #[allow(unused)]
 async fn create_client() -> WebsocketClient {
     let storage = IndexedDBStorageEngine::open("test_db").await.unwrap();
-    let node = Node::new(Arc::new(storage));
+    let node = Node::new(Arc::new(storage), PermissiveAgent::new());
     WebsocketClient::new(node, "localhost:9797").unwrap()
 }
 

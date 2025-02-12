@@ -1,3 +1,4 @@
+use ankurah_core::policy::PolicyAgent;
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use std::sync::{Arc, Weak};
@@ -26,18 +27,22 @@ impl PeerSender for LocalProcessSender {
 }
 
 /// connector which establishes one sender between each of the two given nodes
-pub struct LocalProcessConnection {
+pub struct LocalProcessConnection<PA>
+where PA: PolicyAgent + Send + Sync + 'static
+{
     receiver1_task: tokio::task::JoinHandle<()>,
     receiver2_task: tokio::task::JoinHandle<()>,
-    node1: WeakNode,
-    node2: WeakNode,
+    node1: WeakNode<PA>,
+    node2: WeakNode<PA>,
     node1_id: proto::NodeId,
     node2_id: proto::NodeId,
 }
 
-impl LocalProcessConnection {
+impl<PA> LocalProcessConnection<PA>
+where PA: PolicyAgent + Send + Sync + 'static
+{
     /// Create a new LocalConnector and establish connection between the nodes
-    pub async fn new(node1: &Node, node2: &Node) -> anyhow::Result<Self> {
+    pub async fn new(node1: &Node<PA>, node2: &Node<PA>) -> anyhow::Result<Self> {
         let (node1_tx, node1_rx) = mpsc::channel(100);
         let (node2_tx, node2_rx) = mpsc::channel(100);
 
@@ -64,7 +69,7 @@ impl LocalProcessConnection {
         })
     }
 
-    fn setup_receiver(node: Node, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
+    fn setup_receiver(node: Node<PA>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let _ = node.handle_message(message).await;
@@ -73,7 +78,9 @@ impl LocalProcessConnection {
     }
 }
 
-impl Drop for LocalProcessConnection {
+impl<PA> Drop for LocalProcessConnection<PA>
+where PA: PolicyAgent + Send + Sync + 'static
+{
     fn drop(&mut self) {
         self.receiver1_task.abort();
         self.receiver2_task.abort();

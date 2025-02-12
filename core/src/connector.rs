@@ -1,6 +1,8 @@
 use ankurah_proto as proto;
 use async_trait::async_trait;
 
+use crate::{node::NodeInner, policy::PolicyAgent, Node};
+
 // TODO redesign this such that:
 // - the sender and receiver are disconnected at the same time
 // - a connection id or dyn Ord/Eq/Hash is used to identify the connection for deregistration
@@ -24,4 +26,33 @@ pub enum SendError {
     Other(#[from] anyhow::Error),
     #[error("Unknown error")]
     Unknown,
+}
+
+#[async_trait]
+pub trait NodeComms: Send + Sync {
+    fn id(&self) -> proto::NodeId;
+    fn durable(&self) -> bool;
+    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>);
+    fn deregister_peer(&self, node_id: proto::NodeId);
+    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
+    fn cloned(&self) -> Box<dyn NodeComms>;
+}
+
+#[async_trait]
+impl<PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<PA> {
+    fn id(&self) -> proto::NodeId { self.id.clone() }
+    fn durable(&self) -> bool { self.durable }
+    fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
+        //
+        NodeInner::register_peer(&self, presence, sender);
+    }
+    fn deregister_peer(&self, node_id: proto::NodeId) {
+        //
+        NodeInner::deregister_peer(&self, node_id);
+    }
+    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+        //
+        NodeInner::handle_message(&self, message).await
+    }
+    fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }

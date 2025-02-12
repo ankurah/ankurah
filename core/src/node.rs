@@ -14,6 +14,7 @@ use crate::{
     connector::PeerSender,
     error::{RequestError, RetrievalError},
     model::{Entity, View},
+    policy::PolicyAgent,
     reactor::Reactor,
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
@@ -49,18 +50,23 @@ impl From<ankql::error::ParseError> for RetrievalError {
 }
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
-#[derive(Clone)]
-pub struct Node(Arc<NodeInner>);
 
-#[derive(Clone)]
-pub struct WeakNode(Weak<NodeInner>);
+pub struct Node<PA>(Arc<NodeInner<PA>>);
+impl<PA> Clone for Node<PA> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
 
-impl Deref for Node {
-    type Target = Arc<NodeInner>;
+pub struct WeakNode<PA>(Weak<NodeInner<PA>>);
+impl<PA> Clone for WeakNode<PA> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
+
+impl<P> Deref for Node<P> {
+    type Target = Arc<NodeInner<P>>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-pub struct NodeInner {
+pub struct NodeInner<PA> {
     pub id: proto::NodeId,
     pub durable: bool,
     storage_engine: Arc<dyn StorageEngine>,
@@ -74,12 +80,15 @@ pub struct NodeInner {
 
     /// The reactor for handling subscriptions
     reactor: Arc<Reactor>,
+    policy_agent: PA,
 }
 
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 
-impl Node {
-    pub fn new(engine: Arc<dyn StorageEngine>) -> Self {
+impl<PA> Node<PA>
+where PA: PolicyAgent + Send + Sync + 'static
+{
+    pub fn new(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Self {
         let reactor = Reactor::new(engine.clone());
         let id = proto::NodeId::new();
         info!("Node {} created", id);
@@ -93,9 +102,10 @@ impl Node {
             pending_requests: DashMap::new(),
             reactor,
             durable: false,
+            policy_agent,
         }))
     }
-    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Self {
+    pub fn new_durable(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Self {
         let reactor = Reactor::new(engine.clone());
 
         Node(Arc::new(NodeInner {
@@ -108,16 +118,19 @@ impl Node {
             pending_requests: DashMap::new(),
             reactor,
             durable: true,
+            policy_agent,
         }))
     }
-    pub fn weak(&self) -> WeakNode { WeakNode(Arc::downgrade(&self.0)) }
+    pub fn weak(&self) -> WeakNode<PA> { WeakNode(Arc::downgrade(&self.0)) }
 }
 
-impl WeakNode {
-    pub fn upgrade(&self) -> Option<Node> { self.0.upgrade().map(Node) }
+impl<PA> WeakNode<PA> {
+    pub fn upgrade(&self) -> Option<Node<PA>> { self.0.upgrade().map(Node) }
 }
 
-impl NodeInner {
+impl<PA> NodeInner<PA>
+where PA: PolicyAgent + Send + Sync + 'static
+{
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node {} register peer {}", self.id, presence.node_id);
         self.peer_connections
@@ -302,7 +315,7 @@ impl NodeInner {
     /// Begin a transaction.
     ///
     /// This is the main way to edit Entities.
-    pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(Node(self.clone())) }
+    pub fn begin(self: &Arc<Self>, data: PA::ContextData) -> Transaction { Transaction::new(Node(self.clone()), data) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
@@ -440,6 +453,9 @@ impl NodeInner {
     //     }
     // }
 
+    /// Stub to make sure we are able to pass context data to the node
+    /// Remove this when all the read/write operations are accepting context data
+    pub fn test_data(&self, data: &PA::ContextData) {}
     /// Fetch an entity.
     pub async fn fetch_entity(&self, id: proto::ID, collection: &CollectionId) -> Result<Arc<Entity>, RetrievalError> {
         info!("fetch_entity {:?}-{:?}", id, collection);
@@ -605,7 +621,7 @@ impl NodeInner {
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }
 
-impl Drop for Node {
+impl<PA> Drop for Node<PA> {
     fn drop(&mut self) {
         info!("Node {} dropped", self.id);
     }

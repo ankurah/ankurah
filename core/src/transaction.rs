@@ -1,9 +1,11 @@
 use ankurah_proto as proto;
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::{
     error::RetrievalError,
     model::{Entity, Mutable},
+    policy::PolicyAgent,
     Model, Node,
 };
 
@@ -13,7 +15,7 @@ use append_only_vec::AppendOnlyVec;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 pub struct Transaction {
-    pub(crate) node: Node, // only here for committing entities to storage engine
+    pub(crate) node: Box<dyn NodeWithContext>,
 
     entities: AppendOnlyVec<Arc<Entity>>,
 
@@ -22,8 +24,34 @@ pub struct Transaction {
     consumed: bool,
 }
 
+#[async_trait]
+pub trait NodeWithContext {
+    fn next_entity_id(&self) -> proto::ID;
+    async fn fetch_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError>;
+    async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()>;
+    async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()>;
+}
+
+pub struct NodeAndContext<PA: PolicyAgent> {
+    node: Node<PA>,
+    data: PA::ContextData,
+}
+#[async_trait]
+impl<PA: PolicyAgent + Send + Sync + 'static> NodeWithContext for NodeAndContext<PA> {
+    fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
+    async fn fetch_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
+        self.node.test_data(&self.data);
+        self.node.fetch_entity(id, collection).await
+    }
+    async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()> { self.node.insert_entity(entity).await }
+    async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()> { self.node.commit_events(events).await }
+}
+
 impl Transaction {
-    pub fn new(node: Node) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
+    pub fn new<PA: PolicyAgent + Send + Sync + 'static>(node: Node<PA>, data: PA::ContextData) -> Self {
+        let node = Box::new(NodeAndContext { node, data });
+        Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
+    }
 
     /// Fetch an entity already in the transaction.
     pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {

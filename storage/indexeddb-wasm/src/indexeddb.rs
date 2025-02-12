@@ -1,6 +1,7 @@
 use ankql::selection::filter::evaluate_predicate;
 use ankurah_core::error::RetrievalError;
 use ankurah_core::model::Entity;
+use ankurah_core::policy::DEFAULT_CONTEXT as c;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
 use ankurah_proto as proto;
 use anyhow::Result;
@@ -514,8 +515,7 @@ mod tests {
     #![allow(unused)]
 
     use super::*;
-    use ankurah::Model;
-    use ankurah::{Mutable, Node};
+    use ankurah::{Model, Mutable, Node, PermissiveAgent};
     use serde::{Deserialize, Serialize};
     use wasm_bindgen_test::*;
 
@@ -606,12 +606,12 @@ mod tests {
         tracing::info!("Starting test_basic_workflow");
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
         tracing::info!("Storage engine opened");
-        let node = Node::new(Arc::new(storage_engine));
+        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
 
         let id;
         {
             tracing::info!("Creating transaction");
-            let trx = node.begin();
+            let trx = node.begin(c);
             tracing::info!("Transaction created");
             let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await;
             assert_eq!(album.name().value(), Some("The rest of the owl".to_string()));
@@ -643,10 +643,10 @@ mod tests {
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
-        let node = Node::new(Arc::new(storage_engine));
+        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
 
         {
-            let trx = node.begin();
+            let trx = node.begin(c);
 
             trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
 

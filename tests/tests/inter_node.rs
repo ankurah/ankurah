@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah::{changes::ChangeKind, FetchArgs, Mutable, Node, ResultSet, ID};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, FetchArgs, Mutable, Node, PermissiveAgent, ResultSet, ID};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -13,11 +13,11 @@ pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.i
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
-    let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
-    let node2 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node2 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     {
-        let trx = node1.begin();
+        let trx = node1.begin(c);
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
         trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
         trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
@@ -44,8 +44,8 @@ async fn inter_node_fetch() -> Result<()> {
 #[tokio::test]
 async fn server_edits_subscription() -> Result<()> {
     // Create two nodes
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
-    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&server, &client).await?;
@@ -58,7 +58,7 @@ async fn server_edits_subscription() -> Result<()> {
     use ankurah::View;
     // Create initial entities on node1
     let (rex, snuffy, jasper) = {
-        let trx = server.begin();
+        let trx = server.begin(c);
         let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await;
         let snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await;
         let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await;
@@ -80,7 +80,7 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Update Rex's age to 7 on node1
     {
-        let trx = server.begin();
+        let trx = server.begin(c);
         rex.edit(&trx).await?.age().overwrite(0, 1, "7");
         trx.commit().await?;
     }
@@ -92,7 +92,7 @@ async fn server_edits_subscription() -> Result<()> {
     // short circuit to simplify debugging
     // Update Snuffy's age to 3 on node1
     {
-        let trx = server.begin();
+        let trx = server.begin(c);
         snuffy.edit(&trx).await?.age().overwrite(0, 1, "3");
         trx.commit().await?;
     }
@@ -110,9 +110,9 @@ async fn server_edits_subscription() -> Result<()> {
 #[tokio::test]
 async fn test_client_server_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
-    let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()));
-    let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect both clients to the server
     let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
@@ -120,7 +120,7 @@ async fn test_client_server_propagation() -> Result<()> {
 
     // Create an entity on client_a
     {
-        let trx = client_a.begin();
+        let trx = client_a.begin(c);
         trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
         trx.commit().await?;
     }
@@ -144,9 +144,9 @@ async fn test_client_server_propagation() -> Result<()> {
 #[tokio::test]
 async fn test_client_server_subscription_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
-    let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()));
-    let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect both clients to the server
     let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
@@ -162,7 +162,7 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
 
     // Create an entity on client_a
     let album_id = {
-        let trx = client_a.begin();
+        let trx = client_a.begin(c);
         let album = trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
         let id = album.id();
         trx.commit().await?;
