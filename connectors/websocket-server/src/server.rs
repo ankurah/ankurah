@@ -20,11 +20,11 @@ use ankurah_core::node::Node;
 use super::state::Connection;
 
 pub struct WebsocketServer {
-    node: Arc<Node>,
+    node: Node,
 }
 
 impl WebsocketServer {
-    pub fn new(node: Arc<Node>) -> Self { Self { node } }
+    pub fn new(node: Node) -> Self { Self { node } }
 
     pub async fn run(&self, bind_address: &str) -> Result<()> {
         let app = Router::new().route("/ws", get(ws_handler)).with_state(self.node.clone()).layer(
@@ -51,7 +51,7 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(node): State<Arc<Node>>,
+    State(node): State<Node>,
 ) -> impl IntoResponse {
     info!("Upgrading connection");
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
@@ -59,7 +59,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
 }
 
-async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
+async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Node) {
     println!("Connected to {}", who);
 
     let (sender, mut receiver) = socket.split();
@@ -91,7 +91,7 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<Node>) {
     println!("Websocket context {who} destroyed");
 }
 
-async fn process_message(msg: axum::extract::ws::Message, who: SocketAddr, state: &mut Connection, node: Arc<Node>) -> ControlFlow<(), ()> {
+async fn process_message(msg: axum::extract::ws::Message, who: SocketAddr, state: &mut Connection, node: Node) -> ControlFlow<(), ()> {
     match msg {
         axum::extract::ws::Message::Binary(d) => {
             println!(">>> {} sent {} bytes", who, d.len());

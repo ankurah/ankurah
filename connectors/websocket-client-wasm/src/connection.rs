@@ -19,7 +19,7 @@ pub struct ConnectionInner {
     ws: Arc<WebSocket>,
     url: String,
     state: RwLock<ConnectionState>,
-    node: Arc<Node>,
+    node: Node,
     client: Weak<ClientInner>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
@@ -29,7 +29,7 @@ impl std::ops::Deref for Connection {
 }
 
 impl Connection {
-    pub fn new(node: Arc<Node>, url: String, client: Weak<ClientInner>) -> Result<Self, JsValue> {
+    pub fn new(node: Node, url: String, client: Weak<ClientInner>) -> Result<Self, JsValue> {
         let url = if url.starts_with("ws://") || url.starts_with("wss://") { format!("{}/ws", url) } else { format!("wss://{}/ws", url) };
 
         let ws = WebSocket::new(&url)?;

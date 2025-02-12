@@ -4,6 +4,7 @@ use dashmap::{DashMap, DashSet};
 use rand::prelude::*;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
+    ops::Deref,
     sync::{Arc, Weak},
 };
 use tokio::sync::{oneshot, RwLock};
@@ -48,7 +49,18 @@ impl From<ankql::error::ParseError> for RetrievalError {
 }
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
-pub struct Node {
+#[derive(Clone)]
+pub struct Node(Arc<NodeInner>);
+
+#[derive(Clone)]
+pub struct WeakNode(Weak<NodeInner>);
+
+impl Deref for Node {
+    type Target = Arc<NodeInner>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+pub struct NodeInner {
     pub id: proto::NodeId,
     pub durable: bool,
     storage_engine: Arc<dyn StorageEngine>,
@@ -67,11 +79,11 @@ pub struct Node {
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 
 impl Node {
-    pub fn new(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+    pub fn new(engine: Arc<dyn StorageEngine>) -> Self {
         let reactor = Reactor::new(engine.clone());
         let id = proto::NodeId::new();
         info!("Node {} created", id);
-        Arc::new(Self {
+        Node(Arc::new(NodeInner {
             id,
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
@@ -81,11 +93,12 @@ impl Node {
             pending_requests: DashMap::new(),
             reactor,
             durable: false,
-        })
+        }))
     }
-    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Self {
         let reactor = Reactor::new(engine.clone());
-        Arc::new(Self {
+
+        Node(Arc::new(NodeInner {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
@@ -95,9 +108,16 @@ impl Node {
             pending_requests: DashMap::new(),
             reactor,
             durable: true,
-        })
+        }))
     }
+    pub fn weak(&self) -> WeakNode { WeakNode(Arc::downgrade(&self.0)) }
+}
 
+impl WeakNode {
+    pub fn upgrade(&self) -> Option<Node> { self.0.upgrade().map(Node) }
+}
+
+impl NodeInner {
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node {} register peer {}", self.id, presence.node_id);
         self.peer_connections
@@ -112,7 +132,6 @@ impl Node {
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);
     }
-
     pub async fn request(
         &self,
         node_id: proto::NodeId,
@@ -283,7 +302,7 @@ impl Node {
     /// Begin a transaction.
     ///
     /// This is the main way to edit Entities.
-    pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(self.clone()) }
+    pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(Node(self.clone())) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where

@@ -13,7 +13,7 @@ use append_only_vec::AppendOnlyVec;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 pub struct Transaction {
-    pub(crate) node: Arc<Node>, // only here for committing entities to storage engine
+    pub(crate) node: Node, // only here for committing entities to storage engine
 
     entities: AppendOnlyVec<Arc<Entity>>,
 
@@ -23,7 +23,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new(node: Arc<Node>) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
+    pub fn new(node: Node) -> Self { Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false } }
 
     /// Fetch an entity already in the transaction.
     pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
