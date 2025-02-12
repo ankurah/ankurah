@@ -43,8 +43,12 @@ impl PNBackend {
     pub fn new() -> PNBackend { Self { values: Arc::new(RwLock::new(BTreeMap::default())) } }
 
     pub fn get(&self, property_name: PropertyName) -> i64 {
+        self.get_optional(property_name).unwrap_or(0)
+    }
+
+    pub fn get_optional(&self, property_name: PropertyName) -> Option<i64> {
         let values = self.values.read().unwrap();
-        values.get(&property_name).map(|pnvalue| pnvalue.value).unwrap_or(0)
+        values.get(&property_name).map(|pnvalue| pnvalue.value)
     }
 
     pub fn add(&self, property_name: PropertyName, amount: i64) {

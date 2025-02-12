@@ -209,36 +209,47 @@ static ACTIVE_TYPE_MOD_PREFIX: &str = "::ankurah::property::value";
 fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
     let active_type_ident = format_ident!("active_type");
 
+    let mut active_type = None;
     // First check if there's an explicit attribute
     if let Some(active_type_attr) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_type_ident)) {
-        let active_type = active_type_attr.parse_args::<syn::Type>()?;
-        return Ok(ActiveFieldType::convert_type_with_projected(&active_type, &field.ty));
+        active_type = Some(active_type_attr.parse_args::<syn::Type>()?);
+    } else {
+        // Check for exact type matches and provide default Active types
+        if let Type::Path(type_path) = &field.ty {
+            let path_str = quote!(#type_path).to_string().replace(" ", "");
+            match path_str.as_str() {
+                // Add more default mappings here as needed
+                "String" | "std::string::String" => {
+                    let path = format!("{}::YrsString", ACTIVE_TYPE_MOD_PREFIX);
+                    let yrs = syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"))?;
+                    active_type = Some(yrs);
+                }
+                _ => { // Everything else should use `LWW`` by default.
+                    // TODO: Return a list of compile_error! for these types to specify
+                    // that these need to be `Serialize + for<'de> Deserialize<'de>``
+                    let path = format!("{}::LWW", ACTIVE_TYPE_MOD_PREFIX);
+                    let lww = syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"))?;
+                    active_type = Some(lww);
+                },
+            }
+        };
     }
 
-    // Check for exact type matches and provide default Active types
-    if let Type::Path(type_path) = &field.ty {
-        let path_str = quote!(#type_path).to_string().replace(" ", "");
-        match path_str.as_str() {
-            "String" | "std::string::String" => {
-                let path = format!("{}::YrsString", ACTIVE_TYPE_MOD_PREFIX);
-                return syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"));
-            }
-            // Add more default mappings here as needed
-            _ => {},
-        }
-    };
+    if let Some(active_type) = active_type {
+        return Ok(ActiveFieldType::convert_type_with_projected(&active_type, &field.ty));
+    } else {
+        // If we get here, we don't have a supported default Active type
+        let field_name = field.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "unnamed".to_string());
+        let type_str = format!("{:?}", &field.ty);
 
-    // If we get here, we don't have a supported default Active type
-    let field_name = field.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "unnamed".to_string());
-    let type_str = format!("{:?}", &field.ty);
-
-    Err(syn::Error::new_spanned(
-        &field.ty,
-        format!(
-            "No active value type found for field '{}' (type: {}). Please specify using #[active_type(Type)] attribute",
-            field_name, type_str
-        ),
-    ))
+        Err(syn::Error::new_spanned(
+            &field.ty,
+            format!(
+                "No active value type found for field '{}' (type: {}). Please specify using #[active_type(Type)] attribute",
+                field_name, type_str
+            ),
+        ))
+    }
 }
 
 fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
