@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     let node = Node::new_durable(Arc::new(storage));
 
     // Create and start the websocket server
-    let server = WebsocketServer::new(node);
+    let mut server = WebsocketServer::new(node);
     server.run("0.0.0.0:9797").await?;
 
     Ok(())

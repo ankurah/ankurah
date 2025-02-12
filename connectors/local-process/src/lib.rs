@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 
 use ankurah_core::connector::{PeerSender, SendError};
-use ankurah_core::traits::NodeConnector;
+use ankurah_core::traits::{NodeConnector, NodeHandle, WeakNodeHandle};
 
 #[derive(Clone)]
 /// Sender for local process connection
@@ -29,15 +29,17 @@ impl PeerSender for LocalProcessSender {
 pub struct LocalProcessConnection {
     receiver1_task: tokio::task::JoinHandle<()>,
     receiver2_task: tokio::task::JoinHandle<()>,
-    node1: Weak<dyn NodeConnector>,
-    node2: Weak<dyn NodeConnector>,
+    node1: WeakNodeHandle,
+    node2: WeakNodeHandle,
     node1_id: proto::NodeId,
     node2_id: proto::NodeId,
 }
 
 impl LocalProcessConnection {
     /// Create a new LocalConnector and establish connection between the nodes
-    pub async fn new(node1: &Arc<dyn NodeConnector>, node2: &Arc<dyn NodeConnector>) -> anyhow::Result<Self> {
+    pub async fn new(node1: impl Into<NodeHandle>, node2: impl Into<NodeHandle>) -> anyhow::Result<Self> {
+        let node1 = node1.into();
+        let node2 = node2.into();
         let (node1_tx, node1_rx) = mpsc::channel(100);
         let (node2_tx, node2_rx) = mpsc::channel(100);
 
@@ -51,24 +53,18 @@ impl LocalProcessConnection {
             Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id() }),
         );
 
-        let receiver1_task = Self::setup_receiver(node1, node1_rx);
-        let receiver2_task = Self::setup_receiver(node2, node2_rx);
+        let receiver1_task = Self::setup_receiver(node1.weak(), node1_rx);
+        let receiver2_task = Self::setup_receiver(node2.weak(), node2_rx);
 
-        Ok(Self {
-            node1: Arc::downgrade(node1),
-            node2: Arc::downgrade(node2),
-            node1_id: node1.id(),
-            node2_id: node2.id(),
-            receiver1_task,
-            receiver2_task,
-        })
+        Ok(Self { node1: node1.weak(), node2: node2.weak(), node1_id: node1.id(), node2_id: node2.id(), receiver1_task, receiver2_task })
     }
 
-    fn setup_receiver(node: &Arc<dyn NodeConnector>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
-        let node = node.clone();
+    fn setup_receiver(node: WeakNodeHandle, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                let _ = node.handle_message(message).await;
+                if let Some(node) = node.upgrade() {
+                    let _ = node.handle_message(message).await;
+                }
             }
         })
     }

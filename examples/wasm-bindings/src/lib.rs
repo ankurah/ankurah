@@ -72,7 +72,7 @@ pub async fn create_test_entity(client: &WebsocketClient) -> Result<(), JsValue>
         .create(&Session {
             date_connected: "2024-01-01".to_string(),
             ip_address: "127.0.0.1".to_string(),
-            node_id: client.node().id.clone().into(),
+            node_id: client.node().id().clone().into(),
         })
         .await;
     trx.commit().await.unwrap();

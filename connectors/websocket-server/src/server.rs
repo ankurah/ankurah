@@ -15,19 +15,22 @@ use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::{info, warn, Level};
 
-use ankurah_core::traits::NodeConnector;
+use ankurah_core::traits::{NodeConnector, NodeHandle};
 
 use super::state::Connection;
 
 pub struct WebsocketServer {
-    node: Arc<dyn NodeConnector>,
+    node: Option<NodeHandle>,
 }
 
 impl WebsocketServer {
-    pub fn new(node: Arc<dyn NodeConnector>) -> Self { Self { node } }
+    pub fn new(node: impl Into<NodeHandle>) -> Self { Self { node: Some(node.into()) } }
 
-    pub async fn run(&self, bind_address: &str) -> Result<()> {
-        let app = Router::new().route("/ws", get(ws_handler)).with_state(self.node.clone()).layer(
+    pub async fn run(&mut self, bind_address: &str) -> Result<()> {
+        let Some(node) = self.node.take() else {
+            return Err(anyhow::anyhow!("Already been run"));
+        };
+        let app = Router::new().route("/ws", get(ws_handler)).with_state(node).layer(
             ServiceBuilder::new()
                 .layer(
                     TraceLayer::new_for_http()
@@ -51,7 +54,7 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(node): State<Arc<dyn NodeConnector>>,
+    State(node): State<NodeHandle>,
 ) -> impl IntoResponse {
     info!("Upgrading connection");
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
@@ -59,7 +62,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
 }
 
-async fn handle_socket(socket: WebSocket, who: SocketAddr, node: Arc<dyn NodeConnector>) {
+async fn handle_socket(socket: WebSocket, who: SocketAddr, node: NodeHandle) {
     println!("Connected to {}", who);
 
     let (sender, mut receiver) = socket.split();
@@ -95,7 +98,7 @@ async fn process_message(
     msg: axum::extract::ws::Message,
     who: SocketAddr,
     state: &mut Connection,
-    node: Arc<dyn NodeConnector>,
+    node: NodeHandle,
 ) -> ControlFlow<(), ()> {
     match msg {
         axum::extract::ws::Message::Binary(d) => {

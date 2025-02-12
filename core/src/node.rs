@@ -5,6 +5,7 @@ use dashmap::{DashMap, DashSet};
 use rand::prelude::*;
 use std::{
     collections::{btree_map::Entry, BTreeMap},
+    ops::Deref,
     sync::{Arc, Weak},
 };
 use tokio::sync::{oneshot, RwLock};
@@ -18,7 +19,7 @@ use crate::{
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
-    traits::NodeConnector,
+    traits::{NodeConnector, NodeHandle},
     transaction::Transaction,
 };
 use tracing::{debug, info, warn};
@@ -50,7 +51,9 @@ impl From<ankql::error::ParseError> for RetrievalError {
 }
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
-pub struct Node {
+pub struct Node(Arc<NodeInner>);
+
+pub struct NodeInner {
     pub id: proto::NodeId,
     pub durable: bool,
     storage_engine: Arc<dyn StorageEngine>,
@@ -69,11 +72,11 @@ pub struct Node {
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 
 impl Node {
-    pub fn new(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+    pub fn new(engine: Arc<dyn StorageEngine>) -> Self {
         let reactor = Reactor::new(engine.clone());
         let id = proto::NodeId::new();
         info!("Node {} created", id);
-        Arc::new(Self {
+        Node(Arc::new(NodeInner {
             id,
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
@@ -83,11 +86,12 @@ impl Node {
             pending_requests: DashMap::new(),
             reactor,
             durable: false,
-        })
+        }))
     }
-    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Arc<Self> {
+    pub fn new_durable(engine: Arc<dyn StorageEngine>) -> Self {
         let reactor = Reactor::new(engine.clone());
-        Arc::new(Self {
+
+        Node(Arc::new(NodeInner {
             id: proto::NodeId::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
@@ -97,9 +101,16 @@ impl Node {
             pending_requests: DashMap::new(),
             reactor,
             durable: true,
-        })
+        }))
     }
+}
 
+impl Deref for Node {
+    type Target = Arc<NodeInner>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl NodeInner {
     pub async fn request(
         &self,
         node_id: proto::NodeId,
@@ -126,6 +137,46 @@ impl Node {
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
+    async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
+        match message {
+            proto::NodeMessage::Request(request) => {
+                info!("Node {} received request {}", self.id, request);
+                // TODO: Should we spawn a task here and make handle_message synchronous?
+                // I think this depends on how we want to handle timeouts.
+                // I think we want timeouts to be handled by the node, not the connector,
+                // which would lend itself to spawning a task here and making this function synchronous.
+
+                // double check to make sure we have a connection to the peer based on the node id
+                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
+                    let from = request.from.clone();
+                    let request_id = request.id.clone();
+                    if request.to != self.id {
+                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
+                    }
+
+                    let body = match self.handle_request(request).await {
+                        Ok(result) => result,
+                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                    };
+                    let _result = sender
+                        .send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                            request_id,
+                            from: self.id.clone(),
+                            to: from,
+                            body,
+                        }))
+                        .await;
+                }
+            }
+            proto::NodeMessage::Response(response) => {
+                info!("Node {} received response {}", self.id, response);
+                if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
+                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                }
+            }
+        }
+        Ok(())
+    }
     async fn handle_request(self: &Arc<Self>, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
         match request.body {
             proto::NodeRequestBody::CommitEvents(events) => {
@@ -229,7 +280,7 @@ impl Node {
     /// Begin a transaction.
     ///
     /// This is the main way to edit Entities.
-    pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(self.clone()) }
+    pub fn begin(self: &Arc<Self>) -> Transaction { Transaction::new(Node(self.clone())) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
@@ -539,7 +590,7 @@ impl Drop for Node {
 }
 
 #[async_trait]
-impl NodeConnector for Arc<Node> {
+impl NodeConnector for Node {
     fn id(&self) -> proto::NodeId { self.id.clone() }
 
     fn durable(&self) -> bool { self.durable }
@@ -559,44 +610,17 @@ impl NodeConnector for Arc<Node> {
         self.durable_peers.remove(&node_id);
     }
 
-    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
-        match message {
-            proto::NodeMessage::Request(request) => {
-                info!("Node {} received request {}", self.id, request);
-                // TODO: Should we spawn a task here and make handle_message synchronous?
-                // I think this depends on how we want to handle timeouts.
-                // I think we want timeouts to be handled by the node, not the connector,
-                // which would lend itself to spawning a task here and making this function synchronous.
+    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> { Node::handle_message(self, message).await }
+}
 
-                // double check to make sure we have a connection to the peer based on the node id
-                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
-                    let from = request.from.clone();
-                    let request_id = request.id.clone();
-                    if request.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
-                    }
-
-                    let body = match self.handle_request(request).await {
-                        Ok(result) => result,
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                    };
-                    let _result = sender
-                        .send_message(proto::NodeMessage::Response(proto::NodeResponse {
-                            request_id,
-                            from: self.id.clone(),
-                            to: from,
-                            body,
-                        }))
-                        .await;
-                }
-            }
-            proto::NodeMessage::Response(response) => {
-                info!("Node {} received response {}", self.id, response);
-                if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
-                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
-                }
-            }
-        }
-        Ok(())
+impl Into<NodeHandle> for Node {
+    // obnoxious to have to use a double Arc >_>
+    fn into(self) -> NodeHandle { NodeHandle(Arc::new(self)) }
+}
+impl Into<NodeHandle> for &Node {
+    // obnoxious to have to use a double Arc >_>
+    fn into(self) -> NodeHandle {
+        let node = Node((*self).clone());
+        NodeHandle(Arc::new(node))
     }
 }
