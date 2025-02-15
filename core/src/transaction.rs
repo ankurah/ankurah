@@ -1,12 +1,9 @@
 use ankurah_proto as proto;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 use crate::{
-    error::RetrievalError,
-    model::{Entity, Mutable},
-    policy::PolicyAgent,
-    Model, Node,
+    error::RetrievalError, model::{Entity, Mutable}, policy::PolicyAgent, storage::StorageEngine, Model, Node
 };
 
 use append_only_vec::AppendOnlyVec;
@@ -14,16 +11,17 @@ use append_only_vec::AppendOnlyVec;
 // Q. When do we want unified vs individual property storage for TypeEngine operations?
 // A. When we start to care about differentiating possible recipients for different properties.
 
-pub struct Transaction {
-    pub(crate) node: Box<dyn NodeWithContext>,
+pub struct Transaction<SE: StorageEngine, PA: PolicyAgent> {
+    pub(crate) node: NodeAndContext<SE, PA>,
 
-    entities: AppendOnlyVec<Arc<Entity>>,
+    entities: AppendOnlyVec<Arc<Entity<SE, PA>>>,
 
     // markers
     implicit: bool,
     consumed: bool,
 }
 
+/*
 #[async_trait]
 pub trait NodeWithContext {
     fn next_entity_id(&self) -> proto::ID;
@@ -31,30 +29,42 @@ pub trait NodeWithContext {
     async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()>;
     async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()>;
 }
+*/
 
-pub struct NodeAndContext<PA: PolicyAgent> {
-    node: Node<PA>,
+pub struct NodeAndContext<SE: StorageEngine, PA: PolicyAgent> {
+    node: Node<SE, PA>,
     data: PA::ContextData,
 }
-#[async_trait]
-impl<PA: PolicyAgent + Send + Sync + 'static> NodeWithContext for NodeAndContext<PA> {
+
+/*impl<SE: StorageEngine, PA: PolicyAgent> Deref for NodeAndContext<SE, PA> {
+    type Target = Node<SE, PA>;
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}*/
+
+impl<SE: StorageEngine + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeAndContext<SE, PA> {
     fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
-    async fn fetch_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
+    async fn fetch_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity<SE, PA>>, RetrievalError> {
         self.node.test_data(&self.data);
         self.node.fetch_entity(id, collection).await
     }
-    async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()> { self.node.insert_entity(entity).await }
+    async fn insert_entity(&self, entity: Arc<Entity<SE, PA>>) -> anyhow::Result<()> { self.node.insert_entity(entity).await }
     async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()> { self.node.commit_events(events).await }
 }
 
-impl Transaction {
-    pub fn new<PA: PolicyAgent + Send + Sync + 'static>(node: Node<PA>, data: PA::ContextData) -> Self {
-        let node = Box::new(NodeAndContext { node, data });
-        Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
+impl<SE, PA> Transaction<SE, PA>
+where 
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    pub fn new(node: Node<SE, PA>, data: PA::ContextData) -> Self {
+        let node = NodeAndContext { node, data };
+        Self { node: node, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
     }
 
     /// Fetch an entity already in the transaction.
-    pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
+    pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity<SE, PA>>, RetrievalError> {
         if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
             return Ok(entity);
         }
@@ -63,26 +73,26 @@ impl Transaction {
         Ok(self.add_entity(upstream.snapshot()))
     }
 
-    fn add_entity(&self, entity: Arc<Entity>) -> &Arc<Entity> {
+    fn add_entity(&self, entity: Arc<Entity<SE, PA>>) -> &Arc<Entity<SE, PA>> {
         let index = self.entities.push(entity);
         &self.entities[index]
     }
 
-    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec> {
+    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec, SE, PA> {
         let id = self.node.next_entity_id();
         let new_entity = Arc::new(model.create_entity(id));
         let entity_ref = self.add_entity(new_entity);
-        <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
+        <M::Mutable<'rec, SE, PA> as Mutable<'rec>>::new(entity_ref)
     }
     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
     pub async fn edit<'rec, 'trx: 'rec, M: Model>(
         &'trx self,
         id: impl Into<proto::ID>,
-    ) -> Result<M::Mutable<'rec>, crate::error::RetrievalError> {
+    ) -> Result<M::Mutable<'rec, SE, PA>, crate::error::RetrievalError> {
         let id = id.into();
         let entity = self.get_entity(id, &M::collection()).await?;
 
-        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
+        Ok(<M::Mutable<'rec, SE, PA> as Mutable<'rec>>::new(entity))
     }
 
     #[must_use]
@@ -98,7 +108,7 @@ impl Transaction {
         for entity in self.entities.iter() {
             if let Some(entity_event) = entity.commit()? {
                 if let Some(upstream) = &entity.upstream {
-                    upstream.apply_event(&self.node, &entity_event)?;
+                    upstream.apply_event(self.node.node, &entity_event)?;
                 } else {
                     self.node.insert_entity(entity.clone()).await?;
                 }

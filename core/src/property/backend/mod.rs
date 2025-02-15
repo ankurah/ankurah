@@ -8,7 +8,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::storage::Materialized;
+use crate::node::NodeInner;
+use crate::policy::PolicyAgent;
+use crate::storage::{Materialized, StorageEngine};
 
 pub mod lww;
 pub mod pn_counter;
@@ -21,7 +23,7 @@ pub use yrs::YrsBackend;
 
 use super::PropertyName;
 
-pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
+pub trait PropertyBackend<StorageEngine, PolicyAgent>: Any + Send + Sync + Debug + 'static {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
     fn downcasted(self: Arc<Self>, name: &str) -> BackendDowncasted {
         let upcasted = self.as_arc_dyn_any();
@@ -33,7 +35,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
         }
     }
     fn as_debug(&self) -> &dyn Debug;
-    fn fork(&self) -> Box<dyn PropertyBackend>;
+    fn fork(&self) -> Box<dyn PropertyBackend<StorageEngine, PolicyAgent>>;
 
     fn properties(&self) -> Vec<String>;
     fn materialized(&self) -> BTreeMap<PropertyName, Materialized>;
@@ -58,7 +60,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_precursors: &Clock,
-        node: &Node,
+        node: &NodeInner<StorageEngine, PolicyAgent>,
     ) -> anyhow::Result<()>;
 }
 
@@ -95,30 +97,30 @@ pub enum BackendDowncasted {
 
 /// Holds the property backends inside of entities.
 #[derive(Debug)]
-pub struct Backends {
-    pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
+pub struct Backends<SE, PA> {
+    pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend<SE, PA>>>>>,
     pub head: Arc<Mutex<Clock>>,
 }
 
 // This is where this gets a bit tough.
 // PropertyBackends should either have a concrete type of some sort,
 // or if they can take a generic, they should also take a `Vec<u8>`.
-pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
+pub fn backend_from_string<SE, PA>(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend<SE, PA>>, RetrievalError> {
     if name == "yrs" {
         let backend = match buffer {
-            Some(buffer) => YrsBackend::from_state_buffer(buffer)?,
+            Some(buffer) => <YrsBackend as PropertyBackend<SE, PA>>::from_state_buffer(buffer)?,
             None => YrsBackend::new(),
         };
         Ok(Arc::new(backend))
     } else if name == "lww" {
         let backend = match buffer {
-            Some(buffer) => LWWBackend::from_state_buffer(buffer)?,
+            Some(buffer) => <LWWBackend as PropertyBackend<SE, PA>>::from_state_buffer(buffer)?,
             None => LWWBackend::new(),
         };
         Ok(Arc::new(backend))
     } else if name == "pn" {
         let backend = match buffer {
-            Some(buffer) => PNBackend::from_state_buffer(buffer)?,
+            Some(buffer) => <PNBackend as PropertyBackend<SE, PA>>::from_state_buffer(buffer)?,
             None => PNBackend::new(),
         };
         Ok(Arc::new(backend))
@@ -127,18 +129,26 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
     }
 }
 
-impl Default for Backends {
+impl<SE, PA> Default for Backends<SE, PA>
+where 
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + 'static,
+{
     fn default() -> Self { Self::new() }
 }
 
-impl Backends {
+impl<SE, PA> Backends<SE, PA>
+where 
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + 'static,
+{
     pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())), head: Arc::new(Mutex::new(Clock::default())) } }
 
-    fn backends_lock(&self) -> MutexGuard<BTreeMap<String, Arc<dyn PropertyBackend>>> {
+    fn backends_lock(&self) -> MutexGuard<BTreeMap<String, Arc<dyn PropertyBackend<SE, PA>>>> {
         self.backends.lock().expect("other thread panicked, panic here too")
     }
 
-    pub fn get<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
+    pub fn get<P: PropertyBackend<SE, PA>>(&self) -> Result<Arc<P>, RetrievalError> {
         let backend_name = P::property_backend_name();
         let backend = self.get_raw(backend_name)?;
         let upcasted = backend.as_arc_dyn_any();
@@ -150,7 +160,7 @@ impl Backends {
         Ok(backend.downcasted(&backend_name))
     }
 
-    pub fn get_raw(&self, backend_name: String) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
+    pub fn get_raw(&self, backend_name: String) -> Result<Arc<dyn PropertyBackend<SE, PA>>, RetrievalError> {
         let mut backends = self.backends_lock();
         if let Some(backend) = backends.get(&backend_name) {
             Ok(backend.clone())
@@ -167,7 +177,7 @@ impl Backends {
     }
 
     /// Fork the data behind the backends.
-    pub fn fork(&self) -> Backends {
+    pub fn fork(&self) -> Backends<SE, PA> {
         let backends = self.backends_lock();
         let mut forked = BTreeMap::new();
         for (name, backend) in &*backends {
@@ -177,7 +187,7 @@ impl Backends {
         Self { backends: Arc::new(Mutex::new(forked)), head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())) }
     }
 
-    fn insert(&self, backend_name: String, backend: Arc<dyn PropertyBackend>) {
+    fn insert(&self, backend_name: String, backend: Arc<dyn PropertyBackend<SE, PA>>) {
         let mut backends = self.backends_lock();
         backends.insert(backend_name, backend);
     }
@@ -218,7 +228,7 @@ impl Backends {
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_precursors: &Clock,
-        node: &Node,
+        node: &NodeInner<SE, PA>,
     ) -> Result<()> {
         let backend = self.get_raw(backend_name)?;
         backend.apply_operations(operations, current_head, event_precursors, node)?;

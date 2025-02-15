@@ -1,7 +1,7 @@
 use ankurah_proto as proto;
 use async_trait::async_trait;
 
-use crate::{node::NodeInner, policy::PolicyAgent, Node};
+use crate::{node::NodeInner, policy::PolicyAgent, storage::StorageEngine, Node};
 
 // TODO redesign this such that:
 // - the sender and receiver are disconnected at the same time
@@ -39,7 +39,7 @@ pub trait NodeComms: Send + Sync {
 }
 
 #[async_trait]
-impl<PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<PA> {
+impl<SE: StorageEngine + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
     fn id(&self) -> proto::NodeId { self.id.clone() }
     fn durable(&self) -> bool { self.durable }
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {

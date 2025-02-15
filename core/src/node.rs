@@ -51,28 +51,29 @@ impl From<ankql::error::ParseError> for RetrievalError {
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
-pub struct Node<PA>(Arc<NodeInner<PA>>);
-impl<PA> Clone for Node<PA> {
+pub struct Node<StorageEngine, PolicyAgent>(Arc<NodeInner<StorageEngine, PolicyAgent>>);
+
+impl<SE, PA> Clone for Node<SE, PA> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct WeakNode<PA>(Weak<NodeInner<PA>>);
-impl<PA> Clone for WeakNode<PA> {
+pub struct WeakNode<SE, PA>(Weak<NodeInner<SE, PA>>);
+impl<SE, PA> Clone for WeakNode<SE, PA> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<P> Deref for Node<P> {
-    type Target = Arc<NodeInner<P>>;
+impl<SE, PA> Deref for Node<SE, PA> {
+    type Target = Arc<NodeInner<SE, PA>>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-pub struct NodeInner<PA> {
+pub struct NodeInner<SE, PA> {
     pub id: proto::NodeId,
     pub durable: bool,
-    storage_engine: Arc<dyn StorageEngine>,
+    storage_engine: Arc<SE>,
     collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
 
-    entities: Arc<RwLock<EntityMap>>,
+    entities: Arc<RwLock<EntityMap<SE, PA>>>,
     // peer_connections: Vec<PeerConnection>,
     peer_connections: DashMap<proto::NodeId, PeerState>,
     durable_peers: DashSet<proto::NodeId>,
@@ -83,12 +84,14 @@ pub struct NodeInner<PA> {
     policy_agent: PA,
 }
 
-type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
+type EntityMap<SE, PA> = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity<SE, PA>>>;
 
-impl<PA> Node<PA>
-where PA: PolicyAgent + Send + Sync + 'static
+impl<SE, PA> Node<SE, PA>
+where
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + Send + Sync + 'static
 {
-    pub fn new(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Self {
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
         let reactor = Reactor::new(engine.clone());
         let id = proto::NodeId::new();
         info!("Node {} created", id);
@@ -105,7 +108,7 @@ where PA: PolicyAgent + Send + Sync + 'static
             policy_agent,
         }))
     }
-    pub fn new_durable(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Self {
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
         let reactor = Reactor::new(engine.clone());
 
         Node(Arc::new(NodeInner {
@@ -121,15 +124,17 @@ where PA: PolicyAgent + Send + Sync + 'static
             policy_agent,
         }))
     }
-    pub fn weak(&self) -> WeakNode<PA> { WeakNode(Arc::downgrade(&self.0)) }
+    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
 }
 
-impl<PA> WeakNode<PA> {
-    pub fn upgrade(&self) -> Option<Node<PA>> { self.0.upgrade().map(Node) }
+impl<SE, PA> WeakNode<SE, PA> {
+    pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.0.upgrade().map(Node) }
 }
 
-impl<PA> NodeInner<PA>
-where PA: PolicyAgent + Send + Sync + 'static
+impl<SE, PA> NodeInner<SE, PA>
+where 
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + Send + Sync + 'static
 {
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node {} register peer {}", self.id, presence.node_id);
@@ -315,7 +320,9 @@ where PA: PolicyAgent + Send + Sync + 'static
     /// Begin a transaction.
     ///
     /// This is the main way to edit Entities.
-    pub fn begin(self: &Arc<Self>, data: PA::ContextData) -> Transaction { Transaction::new(Node(self.clone()), data) }
+    pub fn begin(self: &Arc<Self>, data: PA::ContextData) -> Transaction<SE, PA> {
+        Transaction::new(Node(self.clone()), data)
+    }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
@@ -337,7 +344,7 @@ where PA: PolicyAgent + Send + Sync + 'static
             // Apply Events to the Node's registered Entities first.
             let entity = self.fetch_entity(event.entity_id, &event.collection).await?;
 
-            entity.apply_event(&self, event)?;
+            entity.apply_event(self, event)?;
 
             let state = entity.to_state()?;
             // Push the state buffers to storage.
@@ -384,7 +391,7 @@ where PA: PolicyAgent + Send + Sync + 'static
     /// so when they hand out read Entities, they have to work immediately.
     /// TODO: Discuss. The upside is that you can call .read() on a Mutable. The downside is that the behavior is inconsistent
     /// between newly created Entities and Entities that are created in a transaction scope.
-    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Arc<Entity>) -> anyhow::Result<()> {
+    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Arc<Entity<SE, PA>>) -> anyhow::Result<()> {
         match self.entities.write().await.entry((entity.id, entity.collection.clone())) {
             Entry::Vacant(entry) => {
                 entry.insert(Arc::downgrade(&entity));
@@ -403,7 +410,7 @@ where PA: PolicyAgent + Send + Sync + 'static
         collection_id: &CollectionId,
         id: proto::ID,
         state: &proto::State,
-    ) -> Result<Arc<Entity>, RetrievalError> {
+    ) -> Result<Arc<Entity<SE, PA>>, RetrievalError> {
         let mut entities = self.entities.write().await;
 
         match entities.entry((id, collection_id.clone())) {
@@ -425,7 +432,7 @@ where PA: PolicyAgent + Send + Sync + 'static
         }
     }
 
-    pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection_id: &CollectionId) -> Option<Arc<Entity>> {
+    pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection_id: &CollectionId) -> Option<Arc<Entity<SE, PA>>> {
         let entities = self.entities.read().await;
         if let Some(entity) = entities.get(&(id, collection_id.clone())) {
             entity.upgrade()
@@ -457,7 +464,7 @@ where PA: PolicyAgent + Send + Sync + 'static
     /// Remove this when all the read/write operations are accepting context data
     pub fn test_data(&self, data: &PA::ContextData) {}
     /// Fetch an entity.
-    pub async fn fetch_entity(&self, id: proto::ID, collection: &CollectionId) -> Result<Arc<Entity>, RetrievalError> {
+    pub async fn fetch_entity(&self, id: proto::ID, collection: &CollectionId) -> Result<Arc<Entity<SE, PA>>, RetrievalError> {
         info!("fetch_entity {:?}-{:?}", id, collection);
 
         if let Some(local) = self.fetch_entity_from_node(id, collection).await {
@@ -481,7 +488,7 @@ where PA: PolicyAgent + Send + Sync + 'static
         }
     }
 
-    pub async fn get_entity<R: View>(&self, id: proto::ID) -> Result<R, RetrievalError> {
+    pub async fn get_entity<R: View<SE, PA>>(&self, id: proto::ID) -> Result<R, RetrievalError> {
         use crate::model::Model;
         let collection_id = R::Model::collection();
         let entity = self.fetch_entity(id, &collection_id).await?;
@@ -521,12 +528,12 @@ where PA: PolicyAgent + Send + Sync + 'static
         }
     }
 
-    pub async fn get<R: View>(self: &Arc<Self>, id: proto::ID) -> Result<R, RetrievalError> {
+    pub async fn get<R: View<SE, PA>>(self: &Arc<Self>, id: proto::ID) -> Result<R, RetrievalError> {
         let entity = self.fetch_entity(id, &R::collection()).await?;
         Ok(R::from_entity(entity))
     }
 
-    pub async fn fetch<R: View>(
+    pub async fn fetch<R: View<SE, PA>>(
         self: &Arc<Self>,
         args: impl TryInto<FetchArgs, Error = impl Into<RetrievalError>>,
     ) -> Result<ResultSet<R>, RetrievalError> {

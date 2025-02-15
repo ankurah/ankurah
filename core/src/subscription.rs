@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 pub type Callback<R> = Box<dyn Fn(ChangeSet<R>) + Send + Sync + 'static>;
 
 /// A subscription that can be shared between indexes
-pub struct Subscription<R: Clone> {
+pub struct Subscription<R: Clone, SE, PA> {
     #[allow(unused)]
     pub(crate) id: proto::SubscriptionId,
     pub(crate) collection_id: proto::CollectionId,
@@ -14,7 +14,7 @@ pub struct Subscription<R: Clone> {
     pub(crate) callback: Arc<Callback<R>>,
     // Track which entities currently match this subscription
     // TODO make this a ResultSet so we can clone it cheaply
-    pub(crate) matching_entities: Mutex<Vec<Arc<Entity>>>,
+    pub(crate) matching_entities: Mutex<Vec<Arc<Entity<SE, PA>>>>,
 }
 
 /// A handle to a subscription that can be used to register callbacks

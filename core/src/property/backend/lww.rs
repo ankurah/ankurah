@@ -9,9 +9,7 @@ use ankurah_proto::{Clock, ClockOrdering, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName},
-    storage::Materialized,
-    Node,
+    node::NodeInner, property::{backend::PropertyBackend, traits::compare_clocks, PropertyName}, storage::Materialized, Node
 };
 
 #[derive(Clone, Debug)]
@@ -49,12 +47,12 @@ impl LWWBackend {
     }
 }
 
-impl PropertyBackend for LWWBackend {
+impl<SE, PA> PropertyBackend<SE, PA> for LWWBackend {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> { self as Arc<dyn Any + Send + Sync + 'static> }
 
     fn as_debug(&self) -> &dyn Debug { self as &dyn Debug }
 
-    fn fork(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Box<dyn PropertyBackend<SE, PA>> {
         let values = self.values.read().unwrap();
         let cloned = (*values).clone();
         drop(values);
@@ -95,7 +93,7 @@ impl PropertyBackend for LWWBackend {
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_head: &Clock, node: &Node) -> anyhow::Result<()> {
+    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_head: &Clock, node: &NodeInner<SE, PA>) -> anyhow::Result<()> {
         let mut values = self.values.write().unwrap();
 
         // TODO: Figure out this comparison

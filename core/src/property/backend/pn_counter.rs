@@ -9,12 +9,10 @@ use std::{
 use ankurah_proto::Clock;
 
 use crate::{
-    property::{
+    node::NodeInner, property::{
         backend::{Operation, PropertyBackend},
         PropertyName,
-    },
-    storage::Materialized,
-    Node,
+    }, storage::Materialized, Node
 };
 
 #[derive(Debug)]
@@ -61,12 +59,12 @@ impl PNBackend {
     }
 }
 
-impl PropertyBackend for PNBackend {
+impl<SE, PA> PropertyBackend<SE, PA> for PNBackend {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> { self as Arc<dyn Any + Send + Sync + 'static> }
 
     fn as_debug(&self) -> &dyn Debug { self as &dyn Debug }
 
-    fn fork(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Box<dyn PropertyBackend<SE, PA>> {
         let values = self.values.read().unwrap();
         let snapshotted = values.iter().map(|(key, value)| (key.to_owned(), value.snapshot())).collect::<BTreeMap<_, _>>();
         Box::new(Self { values: Arc::new(RwLock::new(snapshotted)) })
@@ -115,7 +113,7 @@ impl PropertyBackend for PNBackend {
         operations: &Vec<Operation>,
         _current_head: &Clock,
         _event_head: &Clock,
-        _node: &Node,
+        _node: &NodeInner<SE, PA>,
     ) -> anyhow::Result<()> {
         for operation in operations {
             let diffs = bincode::deserialize::<BTreeMap<PropertyName, i64>>(&operation.diff)?;

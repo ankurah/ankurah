@@ -10,12 +10,10 @@ use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
 use crate::{
-    property::{
+    node::NodeInner, property::{
         backend::{Operation, PropertyBackend},
         PropertyName,
-    },
-    storage::Materialized,
-    Node,
+    }, storage::Materialized, Node
 };
 
 /// Stores one or more properties of an entity
@@ -62,15 +60,15 @@ impl YrsBackend {
     }
 }
 
-impl PropertyBackend for YrsBackend {
+impl<SE, PA> PropertyBackend<SE, PA> for YrsBackend {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> { self as Arc<dyn Any + Send + Sync + 'static> }
 
     fn as_debug(&self) -> &dyn Debug { self as &dyn Debug }
 
-    fn fork(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Box<dyn PropertyBackend<SE, PA>> {
         // TODO: Don't do all this just to sever the internal Yrs Arcs
-        let state_buffer = self.to_state_buffer().unwrap();
-        let backend = Self::from_state_buffer(&state_buffer).unwrap();
+        let state_buffer = <YrsBackend as PropertyBackend<SE, PA>>::to_state_buffer(&self).unwrap();
+        let backend = <YrsBackend as PropertyBackend<SE, PA>>::from_state_buffer(&state_buffer).unwrap();
         Box::new(backend)
     }
 
@@ -132,7 +130,7 @@ impl PropertyBackend for YrsBackend {
         operations: &Vec<Operation>,
         _current_head: &Clock,
         _event_head: &Clock,
-        _node: &Node,
+        _node: &NodeInner<SE, PA>,
     ) -> anyhow::Result<()> {
         // println!("apply operations: {:?}", operations);
         for operation in operations {

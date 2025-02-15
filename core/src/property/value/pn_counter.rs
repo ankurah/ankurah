@@ -55,7 +55,7 @@ impl<I: Integer> PNCounter<I> {
 }
 
 impl<I> FromEntity for PNCounter<I> {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+    fn from_entity<SE; StorageEngine + 'static, PA: PolicyAgent + 'static>(property_name: PropertyName, entity: &Entity<SE, PA>) -> Self {
         let backend = entity.backends().get::<PNBackend>().expect("PNBackend should exist");
         Self::new(property_name, backend)
     }

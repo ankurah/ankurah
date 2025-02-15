@@ -2,12 +2,12 @@ use ankurah_proto::{Clock, ClockOrdering};
 use anyhow::Result;
 use futures::future::Join3;
 
-use crate::{error::RetrievalError, model::Entity, property::PropertyName, Node};
+use crate::{error::RetrievalError, model::Entity, node::NodeInner, policy::PolicyAgent, property::PropertyName, storage::StorageEngine, Node};
 
 use thiserror::Error;
 
 pub trait InitializeWith<T> {
-    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
+    fn initialize_with<SE: StorageEngine + 'static, PA: PolicyAgent + 'static>(entity: &Entity<SE, PA>, property_name: PropertyName, value: &T) -> Self;
 }
 
 #[derive(Error, Debug)]
@@ -29,7 +29,7 @@ impl From<RetrievalError> for PropertyError {
 }
 
 pub trait FromEntity {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
+    fn from_entity<SE: StorageEngine + 'static, PA: PolicyAgent + 'static>(property_name: PropertyName, entity: &Entity<SE, PA>) -> Self;
 }
 
 pub trait FromActiveType<A> {
@@ -37,7 +37,7 @@ pub trait FromActiveType<A> {
     where Self: Sized;
 }
 
-pub fn compare_clocks(clock: &Clock, other: &Clock, node: &Node) -> ClockOrdering {
+pub fn compare_clocks<SE, PA>(clock: &Clock, other: &Clock, node: &NodeInner<SE, PA>) -> ClockOrdering {
     let ulid1 = clock.as_slice().iter().max();
     let ulid2 = other.as_slice().iter().max();
 

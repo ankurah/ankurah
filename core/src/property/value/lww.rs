@@ -48,7 +48,7 @@ where T: Serialize + for<'a> Deserialize<'a>
 impl<T> FromEntity for LWW<T>
 where T: serde::Serialize + for<'de> serde::Deserialize<'de>
 {
-    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+    fn from_entity<SE, PA>(property_name: PropertyName, entity: &Entity<SE, PA>) -> Self {
         let backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
         Self { property_name: property_name, backend: backend, phantom: PhantomData }
     }

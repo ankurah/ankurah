@@ -5,7 +5,10 @@ use tracing::info;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crate::node::NodeInner;
+use crate::policy::PolicyAgent;
 use crate::property::PropertyError;
+use crate::storage::StorageEngine;
 use crate::Node;
 use crate::{error::RetrievalError, property::Backends};
 
@@ -16,25 +19,29 @@ use ankql::selection::filter::Filterable;
 /// A model is a struct that represents the present values for a given entity
 /// Schema is defined primarily by the Model object, and the View is derived from that via macro.
 pub trait Model {
-    type View: View;
-    type Mutable<'trx>: Mutable<'trx>;
+    type View<SE: StorageEngine + 'static, PA: PolicyAgent + 'static>: View<SE, PA>;
+    type Mutable<'trx, SE: StorageEngine + 'static, PA: PolicyAgent + 'static>: Mutable<'trx, SE, PA>;
     fn collection() -> CollectionId;
-    fn create_entity(&self, id: ID) -> Entity;
+    fn create_entity<SE, PA>(&self, id: ID) -> Entity<SE, PA>;
 }
 
 /// A read only view of an Entity which offers typed accessors
-pub trait View {
+pub trait View<SE, PA>
+where 
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + 'static,
+{
     type Model: Model;
-    type Mutable<'trx>: Mutable<'trx>;
+    type Mutable<'trx>: Mutable<'trx, SE, PA>;
     fn id(&self) -> ID { self.entity().id }
-    fn backends(&self) -> &Backends { self.entity().backends() }
+    fn backends(&self) -> &Backends<SE, PA> { self.entity().backends() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
-    fn entity(&self) -> &Arc<Entity>;
-    fn from_entity(inner: Arc<Entity>) -> Self;
+    fn entity(&self) -> &Arc<Entity<SE, PA>>;
+    fn from_entity(inner: Arc<Entity<SE, PA>>) -> Self;
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
 }
 
-impl std::fmt::Display for Entity {
+impl<SE, PA> std::fmt::Display for Entity<SE, PA> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
     }
@@ -42,23 +49,27 @@ impl std::fmt::Display for Entity {
 
 /// An entity represents a unique thing within a collection
 #[derive(Debug)]
-pub struct Entity {
+pub struct Entity<SE, PA> {
     pub id: ID,
     pub collection: CollectionId,
-    backends: Backends,
+    backends: Backends<SE, PA>,
     head: Arc<Mutex<Clock>>,
-    pub upstream: Option<Arc<Entity>>,
+    pub upstream: Option<Arc<Entity<SE, PA>>>,
 }
 
-impl Entity {
+impl<SE, PA> Entity<SE, PA>
+where 
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + 'static,
+{
     pub fn collection(&self) -> CollectionId { self.collection.clone() }
 
-    pub fn backends(&self) -> &Backends { &self.backends }
+    pub fn backends(&self) -> &Backends<SE, PA> { &self.backends }
 
     pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
 
     // used by the Model macro
-    pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
+    pub fn create(id: ID, collection: CollectionId, backends: Backends<SE, PA>) -> Self {
         Self { id, collection, backends, head: Arc::new(Mutex::new(Clock::default())), upstream: None }
     }
     pub fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
@@ -119,7 +130,7 @@ impl Entity {
         }
     */
 
-    pub fn apply_event(&self, node: &Node, event: &Event) -> Result<()> {
+    pub fn apply_event(&self, node: &NodeInner<SE, PA>, event: &Event) -> Result<()> {
         /*
            case A: event precursor descends the current head, then set entity clock to singleton of event id
            case B: event precursor is concurrent to the current head, push event id to event head clock.
@@ -159,7 +170,7 @@ impl Entity {
     }
 }
 
-impl Filterable for Entity {
+impl<SE: 'static, PA: 'static> Filterable for Entity<SE, PA> {
     fn collection(&self) -> &str { self.collection.as_str() }
 
     /// TODO Implement this as a typecasted value. eg value<T> -> Option<Result<T>>
@@ -173,20 +184,20 @@ impl Filterable for Entity {
 
 /// A mutable Model instance for an Entity with typed accessors.
 /// It is associated with a transaction, and may not outlive said transaction.
-pub trait Mutable<'rec> {
+pub trait Mutable<'rec, SE: StorageEngine + 'static, PA: PolicyAgent + 'static> {
     type Model: Model;
-    type View: View;
+    type View: View<SE, PA>;
     fn id(&self) -> ID { self.entity().id }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
-    fn backends(&self) -> &Backends { &self.entity().backends }
-    fn entity(&self) -> &Arc<Entity>;
-    fn new(inner: &'rec Arc<Entity>) -> Self
+    fn backends(&self) -> &Backends<SE, PA> { &self.entity().backends }
+    fn entity(&self) -> &Arc<Entity<SE, PA>>;
+    fn new(inner: &'rec Arc<Entity<SE, PA>>) -> Self
     where Self: Sized;
 
     fn state(&self) -> anyhow::Result<State> { self.entity().to_state() }
 
     fn read(&self) -> Self::View {
-        let inner: &Arc<Entity> = self.entity();
+        let inner: &Arc<Entity<SE, PA>> = self.entity();
 
         let new_inner = match &inner.upstream {
             // If there is an upstream, use it
