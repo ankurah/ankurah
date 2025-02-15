@@ -121,16 +121,16 @@ impl PostgresBucket {
 }
 
 pub enum PostgresParams {
-    String(String),
-    Number(i64),
-    Bytes(Vec<u8>),
+    String(Option<String>),
+    Number(Option<i64>),
+    Bytes(Option<Vec<u8>>),
 }
 
 impl PostgresParams {
     pub fn postgres_type(&self) -> &'static str {
         match self {
             PostgresParams::String(_) => "varchar",
-            PostgresParams::Number(_) => "int",
+            PostgresParams::Number(_) => "int8",
             PostgresParams::Bytes(_) => "bytea",
         }
     }
@@ -139,7 +139,6 @@ impl PostgresParams {
 #[async_trait]
 impl StorageCollection for PostgresBucket {
     async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
-        // TODO: Create/Alter table
         let state_buffers = bincode::serialize(&state.state_buffers)?;
         let ulid: ulid::Ulid = id.into();
         let uuid: uuid::Uuid = ulid.into();
@@ -167,25 +166,20 @@ impl StorageCollection for PostgresBucket {
                     info!("yrs found");
                     for property in yrs.properties() {
                         info!("property: {:?}", property);
-                        if let Some(string) = yrs.get_string(property.clone()) {
-                            materialized_columns.push(property);
-                            materialized.push(PostgresParams::String(string));
-                        }
+                        materialized_columns.push(property.clone());
+                        materialized.push(PostgresParams::String(yrs.get_string(property.clone())));
                     }
                 }
                 BackendDowncasted::LWW(lww) => {
                     for property in lww.properties() {
-                        let Some(data) = lww.get(property.clone()) else {
-                            continue;
-                        };
-                        materialized_columns.push(property);
-                        materialized.push(PostgresParams::Bytes(data));
+                        materialized_columns.push(property.clone());
+                        materialized.push(PostgresParams::Bytes(lww.get(property.clone())));
                     }
                 }
                 BackendDowncasted::PN(pn) => {
                     for property in pn.properties() {
-                        let data = pn.get(property.clone());
-                        materialized_columns.push(property);
+                        let data = pn.get_optional(property.clone());
+                        materialized_columns.push(property.clone());
                         materialized.push(PostgresParams::Number(data));
                     }
                 }

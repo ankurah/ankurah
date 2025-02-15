@@ -337,7 +337,7 @@ where PA: PolicyAgent + Send + Sync + 'static
             // Apply Events to the Node's registered Entities first.
             let entity = self.fetch_entity(event.entity_id, &event.collection).await?;
 
-            entity.apply_event(event)?;
+            entity.apply_event(&self, event)?;
 
             let state = entity.to_state()?;
             // Push the state buffers to storage.

@@ -3,6 +3,10 @@ use tracing::Level;
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
     model::View,
+    property::{
+        value::{PNCounter, LWW},
+        YrsString,
+    },
     proto, Model,
 };
 use serde::{Deserialize, Serialize};
