@@ -1,13 +1,17 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::model::Entity;
+use crate::node::{MatchArgs, WeakNode};
+use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
 use crate::storage::StorageEngine;
 use crate::subscription::{Subscription, SubscriptionHandle};
 use crate::value::Value;
+use crate::Node;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
 use dashmap::{DashMap, DashSet};
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::info;
@@ -21,7 +25,7 @@ impl From<&str> for FieldId {
 }
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
-pub struct Reactor {
+pub struct Reactor<PA> {
     /// Current subscriptions
     subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Arc<Entity>>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
@@ -34,6 +38,9 @@ pub struct Reactor {
     entity_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
     /// Reference to the storage engine
     storage: Arc<dyn StorageEngine>,
+    // Weak reference to the node
+    // node: OnceCell<WeakNode<PA>>,
+    policy_agent: PA,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -42,34 +49,38 @@ enum WatcherOp {
     Remove,
 }
 
-impl Reactor {
-    pub fn new(storage: Arc<dyn StorageEngine>) -> Arc<Self> {
+impl<PA: PolicyAgent + Send + Sync + 'static> Reactor<PA> {
+    pub fn new(storage: Arc<dyn StorageEngine>, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: DashMap::new(),
             index_watchers: DashMap::new(),
             wildcard_watchers: DashMap::new(),
             entity_watchers: DashMap::new(),
             storage,
+            policy_agent,
+            // node: OnceCell::new(),
         })
     }
 
-    pub async fn subscribe<F>(
-        self: &Arc<Self>,
-        collection_id: &proto::CollectionId,
-        predicate: ast::Predicate,
-        callback: F,
-    ) -> anyhow::Result<SubscriptionHandle>
-    where
-        F: Fn(ChangeSet<Arc<Entity>>) + Send + Sync + 'static,
-    {
-        let sub_id = proto::SubscriptionId::new();
+    // pub fn set_node(self: &Arc<Self>, node: WeakNode<PA>) { self.node.set(node); }
+    // pub fn node(&self) -> Node<PA> {
+    //     self.node.get().expect("set immediately after construction").upgrade().expect("reactor should not outlive node")
+    // }
 
+    pub async fn subscribe(
+        self: &Arc<Self>,
+        sub_id: proto::SubscriptionId,
+        collection_id: &proto::CollectionId,
+        args: impl Into<MatchArgs>,
+        callback: impl Fn(ChangeSet<Arc<Entity>>) + Send + Sync + 'static,
+    ) -> anyhow::Result<()> {
+        let args = args.into();
         // Start watching the relevant indexes
-        self.manage_watchers_recurse(collection_id, &predicate, sub_id, WatcherOp::Add);
+        Self::manage_watchers_recurse(self, collection_id, &args.predicate, sub_id, WatcherOp::Add);
 
         // Find initial matching entities
         let storage_collection = self.storage.collection(collection_id).await?;
-        let states = storage_collection.fetch_states(&predicate).await?;
+        let states = storage_collection.fetch_states(&args.predicate).await?;
         let mut matching_entities = Vec::new();
 
         // Convert states to Entity and filter by predicate
@@ -78,7 +89,7 @@ impl Reactor {
             let entity = Arc::new(entity);
 
             // Evaluate predicate for each entity
-            if ankql::selection::filter::evaluate_predicate(&*entity, &predicate).unwrap_or(false) {
+            if ankql::selection::filter::evaluate_predicate(&*entity, &args.predicate).unwrap_or(false) {
                 matching_entities.push(entity.clone());
 
                 // Set up entity watchers
@@ -90,7 +101,7 @@ impl Reactor {
         let subscription = Arc::new(Subscription {
             id: sub_id,
             collection_id: collection_id.clone(),
-            predicate,
+            predicate: args.predicate,
             callback: Arc::new(Box::new(callback)),
             matching_entities: std::sync::Mutex::new(matching_entities.clone()),
         });
@@ -106,7 +117,7 @@ impl Reactor {
             });
         }
 
-        Ok(SubscriptionHandle::new(self.clone(), sub_id))
+        Ok(())
     }
 
     fn manage_watchers_recurse(

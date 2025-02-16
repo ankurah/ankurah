@@ -1,6 +1,7 @@
 use crate::{
     changes::ChangeSet,
     model::{Entity, Model},
+    node::ContextData,
     proto::{CollectionId, NodeId, ID},
 };
 use ankql::ast::Predicate;
@@ -22,7 +23,7 @@ impl AccessResult {
 
 /// Applications will implement this trait to control access to resources
 /// (Entities and RPC calls) and the Node will be generic over this trait
-pub trait PolicyAgent {
+pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
@@ -45,11 +46,6 @@ pub trait PolicyAgent {
     // For checking if a context can communicate with another node
     fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &NodeId) -> AccessResult;
 }
-
-/// Represents the user session - or whatever other context the PolicyAgent
-/// Needs to perform it's evaluation. Just a marker trait for now but maybe
-/// we'll need to add some methods to it in the future.
-pub trait ContextData: Clone + Send + Sync + 'static {}
 
 /// A policy agent that allows all operations
 #[derive(Clone)]

@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::context::{Context, TContext};
 use crate::storage::Materialized;
 
 pub mod lww;
@@ -58,7 +59,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_precursors: &Clock,
-        node: &Node,
+        // context: &Box<dyn TContext>,
     ) -> anyhow::Result<()>;
 }
 
@@ -218,10 +219,10 @@ impl Backends {
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_precursors: &Clock,
-        node: &Node,
+        // context: &Box<dyn TContext>,
     ) -> Result<()> {
         let backend = self.get_raw(backend_name)?;
-        backend.apply_operations(operations, current_head, event_precursors, node)?;
+        backend.apply_operations(operations, current_head, event_precursors /*context*/)?;
         Ok(())
     }
 

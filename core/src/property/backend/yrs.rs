@@ -132,7 +132,7 @@ impl PropertyBackend for YrsBackend {
         operations: &Vec<Operation>,
         _current_head: &Clock,
         _event_head: &Clock,
-        _node: &Node,
+        // _context: &Context,
     ) -> anyhow::Result<()> {
         // println!("apply operations: {:?}", operations);
         for operation in operations {
