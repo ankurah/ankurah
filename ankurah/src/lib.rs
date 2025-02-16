@@ -70,7 +70,7 @@
 //! ## Example: Inter-Node Subscription
 //!
 //! ```rust
-//! # use ankurah::{Node,Model,PermissiveAgent, policy::DEFAULT_CONTEXT as c};
+//! # use ankurah::{Node,Model};
 //! # use ankurah_storage_sled::SledStorageEngine;
 //! # use ankurah_connector_local_process::LocalProcessConnection;
 //! # use std::sync::Arc;
@@ -83,20 +83,23 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create server and client nodes
-//!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-//!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+//!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
+//!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
 //!
 //!     // Connect nodes using local process connection
 //!     let _conn = LocalProcessConnection::new(&server, &client).await?;
 //!
+//!     // Get contexts for the server and client
+//!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT);
+//!     let client = client.context(ankurah::policy::DEFAULT_CONTEXT);
 //!
 //!     // Subscribe to changes on the client
-//!     let _subscription = client.subscribe::<_,_,AlbumView>("name = 'Origin of Symmetry'", |changes| {
+//!     let _subscription = client.subscribe::<_,AlbumView>("name = 'Origin of Symmetry'", |changes| {
 //!         println!("Received changes: {}", changes);
 //!     }).await?;
 //!
 //!     // Create a new album on the server
-//!     let trx = server.begin(c);
+//!     let trx = server.begin();
 //!     trx.create(&Album {
 //!         name: "Origin of Symmetry".into(),
 //!         year: "2001".into(),
@@ -132,7 +135,7 @@ pub use ankurah_core::{
     model,
     model::Mutable,
     model::View,
-    node::{FetchArgs, Node},
+    node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
     property,
     resultset::ResultSet,

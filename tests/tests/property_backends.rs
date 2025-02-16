@@ -1,10 +1,11 @@
 mod common;
 use ankurah::{
+    policy::DEFAULT_CONTEXT as c,
     property::{
         value::{PNCounter, LWW},
         YrsString,
     },
-    Model, Mutable, Node,
+    Model, Mutable, Node, PermissiveAgent,
 };
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -37,7 +38,7 @@ pub struct Video {
 
 #[tokio::test]
 async fn property_backends() -> Result<()> {
-    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()));
+    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new()).context(c);
 
     let trx = client.begin();
     let cat_video = trx
@@ -56,7 +57,7 @@ async fn property_backends() -> Result<()> {
     cat_video.title.insert(15, " (Very cute)");
     trx.commit().await?;
 
-    let video = client.get_entity::<VideoView>(id).await?;
+    let video = client.get::<VideoView>(id).await?;
     //assert_eq!(video.views().unwrap(), 1);
     assert_eq!(video.visibility().unwrap(), Visibility::Unlisted);
     assert_eq!(video.title().unwrap(), "Cat video #2918 (Very cute)");
@@ -70,8 +71,10 @@ mod pg_common;
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn pg_property_backends() -> Result<()> {
+    use ankurah::PermissiveAgent;
+
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let client = Node::new_durable(Arc::new(storage_engine));
+    let client = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
     let trx = client.begin();
     let cat_video = trx
@@ -100,7 +103,7 @@ async fn pg_property_backends() -> Result<()> {
     cat_video.title.insert(15, " (Very cute)");
     trx.commit().await?;
 
-    let video = client.get_entity::<VideoView>(id).await?;
+    let video = client.get::<VideoView>(id).await?;
     //assert_eq!(video.views().unwrap(), 1);
     assert_eq!(video.visibility().unwrap(), Visibility::Unlisted);
     assert_eq!(video.title().unwrap(), "Cat video #2918 (Very cute)");

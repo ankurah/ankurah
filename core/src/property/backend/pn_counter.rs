@@ -115,7 +115,7 @@ impl PropertyBackend for PNBackend {
         operations: &Vec<Operation>,
         _current_head: &Clock,
         _event_head: &Clock,
-        _node: &Node,
+        // _context: &Box<dyn TContext>,
     ) -> anyhow::Result<()> {
         for operation in operations {
             let diffs = bincode::deserialize::<BTreeMap<PropertyName, i64>>(&operation.diff)?;

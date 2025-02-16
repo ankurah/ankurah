@@ -5,8 +5,8 @@ use tracing::info;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crate::context::TContext;
 use crate::property::PropertyError;
-use crate::Node;
 use crate::{error::RetrievalError, property::Backends};
 
 use anyhow::Result;
@@ -119,7 +119,7 @@ impl Entity {
         }
     */
 
-    pub fn apply_event(&self, node: &Node, event: &Event) -> Result<()> {
+    pub fn apply_event(&self, event: &Event) -> Result<()> {
         /*
            case A: event precursor descends the current head, then set entity clock to singleton of event id
            case B: event precursor is concurrent to the current head, push event id to event head clock.
@@ -128,7 +128,7 @@ impl Entity {
         let head = Clock::new([event.id]);
         for (backend_name, operations) in &event.operations {
             // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
-            self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent, &node)?;
+            self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent /* , context*/)?;
         }
         // TODO figure out how to test this
         info!("Apply event {}", event);

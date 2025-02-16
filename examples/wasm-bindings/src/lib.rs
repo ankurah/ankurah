@@ -51,9 +51,9 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
 #[wasm_bindgen]
 pub async fn fetch_test_items(client: &WebsocketClient) -> Result<Vec<SessionView>, JsValue> {
     client.ready().await;
-    let node = get_node().await;
+    let context = get_node().await.context(c);
     let sessions: ResultSet<SessionView> =
-        node.fetch("date_connected = '2024-01-01'").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        context.fetch("date_connected = '2024-01-01'").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
     Ok(sessions.into())
 }
 
@@ -68,6 +68,7 @@ pub fn subscribe_test_items(client: &WebsocketClient) -> Result<TestResultSetSig
 
         use reactive_graph::traits::Set;
         match node
+            .context(c)
             .subscribe("date_connected = '2024-01-01'", move |changeset: ChangeSet<SessionView>| {
                 rwsignal.set(TestResultSet(Arc::new(changeset.resultset.clone())));
                 // let mut received = received_changesets_clone.lock().unwrap();
@@ -90,10 +91,14 @@ pub fn subscribe_test_items(client: &WebsocketClient) -> Result<TestResultSetSig
 
 #[wasm_bindgen]
 pub async fn create_test_entity() -> Result<(), JsValue> {
-    let node = get_node().await;
-    let trx = node.begin(c);
+    let context = get_node().await.context(c);
+    let trx = context.begin();
     let _session = trx
-        .create(&Session { date_connected: "2024-01-01".to_string(), ip_address: "127.0.0.1".to_string(), node_id: node.id.clone().into() })
+        .create(&Session {
+            date_connected: "2024-01-01".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            node_id: context.node_id().into(),
+        })
         .await;
     trx.commit().await.unwrap();
     Ok(())

@@ -267,7 +267,7 @@ pub enum NodeRequestBody {
     CommitEvents(Vec<Event>),
     // Request to fetch entities matching a predicate
     Fetch { collection: CollectionId, predicate: ast::Predicate },
-    Subscribe { collection: CollectionId, predicate: ast::Predicate },
+    Subscribe { subscription_id: SubscriptionId, collection: CollectionId, predicate: ast::Predicate },
     Unsubscribe { subscription_id: SubscriptionId },
 }
 
@@ -280,8 +280,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")
             }
-            NodeRequestBody::Subscribe { collection, predicate } => {
-                write!(f, "Subscribe {collection} {predicate}")
+            NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
+                write!(f, "Subscribe {subscription_id} {collection} {predicate}")
             }
             NodeRequestBody::Unsubscribe { subscription_id } => {
                 write!(f, "Unsubscribe {subscription_id}")

@@ -9,9 +9,9 @@ use ankurah_proto::{Clock, ClockOrdering, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    context::{Context, TContext},
     property::{backend::PropertyBackend, traits::compare_clocks, PropertyName},
     storage::Materialized,
-    Node,
 };
 
 #[derive(Clone, Debug)]
@@ -95,12 +95,18 @@ impl PropertyBackend for LWWBackend {
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, current_head: &Clock, event_head: &Clock, node: &Node) -> anyhow::Result<()> {
+    fn apply_operations(
+        &self,
+        operations: &Vec<Operation>,
+        current_head: &Clock,
+        event_head: &Clock,
+        // context: &Box<dyn TContext>,
+    ) -> anyhow::Result<()> {
         let mut values = self.values.write().unwrap();
 
         // TODO: Figure out this comparison
         // This'll probably require looking at the events table.
-        if compare_clocks(&current_head, &event_head, &node) == ClockOrdering::Child {
+        if compare_clocks(&current_head, &event_head /*, context*/) == ClockOrdering::Child {
             for operation in operations {
                 let map: BTreeMap<PropertyName, Vec<u8>> = bincode::deserialize(&operation.diff)?;
                 for (property_name, diff) in map {

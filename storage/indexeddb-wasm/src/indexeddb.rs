@@ -606,12 +606,12 @@ mod tests {
         tracing::info!("Starting test_basic_workflow");
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
         tracing::info!("Storage engine opened");
-        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
         let id;
         {
             tracing::info!("Creating transaction");
-            let trx = node.begin(c);
+            let trx = node.begin();
             tracing::info!("Transaction created");
             let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await;
             assert_eq!(album.name().value(), Some("The rest of the owl".to_string()));
@@ -624,7 +624,7 @@ mod tests {
         }
 
         // Retrieve the entity
-        let album_ro: AlbumView = node.get_entity(id).await?;
+        let album_ro: AlbumView = node.get(id).await?;
         assert_eq!(album_ro.name().unwrap(), "The rest of the owl");
         assert_eq!(album_ro.year().unwrap(), "2024");
 
@@ -643,10 +643,10 @@ mod tests {
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
-        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
         {
-            let trx = node.begin(c);
+            let trx = node.begin();
 
             trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
 

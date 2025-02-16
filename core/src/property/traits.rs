@@ -2,7 +2,13 @@ use ankurah_proto::{Clock, ClockOrdering};
 use anyhow::Result;
 use futures::future::Join3;
 
-use crate::{error::RetrievalError, model::Entity, property::PropertyName, Node};
+use crate::{
+    context::{Context, TContext},
+    error::RetrievalError,
+    model::Entity,
+    property::PropertyName,
+    Node,
+};
 
 use thiserror::Error;
 
@@ -20,6 +26,7 @@ pub enum PropertyError {
     RetrievalError(crate::error::RetrievalError),
 }
 
+#[cfg(feature = "wasm")]
 impl Into<wasm_bindgen::JsValue> for PropertyError {
     fn into(self) -> wasm_bindgen::JsValue { wasm_bindgen::JsValue::from_str(&self.to_string()) }
 }
@@ -37,7 +44,7 @@ pub trait FromActiveType<A> {
     where Self: Sized;
 }
 
-pub fn compare_clocks(clock: &Clock, other: &Clock, node: &Node) -> ClockOrdering {
+pub fn compare_clocks(clock: &Clock, other: &Clock /*, context: &Box<dyn TContext>*/) -> ClockOrdering {
     let ulid1 = clock.as_slice().iter().max();
     let ulid2 = other.as_slice().iter().max();
 

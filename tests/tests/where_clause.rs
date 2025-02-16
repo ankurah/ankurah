@@ -7,10 +7,10 @@ use common::{Album, AlbumView};
 use std::sync::Arc;
 #[tokio::test]
 async fn basic_where_clause() -> Result<()> {
-    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new()).context(c);
 
     let _id = {
-        let trx = client.begin(c);
+        let trx = client.begin();
         let id = trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await.id();
         trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
         trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
@@ -36,10 +36,10 @@ mod pg_common;
 #[tokio::test]
 async fn pg_basic_where_clause() -> Result<()> {
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let client = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let client = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
     {
-        let trx = client.begin(c);
+        let trx = client.begin();
 
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
         trx.create(&Album { name: "Death Magnetic".into(), year: "2008".into() }).await;

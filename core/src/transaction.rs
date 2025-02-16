@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::{
+    context::{Context, TContext},
     error::RetrievalError,
     model::{Entity, Mutable},
     policy::PolicyAgent,
@@ -15,7 +16,7 @@ use append_only_vec::AppendOnlyVec;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 pub struct Transaction {
-    pub(crate) node: Box<dyn NodeWithContext>,
+    pub(crate) dyncontext: Box<dyn TContext>,
 
     entities: AppendOnlyVec<Arc<Entity>>,
 
@@ -24,42 +25,18 @@ pub struct Transaction {
     consumed: bool,
 }
 
-#[async_trait]
-pub trait NodeWithContext {
-    fn next_entity_id(&self) -> proto::ID;
-    async fn fetch_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError>;
-    async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()>;
-    async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()>;
-}
-
-pub struct NodeAndContext<PA: PolicyAgent> {
-    node: Node<PA>,
-    data: PA::ContextData,
-}
-#[async_trait]
-impl<PA: PolicyAgent + Send + Sync + 'static> NodeWithContext for NodeAndContext<PA> {
-    fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
-    async fn fetch_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
-        self.node.test_data(&self.data);
-        self.node.fetch_entity(id, collection).await
-    }
-    async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()> { self.node.insert_entity(entity).await }
-    async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()> { self.node.commit_events(events).await }
-}
-
 impl Transaction {
-    pub fn new<PA: PolicyAgent + Send + Sync + 'static>(node: Node<PA>, data: PA::ContextData) -> Self {
-        let node = Box::new(NodeAndContext { node, data });
-        Self { node, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
+    pub(crate) fn new(dyncontext: Box<dyn TContext>) -> Self {
+        Self { dyncontext, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
     }
 
     /// Fetch an entity already in the transaction.
-    pub async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
+    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
         if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
             return Ok(entity);
         }
 
-        let upstream = self.node.fetch_entity(id, collection).await?;
+        let upstream = self.dyncontext.get_entity(id, collection).await?;
         Ok(self.add_entity(upstream.snapshot()))
     }
 
@@ -69,7 +46,7 @@ impl Transaction {
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec> {
-        let id = self.node.next_entity_id();
+        let id = self.dyncontext.next_entity_id();
         let new_entity = Arc::new(model.create_entity(id));
         let entity_ref = self.add_entity(new_entity);
         <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
@@ -98,14 +75,14 @@ impl Transaction {
         for entity in self.entities.iter() {
             if let Some(entity_event) = entity.commit()? {
                 if let Some(upstream) = &entity.upstream {
-                    upstream.apply_event(&self.node, &entity_event)?;
+                    upstream.apply_event(&entity_event)?;
                 } else {
-                    self.node.insert_entity(entity.clone()).await?;
+                    self.dyncontext.insert_entity(entity.clone()).await?;
                 }
                 entity_events.push(entity_event);
             }
         }
-        self.node.commit_events(&entity_events).await?;
+        self.dyncontext.commit_events(&entity_events).await?;
 
         Ok(())
     }

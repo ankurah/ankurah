@@ -1,4 +1,4 @@
-use crate::{changes::ChangeSet, model::Entity};
+use crate::{changes::ChangeSet, model::Entity, node::TNodeErased};
 use ankurah_proto as proto;
 use std::sync::{Arc, Mutex};
 
@@ -20,13 +20,14 @@ pub struct Subscription<R: Clone> {
 /// A handle to a subscription that can be used to register callbacks
 pub struct SubscriptionHandle {
     pub(crate) id: proto::SubscriptionId,
-    pub(crate) reactor: Arc<crate::reactor::Reactor>,
+    pub(crate) node: Box<dyn TNodeErased>,
+    pub(crate) peers: Vec<proto::NodeId>,
 }
 
 impl SubscriptionHandle {
-    pub fn new(reactor: Arc<crate::reactor::Reactor>, id: proto::SubscriptionId) -> Self { Self { id, reactor } }
+    pub fn new(node: Box<dyn TNodeErased>, id: proto::SubscriptionId) -> Self { Self { id, node, peers: Vec::new() } }
 }
 
 impl Drop for SubscriptionHandle {
-    fn drop(&mut self) { self.reactor.unsubscribe(self.id); }
+    fn drop(&mut self) { self.node.unsubscribe(self); }
 }
