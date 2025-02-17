@@ -624,9 +624,9 @@ where PA: PolicyAgent + Send + Sync + 'static
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }
 
-impl<PA> Drop for Node<PA> {
+impl<PA> Drop for NodeInner<PA> {
     fn drop(&mut self) {
-        info!("Node {} dropped", self.id);
+        info!("NodeInner {} dropped", self.id);
     }
 }
 
