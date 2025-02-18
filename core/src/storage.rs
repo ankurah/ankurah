@@ -12,6 +12,7 @@ pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
+    type Value;
     // Opens and/or creates a storage collection.
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
 }

@@ -136,6 +136,7 @@ impl IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageEngine for IndexedDBStorageEngine {
+    type Value = JsValue;
     async fn collection(&self, collection_id: &proto::CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         Ok(Arc::new(IndexedDBBucket {
             db: self.db.clone(),
