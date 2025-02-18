@@ -7,7 +7,7 @@ use crate::{
     policy::PolicyAgent,
     reactor::Reactor,
     resultset::ResultSet,
-    storage::StorageCollectionWrapper,
+    storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
 use ankurah_proto as proto;
@@ -17,8 +17,8 @@ use tracing::info;
 /// Type-erased context wrapper
 pub struct Context(Box<dyn TContext>);
 
-pub struct NodeAndContext<PA: PolicyAgent> {
-    node: Node<PA>,
+pub struct NodeAndContext<SE, PA: PolicyAgent> {
+    node: Node<SE, PA>,
     cdata: PA::ContextData,
 }
 
@@ -42,7 +42,7 @@ pub trait TContext {
 }
 
 #[async_trait]
-impl<PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<PA> {
+impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::NodeId { self.node.id.clone() }
     fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
@@ -67,7 +67,10 @@ impl<PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<PA> {
 }
 
 impl Context {
-    pub fn new<PA: PolicyAgent + Send + Sync + 'static>(node: Node<PA>, data: PA::ContextData) -> Self {
+    pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
+        node: Node<SE, PA>,
+        data: PA::ContextData,
+    ) -> Self {
         Self(Box::new(NodeAndContext { node, cdata: data }))
     }
 

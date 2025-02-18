@@ -25,7 +25,7 @@ impl From<&str> for FieldId {
 }
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
-pub struct Reactor<PA> {
+pub struct Reactor<SE, PA> {
     /// Current subscriptions
     subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Arc<Entity>>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
@@ -37,7 +37,7 @@ pub struct Reactor<PA> {
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
     entity_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
     /// Reference to the storage engine
-    storage: Arc<dyn StorageEngine>,
+    storage: Arc<SE>,
     // Weak reference to the node
     // node: OnceCell<WeakNode<PA>>,
     policy_agent: PA,
@@ -49,8 +49,12 @@ enum WatcherOp {
     Remove,
 }
 
-impl<PA: PolicyAgent + Send + Sync + 'static> Reactor<PA> {
-    pub fn new(storage: Arc<dyn StorageEngine>, policy_agent: PA) -> Arc<Self> {
+impl<SE, PA> Reactor<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    pub fn new(storage: Arc<SE>, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: DashMap::new(),
             index_watchers: DashMap::new(),

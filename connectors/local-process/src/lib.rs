@@ -1,4 +1,5 @@
 use ankurah_core::policy::PolicyAgent;
+use ankurah_core::storage::StorageEngine;
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use std::sync::{Arc, Weak};
@@ -27,22 +28,26 @@ impl PeerSender for LocalProcessSender {
 }
 
 /// connector which establishes one sender between each of the two given nodes
-pub struct LocalProcessConnection<PA>
-where PA: PolicyAgent + Send + Sync + 'static
+pub struct LocalProcessConnection<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
 {
     receiver1_task: tokio::task::JoinHandle<()>,
     receiver2_task: tokio::task::JoinHandle<()>,
-    node1: WeakNode<PA>,
-    node2: WeakNode<PA>,
+    node1: WeakNode<SE, PA>,
+    node2: WeakNode<SE, PA>,
     node1_id: proto::NodeId,
     node2_id: proto::NodeId,
 }
 
-impl<PA> LocalProcessConnection<PA>
-where PA: PolicyAgent + Send + Sync + 'static
+impl<SE, PA> LocalProcessConnection<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
 {
     /// Create a new LocalConnector and establish connection between the nodes
-    pub async fn new(node1: &Node<PA>, node2: &Node<PA>) -> anyhow::Result<Self> {
+    pub async fn new(node1: &Node<SE, PA>, node2: &Node<SE, PA>) -> anyhow::Result<Self> {
         let (node1_tx, node1_rx) = mpsc::channel(100);
         let (node2_tx, node2_rx) = mpsc::channel(100);
 
@@ -69,7 +74,7 @@ where PA: PolicyAgent + Send + Sync + 'static
         })
     }
 
-    fn setup_receiver(node: Node<PA>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
+    fn setup_receiver(node: Node<SE, PA>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let _ = node.handle_message(message).await;
@@ -78,8 +83,10 @@ where PA: PolicyAgent + Send + Sync + 'static
     }
 }
 
-impl<PA> Drop for LocalProcessConnection<PA>
-where PA: PolicyAgent + Send + Sync + 'static
+impl<SE, PA> Drop for LocalProcessConnection<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         self.receiver1_task.abort();
