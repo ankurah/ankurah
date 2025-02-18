@@ -29,6 +29,28 @@ async fn basic_where_clause() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_where_clause_with_id() -> Result<()> {
+    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new()).context(c);
+
+    let album_id = {
+        let trx = client.begin();
+        let id = trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await.id();
+        trx.commit().await?;
+        id
+    };
+
+    // Test querying by ID
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch(format!("id = '{}'", album_id).as_str()).await?;
+
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string()]
+    );
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg_common;
 
