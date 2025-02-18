@@ -16,6 +16,9 @@ use ankurah_proto::State;
 use futures_util::TryStreamExt;
 
 pub mod predicate;
+pub mod value;
+
+use value::PGValue;
 
 use ankurah_proto::{Clock, CollectionId, Event, ID};
 use async_trait::async_trait;
@@ -48,6 +51,8 @@ impl Postgres {
 
 #[async_trait]
 impl StorageEngine for Postgres {
+    type Value = PGValue;
+
     async fn collection(&self, collection_id: &CollectionId) -> Result<std::sync::Arc<dyn StorageCollection>, RetrievalError> {
         if !Postgres::sane_name(collection_id.as_str()) {
             return Err(RetrievalError::InvalidBucketName);
@@ -120,22 +125,6 @@ impl PostgresBucket {
     }
 }
 
-pub enum PostgresParams {
-    String(Option<String>),
-    Number(Option<i64>),
-    Bytes(Option<Vec<u8>>),
-}
-
-impl PostgresParams {
-    pub fn postgres_type(&self) -> &'static str {
-        match self {
-            PostgresParams::String(_) => "varchar",
-            PostgresParams::Number(_) => "int8",
-            PostgresParams::Bytes(_) => "bytea",
-        }
-    }
-}
-
 #[async_trait]
 impl StorageCollection for PostgresBucket {
     async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
@@ -158,7 +147,7 @@ impl StorageCollection for PostgresBucket {
         params.push(&head_uuids);
 
         let mut materialized_columns: Vec<String> = Vec::new();
-        let mut materialized: Vec<PostgresParams> = Vec::new();
+        let mut materialized: Vec<PGValue> = Vec::new();
 
         for backend in backends.downcasted() {
             match backend {
@@ -167,20 +156,20 @@ impl StorageCollection for PostgresBucket {
                     for property in yrs.properties() {
                         info!("property: {:?}", property);
                         materialized_columns.push(property.clone());
-                        materialized.push(PostgresParams::String(yrs.get_string(property.clone())));
+                        materialized.push(PGValue::CharacterVarying(yrs.get_string(property.clone())));
                     }
                 }
                 BackendDowncasted::LWW(lww) => {
                     for property in lww.properties() {
                         materialized_columns.push(property.clone());
-                        materialized.push(PostgresParams::Bytes(lww.get(property.clone())));
+                        materialized.push(PGValue::Bytea(lww.get(property.clone())));
                     }
                 }
                 BackendDowncasted::PN(pn) => {
                     for property in pn.properties() {
                         let data = pn.get_optional(property.clone());
                         materialized_columns.push(property.clone());
-                        materialized.push(PostgresParams::Number(data));
+                        materialized.push(PGValue::BigInt(data));
                     }
                 }
                 _ => {}
@@ -190,9 +179,9 @@ impl StorageCollection for PostgresBucket {
         columns.extend(materialized_columns.clone());
         for parameter in &materialized {
             match &parameter {
-                PostgresParams::String(string) => params.push(string),
-                PostgresParams::Number(number) => params.push(number),
-                PostgresParams::Bytes(bytes) => params.push(bytes),
+                PGValue::CharacterVarying(string) => params.push(string),
+                PGValue::BigInt(number) => params.push(number),
+                PGValue::Bytea(bytes) => params.push(bytes),
             }
         }
 

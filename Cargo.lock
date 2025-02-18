@@ -212,7 +212,6 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "bincode",
- "chrono",
  "futures-util",
  "tokio",
  "tokio-postgres",

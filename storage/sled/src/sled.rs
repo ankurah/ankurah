@@ -55,6 +55,7 @@ pub struct SledStorageCollection {
 
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
+    type Value = Vec<u8>;
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
         let state = self.db.open_tree(state_name(id.as_str())).map_err(|err| SledRetrievalError::StorageError(err))?;
