@@ -1,4 +1,5 @@
 use ankurah::policy::PolicyAgent;
+use ankurah::storage::StorageEngine;
 use ankurah_core::connector::NodeComms;
 use ankurah_core::Node;
 
@@ -37,7 +38,11 @@ pub(crate) struct ClientInner {
 
 /// Client provides a primary handle to speak to the server
 impl WebsocketClient {
-    pub fn new<PA: PolicyAgent + Send + Sync + 'static>(node: Node<PA>, server_url: &str) -> Result<WebsocketClient, JsValue> {
+    pub fn new<SE, PA>(node: Node<SE, PA>, server_url: &str) -> Result<WebsocketClient, JsValue>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
         info!("Created new websocket client for node {}", node.id);
         let inner = Arc::new(ClientInner {
             server_url: server_url.to_string(),

@@ -51,18 +51,18 @@ impl From<ankql::error::ParseError> for RetrievalError {
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
-pub struct Node<PA>(Arc<NodeInner<PA>>);
-impl<PA> Clone for Node<PA> {
+pub struct Node<SE, PA>(Arc<NodeInner<SE, PA>>);
+impl<SE, PA> Clone for Node<SE, PA> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct WeakNode<PA>(Weak<NodeInner<PA>>);
-impl<PA> Clone for WeakNode<PA> {
+pub struct WeakNode<SE, PA>(Weak<NodeInner<SE, PA>>);
+impl<SE, PA> Clone for WeakNode<SE, PA> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<P> Deref for Node<P> {
-    type Target = Arc<NodeInner<P>>;
+impl<SE, PA> Deref for Node<SE, PA> {
+    type Target = Arc<NodeInner<SE, PA>>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
@@ -71,10 +71,10 @@ impl<P> Deref for Node<P> {
 /// we'll need to add some methods to it in the future.
 pub trait ContextData: Clone + Send + Sync + 'static {}
 
-pub struct NodeInner<PA> {
+pub struct NodeInner<SE, PA> {
     pub id: proto::NodeId,
     pub durable: bool,
-    storage_engine: Arc<dyn StorageEngine>,
+    storage_engine: Arc<SE>,
     collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
 
     entities: Arc<RwLock<EntityMap>>,
@@ -84,16 +84,18 @@ pub struct NodeInner<PA> {
     pending_requests: DashMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 
     /// The reactor for handling subscriptions
-    pub reactor: Arc<Reactor<PA>>,
+    pub reactor: Arc<Reactor<SE, PA>>,
     policy_agent: PA,
 }
 
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
 
-impl<PA> Node<PA>
-where PA: PolicyAgent + Send + Sync + 'static
+impl<SE, PA> Node<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Self {
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
         let reactor = Reactor::new(engine.clone(), policy_agent.clone());
         let id = proto::NodeId::new();
         info!("Node {} created", id);
@@ -113,7 +115,7 @@ where PA: PolicyAgent + Send + Sync + 'static
 
         node
     }
-    pub fn new_durable(engine: Arc<dyn StorageEngine>, policy_agent: PA) -> Self {
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
         let reactor = Reactor::new(engine.clone(), policy_agent.clone());
 
         let node = Node(Arc::new(NodeInner {
@@ -131,15 +133,17 @@ where PA: PolicyAgent + Send + Sync + 'static
         // reactor.set_node(node.weak());
         node
     }
-    pub fn weak(&self) -> WeakNode<PA> { WeakNode(Arc::downgrade(&self.0)) }
+    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
 }
 
-impl<PA> WeakNode<PA> {
-    pub fn upgrade(&self) -> Option<Node<PA>> { self.0.upgrade().map(Node) }
+impl<SE, PA> WeakNode<SE, PA> {
+    pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.0.upgrade().map(Node) }
 }
 
-impl<PA> NodeInner<PA>
-where PA: PolicyAgent + Send + Sync + 'static
+impl<SE, PA> NodeInner<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
 {
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node {} register peer {}", self.id, presence.node_id);
@@ -624,7 +628,7 @@ where PA: PolicyAgent + Send + Sync + 'static
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }
 
-impl<PA> Drop for Node<PA> {
+impl<SE, PA> Drop for Node<SE, PA> {
     fn drop(&mut self) {
         info!("Node {} dropped", self.id);
     }
@@ -634,6 +638,10 @@ pub trait TNodeErased: Send + Sync + 'static {
     fn unsubscribe(&self, handle: &SubscriptionHandle) -> ();
 }
 
-impl<PA: PolicyAgent + Send + Sync + 'static> TNodeErased for Node<PA> {
+impl<SE, PA> TNodeErased for Node<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     fn unsubscribe(&self, handle: &SubscriptionHandle) -> () { let _ = self.0.unsubscribe(handle); }
 }

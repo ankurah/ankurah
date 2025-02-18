@@ -1,3 +1,4 @@
+use ankurah_core::storage::StorageEngine;
 use ankurah_proto as proto;
 use anyhow::Result;
 use axum::extract::{connect_info::ConnectInfo, State};
@@ -19,12 +20,20 @@ use ankurah_core::{node::Node, policy::PolicyAgent};
 
 use super::state::Connection;
 
-pub struct WebsocketServer<PA: PolicyAgent> {
-    node: Option<Node<PA>>,
+pub struct WebsocketServer<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    node: Option<Node<SE, PA>>,
 }
 
-impl<PA: PolicyAgent + Send + Sync + 'static> WebsocketServer<PA> {
-    pub fn new(node: Node<PA>) -> Self { Self { node: Some(node) } }
+impl<SE, PA> WebsocketServer<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    pub fn new(node: Node<SE, PA>) -> Self { Self { node: Some(node) } }
 
     pub async fn run(&mut self, bind_address: &str) -> Result<()> {
         let Some(node) = self.node.take() else {
@@ -50,19 +59,27 @@ impl<PA: PolicyAgent + Send + Sync + 'static> WebsocketServer<PA> {
     }
 }
 
-async fn ws_handler<PA: PolicyAgent + Send + Sync + 'static>(
+async fn ws_handler<SE, PA>(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(node): State<Node<PA>>,
-) -> impl IntoResponse {
+    State(node): State<Node<SE, PA>>,
+) -> impl IntoResponse
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     info!("Upgrading connection");
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
     println!("`{user_agent}` at {addr} connected.");
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
 }
 
-async fn handle_socket<PA: PolicyAgent + Send + Sync + 'static>(socket: WebSocket, who: SocketAddr, node: Node<PA>) {
+async fn handle_socket<SE, PA>(socket: WebSocket, who: SocketAddr, node: Node<SE, PA>)
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     println!("Connected to {}", who);
 
     let (sender, mut receiver) = socket.split();
@@ -94,12 +111,16 @@ async fn handle_socket<PA: PolicyAgent + Send + Sync + 'static>(socket: WebSocke
     println!("Websocket context {who} destroyed");
 }
 
-async fn process_message<PA: PolicyAgent + Send + Sync + 'static>(
+async fn process_message<SE, PA>(
     msg: axum::extract::ws::Message,
     who: SocketAddr,
     state: &mut Connection,
-    node: Node<PA>,
-) -> ControlFlow<(), ()> {
+    node: Node<SE, PA>,
+) -> ControlFlow<(), ()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     match msg {
         axum::extract::ws::Message::Binary(d) => {
             println!(">>> {} sent {} bytes", who, d.len());

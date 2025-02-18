@@ -11,7 +11,7 @@ use tracing::{error, info};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
 lazy_static! {
-    static ref NODE: OnceCell<Node<PermissiveAgent>> = OnceCell::new();
+    static ref NODE: OnceCell<Node<IndexedDBStorageEngine, PermissiveAgent>> = OnceCell::new();
     static ref NOTIFY: tokio::sync::Notify = tokio::sync::Notify::new();
 }
 
@@ -22,7 +22,7 @@ pub async fn start() -> Result<(), JsValue> {
     let _ = any_spawner::Executor::init_wasm_bindgen();
 
     let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let node: Node<PermissiveAgent> = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+    let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
     if let Err(_) = NODE.set(node) {
         error!("Failed to set node");
     }
@@ -30,7 +30,7 @@ pub async fn start() -> Result<(), JsValue> {
 
     Ok(())
 }
-pub async fn get_node() -> Node<PermissiveAgent> {
+pub async fn get_node() -> Node<IndexedDBStorageEngine, PermissiveAgent> {
     if NODE.get().is_none() {
         NOTIFY.notified().await;
     }
