@@ -2,7 +2,7 @@ use ankql::ast::Predicate;
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
     core::{context::Context, node::ContextData},
-    policy::{PolicyAgent, DEFAULT_CONTEXT as c},
+    policy::{AccessResult, PolicyAgent, DEFAULT_CONTEXT as c},
     Model, Mutable, Node, PermissiveAgent, ResultSet,
 };
 use ankurah_storage_sled::SledStorageEngine;
@@ -87,7 +87,7 @@ async fn local_access_control() -> Result<()> {
     user1.edit(&trx).await?.role.replace("admin")?;
     trx.commit().await?;
 
-    // 5. Charlie tries to  to create a user (will be restricted later)
+    // 6. Charlie tries to create a user (will be restricted later)
     let trx = ctx_c.begin();
     trx.create(&User { username: "eve".into(), role: "employee".into(), department: "Finance".into() }).await;
     trx.commit().await?;
@@ -107,7 +107,10 @@ impl PolicyAgent for TestAgent {
     type ContextData = MyContextData;
 
     fn can_access_collection(&self, data: &Self::ContextData, collection: &ankurah::proto::CollectionId) -> ankurah::policy::AccessResult {
-        todo!()
+        match data {
+            MyContextData::Root => AccessResult::Allow,    // Root can access everything
+            MyContextData::User(_) => AccessResult::Allow, // All users can access collections, but individual entities will be filtered
+        }
     }
 
     fn can_read_entity(
@@ -116,7 +119,21 @@ impl PolicyAgent for TestAgent {
         collection: &ankurah::proto::CollectionId,
         id: &ankurah::ID,
     ) -> ankurah::policy::AccessResult {
-        todo!()
+        match data {
+            MyContextData::Root => AccessResult::Allow, // Root can read everything
+            MyContextData::User(user) => {
+                let role = user.role()?;
+                match collection.as_str() {
+                    "doc" => {
+                        // We'll need to fetch the doc to check its access level
+                        // For now return Ok - we'll filter in the fetch predicate
+                        Ok(())
+                    }
+                    "user" => Ok(()), // All users can read user info
+                    _ => Ok(()),
+                }
+            }
+        }
     }
 
     fn can_modify_entity(
@@ -125,7 +142,24 @@ impl PolicyAgent for TestAgent {
         collection: &ankurah::proto::CollectionId,
         id: &ankurah::ID,
     ) -> ankurah::policy::AccessResult {
-        todo!()
+        // TODO Entity -> View downcasting
+        match data {
+            MyContextData::Root => AccessResult::Allow, // Root can modify everything
+            MyContextData::User(user) => {
+                let role = user.role().unwrap();
+                match role.as_str() {
+                    "admin" => AccessResult::Allow, // Admins can modify anything
+                    "manager" => {
+                        match collection.as_str() {
+                            "user" => AccessResult::Deny,
+                            "doc" => AccessResult::Allow, // Managers can modify docs
+                            _ => AccessResult::Allow,
+                        }
+                    }
+                    _ => AccessResult::Deny,
+                }
+            }
+        }
     }
 
     fn can_create_in_collection(
@@ -133,7 +167,23 @@ impl PolicyAgent for TestAgent {
         data: &Self::ContextData,
         collection: &ankurah::proto::CollectionId,
     ) -> ankurah::policy::AccessResult {
-        todo!()
+        match data {
+            MyContextData::Root => AccessResult::Allow, // Root can create anything
+            MyContextData::User(user) => {
+                let role = user.role().unwrap();
+                match role.as_str() {
+                    "admin" => AccessResult::Allow, // Admins can create anything
+                    "manager" => {
+                        match collection.as_str() {
+                            "user" => AccessResult::Deny,
+                            "doc" => AccessResult::Allow, // Managers can create docs
+                            _ => AccessResult::Allow,
+                        }
+                    }
+                    _ => AccessResult::Deny,
+                }
+            }
+        }
     }
 
     fn can_subscribe(
@@ -142,11 +192,13 @@ impl PolicyAgent for TestAgent {
         collection: &ankurah::proto::CollectionId,
         predicate: &ankql::ast::Predicate,
     ) -> ankurah::policy::AccessResult {
-        todo!()
+        // For now, use same rules as can_access_collection
+        self.can_access_collection(data, collection)
     }
 
     fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &ankurah::proto::NodeId) -> ankurah::policy::AccessResult {
-        todo!()
+        // For this test, allow all node communication
+        Ok(())
     }
 }
 
