@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use tracing::info;
 
 /// Type-erased context wrapper
-pub struct Context(Box<dyn TContext>);
+#[derive(Clone)]
+pub struct Context(Arc<dyn TContext>);
 
 pub struct NodeAndContext<SE, PA: PolicyAgent> {
     node: Node<SE, PA>,
@@ -37,7 +38,6 @@ pub trait TContext {
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>;
-    fn cloned(&self) -> Box<dyn TContext>;
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper;
 }
 
@@ -62,7 +62,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
         self.node.subscribe(sub_id, collection, args, callback).await
     }
-    fn cloned(&self) -> Box<dyn TContext> { Box::new(NodeAndContext { node: self.node.clone(), cdata: self.cdata.clone() }) }
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.node.collection(id).await }
 }
 
@@ -71,13 +70,13 @@ impl Context {
         node: Node<SE, PA>,
         data: PA::ContextData,
     ) -> Self {
-        Self(Box::new(NodeAndContext { node, cdata: data }))
+        Self(Arc::new(NodeAndContext { node, cdata: data }))
     }
 
     pub fn node_id(&self) -> proto::NodeId { self.0.node_id() }
 
     /// Begin a transaction.
-    pub fn begin(&self) -> Transaction { Transaction::new(self.0.cloned()) }
+    pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
@@ -108,6 +107,14 @@ impl Context {
         let views = entities.into_iter().map(|entity| R::from_entity(entity)).collect();
 
         Ok(ResultSet { items: views })
+    }
+
+    pub async fn fetch_one<R: View>(
+        &self,
+        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
+    ) -> Result<Option<R>, RetrievalError> {
+        let result_set = self.fetch::<R>(args).await?;
+        Ok(result_set.items.into_iter().next())
     }
 
     /// Subscribe to changes in entities matching a predicate

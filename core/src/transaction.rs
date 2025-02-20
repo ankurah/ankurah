@@ -16,7 +16,7 @@ use append_only_vec::AppendOnlyVec;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 pub struct Transaction {
-    pub(crate) dyncontext: Box<dyn TContext>,
+    pub(crate) dyncontext: Arc<dyn TContext>,
 
     entities: AppendOnlyVec<Arc<Entity>>,
 
@@ -26,7 +26,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(dyncontext: Box<dyn TContext>) -> Self {
+    pub(crate) fn new(dyncontext: Arc<dyn TContext>) -> Self {
         Self { dyncontext, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
     }
 
