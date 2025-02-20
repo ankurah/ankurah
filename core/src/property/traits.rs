@@ -34,6 +34,10 @@ impl PartialEq for PropertyError {
     fn eq(&self, other: &Self) -> bool { self.to_string() == other.to_string() }
 }
 
+impl From<PropertyError> for std::fmt::Error {
+    fn from(_: PropertyError) -> std::fmt::Error { std::fmt::Error }
+}
+
 #[cfg(feature = "wasm")]
 impl Into<wasm_bindgen::JsValue> for PropertyError {
     fn into(self) -> wasm_bindgen::JsValue { wasm_bindgen::JsValue::from_str(&self.to_string()) }
