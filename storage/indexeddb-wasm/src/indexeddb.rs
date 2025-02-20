@@ -1,5 +1,5 @@
 use ankql::selection::filter::evaluate_predicate;
-use ankurah_core::error::RetrievalError;
+use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::model::Entity;
 use ankurah_core::policy::DEFAULT_CONTEXT as c;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
@@ -149,7 +149,7 @@ impl StorageEngine for IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageCollection for IndexedDBBucket {
-    async fn set_state(&self, id: proto::ID, state: &proto::State) -> anyhow::Result<bool> {
+    async fn set_state(&self, id: proto::ID, state: &proto::State) -> Result<bool, MutationError> {
         let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!("IndexedDBBucket({}) set_state({invocation}) {id} {state}", self.collection_id);
         // Lock the mutex to prevent concurrent updates
@@ -161,23 +161,25 @@ impl StorageCollection for IndexedDBBucket {
             let transaction = self
                 .db
                 .transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readwrite)
-                .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to create transaction"))?;
 
-            let store = transaction.object_store("entities").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+            let store = transaction.object_store("entities").map_err(|_e| MutationError::FailedStep("Failed to get object store"))?;
 
-            let old_request = store.get(&id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to get old entity"))?;
+            let old_request = store.get(&id.as_string().into()).map_err(|_e| MutationError::FailedStep("Failed to get old entity"))?;
 
             crate::cb_future::CBFuture::new(&old_request, "success", "error")
                 .await
-                .map_err(|_e| anyhow::anyhow!("Failed to get old entity"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to get old entity"))?;
 
             let old_entity: JsValue = old_request.result().unwrap();
 
             // Check if the entity changed
             if !old_entity.is_undefined() && !old_entity.is_null() {
-                let old_head = js_sys::Reflect::get(&old_entity, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
+                let old_head =
+                    js_sys::Reflect::get(&old_entity, &"head".into()).map_err(|_e| MutationError::FailedStep("Failed to get old head"))?;
                 if !old_head.is_undefined() && !old_head.is_null() {
-                    let old_clock: proto::Clock = old_head.try_into().map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
+                    let old_clock: proto::Clock =
+                        old_head.try_into().map_err(|_e| MutationError::FailedStep("Failed to parse old head"))?;
                     info!(
                         "IndexedDBBucket({}) set_state({invocation}) MARK 1 {} {} old_clock {}",
                         self.collection_id, id, state, old_clock
@@ -202,27 +204,28 @@ impl StorageCollection for IndexedDBBucket {
             // Create a JS object to store our data
             let entity = js_sys::Object::new();
             js_sys::Reflect::set(&entity, &"id".into(), &id.as_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set id on entity"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set id on entity"))?;
             js_sys::Reflect::set(&entity, &"collection".into(), &self.collection_id.as_str().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set collection on entity"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set collection on entity"))?;
 
             // Store state_buffers
             let state_buffer = bincode::serialize(&state.state_buffers)?;
             js_sys::Reflect::set(&entity, &"state_buffer".into(), &js_sys::Uint8Array::from(&state_buffer[..]).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set data on entity"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set data on entity"))?;
 
             js_sys::Reflect::set(&entity, &"head".into(), &(&(state.head)).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set head on entity"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set head on entity"))?;
 
             // Put the entity in the store
-            let request =
-                store.put_with_key(&entity, &id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to put entity in store"))?;
+            let request = store
+                .put_with_key(&entity, &id.as_string().into())
+                .map_err(|_e| MutationError::FailedStep("Failed to put entity in store"))?;
 
             let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
-            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put entity in store"))?;
+            request_fut.await.map_err(|_e| MutationError::FailedStep("Failed to put entity in store"))?;
 
             let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
-            trx_fut.await.map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
+            trx_fut.await.map_err(|_e| MutationError::FailedStep("Failed to complete transaction"))?;
 
             Ok(true) // It was updated
         })
@@ -348,7 +351,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn add_event(&self, entity_event: &ankurah_proto::Event) -> anyhow::Result<bool> {
+    async fn add_event(&self, entity_event: &ankurah_proto::Event) -> Result<bool, MutationError> {
         let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!("IndexedDBBucket({}) add_event({invocation})", self.collection_id);
         let _lock = self.mutex.lock().await;
@@ -358,9 +361,9 @@ impl StorageCollection for IndexedDBBucket {
             let transaction = self
                 .db
                 .transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite)
-                .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to create transaction"))?;
 
-            let store = transaction.object_store("events").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+            let store = transaction.object_store("events").map_err(|_e| MutationError::FailedStep("Failed to get object store"))?;
 
             // Create a JS object to store the event data
             let event_obj = js_sys::Object::new();
@@ -372,14 +375,14 @@ impl StorageCollection for IndexedDBBucket {
             let entity_uuid = uuid::Uuid::from(entity_id);
 
             js_sys::Reflect::set(&event_obj, &"id".into(), &event_uuid.to_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set id on event"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set id on event"))?;
             js_sys::Reflect::set(&event_obj, &"entity_id".into(), &entity_uuid.to_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set entity_id on event"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set entity_id on event"))?;
 
             // Serialize operations
             let operations = bincode::serialize(&entity_event.operations)?;
             js_sys::Reflect::set(&event_obj, &"operations".into(), &js_sys::Uint8Array::from(&operations[..]).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set operations on event"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set operations on event"))?;
 
             // Convert parent clock to UUIDs and then to a JS array of strings
             let parent_uuids: Vec<uuid::Uuid> = (&entity_event.parent).into();
@@ -389,18 +392,18 @@ impl StorageCollection for IndexedDBBucket {
                 parent_array.push(&js_str);
             }
             js_sys::Reflect::set(&event_obj, &"parent".into(), &parent_array)
-                .map_err(|_e| anyhow::anyhow!("Failed to set parent on event"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to set parent on event"))?;
 
             // Store the event
             let request = store
                 .put_with_key(&event_obj, &event_uuid.to_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to put event in store"))?;
+                .map_err(|_e| MutationError::FailedStep("Failed to put event in store"))?;
 
             let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
-            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put event in store"))?;
+            request_fut.await.map_err(|_e| MutationError::FailedStep("Failed to put event in store"))?;
 
             let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
-            trx_fut.await.map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
+            trx_fut.await.map_err(|_e| MutationError::FailedStep("Failed to complete transaction"))?;
 
             Ok(true)
         })

@@ -13,7 +13,7 @@ use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
     connector::PeerSender,
     context::Context,
-    error::{RequestError, RetrievalError},
+    error::{MutationError, RequestError, RetrievalError},
     model::Entity,
     policy::PolicyAgent,
     reactor::Reactor,
@@ -383,7 +383,7 @@ where
 
     pub fn context(self: &Arc<Self>, data: PA::ContextData) -> Context { Context::new(Node(self.clone()), data) }
 
-    async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::Event>) -> anyhow::Result<()> {
+    async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::Event>) -> Result<(), MutationError> {
         info!("Node {} committing events {}", self.id, events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","));
         let mut changes = Vec::new();
 
@@ -410,7 +410,7 @@ where
     }
 
     /// Apply events to local state buffer and broadcast to peers.
-    pub async fn commit_events(self: &Arc<Self>, events: &Vec<proto::Event>) -> anyhow::Result<()> {
+    pub async fn commit_events(self: &Arc<Self>, events: &Vec<proto::Event>) -> Result<(), MutationError> {
         self.commit_events_local(events).await?;
 
         // Then propagate to all peers
@@ -439,13 +439,13 @@ where
     /// so when they hand out read Entities, they have to work immediately.
     /// TODO: Discuss. The upside is that you can call .read() on a Mutable. The downside is that the behavior is inconsistent
     /// between newly created Entities and Entities that are created in a transaction scope.
-    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Arc<Entity>) -> anyhow::Result<()> {
+    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Arc<Entity>) -> Result<(), MutationError> {
         match self.entities.write().await.entry((entity.id, entity.collection.clone())) {
             Entry::Vacant(entry) => {
                 entry.insert(Arc::downgrade(&entity));
                 Ok(())
             }
-            Entry::Occupied(_) => Err(anyhow!("Entity already exists")),
+            Entry::Occupied(_) => Err(MutationError::AlreadyExists),
         }
     }
 
@@ -628,7 +628,7 @@ where
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }
 
-impl<SE, PA> Drop for Node<SE, PA> {
+impl<SE, PA> Drop for NodeInner<SE, PA> {
     fn drop(&mut self) {
         info!("Node {} dropped", self.id);
     }

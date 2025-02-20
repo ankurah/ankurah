@@ -7,6 +7,8 @@ use crate::connector::SendError;
 
 #[derive(Error, Debug)]
 pub enum RetrievalError {
+    #[error("access denied")]
+    AccessDenied(AccessError),
     #[error("Parse error: {0}")]
     ParseError(ankql::error::ParseError),
     #[error("ID {0:?} not found")]
@@ -31,6 +33,8 @@ pub enum RetrievalError {
     Anyhow(anyhow::Error),
     #[error("Decode error: {0}")]
     DecodeError(DecodeError),
+    #[error("State error: {0}")]
+    StateError(StateError),
 }
 
 impl RetrievalError {
@@ -73,4 +77,65 @@ impl From<SendError> for RequestError {
 
 impl From<DecodeError> for RetrievalError {
     fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(err) }
+}
+
+#[derive(Error, Debug)]
+pub enum MutationError {
+    #[error("access denied")]
+    AccessDenied(AccessError),
+    #[error("already exists")]
+    AlreadyExists,
+    #[error("retrieval error: {0}")]
+    RetrievalError(RetrievalError),
+    #[error("state error: {0}")]
+    StateError(StateError),
+    #[error("failed update: {0}")]
+    UpdateFailed(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("failed step: {0}")]
+    FailedStep(&'static str),
+    #[error("general error: {0}")]
+    General(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl From<bincode::Error> for MutationError {
+    fn from(e: bincode::Error) -> Self { MutationError::StateError(StateError::SerializationError(e)) }
+}
+
+#[derive(Error, Debug)]
+pub enum AccessError {
+    #[error("write denied")]
+    WriteDenied,
+    #[error("read denied")]
+    ReadDenied,
+}
+
+impl From<RetrievalError> for MutationError {
+    fn from(err: RetrievalError) -> Self {
+        match err {
+            RetrievalError::AccessDenied(a) => MutationError::AccessDenied(a),
+            _ => MutationError::RetrievalError(err),
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum StateError {
+    #[error("serialization error: {0}")]
+    SerializationError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("DDL error: {0}")]
+    DDLError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("DMLError: {0}")]
+    DMLError(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl From<bincode::Error> for StateError {
+    fn from(e: bincode::Error) -> Self { StateError::SerializationError(Box::new(e)) }
+}
+
+impl From<StateError> for MutationError {
+    fn from(err: StateError) -> Self { MutationError::StateError(err) }
+}
+
+impl From<StateError> for RetrievalError {
+    fn from(err: StateError) -> Self { RetrievalError::StateError(err) }
 }

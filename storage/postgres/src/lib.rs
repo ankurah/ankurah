@@ -4,7 +4,7 @@ use std::{
 };
 
 use ankurah_core::{
-    error::RetrievalError,
+    error::{MutationError, RetrievalError, StateError},
     property::{
         backend::{BackendDowncasted, PropertyBackend},
         Backends,
@@ -79,18 +79,18 @@ impl PostgresBucket {
 
     pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
 
-    pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
+    pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"("id" UUID UNIQUE, "entity_id" UUID, "operations" bytea, "parent" UUID[])"#,
             self.event_table()
         );
 
         info!("Applying DDL: {}", create_query);
-        client.execute(&create_query, &[]).await?;
+        client.execute(&create_query, &[]).await.map_err(|e| StateError::DDLError(Box::new(e)))?;
         Ok(())
     }
 
-    pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
+    pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
         let create_query =
             format!(r#"CREATE TABLE IF NOT EXISTS "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.state_table());
 
@@ -102,7 +102,7 @@ impl PostgresBucket {
                 // if err.code() == Some(SqlState::UNIQUE_VIOLATION) {
                 //     Ok(())
                 // } else {
-                Err(err.into())
+                Err(StateError::DDLError(Box::new(err)))
                 // }
             }
         }
@@ -112,12 +112,12 @@ impl PostgresBucket {
         &self,
         client: &mut tokio_postgres::Client,
         missing: Vec<(String, &'static str)>, // column name, datatype
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), StateError> {
         for (column, datatype) in missing {
             if Postgres::sane_name(&column) {
                 let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.state_table(), column, datatype,);
                 info!("Running: {}", alter_query);
-                client.execute(&alter_query, &[]).await?;
+                client.execute(&alter_query, &[]).await.map_err(|err| StateError::DDLError(Box::new(err)))?;
             }
         }
 
@@ -127,7 +127,7 @@ impl PostgresBucket {
 
 #[async_trait]
 impl StorageCollection for PostgresBucket {
-    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
+    async fn set_state(&self, id: ID, state: &State) -> Result<bool, MutationError> {
         let state_buffers = bincode::serialize(&state.state_buffers)?;
         let ulid: ulid::Ulid = id.into();
         let uuid: uuid::Uuid = ulid.into();
@@ -211,7 +211,7 @@ impl StorageCollection for PostgresBucket {
             columns_update_str
         );
 
-        let mut client = self.pool.get().await?;
+        let mut client = self.pool.get().await.map_err(|err| MutationError::General(Box::new(err)))?;
         info!("Querying: {}", query);
         let row = match client.query_one(&query, params.as_slice()).await {
             Ok(row) => row,
@@ -232,7 +232,9 @@ impl StorageCollection for PostgresBucket {
                             if let Some(index) = index {
                                 let param = &materialized[index];
                                 info!("column '{}' not found in materialized, adding it", column);
-                                self.add_missing_columns(&mut client, vec![(column, param.postgres_type())]).await?;
+                                self.add_missing_columns(&mut client, vec![(column, param.postgres_type())])
+                                    .await
+                                    .map_err(|err| StateError::DDLError(Box::new(err)))?;
                                 return self.set_state(id, state).await; // retry
                             } else {
                                 error!("column '{}' not found in materialized", column);
@@ -242,7 +244,7 @@ impl StorageCollection for PostgresBucket {
                     _ => {}
                 }
 
-                return Err(err.into());
+                return Err(StateError::DDLError(Box::new(err)).into());
             }
         };
 
@@ -380,7 +382,7 @@ impl StorageCollection for PostgresBucket {
     /// entity_id uuid, // `ID`/`ULID`
     /// operations bytea, // `Vec<Operation>`
     /// clock bytea, // `Clock`
-    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool> {
+    async fn add_event(&self, entity_event: &Event) -> Result<bool, MutationError> {
         let event_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.id));
         let entity_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.entity_id));
         let operations = bincode::serialize(&entity_event.operations)?;
@@ -391,7 +393,7 @@ impl StorageCollection for PostgresBucket {
         // event we receive from a peer should be fine.
         let query = format!(r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent") VALUES($1, $2, $3, $4)"#, self.event_table(),);
 
-        let mut client = self.pool.get().await?;
+        let mut client = self.pool.get().await.map_err(|err| MutationError::General(Box::new(err)))?;
         info!("Running: {}", query);
         let affected = match client.execute(&query, &[&event_id, &entity_id, &operations, &parent_uuids]).await {
             Ok(affected) => affected,
@@ -407,7 +409,7 @@ impl StorageCollection for PostgresBucket {
                     _ => {}
                 }
 
-                return Err(err.into());
+                return Err(StateError::DMLError(Box::new(err)).into());
             }
         };
 

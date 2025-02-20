@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::{
     context::{Context, TContext},
-    error::RetrievalError,
+    error::{MutationError, RetrievalError},
     model::{Entity, Mutable},
     policy::PolicyAgent,
     Model, Node,
@@ -63,11 +63,11 @@ impl Transaction {
     }
 
     #[must_use]
-    pub async fn commit(mut self) -> anyhow::Result<()> { self.commit_mut_ref().await }
+    pub async fn commit(mut self) -> Result<(), MutationError> { self.commit_mut_ref().await }
 
     #[must_use]
     // only because Drop is &mut self not mut self
-    pub(crate) async fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn commit_mut_ref(&mut self) -> Result<(), MutationError> {
         tracing::debug!("trx.commit");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations

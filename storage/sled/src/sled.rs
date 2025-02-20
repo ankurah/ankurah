@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ankurah_core::{
-    error::RetrievalError,
+    error::{MutationError, RetrievalError},
     model::Entity,
     storage::{StorageCollection, StorageEngine},
 };
@@ -66,21 +66,22 @@ impl StorageEngine for SledStorageEngine {
 
 #[async_trait]
 impl StorageCollection for SledStorageCollection {
-    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
+    async fn set_state(&self, id: ID, state: &State) -> Result<bool, MutationError> {
         let tree = self.state.clone();
         let binary_state = bincode::serialize(state)?;
         let id_bytes = id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
-            let last = tree.insert(id_bytes, binary_state.clone())?;
+            let last = tree.insert(id_bytes, binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
             if let Some(last_bytes) = last {
                 Ok(last_bytes != binary_state)
             } else {
                 Ok(true)
             }
         })
-        .await?
+        .await
+        .map_err(|e| MutationError::General(Box::new(e)))?
     }
 
     async fn get_state(&self, id: ID) -> Result<State, RetrievalError> {
@@ -146,7 +147,7 @@ impl StorageCollection for SledStorageCollection {
         .map_err(RetrievalError::future_join)?
     }
 
-    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool> {
+    async fn add_event(&self, entity_event: &Event) -> Result<bool, MutationError> {
         // Maybe it is worthwhile for us to separate the events table into
         // `collection-entityid` names until we have indices?
         let events = self.events.clone();
@@ -158,14 +159,15 @@ impl StorageCollection for SledStorageCollection {
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
-            let last = events.insert(id_bytes, binary_state.clone())?;
+            let last = events.insert(id_bytes, binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
             if let Some(last_bytes) = last {
                 Ok(last_bytes != binary_state)
             } else {
                 Ok(true)
             }
         })
-        .await?
+        .await
+        .map_err(|e| MutationError::General(Box::new(e)))?
     }
 
     async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> {

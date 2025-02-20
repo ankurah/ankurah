@@ -14,7 +14,7 @@ use crate::storage::Materialized;
 pub mod lww;
 pub mod pn_counter;
 pub mod yrs;
-use crate::error::RetrievalError;
+use crate::error::{MutationError, RetrievalError, StateError};
 use crate::Node;
 pub use lww::LWWBackend;
 pub use pn_counter::PNBackend;
@@ -47,20 +47,20 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     where Self: Sized;
 
     /// Get the latest state buffer for this property backend.
-    fn to_state_buffer(&self) -> Result<Vec<u8>>;
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError>;
     /// Construct a property backend from a state buffer.
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized;
 
     /// Retrieve operations applied to this backend since the last time we called this method.
-    fn to_operations(&self) -> anyhow::Result<Vec<Operation>>;
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError>;
     fn apply_operations(
         &self,
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_precursors: &Clock,
         // context: &Box<dyn TContext>,
-    ) -> anyhow::Result<()>;
+    ) -> Result<(), MutationError>;
 }
 
 pub enum BackendDowncasted {
@@ -183,7 +183,7 @@ impl Backends {
         backends.insert(backend_name, backend);
     }
 
-    pub fn to_state_buffers(&self) -> Result<State> {
+    pub fn to_state_buffers(&self) -> Result<State, StateError> {
         let backends = self.backends_lock();
         let mut state_buffers = BTreeMap::default();
         for (name, backend) in &*backends {
@@ -203,7 +203,7 @@ impl Backends {
         Ok(backends)
     }
 
-    pub fn to_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>> {
+    pub fn to_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>, MutationError> {
         let backends = self.backends_lock();
         let mut operations = BTreeMap::<String, Vec<Operation>>::new();
         for (name, backend) in &*backends {
@@ -220,7 +220,7 @@ impl Backends {
         current_head: &Clock,
         event_precursors: &Clock,
         // context: &Box<dyn TContext>,
-    ) -> Result<()> {
+    ) -> Result<(), MutationError> {
         let backend = self.get_raw(backend_name)?;
         backend.apply_operations(operations, current_head, event_precursors /*context*/)?;
         Ok(())

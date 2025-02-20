@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::context::TContext;
+use crate::error::MutationError;
+use crate::error::StateError;
 use crate::property::PropertyError;
 use crate::{error::RetrievalError, property::Backends};
 
@@ -55,7 +57,7 @@ impl Entity {
 
     pub fn backends(&self) -> &Backends { &self.backends }
 
-    pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
+    pub fn to_state(&self) -> Result<State, StateError> { self.backends.to_state_buffers() }
 
     // used by the Model macro
     pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
@@ -70,7 +72,7 @@ impl Entity {
     /// Collect an event which contains all operations for all backends since the last time they were collected
     /// Used for transaction commit.
     /// TODO: We need to think about rollbacks
-    pub fn commit(&self) -> Result<Option<Event>> {
+    pub fn commit(&self) -> Result<Option<Event>, MutationError> {
         let operations = self.backends.to_operations()?;
         if operations.is_empty() {
             Ok(None)
@@ -119,7 +121,7 @@ impl Entity {
         }
     */
 
-    pub fn apply_event(&self, event: &Event) -> Result<()> {
+    pub fn apply_event(&self, event: &Event) -> Result<(), MutationError> {
         /*
            case A: event precursor descends the current head, then set entity clock to singleton of event id
            case B: event precursor is concurrent to the current head, push event id to event head clock.
@@ -187,7 +189,7 @@ pub trait Mutable<'rec> {
     fn new(inner: &'rec Arc<Entity>) -> Self
     where Self: Sized;
 
-    fn state(&self) -> anyhow::Result<State> { self.entity().to_state() }
+    fn state(&self) -> Result<State, StateError> { self.entity().to_state() }
 
     fn read(&self) -> Self::View {
         let inner: &Arc<Entity> = self.entity();

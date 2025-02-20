@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     context::{Context, TContext},
+    error::{MutationError, StateError},
     property::{backend::PropertyBackend, traits::compare_clocks, PropertyName},
     storage::Materialized,
 };
@@ -71,7 +72,7 @@ impl PropertyBackend for LWWBackend {
 
     fn property_backend_name() -> String { "lww".to_owned() }
 
-    fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         let values = self.values.read().unwrap();
         let state_buffer = bincode::serialize(&*values)?;
         Ok(state_buffer)
@@ -83,7 +84,7 @@ impl PropertyBackend for LWWBackend {
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
-    fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
         let values = self.values.read().unwrap();
 
         let mut map = BTreeMap::<&PropertyName, &Vec<u8>>::default();
@@ -101,7 +102,7 @@ impl PropertyBackend for LWWBackend {
         current_head: &Clock,
         event_head: &Clock,
         // context: &Box<dyn TContext>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), MutationError> {
         let mut values = self.values.write().unwrap();
 
         // TODO: Figure out this comparison
