@@ -1,3 +1,4 @@
+use ankql::ast::Predicate;
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
     core::{context::Context, node::ContextData},
@@ -43,29 +44,66 @@ impl ContextData for MyContextData {}
 
 #[tokio::test]
 async fn local_access_control() -> Result<()> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), MyAccessControlAgent {});
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), TestAgent {});
     let root_context = node.context(MyContextData::Root);
-    // Create our test dataset
     create_test_dataset(root_context.clone()).await?;
 
     let alice = root_context.fetch_one::<UserView>("username = 'alice'").await?.unwrap();
     let bob = root_context.fetch_one::<UserView>("username = 'bob'").await?.unwrap();
     let charlie = root_context.fetch_one::<UserView>("username = 'charlie'").await?.unwrap();
 
-    let alice_context = node.context(MyContextData::User(alice));
-    let bob_context = node.context(MyContextData::User(bob));
-    let charlie_context = node.context(MyContextData::User(charlie));
+    let ctx_a = node.context(MyContextData::User(alice));
+    let ctx_b = node.context(MyContextData::User(bob));
+    let ctx_c = node.context(MyContextData::User(charlie));
+
+    // Scenarios we need to cover in this test:
+
+    // ALICE
+
+    // 1. Alice is allowed to fetch all users (this will just work because we're not actually checking anything yet)
+    let all_users = ctx_a.fetch::<UserView>(Predicate::True).await?;
+    assert!(all_users.len() == 3);
+
+    // 2. Alice is allowed to create a new user
+    let trx = ctx_a.begin();
+    trx.create(&User { username: "dave".into(), role: "employee".into(), department: "IT".into() }).await;
+    trx.commit().await?;
+
+    // CHARLIE
+
+    // 3. Charlie does a wildcard fetch for docs, but only Press Release and HR Policies are returned
+    let charlie_docs = ctx_c.fetch::<DocView>(Predicate::True).await?;
+    let mut titles: Vec<_> = charlie_docs.iter().map(|d| d.title().unwrap()).collect();
+    titles.sort();
+    assert_eq!(titles, vec!["HR Policies", "Press Release"]);
+
+    // 4. Charlie is allowed to fetch all users
+    let charlie_users = ctx_c.fetch::<UserView>(Predicate::True).await?;
+    assert!(charlie_users.len() == 4); // Including newly created Dave
+
+    // 5. Charlie is sneaky and tries to edit his own role, but is blocked
+    let user1 = all_users.items.iter().find(|u| u.username().unwrap() == "charlie").unwrap();
+    let trx = ctx_c.begin();
+    user1.edit(&trx).await?.role.replace("admin")?;
+    trx.commit().await?;
+
+    // 5. Charlie tries to  to create a user (will be restricted later)
+    let trx = ctx_c.begin();
+    trx.create(&User { username: "eve".into(), role: "employee".into(), department: "Finance".into() }).await;
+    trx.commit().await?;
 
     Ok(())
 }
 
+// TODO cover fetch,subscribe,create,modify,delete
+
 #[derive(Debug, Clone)]
-pub struct MyAccessControlAgent {
+pub struct TestAgent {
     // maybe I have a clone of the Node in here
     // or maybe I have my own state machine stuff
     // or maybe I'm totally stateless
 }
-impl PolicyAgent for MyAccessControlAgent {
+impl PolicyAgent for TestAgent {
     type ContextData = MyContextData;
 
     fn can_access_collection(&self, data: &Self::ContextData, collection: &ankurah::proto::CollectionId) -> ankurah::policy::AccessResult {
@@ -114,13 +152,9 @@ impl PolicyAgent for MyAccessControlAgent {
 
 async fn create_test_dataset(context: Context) -> Result<()> {
     let trx = context.begin();
-
-    // Create test users with different roles
     trx.create(&User { username: "alice".into(), role: "admin".into(), department: "IT".into() }).await;
     trx.create(&User { username: "bob".into(), role: "manager".into(), department: "HR".into() }).await;
     trx.create(&User { username: "charlie".into(), role: "employee".into(), department: "Finance".into() }).await;
-
-    // Create test documents with different sensitivity levels
     trx.create(&Doc { title: "Corp Strategy".into(), access: "restricted".into(), dept: "Executive".into(), owner: "alice".into() }).await;
     trx.create(&Doc { title: "HR Policies".into(), access: "internal".into(), dept: "HR".into(), owner: "bob".into() }).await;
     trx.create(&Doc { title: "Financials".into(), access: "confidential".into(), dept: "Finance".into(), owner: "charlie".into() }).await;
