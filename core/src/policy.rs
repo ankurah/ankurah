@@ -32,7 +32,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn can_access_collection(&self, data: &Self::ContextData, collection: &CollectionId) -> AccessResult;
 
     // For checking if a context can read an entity
-    fn can_read_entity(&self, data: &Self::ContextData, collection: &CollectionId, id: &ID) -> AccessResult;
+    fn can_read_entity(&self, data: &Self::ContextData, entity: &Entity) -> AccessResult;
 
     // For checking if a context can modify an entity
     fn can_modify_entity(&self, data: &Self::ContextData, collection: &CollectionId, id: &ID) -> AccessResult;
@@ -60,7 +60,7 @@ impl PolicyAgent for PermissiveAgent {
 
     fn can_access_collection(&self, _context: &Self::ContextData, _collection: &CollectionId) -> AccessResult { AccessResult::Allow }
 
-    fn can_read_entity(&self, _context: &Self::ContextData, _collection: &CollectionId, _id: &ID) -> AccessResult { AccessResult::Allow }
+    fn can_read_entity(&self, _context: &Self::ContextData, _entity: &Entity) -> AccessResult { AccessResult::Allow }
 
     fn can_modify_entity(&self, _context: &Self::ContextData, _collection: &CollectionId, _id: &ID) -> AccessResult { AccessResult::Allow }
 

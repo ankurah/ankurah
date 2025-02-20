@@ -113,22 +113,22 @@ impl PolicyAgent for TestAgent {
         }
     }
 
-    fn can_read_entity(
-        &self,
-        data: &Self::ContextData,
-        collection: &ankurah::proto::CollectionId,
-        id: &ankurah::ID,
-    ) -> ankurah::policy::AccessResult {
+    fn can_read_entity(&self, data: &Self::ContextData, entity: &ankurah::model::Entity) -> ankurah::policy::AccessResult {
         match data {
             MyContextData::Root => AccessResult::Allow, // Root can read everything
             MyContextData::User(user) => {
-                let role = user.role()?;
-                match collection.as_str() {
-                    "doc" => {
-                        // We'll need to fetch the doc to check its access level
-                        // For now return Ok - we'll filter in the fetch predicate
-                        Ok(())
-                    }
+                let role = user.role().unwrap();
+                match entity.collection().as_str() {
+                    "doc" => match entity.view::<DocView>() {
+                        Some(doc) => {
+                            let access = doc.access()?;
+                            match access.as_str() {
+                                "public" => AccessResult::Allow,
+                                _ => AccessResult::Deny,
+                            }
+                        }
+                        None => AccessResult::Deny,
+                    },
                     "user" => Ok(()), // All users can read user info
                     _ => Ok(()),
                 }
@@ -198,7 +198,7 @@ impl PolicyAgent for TestAgent {
 
     fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &ankurah::proto::NodeId) -> ankurah::policy::AccessResult {
         // For this test, allow all node communication
-        Ok(())
+        AccessResult::Allow
     }
 }
 

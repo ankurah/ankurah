@@ -96,6 +96,16 @@ impl Entity {
         }
     }
 
+    pub fn view<V: View>(&self) -> Option<V> {
+        if self.collection() != V::collection() {
+            None
+        } else {
+            Some(V::from_entity(self))
+        }
+    }
+
+    // pub fn property<T: Property>(&self, name: &str) -> Option<&T> { self.backends.get_property::<T>(name) }
+
     /*
         entity1: [], head: [],
         event1: ["blah"], precursors: [],
