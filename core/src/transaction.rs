@@ -17,7 +17,7 @@ use wasm_bindgen::prelude::*;
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Transaction {
-    pub(crate) dyncontext: Box<dyn TContext + Send + Sync + 'static>,
+    pub(crate) dyncontext: Arc<dyn TContext + Send + Sync + 'static>,
 
     entities: AppendOnlyVec<Entity>,
 
@@ -34,7 +34,7 @@ impl Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(dyncontext: Box<dyn TContext + Send + Sync + 'static>) -> Self {
+    pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
         Self { dyncontext, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
     }
 

@@ -44,7 +44,6 @@ pub trait TContext {
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>;
-    fn cloned(&self) -> Box<dyn TContext + Send + Sync + 'static>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
@@ -101,6 +100,8 @@ impl Context {
 
     pub fn node_id(&self) -> proto::ID { self.0.node_id() }
 
+    /// Begin a transaction.
+    pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
@@ -131,6 +132,14 @@ impl Context {
         let views = entities.into_iter().map(|entity| R::from_entity(entity)).collect();
 
         Ok(ResultSet { items: views, loaded: true })
+    }
+
+    pub async fn fetch_one<R: View>(
+        &self,
+        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
+    ) -> Result<Option<R>, RetrievalError> {
+        let result_set = self.fetch::<R>(args).await?;
+        Ok(result_set.items.into_iter().next())
     }
 
     /// Subscribe to changes in entities matching a predicate

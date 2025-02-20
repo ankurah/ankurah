@@ -84,7 +84,7 @@ impl<SE, PA> Deref for Node<SE, PA> {
 /// Represents the user session - or whatever other context the PolicyAgent
 /// Needs to perform it's evaluation. Just a marker trait for now but maybe
 /// we'll need to add some methods to it in the future.
-pub trait ContextData: Clone + Send + Sync + 'static {}
+pub trait ContextData: Send + Sync + 'static {}
 
 pub struct NodeInner<SE, PA> {
     pub id: proto::ID,
