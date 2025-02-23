@@ -55,7 +55,25 @@ impl Sql {
                     self.sql(format!(r#""{}"."{}""#, collection, name));
                 }
             },
-            _ => unimplemented!("Only literal and identifier expressions are supported"),
+            Expr::ExprList(exprs) => {
+                self.sql("(");
+                for (i, expr) in exprs.iter().enumerate() {
+                    if i > 0 {
+                        self.sql(", ");
+                    }
+                    match expr {
+                        Expr::Literal(lit) => match lit {
+                            Literal::String(s) => self.arg(s.to_owned()),
+                            Literal::Integer(int) => self.arg(*int),
+                            Literal::Float(float) => self.arg(*float),
+                            Literal::Boolean(bool) => self.arg(*bool),
+                        },
+                        _ => unimplemented!("Only literal expressions are supported in IN lists"),
+                    }
+                }
+                self.sql(")");
+            }
+            _ => unimplemented!("Only literal, identifier, and list expressions are supported"),
         }
     }
 
@@ -109,7 +127,8 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> &'static str {
         ComparisonOperator::GreaterThanOrEqual => ">=",
         ComparisonOperator::LessThan => "<",
         ComparisonOperator::LessThanOrEqual => "<=",
-        _ => unimplemented!("Only basic comparison operators are supported"),
+        ComparisonOperator::In => "IN",
+        ComparisonOperator::Between => unimplemented!("BETWEEN operator is not yet supported"),
     }
 }
 
@@ -181,6 +200,18 @@ mod tests {
 
         assert_eq!(sql_string, "FALSE");
         let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![];
+        assert_args(&args, &expected);
+    }
+
+    #[test]
+    fn test_in_operator() {
+        let predicate = parse_selection("name IN ('Alice', 'Bob', 'Charlie')").unwrap();
+        let mut sql = Sql::new();
+        sql.predicate(&predicate);
+        let (sql_string, args) = sql.collapse();
+
+        assert_eq!(sql_string, r#""name" IN ($1, $2, $3)"#);
+        let expected: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new("Alice"), Box::new("Bob"), Box::new("Charlie")];
         assert_args(&args, &expected);
     }
 }

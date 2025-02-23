@@ -12,6 +12,38 @@ pub enum Error {
     PropertyNotFound(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprOutput<T> {
+    List(Vec<ExprOutput<T>>),
+    Value(T),
+    None,
+}
+
+impl<T: PartialEq> ExprOutput<T> {
+    fn as_value(&self) -> Option<&T> {
+        match self {
+            ExprOutput::Value(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn as_list(&self) -> Option<&Vec<ExprOutput<T>>> {
+        match self {
+            ExprOutput::List(l) => Some(l),
+            _ => None,
+        }
+    }
+}
+
+impl ExprOutput<String> {
+    fn is_none(&self) -> bool {
+        match self {
+            ExprOutput::None => true,
+            _ => false,
+        }
+    }
+}
+
 // Just to make this fast, lets assume all values are strings.
 pub trait Filterable {
     fn collection(&self) -> &str;
@@ -20,24 +52,31 @@ pub trait Filterable {
     fn value(&self, name: &str) -> Option<String>;
 }
 
-fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<Option<String>, Error> {
+fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<String>, Error> {
     match expr {
-        Expr::Literal(lit) => Ok(match lit {
-            Literal::String(s) => Some(s.clone()),
-            Literal::Integer(i) => Some(i.to_string()),
-            Literal::Float(f) => Some(f.to_string()),
-            Literal::Boolean(b) => Some(b.to_string()),
-        }),
+        Expr::Literal(lit) => Ok(ExprOutput::Value(match lit {
+            Literal::String(s) => s.clone(),
+            Literal::Integer(i) => i.to_string(),
+            Literal::Float(f) => f.to_string(),
+            Literal::Boolean(b) => b.to_string(),
+        })),
         Expr::Identifier(id) => match id {
-            Identifier::Property(name) => Ok(item.value(name)),
+            Identifier::Property(name) => Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone()))?)),
             Identifier::CollectionProperty(collection, name) => {
                 if collection != item.collection() {
                     return Err(Error::CollectionMismatch { expected: collection.clone(), actual: item.collection().to_string() });
                 }
-                Ok(item.value(name))
+                Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone()))?))
             }
         },
-        _ => unimplemented!("Only literal and identifier expressions are supported"),
+        Expr::ExprList(exprs) => {
+            let mut result = Vec::new();
+            for expr in exprs {
+                result.push(evaluate_expr(item, expr)?);
+            }
+            Ok(ExprOutput::List(result))
+        }
+        _ => unimplemented!("Only literal, identifier, and list expressions are supported"),
     }
 }
 
@@ -48,13 +87,21 @@ pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Res
             let right_val = evaluate_expr(item, right)?;
 
             Ok(match operator {
-                ComparisonOperator::Equal => left_val == right_val,
-                ComparisonOperator::NotEqual => left_val != right_val,
-                ComparisonOperator::GreaterThan => left_val > right_val,
-                ComparisonOperator::GreaterThanOrEqual => left_val >= right_val,
-                ComparisonOperator::LessThan => left_val < right_val,
-                ComparisonOperator::LessThanOrEqual => left_val <= right_val,
-                _ => unimplemented!("Only basic comparison operators are supported"),
+                ComparisonOperator::Equal => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l == r).unwrap_or(false),
+                ComparisonOperator::NotEqual => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l != r).unwrap_or(false),
+                ComparisonOperator::GreaterThan => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l > r).unwrap_or(false),
+                ComparisonOperator::GreaterThanOrEqual => {
+                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l >= r).unwrap_or(false)
+                }
+                ComparisonOperator::LessThan => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l < r).unwrap_or(false),
+                ComparisonOperator::LessThanOrEqual => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l <= r).unwrap_or(false),
+                ComparisonOperator::In => {
+                    let value =
+                        left_val.as_value().ok_or_else(|| Error::PropertyNotFound("Expected single value for IN left operand".into()))?;
+                    let list = right_val.as_list().ok_or_else(|| Error::PropertyNotFound("Expected list for IN right operand".into()))?;
+                    list.iter().any(|item| item.as_value().map(|v| v == value).unwrap_or(false))
+                }
+                ComparisonOperator::Between => unimplemented!("BETWEEN operator not yet supported"),
             })
         }
         Predicate::And(left, right) => Ok(evaluate_predicate(item, left)? && evaluate_predicate(item, right)?),
@@ -184,6 +231,47 @@ mod tests {
                 FilterResult::Pass(TestItem::new("Charlie", "30")),
                 FilterResult::Skip(TestItem::new("David", "35")),
                 FilterResult::Skip(TestItem::new("Eve", "40")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_in_operator() {
+        let items = vec![
+            TestItem::new("Alice", "20"),
+            TestItem::new("Bob", "25"),
+            TestItem::new("Charlie", "30"),
+            TestItem::new("David", "35"),
+            TestItem::new("Eve", "40"),
+        ];
+
+        // Test IN with names
+        let predicate = parse_selection("name IN ('Alice', 'Charlie', 'Eve')").unwrap();
+        let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), predicate).collect();
+
+        assert_eq!(
+            results,
+            vec![
+                FilterResult::Pass(TestItem::new("Alice", "20")),
+                FilterResult::Skip(TestItem::new("Bob", "25")),
+                FilterResult::Pass(TestItem::new("Charlie", "30")),
+                FilterResult::Skip(TestItem::new("David", "35")),
+                FilterResult::Pass(TestItem::new("Eve", "40")),
+            ]
+        );
+
+        // Test IN with ages
+        let predicate = parse_selection("age IN ('20', '30', '40')").unwrap();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
+
+        assert_eq!(
+            results,
+            vec![
+                FilterResult::Pass(TestItem::new("Alice", "20")),
+                FilterResult::Skip(TestItem::new("Bob", "25")),
+                FilterResult::Pass(TestItem::new("Charlie", "30")),
+                FilterResult::Skip(TestItem::new("David", "35")),
+                FilterResult::Pass(TestItem::new("Eve", "40")),
             ]
         );
     }

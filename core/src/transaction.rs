@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ankurah_proto as proto;
 
 use crate::{
