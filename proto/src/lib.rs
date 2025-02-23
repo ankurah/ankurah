@@ -60,6 +60,9 @@ pub struct CollectionId(String);
 impl From<&str> for CollectionId {
     fn from(val: &str) -> Self { CollectionId(val.to_string()) }
 }
+impl PartialEq<str> for CollectionId {
+    fn eq(&self, other: &str) -> bool { self.0 == other }
+}
 
 impl From<CollectionId> for String {
     fn from(collection_id: CollectionId) -> Self { collection_id.0 }

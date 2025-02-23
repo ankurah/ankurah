@@ -99,7 +99,8 @@ pub async fn create_test_entity() -> Result<(), JsValue> {
             ip_address: "127.0.0.1".to_string(),
             node_id: context.node_id().into(),
         })
-        .await;
+        .await
+        .unwrap();
     trx.commit().await.unwrap();
     Ok(())
 }

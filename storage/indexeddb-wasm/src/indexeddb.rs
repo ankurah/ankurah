@@ -617,7 +617,7 @@ mod tests {
             tracing::info!("Creating transaction");
             let trx = node.begin();
             tracing::info!("Transaction created");
-            let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await;
+            let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await?;
             assert_eq!(album.name().value(), Some("The rest of the owl".to_string()));
 
             id = album.id();
@@ -652,13 +652,13 @@ mod tests {
         {
             let trx = node.begin();
 
-            trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
+            trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
 
-            trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
+            trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
 
-            trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
+            trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
 
-            trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
+            trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
 
             trx.commit().await?;
         }

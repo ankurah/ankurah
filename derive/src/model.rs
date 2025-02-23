@@ -124,7 +124,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         // TODO wasm-bindgen this
         impl #view_name {
-            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::RetrievalError> {
+            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::MutationError> {
                 use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                 trx.edit::<#name>(self.id()).await

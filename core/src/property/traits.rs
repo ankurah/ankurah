@@ -21,7 +21,7 @@ pub enum PropertyError {
     #[error("property is missing")]
     Missing,
     #[error("deserialization error: {0}")]
-    DeserializeError(Box<dyn std::error::Error>),
+    DeserializeError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("retrieval error: {0}")]
     RetrievalError(crate::error::RetrievalError),
 }

@@ -84,8 +84,8 @@ pub struct NodeInner<SE, PA> {
     pending_requests: DashMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 
     /// The reactor for handling subscriptions
-    pub reactor: Arc<Reactor<SE, PA>>,
-    policy_agent: PA,
+    pub(crate) reactor: Arc<Reactor<SE, PA>>,
+    pub(crate) policy_agent: PA,
 }
 
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
@@ -543,9 +543,12 @@ where
             }
         }
 
+        self.policy_agent.can_access_collection(cdata, collection_id)?;
         // Fetch raw states from storage
         let storage_collection = self.collection(&collection_id).await;
-        let states = storage_collection.fetch_states(&args.predicate).await?;
+
+        let predicate = self.policy_agent.filter_predicate(cdata, collection_id, args.predicate)?;
+        let states = storage_collection.fetch_states(&predicate).await?;
 
         // Convert states to entities
         let mut entities = Vec::new();

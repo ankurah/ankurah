@@ -4,11 +4,12 @@ use crate::{
     error::{MutationError, RetrievalError},
     model::{Entity, View},
     node::{MatchArgs, Node},
-    policy::PolicyAgent,
+    policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
+    Model,
 };
 use ankurah_proto as proto;
 use async_trait::async_trait;
@@ -27,6 +28,8 @@ pub struct NodeAndContext<SE, PA: PolicyAgent> {
 pub trait TContext {
     fn node_id(&self) -> proto::NodeId;
     fn next_entity_id(&self) -> proto::ID;
+    fn check_create(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied>;
+    fn check_edit(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Arc<Entity>>, RetrievalError>;
     async fn insert_entity(&self, entity: Arc<Entity>) -> Result<(), MutationError>;
@@ -45,6 +48,10 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::NodeId { self.node.id.clone() }
     fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
+    fn check_create(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied> {
+        self.node.policy_agent.pre_create(&self.cdata, entity).into()
+    }
+    fn check_edit(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied> { self.node.policy_agent.pre_edit(&self.cdata, entity).into() }
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
         self.node.get_entity(collection, id /*&self.cdata*/).await
     }

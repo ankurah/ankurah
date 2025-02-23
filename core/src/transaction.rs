@@ -45,19 +45,19 @@ impl Transaction {
         &self.entities[index]
     }
 
-    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec> {
+    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<M::Mutable<'rec>, MutationError> {
         let id = self.dyncontext.next_entity_id();
         let new_entity = Arc::new(model.create_entity(id));
+        self.dyncontext.check_create(&new_entity)?;
+
         let entity_ref = self.add_entity(new_entity);
-        <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
+        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
     }
     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
-    pub async fn edit<'rec, 'trx: 'rec, M: Model>(
-        &'trx self,
-        id: impl Into<proto::ID>,
-    ) -> Result<M::Mutable<'rec>, crate::error::RetrievalError> {
+    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::ID>) -> Result<M::Mutable<'rec>, MutationError> {
         let id = id.into();
         let entity = self.get_entity(id, &M::collection()).await?;
+        self.dyncontext.check_edit(entity)?;
 
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
     }

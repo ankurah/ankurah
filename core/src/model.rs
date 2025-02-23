@@ -96,11 +96,11 @@ impl Entity {
         }
     }
 
-    pub fn view<V: View>(&self) -> Option<V> {
+    pub fn view<V: View>(self: &Arc<Self>) -> Option<V> {
         if self.collection() != V::collection() {
             None
         } else {
-            Some(V::from_entity(self))
+            Some(V::from_entity(self.clone()))
         }
     }
 

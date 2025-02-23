@@ -20,10 +20,10 @@ async fn inter_node_fetch() -> Result<()> {
 
     {
         let trx = ctx1.begin();
-        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
-        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
-        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
-        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
+        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
+        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
+        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
+        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
         trx.commit().await?;
     };
 
@@ -63,9 +63,9 @@ async fn server_edits_subscription() -> Result<()> {
     // Create initial entities on node1
     let (rex, snuffy, jasper) = {
         let trx = server.begin();
-        let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await;
-        let snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await;
-        let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await;
+        let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await?;
+        let snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await?;
+        let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await?;
 
         let read = (rex.read(), snuffy.read(), jasper.read());
         trx.commit().await?;
@@ -129,7 +129,7 @@ async fn test_client_server_propagation() -> Result<()> {
     // Create an entity on client_a
     {
         let trx = client_a.begin();
-        trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
+        trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await?;
         trx.commit().await?;
     }
 
@@ -175,7 +175,7 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     // Create an entity on client_a
     let album_id = {
         let trx = client_a.begin();
-        let album = trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
+        let album = trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await?;
         let id = album.id();
         trx.commit().await?;
         id

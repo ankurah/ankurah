@@ -28,7 +28,7 @@ pub trait StorageCollection: Send + Sync {
     // Fetch raw entity states matching a predicate
     async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError>;
 
-    async fn set_states(&self, entities: Vec<(ID, &State)>) -> anyhow::Result<()> {
+    async fn set_states(&self, entities: Vec<(ID, &State)>) -> Result<(), MutationError> {
         for (id, state) in entities {
             self.set_state(id, state).await?;
         }
