@@ -138,3 +138,15 @@ impl From<StateError> for MutationError {
 impl From<StateError> for RetrievalError {
     fn from(err: StateError) -> Self { RetrievalError::StateError(err) }
 }
+
+#[derive(Error, Debug)]
+pub enum ValidationError {
+    #[error("Deserialization error: {0}")]
+    Deserialization(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("Validation failed: {0}")]
+    ValidationFailed(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    #[error("Rejected: {0}")]
+    Rejected(&'static str),
+}

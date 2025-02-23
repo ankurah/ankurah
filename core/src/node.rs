@@ -1,5 +1,6 @@
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
+use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
 use rand::prelude::*;
 use std::{
@@ -13,7 +14,7 @@ use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
     connector::PeerSender,
     context::Context,
-    error::{MutationError, RequestError, RetrievalError},
+    error::{MutationError, RequestError, RetrievalError, ValidationError},
     model::Entity,
     policy::PolicyAgent,
     reactor::Reactor,
@@ -67,9 +68,16 @@ impl<SE, PA> Deref for Node<SE, PA> {
 }
 
 /// Represents the user session - or whatever other context the PolicyAgent
-/// Needs to perform it's evaluation. Just a marker trait for now but maybe
-/// we'll need to add some methods to it in the future.
-pub trait ContextData: Send + Sync + 'static {}
+/// Needs to perform it's evaluation.
+#[async_trait]
+pub trait ContextData: Send + Sync + 'static {
+    /// Validate and convert from wire format to this context type
+    async fn validate(context: proto::Context) -> Result<Self, ValidationError>
+    where Self: Sized;
+
+    /// Convert this context to wire format
+    fn proto(&self) -> Result<proto::Context, ValidationError>;
+}
 
 pub struct NodeInner<SE, PA> {
     pub id: proto::NodeId,

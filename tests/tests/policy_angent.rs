@@ -1,17 +1,20 @@
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
 use ankql::parser::parse_selection;
-use ankurah::error::MutationError;
+use ankurah::error::{MutationError, RetrievalError, ValidationError};
 use ankurah::model::Entity;
+use ankurah::property::PropertyError;
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
     core::{context::Context, node::ContextData},
-    policy::{AccessDenied, PolicyAgent, DEFAULT_CONTEXT as c},
-    proto::CollectionId,
+    policy::{AccessDenied, PolicyAgent},
+    proto::{self, CollectionId},
     Model, Mutable, Node, PermissiveAgent, ResultSet,
 };
-
+use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 mod common;
@@ -34,18 +37,63 @@ pub struct Doc {
 
 pub enum MyContextData {
     Root,
-    User(UserView),
+    User { username: String, role: String, department: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyContextProto {
+    pub username: String,
+    pub role: String,
+    pub department: String,
+    pub evil_bit: bool,
 }
 
 impl std::fmt::Debug for MyContextData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MyContextData::Root => write!(f, "Root"),
-            MyContextData::User(user) => write!(f, "User({})", user.username()?),
+            MyContextData::User { username, role, department } => write!(f, "User({} {} {})", username, role, department),
         }
     }
 }
-impl ContextData for MyContextData {}
+#[async_trait]
+impl ContextData for MyContextData {
+    async fn validate(context: proto::Context) -> Result<Self, ValidationError> {
+        let proto: MyContextProto = serde_json::from_slice(&context.0).map_err(|e| ValidationError::Deserialization(Box::new(e)))?;
+        if proto.evil_bit {
+            Err(ValidationError::Rejected("Evil bit is set"))
+        } else {
+            let username = proto.username;
+            if username == "root" {
+                Ok(MyContextData::Root)
+            } else {
+                let role = proto.role;
+                let department = proto.department;
+                Ok(MyContextData::User { username, role, department })
+            }
+        }
+    }
+
+    fn proto(&self) -> Result<proto::Context, ValidationError> {
+        match self {
+            MyContextData::Root => {
+                let proto = MyContextProto { username: "root".into(), role: "root".into(), department: "root".into(), evil_bit: false };
+                Ok(proto::Context(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?))
+            }
+            MyContextData::User { username, role, department } => {
+                let proto =
+                    MyContextProto { username: username.clone(), role: role.clone(), department: department.clone(), evil_bit: false };
+                Ok(proto::Context(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?))
+            }
+        }
+    }
+}
+impl TryFrom<UserView> for MyContextData {
+    type Error = PropertyError;
+    fn try_from(user: UserView) -> Result<Self, Self::Error> {
+        Ok(MyContextData::User { username: user.username()?, role: user.role()?, department: user.department()? })
+    }
+}
 
 #[tokio::test]
 async fn local_access_control() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,52 +105,103 @@ async fn local_access_control() -> Result<(), Box<dyn std::error::Error>> {
     let bob = root_context.fetch_one::<UserView>("username = 'bob'").await?.unwrap();
     let charlie = root_context.fetch_one::<UserView>("username = 'charlie'").await?.unwrap();
 
-    let ctx_a = node.context(MyContextData::User(alice));
-    let ctx_b = node.context(MyContextData::User(bob));
-    let ctx_c = node.context(MyContextData::User(charlie));
+    let c_alice = node.context(alice.try_into()?);
+    let _c_bob = node.context(bob.try_into()?);
+    let c_charlie = node.context(charlie.try_into()?);
 
     // Scenarios we need to cover in this test:
 
     // ALICE
 
     // 1. Alice is allowed to fetch all users (this will just work because we're not actually checking anything yet)
-    let all_users = ctx_a.fetch::<UserView>(Predicate::True).await?;
+    let all_users = c_alice.fetch::<UserView>(Predicate::True).await?;
     assert!(all_users.len() == 3);
 
     // 2. Alice is allowed to create a new user
-    let trx = ctx_a.begin();
+    let trx = c_alice.begin();
     trx.create(&User { username: "dave".into(), role: "employee".into(), department: "IT".into() }).await?;
     trx.commit().await?;
-    println!("passed 2");
-    // CHARLIE
 
     // 3. Charlie does a wildcard fetch for docs, but only Press Release and HR Policies are returned
-    let charlie_docs = ctx_c.fetch::<DocView>(Predicate::True).await?;
+    let charlie_docs = c_charlie.fetch::<DocView>(Predicate::True).await?;
     let mut titles: Vec<_> = charlie_docs.iter().map(|d| d.title().unwrap()).collect();
     titles.sort();
     assert_eq!(titles, vec!["HR Policies", "Press Release"]);
-    println!("passed 3");
     // 4. Charlie is allowed to fetch all users
-    let charlie_users = ctx_c.fetch::<UserView>(Predicate::True).await?;
+    let charlie_users = c_charlie.fetch::<UserView>(Predicate::True).await?;
     assert!(charlie_users.len() == 4); // Including newly created Dave
-    println!("passed 4");
 
     // 5. Charlie is sneaky and tries to edit his own role, but is blocked
     let user1 = all_users.items.iter().find(|u| u.username().unwrap() == "charlie").unwrap();
-    let trx = ctx_c.begin();
+    let trx = c_charlie.begin();
     // assert!(matches!(user1.edit(&trx).await?.role.replace("admin"), Err(MutationError::AccessDenied(_))));
     assert!(matches!(user1.edit(&trx).await, Err(MutationError::AccessDenied(_))));
     trx.commit().await?;
-    println!("passed 5");
 
     // 6. Charlie tries to create a user - but is blocked
-    let trx = ctx_c.begin();
+    let trx = c_charlie.begin();
     assert!(matches!(
         trx.create(&User { username: "eve".into(), role: "employee".into(), department: "Finance".into() }).await,
         Err(MutationError::AccessDenied(_))
     ));
     trx.commit().await?;
-    println!("passed 6");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn distributed_access_control() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a server with TestAgent (enforcing policies) and a "dishonest" client with PermissiveAgent (no restrictions)
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), TestAgent {});
+    let dishonest_client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), DishonestTestAgent {});
+
+    // Connect the client to the server
+    let _conn = LocalProcessConnection::new(&dishonest_client, &server).await?;
+
+    // Set up the initial dataset on the server with proper permissions
+    let server_context = server.context(MyContextData::Root);
+    create_test_dataset(server_context.clone()).await?;
+
+    // Get user references from server
+    let alice = server_context.fetch_one::<UserView>("username = 'alice'").await?.unwrap();
+    let charlie = server_context.fetch_one::<UserView>("username = 'charlie'").await?.unwrap();
+
+    // Create contexts for both honest and dishonest operations
+    let c_alice = dishonest_client.context(alice.try_into()?);
+    let c_charlie = dishonest_client.context(charlie.try_into()?);
+
+    // 1. Alice is allowed to fetch all users (this will just work because we're not actually checking anything yet)
+    let all_users = c_alice.fetch::<UserView>(Predicate::True).await?;
+    assert!(all_users.len() == 3);
+
+    // 2. Alice is allowed to create a new user
+    let trx = c_alice.begin();
+    trx.create(&User { username: "dave".into(), role: "employee".into(), department: "IT".into() }).await?;
+    trx.commit().await?;
+
+    // 3. Charlie does a wildcard fetch for docs, but only Press Release and HR Policies are returned
+    let charlie_docs = c_charlie.fetch::<DocView>(Predicate::True).await?;
+    let mut titles: Vec<_> = charlie_docs.iter().map(|d| d.title().unwrap()).collect();
+    titles.sort();
+    assert_eq!(titles, vec!["HR Policies", "Press Release"]);
+    // 4. Charlie is allowed to fetch all users
+    let charlie_users = c_charlie.fetch::<UserView>(Predicate::True).await?;
+    assert!(charlie_users.len() == 4); // Including newly created Dave
+
+    // 5. Charlie is sneaky and tries to edit his own role, but is blocked
+    let user1 = all_users.items.iter().find(|u| u.username().unwrap() == "charlie").unwrap();
+    let trx = c_charlie.begin();
+    // assert!(matches!(user1.edit(&trx).await?.role.replace("admin"), Err(MutationError::AccessDenied(_))));
+    assert!(matches!(user1.edit(&trx).await, Err(MutationError::AccessDenied(_))));
+    trx.commit().await?;
+
+    // 6. Charlie tries to create a user - but is blocked
+    let trx = c_charlie.begin();
+    assert!(matches!(
+        trx.create(&User { username: "eve".into(), role: "employee".into(), department: "Finance".into() }).await,
+        Err(MutationError::AccessDenied(_))
+    ));
+    trx.commit().await?;
 
     Ok(())
 }
@@ -115,15 +214,29 @@ pub struct TestAgent {
     // or maybe I have my own state machine stuff
     // or maybe I'm totally stateless
 }
+
+#[derive(Debug, Clone)]
+pub struct DishonestTestAgent {}
+
+/// Everything is allowed
+impl PolicyAgent for DishonestTestAgent {
+    type ContextData = MyContextData;
+    fn pre_create(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
+    fn pre_edit(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
+    fn can_access_collection(&self, context: &MyContextData, _collection: &CollectionId) -> Result<(), AccessDenied> { Ok(()) }
+    fn filter_predicate(&self, cdata: &MyContextData, collection: &CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied> {
+        Ok(predicate)
+    }
+}
+
+/// Actually enforces policies
 impl PolicyAgent for TestAgent {
     type ContextData = MyContextData;
     fn pre_create(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> {
         println!("pre_create: {:?}", cdata);
         match cdata {
             MyContextData::Root => Ok(()),
-            MyContextData::User(user) => {
-                let username: String = user.username()?;
-                let role: String = user.role()?;
+            MyContextData::User { username, role, department } => {
                 let collection = entity.collection();
                 println!("collection: {} role: {} username: {}", collection, role, username);
                 match collection.as_str() {
@@ -146,10 +259,8 @@ impl PolicyAgent for TestAgent {
     fn pre_edit(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> {
         match cdata {
             MyContextData::Root => Ok(()),
-            MyContextData::User(user) => {
+            MyContextData::User { username, role, department } => {
                 // same as create
-                let username: String = user.username()?;
-                let role: String = user.role()?;
                 let collection = entity.collection();
                 println!("collection: {} role: {} username: {}", collection, role, username);
                 match collection.as_str() {
@@ -173,9 +284,7 @@ impl PolicyAgent for TestAgent {
     fn filter_predicate(&self, cdata: &MyContextData, collection: &CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied> {
         match cdata {
             MyContextData::Root => Ok(predicate),
-            MyContextData::User(user) => {
-                let role: String = user.role()?;
-
+            MyContextData::User { role, .. } => {
                 if role == "admin" {
                     Ok(predicate)
                 } else if collection == "doc" {

@@ -340,6 +340,10 @@ pub struct Presence {
     pub durable: bool,
 }
 
+/// Raw context data that can be transmitted between nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Context(pub Vec<u8>);
+
 impl TryFrom<JsValue> for Clock {
     type Error = DecodeError;
 

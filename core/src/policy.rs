@@ -1,11 +1,13 @@
 use crate::{
     changes::ChangeSet,
+    error::ValidationError,
     model::{Entity, Model},
     node::ContextData,
     property::PropertyError,
-    proto::{CollectionId, NodeId, ID},
+    proto,
 };
 use ankql::{ast::Predicate, error::ParseError};
+use async_trait::async_trait;
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -15,7 +17,7 @@ pub enum AccessDenied {
     #[error("Access denied by policy: {0}")]
     ByPolicy(&'static str),
     #[error("Access denied by collection: {0}")]
-    CollectionDenied(CollectionId),
+    CollectionDenied(proto::CollectionId),
     #[error("Access denied by property error: {0}")]
     PropertyError(Box<PropertyError>),
     #[error("Access denied by parse error: {0}")]
@@ -39,12 +41,12 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     type ContextData: ContextData;
 
     // For checking if a context can access a collection
-    fn can_access_collection(&self, data: &Self::ContextData, collection: &CollectionId) -> Result<(), AccessDenied>;
+    fn can_access_collection(&self, data: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied>;
 
     fn filter_predicate(
         &self,
         data: &Self::ContextData,
-        collection: &CollectionId,
+        collection: &proto::CollectionId,
         predicate: Predicate,
     ) -> Result<Predicate, AccessDenied>;
 
@@ -77,7 +79,7 @@ impl PermissiveAgent {
 impl PolicyAgent for PermissiveAgent {
     type ContextData = &'static DefaultContext;
 
-    fn can_access_collection(&self, _context: &Self::ContextData, _collection: &CollectionId) -> Result<(), AccessDenied> { Ok(()) }
+    fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
 
     fn pre_create(&self, _context: &Self::ContextData, _entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
 
@@ -86,7 +88,7 @@ impl PolicyAgent for PermissiveAgent {
     fn filter_predicate(
         &self,
         _context: &Self::ContextData,
-        _collection: &CollectionId,
+        _collection: &proto::CollectionId,
         predicate: Predicate,
     ) -> Result<Predicate, AccessDenied> {
         Ok(predicate)
@@ -114,4 +116,8 @@ impl DefaultContext {
     pub fn new() -> Self { Self {} }
 }
 
-impl ContextData for &'static DefaultContext {}
+#[async_trait]
+impl ContextData for &'static DefaultContext {
+    async fn validate(_context: proto::Context) -> Result<Self, ValidationError> { Ok(DEFAULT_CONTEXT) }
+    fn proto(&self) -> Result<proto::Context, ValidationError> { Ok(proto::Context(vec![])) }
+}
