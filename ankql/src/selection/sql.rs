@@ -14,7 +14,22 @@ fn generate_expr_sql(expr: &Expr) -> String {
                 format!(r#""{}"."{}""#, collection, name)
             }
         },
-        _ => unimplemented!("Only literal and identifier expressions are supported"),
+        Expr::ExprList(exprs) => {
+            let values: Vec<String> = exprs
+                .iter()
+                .map(|expr| match expr {
+                    Expr::Literal(lit) => match lit {
+                        Literal::String(s) => format!("'{}'", s),
+                        Literal::Integer(i) => i.to_string(),
+                        Literal::Float(f) => f.to_string(),
+                        Literal::Boolean(b) => b.to_string(),
+                    },
+                    _ => unimplemented!("Only literal expressions are supported in IN lists"),
+                })
+                .collect();
+            format!("({})", values.join(", "))
+        }
+        _ => unimplemented!("Only literal, identifier, and list expressions are supported"),
     }
 }
 
@@ -26,7 +41,8 @@ fn comparison_op_to_sql(op: &ComparisonOperator) -> &'static str {
         ComparisonOperator::GreaterThanOrEqual => ">=",
         ComparisonOperator::LessThan => "<",
         ComparisonOperator::LessThanOrEqual => "<=",
-        _ => unimplemented!("Only basic comparison operators are supported"),
+        ComparisonOperator::In => "IN",
+        ComparisonOperator::Between => unimplemented!("BETWEEN operator is not yet supported"),
     }
 }
 
@@ -79,5 +95,17 @@ mod tests {
         let predicate = parse_selection("person.name = 'Alice'").unwrap();
         let sql = generate_selection_sql(&predicate);
         assert_eq!(sql, r#""person"."name" = 'Alice'"#);
+    }
+
+    #[test]
+    fn test_in_operator() {
+        let predicate = parse_selection("name IN ('Alice', 'Bob', 'Charlie')").unwrap();
+        let sql = generate_selection_sql(&predicate);
+        assert_eq!(sql, r#""name" IN ('Alice', 'Bob', 'Charlie')"#);
+
+        // Test with numbers
+        let predicate = parse_selection("age IN (25, 30, 35)").unwrap();
+        let sql = generate_selection_sql(&predicate);
+        assert_eq!(sql, r#""age" IN (25, 30, 35)"#);
     }
 }

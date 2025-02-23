@@ -24,7 +24,7 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
     ExprAtomValue = _{ UnaryNot* ~ AtomicExpr ~ IsNullPostfix? }
         UnaryNot   = @{ NotFlag }
         IsNullPostfix = { ^"is" ~ NotFlag? ~ ^"null" }
-        AtomicExpr = _{ Literal | IdentifierWithOptionalContinuation | ExpressionInParentheses }
+        AtomicExpr = _{ Literal | IdentifierWithOptionalContinuation | ExpressionInParentheses | Row }
             Literal = _{ True | False | Null | Double | Decimal | Unsigned | Integer | SingleQuotedString }
                 True     = { ^"true" }
                 False    = { ^"false" }
@@ -39,6 +39,7 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
             IdentifierWithOptionalContinuation = { Identifier ~ (ReferenceContinuation)? }
                 ReferenceContinuation          = { "." ~ Identifier }
             ExpressionInParentheses = { "(" ~ Expr ~ ")" }
+            Row = { "(" ~ Expr ~ ("," ~ Expr)* ~ ")" }
 
 Identifier = @{ DoubleQuotedIdentifier | IdentifierInner  }
     DoubleQuotedIdentifier = @{ ("\"" ~ IdentifierInner ~ "\"") }
@@ -50,5 +51,6 @@ Identifier = @{ DoubleQuotedIdentifier | IdentifierInner  }
                 | ^"values"}
 
 NotFlag = { ^"not" }
+
 EOF = { EOI | ";" }
 WHITESPACE = _{ " " | "\t" | "\n" | "\r\n" }

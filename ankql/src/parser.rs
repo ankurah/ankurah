@@ -93,7 +93,8 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, ParseError> {
                     | grammar::Rule::Gt
                     | grammar::Rule::LtEq
                     | grammar::Rule::Lt
-                    | grammar::Rule::NotEq => create_comparison(result, op.as_rule(), right)?,
+                    | grammar::Rule::NotEq
+                    | grammar::Rule::In => create_comparison(result, op.as_rule(), right)?,
                     grammar::Rule::And | grammar::Rule::Or => create_logical_op(op.as_rule(), result, right, &mut pairs)?,
                     _ => {
                         return Err(ParseError::UnexpectedRule { expected: "comparison operator, And, or Or", got: op.as_rule() });
@@ -116,6 +117,7 @@ fn create_comparison(left: ast::Expr, op: grammar::Rule, right: Pair<grammar::Ru
         grammar::Rule::LtEq => ast::ComparisonOperator::LessThanOrEqual,
         grammar::Rule::Lt => ast::ComparisonOperator::LessThan,
         grammar::Rule::NotEq => ast::ComparisonOperator::NotEqual,
+        grammar::Rule::In => ast::ComparisonOperator::In,
         _ => {
             return Err(ParseError::UnexpectedRule { expected: "comparison operator", got: op });
         }
@@ -141,7 +143,8 @@ fn create_logical_op(
             | grammar::Rule::Gt
             | grammar::Rule::LtEq
             | grammar::Rule::Lt
-            | grammar::Rule::NotEq => {
+            | grammar::Rule::NotEq
+            | grammar::Rule::In => {
                 let next_right = rest.next().ok_or(ParseError::MissingOperand("comparison right"))?;
                 let next_right_expr = parse_atomic_expr(next_right)?;
                 ast::Predicate::Comparison {
@@ -153,6 +156,7 @@ fn create_logical_op(
                         grammar::Rule::LtEq => ast::ComparisonOperator::LessThanOrEqual,
                         grammar::Rule::Lt => ast::ComparisonOperator::LessThan,
                         grammar::Rule::NotEq => ast::ComparisonOperator::NotEqual,
+                        grammar::Rule::In => ast::ComparisonOperator::In,
                         _ => unreachable!(),
                     },
                     right: Box::new(next_right_expr),
@@ -183,6 +187,18 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
             let inner = pair.into_inner().next().ok_or(ParseError::EmptyExpression)?;
             let pred = parse_expr(inner)?;
             Ok(ast::Expr::Predicate(pred))
+        }
+        grammar::Rule::Row => {
+            let mut exprs = Vec::new();
+            for expr_pair in pair.into_inner() {
+                if expr_pair.as_rule() == grammar::Rule::Expr {
+                    let expr = parse_atomic_expr(expr_pair.into_inner().next().ok_or(ParseError::EmptyExpression)?)?;
+                    exprs.push(expr);
+                } else {
+                    exprs.push(parse_atomic_expr(expr_pair)?);
+                }
+            }
+            Ok(ast::Expr::ExprList(exprs))
         }
         _ => Err(ParseError::UnexpectedRule { expected: "atomic expression", got: pair.as_rule() }),
     }
@@ -355,6 +371,41 @@ mod tests {
         matches!(
             parse_selection(input),
             Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses", got: grammar::Rule::ExpressionInParentheses })
+        );
+    }
+
+    #[test]
+    fn test_parse_selection_in_clause() {
+        let input = r#"status IN ('active', 'pending')"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(
+            predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                operator: ast::ComparisonOperator::In,
+                right: Box::new(ast::Expr::ExprList(vec![
+                    ast::Expr::Literal(ast::Literal::String("active".to_string())),
+                    ast::Expr::Literal(ast::Literal::String("pending".to_string())),
+                ]))
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_selection_in_clause_numbers() {
+        let input = r#"user_id IN (1, 2, 3)"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(
+            predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                operator: ast::ComparisonOperator::In,
+                right: Box::new(ast::Expr::ExprList(vec![
+                    ast::Expr::Literal(ast::Literal::Integer(1)),
+                    ast::Expr::Literal(ast::Literal::Integer(2)),
+                    ast::Expr::Literal(ast::Literal::Integer(3)),
+                ]))
+            }
         );
     }
 }
