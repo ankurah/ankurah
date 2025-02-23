@@ -67,9 +67,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
         self.node.subscribe(sub_id, collection, args, callback).await
     }
-    fn cloned(&self) -> Box<dyn TContext + Send + Sync + 'static> {
-        Box::new(NodeAndContext { node: self.node.clone(), cdata: self.cdata.clone() })
-    }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.collections.get(id).await
     }
@@ -87,7 +84,7 @@ impl Context {
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl Context {
     /// Begin a transaction.
-    pub fn begin(&self) -> Transaction { Transaction::new(self.0.cloned()) }
+    pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone()) }
 }
 
 impl Context {
@@ -100,8 +97,6 @@ impl Context {
 
     pub fn node_id(&self) -> proto::ID { self.0.node_id() }
 
-    /// Begin a transaction.
-    pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where

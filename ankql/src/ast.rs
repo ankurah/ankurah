@@ -7,6 +7,7 @@ pub enum Expr {
     Identifier(Identifier),
     Predicate(Predicate),
     InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
+    ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
