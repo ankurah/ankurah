@@ -14,8 +14,8 @@ use crate::{
 
 pub struct LWW<T>
 where
-    T: TryFrom<PropertyValue, Error=PropertyError>,
-    for<'a> &'a T: TryInto<PropertyValue, Error=PropertyError>,
+    T: TryFrom<PropertyValue, Error = PropertyError>,
+    for<'a> &'a T: TryInto<PropertyValue, Error = PropertyError>,
 {
     pub property_name: PropertyName,
     pub backend: Arc<LWWBackend>,
@@ -25,8 +25,8 @@ where
 
 impl<T> std::fmt::Debug for LWW<T>
 where
-    T: TryFrom<PropertyValue, Error=PropertyError>,
-    for<'a> &'a T: TryInto<PropertyValue, Error=PropertyError>,
+    T: TryFrom<PropertyValue, Error = PropertyError>,
+    for<'a> &'a T: TryInto<PropertyValue, Error = PropertyError>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LWW").field("property_name", &self.property_name).finish()
@@ -35,8 +35,8 @@ where
 
 impl<T> LWW<T>
 where
-    T: TryFrom<PropertyValue, Error=PropertyError>,
-    for<'a> &'a T: TryInto<PropertyValue, Error=PropertyError>,
+    T: TryFrom<PropertyValue, Error = PropertyError>,
+    for<'a> &'a T: TryInto<PropertyValue, Error = PropertyError>,
 {
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
         let value: PropertyValue = value.try_into()?;
@@ -44,7 +44,7 @@ where
         Ok(())
     }
 
-    pub fn get(&self) -> Result<T, PropertyError> { 
+    pub fn get(&self) -> Result<T, PropertyError> {
         let value = self.get_value()?;
         value.try_into()
     }
@@ -59,8 +59,8 @@ where
 
 impl<T> FromEntity for LWW<T>
 where
-    T: TryFrom<PropertyValue, Error=PropertyError>,
-    for<'a> &'a T: TryInto<PropertyValue, Error=PropertyError>,
+    T: TryFrom<PropertyValue, Error = PropertyError>,
+    for<'a> &'a T: TryInto<PropertyValue, Error = PropertyError>,
 {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
@@ -70,8 +70,8 @@ where
 
 impl<T> FromActiveType<LWW<T>> for T
 where
-    T: TryFrom<PropertyValue, Error=PropertyError>,
-    for<'a> &'a T: TryInto<PropertyValue, Error=PropertyError>,
+    T: TryFrom<PropertyValue, Error = PropertyError>,
+    for<'a> &'a T: TryInto<PropertyValue, Error = PropertyError>,
 {
     fn from_active(active: LWW<T>) -> Result<Self, PropertyError>
     where Self: Sized {
@@ -81,8 +81,8 @@ where
 
 impl<T> InitializeWith<T> for LWW<T>
 where
-    T: TryFrom<PropertyValue, Error=PropertyError>,
-    for<'a> &'a T: TryInto<PropertyValue, Error=PropertyError>,
+    T: TryFrom<PropertyValue, Error = PropertyError>,
+    for<'a> &'a T: TryInto<PropertyValue, Error = PropertyError>,
 {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self {
         let new = Self::from_entity(property_name, entity);
