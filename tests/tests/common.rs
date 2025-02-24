@@ -4,7 +4,7 @@ use ankurah::{
     changes::{ChangeKind, ChangeSet},
     model::View,
     property::{
-        value::{PNCounter, LWW},
+        value::LWW,
         YrsString,
     },
     proto, Model,
