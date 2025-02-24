@@ -1,9 +1,7 @@
 mod common;
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
-    property::{
-        value::LWW, PropertyError, PropertyValue, YrsString
-    },
+    property::{value::LWW, PropertyError, PropertyValue, YrsString},
     Model, Mutable, Node, PermissiveAgent,
 };
 use ankurah_storage_sled::SledStorageEngine;
@@ -43,29 +41,18 @@ impl TryFrom<PropertyValue> for Visibility {
                         "public" => Ok(Visibility::Public),
                         "private" => Ok(Visibility::Private),
                         "unlisted" => Ok(Visibility::Unlisted),
-                        value => {
-                            Err(PropertyError::InvalidValue {
-                                value: value.to_owned(),
-                                ty: "Visibility".to_owned(),
-                            })
-                        }
+                        value => Err(PropertyError::InvalidValue { value: value.to_owned(), ty: "Visibility".to_owned() }),
                     }
                 } else {
-                    Err(PropertyError::InvalidValue {
-                        value: "None".to_owned(),
-                        ty: "Visibility".to_owned(),
-                    })
+                    Err(PropertyError::InvalidValue { value: "None".to_owned(), ty: "Visibility".to_owned() })
                 }
             }
-            other => Err(PropertyError::InvalidVariant {
-                given: other,
-                ty: "Visibility".to_owned(),
-            }),
+            other => Err(PropertyError::InvalidVariant { given: other, ty: "Visibility".to_owned() }),
         }
     }
 }
 
-#[derive( Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Video {
     //#[active_type(YrsString)]
     pub title: String,
@@ -154,12 +141,9 @@ async fn pg_property_backends() -> Result<()> {
     Ok(())
 }
 
-
-
-
 ///
-/// 
-/// 
+///
+///
 
 impl ::ankurah::model::Model for Video {
     type View = VideoView;

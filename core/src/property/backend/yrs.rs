@@ -80,21 +80,22 @@ impl PropertyBackend for YrsBackend {
     }
 
     fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
-        let trx = Transact::transact(&self.doc);
-        let root_refs = trx.root_refs();
+        let properties = self.properties();
+
         let mut values = BTreeMap::new();
-        for (name, value) in root_refs {
-            println!("name: {:?}, out: {:?}", name, value);
-            match value {
-                yrs::Out::YText(text) => {
-                    let value = PropertyValue::String(Some(text.get_string(&trx)));
-                    values.insert(name.to_owned(), value);
+        let trx = Transact::transact(&self.doc);
+        for property in properties {
+            let value = match trx.get_text(property.clone()) {
+                Some(text_ref) => {
+                    let text = text_ref.get_string(&trx);
+                    Some(text)
                 }
-                _ => {
-                    println!("unimplemented yrs value: {:?}", value)
-                },
-            }
+                None => None,
+            };
+
+            values.insert(property.clone(), PropertyValue::String(value));
         }
+
         values
     }
 

@@ -41,9 +41,7 @@ macro_rules! into {
     ($ty:ty => $variant:ident) => {
         impl<'a> TryInto<PropertyValue> for &'a $ty {
             type Error = PropertyError;
-            fn try_into(self) -> Result<PropertyValue, PropertyError> {
-                Ok(PropertyValue::$variant(Some(self.clone())))
-            }
+            fn try_into(self) -> Result<PropertyValue, PropertyError> { Ok(PropertyValue::$variant(Some(self.clone()))) }
         }
 
         impl TryFrom<PropertyValue> for $ty {
@@ -54,20 +52,14 @@ macro_rules! into {
                         Some(value) => Ok(value),
                         None => Err(PropertyError::Missing),
                     },
-                    variant => Err(PropertyError::InvalidVariant {
-                        given: variant,
-                        ty: stringify!($ty).to_owned(),
-                    })
+                    variant => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
                 }
-
             }
         }
 
         impl<'a> TryInto<PropertyValue> for &'a Option<$ty> {
             type Error = PropertyError;
-            fn try_into(self) -> Result<PropertyValue, PropertyError> {
-                Ok(PropertyValue::$variant(self.clone()))
-            }
+            fn try_into(self) -> Result<PropertyValue, PropertyError> { Ok(PropertyValue::$variant(self.clone())) }
         }
 
         impl TryFrom<PropertyValue> for Option<$ty> {
