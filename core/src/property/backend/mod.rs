@@ -9,18 +9,17 @@ use std::{
 };
 
 use crate::context::{Context, TContext};
-use crate::storage::Materialized;
 
 pub mod lww;
-pub mod pn_counter;
+//pub mod pn_counter;
 pub mod yrs;
 use crate::error::RetrievalError;
 use crate::Node;
 pub use lww::LWWBackend;
-pub use pn_counter::PNBackend;
+//pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
 
-use super::PropertyName;
+use super::{PropertyName, PropertyValue};
 
 pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
@@ -29,15 +28,15 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
         match name {
             "yrs" => BackendDowncasted::Yrs(upcasted.downcast::<YrsBackend>().unwrap()),
             "lww" => BackendDowncasted::LWW(upcasted.downcast::<LWWBackend>().unwrap()),
-            "pn" => BackendDowncasted::PN(upcasted.downcast::<PNBackend>().unwrap()),
+            //"pn" => BackendDowncasted::PN(upcasted.downcast::<PNBackend>().unwrap()),
             _ => BackendDowncasted::Unknown(upcasted),
         }
     }
     fn as_debug(&self) -> &dyn Debug;
     fn fork(&self) -> Box<dyn PropertyBackend>;
 
-    fn properties(&self) -> Vec<String>;
-    fn materialized(&self) -> BTreeMap<PropertyName, Materialized>;
+    fn properties(&self) -> Vec<PropertyName>;
+    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue>;
 
     // TODO: This should be a specific typecast, not just a string
     fn get_property_value_string(&self, property_name: &str) -> Option<String>;
@@ -66,7 +65,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 pub enum BackendDowncasted {
     Yrs(Arc<YrsBackend>),
     LWW(Arc<LWWBackend>),
-    PN(Arc<PNBackend>),
+    //PN(Arc<PNBackend>),
     Unknown(Arc<dyn Any>),
 }
 
@@ -104,6 +103,8 @@ pub struct Backends {
 // This is where this gets a bit tough.
 // PropertyBackends should either have a concrete type of some sort,
 // or if they can take a generic, they should also take a `Vec<u8>`.
+
+// TODO: Implement a property backend type registry rather than this hardcoded nonsense.
 pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
     if name == "yrs" {
         let backend = match buffer {
@@ -117,13 +118,13 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
             None => LWWBackend::new(),
         };
         Ok(Arc::new(backend))
-    } else if name == "pn" {
+    } /*else if name == "pn" {
         let backend = match buffer {
             Some(buffer) => PNBackend::from_state_buffer(buffer)?,
             None => PNBackend::new(),
         };
         Ok(Arc::new(backend))
-    } else {
+    } */ else {
         panic!("unknown backend: {:?}", name);
     }
 }
@@ -235,5 +236,21 @@ impl Backends {
         }
         *self.head.lock().unwrap() = state.head.clone();
         Ok(())
+    }
+
+    pub fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+        let backends = self.backends_lock();
+        let mut map = BTreeMap::new();
+        for (_, backend) in backends.iter() {
+            let values = backend.property_values();
+            for (property, value) in values {
+                if map.contains_key(&property) {
+                    panic!("Property '{:?}' is in multiple property backends", property);
+                }
+
+                map.insert(property, value);
+            }
+        }
+        map
     }
 }

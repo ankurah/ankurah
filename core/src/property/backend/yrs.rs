@@ -12,9 +12,8 @@ use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Trans
 use crate::{
     property::{
         backend::{Operation, PropertyBackend},
-        PropertyName,
+        PropertyName, PropertyValue,
     },
-    storage::Materialized,
     Node,
 };
 
@@ -80,9 +79,23 @@ impl PropertyBackend for YrsBackend {
         root_refs.map(|(name, _)| name.to_owned()).collect()
     }
 
-    fn materialized(&self) -> BTreeMap<PropertyName, Materialized> {
-        //let mut map = BTreeMap::new();
-        unimplemented!()
+    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+        let trx = Transact::transact(&self.doc);
+        let root_refs = trx.root_refs();
+        let mut values = BTreeMap::new();
+        for (name, value) in root_refs {
+            println!("name: {:?}, out: {:?}", name, value);
+            match value {
+                yrs::Out::YText(text) => {
+                    let value = PropertyValue::String(Some(text.get_string(&trx)));
+                    values.insert(name.to_owned(), value);
+                }
+                _ => {
+                    println!("unimplemented yrs value: {:?}", value)
+                },
+            }
+        }
+        values
     }
 
     fn property_backend_name() -> String { "yrs".to_owned() }
