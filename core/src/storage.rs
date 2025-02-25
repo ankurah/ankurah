@@ -40,17 +40,6 @@ pub trait StorageCollection: Send + Sync {
     async fn get_events(&self, id: ID) -> Result<Vec<Event>, crate::error::RetrievalError>;
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum MaterializedTag {
-    String,
-    Number,
-}
-
-pub enum Materialized {
-    String(String),
-    Number(i64),
-}
-
 /// Manages the storage and state of the collection without any knowledge of the model type
 #[derive(Clone)]
 pub struct StorageCollectionWrapper(pub(crate) Arc<dyn StorageCollection>);

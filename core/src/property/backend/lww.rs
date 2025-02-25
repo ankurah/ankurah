@@ -10,18 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     context::{Context, TContext},
-    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName},
-    storage::Materialized,
+    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue},
 };
 
 #[derive(Clone, Debug)]
 pub struct LWWBackend {
-    values: Arc<RwLock<BTreeMap<PropertyName, Vec<u8>>>>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct LWWDiff {
-    data: BTreeMap<PropertyName, Vec<u8>>,
+    values: Arc<RwLock<BTreeMap<PropertyName, PropertyValue>>>,
 }
 
 impl Default for LWWBackend {
@@ -31,7 +25,7 @@ impl Default for LWWBackend {
 impl LWWBackend {
     pub fn new() -> LWWBackend { Self { values: Arc::new(RwLock::new(BTreeMap::default())) } }
 
-    pub fn set(&self, property_name: PropertyName, value: Vec<u8>) {
+    pub fn set(&self, property_name: PropertyName, value: PropertyValue) {
         let mut values = self.values.write().unwrap();
         match values.entry(property_name) {
             Entry::Occupied(mut entry) => {
@@ -43,7 +37,7 @@ impl LWWBackend {
         }
     }
 
-    pub fn get(&self, property_name: PropertyName) -> Option<Vec<u8>> {
+    pub fn get(&self, property_name: PropertyName) -> Option<PropertyValue> {
         let values = self.values.read().unwrap();
         values.get(&property_name).cloned()
     }
@@ -62,36 +56,34 @@ impl PropertyBackend for LWWBackend {
         Box::new(Self { values: Arc::new(RwLock::new(cloned)) })
     }
 
-    fn properties(&self) -> Vec<String> {
+    fn properties(&self) -> Vec<PropertyName> {
         let values = self.values.read().unwrap();
-        values.keys().cloned().collect::<Vec<String>>()
+        values.keys().cloned().collect::<Vec<PropertyName>>()
     }
 
-    fn materialized(&self) -> BTreeMap<PropertyName, Materialized> { unimplemented!() }
+    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+        let values = self.values.read().unwrap();
+        values.clone()
+    }
 
     fn property_backend_name() -> String { "lww".to_owned() }
 
+    // This is identical to [`to_operations`] for [`LWWBackend`].
     fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
-        let values = self.values.read().unwrap();
-        let state_buffer = bincode::serialize(&*values)?;
+        let property_values = self.property_values();
+        let state_buffer = bincode::serialize(&property_values)?;
         Ok(state_buffer)
     }
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        let map = bincode::deserialize::<BTreeMap<PropertyName, Vec<u8>>>(state_buffer)?;
+        let map = bincode::deserialize::<BTreeMap<PropertyName, PropertyValue>>(state_buffer)?;
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
     fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
-        let values = self.values.read().unwrap();
-
-        let mut map = BTreeMap::<&PropertyName, &Vec<u8>>::default();
-        for (property_name, value) in &*values {
-            map.insert(property_name, value);
-        }
-
-        let serialized_diff = bincode::serialize(&map)?;
+        let property_values = self.property_values();
+        let serialized_diff = bincode::serialize(&property_values)?;
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
@@ -108,9 +100,9 @@ impl PropertyBackend for LWWBackend {
         // This'll probably require looking at the events table.
         if compare_clocks(&current_head, &event_head /*, context*/) == ClockOrdering::Child {
             for operation in operations {
-                let map: BTreeMap<PropertyName, Vec<u8>> = bincode::deserialize(&operation.diff)?;
-                for (property_name, diff) in map {
-                    values.insert(property_name, diff);
+                let map: BTreeMap<PropertyName, PropertyValue> = bincode::deserialize(&operation.diff)?;
+                for (property_name, new_value) in map {
+                    values.insert(property_name, new_value);
                 }
             }
         }
@@ -119,7 +111,9 @@ impl PropertyBackend for LWWBackend {
     }
 
     fn get_property_value_string(&self, property_name: &str) -> Option<String> {
-        self.values.read().unwrap().get(property_name).map(|v| String::from_utf8_lossy(v).to_string())
+        //let values = self.values.read().unwrap();
+        //values.get(property_name).map(|v| String::from_utf8_lossy(v).to_string())
+        unimplemented!()
     }
 }
 

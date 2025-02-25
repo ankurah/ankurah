@@ -7,7 +7,7 @@ use ankurah_core::{
     error::RetrievalError,
     property::{
         backend::{BackendDowncasted, PropertyBackend},
-        Backends,
+        Backends, PropertyValue,
     },
     storage::{StorageCollection, StorageEngine},
 };
@@ -149,37 +149,18 @@ impl StorageCollection for PostgresBucket {
         let mut materialized_columns: Vec<String> = Vec::new();
         let mut materialized: Vec<PGValue> = Vec::new();
 
-        for backend in backends.downcasted() {
-            match backend {
-                BackendDowncasted::Yrs(yrs) => {
-                    info!("yrs found");
-                    for property in yrs.properties() {
-                        info!("property: {:?}", property);
-                        materialized_columns.push(property.clone());
-                        materialized.push(PGValue::CharacterVarying(yrs.get_string(property.clone())));
-                    }
-                }
-                BackendDowncasted::LWW(lww) => {
-                    for property in lww.properties() {
-                        materialized_columns.push(property.clone());
-                        materialized.push(PGValue::Bytea(lww.get(property.clone())));
-                    }
-                }
-                BackendDowncasted::PN(pn) => {
-                    for property in pn.properties() {
-                        let data = pn.get_optional(property.clone());
-                        materialized_columns.push(property.clone());
-                        materialized.push(PGValue::BigInt(data));
-                    }
-                }
-                _ => {}
-            }
+        for (name, value) in backends.property_values() {
+            materialized_columns.push(name.clone());
+            let pg_value: PGValue = value.into();
+            materialized.push(pg_value);
         }
 
         columns.extend(materialized_columns.clone());
         for parameter in &materialized {
             match &parameter {
                 PGValue::CharacterVarying(string) => params.push(string),
+                PGValue::SmallInt(number) => params.push(number),
+                PGValue::Integer(number) => params.push(number),
                 PGValue::BigInt(number) => params.push(number),
                 PGValue::Bytea(bytes) => params.push(bytes),
             }

@@ -1,22 +1,40 @@
 // use tokio_postgres::types::ToSql;
 
+use ankurah_core::property::PropertyValue;
+
 #[derive(Debug)]
 pub enum PGValue {
-    BigInt(Option<i64>),
     // Boolean(bool),
     Bytea(Option<Vec<u8>>),
     CharacterVarying(Option<String>),
-    // Integer(i32),
+    SmallInt(Option<i16>),
+    Integer(Option<i32>),
+    BigInt(Option<i64>),
     // Text(String),
     // Timestamp(chrono::DateTime<chrono::Utc>),
 }
 
 impl PGValue {
     pub fn postgres_type(&self) -> &'static str {
-        match self {
+        match *self {
             PGValue::CharacterVarying(_) => "varchar",
+            PGValue::SmallInt(_) => "int2",
+            PGValue::Integer(_) => "int4",
             PGValue::BigInt(_) => "int8",
             PGValue::Bytea(_) => "bytea",
+        }
+    }
+}
+
+impl From<PropertyValue> for PGValue {
+    fn from(property: PropertyValue) -> Self {
+        match property {
+            PropertyValue::String(string) => PGValue::CharacterVarying(string),
+            PropertyValue::I16(integer) => PGValue::SmallInt(integer),
+            PropertyValue::I32(integer) => PGValue::Integer(integer),
+            PropertyValue::I64(integer) => PGValue::BigInt(integer),
+            PropertyValue::Object(items) => PGValue::Bytea(items),
+            PropertyValue::Binary(items) => PGValue::Bytea(items),
         }
     }
 }
