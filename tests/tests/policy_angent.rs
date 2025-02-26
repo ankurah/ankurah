@@ -58,7 +58,7 @@ impl std::fmt::Debug for MyContextData {
 }
 #[async_trait]
 impl ContextData for MyContextData {
-    async fn validate(context: proto::BearerContext) -> Result<Self, ValidationError> {
+    async fn validate(context: proto::AuthData) -> Result<Self, ValidationError> {
         let proto: MyContextProto = serde_json::from_slice(&context.0).map_err(|e| ValidationError::Deserialization(Box::new(e)))?;
         if proto.evil_bit {
             Err(ValidationError::Rejected("Evil bit is set"))
@@ -74,16 +74,16 @@ impl ContextData for MyContextData {
         }
     }
 
-    fn proto(&self) -> proto::BearerContext {
+    fn proto(&self) -> proto::AuthData {
         match self {
             MyContextData::Root => {
                 let proto = MyContextProto { username: "root".into(), role: "root".into(), department: "root".into(), evil_bit: false };
-                proto::BearerContext(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
+                proto::AuthData(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
             }
             MyContextData::User { username, role, department } => {
                 let proto =
                     MyContextProto { username: username.clone(), role: role.clone(), department: department.clone(), evil_bit: false };
-                proto::BearerContext(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
+                proto::AuthData(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
             }
         }
     }

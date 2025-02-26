@@ -1,14 +1,13 @@
 use crate::{
-    changes::ChangeSet,
     error::ValidationError,
-    model::{Entity, Model},
-    node::ContextData,
+    model::Entity,
+    node::{ContextData, Node, NodeInner},
     property::PropertyError,
     proto,
+    storage::StorageEngine,
 };
 use ankql::{ast::Predicate, error::ParseError};
 use async_trait::async_trait;
-use std::collections::HashSet;
 use thiserror::Error;
 
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
@@ -35,11 +34,47 @@ impl AccessDenied {}
 
 /// Applications will implement this trait to control access to resources
 /// (Entities and RPC calls) and the Node will be generic over this trait
+#[async_trait]
 pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
 
+    /// Validate and convert from wire format to this context type
+    async fn validate_request<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        auth: proto::AuthData,
+        request: &proto::NodeRequest,
+    ) -> Result<Self::ContextData, ValidationError>
+    where
+        Self: Sized;
+
+    /// Create relevant auth data for a given request
+    fn sign_request<SE: StorageEngine>(
+        &self,
+        node: &NodeInner<SE, Self>,
+        cdata: &Self::ContextData,
+        request: &proto::NodeRequest,
+    ) -> proto::AuthData;
+
+    /// Create an attestation for an event
+    fn attest_event<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        cdata: &Self::ContextData,
+        event: &proto::Event,
+    ) -> Result<proto::Attestation, AccessDenied>;
+
+    fn validate_event_attestation<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        from_node: &proto::NodeId,
+        event: &proto::Event,
+        attestation: Option<&proto::Attestation>,
+    ) -> Result<(), AccessDenied>;
+
+    // For checking if a context can access a collection
     // For checking if a context can access a collection
     fn can_access_collection(&self, data: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied>;
 
@@ -77,8 +112,49 @@ impl PermissiveAgent {
     pub fn new() -> Self { Self {} }
 }
 
+#[async_trait]
 impl PolicyAgent for PermissiveAgent {
     type ContextData = &'static DefaultContext;
+
+    /// Create relevant auth data for a given request
+    fn sign_request<SE: StorageEngine>(
+        &self,
+        _node: &NodeInner<SE, Self>,
+        _cdata: &Self::ContextData,
+        _request: &proto::NodeRequest,
+    ) -> proto::AuthData {
+        proto::AuthData(vec![])
+    }
+
+    /// Validate auth data and yield the context data if valid
+    async fn validate_request<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _auth: proto::AuthData,
+        _request: &proto::NodeRequest,
+    ) -> Result<Self::ContextData, ValidationError> {
+        Ok(DEFAULT_CONTEXT)
+    }
+
+    /// Create an attestation for an event
+    fn attest_event<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _cdata: &Self::ContextData,
+        _event: &proto::Event,
+    ) -> Result<proto::Attestation, AccessDenied> {
+        Ok(proto::Attestation(vec![]))
+    }
+
+    fn validate_event_attestation<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _from_node: &proto::NodeId,
+        _event: &proto::Event,
+        _attestation: Option<&proto::Attestation>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
 
     fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
 
@@ -118,7 +194,4 @@ impl DefaultContext {
 }
 
 #[async_trait]
-impl ContextData for &'static DefaultContext {
-    async fn validate(_context: proto::BearerContext) -> Result<Self, ValidationError> { Ok(DEFAULT_CONTEXT) }
-    fn proto(&self) -> proto::BearerContext { proto::BearerContext(vec![]) }
-}
+impl ContextData for &'static DefaultContext {}

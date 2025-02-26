@@ -70,14 +70,7 @@ impl<SE, PA> Deref for Node<SE, PA> {
 /// Represents the user session - or whatever other context the PolicyAgent
 /// Needs to perform it's evaluation.
 #[async_trait]
-pub trait ContextData: Send + Sync + 'static {
-    /// Validate and convert from wire format to this context type
-    async fn validate(context: proto::BearerContext) -> Result<Self, ValidationError>
-    where Self: Sized;
-
-    /// Convert this context to wire format
-    fn proto(&self) -> proto::BearerContext;
-}
+pub trait ContextData: Send + Sync + 'static {}
 
 pub struct NodeInner<SE, PA> {
     pub id: proto::NodeId,
@@ -90,6 +83,7 @@ pub struct NodeInner<SE, PA> {
     peer_connections: DashMap<proto::NodeId, PeerState>,
     durable_peers: DashSet<proto::NodeId>,
     pending_requests: DashMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    pending_notifications: DashMap<proto::NotificationId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
@@ -115,6 +109,7 @@ where
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
+            pending_notifications: DashMap::new(),
             reactor,
             durable: false,
             policy_agent,
@@ -134,6 +129,7 @@ where
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
+            pending_notifications: DashMap::new(),
             reactor,
             durable: true,
             policy_agent,
@@ -179,30 +175,72 @@ where
         // Store the response channel
         self.pending_requests.insert(request_id.clone(), response_tx);
 
-        let context = cdata.proto();
-        let request = proto::NodeRequest { id: request_id, to: node_id.clone(), from: self.id.clone(), context, body: request_body };
-
+        let request = proto::NodeRequest { id: request_id, to: node_id.clone(), from: self.id.clone(), body: request_body };
+        let auth = self.policy_agent.sign_request(self, cdata, &request);
         {
             // Get the peer connection
-
             let connection = { self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?.sender.cloned() };
-
             // Send the request
-            connection.send_message(proto::NodeMessage::Request(request)).await?;
+            connection.send_message(proto::NodeMessage::Request { auth, request }).await?;
         }
 
         // Wait for response
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
+    pub async fn notify(&self, node_id: proto::NodeId, notification: proto::NotificationBody) -> Result<(), RequestError> {
+        // same as request, minus cdata and the sign_request step
+
+        let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
+        let id = proto::NotificationId::new();
+
+        // Store the response channel
+        self.pending_notifications.insert(id.clone(), response_tx);
+
+        let notification =
+            proto::NodeMessage::Notification(proto::Notification { id, from: self.id.clone(), to: node_id.clone(), body: notification });
+        {
+            // Get the peer connection
+            let connection = { self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?.sender.cloned() };
+            // Send the request
+            connection.send_message(notification).await?;
+        }
+
+        response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?;
+        Ok(())
+    }
+
+    // TODO add a node id argument to this function rather than getting it from the message
+    // (does this actually make it more secure? or just move the place they could lie to us to the handshake?)
+    // Not if its signed by a node key.
     pub async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
-            proto::NodeMessage::Request(request) => {
+            proto::NodeMessage::Notification(notification) => {
+                info!("Node {} received notification {}", self.id, notification);
+
+                if let Some(sender) = { self.peer_connections.get(&notification.from).map(|c| c.sender.cloned()) } {
+                    let from = notification.from.clone();
+                    let request_id = notification.id.clone();
+                    if notification.to != self.id {
+                        warn!("{} received message from {} but is not the intended recipient", self.id, notification.from);
+                        return Ok(());
+                    }
+
+                    let body = match self.handle_notification(notification).await {
+                        Ok(result) => unimplemented!(),
+                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                    };
+                    let _result = sender.send_message(proto::NodeMessage::AckNotification { id: notification.id }).await;
+                }
+            }
+            proto::NodeMessage::Request { auth, request } => {
                 info!("Node {} received request {}", self.id, request);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
                 // I think we want timeouts to be handled by the node, not the connector,
                 // which would lend itself to spawning a task here and making this function synchronous.
+
+                let cdata = self.policy_agent.validate_request(self, auth, &request).await?;
 
                 // double check to make sure we have a connection to the peer based on the node id
                 if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
@@ -210,6 +248,7 @@ where
                     let request_id = request.id.clone();
                     if request.to != self.id {
                         warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
+                        return Ok(());
                     }
 
                     let body = match self.handle_request(request).await {
@@ -237,7 +276,7 @@ where
     }
 
     async fn handle_request(self: &Arc<Self>, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
-        let cdata = PA::ContextData::validate(request.context).await?;
+        let cdata = PA::ContextData::validate(request.token).await?;
         match request.body {
             proto::NodeRequestBody::CommitEvents(events) => {
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
@@ -258,15 +297,35 @@ where
             proto::NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
                 self.handle_subscribe_request(&cdata, request.from, subscription_id, collection, predicate).await
             }
-            proto::NodeRequestBody::Unsubscribe { subscription_id } => {
-                // QUESTION: should this be access controlled? or is the subscriptionid suitably entropic to prevent attacks?
-                self.reactor.unsubscribe(subscription_id);
+        }
+    }
 
-                // Remove and drop the subscription handle
-                if let Some(mut peer_state) = self.peer_connections.get_mut(&request.from) {
-                    peer_state.subscriptions.remove(&subscription_id);
+    async fn handle_notification(self: &Arc<Self>, notification: proto::Notification) -> anyhow::Result<()> {
+        let Some(peer_state) = self.peer_connections.get_mut(&notification.from) else {
+            return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
+        };
+
+        match notification.body {
+            proto::NotificationBody::SubscriptionUpdate { subscription_id, events } => {
+                if peer_state.subscriptions.contains(&subscription_id) {
+                    // TODO get an attestation for each event, and verify them
+                    match self.commit_events_local(&cdata, &events).await {
+                        // LEFT OFF HERE - TODO - determine where we should be checking with the policy agent for contemporaneous events and attested events
+                        Ok(_) => Ok(proto::NodeResponseBody::CommitComplete),
+                        Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
+                    }
+                } else {
+                    Err(anyhow!("Subscription {} not found", subscription_id))
                 }
-                Ok(proto::NodeResponseBody::Success)
+            }
+            proto::NotificationBody::Unsubscribe { subscription_id } => {
+                if peer_state.subscriptions.remove(&subscription_id) {
+                    self.reactor.unsubscribe(subscription_id);
+
+                    Ok(proto::NodeResponseBody::Success)
+                } else {
+                    Err(anyhow!("Subscription {} not found", subscription_id))
+                }
             }
         }
     }
@@ -318,7 +377,7 @@ where
         futures::future::join_all(
             peers
                 .iter()
-                .map(|peer_id| self.request(peer_id.clone(), proto::NodeRequestBody::Unsubscribe { subscription_id: sub_id.clone() })),
+                .map(|peer_id| self.notify(peer_id.clone(), proto::NotificationBody::Unsubscribe { subscription_id: sub_id.clone() })),
         )
         .await
         .into_iter()
@@ -365,14 +424,15 @@ where
                         let node = node.clone();
                         let peer_id = peer_id.clone();
                         tokio::spawn(async move {
-                            let _ = node.request(peer_id, proto::NodeRequestBody::CommitEvents(events)).await;
+                            let _ = node
+                                .notify(peer_id, proto::NotificationBody::SubscriptionUpdate { subscription_id: sub_id.clone(), events })
+                                .await;
                         });
                     }
                 })
                 .await?
         };
 
-        // Store the subscription handle
         if let Some(mut peer_state) = self.peer_connections.get_mut(&peer_id) {
             peer_state.subscriptions.insert(sub_id);
         }
@@ -441,7 +501,7 @@ where
         futures::future::join_all(peer_ids.iter().map(|peer_id| {
             let events = events.clone();
             async move {
-                match self.request(peer_id.clone(), cdata, proto::NodeRequestBody::CommitEvents(events)).await {
+                match self.request(peer_id.clone(), cdata, proto::NodeRequestBody::CommitEvents { events }).await {
                     Ok(proto::NodeResponseBody::CommitComplete) => {
                         info!("Peer {} confirmed commit", peer_id)
                     }
@@ -556,7 +616,7 @@ where
     ) -> Result<Vec<Arc<Entity>>, RetrievalError> {
         if !self.durable {
             // Fetch from peers and commit first response
-            match self.fetch_from_peer(&collection_id, &args.predicate).await {
+            match self.fetch_from_peer(&collection_id, &args.predicate, cdata).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if args.cached => (),
                 Err(e) => {
