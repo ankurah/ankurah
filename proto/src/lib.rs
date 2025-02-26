@@ -128,6 +128,7 @@ pub struct NodeRequest {
     pub id: RequestId,
     pub to: NodeId,
     pub from: NodeId,
+    pub context: BearerContext,
     pub body: NodeRequestBody,
 }
 
@@ -340,9 +341,33 @@ pub struct Presence {
     pub durable: bool,
 }
 
-/// Raw context data that can be transmitted between nodes
+/// Raw context data that can be transmitted between nodes - this may be a bearer token
+/// or some other arbitrary data at the discretion of the Policy Agent
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Context(pub Vec<u8>);
+pub struct BearerContext(pub Vec<u8>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attestation {
+    pub kind: AttestationKind,
+    pub signature: AttestationSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationPrincipal {
+    key_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationSignature {
+    pub principal: AttestationPrincipal,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AttestationKind {
+    Author,
+    Validator,
+}
 
 impl TryFrom<JsValue> for Clock {
     type Error = DecodeError;

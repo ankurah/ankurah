@@ -59,6 +59,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     // // For checking if a context can create entities in a collection
     fn pre_create(&self, data: &Self::ContextData, entity: &Entity) -> Result<(), AccessDenied>;
 
+    // TODO - figure out how we can convert pre-event actions and post-event actions into a single representation suitable for passing to pre_edit so we can policy-control discrete mutations
     fn pre_edit(&self, data: &Self::ContextData, entity: &Entity) -> Result<(), AccessDenied>;
 
     // // For checking if a context can subscribe to changes
@@ -118,6 +119,6 @@ impl DefaultContext {
 
 #[async_trait]
 impl ContextData for &'static DefaultContext {
-    async fn validate(_context: proto::Context) -> Result<Self, ValidationError> { Ok(DEFAULT_CONTEXT) }
-    fn proto(&self) -> Result<proto::Context, ValidationError> { Ok(proto::Context(vec![])) }
+    async fn validate(_context: proto::BearerContext) -> Result<Self, ValidationError> { Ok(DEFAULT_CONTEXT) }
+    fn proto(&self) -> proto::BearerContext { proto::BearerContext(vec![]) }
 }

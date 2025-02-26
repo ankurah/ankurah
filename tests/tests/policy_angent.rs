@@ -58,7 +58,7 @@ impl std::fmt::Debug for MyContextData {
 }
 #[async_trait]
 impl ContextData for MyContextData {
-    async fn validate(context: proto::Context) -> Result<Self, ValidationError> {
+    async fn validate(context: proto::BearerContext) -> Result<Self, ValidationError> {
         let proto: MyContextProto = serde_json::from_slice(&context.0).map_err(|e| ValidationError::Deserialization(Box::new(e)))?;
         if proto.evil_bit {
             Err(ValidationError::Rejected("Evil bit is set"))
@@ -74,16 +74,16 @@ impl ContextData for MyContextData {
         }
     }
 
-    fn proto(&self) -> Result<proto::Context, ValidationError> {
+    fn proto(&self) -> proto::BearerContext {
         match self {
             MyContextData::Root => {
                 let proto = MyContextProto { username: "root".into(), role: "root".into(), department: "root".into(), evil_bit: false };
-                Ok(proto::Context(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?))
+                proto::BearerContext(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
             }
             MyContextData::User { username, role, department } => {
                 let proto =
                     MyContextProto { username: username.clone(), role: role.clone(), department: department.clone(), evil_bit: false };
-                Ok(proto::Context(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?))
+                proto::BearerContext(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
             }
         }
     }
@@ -150,7 +150,7 @@ async fn local_access_control() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn distributed_access_control() -> Result<(), Box<dyn std::error::Error>> {
+async fn keeping_peers_honest() -> Result<(), Box<dyn std::error::Error>> {
     // Create a server with TestAgent (enforcing policies) and a "dishonest" client with PermissiveAgent (no restrictions)
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), TestAgent {});
     let dishonest_client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), DishonestTestAgent {});

@@ -72,11 +72,11 @@ impl<SE, PA> Deref for Node<SE, PA> {
 #[async_trait]
 pub trait ContextData: Send + Sync + 'static {
     /// Validate and convert from wire format to this context type
-    async fn validate(context: proto::Context) -> Result<Self, ValidationError>
+    async fn validate(context: proto::BearerContext) -> Result<Self, ValidationError>
     where Self: Sized;
 
     /// Convert this context to wire format
-    fn proto(&self) -> Result<proto::Context, ValidationError>;
+    fn proto(&self) -> proto::BearerContext;
 }
 
 pub struct NodeInner<SE, PA> {
@@ -170,6 +170,7 @@ where
     pub async fn request(
         &self,
         node_id: proto::NodeId,
+        cdata: &PA::ContextData,
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError> {
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
@@ -178,7 +179,8 @@ where
         // Store the response channel
         self.pending_requests.insert(request_id.clone(), response_tx);
 
-        let request = proto::NodeRequest { id: request_id, to: node_id.clone(), from: self.id.clone(), body: request_body };
+        let context = cdata.proto();
+        let request = proto::NodeRequest { id: request_id, to: node_id.clone(), from: self.id.clone(), context, body: request_body };
 
         {
             // Get the peer connection
@@ -235,26 +237,31 @@ where
     }
 
     async fn handle_request(self: &Arc<Self>, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
+        let cdata = PA::ContextData::validate(request.context).await?;
         match request.body {
             proto::NodeRequestBody::CommitEvents(events) => {
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message
-                match self.commit_events_local(&events).await {
+                match self.commit_events_local(&cdata, &events).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
             proto::NodeRequestBody::Fetch { collection, predicate } => {
+                self.policy_agent.can_access_collection(&cdata, &collection)?;
                 let storage_collection = self.collection(&collection).await;
+                let predicate = self.policy_agent.filter_predicate(&cdata, &collection, predicate)?;
                 let states: Vec<_> = storage_collection.fetch_states(&predicate).await?.into_iter().collect();
                 Ok(proto::NodeResponseBody::Fetch(states))
             }
             proto::NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
-                self.handle_subscribe_request(request.from, subscription_id, collection, predicate).await
+                self.handle_subscribe_request(&cdata, request.from, subscription_id, collection, predicate).await
             }
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
+                // QUESTION: should this be access controlled? or is the subscriptionid suitably entropic to prevent attacks?
                 self.reactor.unsubscribe(subscription_id);
+
                 // Remove and drop the subscription handle
                 if let Some(mut peer_state) = self.peer_connections.get_mut(&request.from) {
                     peer_state.subscriptions.remove(&subscription_id);
@@ -266,6 +273,7 @@ where
 
     pub async fn request_remote_subscribe(
         &self,
+        cdata: &PA::ContextData,
         sub: &mut SubscriptionHandle,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
@@ -278,6 +286,7 @@ where
             match self
                 .request(
                     peer_id,
+                    &cdata,
                     proto::NodeRequestBody::Subscribe {
                         subscription_id: sub.id.clone(),
                         collection: collection_id.clone(),
@@ -320,6 +329,7 @@ where
 
     async fn handle_subscribe_request(
         self: &Arc<Self>,
+        cdata: &PA::ContextData,
         peer_id: proto::NodeId,
         sub_id: proto::SubscriptionId,
         collection_id: CollectionId,
@@ -328,6 +338,9 @@ where
         // First fetch initial state
         let storage_collection = self.collection(&collection_id).await;
         let states = storage_collection.fetch_states(&predicate).await?;
+
+        self.policy_agent.can_access_collection(cdata, &collection_id)?;
+        let predicate = self.policy_agent.filter_predicate(cdata, &collection_id, predicate)?;
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
@@ -391,7 +404,7 @@ where
 
     pub fn context(self: &Arc<Self>, data: PA::ContextData) -> Context { Context::new(Node(self.clone()), data) }
 
-    async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::Event>) -> Result<(), MutationError> {
+    async fn commit_events_local(self: &Arc<Self>, cdata: &PA::ContextData, events: &Vec<proto::Event>) -> Result<(), MutationError> {
         info!("Node {} committing events {}", self.id, events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","));
         let mut changes = Vec::new();
 
@@ -400,6 +413,7 @@ where
             // Apply Events to the Node's registered Entities first.
             let entity = self.get_entity(&event.collection, event.entity_id).await?;
 
+            self.policy_agent.pre_edit(cdata, &entity)?;
             entity.apply_event(event)?;
 
             let state = entity.to_state()?;
@@ -418,8 +432,8 @@ where
     }
 
     /// Apply events to local state buffer and broadcast to peers.
-    pub async fn commit_events(self: &Arc<Self>, events: &Vec<proto::Event>) -> Result<(), MutationError> {
-        self.commit_events_local(events).await?;
+    pub async fn commit_events(self: &Arc<Self>, cdata: &PA::ContextData, events: &Vec<proto::Event>) -> Result<(), MutationError> {
+        self.commit_events_local(cdata, events).await?;
 
         // Then propagate to all peers
         let peer_ids: Vec<_> = self.peer_connections.iter().map(|i| i.key().clone()).collect();
@@ -427,7 +441,7 @@ where
         futures::future::join_all(peer_ids.iter().map(|peer_id| {
             let events = events.clone();
             async move {
-                match self.request(peer_id.clone(), proto::NodeRequestBody::CommitEvents(events)).await {
+                match self.request(peer_id.clone(), cdata, proto::NodeRequestBody::CommitEvents(events)).await {
                     Ok(proto::NodeResponseBody::CommitComplete) => {
                         info!("Peer {} confirmed commit", peer_id)
                     }
@@ -569,6 +583,7 @@ where
 
     pub async fn subscribe(
         self: &Arc<Self>,
+        cdata: &PA::ContextData,
         sub_id: proto::SubscriptionId,
         collection_id: &CollectionId,
         args: MatchArgs,
@@ -576,9 +591,11 @@ where
     ) -> Result<SubscriptionHandle, RetrievalError> {
         let mut handle = SubscriptionHandle::new(Box::new(Node(self.clone())) as Box<dyn TNodeErased>, sub_id);
 
+        self.policy_agent.can_access_collection(cdata, collection_id)?;
+
         // TODO spawn a task for these and make this fn syncrhonous - Pending error handling refinement / retry logic
         // spawn(async move {
-        self.request_remote_subscribe(&mut handle, &collection_id, &args.predicate).await?;
+        self.request_remote_subscribe(cdata, &mut handle, &collection_id, &args.predicate).await?;
         self.reactor.subscribe(handle.id, &collection_id, args, callback).await?;
         // });
 
@@ -599,11 +616,16 @@ where
         self: &Arc<Self>,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
+        cdata: &PA::ContextData,
     ) -> anyhow::Result<(), RetrievalError> {
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self
-            .request(peer_id.clone(), proto::NodeRequestBody::Fetch { collection: collection_id.clone(), predicate: predicate.clone() })
+            .request(
+                peer_id.clone(),
+                cdata,
+                proto::NodeRequestBody::Fetch { collection: collection_id.clone(), predicate: predicate.clone() },
+            )
             .await
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
         {

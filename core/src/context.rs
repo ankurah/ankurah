@@ -59,7 +59,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.node.fetch_entities(collection, args, &self.cdata).await
     }
     async fn insert_entity(&self, entity: Arc<Entity>) -> Result<(), MutationError> { self.node.insert_entity(entity).await }
-    async fn commit_events(&self, events: &Vec<proto::Event>) -> Result<(), MutationError> { self.node.commit_events(events).await }
+    async fn commit_events(&self, events: &Vec<proto::Event>) -> Result<(), MutationError> {
+        self.node.commit_events(&self.cdata, events).await
+    }
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
@@ -67,7 +69,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
-        self.node.subscribe(sub_id, collection, args, callback).await
+        self.node.subscribe(self.cdata, sub_id, collection, args, callback).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.node.collection(id).await }
 }
