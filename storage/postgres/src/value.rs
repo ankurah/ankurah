@@ -5,11 +5,11 @@ use ankurah_core::property::PropertyValue;
 #[derive(Debug)]
 pub enum PGValue {
     // Boolean(bool),
-    Bytea(Option<Vec<u8>>),
-    CharacterVarying(Option<String>),
-    SmallInt(Option<i16>),
-    Integer(Option<i32>),
-    BigInt(Option<i64>),
+    Bytea(Vec<u8>),
+    CharacterVarying(String),
+    SmallInt(i16),
+    Integer(i32),
+    BigInt(i64),
     // Text(String),
     // Timestamp(chrono::DateTime<chrono::Utc>),
 }

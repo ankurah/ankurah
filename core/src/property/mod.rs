@@ -15,13 +15,13 @@ pub type PropertyName = String;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum PropertyValue {
     // Numbers
-    I16(Option<i16>),
-    I32(Option<i32>),
-    I64(Option<i64>),
+    I16(i16),
+    I32(i32),
+    I64(i64),
 
-    String(Option<String>),
-    Object(Option<Vec<u8>>),
-    Binary(Option<Vec<u8>>),
+    String(String),
+    Object(Vec<u8>),
+    Binary(Vec<u8>),
 }
 
 impl Display for PropertyValue {
@@ -37,38 +37,53 @@ impl Display for PropertyValue {
     }
 }
 
+pub trait Property: Sized {
+    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError>;
+    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError>;
+
+    /*
+    fn from_option(option: Option<PropertyValue>) -> Result<Self, PropertyError> {
+        match option {
+            Some(value) => Self::from_value(value),
+            None => Err(PropertyError::Missing),
+        }
+    }
+    fn from_result(result: Result<Option<PropertyValue>, PropertyError>) -> Result<Self, PropertyError> {
+        Self::from_option(result?)
+    }
+    */
+}
+
+impl<T> Property for Option<T>
+where 
+    T: Property,
+{
+    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> {
+        match self {
+            Some(value) => Ok(<T as Property>::into_value(value)?),
+            None => Ok(None),
+        }
+    }
+    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
+        match T::from_value(value) {
+            Ok(value) => Ok(Some(value)),
+            Err(PropertyError::Missing) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 macro_rules! into {
     ($ty:ty => $variant:ident) => {
-        impl<'a> TryInto<PropertyValue> for &'a $ty {
-            type Error = PropertyError;
-            fn try_into(self) -> Result<PropertyValue, PropertyError> { Ok(PropertyValue::$variant(Some(self.clone()))) }
-        }
-
-        impl TryFrom<PropertyValue> for $ty {
-            type Error = PropertyError;
-            fn try_from(value: PropertyValue) -> Result<$ty, PropertyError> {
-                match value {
-                    PropertyValue::$variant(value) => match value {
-                        Some(value) => Ok(value),
-                        None => Err(PropertyError::Missing),
-                    },
-                    variant => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
-                }
+        impl Property for $ty {
+            fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> {
+                Ok(Some(PropertyValue::$variant(self.clone())))
             }
-        }
-
-        impl<'a> TryInto<PropertyValue> for &'a Option<$ty> {
-            type Error = PropertyError;
-            fn try_into(self) -> Result<PropertyValue, PropertyError> { Ok(PropertyValue::$variant(self.clone())) }
-        }
-
-        impl TryFrom<PropertyValue> for Option<$ty> {
-            type Error = PropertyError;
-            fn try_from(value: PropertyValue) -> Result<Option<$ty>, PropertyError> {
-                match <$ty>::try_from(value) {
-                    Ok(value) => Ok(Some(value)),
-                    Err(PropertyError::Missing) => Ok(None),
-                    Err(err) => Err(err),
+            fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
+                match value {
+                    Some(PropertyValue::$variant(value)) => Ok(value),
+                    Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
+                    None => Err(PropertyError::Missing),
                 }
             }
         }

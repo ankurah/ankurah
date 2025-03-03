@@ -59,6 +59,18 @@ impl YrsBackend {
         txn.apply_update(update)?;
         Ok(())
     }
+
+    fn get_property_string(&self, trx: &yrs::Transaction, property_name: &PropertyName) -> Option<PropertyValue> {
+        let value = match trx.get_text(property_name.clone()) {
+            Some(text_ref) => {
+                let text = text_ref.get_string(trx);
+                Some(text)
+            }
+            None => None,
+        };
+
+        value.map(|s| PropertyValue::String(s))
+    }
 }
 
 impl PropertyBackend for YrsBackend {
@@ -78,30 +90,26 @@ impl PropertyBackend for YrsBackend {
         let root_refs = trx.root_refs();
         root_refs.map(|(name, _)| name.to_owned()).collect()
     }
+    
+    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
+        let trx = Transact::transact(&self.doc);
+        self.get_property_string(&trx, property_name)
+    }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+    fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
         let properties = self.properties();
 
         let mut values = BTreeMap::new();
         let trx = Transact::transact(&self.doc);
-        for property in properties {
-            let value = match trx.get_text(property.clone()) {
-                Some(text_ref) => {
-                    let text = text_ref.get_string(&trx);
-                    Some(text)
-                }
-                None => None,
-            };
-
-            values.insert(property.clone(), PropertyValue::String(value));
+        for property_name in properties {
+            let value = self.get_property_string(&trx, &property_name);
+            values.insert(property_name, value);
         }
 
         values
     }
 
     fn property_backend_name() -> String { "yrs".to_owned() }
-
-    fn get_property_value_string(&self, property_name: &str) -> Option<String> { self.get_string(property_name) }
 
     fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
         let txn = self.doc.transact();

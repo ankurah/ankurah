@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use crate::context::TContext;
 use crate::property::PropertyError;
+use crate::property::PropertyValue;
 use crate::{error::RetrievalError, property::Backends};
 
 use anyhow::Result;
@@ -170,7 +171,21 @@ impl Filterable for Entity {
             Some(self.id.to_string())
         } else {
             // Iterate through backends to find one that has this property
-            self.backends.backends.lock().unwrap().values().find_map(|backend| backend.get_property_value_string(name))
+            let backends = self.backends.backends.lock().unwrap();
+            backends.values()
+                .find_map(|backend| 
+                    match backend.property_value(&name.to_owned()) {
+                        Some(value) => match value {
+                            PropertyValue::String(s) => Some(s),
+                            PropertyValue::I16(i) => Some(i.to_string()),
+                            PropertyValue::I32(i) => Some(i.to_string()),
+                            PropertyValue::I64(i) => Some(i.to_string()),
+                            PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                            PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                        },
+                        None => None,
+                    }
+                )
         }
     }
 }
