@@ -36,10 +36,11 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn fork(&self) -> Box<dyn PropertyBackend>;
 
     fn properties(&self) -> Vec<PropertyName>;
-    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue>;
-
-    // TODO: This should be a specific typecast, not just a string
-    fn get_property_value_string(&self, property_name: &str) -> Option<String>;
+    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
+        let mut map = self.property_values();
+        map.remove(property_name).flatten()
+    }
+    fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>>;
 
     /// Unique property backend identifier.
     fn property_backend_name() -> String
@@ -240,7 +241,7 @@ impl Backends {
         Ok(())
     }
 
-    pub fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+    pub fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
         let backends = self.backends_lock();
         let mut map = BTreeMap::new();
         for (_, backend) in backends.iter() {

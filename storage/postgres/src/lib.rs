@@ -1,13 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use ankurah_core::{
     error::RetrievalError,
     property::{
-        backend::{BackendDowncasted, PropertyBackend},
-        Backends, PropertyValue,
+        backend::{BackendDowncasted, PropertyBackend}, Backends, PropertyName, PropertyValue
     },
     storage::{StorageCollection, StorageEngine},
 };
@@ -58,26 +57,82 @@ impl StorageEngine for Postgres {
             return Err(RetrievalError::InvalidBucketName);
         }
 
-        let bucket = PostgresBucket { pool: self.pool.clone(), collection_id: collection_id.clone() };
+        let bucket = PostgresBucket {
+            pool: self.pool.clone(),
+            collection_id: collection_id.clone(),
+            columns: Arc::new(RwLock::new(Vec::new()))
+        };
+
 
         // Try to create the table if it doesn't exist
         let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
         bucket.create_event_table(&mut client).await?;
         bucket.create_state_table(&mut client).await?;
+        bucket.rebuild_columns_cache(&mut client).await?;
 
         Ok(Arc::new(bucket))
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PostgresColumn {
+    pub name: String,
+    pub is_nullable: bool,
+    pub data_type: String,
+}
+
 pub struct PostgresBucket {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
     collection_id: CollectionId,
+
+    columns: Arc<RwLock<Vec<PostgresColumn>>>,
 }
 
 impl PostgresBucket {
     fn state_table(&self) -> String { format!("{}", self.collection_id.as_str()) }
 
     pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
+
+    /// Rebuild the cache of columns in the table.
+    pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
+        let schema = "ankurah";
+
+        let column_query = format!(
+            r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2;"#,
+        );
+        let mut new_columns = Vec::new();
+        info!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &schema, &self.collection_id.as_str());
+        let rows = client.query(&column_query, &[&schema, &self.collection_id.as_str()]).await?;
+        for row in rows {
+            let name: String = row.get("column_name");
+            info!("found column: {:?}", name);
+            new_columns.push(PostgresColumn {
+                name: row.get("column_name"),
+                is_nullable: row.get("is_nullable"),
+                data_type: row.get("data_type"),
+            })
+        }
+
+        let mut columns = self.columns.write().unwrap();
+        *columns = new_columns;
+        drop(columns);
+
+        Ok(())
+    }
+
+    pub fn existing_columns(&self) -> Vec<String> {
+        let columns = self.columns.read().unwrap();
+        columns.iter().map(|column| column.name.clone()).collect()
+    }
+
+    pub fn column(&self, column_name: &String) -> Option<PostgresColumn> {
+        let columns = self.columns.read().unwrap();
+        columns.iter().find(|column| column.name == *column_name).cloned()
+    }
+
+    pub fn has_column(&self, column_name: &String) -> bool {
+        self.column(column_name).is_some()
+    }
 
     pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
         let create_query = format!(
@@ -121,8 +176,13 @@ impl PostgresBucket {
             }
         }
 
+        self.rebuild_columns_cache(client).await?;
         Ok(())
     }
+}
+
+pub struct PostgresSetState {
+    
 }
 
 #[async_trait]
@@ -139,6 +199,8 @@ impl StorageCollection for PostgresBucket {
             warn!("Warning: Empty head detected for entity {}", id);
         }
 
+        let mut client = self.pool.get().await?;
+
         let backends = Backends::from_state_buffers(state)?;
         let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned()];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
@@ -146,23 +208,40 @@ impl StorageCollection for PostgresBucket {
         params.push(&state_buffers);
         params.push(&head_uuids);
 
-        let mut materialized_columns: Vec<String> = Vec::new();
-        let mut materialized: Vec<PGValue> = Vec::new();
+        self.rebuild_columns_cache(&mut client).await?;
+        info!("existing columns: {:?}", self.existing_columns());
+        let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
+        for (column, value) in backends.property_values() {
+            let pg_value: Option<PGValue> = value.map(|value| value.into());
+            if !self.has_column(&column) {
+                info!("doesn't have column: {:?}", column);
+                // We don't have the column yet and we know the type.
+                if let Some(ref pg_value) = pg_value {
+                    info!("adding missing column: {:?}", column);
+                    self.add_missing_columns(&mut client, vec![(column.clone(), pg_value.postgres_type())]).await?;
+                } else {
+                    // The column doesn't exist yet and we don't have a value.
+                    // This means the entire column is already null/none so we
+                    // don't need to set anything.
+                    continue;
+                }
+            }
 
-        for (name, value) in backends.property_values() {
-            materialized_columns.push(name.clone());
-            let pg_value: PGValue = value.into();
-            materialized.push(pg_value);
+            materialized.push((column.clone(), pg_value));
         }
 
-        columns.extend(materialized_columns.clone());
-        for parameter in &materialized {
+        for (name, parameter) in &materialized {
+            columns.push(name.clone());
+
             match &parameter {
-                PGValue::CharacterVarying(string) => params.push(string),
-                PGValue::SmallInt(number) => params.push(number),
-                PGValue::Integer(number) => params.push(number),
-                PGValue::BigInt(number) => params.push(number),
-                PGValue::Bytea(bytes) => params.push(bytes),
+                Some(value) => match value {
+                    PGValue::CharacterVarying(string) => params.push(string),
+                    PGValue::SmallInt(number) => params.push(number),
+                    PGValue::Integer(number) => params.push(number),
+                    PGValue::BigInt(number) => params.push(number),
+                    PGValue::Bytea(bytes) => params.push(bytes),
+                }
+                None => params.push(&None::<i32>),
             }
         }
 
@@ -192,7 +271,6 @@ impl StorageCollection for PostgresBucket {
             columns_update_str
         );
 
-        let mut client = self.pool.get().await?;
         info!("Querying: {}", query);
         let row = match client.query_one(&query, params.as_slice()).await {
             Ok(row) => row,
@@ -205,13 +283,13 @@ impl StorageCollection for PostgresBucket {
                             return self.set_state(id, state).await; // retry
                         }
                     }
+                    /*
                     ErrorKind::UndefinedColumn { table, column } => {
                         // TODO: We should check the definition of this and add all
                         // needed columns rather than recursively doing it.
                         if table == Some(self.state_table()) {
-                            let index = materialized_columns.iter().enumerate().find(|(_, name)| **name == column).map(|(index, _)| index);
+                            let index = materialized.iter().find(|(name, param)| **name == column).map(|(index, _)| index);
                             if let Some(index) = index {
-                                let param = &materialized[index];
                                 info!("column '{}' not found in materialized, adding it", column);
                                 self.add_missing_columns(&mut client, vec![(column, param.postgres_type())]).await?;
                                 return self.set_state(id, state).await; // retry
@@ -220,6 +298,7 @@ impl StorageCollection for PostgresBucket {
                             }
                         }
                     }
+                    */
                     _ => {}
                 }
 

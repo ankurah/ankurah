@@ -10,12 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     context::{Context, TContext},
-    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue},
+    property::{backend::PropertyBackend, traits::compare_clocks, PropertyError, PropertyName, PropertyValue},
 };
 
 #[derive(Clone, Debug)]
 pub struct LWWBackend {
-    values: Arc<RwLock<BTreeMap<PropertyName, PropertyValue>>>,
+    values: Arc<RwLock<BTreeMap<PropertyName, Option<PropertyValue>>>>,
 }
 
 impl Default for LWWBackend {
@@ -25,7 +25,7 @@ impl Default for LWWBackend {
 impl LWWBackend {
     pub fn new() -> LWWBackend { Self { values: Arc::new(RwLock::new(BTreeMap::default())) } }
 
-    pub fn set(&self, property_name: PropertyName, value: PropertyValue) {
+    pub fn set(&self, property_name: PropertyName, value: Option<PropertyValue>) {
         let mut values = self.values.write().unwrap();
         match values.entry(property_name) {
             Entry::Occupied(mut entry) => {
@@ -37,9 +37,9 @@ impl LWWBackend {
         }
     }
 
-    pub fn get(&self, property_name: PropertyName) -> Option<PropertyValue> {
+    pub fn get(&self, property_name: &PropertyName) -> Option<PropertyValue> {
         let values = self.values.read().unwrap();
-        values.get(&property_name).cloned()
+        values.get(property_name).cloned().flatten()
     }
 }
 
@@ -61,7 +61,11 @@ impl PropertyBackend for LWWBackend {
         values.keys().cloned().collect::<Vec<PropertyName>>()
     }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
+        self.get(property_name)
+    }
+
+    fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
         let values = self.values.read().unwrap();
         values.clone()
     }
@@ -77,7 +81,7 @@ impl PropertyBackend for LWWBackend {
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        let map = bincode::deserialize::<BTreeMap<PropertyName, PropertyValue>>(state_buffer)?;
+        let map = bincode::deserialize::<BTreeMap<PropertyName, Option<PropertyValue>>>(state_buffer)?;
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
@@ -100,7 +104,7 @@ impl PropertyBackend for LWWBackend {
         // This'll probably require looking at the events table.
         if compare_clocks(&current_head, &event_head /*, context*/) == ClockOrdering::Child {
             for operation in operations {
-                let map: BTreeMap<PropertyName, PropertyValue> = bincode::deserialize(&operation.diff)?;
+                let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&operation.diff)?;
                 for (property_name, new_value) in map {
                     values.insert(property_name, new_value);
                 }
@@ -108,12 +112,6 @@ impl PropertyBackend for LWWBackend {
         }
 
         Ok(())
-    }
-
-    fn get_property_value_string(&self, property_name: &str) -> Option<String> {
-        //let values = self.values.read().unwrap();
-        //values.get(property_name).map(|v| String::from_utf8_lossy(v).to_string())
-        unimplemented!()
     }
 }
 
