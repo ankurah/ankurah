@@ -23,75 +23,67 @@ use common::{Album, AlbumView, Pet, PetView};
 #[derive(Debug, Clone, Model)]
 pub struct User {
     pub username: String,
-    pub role: String, // "admin", "manager", "employee"
-    pub department: String,
+    pub max_level: u8,
 }
 
 #[derive(Debug, Clone, Model)]
 pub struct Doc {
     pub title: String,
-    pub access: String, // "public", "internal", "confidential", "restricted"
-    pub dept: String,
+    pub level: u8,
     pub owner: String, // username of creator
 }
 
 pub enum MyContextData {
     Root,
-    User { username: String, role: String, department: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MyContextProto {
-    pub username: String,
-    pub role: String,
-    pub department: String,
-    pub evil_bit: bool,
+    User { username: String, max_level: u8 },
 }
 
 impl std::fmt::Debug for MyContextData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MyContextData::Root => write!(f, "Root"),
-            MyContextData::User { username, role, department } => write!(f, "User({} {} {})", username, role, department),
+            MyContextData::User { username, max_level } => {
+                write!(f, "User({} {} {})", username, max_level)
+            }
         }
     }
 }
 #[async_trait]
 impl ContextData for MyContextData {
-    async fn validate(context: proto::AuthData) -> Result<Self, ValidationError> {
-        let proto: MyContextProto = serde_json::from_slice(&context.0).map_err(|e| ValidationError::Deserialization(Box::new(e)))?;
-        if proto.evil_bit {
-            Err(ValidationError::Rejected("Evil bit is set"))
-        } else {
-            let username = proto.username;
-            if username == "root" {
-                Ok(MyContextData::Root)
-            } else {
-                let role = proto.role;
-                let department = proto.department;
-                Ok(MyContextData::User { username, role, department })
-            }
-        }
-    }
+    // async fn validate(context: proto::AuthData) -> Result<Self, ValidationError> {
+    //     let proto: MyContextProto = serde_json::from_slice(&context.0).map_err(|e| ValidationError::Deserialization(Box::new(e)))?;
+    //     if proto.evil_bit {
+    //         Err(ValidationError::Rejected("Evil bit is set"))
+    //     } else {
+    //         let username = proto.username;
+    //         if username == "root" {
+    //             Ok(MyContextData::Root)
+    //         } else {
+    //             let role = proto.role;
+    //             let department = proto.department;
+    //             Ok(MyContextData::User { username, role, department })
+    //         }
+    //     }
+    // }
 
-    fn proto(&self) -> proto::AuthData {
-        match self {
-            MyContextData::Root => {
-                let proto = MyContextProto { username: "root".into(), role: "root".into(), department: "root".into(), evil_bit: false };
-                proto::AuthData(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
-            }
-            MyContextData::User { username, role, department } => {
-                let proto =
-                    MyContextProto { username: username.clone(), role: role.clone(), department: department.clone(), evil_bit: false };
-                proto::AuthData(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
-            }
-        }
-    }
+    // fn proto(&self) -> proto::AuthData {
+    //     match self {
+    //         MyContextData::Root => {
+    //             let proto = MyContextProto { username: "root".into(), role: "root".into(), department: "root".into(), evil_bit: false };
+    //             proto::AuthData(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
+    //         }
+    //         MyContextData::User { username, role, department } => {
+    //             let proto =
+    //                 MyContextProto { username: username.clone(), role: role.clone(), department: department.clone(), evil_bit: false };
+    //             proto::AuthData(serde_json::to_vec(&proto).map_err(|e| ValidationError::Serialization(e.to_string()))?)
+    //         }
+    //     }
+    // }
 }
 impl TryFrom<UserView> for MyContextData {
     type Error = PropertyError;
     fn try_from(user: UserView) -> Result<Self, Self::Error> {
-        Ok(MyContextData::User { username: user.username()?, role: user.role()?, department: user.department()? })
+        Ok(MyContextData::User { username: user.username()?, max_level: user.max_access_level()? })
     }
 }
 
@@ -119,7 +111,7 @@ async fn local_access_control() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Alice is allowed to create a new user
     let trx = c_alice.begin();
-    trx.create(&User { username: "dave".into(), role: "employee".into(), department: "IT".into() }).await?;
+    trx.create(&User { username: "dave".into(), max_level: "employee".into() }).await?;
     trx.commit().await?;
 
     // 3. Charlie does a wildcard fetch for docs, but only Press Release and HR Policies are returned
@@ -141,7 +133,7 @@ async fn local_access_control() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Charlie tries to create a user - but is blocked
     let trx = c_charlie.begin();
     assert!(matches!(
-        trx.create(&User { username: "eve".into(), role: "employee".into(), department: "Finance".into() }).await,
+        trx.create(&User { username: "eve".into(), max_level: "employee".into() }).await,
         Err(MutationError::AccessDenied(_))
     ));
     trx.commit().await?;
@@ -176,7 +168,7 @@ async fn keeping_peers_honest() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Alice is allowed to create a new user
     let trx = c_alice.begin();
-    trx.create(&User { username: "dave".into(), role: "employee".into(), department: "IT".into() }).await?;
+    trx.create(&User { username: "dave".into(), max_level: "employee".into() }).await?;
     trx.commit().await?;
 
     // 3. Charlie does a wildcard fetch for docs, but only Press Release and HR Policies are returned
@@ -198,7 +190,7 @@ async fn keeping_peers_honest() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Charlie tries to create a user - but is blocked
     let trx = c_charlie.begin();
     assert!(matches!(
-        trx.create(&User { username: "eve".into(), role: "employee".into(), department: "Finance".into() }).await,
+        trx.create(&User { username: "eve".into(), max_level: "employee".into() }).await,
         Err(MutationError::AccessDenied(_))
     ));
     trx.commit().await?;
@@ -219,56 +211,184 @@ pub struct TestAgent {
 pub struct DishonestTestAgent {}
 
 /// Everything is allowed
+#[async_trait]
 impl PolicyAgent for DishonestTestAgent {
     type ContextData = MyContextData;
-    fn pre_create(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
-    fn pre_edit(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
-    fn can_access_collection(&self, context: &MyContextData, _collection: &CollectionId) -> Result<(), AccessDenied> { Ok(()) }
-    fn filter_predicate(&self, cdata: &MyContextData, collection: &CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied> {
+
+    fn check_read(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
+    fn check_write(&self, cdata: &MyContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+    fn can_access_collection(&self, _context: &MyContextData, _collection: &CollectionId) -> Result<(), AccessDenied> { Ok(()) }
+    fn filter_predicate(
+        &self,
+        _cdata: &MyContextData,
+        _collection: &CollectionId,
+        predicate: Predicate,
+    ) -> Result<Predicate, AccessDenied> {
         Ok(predicate)
     }
+
+    fn sign_request<SE: StorageEngine>(
+        &self,
+        node: &NodeInner<SE, Self>,
+        cdata: &Self::ContextData,
+        request: &proto::Request,
+    ) -> proto::AuthData {
+        proto::AuthData(vec![])
+    }
+
+    async fn check_request<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        auth: &proto::AuthData,
+        request: &proto::Request,
+    ) -> Result<Self::ContextData, ValidationError> {
+        Ok(MyContextData::Root)
+    }
+    fn check_event<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        cdata: &Self::ContextData,
+        event: &proto::Event,
+    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+        Ok(None)
+    }
+
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        received_from_node: &proto::NodeId,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+}
+
+pub struct MyAuthData {
+    pub user_id: String,
+    pub fake_signed: bool,
+}
+pub struct MyAttestation {
+    pub node_id: String,
+    pub signature: String,
 }
 
 /// Actually enforces policies
 impl PolicyAgent for TestAgent {
     type ContextData = MyContextData;
-    fn pre_create(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> {
-        println!("pre_create: {:?}", cdata);
+    type ContextData: ContextData;
+
+    fn sign_request<SE: StorageEngine>(
+        &self,
+        node: &NodeInner<SE, Self>,
+        cdata: &MyContextData,
+        request: &proto::Request,
+    ) -> proto::AuthData {
+        // Pretending this is a JWT or something like that
+        proto::AuthData(serde_json::to_vec(&MyAuthData { user_id: cdata.username.clone(), fake_signed: true }).unwrap())
+    }
+
+    async fn check_request<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        auth: &proto::AuthData,
+        request: &proto::Request,
+    ) -> Result<Self::ContextData, ValidationError>
+    where
+        Self: Sized,
+    {
+        let auth_data: MyAuthData = serde_json::from_slice(&auth.0).map_err(|e| ValidationError::Deserialization(Box::new(e)))?;
+        // "Validate" the JWT
+        if auth_data.fake_signed {
+            Ok(MyContextData::User { username: auth_data.user_id, max_level: 0 })
+        } else {
+            Err(ValidationError::InvalidAuthData)
+        }
+    }
+
+    fn check_event<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        cdata: &Self::ContextData,
+        entity: &Entity,
+        event: &proto::Event,
+    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+        self.check_write(cdata, entity, Some(event))?;
+        Ok(Some(proto::Attestation(
+            serde_json::to_vec(&MyAttestation { node_id: node.id.to_string(), signature: "shibboleet".to_string() }).unwrap(),
+        )))
+    }
+
+    /// Validate an event attestation
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        received_from_node: &proto::NodeId,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        // iterate over all the attestions and check if the node_id is in the list of trusted nodes (durable peers)
+        let trusted_nodes = node.get_durable_peers();
+        for attestation in event.attestations.iter() {
+            let attestation: MyAttestation = serde_json::from_slice(&attestation.0).map_err(|e| AccessDenied::InvalidAttestation)?;
+            if trusted_nodes.contains(&attestation.node_id) && attestation.signature == "shibboleet" {
+                return Ok(());
+            }
+        }
+        Err(AccessDenied::InsufficientAttestation)
+    }
+
+    fn can_access_collection(&self, data: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied>;
+
+    fn filter_predicate(
+        &self,
+        cdata: &MyContextData,
+        collection: &CollectionId,
+        mut predicate: Predicate,
+    ) -> Result<Predicate, AccessDenied> {
         match cdata {
-            MyContextData::Root => Ok(()),
-            MyContextData::User { username, role, department } => {
-                let collection = entity.collection();
-                println!("collection: {} role: {} username: {}", collection, role, username);
-                match collection.as_str() {
-                    "user" => {
-                        if role == "admin" {
-                            Ok(())
-                        } else {
-                            Err(AccessDenied::ByPolicy("Only admins can create users"))
-                        }
-                    }
-                    "doc" => {
-                        // everybody can create documents
-                        Ok(())
-                    }
-                    _ => Err(AccessDenied::ByPolicy("Unknown collection")),
+            // Root can access everything
+            MyContextData::Root => Ok(predicate),
+            MyContextData::User { max_level, username } => {
+                // We only want to show docs that are owned by the user or have sufficient access
+                if (collection == "doc") {
+                    let addendum = parse_selection(&format!("username = '{}' OR level <= {}", username, max_level))?;
+                    predicate = Predicate::And(Box::new(predicate), Box::new(addendum));
                 }
+
+                Ok(predicate)
             }
         }
     }
-    fn pre_edit(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> {
+
+    /// Check if a context can read an entity
+    fn check_read(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> {
+        // do the same same as filter predicate on the entity
+        let collection = entity.collection();
+
+        if entity.collection() == "doc" {
+            if cdata.max_level <= cdata.max_level {
+                return Ok(());
+            } else {
+                Err(AccessDenied::ByPolicy("Only access level 3 or higher can read users"))
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_write(&self, cdata: &MyContextData, entity: &Entity) -> Result<(), AccessDenied> {
         match cdata {
             MyContextData::Root => Ok(()),
-            MyContextData::User { username, role, department } => {
+            MyContextData::User { username, max_level, .. } => {
                 // same as create
                 let collection = entity.collection();
-                println!("collection: {} role: {} username: {}", collection, role, username);
+                println!("collection: {} max_level: {} username: {}", collection, max_level, username);
                 match collection.as_str() {
                     "user" => {
-                        if role == "admin" {
+                        if max_level >= 3 {
                             Ok(())
                         } else {
-                            Err(AccessDenied::ByPolicy("Only admins can edit users"))
+                            Err(AccessDenied::ByPolicy("Only access level 3 or higher can edit users"))
                         }
                     }
                     "doc" => {
@@ -280,40 +400,18 @@ impl PolicyAgent for TestAgent {
             }
         }
     }
-    fn can_access_collection(&self, context: &MyContextData, _collection: &CollectionId) -> Result<(), AccessDenied> { Ok(()) }
-    fn filter_predicate(&self, cdata: &MyContextData, collection: &CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied> {
-        match cdata {
-            MyContextData::Root => Ok(predicate),
-            MyContextData::User { role, .. } => {
-                if role == "admin" {
-                    Ok(predicate)
-                } else if collection == "doc" {
-                    // Define access filter based on role
-                    let access_filter = match role.as_str() {
-                        "manager" => parse_selection("access IN ('restricted', 'internal', 'public')")?,
-                        "employee" => parse_selection("access IN ('internal', 'public')")?,
-                        _ => return Err(AccessDenied::CollectionDenied(collection.clone())),
-                    };
-
-                    Ok(Predicate::And(Box::new(access_filter), Box::new(predicate)))
-                } else {
-                    Ok(predicate)
-                }
-            }
-        }
-    }
 }
 
 async fn create_test_dataset(context: Context) -> Result<()> {
     let trx = context.begin();
-    trx.create(&User { username: "alice".into(), role: "admin".into(), department: "IT".into() }).await?;
-    trx.create(&User { username: "bob".into(), role: "manager".into(), department: "HR".into() }).await?;
-    trx.create(&User { username: "charlie".into(), role: "employee".into(), department: "Finance".into() }).await?;
-    trx.create(&Doc { title: "Corp Strategy".into(), access: "restricted".into(), dept: "Executive".into(), owner: "alice".into() })
-        .await?;
-    trx.create(&Doc { title: "HR Policies".into(), access: "internal".into(), dept: "HR".into(), owner: "bob".into() }).await?;
-    trx.create(&Doc { title: "Financials".into(), access: "confidential".into(), dept: "Finance".into(), owner: "charlie".into() }).await?;
-    trx.create(&Doc { title: "Press Release".into(), access: "public".into(), dept: "Marketing".into(), owner: "bob".into() }).await?;
+    trx.create(&User { username: "alice".into(), max_level: 3 }).await?; // CFO
+    trx.create(&User { username: "bob".into(), max_level: 2 }).await?; // Manager
+    trx.create(&User { username: "charlie".into(), max_level: 1 }).await?; // Employee
+
+    trx.create(&Doc { title: "Press Release".into(), level: 0, owner: "bob".into() }).await?; // Anyone can read
+    trx.create(&Doc { title: "HR Policies".into(), level: 1, owner: "bob".into() }).await?; // employees can read
+    trx.create(&Doc { title: "Corp Strategy".into(), level: 2, owner: "alice".into() }).await?; // managers can read
+    trx.create(&Doc { title: "Financials".into(), level: 3, owner: "charlie".into() }).await?; // leadership can read
     trx.commit().await?;
     Ok(())
 }

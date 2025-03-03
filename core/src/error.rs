@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use ankurah_proto::{DecodeError, ID};
+use ankurah_proto::{error::DecodeError, ID};
 use thiserror::Error;
 
 use crate::{connector::SendError, policy::AccessDenied};
@@ -95,6 +95,8 @@ pub enum MutationError {
     FailedStep(&'static str),
     #[error("general error: {0}")]
     General(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("no durable peers available")]
+    NoDurablePeers,
 }
 
 impl From<AccessDenied> for MutationError {

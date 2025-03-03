@@ -16,6 +16,8 @@ use append_only_vec::AppendOnlyVec;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 pub struct Transaction {
+    id: proto::TransactionId,
+
     pub(crate) dyncontext: Arc<dyn TContext>,
 
     entities: AppendOnlyVec<Arc<Entity>>,
@@ -27,7 +29,8 @@ pub struct Transaction {
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext>) -> Self {
-        Self { dyncontext, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
+        let id = proto::TransactionId::new();
+        Self { dyncontext, entities: AppendOnlyVec::new(), id, implicit: true, consumed: false }
     }
 
     /// Fetch an entity already in the transaction.
@@ -48,7 +51,7 @@ impl Transaction {
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<M::Mutable<'rec>, MutationError> {
         let id = self.dyncontext.next_entity_id();
         let new_entity = Arc::new(model.create_entity(id));
-        self.dyncontext.check_create(&new_entity)?;
+        self.dyncontext.check_write(&new_entity)?;
 
         let entity_ref = self.add_entity(new_entity);
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
@@ -57,7 +60,7 @@ impl Transaction {
     pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::ID>) -> Result<M::Mutable<'rec>, MutationError> {
         let id = id.into();
         let entity = self.get_entity(id, &M::collection()).await?;
-        self.dyncontext.check_edit(entity)?;
+        self.dyncontext.check_write(entity)?;
 
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
     }
@@ -82,7 +85,7 @@ impl Transaction {
                 entity_events.push(entity_event);
             }
         }
-        self.dyncontext.commit_events(&entity_events).await?;
+        self.dyncontext.commit_transaction(&self.id, entity_events).await?;
 
         Ok(())
     }

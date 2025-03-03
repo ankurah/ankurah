@@ -5,7 +5,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{Clock, ClockOrdering, Operation};
+use ankurah_proto::{
+    clock::{Clock, ClockOrdering},
+    Operation,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{

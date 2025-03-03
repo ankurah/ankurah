@@ -52,7 +52,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         //
-        NodeInner::handle_message(&self, message).await
+        self.handle_message(message).await
     }
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }

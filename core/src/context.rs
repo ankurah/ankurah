@@ -28,12 +28,11 @@ pub struct NodeAndContext<SE, PA: PolicyAgent> {
 pub trait TContext {
     fn node_id(&self) -> proto::NodeId;
     fn next_entity_id(&self) -> proto::ID;
-    fn check_create(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied>;
-    fn check_edit(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied>;
+    fn check_write(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Arc<Entity>>, RetrievalError>;
     async fn insert_entity(&self, entity: Arc<Entity>) -> Result<(), MutationError>;
-    async fn commit_events(&self, events: &Vec<proto::Event>) -> Result<(), MutationError>;
+    async fn commit_transaction(&self, id: &proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError>;
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
@@ -48,10 +47,9 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::NodeId { self.node.id.clone() }
     fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
-    fn check_create(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied> {
-        self.node.policy_agent.pre_create(&self.cdata, entity).into()
+    fn check_write(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied> {
+        self.node.policy_agent.check_write(&self.cdata, entity, None).into()
     }
-    fn check_edit(&self, entity: &Arc<Entity>) -> Result<(), AccessDenied> { self.node.policy_agent.pre_edit(&self.cdata, entity).into() }
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
         self.node.get_entity(collection, id /*&self.cdata*/).await
     }
@@ -59,8 +57,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.node.fetch_entities(collection, args, &self.cdata).await
     }
     async fn insert_entity(&self, entity: Arc<Entity>) -> Result<(), MutationError> { self.node.insert_entity(entity).await }
-    async fn commit_events(&self, events: &Vec<proto::Event>) -> Result<(), MutationError> {
-        self.node.commit_events(&self.cdata, events).await
+    async fn commit_transaction(&self, id: &proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError> {
+        self.node
+            .commit_transaction(
+                &self.cdata,
+                id.clone(),
+                events.into_iter().map(|e| proto::Attested { payload: e, attestations: vec![] }).collect(),
+            )
+            .await
     }
     async fn subscribe(
         &self,
@@ -69,7 +73,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
-        self.node.subscribe(self.cdata, sub_id, collection, args, callback).await
+        self.node.subscribe(&self.cdata, sub_id, collection, args, callback).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.node.collection(id).await }
 }

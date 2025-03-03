@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{CollectionId, Event, State, ID};
+use ankurah_proto::{Attested, CollectionId, Event, State, ID};
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
@@ -36,8 +36,8 @@ pub trait StorageCollection: Send + Sync {
     }
 
     // TODO:
-    async fn add_event(&self, entity_event: &Event) -> Result<bool, MutationError>;
-    async fn get_events(&self, id: ID) -> Result<Vec<Event>, RetrievalError>;
+    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError>;
+    async fn get_events(&self, id: ID) -> Result<Vec<Attested<Event>>, RetrievalError>;
 }
 
 #[derive(Serialize, Deserialize)]

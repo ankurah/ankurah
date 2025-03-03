@@ -18,24 +18,36 @@ pub struct NodeId(Ulid);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CollectionId(String);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TransactionId(Ulid);
+
 /// Raw context data that can be transmitted between nodes - this may be a bearer token
 /// or some other arbitrary data at the discretion of the Policy Agent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthData(pub Vec<u8>);
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NodeRequest {
+pub struct Request {
     pub id: RequestId,
     pub to: NodeId,
     pub from: NodeId,
-    pub body: NodeRequestBody,
+    pub body: RequestBody,
 }
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NodeResponse {
+pub struct Update {
+    pub id: UpdateId,
+    pub from: NodeId,
+    pub to: NodeId,
+    pub body: UpdateBody,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Response {
     pub request_id: RequestId,
     pub from: NodeId,
     pub to: NodeId,
-    pub body: NodeResponseBody,
+    pub body: ResponseBody,
 }
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash)]
@@ -51,11 +63,11 @@ pub struct Event {
     pub parent: Clock,
 }
 
-// #[derive(Debug, Serialize, Deserialize, Clone)]
-// pub struct EventWrapper {
-//     pub event: Event,
-//     pub attestation: Attestation,
-// }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Attested<T> {
+    pub payload: T,
+    pub attestations: Vec<Attestation>,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Operation {
@@ -74,35 +86,41 @@ pub struct State {
 pub struct SubscriptionId(Ulid);
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum NodeRequestBody {
+pub enum RequestBody {
     // Request that the Events to be committed on the remote node
-    CommitEvents { events: Vec<Event> },
+    CommitTransaction { id: TransactionId, events: Vec<Attested<Event>> },
     // Request to fetch entities matching a predicate
     Fetch { collection: CollectionId, predicate: ast::Predicate },
     Subscribe { subscription_id: SubscriptionId, collection: CollectionId, predicate: ast::Predicate },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NotificationId(Ulid);
-
 #[derive(Debug, Serialize, Deserialize)]
-pub enum NotificationBody {
+pub enum UpdateBody {
     /// New events for a subscription
-    SubscriptionUpdate { subscription_id: SubscriptionId, events: Vec<Event> },
+    SubscriptionUpdate { subscription_id: SubscriptionId, events: Vec<Attested<Event>> },
     /// Unsubscribe from a subscription
     Unsubscribe { subscription_id: SubscriptionId },
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UpdateId(Ulid);
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Notification {
-    pub id: NotificationId,
+pub struct UpdateAck {
+    pub id: UpdateId,
     pub from: NodeId,
     pub to: NodeId,
-    pub body: NotificationBody,
+    pub body: UpdateAckBody,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum NodeResponseBody {
+pub enum UpdateAckBody {
+    Success,
+    Error(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ResponseBody {
     // Response to CommitEvents
     CommitComplete,
     Fetch(Vec<(ID, State)>),
@@ -112,10 +130,10 @@ pub enum NodeResponseBody {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeMessage {
-    Request { auth: AuthData, request: NodeRequest },
-    Response(NodeResponse),
-    Notification(Notification),
-    AckNotification { id: NotificationId },
+    Request { auth: AuthData, request: Request },
+    Response(Response),
+    Update(Update),
+    UpdateAck(UpdateAck),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

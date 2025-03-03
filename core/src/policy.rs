@@ -7,6 +7,7 @@ use crate::{
     storage::StorageEngine,
 };
 use ankql::{ast::Predicate, error::ParseError};
+use ankurah_proto::{Attestation, Attested};
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -21,6 +22,8 @@ pub enum AccessDenied {
     PropertyError(Box<PropertyError>),
     #[error("Access denied by parse error: {0}")]
     ParseError(ParseError),
+    #[error("Insufficient attestation")]
+    InsufficientAttestation,
 }
 
 impl From<PropertyError> for AccessDenied {
@@ -32,52 +35,64 @@ impl From<ParseError> for AccessDenied {
 
 impl AccessDenied {}
 
-/// Applications will implement this trait to control access to resources
-/// (Entities and RPC calls) and the Node will be generic over this trait
+/// PolicyAgents control access to resources, by:
+/// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
+/// - checking access for requests. If approved, yield a ContextData
+/// - attesting events for requests that were approved
+/// - validating attestations for events
 #[async_trait]
 pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
 
-    /// Validate and convert from wire format to this context type
-    async fn validate_request<SE: StorageEngine>(
-        &self,
-        node: &Node<SE, Self>,
-        auth: proto::AuthData,
-        request: &proto::NodeRequest,
-    ) -> Result<Self::ContextData, ValidationError>
-    where
-        Self: Sized;
-
     /// Create relevant auth data for a given request
+    /// This could be a JWT or a cryptographic signature, or some other arbitrary method of authentication as defined by the PolicyAgent
     fn sign_request<SE: StorageEngine>(
         &self,
         node: &NodeInner<SE, Self>,
         cdata: &Self::ContextData,
-        request: &proto::NodeRequest,
+        request: &proto::Request,
     ) -> proto::AuthData;
 
-    /// Create an attestation for an event
-    fn attest_event<SE: StorageEngine>(
+    /// Reverse of sign_request. This will typically parse + validate the auth data and return a ContextData if valid
+    /// optionally, the PolicyAgent may introspect the request directly for signature validation, or other policy checks
+    /// Note that check_read and check_write will be called with the ContextData as well if the request is approved
+    /// Meaning that the PolicyAgent need not necessarily introspect the request directly here if it doesn't want to.
+    async fn check_request<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        auth: &proto::AuthData,
+        request: &proto::Request,
+    ) -> Result<Self::ContextData, ValidationError>
+    where
+        Self: Sized;
+
+    /// Check the event and optionally return an attestation
+    /// This could be used to attest that the event has passed the policy check for a given context
+    /// or you could just return None if you don't want to attest to the event
+    fn check_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
         cdata: &Self::ContextData,
+        entity: &Entity,
         event: &proto::Event,
-    ) -> Result<proto::Attestation, AccessDenied>;
+    ) -> Result<Option<proto::Attestation>, AccessDenied>;
 
-    fn validate_event_attestation<SE: StorageEngine>(
+    /// Validate an event attestation
+    /// This could be used to validate that the event has sufficient attestation as to be trusted
+    fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        from_node: &proto::NodeId,
-        event: &proto::Event,
-        attestation: Option<&proto::Attestation>,
+        received_from_node: &proto::NodeId,
+        event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
     // For checking if a context can access a collection
     // For checking if a context can access a collection
     fn can_access_collection(&self, data: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied>;
 
+    /// Filter a predicate based on the context data
     fn filter_predicate(
         &self,
         data: &Self::ContextData,
@@ -85,17 +100,13 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         predicate: Predicate,
     ) -> Result<Predicate, AccessDenied>;
 
-    // // For checking if a context can read an entity
-    // fn can_read_entity(&self, data: &Self::ContextData, entity: &Entity) -> AccessResult;
+    /// Check if a context can read an entity
+    fn check_read(&self, data: &Self::ContextData, entity: &Entity) -> Result<(), AccessDenied>;
 
-    // // For checking if a context can modify an entity
-    // fn can_modify_entity(&self, data: &Self::ContextData, collection: &CollectionId, id: &ID) -> AccessResult;
+    /// Check if a context can edit an entity
+    fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
 
-    // // For checking if a context can create entities in a collection
-    fn pre_create(&self, data: &Self::ContextData, entity: &Entity) -> Result<(), AccessDenied>;
-
-    // TODO - figure out how we can convert pre-event actions and post-event actions into a single representation suitable for passing to pre_edit so we can policy-control discrete mutations
-    fn pre_edit(&self, data: &Self::ContextData, entity: &Entity) -> Result<(), AccessDenied>;
+    // fn check_write_event(&self, data: &Self::ContextData, entity: &Entity, event: &proto::Event) -> Result<(), AccessDenied>;
 
     // // For checking if a context can subscribe to changes
     // fn can_subscribe(&self, data: &Self::ContextData, collection: &CollectionId, predicate: &Predicate) -> AccessResult;
@@ -121,46 +132,48 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _node: &NodeInner<SE, Self>,
         _cdata: &Self::ContextData,
-        _request: &proto::NodeRequest,
+        _request: &proto::Request,
     ) -> proto::AuthData {
         proto::AuthData(vec![])
     }
 
     /// Validate auth data and yield the context data if valid
-    async fn validate_request<SE: StorageEngine>(
+    async fn check_request<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _auth: proto::AuthData,
-        _request: &proto::NodeRequest,
+        _auth: &proto::AuthData,
+        _request: &proto::Request,
     ) -> Result<Self::ContextData, ValidationError> {
         Ok(DEFAULT_CONTEXT)
     }
 
     /// Create an attestation for an event
-    fn attest_event<SE: StorageEngine>(
+    fn check_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
+        _entity: &Entity,
         _event: &proto::Event,
-    ) -> Result<proto::Attestation, AccessDenied> {
-        Ok(proto::Attestation(vec![]))
+    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+        Ok(None)
     }
 
-    fn validate_event_attestation<SE: StorageEngine>(
+    fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
         _from_node: &proto::NodeId,
-        _event: &proto::Event,
-        _attestation: Option<&proto::Attestation>,
+        _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
     fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
 
-    fn pre_create(&self, _context: &Self::ContextData, _entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
+    fn check_read(&self, _context: &Self::ContextData, _entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
 
-    fn pre_edit(&self, _context: &Self::ContextData, _entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
+    fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
+        Ok(())
+    }
 
     fn filter_predicate(
         &self,

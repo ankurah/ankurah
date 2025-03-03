@@ -1,6 +1,5 @@
-use ankurah_proto::{Clock, ClockOrdering};
+use ankurah_proto::clock::{Clock, ClockOrdering};
 use anyhow::Result;
-use futures::future::Join3;
 
 use crate::{
     context::{Context, TContext},

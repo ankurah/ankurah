@@ -11,7 +11,7 @@ use ankurah_core::{
     },
     storage::{StorageCollection, StorageEngine},
 };
-use ankurah_proto::State;
+use ankurah_proto::{Attested, State};
 
 use futures_util::TryStreamExt;
 
@@ -382,11 +382,11 @@ impl StorageCollection for PostgresBucket {
     /// entity_id uuid, // `ID`/`ULID`
     /// operations bytea, // `Vec<Operation>`
     /// clock bytea, // `Clock`
-    async fn add_event(&self, entity_event: &Event) -> Result<bool, MutationError> {
-        let event_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.id));
-        let entity_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.entity_id));
-        let operations = bincode::serialize(&entity_event.operations)?;
-        let parent_uuids: Vec<uuid::Uuid> = (&entity_event.parent).into();
+    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
+        let event_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.payload.id));
+        let entity_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.payload.entity_id));
+        let operations = bincode::serialize(&entity_event.payload.operations)?;
+        let parent_uuids: Vec<uuid::Uuid> = (&entity_event.payload.parent).into();
 
         // Does it even matter if this conflicts?
         // One peers event should match any duplicates, so taking the first
@@ -416,7 +416,7 @@ impl StorageCollection for PostgresBucket {
         Ok(affected > 0)
     }
 
-    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> {
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
         let query = format!(r#"SELECT "id", "operations", "parent" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
 
         let entity_uuid = uuid::Uuid::from(ulid::Ulid::from(entity_id));

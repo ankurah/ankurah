@@ -7,6 +7,12 @@ impl std::fmt::Display for NodeId {
     }
 }
 
+impl std::fmt::Display for TransactionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id_str = self.0.to_string();
+        write!(f, "T{}", &id_str[20..])
+    }
+}
 impl From<NodeId> for String {
     fn from(node_id: NodeId) -> Self { node_id.0.to_string() }
 }
@@ -39,7 +45,7 @@ impl std::fmt::Display for RequestId {
     }
 }
 
-impl std::fmt::Display for NotificationId {
+impl std::fmt::Display for UpdateId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let id_str = self.0.to_string();
         write!(f, "N{}", &id_str[20..])
@@ -58,6 +64,10 @@ impl NodeId {
     pub fn new() -> Self { Self(Ulid::new()) }
 }
 
+impl TransactionId {
+    pub fn new() -> Self { Self(Ulid::new()) }
+}
+
 impl Default for RequestId {
     fn default() -> Self { Self::new() }
 }
@@ -65,7 +75,7 @@ impl Default for RequestId {
 impl RequestId {
     pub fn new() -> Self { Self(Ulid::new()) }
 }
-impl NotificationId {
+impl UpdateId {
     pub fn new() -> Self { Self(Ulid::new()) }
 }
 
@@ -80,22 +90,26 @@ impl SubscriptionId {
     pub fn test(id: u64) -> Self { Self(Ulid::from_parts(id, 0)) }
 }
 
-impl std::fmt::Display for NodeRequest {
+impl std::fmt::Display for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Request {} from {}->{}: {}", self.id, self.from, self.to, self.body)
     }
 }
 
-impl std::fmt::Display for Notification {
+impl std::fmt::Display for Update {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Notification {} from {}->{}: {}", self.id, self.from, self.to, self.body)
     }
 }
 
-impl std::fmt::Display for NodeResponse {
+impl std::fmt::Display for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Response({}) {}->{} {}", self.request_id, self.from, self.to, self.body)
     }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for Attested<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "AttestationSet({})", self.payload) }
 }
 
 impl std::fmt::Display for Event {
@@ -127,54 +141,70 @@ impl std::fmt::Display for State {
     }
 }
 
-impl std::fmt::Display for NodeRequestBody {
+impl std::fmt::Display for RequestBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeRequestBody::CommitEvents { events } => {
-                write!(f, "CommitEvents [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
+            RequestBody::CommitTransaction { id, events } => {
+                write!(f, "CommitTransaction {id} [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
             }
-            NodeRequestBody::Fetch { collection, predicate } => {
+            RequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")
             }
-            NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
+            RequestBody::Subscribe { subscription_id, collection, predicate } => {
                 write!(f, "Subscribe {subscription_id} {collection} {predicate}")
             }
         }
     }
 }
 
-impl std::fmt::Display for NotificationBody {
+impl std::fmt::Display for UpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NotificationBody::SubscriptionUpdate { subscription_id, events } => {
+            UpdateBody::SubscriptionUpdate { subscription_id, events } => {
                 write!(
                     f,
                     "SubscriptionUpdate {subscription_id} [{}]",
                     events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", ")
                 )
             }
-            NotificationBody::Unsubscribe { subscription_id } => {
+            UpdateBody::Unsubscribe { subscription_id } => {
                 write!(f, "Unsubscribe {subscription_id}")
             }
         }
     }
 }
 
-impl std::fmt::Display for NodeResponseBody {
+impl std::fmt::Display for ResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeResponseBody::CommitComplete => write!(f, "CommitComplete"),
-            NodeResponseBody::Fetch(tuples) => {
+            ResponseBody::CommitComplete => write!(f, "CommitComplete"),
+            ResponseBody::Fetch(tuples) => {
                 write!(f, "Fetch [{}]", tuples.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::Subscribe { initial, subscription_id } => write!(
+            ResponseBody::Subscribe { initial, subscription_id } => write!(
                 f,
                 "Subscribe {} initial [{}]",
                 subscription_id,
                 initial.iter().map(|(id, state)| format!("{} {}", id, state)).collect::<Vec<_>>().join(", ")
             ),
-            NodeResponseBody::Success => write!(f, "Success"),
-            NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
+            ResponseBody::Success => write!(f, "Success"),
+            ResponseBody::Error(e) => write!(f, "Error: {e}"),
         }
     }
+}
+
+impl std::fmt::Display for UpdateAckBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateAckBody::Success => write!(f, "Success"),
+            UpdateAckBody::Error(e) => write!(f, "Error: {e}"),
+        }
+    }
+}
+impl Attested<Event> {
+    pub fn collection(&self) -> &CollectionId { &self.payload.collection }
+}
+
+impl<T: Clone> Clone for Attested<T> {
+    fn clone(&self) -> Self { Self { payload: self.payload.clone(), attestations: self.attestations.clone() } }
 }
