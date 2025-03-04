@@ -3,7 +3,7 @@ use std::{marker::PhantomData, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model::Entity,
+    entity::Entity,
     property::{
         backend::LWWBackend,
         traits::{FromActiveType, FromEntity, PropertyError},

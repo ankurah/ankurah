@@ -1,15 +1,16 @@
 use crate::{
+    entity::Entity,
     error::ValidationError,
-    model::Entity,
     node::{ContextData, Node, NodeInner},
     property::PropertyError,
     proto,
     storage::StorageEngine,
 };
 use ankql::{ast::Predicate, error::ParseError};
-use ankurah_proto::{Attestation, Attested};
+use ankurah_proto::Attested;
 use async_trait::async_trait;
 use thiserror::Error;
+use tracing::info;
 
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
 #[derive(Debug, Error)]
@@ -134,6 +135,7 @@ impl PolicyAgent for PermissiveAgent {
         _cdata: &Self::ContextData,
         _request: &proto::Request,
     ) -> proto::AuthData {
+        info!("PermissiveAgent sign_request: {:?}", _request);
         proto::AuthData(vec![])
     }
 
@@ -144,6 +146,7 @@ impl PolicyAgent for PermissiveAgent {
         _auth: &proto::AuthData,
         _request: &proto::Request,
     ) -> Result<Self::ContextData, ValidationError> {
+        info!("PermissiveAgent check_request: {:?}", _request);
         Ok(DEFAULT_CONTEXT)
     }
 
@@ -155,6 +158,7 @@ impl PolicyAgent for PermissiveAgent {
         _entity: &Entity,
         _event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
+        info!("PermissiveAgent check_event: {:?}", _event);
         Ok(None)
     }
 
@@ -164,14 +168,22 @@ impl PolicyAgent for PermissiveAgent {
         _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
+        info!("PermissiveAgent validate_received_event: {:?}", _event);
         Ok(())
     }
 
-    fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
+    fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> {
+        info!("PermissiveAgent can_access_collection: {:?}", _collection);
+        Ok(())
+    }
 
-    fn check_read(&self, _context: &Self::ContextData, _entity: &Entity) -> Result<(), AccessDenied> { Ok(()) }
+    fn check_read(&self, _context: &Self::ContextData, _entity: &Entity) -> Result<(), AccessDenied> {
+        info!("PermissiveAgent check_read: {:?}", _entity);
+        Ok(())
+    }
 
     fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
+        info!("PermissiveAgent check_write: {:?}", _event);
         Ok(())
     }
 
@@ -181,6 +193,7 @@ impl PolicyAgent for PermissiveAgent {
         _collection: &proto::CollectionId,
         predicate: Predicate,
     ) -> Result<Predicate, AccessDenied> {
+        info!("PermissiveAgent filter_predicate: {:?}", predicate);
         Ok(predicate)
     }
 

@@ -1,13 +1,7 @@
 use ankurah_proto::clock::{Clock, ClockOrdering};
 use anyhow::Result;
 
-use crate::{
-    context::{Context, TContext},
-    error::RetrievalError,
-    model::Entity,
-    property::PropertyName,
-    Node,
-};
+use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
 
 use thiserror::Error;
 

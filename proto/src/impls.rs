@@ -109,7 +109,7 @@ impl std::fmt::Display for Response {
 }
 
 impl<T: std::fmt::Display> std::fmt::Display for Attested<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "AttestationSet({})", self.payload) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Attested({})", self.payload) }
 }
 
 impl std::fmt::Display for Event {

@@ -15,7 +15,6 @@ use crate::{
         PropertyName,
     },
     storage::Materialized,
-    Node,
 };
 
 #[derive(Debug)]

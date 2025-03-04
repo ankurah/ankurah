@@ -1,21 +1,21 @@
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
+use dashmap::{DashMap, DashSet, Entry};
 use rand::prelude::*;
-use std::{
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
-    ops::Deref,
-    sync::{Arc, Weak},
-};
-use tokio::sync::{oneshot, RwLock};
+use std::ops::Deref;
+use std::sync::Arc;
+use std::sync::Weak;
 
+use tokio::sync::oneshot;
+
+use crate::registry::EntityRegistry;
 use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
     connector::PeerSender,
     context::Context,
-    error::{MutationError, RequestError, RetrievalError, ValidationError},
-    model::Entity,
+    entity::{Entity, WeakEntity},
+    error::{MutationError, RequestError, RetrievalError},
     policy::PolicyAgent,
     reactor::Reactor,
     storage::{StorageCollectionWrapper, StorageEngine},
@@ -26,8 +26,9 @@ use tracing::{debug, info, warn};
 
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
+    #[allow(unused)]
     durable: bool,
-    subscriptions: BTreeSet<proto::SubscriptionId>,
+    subscriptions: DashSet<proto::SubscriptionId>,
 }
 
 pub struct MatchArgs {
@@ -76,9 +77,9 @@ pub struct NodeInner<SE, PA> {
     pub id: proto::NodeId,
     pub durable: bool,
     storage_engine: Arc<SE>,
-    collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
+    collections: DashMap<CollectionId, StorageCollectionWrapper>,
 
-    entities: Arc<RwLock<EntityMap>>,
+    pub(crate) entities: EntityRegistry,
     // peer_connections: Vec<PeerConnection>,
     peer_connections: DashMap<proto::NodeId, PeerState>,
     durable_peers: DashSet<proto::NodeId>,
@@ -90,22 +91,21 @@ pub struct NodeInner<SE, PA> {
     pub(crate) policy_agent: PA,
 }
 
-type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
-
 impl<SE, PA> Node<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
-        let reactor = Reactor::new(engine.clone(), policy_agent.clone());
+        let entities = EntityRegistry::new();
+        let reactor = Reactor::new(engine.clone(), entities.clone(), policy_agent.clone());
         let id = proto::NodeId::new();
         info!("Node {} created", id);
         let node = Node(Arc::new(NodeInner {
             id,
             storage_engine: engine,
-            collections: RwLock::new(BTreeMap::new()),
-            entities: Arc::new(RwLock::new(BTreeMap::new())),
+            collections: DashMap::new(),
+            entities,
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
@@ -119,13 +119,16 @@ where
         node
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
-        let reactor = Reactor::new(engine.clone(), policy_agent.clone());
+        let entities = EntityRegistry::new();
+        let reactor = Reactor::new(engine.clone(), entities.clone(), policy_agent.clone());
+        let id = proto::NodeId::new();
+        info!("Node {} created as durable", id);
 
         let node = Node(Arc::new(NodeInner {
-            id: proto::NodeId::new(),
+            id,
             storage_engine: engine,
-            collections: RwLock::new(BTreeMap::new()),
-            entities: Arc::new(RwLock::new(BTreeMap::new())),
+            collections: DashMap::new(),
+            entities: EntityRegistry::new(),
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
@@ -152,7 +155,7 @@ where
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node {} register peer {}", self.id, presence.node_id);
         self.peer_connections
-            .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: BTreeSet::new() });
+            .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: DashSet::new() });
         if presence.durable {
             self.durable_peers.insert(presence.node_id.clone());
         }
@@ -205,7 +208,7 @@ where
             connection.send_message(notification).await?;
         }
 
-        response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?;
+        response_rx.await.map_err(|_| RequestError::InternalChannelClosed)??;
         Ok(())
     }
 }
@@ -316,21 +319,18 @@ where
         };
 
         match notification.body {
-            proto::UpdateBody::SubscriptionUpdate { subscription_id, events } => {
-                if peer_state.subscriptions.contains(&subscription_id) {
-                    self.apply_events_from_peer(&notification.from, events).await?;
-                    Ok(())
-                } else {
-                    Err(anyhow!("Subscription {} not found", subscription_id))
-                }
+            proto::UpdateBody::SubscriptionUpdate { subscription_id: _, events } => {
+                info!("Node {} received subscription update for {} events", self.id, events.len());
+                self.apply_events_from_peer(&notification.from, events).await?;
+                Ok(())
             }
             proto::UpdateBody::Unsubscribe { subscription_id } => {
-                if peer_state.subscriptions.remove(&subscription_id) {
+                if let Some(_) = peer_state.subscriptions.remove(&subscription_id) {
                     self.reactor.unsubscribe(subscription_id);
 
                     Ok(())
                 } else {
-                    Err(anyhow!("Subscription {} not found", subscription_id))
+                    Err(anyhow!("Subscription {} not found (unsubscribe)", subscription_id))
                 }
             }
         }
@@ -347,7 +347,7 @@ where
         let mut changes = Vec::new();
 
         // first check if all events are allowed by the local policy agent
-        let mut updates: Vec<(Arc<Entity>, proto::Attested<proto::Event>)> = Vec::new();
+        let mut updates: Vec<(Entity, proto::Attested<proto::Event>)> = Vec::new();
         for event in events.iter_mut() {
             // Apply Events to the Node's registered Entities first.
             let entity = self.get_entity(&event.payload.collection, event.payload.entity_id.clone()).await?;
@@ -396,13 +396,27 @@ where
         from_peer_id: &proto::NodeId,
         events: Vec<proto::Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
+        let mut changes = Vec::new();
         for event in events {
-            self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
-            let entity = self.get_entity(&event.payload.collection, event.payload.entity_id.clone()).await?;
-            let collection = self.collection(&event.payload.collection).await;
-            collection.add_event(&event).await?;
-            entity.apply_event(&event.payload)?;
+            match self.policy_agent.validate_received_event(self, from_peer_id, &event) {
+                Ok(()) => {
+                    let entity = self.get_entity(&event.payload.collection, event.payload.entity_id.clone()).await?;
+                    entity.apply_event(&event.payload)?;
+                    let collection = self.collection(&event.payload.collection).await;
+                    let state = entity.to_state()?;
+                    collection.add_event(&event).await?;
+                    let changed = collection.set_state(event.payload.entity_id, &state).await?;
+                    if changed {
+                        changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });
+                    }
+                }
+                Err(e) => {
+                    warn!("Node {} received invalid event from peer {} - {}", self.id, from_peer_id, e);
+                }
+            }
         }
+        info!("Node {} notifying reactor of {} changes", self.id, changes.len());
+        self.reactor.notify_change(changes);
         Ok(())
     }
 }
@@ -482,7 +496,7 @@ where
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
-        let handle = {
+        let _handle = {
             let peer_id = peer_id.clone();
             self.reactor
                 .subscribe(sub_id, &collection_id, predicate, move |changeset| {
@@ -520,21 +534,17 @@ where
     }
 
     pub async fn collection(&self, id: &CollectionId) -> StorageCollectionWrapper {
-        let collections = self.collections.read().await;
-        if let Some(store) = collections.get(id) {
+        if let Some(store) = self.collections.get(id) {
             return store.clone();
         }
-        drop(collections);
 
         let collection = StorageCollectionWrapper::new(self.storage_engine.collection(id).await.unwrap());
 
-        let mut collections = self.collections.write().await;
-
         // We might have raced with another node to create this collection
-        if let Entry::Vacant(entry) = collections.entry(id.clone()) {
+
+        if let Entry::Vacant(entry) = self.collections.entry(id.clone()) {
             entry.insert(collection.clone());
         }
-        drop(collections);
 
         collection
     }
@@ -543,92 +553,29 @@ where
 
     pub fn context(self: &Arc<Self>, data: PA::ContextData) -> Context { Context::new(Node(self.clone()), data) }
 
-    /// This should be called only by the transaction commit for newly created Entities
-    /// This is necessary because Entities created in a transaction scope have no upstream
-    /// so when they hand out read Entities, they have to work immediately.
-    /// TODO: Discuss. The upside is that you can call .read() on a Mutable. The downside is that the behavior is inconsistent
-    /// between newly created Entities and Entities that are created in a transaction scope.
-    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Arc<Entity>) -> Result<(), MutationError> {
-        match self.entities.write().await.entry((entity.id, entity.collection.clone())) {
-            Entry::Vacant(entry) => {
-                entry.insert(Arc::downgrade(&entity));
-                Ok(())
-            }
-            Entry::Occupied(_) => Err(MutationError::AlreadyExists),
-        }
-    }
-
-    /// Register a Entity with the node, with the intention of preventing duplicate resident entities.
-    /// Returns true if the Entity was already present.
-    /// Note that this does not actually store the entity in the storage engine.
-    #[must_use]
-    pub(crate) async fn assert_entity(
-        &self,
-        collection_id: &CollectionId,
-        id: proto::ID,
-        state: &proto::State,
-    ) -> Result<Arc<Entity>, RetrievalError> {
-        let mut entities = self.entities.write().await;
-
-        match entities.entry((id, collection_id.clone())) {
-            Entry::Occupied(mut entry) => {
-                if let Some(entity) = entry.get().upgrade() {
-                    entity.apply_state(state)?;
-                    Ok(entity)
-                } else {
-                    let entity = Arc::new(Entity::from_state(id, collection_id.clone(), state)?);
-                    entry.insert(Arc::downgrade(&entity));
-                    Ok(entity)
-                }
-            }
-            Entry::Vacant(entry) => {
-                let entity = Arc::new(Entity::from_state(id, collection_id.clone(), state)?);
-                entry.insert(Arc::downgrade(&entity));
-                Ok(entity)
-            }
-        }
-    }
-
-    pub(crate) async fn fetch_entity_from_node(
-        &self,
-        id: proto::ID,
-        collection_id: &CollectionId,
-        // cdata: &PA::ContextData,
-    ) -> Option<Arc<Entity>> {
-        let entities = self.entities.read().await;
-        // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(&(id, collection_id.clone())) {
-            entity.upgrade()
-        } else {
-            None
-        }
-    }
-
     /// Retrieve a single entity by id
     pub(crate) async fn get_entity(
         &self,
         collection_id: &CollectionId,
         id: proto::ID,
         // cdata: &PA::ContextData,
-    ) -> Result<Arc<Entity>, RetrievalError> {
+    ) -> Result<Entity, RetrievalError> {
         info!("fetch_entity {:?}-{:?}", id, collection_id);
 
-        if let Some(local) = self.fetch_entity_from_node(id, collection_id).await {
-            return Ok(local);
+        if let Some(entity) = self.entities.get(&id) {
+            return Ok(entity);
         }
-        debug!("fetch_entity 2");
+        info!("fetch_entity 2");
 
         let collection = self.collection(collection_id).await;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                return self.assert_entity(collection_id, id, &entity_state).await;
+                info!("fetch_entity 3");
+                self.entities.assert(collection_id, id, &entity_state)
             }
             Err(RetrievalError::NotFound(id)) => {
-                // let scoped_entity = Entity::new(id, collection.to_string());
-                // let ref_entity = Arc::new(scoped_entity);
-                // Revisit this
-                let entity = self.assert_entity(collection_id, id, &proto::State::default()).await?;
-                Ok(entity)
+                info!("fetch_entity 4");
+                self.entities.assert(collection_id, id, &proto::State::default())
             }
             Err(e) => Err(e),
         }
@@ -640,7 +587,7 @@ where
         collection_id: &CollectionId,
         args: MatchArgs,
         cdata: &PA::ContextData,
-    ) -> Result<Vec<Arc<Entity>>, RetrievalError> {
+    ) -> Result<Vec<Entity>, RetrievalError> {
         if !self.durable {
             // Fetch from peers and commit first response
             match self.fetch_from_peer(&collection_id, &args.predicate, cdata).await {
@@ -662,7 +609,7 @@ where
         // Convert states to entities
         let mut entities = Vec::new();
         for (id, state) in states {
-            let entity = self.assert_entity(&collection_id, id, &state).await?;
+            let entity = self.entities.assert(&collection_id, id, &state)?;
             entities.push(entity);
         }
         Ok(entities)
@@ -674,7 +621,7 @@ where
         sub_id: proto::SubscriptionId,
         collection_id: &CollectionId,
         args: MatchArgs,
-        callback: Box<dyn Fn(ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
+        callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<SubscriptionHandle, RetrievalError> {
         let mut handle = SubscriptionHandle::new(Box::new(Node(self.clone())) as Box<dyn TNodeErased>, sub_id);
 
@@ -694,7 +641,7 @@ where
         let sub_id = handle.id.clone();
         spawn(async move {
             node.reactor.unsubscribe(sub_id);
-            node.request_remote_unsubscribe(sub_id, peers).await;
+            node.request_remote_unsubscribe(sub_id, peers).await.unwrap();
         });
         Ok(())
     }

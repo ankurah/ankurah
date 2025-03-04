@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
+    entity::Entity,
     error::MutationError,
-    model::Entity,
     property::{
         backend::YrsBackend,
         traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},
@@ -82,7 +82,7 @@ impl<'a, Projected> FromActiveType<YrsString<Projected>> for std::borrow::Cow<'a
 impl<Projected> InitializeWith<String> for YrsString<Projected> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &String) -> Self {
         let new_string = Self::from_entity(property_name, entity);
-        new_string.insert(0, value);
+        new_string.insert(0, value).unwrap();
         new_string
     }
 }
@@ -91,7 +91,7 @@ impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Option<String>) -> Self {
         let new_string = Self::from_entity(property_name, entity);
         if let Some(value) = value {
-            new_string.insert(0, value);
+            new_string.insert(0, value).unwrap();
         }
         new_string
     }

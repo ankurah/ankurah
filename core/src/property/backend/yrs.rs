@@ -16,7 +16,6 @@ use crate::{
         PropertyName,
     },
     storage::Materialized,
-    Node,
 };
 
 /// Stores one or more properties of an entity

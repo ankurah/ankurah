@@ -130,7 +130,9 @@ pub use ankurah_proto as proto;
 pub use proto::ID;
 // Re-export commonly used types
 pub use ankurah_core::{
-    changes, error,
+    changes,
+    entity::{self, Entity},
+    error,
     event::Event,
     model,
     model::Mutable,

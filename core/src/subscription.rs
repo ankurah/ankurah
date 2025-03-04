@@ -1,4 +1,4 @@
-use crate::{changes::ChangeSet, model::Entity, node::TNodeErased};
+use crate::{changes::ChangeSet, entity::Entity, node::TNodeErased};
 use ankurah_proto as proto;
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +14,7 @@ pub struct Subscription<R: Clone> {
     pub(crate) callback: Arc<Callback<R>>,
     // Track which entities currently match this subscription
     // TODO make this a ResultSet so we can clone it cheaply
-    pub(crate) matching_entities: Mutex<Vec<Arc<Entity>>>,
+    pub(crate) matching_entities: Mutex<Vec<Entity>>,
 }
 
 /// A handle to a subscription that can be used to register callbacks

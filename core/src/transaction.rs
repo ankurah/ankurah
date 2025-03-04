@@ -1,13 +1,12 @@
 use ankurah_proto as proto;
-use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::{
-    context::{Context, TContext},
+    context::TContext,
+    entity::Entity,
     error::{MutationError, RetrievalError},
-    model::{Entity, Mutable},
-    policy::PolicyAgent,
-    Model, Node,
+    model::Mutable,
+    Model,
 };
 
 use append_only_vec::AppendOnlyVec;
@@ -20,7 +19,7 @@ pub struct Transaction {
 
     pub(crate) dyncontext: Arc<dyn TContext>,
 
-    entities: AppendOnlyVec<Arc<Entity>>,
+    entities: AppendOnlyVec<Entity>,
 
     // markers
     implicit: bool,
@@ -34,8 +33,8 @@ impl Transaction {
     }
 
     /// Fetch an entity already in the transaction.
-    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
-        if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
+    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Entity, RetrievalError> {
+        if let Some(entity) = self.entities.iter().find(|entity| entity.id() == &id && entity.collection() == collection) {
             return Ok(entity);
         }
 
@@ -43,14 +42,14 @@ impl Transaction {
         Ok(self.add_entity(upstream.snapshot()))
     }
 
-    fn add_entity(&self, entity: Arc<Entity>) -> &Arc<Entity> {
+    fn add_entity(&self, entity: Entity) -> &Entity {
         let index = self.entities.push(entity);
         &self.entities[index]
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<M::Mutable<'rec>, MutationError> {
         let id = self.dyncontext.next_entity_id();
-        let new_entity = Arc::new(model.create_entity(id));
+        let new_entity = model.create_entity(id);
         self.dyncontext.check_write(&new_entity)?;
 
         let entity_ref = self.add_entity(new_entity);
@@ -77,7 +76,7 @@ impl Transaction {
         let mut entity_events = Vec::new();
         for entity in self.entities.iter() {
             if let Some(entity_event) = entity.commit()? {
-                if let Some(upstream) = &entity.upstream {
+                if let Some(upstream) = entity.upstream() {
                     upstream.apply_event(&entity_event)?;
                 } else {
                     self.dyncontext.insert_entity(entity.clone()).await?;

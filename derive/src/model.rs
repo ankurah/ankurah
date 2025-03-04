@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, ToTokens};
+use quote::{format_ident, quote};
 use syn::{parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DeriveInput, Fields, Type};
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
@@ -67,11 +67,11 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             fn collection() -> ankurah::derive_deps::ankurah_proto::CollectionId {
                 #name_str.into()
             }
-            fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::model::Entity {
+            fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::Entity {
                 use ankurah::property::InitializeWith;
 
                 let backends = ankurah::property::Backends::new();
-                let entity = ankurah::model::Entity::create(
+                let entity = ankurah::entity::Entity::create(
                     id,
                     Self::collection(),
                     backends
@@ -86,7 +86,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         #wasm_attributes
         #clone_derive
         pub struct #view_name {
-            entity: std::sync::Arc<::ankurah::model::Entity>,
+            entity: ::ankurah::entity::Entity,
             #(
                 #ephemeral_field_visibility #ephemeral_field_names: #ephemeral_field_types,
             )*
@@ -106,13 +106,13 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                 })
             }
 
-            fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
+            fn entity(&self) -> &::ankurah::entity::Entity {
                 &self.entity
             }
 
-            fn from_entity(entity: std::sync::Arc<::ankurah::model::Entity>) -> Self {
+            fn from_entity(entity: ::ankurah::Entity) -> Self {
                 use ::ankurah::model::View;
-                assert_eq!(Self::collection(), entity.collection);
+                assert_eq!(&Self::collection(), entity.collection());
                 #view_name {
                     entity,
                     #(
@@ -134,12 +134,12 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         #wasm_attributes
         impl #view_name {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
-                self.entity.id.clone()
+                self.entity.id().clone()
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                     use ankurah::property::{FromActiveType, FromEntity};
-                    let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), self.entity.as_ref());
+                    let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity);
                     #projected_field_types_turbofish::from_active(active_result)
                 }
             )*
@@ -152,7 +152,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         #[derive(Debug)]
         pub struct #mutable_name<'rec> {
-            entity: &'rec std::sync::Arc<::ankurah::model::Entity>,
+            entity: &'rec ::ankurah::Entity,
             #(#active_field_visibility #active_field_names: #active_field_types,)*
         }
 
@@ -160,16 +160,16 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
             type Model = #name;
             type View = #view_name;
 
-            fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
+            fn entity(&self) -> &::ankurah::Entity {
                 &self.entity
             }
 
-            fn new(entity: &'rec std::sync::Arc<::ankurah::model::Entity>) -> Self {
+            fn new(entity: &'rec ::ankurah::Entity) -> Self {
                 use ankurah::{
                     model::Mutable,
                     property::FromEntity,
                 };
-                assert_eq!(entity.collection(), Self::collection());
+                assert_eq!(entity.collection(), &Self::collection());
                 Self {
                     entity,
                     #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), entity), )*
@@ -179,7 +179,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
         impl<'rec> #mutable_name<'rec> {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
-                self.entity.id.clone()
+                self.entity.id().clone()
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> &#active_field_types {

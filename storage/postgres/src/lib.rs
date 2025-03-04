@@ -11,7 +11,7 @@ use ankurah_core::{
     },
     storage::{StorageCollection, StorageEngine},
 };
-use ankurah_proto::{Attested, State};
+use ankurah_proto::{Attestation, Attested, State};
 
 use futures_util::TryStreamExt;
 
@@ -81,7 +81,7 @@ impl PostgresBucket {
 
     pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
         let create_query = format!(
-            r#"CREATE TABLE IF NOT EXISTS "{}"("id" UUID UNIQUE, "entity_id" UUID, "operations" bytea, "parent" UUID[])"#,
+            r#"CREATE TABLE IF NOT EXISTS "{}"("id" UUID UNIQUE, "entity_id" UUID, "operations" bytea, "parent" UUID[], "attestations" bytea )"#,
             self.event_table()
         );
 
@@ -387,15 +387,18 @@ impl StorageCollection for PostgresBucket {
         let entity_id = uuid::Uuid::from(ulid::Ulid::from(entity_event.payload.entity_id));
         let operations = bincode::serialize(&entity_event.payload.operations)?;
         let parent_uuids: Vec<uuid::Uuid> = (&entity_event.payload.parent).into();
-
+        let attestations = bincode::serialize(&entity_event.attestations)?;
         // Does it even matter if this conflicts?
         // One peers event should match any duplicates, so taking the first
         // event we receive from a peer should be fine.
-        let query = format!(r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent") VALUES($1, $2, $3, $4)"#, self.event_table(),);
+        let query = format!(
+            r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent", "attestations") VALUES($1, $2, $3, $4, $5)"#,
+            self.event_table(),
+        );
 
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(Box::new(err)))?;
         info!("Running: {}", query);
-        let affected = match client.execute(&query, &[&event_id, &entity_id, &operations, &parent_uuids]).await {
+        let affected = match client.execute(&query, &[&event_id, &entity_id, &operations, &parent_uuids, &attestations]).await {
             Ok(affected) => affected,
             Err(err) => {
                 let kind = error_kind(&err);
@@ -417,7 +420,8 @@ impl StorageCollection for PostgresBucket {
     }
 
     async fn get_events(&self, entity_id: ID) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
-        let query = format!(r#"SELECT "id", "operations", "parent" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
+        let query =
+            format!(r#"SELECT "id", "operations", "parent", "attestations" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
 
         let entity_uuid = uuid::Uuid::from(ulid::Ulid::from(entity_id));
 
@@ -448,15 +452,20 @@ impl StorageCollection for PostgresBucket {
             let operations_binary: Vec<u8> = row.get("operations");
             let operations = bincode::deserialize(&operations_binary)?;
             let parent: Vec<uuid::Uuid> = row.get("parent");
+            let attestations_binary: Vec<u8> = row.get("attestations");
+            let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary)?;
             let parent = parent.into_iter().map(|uuid| ID::from_ulid(uuid.into())).collect::<BTreeSet<_>>();
             let clock = Clock::new(parent);
 
-            events.push(Event {
-                id: event_id,
-                collection: self.collection_id.clone(),
-                entity_id: entity_id,
-                operations: operations,
-                parent: clock,
+            events.push(Attested {
+                payload: Event {
+                    id: event_id,
+                    collection: self.collection_id.clone(),
+                    entity_id: entity_id,
+                    operations: operations,
+                    parent: clock,
+                },
+                attestations: attestations,
             })
         }
 

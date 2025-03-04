@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -11,6 +10,8 @@ use crate::error::DecodeError;
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
 #[wasm_bindgen]
 pub struct ID(Ulid);
+// TODO - get rid of ID in favor of EntityId and other discrete ID types
+
 impl ID {
     pub fn new() -> Self { ID(Ulid::new()) }
 

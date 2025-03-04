@@ -1,17 +1,16 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
-use crate::model::Entity;
-use crate::node::{MatchArgs, WeakNode};
+use crate::entity::Entity;
+use crate::node::MatchArgs;
 use crate::policy::PolicyAgent;
+use crate::registry::EntityRegistry;
 use crate::resultset::ResultSet;
 use crate::storage::StorageEngine;
-use crate::subscription::{Subscription, SubscriptionHandle};
+use crate::subscription::Subscription;
 use crate::value::Value;
-use crate::Node;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
 use dashmap::{DashMap, DashSet};
-use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::info;
@@ -27,7 +26,7 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<SE, PA> {
     /// Current subscriptions
-    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Arc<Entity>>>>,
+    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Entity>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: DashMap<(proto::CollectionId, FieldId), ComparisonIndex>,
     /// The set of watchers who want to be notified of any changes to a given collection
@@ -36,11 +35,9 @@ pub struct Reactor<SE, PA> {
     /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
     entity_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
-    /// Reference to the storage engine
     storage: Arc<SE>,
-    // Weak reference to the node
-    // node: OnceCell<WeakNode<PA>>,
-    policy_agent: PA,
+    entities: EntityRegistry,
+    _policy_agent: PA,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -54,29 +51,24 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(storage: Arc<SE>, policy_agent: PA) -> Arc<Self> {
+    pub fn new(storage: Arc<SE>, entities: EntityRegistry, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: DashMap::new(),
             index_watchers: DashMap::new(),
             wildcard_watchers: DashMap::new(),
             entity_watchers: DashMap::new(),
             storage,
-            policy_agent,
-            // node: OnceCell::new(),
+            entities,
+            _policy_agent: policy_agent,
         })
     }
-
-    // pub fn set_node(self: &Arc<Self>, node: WeakNode<PA>) { self.node.set(node); }
-    // pub fn node(&self) -> Node<PA> {
-    //     self.node.get().expect("set immediately after construction").upgrade().expect("reactor should not outlive node")
-    // }
 
     pub async fn subscribe(
         self: &Arc<Self>,
         sub_id: proto::SubscriptionId,
         collection_id: &proto::CollectionId,
         args: impl Into<MatchArgs>,
-        callback: impl Fn(ChangeSet<Arc<Entity>>) + Send + Sync + 'static,
+        callback: impl Fn(ChangeSet<Entity>) + Send + Sync + 'static,
     ) -> anyhow::Result<()> {
         let args = args.into();
         // Start watching the relevant indexes
@@ -89,15 +81,14 @@ where
 
         // Convert states to Entity and filter by predicate
         for (id, state) in states {
-            let entity = crate::model::Entity::from_state(id, collection_id.to_owned(), &state)?;
-            let entity = Arc::new(entity);
+            let entity = self.entities.assert(collection_id, id, &state)?;
 
             // Evaluate predicate for each entity
-            if ankql::selection::filter::evaluate_predicate(&*entity, &args.predicate).unwrap_or(false) {
+            if ankql::selection::filter::evaluate_predicate(&entity, &args.predicate).unwrap_or(false) {
                 matching_entities.push(entity.clone());
 
                 // Set up entity watchers
-                self.entity_watchers.entry(entity.id.clone()).or_default().push(sub_id);
+                self.entity_watchers.entry(entity.id().clone()).or_default().push(sub_id);
             }
         }
 
@@ -110,7 +101,7 @@ where
             matching_entities: std::sync::Mutex::new(matching_entities.clone()),
         });
 
-        // Store subscription
+        // TODO - is this a memory leak?
         self.subscriptions.insert(sub_id, subscription.clone());
 
         // Call callback with initial state
@@ -195,7 +186,7 @@ where
             // Remove from entity watchers using subscription's matching_entities
             let matching = sub.matching_entities.lock().unwrap();
             for entity in matching.iter() {
-                if let Some(mut watchers) = self.entity_watchers.get_mut(&entity.id.clone()) {
+                if let Some(mut watchers) = self.entity_watchers.get_mut(&entity.id().clone()) {
                     watchers.retain(|&id| id != sub_id);
                 }
             }
@@ -203,21 +194,21 @@ where
     }
 
     /// Update entity watchers when an entity's matching status changes
-    fn update_entity_watchers(&self, entity: &Arc<crate::model::Entity>, matching: bool, sub_id: proto::SubscriptionId) {
+    fn update_entity_watchers(&self, entity: &Entity, matching: bool, sub_id: proto::SubscriptionId) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
             let mut entities = subscription.matching_entities.lock().unwrap();
-            let mut watchers = self.entity_watchers.entry(entity.id.clone()).or_default();
+            let mut watchers = self.entity_watchers.entry(entity.id().clone()).or_default();
 
             // TODO - we can't just use the matching flag, because we need to know if the entity was in the set before
             // or after calling notify_change
-            let did_match = entities.iter().any(|r| r.id == entity.id);
+            let did_match = entities.iter().any(|e| e.id() == entity.id());
             match (did_match, matching) {
                 (false, true) => {
                     entities.push(entity.clone());
                     watchers.push(sub_id);
                 }
                 (true, false) => {
-                    entities.retain(|r| r.id != entity.id);
+                    entities.retain(|r| r.id() != entity.id());
                     watchers.retain(|&id| id != sub_id);
                 }
                 _ => {} // No change needed
@@ -230,8 +221,7 @@ where
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
         info!("notify_change notified");
         // Group changes by subscription
-        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Arc<Entity>>>> =
-            std::collections::HashMap::new();
+        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Entity>>> = std::collections::HashMap::new();
 
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
@@ -241,8 +231,12 @@ where
             for index_ref in self.index_watchers.iter() {
                 // Get the field value from the entity
                 let (collection_id, field_id) = index_ref.key();
-                if collection_id == &(change.entity.collection) {
+                info!("collection_id: {:?} field_id: {:?}", collection_id, field_id);
+                if collection_id == change.entity.collection() {
+                    info!("collection_id matches, checking field_id {:?}", field_id);
                     if let Some(field_value) = change.entity.value(&field_id.0) {
+                        // info!("index_ref: {:?}", index_ref);
+                        info!("field_value: {:?}", field_value);
                         possibly_interested_subs.extend(index_ref.find_matching(Value::String(field_value)));
                     }
                 }
@@ -250,14 +244,14 @@ where
 
             info!("wildcard watchers: {:?}", self.wildcard_watchers);
             // Also check wildcard watchers for this collection
-            if let Some(watchers) = self.wildcard_watchers.get(&change.entity.collection) {
+            if let Some(watchers) = self.wildcard_watchers.get(&change.entity.collection()) {
                 for watcher in watchers.iter() {
                     possibly_interested_subs.insert(watcher.key().clone());
                 }
             }
 
             // Check entity watchers
-            if let Some(watchers) = self.entity_watchers.get(&change.entity.id) {
+            if let Some(watchers) = self.entity_watchers.get(&change.entity.id()) {
                 for watcher in watchers.iter() {
                     possibly_interested_subs.insert(watcher.clone());
                 }
@@ -270,17 +264,17 @@ where
                     let entity = &change.entity;
                     // Use evaluate_predicate directly on the entity instead of fetch_entities
                     info!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
-                    let matches = ankql::selection::filter::evaluate_predicate(&**entity, &subscription.predicate).unwrap_or(false);
+                    let matches = ankql::selection::filter::evaluate_predicate(entity, &subscription.predicate).unwrap_or(false);
 
-                    let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id == entity.id);
+                    let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id() == entity.id());
                     use ankql::selection::filter::Filterable;
-                    info!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id, entity.value("status"));
+                    info!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id(), entity.value("status"));
 
                     // Update entity watchers and notify subscription if needed
                     self.update_entity_watchers(entity, matches, sub_id);
 
                     // Determine the change type
-                    let new_change: Option<ItemChange<Arc<Entity>>> = if matches != did_match {
+                    let new_change: Option<ItemChange<Entity>> = if matches != did_match {
                         // Matching status changed
                         Some(if matches {
                             ItemChange::Add { item: entity.clone(), events: change.events.clone() }

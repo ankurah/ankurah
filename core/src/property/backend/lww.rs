@@ -12,7 +12,6 @@ use ankurah_proto::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    context::{Context, TContext},
     error::{MutationError, StateError},
     property::{backend::PropertyBackend, traits::compare_clocks, PropertyName},
     storage::Materialized,

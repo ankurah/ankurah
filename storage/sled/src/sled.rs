@@ -1,4 +1,4 @@
-use ankurah_proto::{CollectionId, Event, State, ID};
+use ankurah_proto::{Attested, CollectionId, Event, State, ID};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ankurah_core::{
+    entity::Entity,
     error::{MutationError, RetrievalError},
-    model::Entity,
     storage::{StorageCollection, StorageEngine},
 };
 
@@ -147,7 +147,7 @@ impl StorageCollection for SledStorageCollection {
         .map_err(RetrievalError::future_join)?
     }
 
-    async fn add_event(&self, entity_event: &Event) -> Result<bool, MutationError> {
+    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
         // Maybe it is worthwhile for us to separate the events table into
         // `collection-entityid` names until we have indices?
         let events = self.events.clone();
@@ -155,7 +155,7 @@ impl StorageCollection for SledStorageCollection {
         // TODO: Shorten `Event` struct to not include `id`/`collection`
         // since we can infer that based on key/tree respectively
         let binary_state = bincode::serialize(entity_event)?;
-        let id_bytes = entity_event.id.to_bytes();
+        let id_bytes = entity_event.payload.id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
@@ -170,14 +170,14 @@ impl StorageCollection for SledStorageCollection {
         .map_err(|e| MutationError::General(Box::new(e)))?
     }
 
-    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> {
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
         let mut matching_events = Vec::new();
 
         // full events table scan searching for matching entity ids
         for event_data in self.events.iter() {
             let (_key, data) = event_data.map_err(|err| SledRetrievalError::StorageError(err))?;
-            let event: Event = bincode::deserialize(&data)?;
-            if entity_id == event.entity_id {
+            let event: Attested<Event> = bincode::deserialize(&data)?;
+            if entity_id == event.payload.entity_id {
                 matching_events.push(event);
             }
         }

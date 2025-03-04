@@ -84,20 +84,20 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Update Rex's age to 7 on node1
     {
-        let trx = server.begin();
-        rex.edit(&trx).await?.age().overwrite(0, 1, "7");
+        let trx: ankurah::transaction::Transaction = server.begin();
+        rex.edit(&trx).await?.age().overwrite(0, 1, "7")?;
         trx.commit().await?;
     }
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Update)]]); // Rex still matches the predicate, but the age has changed
     assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Update)]]);
+    assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Update)]]); // Rex still matches the predicate, but the age has changed
 
     // short circuit to simplify debugging
     // Update Snuffy's age to 3 on node1
     {
         let trx = server.begin();
-        snuffy.edit(&trx).await?.age().overwrite(0, 1, "3");
+        snuffy.edit(&trx).await?.age().overwrite(0, 1, "3")?;
         trx.commit().await?;
     }
 
