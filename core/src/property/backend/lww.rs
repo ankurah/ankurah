@@ -93,10 +93,7 @@ impl PropertyBackend for LWWBackend {
 
     fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
         let property_values = self.property_values();
-        let serialized_diff = bincode::serialize(&LWWDiff {
-            version: LWW_DIFF_VERSION,
-            data: bincode::serialize(&property_values)?,
-        })?;
+        let serialized_diff = bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&property_values)? })?;
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
