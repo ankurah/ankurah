@@ -40,18 +40,6 @@ impl Display for PropertyValue {
 pub trait Property: Sized {
     fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError>;
     fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError>;
-
-    /*
-    fn from_option(option: Option<PropertyValue>) -> Result<Self, PropertyError> {
-        match option {
-            Some(value) => Self::from_value(value),
-            None => Err(PropertyError::Missing),
-        }
-    }
-    fn from_result(result: Result<Option<PropertyValue>, PropertyError>) -> Result<Self, PropertyError> {
-        Self::from_option(result?)
-    }
-    */
 }
 
 impl<T> Property for Option<T>
@@ -91,3 +79,15 @@ into!(String => String);
 into!(i16 => I16);
 into!(i32 => I32);
 into!(i64 => I64);
+
+impl<'a> Property for std::borrow::Cow<'a, str> {
+    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_string()))) }
+
+    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
+        match value {
+            Some(PropertyValue::String(value)) => Ok(value.into()),
+            Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
+            None => Err(PropertyError::Missing),
+        }
+    }
+}

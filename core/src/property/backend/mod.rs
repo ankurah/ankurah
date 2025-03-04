@@ -23,15 +23,6 @@ use super::{PropertyName, PropertyValue};
 
 pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
-    fn downcasted(self: Arc<Self>, name: &str) -> BackendDowncasted {
-        let upcasted = self.as_arc_dyn_any();
-        match name {
-            "yrs" => BackendDowncasted::Yrs(upcasted.downcast::<YrsBackend>().unwrap()),
-            "lww" => BackendDowncasted::LWW(upcasted.downcast::<LWWBackend>().unwrap()),
-            //"pn" => BackendDowncasted::PN(upcasted.downcast::<PNBackend>().unwrap()),
-            _ => BackendDowncasted::Unknown(upcasted),
-        }
-    }
     fn as_debug(&self) -> &dyn Debug;
     fn fork(&self) -> Box<dyn PropertyBackend>;
 
@@ -61,13 +52,6 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
         event_precursors: &Clock,
         // context: &Box<dyn TContext>,
     ) -> anyhow::Result<()>;
-}
-
-pub enum BackendDowncasted {
-    Yrs(Arc<YrsBackend>),
-    LWW(Arc<LWWBackend>),
-    //PN(Arc<PNBackend>),
-    Unknown(Arc<dyn Any>),
 }
 
 // impl Event {
@@ -150,11 +134,6 @@ impl Backends {
         Ok(upcasted.downcast::<P>().unwrap())
     }
 
-    pub fn get_with_name(&self, backend_name: String) -> Result<BackendDowncasted, RetrievalError> {
-        let backend = self.get_raw(backend_name.clone())?;
-        Ok(backend.downcasted(&backend_name))
-    }
-
     pub fn get_raw(&self, backend_name: String) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
         let mut backends = self.backends_lock();
         if let Some(backend) = backends.get(&backend_name) {
@@ -164,11 +143,6 @@ impl Backends {
             backends.insert(backend_name, backend.clone());
             Ok(backend)
         }
-    }
-
-    pub fn downcasted(&self) -> Vec<BackendDowncasted> {
-        let backends = self.backends_lock();
-        backends.iter().map(|(name, backend)| backend.clone().downcasted(name)).collect()
     }
 
     /// Fork the data behind the backends.
