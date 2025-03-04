@@ -20,6 +20,12 @@ pub struct LWWBackend {
     values: Arc<RwLock<BTreeMap<PropertyName, Option<PropertyValue>>>>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct LWWDiff {
+    version: u8,
+    data: Vec<u8>,
+}
+
 impl Default for LWWBackend {
     fn default() -> Self { Self::new() }
 }
@@ -75,7 +81,7 @@ impl PropertyBackend for LWWBackend {
     // This is identical to [`to_operations`] for [`LWWBackend`].
     fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
         let property_values = self.property_values();
-        let state_buffer = bincode::serialize(&(LWW_DIFF_VERSION, &property_values))?;
+        let state_buffer = bincode::serialize(&property_values)?;
         Ok(state_buffer)
     }
 
@@ -87,7 +93,10 @@ impl PropertyBackend for LWWBackend {
 
     fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
         let property_values = self.property_values();
-        let serialized_diff = bincode::serialize(&(LWW_DIFF_VERSION, &property_values))?;
+        let serialized_diff = bincode::serialize(&LWWDiff {
+            version: LWW_DIFF_VERSION,
+            data: bincode::serialize(&property_values)?,
+        })?;
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
@@ -104,7 +113,7 @@ impl PropertyBackend for LWWBackend {
         // This'll probably require looking at the events table.
         if compare_clocks(&current_head, &event_head /*, context*/) == ClockOrdering::Child {
             for operation in operations {
-                let (version, data): (u8, Vec<u8>) = bincode::deserialize(&operation.diff)?;
+                let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
                 match version {
                     1 => {
                         let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&data)?;

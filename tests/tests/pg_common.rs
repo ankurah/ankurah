@@ -12,8 +12,8 @@ pub async fn create_postgres_container() -> Result<(ContainerAsync<postgres::Pos
         .with_user("postgres")
         .with_password("postgres")
         .with_init_sql(include_str!("pg_init.sql").to_string().into_bytes())
-        .with_container_name("ankurah_pg")
         // if you want to inspect the container
+        //.with_container_name("ankurah_pg")
         //.with_reuse(testcontainers::ReuseDirective::Always)
         .start()
         .await
