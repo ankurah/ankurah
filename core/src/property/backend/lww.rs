@@ -106,9 +106,10 @@ impl PropertyBackend for LWWBackend {
         // This'll probably require looking at the events table.
         if compare_clocks(&current_head, &event_head /*, context*/) == ClockOrdering::Child {
             for operation in operations {
-                let (version, map): (u8, BTreeMap<PropertyName, Option<PropertyValue>>) = bincode::deserialize(&operation.diff)?;
+                let (version, data): (u8, Vec<u8>) = bincode::deserialize(&operation.diff)?;
                 match version {
                     1 => {
+                        let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&data)?;
                         for (property_name, new_value) in map {
                             values.insert(property_name, new_value);
                         }
