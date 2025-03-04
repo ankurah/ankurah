@@ -82,6 +82,7 @@ async fn server_edits_subscription() -> Result<()> {
     // Initial state should include Rex
     assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Initial)]]);
 
+    println!("MARK 1\n\n\n");
     // Update Rex's age to 7 on node1
     {
         let trx: ankurah::transaction::Transaction = server.begin();
@@ -93,7 +94,7 @@ async fn server_edits_subscription() -> Result<()> {
     assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Update)]]);
     assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Update)]]); // Rex still matches the predicate, but the age has changed
 
-    // short circuit to simplify debugging
+    println!("MARK 2\n\n\n");
     // Update Snuffy's age to 3 on node1
     {
         let trx = server.begin();
@@ -103,6 +104,10 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Sleep for a bit to ensure the change is propagated
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // LEFT OFF HERE - determine how this ever worked. simply adding the edit event should not be enough to project the current state of snuffy for the client
+    // because the client never received the state of snuffy in the first place, and thus the edit event doesn't refer to any state that the client has.
+    // AHA! It's the change to only send committed events to durable nodes.
 
     // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
     assert_eq!(check_server(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);

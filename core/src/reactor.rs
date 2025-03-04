@@ -263,12 +263,12 @@ where
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
                     let entity = &change.entity;
                     // Use evaluate_predicate directly on the entity instead of fetch_entities
-                    info!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
+                    // info!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
                     let matches = ankql::selection::filter::evaluate_predicate(entity, &subscription.predicate).unwrap_or(false);
 
                     let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id() == entity.id());
                     use ankql::selection::filter::Filterable;
-                    info!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id(), entity.value("status"));
+                    // info!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id(), entity.value("status"));
 
                     // Update entity watchers and notify subscription if needed
                     self.update_entity_watchers(entity, matches, sub_id);

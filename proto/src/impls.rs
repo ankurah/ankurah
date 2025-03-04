@@ -98,7 +98,7 @@ impl std::fmt::Display for Request {
 
 impl std::fmt::Display for Update {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Notification {} from {}->{}: {}", self.id, self.from, self.to, self.body)
+        write!(f, "Update {} from {}->{}: {}", self.id, self.from, self.to, self.body)
     }
 }
 

@@ -122,12 +122,12 @@ impl Entity {
             self.0.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent /* , context*/)?;
         }
         // TODO figure out how to test this
-        info!("Apply event {}", event);
+        // info!("Apply event {}", event);
 
         *self.0.head.lock().unwrap() = head.clone();
         // Hack
         *self.0.backends.head.lock().unwrap() = head;
-        info!("Apply event MARK 2 new head {}", self.0.head.lock().unwrap());
+        // info!("Apply event MARK 2 new head {}", self.0.head.lock().unwrap());
 
         Ok(())
     }

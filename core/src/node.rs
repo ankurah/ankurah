@@ -191,7 +191,7 @@ where
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
-    pub async fn notify(&self, node_id: proto::NodeId, notification: proto::UpdateBody) -> Result<(), RequestError> {
+    pub async fn send_update(&self, node_id: proto::NodeId, notification: proto::UpdateBody) -> Result<(), RequestError> {
         // same as request, minus cdata and the sign_request step
 
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::ResponseBody, RequestError>>();
@@ -224,7 +224,7 @@ where
     pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
             proto::NodeMessage::Update(update) => {
-                info!("Node {} received notification {}", self.id, update);
+                info!("Node {} received update {}", self.id, update);
 
                 if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
                     let _from = update.from.clone();
@@ -320,6 +320,7 @@ where
 
         match notification.body {
             proto::UpdateBody::SubscriptionUpdate { subscription_id: _, events } => {
+                // TODO check if this is a valid subscription
                 info!("Node {} received subscription update for {} events", self.id, events.len());
                 self.apply_events_from_peer(&notification.from, events).await?;
                 Ok(())
@@ -359,9 +360,15 @@ where
         }
 
         // If we're not a durable node, send the transaction to a durable peer and wait for confirmation
-        if !self.durable {
-            let peer_id: proto::NodeId = self.get_durable_peers().pop().ok_or(MutationError::NoDurablePeers)?;
-            match self.request(peer_id.clone(), cdata, proto::RequestBody::CommitTransaction { id: id.clone(), events }).await {
+        // if !self.durable {
+        // let peer_id: proto::NodeId = self.get_durable_peers().pop().ok_or(MutationError::NoDurablePeers)?;
+        // HACK - sendding all events to all peers is wrong, but we were doing it before, and I'm reproducing that behavior here temporarily.
+        // TODO - these need to race each other, and run concurrently.
+        for peer_id in self.get_durable_peers() {
+            match self
+                .request(peer_id.clone(), cdata, proto::RequestBody::CommitTransaction { id: id.clone(), events: events.clone() })
+                .await
+            {
                 Ok(proto::ResponseBody::CommitComplete) => {
                     info!("Peer {} confirmed commit", peer_id)
                 }
@@ -405,6 +412,7 @@ where
                     let collection = self.collection(&event.payload.collection).await;
                     let state = entity.to_state()?;
                     collection.add_event(&event).await?;
+                    info!("Node {} set_state for entity {} in collection {}", self.id, event.payload.entity_id, event.payload.collection);
                     let changed = collection.set_state(event.payload.entity_id, &state).await?;
                     if changed {
                         changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });
@@ -471,7 +479,9 @@ where
         // QUESTION: Should we fire and forget these? or do error handling?
 
         futures::future::join_all(
-            peers.iter().map(|peer_id| self.notify(peer_id.clone(), proto::UpdateBody::Unsubscribe { subscription_id: sub_id.clone() })),
+            peers
+                .iter()
+                .map(|peer_id| self.send_update(peer_id.clone(), proto::UpdateBody::Unsubscribe { subscription_id: sub_id.clone() })),
         )
         .await
         .into_iter()
@@ -518,7 +528,7 @@ where
                         let peer_id = peer_id.clone();
                         tokio::spawn(async move {
                             let _ = node
-                                .notify(peer_id, proto::UpdateBody::SubscriptionUpdate { subscription_id: sub_id.clone(), events })
+                                .send_update(peer_id, proto::UpdateBody::SubscriptionUpdate { subscription_id: sub_id.clone(), events })
                                 .await;
                         });
                     }
@@ -689,6 +699,7 @@ where
 
     /// Get all durable peer node IDs
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
+    pub fn get_peers(&self) -> Vec<proto::NodeId> { self.peer_connections.iter().map(|e| e.key().clone()).collect() }
 }
 
 impl<SE, PA> Drop for NodeInner<SE, PA> {
