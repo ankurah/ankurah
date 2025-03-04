@@ -112,11 +112,6 @@ impl PropertyBackend for PNBackend {
 
         Ok(())
     }
-
-    fn get_property_value_string(&self, property_name: &str) -> Option<String> {
-        //self.values.read().unwrap().get(property_name).map(|v| v.value.to_string())
-        unimplemented!()
-    }
 }
 
 

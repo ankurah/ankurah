@@ -5,10 +5,7 @@ use std::{
 
 use ankurah_core::{
     error::RetrievalError,
-    property::{
-        backend::{BackendDowncasted, PropertyBackend},
-        Backends, PropertyName, PropertyValue,
-    },
+    property::Backends,
     storage::{StorageCollection, StorageEngine},
 };
 use ankurah_proto::State;
@@ -175,8 +172,6 @@ impl PostgresBucket {
     }
 }
 
-pub struct PostgresSetState {}
-
 #[async_trait]
 impl StorageCollection for PostgresBucket {
     async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
@@ -200,16 +195,12 @@ impl StorageCollection for PostgresBucket {
         params.push(&state_buffers);
         params.push(&head_uuids);
 
-        self.rebuild_columns_cache(&mut client).await?;
-        info!("existing columns: {:?}", self.existing_columns());
         let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
         for (column, value) in backends.property_values() {
             let pg_value: Option<PGValue> = value.map(|value| value.into());
             if !self.has_column(&column) {
-                info!("doesn't have column: {:?}", column);
                 // We don't have the column yet and we know the type.
                 if let Some(ref pg_value) = pg_value {
-                    info!("adding missing column: {:?}", column);
                     self.add_missing_columns(&mut client, vec![(column.clone(), pg_value.postgres_type())]).await?;
                 } else {
                     // The column doesn't exist yet and we don't have a value.
@@ -247,8 +238,6 @@ impl StorageCollection for PostgresBucket {
             .collect::<Vec<String>>()
             .join(", ");
 
-        info!("columns: {:?}", columns);
-
         // be careful with sql injection via bucket name
         let query = format!(
             r#"WITH old_state AS (
@@ -275,22 +264,6 @@ impl StorageCollection for PostgresBucket {
                             return self.set_state(id, state).await; // retry
                         }
                     }
-                    /*
-                    ErrorKind::UndefinedColumn { table, column } => {
-                        // TODO: We should check the definition of this and add all
-                        // needed columns rather than recursively doing it.
-                        if table == Some(self.state_table()) {
-                            let index = materialized.iter().find(|(name, param)| **name == column).map(|(index, _)| index);
-                            if let Some(index) = index {
-                                info!("column '{}' not found in materialized, adding it", column);
-                                self.add_missing_columns(&mut client, vec![(column, param.postgres_type())]).await?;
-                                return self.set_state(id, state).await; // retry
-                            } else {
-                                error!("column '{}' not found in materialized", column);
-                            }
-                        }
-                    }
-                    */
                     _ => {}
                 }
 
