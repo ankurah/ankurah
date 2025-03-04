@@ -13,6 +13,8 @@ use crate::{
     property::{backend::PropertyBackend, traits::compare_clocks, PropertyError, PropertyName, PropertyValue},
 };
 
+const LWW_DIFF_VERSION: u8 = 1;
+
 #[derive(Clone, Debug)]
 pub struct LWWBackend {
     values: Arc<RwLock<BTreeMap<PropertyName, Option<PropertyValue>>>>,
@@ -75,7 +77,7 @@ impl PropertyBackend for LWWBackend {
     // This is identical to [`to_operations`] for [`LWWBackend`].
     fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
         let property_values = self.property_values();
-        let state_buffer = bincode::serialize(&property_values)?;
+        let state_buffer = bincode::serialize(&(LWW_DIFF_VERSION, &property_values))?;
         Ok(state_buffer)
     }
 
@@ -87,7 +89,7 @@ impl PropertyBackend for LWWBackend {
 
     fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
         let property_values = self.property_values();
-        let serialized_diff = bincode::serialize(&property_values)?;
+        let serialized_diff = bincode::serialize(&(LWW_DIFF_VERSION, &property_values))?;
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
@@ -104,9 +106,14 @@ impl PropertyBackend for LWWBackend {
         // This'll probably require looking at the events table.
         if compare_clocks(&current_head, &event_head /*, context*/) == ClockOrdering::Child {
             for operation in operations {
-                let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&operation.diff)?;
-                for (property_name, new_value) in map {
-                    values.insert(property_name, new_value);
+                let (version, map): (u8, BTreeMap<PropertyName, Option<PropertyValue>>) = bincode::deserialize(&operation.diff)?;
+                match version {
+                    1 => {
+                        for (property_name, new_value) in map {
+                            values.insert(property_name, new_value);
+                        }
+                    }
+                    version => return Err(anyhow::anyhow!("Unknown LWW operation version: {:?}", version)),
                 }
             }
         }
