@@ -6,7 +6,8 @@ use std::{
 use ankurah_core::{
     error::RetrievalError,
     property::{
-        backend::{BackendDowncasted, PropertyBackend}, Backends, PropertyName, PropertyValue
+        backend::{BackendDowncasted, PropertyBackend},
+        Backends, PropertyName, PropertyValue,
     },
     storage::{StorageCollection, StorageEngine},
 };
@@ -57,12 +58,8 @@ impl StorageEngine for Postgres {
             return Err(RetrievalError::InvalidBucketName);
         }
 
-        let bucket = PostgresBucket {
-            pool: self.pool.clone(),
-            collection_id: collection_id.clone(),
-            columns: Arc::new(RwLock::new(Vec::new()))
-        };
-
+        let bucket =
+            PostgresBucket { pool: self.pool.clone(), collection_id: collection_id.clone(), columns: Arc::new(RwLock::new(Vec::new())) };
 
         // Try to create the table if it doesn't exist
         let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
@@ -129,9 +126,7 @@ impl PostgresBucket {
         columns.iter().find(|column| column.name == *column_name).cloned()
     }
 
-    pub fn has_column(&self, column_name: &String) -> bool {
-        self.column(column_name).is_some()
-    }
+    pub fn has_column(&self, column_name: &String) -> bool { self.column(column_name).is_some() }
 
     pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
         let create_query = format!(
@@ -180,9 +175,7 @@ impl PostgresBucket {
     }
 }
 
-pub struct PostgresSetState {
-    
-}
+pub struct PostgresSetState {}
 
 #[async_trait]
 impl StorageCollection for PostgresBucket {
@@ -239,7 +232,7 @@ impl StorageCollection for PostgresBucket {
                     PGValue::Integer(number) => params.push(number),
                     PGValue::BigInt(number) => params.push(number),
                     PGValue::Bytea(bytes) => params.push(bytes),
-                }
+                },
                 None => params.push(&None::<i32>),
             }
         }

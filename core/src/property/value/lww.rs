@@ -6,7 +6,9 @@ use tracing::warn;
 use crate::{
     model::Entity,
     property::{
-        backend::LWWBackend, traits::{FromActiveType, FromEntity, PropertyError}, InitializeWith, Property, PropertyName, PropertyValue
+        backend::LWWBackend,
+        traits::{FromActiveType, FromEntity, PropertyError},
+        InitializeWith, Property, PropertyName, PropertyValue,
     },
 };
 
@@ -35,9 +37,7 @@ impl<T: Property> LWW<T> {
         T::from_value(value)
     }
 
-    pub fn get_value(&self) -> Option<PropertyValue> {
-        self.backend.get(&self.property_name)
-    }
+    pub fn get_value(&self) -> Option<PropertyValue> { self.backend.get(&self.property_name) }
 }
 
 impl<T: Property> FromEntity for LWW<T> {

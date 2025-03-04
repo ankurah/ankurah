@@ -55,8 +55,7 @@ pub trait Property: Sized {
 }
 
 impl<T> Property for Option<T>
-where 
-    T: Property,
+where T: Property
 {
     fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> {
         match self {
@@ -76,9 +75,7 @@ where
 macro_rules! into {
     ($ty:ty => $variant:ident) => {
         impl Property for $ty {
-            fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> {
-                Ok(Some(PropertyValue::$variant(self.clone())))
-            }
+            fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::$variant(self.clone()))) }
             fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
                 match value {
                     Some(PropertyValue::$variant(value)) => Ok(value),

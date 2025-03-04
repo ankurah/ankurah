@@ -172,20 +172,17 @@ impl Filterable for Entity {
         } else {
             // Iterate through backends to find one that has this property
             let backends = self.backends.backends.lock().unwrap();
-            backends.values()
-                .find_map(|backend| 
-                    match backend.property_value(&name.to_owned()) {
-                        Some(value) => match value {
-                            PropertyValue::String(s) => Some(s),
-                            PropertyValue::I16(i) => Some(i.to_string()),
-                            PropertyValue::I32(i) => Some(i.to_string()),
-                            PropertyValue::I64(i) => Some(i.to_string()),
-                            PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                            PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                        },
-                        None => None,
-                    }
-                )
+            backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
+                Some(value) => match value {
+                    PropertyValue::String(s) => Some(s),
+                    PropertyValue::I16(i) => Some(i.to_string()),
+                    PropertyValue::I32(i) => Some(i.to_string()),
+                    PropertyValue::I64(i) => Some(i.to_string()),
+                    PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                },
+                None => None,
+            })
         }
     }
 }

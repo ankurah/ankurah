@@ -90,7 +90,7 @@ impl PropertyBackend for YrsBackend {
         let root_refs = trx.root_refs();
         root_refs.map(|(name, _)| name.to_owned()).collect()
     }
-    
+
     fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
         let trx = Transact::transact(&self.doc);
         self.get_property_string(&trx, property_name)

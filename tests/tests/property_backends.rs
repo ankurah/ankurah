@@ -31,14 +31,12 @@ impl Property for Visibility {
 
     fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
         match value {
-            Some(PropertyValue::String(variant_str)) => {
-                match &*variant_str {
-                    "public" => Ok(Visibility::Public),
-                    "private" => Ok(Visibility::Private),
-                    "unlisted" => Ok(Visibility::Unlisted),
-                    value => Err(PropertyError::InvalidValue { value: value.to_owned(), ty: "Visibility".to_owned() }),
-                }
-            }
+            Some(PropertyValue::String(variant_str)) => match &*variant_str {
+                "public" => Ok(Visibility::Public),
+                "private" => Ok(Visibility::Private),
+                "unlisted" => Ok(Visibility::Unlisted),
+                value => Err(PropertyError::InvalidValue { value: value.to_owned(), ty: "Visibility".to_owned() }),
+            },
             Some(other) => Err(PropertyError::InvalidVariant { given: other, ty: "Visibility".to_owned() }),
             None => Err(PropertyError::Missing),
         }
