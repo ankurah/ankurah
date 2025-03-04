@@ -98,17 +98,16 @@ impl PostgresBucket {
         let schema = "ankurah";
 
         let column_query = format!(
-            r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2;"#,
+            r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_catalog = $1 AND table_name = $2;"#,
         );
         let mut new_columns = Vec::new();
         info!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &schema, &self.collection_id.as_str());
         let rows = client.query(&column_query, &[&schema, &self.collection_id.as_str()]).await?;
         for row in rows {
-            let name: String = row.get("column_name");
-            info!("found column: {:?}", name);
+            let is_nullable: String = row.get("is_nullable");
             new_columns.push(PostgresColumn {
                 name: row.get("column_name"),
-                is_nullable: row.get("is_nullable"),
+                is_nullable: is_nullable.eq("YES"),
                 data_type: row.get("data_type"),
             })
         }
