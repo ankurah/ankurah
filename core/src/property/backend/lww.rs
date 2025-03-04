@@ -63,9 +63,7 @@ impl PropertyBackend for LWWBackend {
         values.keys().cloned().collect::<Vec<PropertyName>>()
     }
 
-    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
-        self.get(property_name)
-    }
+    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> { self.get(property_name) }
 
     fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
         let values = self.values.read().unwrap();
