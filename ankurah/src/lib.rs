@@ -137,7 +137,7 @@ pub use ankurah_core::{
     model::View,
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
-    property,
+    property::{self, Property},
     resultset::ResultSet,
     storage,
     subscription::SubscriptionHandle,

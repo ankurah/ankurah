@@ -1,8 +1,8 @@
 mod common;
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
-    property::{value::LWW, Property, PropertyError, PropertyValue, YrsString},
-    Model, Mutable, Node, PermissiveAgent,
+    property::{value::LWW, PropertyError, PropertyValue, YrsString},
+    Model, Mutable, Node, PermissiveAgent, Property,
 };
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -11,36 +11,12 @@ use common::{Album, AlbumView};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Property, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[wasm_bindgen]
 pub enum Visibility {
     Public,
     Unlisted,
     Private,
-}
-
-impl Property for Visibility {
-    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> {
-        let tag = match self {
-            Visibility::Public => "public",
-            Visibility::Private => "private",
-            Visibility::Unlisted => "unlisted",
-        };
-        Ok(Some(PropertyValue::String(tag.to_owned())))
-    }
-
-    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
-        match value {
-            Some(PropertyValue::String(variant_str)) => match &*variant_str {
-                "public" => Ok(Visibility::Public),
-                "private" => Ok(Visibility::Private),
-                "unlisted" => Ok(Visibility::Unlisted),
-                value => Err(PropertyError::InvalidValue { value: value.to_owned(), ty: "Visibility".to_owned() }),
-            },
-            Some(other) => Err(PropertyError::InvalidVariant { given: other, ty: "Visibility".to_owned() }),
-            None => Err(PropertyError::Missing),
-        }
-    }
 }
 
 #[derive(Model, Debug, Serialize, Deserialize)]
