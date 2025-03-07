@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::BTreeMap,
+    collections::{btree_map::Entry, BTreeMap},
     fmt::Debug,
     ops::DerefMut,
     sync::{Arc, RwLock},
@@ -41,8 +41,10 @@ impl PNBackend {
     }
 
     pub fn add_raw(mut values: impl DerefMut<Target = BTreeMap<PropertyName, PNValue>>, property_name: PropertyName, amount: PNValue) {
-        let value = values.deref_mut().entry(property_name).or_default();
-        value.value += amount;
+        match values.deref_mut().entry(property_name) {
+            Entry::Vacant(vacant_entry) => vacant_entry.insert(amount),
+            Entry::Occupied(occupied_entry) => occupied_entry.get_mut() + amount,
+        }
     }
 }
 
@@ -62,11 +64,12 @@ impl PropertyBackend for PNBackend {
         values.keys().cloned().collect::<Vec<String>>()
     }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+    fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
         let values = self.values.read().unwrap();
         let mut map = BTreeMap::new();
         for (property, data) in values.iter() {
-            map.insert(property.clone(), PropertyValue::Number(data.value));
+            let value: PropertyValue = data.into();
+            map.insert(property.clone(), Some(value));
         }
 
         map
@@ -189,9 +192,11 @@ macro_rules! pn_value {
     };
 }
 
-pn_value!(
+/*pn_value!(
     i8  => I8,  u8  => U8,
     i16 => I16, u16 => U16,
     i32 => I32, u32 => U32,
     i64 => I64, u64 => U64
-);
+);*/
+
+pn_value!(i16 => I16, i32 => I32, i64 => I64);

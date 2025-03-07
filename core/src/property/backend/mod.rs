@@ -11,12 +11,12 @@ use std::{
 use crate::context::{Context, TContext};
 
 pub mod lww;
-//pub mod pn_counter;
+pub mod pn_counter;
 pub mod yrs;
 use crate::error::RetrievalError;
 use crate::Node;
 pub use lww::LWWBackend;
-//pub use pn_counter::PNBackend;
+pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
 
 use super::{PropertyName, PropertyValue};
