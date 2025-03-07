@@ -12,6 +12,6 @@ where
 
 #[cfg(target_arch = "wasm32")]
 pub fn spawn<F>(future: F)
-where F: Future + Send + 'static {
+where F: Future<Output = ()> + Send + 'static {
     wasm_bindgen_futures::spawn_local(future);
 }
