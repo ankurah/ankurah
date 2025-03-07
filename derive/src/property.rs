@@ -1,15 +1,14 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, ToTokens};
-use syn::{parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DeriveInput, Fields, Type};
+use quote::quote;
+use syn::{parse_macro_input, Data, DeriveInput};
 
-// Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
 pub fn derive_property_impl(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident.clone();
 
     let mut variants = Vec::new();
     match input.data.clone() {
-        Data::Struct(data) => return syn::Error::new_spanned(&input, "Only named fields are supported").to_compile_error().into(),
+        Data::Struct(_data) => return syn::Error::new_spanned(&input, "Only named fields are supported").to_compile_error().into(),
         Data::Enum(data) => {
             for variant in data.variants {
                 if !variant.fields.is_empty() {
