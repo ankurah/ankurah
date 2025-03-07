@@ -21,7 +21,7 @@ use ankurah_proto::{Clock, CollectionId, Event, ID};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub struct Postgres {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,

@@ -50,7 +50,7 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
 
 #[wasm_bindgen]
 pub async fn fetch_test_items(client: &WebsocketClient) -> Result<Vec<SessionView>, JsValue> {
-    client.ready().await;
+    client.ready().await?;
     let context = get_node().await.context(c);
     let sessions: ResultSet<SessionView> =
         context.fetch("date_connected = '2024-01-01'").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -63,7 +63,14 @@ pub fn subscribe_test_items(client: &WebsocketClient) -> Result<TestResultSetSig
 
     let client = client.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        client.ready().await;
+        match client.ready().await {
+            Ok(_) => {},
+            Err(err) => {
+                error!("client ready error: {}", err);
+                return;
+            }
+        }
+
         let node = get_node().await;
 
         use reactive_graph::traits::Set;

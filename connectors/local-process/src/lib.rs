@@ -2,7 +2,6 @@ use ankurah_core::policy::PolicyAgent;
 use ankurah_core::storage::StorageEngine;
 use ankurah_proto as proto;
 use async_trait::async_trait;
-use std::sync::{Arc, Weak};
 use tokio::sync::mpsc;
 
 use ankurah_core::connector::{PeerSender, SendError};

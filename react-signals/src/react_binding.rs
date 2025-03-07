@@ -218,7 +218,7 @@ impl ReactiveNode for TrackerInner {
 impl Subscriber for TrackerInner {
     fn add_source(&self, source: AnySource) { self.0.write().or_poisoned().sources.push(source); }
 
-    fn clear_sources(&self, subscriber: &AnySubscriber) { self.0.write().or_poisoned().sources.clear(); }
+    fn clear_sources(&self, _subscriber: &AnySubscriber) { self.0.write().or_poisoned().sources.clear(); }
 }
 
 impl ToAnySubscriber for Tracker {

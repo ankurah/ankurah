@@ -323,7 +323,7 @@ where
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
-        let handle = {
+        {
             let peer_id = peer_id.clone();
             self.reactor
                 .subscribe(sub_id, &collection_id, predicate, move |changeset| {
@@ -530,7 +530,7 @@ where
         self: &Arc<Self>,
         collection_id: &CollectionId,
         args: MatchArgs,
-        cdata: &PA::ContextData,
+        _cdata: &PA::ContextData,
     ) -> Result<Vec<Arc<Entity>>, RetrievalError> {
         if !self.durable {
             // Fetch from peers and commit first response

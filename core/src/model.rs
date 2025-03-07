@@ -5,7 +5,6 @@ use tracing::info;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::context::TContext;
 use crate::property::PropertyError;
 use crate::property::PropertyValue;
 use crate::{error::RetrievalError, property::Backends};

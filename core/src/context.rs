@@ -5,7 +5,6 @@ use crate::{
     model::{Entity, View},
     node::{MatchArgs, Node},
     policy::PolicyAgent,
-    reactor::Reactor,
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,

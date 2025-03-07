@@ -1,8 +1,7 @@
 use crate::client::ClientInner;
 use crate::connection_state::ConnectionState;
 use ankurah_core::connector::NodeComms;
-use ankurah_core::policy::PolicyAgent;
-use ankurah_core::{connector::PeerSender, Node};
+use ankurah_core::connector::PeerSender;
 use ankurah_proto::{self as proto};
 use anyhow::anyhow;
 use async_trait::async_trait;

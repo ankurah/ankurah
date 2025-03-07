@@ -1,13 +1,11 @@
 use ankurah_proto as proto;
-use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::{
-    context::{Context, TContext},
+    context::TContext,
     error::RetrievalError,
     model::{Entity, Mutable},
-    policy::PolicyAgent,
-    Model, Node,
+    Model, 
 };
 
 use append_only_vec::AppendOnlyVec;
