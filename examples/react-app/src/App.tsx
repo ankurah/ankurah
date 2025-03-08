@@ -69,7 +69,7 @@ function App() {
     const connectionState = appState?.client?.connection_state.value?.value();
     // eslint-disable-next-line react-hooks/rules-of-hooks
     const test_items_signal = useMemo(
-      () => (appState?.client ? subscribe_test_items(appState?.client) : null),
+      () => (appState?.client ? subscribe_test_items(appState?.client) : null), //date_connected = '2024-01-01'
       [appState?.client],
     );
 

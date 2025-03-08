@@ -12,9 +12,11 @@ use crate::{
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use tracing::info;
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
 
 /// Type-erased context wrapper
-#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
 impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
