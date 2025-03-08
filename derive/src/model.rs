@@ -9,7 +9,8 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let name_str = name.to_string().to_lowercase();
     let view_name = format_ident!("{}View", name);
     let mutable_name = format_ident!("{}Mut", name);
-
+    let resultset_name = format_ident!("{}ResultSet", name);
+    let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
     let clone_derive = if !get_model_flag(&input.attrs, "no_clone") {
         quote! { #[derive(Clone)] }
     } else {
@@ -53,14 +54,74 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
 
     let wasm_attributes = if cfg!(feature = "wasm") {
         quote! {
-            use ankurah::derive_deps::wasm_bindgen::prelude::*;
             #[wasm_bindgen]
         }
     } else {
         quote! {}
     };
 
+    let wasm_impl = if cfg!(feature = "wasm") {
+        quote! {
+            use ::ankurah::derive_deps::{wasm_bindgen::prelude::*, wasm_bindgen_futures, reactive_graph, tracing};
+
+            // #[wasm_bindgen]
+            impl #name {
+                pub async fn get(context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
+                }
+                pub async fn fetch(context: &::ankurah::core::context::Context, predicate: &str) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
+                    let resultset = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                    Ok(resultset.into())
+                }
+                pub fn subscribe(context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
+                    let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
+                    let (signal, rwsignal) = reactive_graph::signal::RwSignal::new(#resultset_name::default()).split();
+
+                    let context2 = (*context).clone();
+                    let handle2 = handle.clone();
+                    let future = Box::pin(async move {
+                        use reactive_graph::traits::Set;
+                        let handle = context2
+                            .subscribe(predicate.as_str(), move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                                rwsignal.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
+                            })
+                            .await;
+                        match handle {
+                            Ok(h) => {
+                                handle2.set(h);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to subscribe to changes: {}", e);
+                            }
+                        };
+                    });
+                    wasm_bindgen_futures::spawn_local(future);
+
+                    Ok(#resultset_signal_name{
+                        sig: Box::new(signal),
+                        handle: Box::new(())
+                    })
+                    }
+        //         // pub async fn create(&self, transaction: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
+        //         //     transaction.create(self).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
+        //         // }
+            }
+            #[wasm_bindgen]
+            #[derive(ankurah::WasmSignal, Clone, Default)]
+            pub struct #resultset_name(::std::sync::Arc<::ankurah::core::resultset::ResultSet<#view_name>>);
+
+            #[wasm_bindgen]
+            impl #resultset_name {
+                pub fn resultset(&self) -> Vec<#view_name> { self.0.items.to_vec() }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded: proc_macro::TokenStream = quote! {
+        #wasm_impl
+
         impl ::ankurah::model::Model for #name {
             type View = #view_name;
             type Mutable<'rec> = #mutable_name<'rec>;

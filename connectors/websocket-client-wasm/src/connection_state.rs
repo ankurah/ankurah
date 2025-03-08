@@ -1,4 +1,3 @@
-// #[cfg(feature = "react")]
 use ankurah::WasmSignal;
 use wasm_bindgen::prelude::*;
 

@@ -13,9 +13,16 @@ use crate::{
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use tracing::info;
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
 
 /// Type-erased context wrapper
-pub struct Context(Box<dyn TContext>);
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+pub struct Context(Arc<dyn TContext>);
+
+impl Clone for Context {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
 
 pub struct NodeAndContext<SE, PA: PolicyAgent> {
     node: Node<SE, PA>,
@@ -71,7 +78,7 @@ impl Context {
         node: Node<SE, PA>,
         data: PA::ContextData,
     ) -> Self {
-        Self(Box::new(NodeAndContext { node, cdata: data }))
+        Self(Arc::new(NodeAndContext { node, cdata: data }))
     }
 
     pub fn node_id(&self) -> proto::NodeId { self.0.node_id() }
