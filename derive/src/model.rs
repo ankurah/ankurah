@@ -3,8 +3,8 @@ use quote::{format_ident, quote};
 use syn::{parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DeriveInput, Fields, Type};
 
 // Consider changing this to an attribute macro so we can modify the input struct? For now, users will have to also derive Debug.
-pub fn derive_model_impl(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(stream as DeriveInput);
     let name = input.ident.clone();
     let name_str = name.to_string().to_lowercase();
     let view_name = format_ident!("{}View", name);
@@ -17,9 +17,9 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let fields = match input.data {
-        Data::Struct(data) => match data.fields {
-            Fields::Named(fields) => fields.named,
+    let fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => fields.named.clone(),
             fields => return syn::Error::new_spanned(fields, "Only named fields are supported").to_compile_error().into(),
         },
         _ => return syn::Error::new_spanned(&name, "Only structs are supported").to_compile_error().into(),
@@ -61,19 +61,40 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     };
 
     let wasm_impl = if cfg!(feature = "wasm") {
+        let get_name = format_ident!("get_{}", name_str);
+        let fetch_name = format_ident!("fetch_{}", name_str);
+        let subscribe_name = format_ident!("subscribe_{}", name_str);
+        let create_name = format_ident!("create_{}", name_str);
+
+        let tsinput = input.clone();
+        // tsinput.ident = syn::Ident::new(&format!("_{}", tsinput.ident.to_string()), tsinput.ident.span());
+        let tsify_impl = crate::tsify::derive::expand(tsinput).unwrap_or_else(syn::Error::into_compile_error);
+        // let args = proc_macro2::TokenStream::from(stream);
+        // let declare_impl = crate::tsify::declare_impl(args, item).unwrap_or_else(syn::Error::into_compile_error);
+        // let declare_impl = match input.data {
+        //     Data::Struct(data) => crate::tsify::declare_impl(proc_macro2::TokenStream::new(), data.into()),
+        //     // syn::Item::Enum(item) => derive::expand_by_attr(args, item.into()),
+        //     // syn::Item::Struct(item) => derive::expand_by_attr(args, item.into()),
+        //     _ => Err(syn::Error::new_spanned(&input.ident, "Only structs are supported for wasm-bindgen")),
+        // };
+        // .into()
         quote! {
             use ::ankurah::derive_deps::{wasm_bindgen::prelude::*, wasm_bindgen_futures, reactive_graph, tracing};
+            #tsify_impl
 
-            // #[wasm_bindgen]
-            impl #name {
-                pub async fn get(context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+
+            // impl #name {
+                #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+                pub async fn #get_name (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                     context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
                 }
-                pub async fn fetch(context: &::ankurah::core::context::Context, predicate: &str) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
+                #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+                pub async fn #fetch_name (context: &::ankurah::core::context::Context, predicate: &str) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
                     let resultset = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                     Ok(resultset.into())
                 }
-                pub fn subscribe(context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
+                #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+                pub fn #subscribe_name (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
                     let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
                     let (signal, rwsignal) = reactive_graph::signal::RwSignal::new(#resultset_name::default()).split();
 
@@ -83,12 +104,18 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                         use reactive_graph::traits::Set;
                         let handle = context2
                             .subscribe(predicate.as_str(), move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                                tracing::info!("Changeset");
                                 rwsignal.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
                             })
                             .await;
                         match handle {
                             Ok(h) => {
-                                handle2.set(h);
+                                match handle2.set(h) {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        tracing::error!("Failed to set handle");
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::error!("Failed to subscribe to changes: {}", e);
@@ -101,11 +128,13 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
                         sig: Box::new(signal),
                         handle: Box::new(())
                     })
-                    }
-        //         // pub async fn create(&self, transaction: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
-        //         //     transaction.create(self).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
-        //         // }
-            }
+                }
+                #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+                pub async fn #create_name(transaction: &ankurah::transaction::Transaction, me: #name) -> Result<(), ::wasm_bindgen::JsValue> {
+                    transaction.create(&me).await;
+                    Ok(())
+                }
+            // }
             #[wasm_bindgen]
             #[derive(ankurah::WasmSignal, Clone, Default)]
             pub struct #resultset_name(::std::sync::Arc<::ankurah::core::resultset::ResultSet<#view_name>>);
@@ -212,6 +241,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
         }
 
         #[derive(Debug)]
+        // #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         pub struct #mutable_name<'rec> {
             entity: &'rec std::sync::Arc<::ankurah::model::Entity>,
             #(#active_field_visibility #active_field_names: #active_field_types,)*

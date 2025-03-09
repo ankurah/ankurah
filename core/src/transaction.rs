@@ -10,9 +10,13 @@ use crate::{
 
 use append_only_vec::AppendOnlyVec;
 
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
+
 // Q. When do we want unified vs individual property storage for TypeEngine operations?
 // A. When we start to care about differentiating possible recipients for different properties.
 
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Transaction {
     pub(crate) dyncontext: Box<dyn TContext + Send + Sync + 'static>,
 
@@ -21,6 +25,13 @@ pub struct Transaction {
     // markers
     implicit: bool,
     consumed: bool,
+}
+
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl Transaction {
+    #[wasm_bindgen(js_name = "commit")]
+    pub async fn js_commit(mut self) -> Result<(), JsValue> { self.commit_mut_ref().await.map_err(|e| JsValue::from_str(&e.to_string())) }
 }
 
 impl Transaction {

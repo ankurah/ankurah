@@ -1,9 +1,12 @@
 import styled from "styled-components";
-import { useAppState } from "./AppState";
+import { useAppState } from "./main";
 import {
   withSignals,
-  create_test_entity,
-  subscribe_test_items,
+  // create_test_entity,
+  // subscribe_test_items,
+  create_session,
+  subscribe_session,
+  get_context,
 } from "example-wasm-bindings";
 import { useMemo } from "react";
 
@@ -63,21 +66,33 @@ function App() {
   return withSignals(() => {
     // eslint-disable-next-line react-hooks/rules-of-hooks
     const appState = useAppState();
+    const context = appState.context;
     console.log("render 1", { appState });
 
     // const [connectionState, setConnectionState] = useState<string | null>(null);
     const connectionState = appState?.client?.connection_state.value?.value();
     // eslint-disable-next-line react-hooks/rules-of-hooks
     const test_items_signal = useMemo(
-      () => (appState?.client ? subscribe_test_items(appState?.client) : null), //date_connected = '2024-01-01'
-      [appState?.client],
+      () => {
+        console.log("initializing usememo");
+        return subscribe_session(context, "date_connected = '2024-01-01'")
+      },
+      [],
     );
 
     const handleButtonPress = () => {
       if (appState?.client) {
-        create_test_entity(appState.client).then(() => {
+        (async () => {
+          const context = await get_context();
+          const transaction = context.begin();
+          await create_session(transaction, {
+            date_connected: "2024-01-01",
+            ip_address: "127.0.0.1",
+            node_id: context.node_id(),
+          });
           console.log("Session created");
-        });
+          transaction.commit();
+        })();
       } else {
         console.log("Client not ready");
       }
