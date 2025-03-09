@@ -4,6 +4,9 @@ description = "Inter-node communication protocol for Ankurah"
 version     = "0.2.0"
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-proto"
+homepage    = "https://github.com/ankurah/ankurah"
+repository  = "https://github.com/ankurah/ankurah"
 
 [dependencies]
 anyhow             = "1.0.86"
