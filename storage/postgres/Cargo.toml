@@ -1,12 +1,12 @@
 [package]
-name        = "ankurah-storage-postgres"
-version     = "0.2.0"
-edition     = "2021"
-description = "Ankurah storage engine using Postgres"
-license     = "MIT OR Apache-2.0"
+name          = "ankurah-storage-postgres"
+version       = "0.2.0"
+edition       = "2021"
+description   = "Ankurah storage engine using Postgres"
+license       = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/ankurah-storage-postgres"
-homepage    = "https://github.com/ankurah/ankurah"
-repository  = "https://github.com/ankurah/ankurah"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }

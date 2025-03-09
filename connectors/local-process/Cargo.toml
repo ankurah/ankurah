@@ -1,12 +1,12 @@
 [package]
-name        = "ankurah-connector-local-process"
-version     = "0.2.0"
-edition     = "2021"
-description = "Ankurah connector for local processes"
-license     = "MIT OR Apache-2.0"
+name          = "ankurah-connector-local-process"
+version       = "0.2.0"
+edition       = "2021"
+description   = "Ankurah connector for local processes"
+license       = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/ankurah-connector-local-process"
-homepage    = "https://github.com/ankurah/ankurah"
-repository  = "https://github.com/ankurah/ankurah"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
 ankurah-core  = { path = "../../core", version = "^0.2.0" }
