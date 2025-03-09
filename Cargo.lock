@@ -237,6 +237,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-tests"
+version = "0.2.0"
+dependencies = [
+ "ankql",
+ "ankurah",
+ "ankurah-connector-local-process",
+ "ankurah-react-signals",
+ "ankurah-storage-postgres",
+ "ankurah-storage-sled",
+ "anyhow",
+ "bb8",
+ "bb8-postgres",
+ "ctor",
+ "js-sys",
+ "reactive_graph",
+ "serde",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "ankurah-websocket-client-wasm"
 version = "0.2.0"
 dependencies = [
@@ -3409,33 +3436,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d43ed4e8f58424c3a2c6c56dbea6643c3c23e8666a34df13c54f0a184e6c707"
 dependencies = [
  "testcontainers",
-]
-
-[[package]]
-name = "tests"
-version = "0.2.0"
-dependencies = [
- "ankql",
- "ankurah",
- "ankurah-connector-local-process",
- "ankurah-react-signals",
- "ankurah-storage-postgres",
- "ankurah-storage-sled",
- "anyhow",
- "bb8",
- "bb8-postgres",
- "ctor",
- "js-sys",
- "reactive_graph",
- "serde",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-postgres",
- "tracing",
- "tracing-subscriber",
- "ulid",
- "wasm-bindgen",
 ]
 
 [[package]]

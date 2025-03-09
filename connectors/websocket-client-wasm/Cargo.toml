@@ -5,6 +5,9 @@ authors     = ["Daniel Norman <daniel@danielnorman.net>"]
 edition     = "2021"
 description = "Ankurah WebSocket Client - A WebSocket client for Ankurah"
 license     = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-websocket-client-wasm"
+homepage    = "https://github.com/ankurah/ankurah"
+repository  = "https://github.com/ankurah/ankurah"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

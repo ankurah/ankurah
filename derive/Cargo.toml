@@ -4,6 +4,9 @@ version     = "0.2.0"
 edition     = "2021"
 description = "Ankurah Derive - Derive macros for Ankurah"
 license     = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-derive"
+homepage    = "https://github.com/ankurah/ankurah"
+repository  = "https://github.com/ankurah/ankurah"
 
 [features]
 default = []
