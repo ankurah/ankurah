@@ -1,12 +1,12 @@
 [package]
-name        = "ankurah-storage-indexeddb-wasm"
-version     = "0.2.0"
-edition     = "2021"
-description = "Ankurah storage engine using IndexedDB in the browser"
-license     = "MIT OR Apache-2.0"
+name          = "ankurah-storage-indexeddb-wasm"
+version       = "0.2.0"
+edition       = "2021"
+description   = "Ankurah storage engine using IndexedDB in the browser"
+license       = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/ankurah-storage-indexeddb-wasm"
-homepage    = "https://github.com/ankurah/ankurah"
-repository  = "https://github.com/ankurah/ankurah"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
 
 [features]
 default = []

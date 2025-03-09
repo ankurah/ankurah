@@ -1,12 +1,12 @@
 [package]
-name        = "ankurah-react-signals"
-version     = "0.2.0"
-edition     = "2021"
-description = "Observe ankurah state with signals in react"
-license     = "MIT OR Apache-2.0"
+name          = "ankurah-react-signals"
+version       = "0.2.0"
+edition       = "2021"
+description   = "Observe ankurah state with signals in react"
+license       = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/ankurah-react-signals"
-homepage    = "https://github.com/ankurah/ankurah"
-repository  = "https://github.com/ankurah/ankurah"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
 futures              = "0.3"
