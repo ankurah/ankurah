@@ -12,7 +12,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
     // Generate the wrapper struct name
     let wrapper_name = Ident::new(&format!("{}Signal", name), name.span());
-    println!("wrapper_name: {}", wrapper_name);
+    // println!("wrapper_name: {}", wrapper_name);
 
     // Generate the code
     let expanded = quote! {
@@ -22,17 +22,18 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
         pub struct #wrapper_name{
             pub (crate) sig: Box<dyn ::ankurah::derive_deps::GetSignalValue<Value = #name>>,
             pub (crate) handle: ::std::boxed::Box<dyn ::std::any::Any>
-        };
+        }
 
         // impl <T> From<T> for #wrapper_name  where T: ::ankurah::GetSignalValue<Value = #name> + 'static{
         //     fn from(value: T) -> Self {
-        //         #wrapper_name(Box::new(value))
+        //         unimplemented!()
+        //         // #wrapper_name(Box::new(value))
         //     }
         // }
 
-        panic!("panicking");
-        use ::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen;
-        #[wasm_bindgen]
+
+
+        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         impl #wrapper_name {
 
             #[wasm_bindgen(js_name = "subscribe")]

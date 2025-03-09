@@ -10,6 +10,8 @@ use once_cell::sync::OnceCell;
 use tracing::{error, info};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
+pub use example_model::*;
+
 lazy_static! {
     static ref NODE: OnceCell<Node<IndexedDBStorageEngine, PermissiveAgent>> = OnceCell::new();
     static ref NOTIFY: tokio::sync::Notify = tokio::sync::Notify::new();

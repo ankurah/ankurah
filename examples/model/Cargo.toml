@@ -18,3 +18,5 @@ reactive_graph = { version = "0.1.4", features = ["effects"], optional = true }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 uuid      = { version = "1.7", features = ["v4", "serde", "js"] }
 ###### 
+
+tracing = { version = "0.1" }

@@ -628,9 +628,9 @@ where
     pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }
 
-impl<SE, PA> Drop for Node<SE, PA> {
+impl<SE, PA> Drop for NodeInner<SE, PA> {
     fn drop(&mut self) {
-        info!("Node {} dropped", self.id);
+        info!("NodeInner {} dropped", self.id);
     }
 }
 

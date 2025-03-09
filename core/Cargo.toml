@@ -6,7 +6,7 @@ edition     = "2021"
 license     = "MIT OR Apache-2.0"
 
 [features]
-wasm    = ["wasm-bindgen", "wasm-bindgen-futures"]
+wasm    = ["wasm-bindgen", "wasm-bindgen-futures", "serde-wasm-bindgen"]
 default = []
 
 [dependencies]
@@ -34,5 +34,6 @@ futures              = "0.3"
 futures-util         = "0.3"
 wasm-bindgen         = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+serde-wasm-bindgen  = { version = "0.6", optional = true }
 
 [dev-dependencies]
