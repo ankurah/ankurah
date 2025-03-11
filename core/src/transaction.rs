@@ -1,13 +1,11 @@
 use ankurah_proto as proto;
-use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::{
-    context::{Context, TContext},
+    context::TContext,
     error::RetrievalError,
     model::{Entity, Mutable},
-    policy::PolicyAgent,
-    Model, Node,
+    Model,
 };
 
 use append_only_vec::AppendOnlyVec;
@@ -16,7 +14,7 @@ use append_only_vec::AppendOnlyVec;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 pub struct Transaction {
-    pub(crate) dyncontext: Box<dyn TContext>,
+    pub(crate) dyncontext: Box<dyn TContext + Send + Sync + 'static>,
 
     entities: AppendOnlyVec<Arc<Entity>>,
 
@@ -26,7 +24,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(dyncontext: Box<dyn TContext>) -> Self {
+    pub(crate) fn new(dyncontext: Box<dyn TContext + Send + Sync + 'static>) -> Self {
         Self { dyncontext, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
     }
 

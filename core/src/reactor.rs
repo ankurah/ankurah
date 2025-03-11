@@ -1,17 +1,15 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::model::Entity;
-use crate::node::{MatchArgs, WeakNode};
+use crate::node::MatchArgs;
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
 use crate::storage::StorageEngine;
-use crate::subscription::{Subscription, SubscriptionHandle};
+use crate::subscription::Subscription;
 use crate::value::Value;
-use crate::Node;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
 use dashmap::{DashMap, DashSet};
-use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::info;
@@ -40,7 +38,7 @@ pub struct Reactor<SE, PA> {
     storage: Arc<SE>,
     // Weak reference to the node
     // node: OnceCell<WeakNode<PA>>,
-    policy_agent: PA,
+    _policy_agent: PA,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -61,7 +59,7 @@ where
             wildcard_watchers: DashMap::new(),
             entity_watchers: DashMap::new(),
             storage,
-            policy_agent,
+            _policy_agent: policy_agent,
             // node: OnceCell::new(),
         })
     }

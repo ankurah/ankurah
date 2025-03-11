@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use crate::error::RetrievalError;
 use ankurah_proto::{CollectionId, Event, State, ID};

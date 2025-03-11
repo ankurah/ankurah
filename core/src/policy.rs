@@ -1,11 +1,8 @@
 use crate::{
-    changes::ChangeSet,
-    model::{Entity, Model},
     node::ContextData,
     proto::{CollectionId, NodeId, ID},
 };
 use ankql::ast::Predicate;
-use std::collections::HashSet;
 
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

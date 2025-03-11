@@ -11,7 +11,7 @@ use axum::{
 use axum_extra::{headers, TypedHeader};
 use bincode::deserialize;
 use futures_util::StreamExt;
-use std::{net::SocketAddr, ops::ControlFlow, sync::Arc};
+use std::{net::SocketAddr, ops::ControlFlow};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 use tracing::{info, warn, Level};
