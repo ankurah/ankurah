@@ -3,8 +3,6 @@ use std::sync::Arc;
 use ankurah_core::connector::{PeerSender, SendError};
 use ankurah_proto as proto;
 use async_trait::async_trait;
-use axum::extract::ws::WebSocket;
-use futures_util::stream::SplitSink;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -12,7 +10,7 @@ use tracing::info;
 #[derive(Clone)]
 pub struct WebSocketClientSender {
     tx: mpsc::Sender<axum::extract::ws::Message>,
-    pub(crate) inner: Arc<Inner>,
+    inner: Arc<Inner>,
 }
 struct Inner {
     pub(crate) recipient_node_id: proto::NodeId,

@@ -5,7 +5,6 @@ use crate::{
     model::{Entity, View},
     node::{MatchArgs, Node},
     policy::PolicyAgent,
-    reactor::Reactor,
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
@@ -15,7 +14,10 @@ use async_trait::async_trait;
 use tracing::info;
 
 /// Type-erased context wrapper
-pub struct Context(Box<dyn TContext>);
+pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
+impl Clone for Context {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
 
 pub struct NodeAndContext<SE, PA: PolicyAgent> {
     node: Node<SE, PA>,
@@ -37,7 +39,7 @@ pub trait TContext {
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>;
-    fn cloned(&self) -> Box<dyn TContext>;
+    fn cloned(&self) -> Box<dyn TContext + Send + Sync + 'static>;
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper;
 }
 
@@ -62,7 +64,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
         self.node.subscribe(sub_id, collection, args, callback).await
     }
-    fn cloned(&self) -> Box<dyn TContext> { Box::new(NodeAndContext { node: self.node.clone(), cdata: self.cdata.clone() }) }
+    fn cloned(&self) -> Box<dyn TContext + Send + Sync + 'static> {
+        Box::new(NodeAndContext { node: self.node.clone(), cdata: self.cdata.clone() })
+    }
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.node.collection(id).await }
 }
 
@@ -71,7 +75,7 @@ impl Context {
         node: Node<SE, PA>,
         data: PA::ContextData,
     ) -> Self {
-        Self(Box::new(NodeAndContext { node, cdata: data }))
+        Self(Arc::new(NodeAndContext { node, cdata: data }))
     }
 
     pub fn node_id(&self) -> proto::NodeId { self.0.node_id() }

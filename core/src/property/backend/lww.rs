@@ -8,10 +8,7 @@ use std::{
 use ankurah_proto::{Clock, ClockOrdering, Operation};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    context::{Context, TContext},
-    property::{backend::PropertyBackend, traits::compare_clocks, PropertyError, PropertyName, PropertyValue},
-};
+use crate::property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue};
 
 const LWW_DIFF_VERSION: u8 = 1;
 

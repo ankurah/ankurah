@@ -9,12 +9,9 @@ use ankurah_proto::Clock;
 use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
-use crate::{
-    property::{
-        backend::{Operation, PropertyBackend},
-        PropertyName, PropertyValue,
-    },
-    Node,
+use crate::property::{
+    backend::{Operation, PropertyBackend},
+    PropertyName, PropertyValue,
 };
 
 /// Stores one or more properties of an entity

@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
-    durable: bool,
+    _durable: bool,
     subscriptions: BTreeSet<proto::SubscriptionId>,
 }
 
@@ -38,6 +38,12 @@ impl TryInto<MatchArgs> for &str {
     type Error = ankql::error::ParseError;
     fn try_into(self) -> Result<MatchArgs, Self::Error> {
         Ok(MatchArgs { predicate: ankql::parser::parse_selection(self)?, cached: false })
+    }
+}
+impl TryInto<MatchArgs> for String {
+    type Error = ankql::error::ParseError;
+    fn try_into(self) -> Result<MatchArgs, Self::Error> {
+        Ok(MatchArgs { predicate: ankql::parser::parse_selection(&self)?, cached: false })
     }
 }
 
@@ -85,7 +91,7 @@ pub struct NodeInner<SE, PA> {
 
     /// The reactor for handling subscriptions
     pub reactor: Arc<Reactor<SE, PA>>,
-    policy_agent: PA,
+    _policy_agent: PA,
 }
 
 type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
@@ -109,7 +115,7 @@ where
             pending_requests: DashMap::new(),
             reactor,
             durable: false,
-            policy_agent,
+            _policy_agent: policy_agent,
         }));
         // reactor.set_node(node.weak());
 
@@ -128,7 +134,7 @@ where
             pending_requests: DashMap::new(),
             reactor,
             durable: true,
-            policy_agent,
+            _policy_agent: policy_agent,
         }));
         // reactor.set_node(node.weak());
         node
@@ -148,7 +154,7 @@ where
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node {} register peer {}", self.id, presence.node_id);
         self.peer_connections
-            .insert(presence.node_id.clone(), PeerState { sender, durable: presence.durable, subscriptions: BTreeSet::new() });
+            .insert(presence.node_id.clone(), PeerState { sender, _durable: presence.durable, subscriptions: BTreeSet::new() });
         if presence.durable {
             self.durable_peers.insert(presence.node_id.clone());
         }
@@ -305,7 +311,7 @@ where
         )
         .await
         .into_iter()
-        .collect::<Result<Vec<_>, _>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
         Ok(())
     }
@@ -323,7 +329,7 @@ where
 
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
-        let handle = {
+        {
             let peer_id = peer_id.clone();
             self.reactor
                 .subscribe(sub_id, &collection_id, predicate, move |changeset| {
@@ -348,7 +354,7 @@ where
                         });
                     }
                 })
-                .await?
+                .await?;
         };
 
         // Store the subscription handle
@@ -530,7 +536,7 @@ where
         self: &Arc<Self>,
         collection_id: &CollectionId,
         args: MatchArgs,
-        cdata: &PA::ContextData,
+        _cdata: &PA::ContextData,
     ) -> Result<Vec<Arc<Entity>>, RetrievalError> {
         if !self.durable {
             // Fetch from peers and commit first response
@@ -579,7 +585,9 @@ where
         let sub_id = handle.id.clone();
         spawn(async move {
             node.reactor.unsubscribe(sub_id);
-            node.request_remote_unsubscribe(sub_id, peers).await;
+            if let Err(e) = node.request_remote_unsubscribe(sub_id, peers).await {
+                warn!("Error unsubscribing from peers: {}", e);
+            }
         });
         Ok(())
     }

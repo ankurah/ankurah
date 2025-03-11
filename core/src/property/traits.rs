@@ -1,14 +1,7 @@
 use ankurah_proto::{Clock, ClockOrdering};
 use anyhow::Result;
-use futures::future::Join3;
 
-use crate::{
-    context::{Context, TContext},
-    error::RetrievalError,
-    model::Entity,
-    property::PropertyName,
-    Node,
-};
+use crate::{error::RetrievalError, model::Entity, property::PropertyName};
 
 use thiserror::Error;
 
@@ -30,6 +23,10 @@ pub enum PropertyError {
     InvalidVariant { given: PropertyValue, ty: String },
     #[error("invalid value `{value}` for `{ty}`")]
     InvalidValue { value: String, ty: String },
+}
+
+impl PartialEq for PropertyError {
+    fn eq(&self, other: &Self) -> bool { self.to_string() == other.to_string() }
 }
 
 #[cfg(feature = "wasm")]
