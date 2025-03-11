@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "ankql"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "env_logger",
  "log",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankql",
  "ankurah-connector-local-process",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-connector-local-process"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah-core",
  "ankurah-proto",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankql",
  "ankurah-derive",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-derive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-example-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah",
  "ankurah-storage-sled",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankql",
  "anyhow",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-react-signals"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah-derive",
  "any_spawner",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-indexeddb-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankql",
  "ankurah",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-postgres"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankql",
  "ankurah-core",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-sled"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankql",
  "ankurah-core",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-tests"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankql",
  "ankurah",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-websocket-client-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah",
  "ankurah-core",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-websocket-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah-core",
  "ankurah-proto",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "example-model"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah",
  "serde",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "example-wasm-bindings"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah",
  "ankurah-storage-indexeddb-wasm",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "leptos-example"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ankurah",
  "ankurah-storage-indexeddb-wasm",
