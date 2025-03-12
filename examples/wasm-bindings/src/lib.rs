@@ -1,6 +1,6 @@
 use std::{panic, sync::Arc};
 
-use ankurah::{changes::ChangeSet, ResultSet, WasmSignal};
+use ankurah::{changes::ChangeSet, core::context::Context, ResultSet, WasmSignal};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 pub use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 pub use ankurah_websocket_client_wasm::WebsocketClient;
@@ -9,6 +9,8 @@ use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
 use tracing::{error, info};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
+
+pub use example_model::*;
 
 lazy_static! {
     static ref NODE: OnceCell<Node<IndexedDBStorageEngine, PermissiveAgent>> = OnceCell::new();
@@ -35,6 +37,11 @@ pub async fn get_node() -> Node<IndexedDBStorageEngine, PermissiveAgent> {
         NOTIFY.notified().await;
     }
     NODE.get().unwrap().clone()
+}
+#[wasm_bindgen]
+pub async fn get_context() -> Context {
+    let node = get_node().await;
+    node.context(c)
 }
 
 #[wasm_bindgen]

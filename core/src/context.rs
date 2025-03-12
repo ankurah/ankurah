@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 /// Type-erased context wrapper
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
 impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }

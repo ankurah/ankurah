@@ -12,7 +12,6 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
     // Generate the wrapper struct name
     let wrapper_name = Ident::new(&format!("{}Signal", name), name.span());
-    println!("wrapper_name: {}", wrapper_name);
 
     // Generate the code
     let expanded = quote! {

@@ -1,7 +1,6 @@
 use ankql::selection::filter::evaluate_predicate;
 use ankurah_core::error::RetrievalError;
 use ankurah_core::model::Entity;
-use ankurah_core::policy::DEFAULT_CONTEXT as c;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
 use ankurah_proto as proto;
 use anyhow::Result;
@@ -516,7 +515,7 @@ mod tests {
     #![allow(unused)]
 
     use super::*;
-    use ankurah::{Model, Mutable, Node, PermissiveAgent};
+    use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Mutable, Node, PermissiveAgent};
     use serde::{Deserialize, Serialize};
     use wasm_bindgen_test::*;
 
