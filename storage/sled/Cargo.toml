@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-storage-sled"
-version       = "0.2.1"
+version       = "0.2.2"
 edition       = "2021"
 description   = "Ankurah storage engine using Sled"
 license       = "MIT OR Apache-2.0"
@@ -9,9 +9,9 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
-ankurah-proto = { path = "../../proto", version = "^0.2.1" }
-ankurah-core  = { path = "../../core", version = "^0.2.1" }
-ankql         = { path = "../../ankql", version = "^0.2.1" }
+ankurah-proto = { path = "../../proto", version = "^0.2.2" }
+ankurah-core  = { path = "../../core", version = "^0.2.2" }
+ankql         = { path = "../../ankql", version = "^0.2.2" }
 anyhow        = "1.0"
 async-trait   = "0.1"
 sled          = "0.34"
