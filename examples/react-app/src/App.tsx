@@ -75,7 +75,7 @@ function App() {
     const test_items_signal = useMemo(
       () => {
         console.log("initializing usememo");
-        return subscribe_session(context, "date_connected = '2024-01-01'")
+        return subscribe_session(context, "date_connected = '2024-01-01'");
       },
       [],
     );

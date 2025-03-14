@@ -64,12 +64,6 @@ pub async fn create_client() -> Result<WebsocketClient, JsValue> {
 //     Ok(sessions.into())
 // }
 
-#[wasm_bindgen]
-pub async fn get_context() -> Context {
-    let node = get_node().await;
-    node.context(c)
-}
-
 // #[wasm_bindgen]
 // pub fn subscribe_test_items(client: &WebsocketClient) -> Result<TestResultSetSignal, JsValue> {
 //     let (signal, rwsignal) = reactive_graph::signal::RwSignal::new(TestResultSet::default()).split();

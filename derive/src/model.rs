@@ -104,29 +104,23 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         use reactive_graph::traits::Set;
                         let handle = context2
                             .subscribe(predicate.as_str(), move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                                tracing::info!("Changeset");
                                 rwsignal.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
                             })
                             .await;
                         match handle {
                             Ok(h) => {
-                                match handle2.set(h) {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        tracing::error!("Failed to set handle");
-                                    }
-                                }
+                                handle2.set(h).unwrap();
                             }
                             Err(e) => {
                                 tracing::error!("Failed to subscribe to changes: {}", e);
                             }
-                        };
+                        }
                     });
                     wasm_bindgen_futures::spawn_local(future);
 
                     Ok(#resultset_signal_name{
                         sig: Box::new(signal),
-                        handle: Box::new(())
+                        handle: Box::new(handle)
                     })
                 }
                 #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
