@@ -12,9 +12,11 @@ use crate::{
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use tracing::info;
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
 
 /// Type-erased context wrapper
-#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
 impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
@@ -71,6 +73,21 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.node.collection(id).await }
 }
 
+// This whole impl is conditionalized by the wasm feature flag
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl Context {
+    #[wasm_bindgen(js_name = "node_id")]
+    pub fn js_node_id(&self) -> String { self.0.node_id().into() }
+}
+
+// This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+impl Context {
+    /// Begin a transaction.
+    pub fn begin(&self) -> Transaction { Transaction::new(self.0.cloned()) }
+}
+
 impl Context {
     pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
         node: Node<SE, PA>,
@@ -81,8 +98,6 @@ impl Context {
 
     pub fn node_id(&self) -> proto::NodeId { self.0.node_id() }
 
-    /// Begin a transaction.
-    pub fn begin(&self) -> Transaction { Transaction::new(self.0.cloned()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where

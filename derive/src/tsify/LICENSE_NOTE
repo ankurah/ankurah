@@ -1,0 +1,5 @@
+The code in this directory was copied from the `tsify` crate, which is dual licensed under the MIT license and the Apache License 2.0.
+Over time, this code will diverge from the original code sufficiently that the original license files will no longer be applicable.
+Until that time, we will preserve the original license files in the `LICENSE_MIT` and `LICENSE_APACHE` files in this directory.
+
+We appreciate the work of the `tsify` crate authors, and we thank them for their contributions to the Rust ecosystem.

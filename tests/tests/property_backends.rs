@@ -10,6 +10,7 @@ use anyhow::Result;
 use common::{Album, AlbumView};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use wasm_bindgen::prelude::*;
 
 #[derive(Property, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[wasm_bindgen]

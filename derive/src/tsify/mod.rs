@@ -1,0 +1,9 @@
+pub(crate) mod attrs;
+pub(crate) mod comments;
+pub(crate) mod container;
+pub(crate) mod decl;
+pub(crate) mod error_tracker;
+pub(crate) mod parser;
+pub(crate) mod type_alias;
+pub(crate) mod typescript;
+pub(crate) mod wasm_bindgen;
