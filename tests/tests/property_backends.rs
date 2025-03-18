@@ -31,6 +31,14 @@ pub struct Video {
     pub views: i32,*/
     #[active_type(LWW)]
     pub attribution: Option<String>,
+
+}
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Playlist {
+    pub title: String,
+    pub description: Option<String>,
+    pub videos: Edge<Video>,
 }
 
 #[tokio::test]

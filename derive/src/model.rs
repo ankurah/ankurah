@@ -19,6 +19,7 @@ pub fn derive_model_impl(input: TokenStream) -> TokenStream {
     let fields = match input.data {
         Data::Struct(data) => match data.fields {
             Fields::Named(fields) => fields.named,
+            Fields::Unit => Punctuated::new(),
             fields => return syn::Error::new_spanned(fields, "Only named fields are supported").to_compile_error().into(),
         },
         _ => return syn::Error::new_spanned(&name, "Only structs are supported").to_compile_error().into(),
