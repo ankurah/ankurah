@@ -61,7 +61,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let wasm_impl = if cfg!(feature = "wasm") {
+
+    #[cfg(feature = "wasm")]
+    let wasm_impl = {
         let namespace_struct = format_ident!("NS_{}", name_str);
         let pojo_interface = format_ident!("{}Pojo", name_str);
 
@@ -94,9 +96,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
                     }
-                    pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
+                    pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<#resultset_name, ::wasm_bindgen::JsValue> {
                         let resultset = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        Ok(resultset.into())
+                        Ok(#resultset_name(::std::sync::Arc::new(resultset)))
                     }
                     pub fn subscribe (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
                         let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
@@ -142,13 +144,23 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                 #[wasm_bindgen]
                 impl #resultset_name {
-                    pub fn resultset(&self) -> Vec<#view_name> { self.0.items.to_vec() }
+                    #[wasm_bindgen(getter)]
+                    pub fn items(&self) -> Vec<#view_name> { self.0.items.to_vec() }
+                    pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Option<#view_name> {
+                        self.0.items.iter().find(|item| item.id() == id).map(|item| item.clone())
+                        // todo generate a map on demand if there are more than a certain number of items (benchmark this)
+                    }
+                    #[wasm_bindgen(getter)]
+                    pub fn loaded(&self) -> bool {
+                        self.0.loaded
+                    }
                 }
             };
         }
-    } else {
-        quote! {}
     };
+
+    #[cfg(not(feature = "wasm"))]
+    let wasm_impl = quote! {};
 
     let expanded: proc_macro::TokenStream = quote! {
 
@@ -441,6 +453,7 @@ fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {
 
 /// We have incorporated the code from the `tsify` crate into this crate, with the intention to modify it to better fit the needs of the Ankurah project.
 /// The original license files are preserved in the `tsify` directory.
+#[cfg(feature = "wasm")]
 pub fn expand_ts_model_type(input: &DeriveInput, interface_name: String) -> syn::Result<proc_macro2::TokenStream> {
     let cont = crate::tsify::container::Container::from_derive_input(&input)?;
 

@@ -25,8 +25,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
         // impl <T> From<T> for #wrapper_name  where T: ::ankurah::GetSignalValue<Value = #name> + 'static{
         //     fn from(value: T) -> Self {
-        //         unimplemented!()
-        //         // #wrapper_name(Box::new(value))
+        //         #wrapper_name(Box::new(value))
         //     }
         // }
 

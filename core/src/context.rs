@@ -127,7 +127,7 @@ impl Context {
 
         let views = entities.into_iter().map(|entity| R::from_entity(entity)).collect();
 
-        Ok(ResultSet { items: views })
+        Ok(ResultSet { items: views, loaded: true })
     }
 
     /// Subscribe to changes in entities matching a predicate
