@@ -61,9 +61,9 @@ pub fn compare_clocks(clock: &Clock, other: &Clock /*, context: &Box<dyn TContex
     let ulid2 = other.as_slice().iter().max();
 
     if ulid1 > ulid2 {
-        ClockOrdering::Child
-    } else if ulid1 < ulid2 {
         ClockOrdering::Parent
+    } else if ulid1 < ulid2 {
+        ClockOrdering::Child
     } else {
         ClockOrdering::Sibling
     }

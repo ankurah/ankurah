@@ -24,6 +24,8 @@ pub enum PropertyValue {
     String(String),
     Object(Vec<u8>),
     Binary(Vec<u8>),
+
+    Ref(ID),
 }
 
 impl Display for PropertyValue {
@@ -36,6 +38,7 @@ impl Display for PropertyValue {
             PropertyValue::String(string) => write!(f, "{:?}", string),
             PropertyValue::Object(object) => write!(f, "{:?}", object),
             PropertyValue::Binary(binary) => write!(f, "{:?}", binary),
+            PropertyValue::Ref(id) => write!(f, "{:?}", id),
         }
     }
 }
@@ -83,6 +86,7 @@ into!(i16 => I16);
 into!(i32 => I32);
 into!(i64 => I64);
 into!(bool => Bool);
+into!(EntityId => Ref);
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
     fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_string()))) }

@@ -8,10 +8,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod entity_ref;
 pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
 use crate::error::{MutationError, RetrievalError, StateError};
+pub use entity_ref::RefBackend;
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -73,6 +75,12 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
         let backend = match buffer {
             Some(buffer) => LWWBackend::from_state_buffer(buffer)?,
             None => LWWBackend::new(),
+        };
+        Ok(Arc::new(backend))
+    } else if name == "ref" {
+        let backend = match buffer {
+            Some(buffer) => RefBackend::from_state_buffer(buffer)?,
+            None => RefBackend::new(),
         };
         Ok(Arc::new(backend))
     }
