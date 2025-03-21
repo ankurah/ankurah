@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-postgres"
-version = "0.2.2"
+version = "0.2.2-p1"
 dependencies = [
  "ankql",
  "ankurah-core",
