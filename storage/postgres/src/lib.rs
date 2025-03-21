@@ -55,11 +55,20 @@ impl StorageEngine for Postgres {
             return Err(RetrievalError::InvalidBucketName);
         }
 
-        let bucket =
-            PostgresBucket { pool: self.pool.clone(), collection_id: collection_id.clone(), columns: Arc::new(RwLock::new(Vec::new())) };
+        let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
+
+        // get the current schema from the database
+        let schema = client.query_one("SELECT current_database()", &[]).await.map_err(|err| RetrievalError::storage(err))?;
+        let schema = schema.get("current_database");
+
+        let bucket = PostgresBucket {
+            pool: self.pool.clone(),
+            schema,
+            collection_id: collection_id.clone(),
+            columns: Arc::new(RwLock::new(Vec::new())),
+        };
 
         // Try to create the table if it doesn't exist
-        let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
         bucket.create_event_table(&mut client).await?;
         bucket.create_state_table(&mut client).await?;
         bucket.rebuild_columns_cache(&mut client).await?;
@@ -78,7 +87,7 @@ pub struct PostgresColumn {
 pub struct PostgresBucket {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
     collection_id: CollectionId,
-
+    schema: String,
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
 }
 
@@ -89,14 +98,12 @@ impl PostgresBucket {
 
     /// Rebuild the cache of columns in the table.
     pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
-        let schema = "ankurah";
-
         let column_query = format!(
             r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_catalog = $1 AND table_name = $2;"#,
         );
         let mut new_columns = Vec::new();
-        info!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &schema, &self.collection_id.as_str());
-        let rows = client.query(&column_query, &[&schema, &self.collection_id.as_str()]).await?;
+        info!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &self.schema, &self.collection_id.as_str());
+        let rows = client.query(&column_query, &[&self.schema, &self.collection_id.as_str()]).await?;
         for row in rows {
             let is_nullable: String = row.get("is_nullable");
             new_columns.push(PostgresColumn {
