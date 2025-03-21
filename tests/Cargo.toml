@@ -16,7 +16,7 @@ ankurah                         = { path = "../ankurah", features = ["derive", "
 ankurah-storage-sled            = { path = "../storage/sled", version = "^0.2.2" }
 ankurah-connector-local-process = { path = "../connectors/local-process", version = "^0.2.2" }
 tokio-postgres                  = { version = "0.7", optional = true }
-ankurah-storage-postgres        = { path = "../storage/postgres", optional = true, version = "^0.2.2-p1" }
+ankurah-storage-postgres        = { path = "../storage/postgres", optional = true, version = "^0.2.2-p2" }
 bb8                             = { version = "0.9", optional = true }
 bb8-postgres                    = { version = "0.9", optional = true }
 tokio                           = { version = "1.40", features = ["full"] }
