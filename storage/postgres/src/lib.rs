@@ -163,7 +163,14 @@ impl PostgresBucket {
             if Postgres::sane_name(&column) {
                 let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.state_table(), column, datatype,);
                 info!("Running: {}", alter_query);
-                client.execute(&alter_query, &[]).await?;
+                match client.execute(&alter_query, &[]).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!("Error adding column: {} to table: {} - rebuilding columns cache", err, self.state_table());
+                        self.rebuild_columns_cache(client).await?;
+                        return Err(err.into());
+                    }
+                }
             }
         }
 
