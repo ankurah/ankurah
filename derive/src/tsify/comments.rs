@@ -45,19 +45,12 @@ pub fn extract_doc_comments(attrs: &[syn::Attribute]) -> Vec<String> {
 }
 
 /// Output extracted doc comments as Typescript doc comments.
-pub fn write_doc_comments(
-    f: &mut std::fmt::Formatter<'_>,
-    comments: &[String],
-) -> Result<(), std::fmt::Error> {
+pub fn write_doc_comments(f: &mut std::fmt::Formatter<'_>, comments: &[String]) -> Result<(), std::fmt::Error> {
     if comments.is_empty() {
         return Ok(());
     }
 
-    let comment = comments
-        .iter()
-        .map(|line| format!(" *{}\n", line.trim_matches('"')))
-        .collect::<Vec<_>>()
-        .join("");
+    let comment = comments.iter().map(|line| format!(" *{}\n", line.trim_matches('"'))).collect::<Vec<_>>().join("");
 
     write!(f, "{}", format_args!("/**\n{} */\n", comment))
 }

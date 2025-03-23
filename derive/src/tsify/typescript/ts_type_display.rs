@@ -22,21 +22,13 @@ impl Display for TsType {
             },
 
             TsType::Tuple(elems) => {
-                let elems = elems
-                    .iter()
-                    .map(|elem| elem.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let elems = elems.iter().map(|elem| elem.to_string()).collect::<Vec<_>>().join(", ");
 
                 write!(f, "[{elems}]")
             }
 
             TsType::Ref { name, type_params } => {
-                let params = type_params
-                    .iter()
-                    .map(|param| param.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let params = type_params.iter().map(|param| param.to_string()).collect::<Vec<_>>().join(", ");
 
                 if params.is_empty() {
                     write!(f, "{name}")
@@ -46,12 +38,7 @@ impl Display for TsType {
             }
 
             TsType::Fn { params, type_ann } => {
-                let params = params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, param)| format!("arg{i}: {param}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let params = params.iter().enumerate().map(|(i, param)| format!("arg{i}: {param}")).collect::<Vec<_>>().join(", ");
 
                 write!(f, "({params}) => {type_ann}")
             }

@@ -18,16 +18,10 @@ pub struct ErrorTracker {
 }
 
 impl ErrorTracker {
-    pub fn new() -> Self {
-        Self {
-            errors: RefCell::new(Some(Vec::new())),
-        }
-    }
+    pub fn new() -> Self { Self { errors: RefCell::new(Some(Vec::new())) } }
 
     /// Add a `syn::Error` to the list of errors.
-    pub fn syn_error(&self, err: syn::Error) {
-        self.errors.borrow_mut().as_mut().unwrap().push(err)
-    }
+    pub fn syn_error(&self, err: syn::Error) { self.errors.borrow_mut().as_mut().unwrap().push(err) }
 
     /// Return all accumulated errors. This also clears the list of errors.
     pub fn check(self) -> syn::Result<()> {
