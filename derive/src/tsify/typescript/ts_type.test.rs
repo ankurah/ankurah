@@ -30,11 +30,7 @@ fn test_basic_types() {
         assert_ts!(config, ByteBuf, "number[]");
     }
 
-    assert_ts!(
-        config,
-        u8 | u16 | u32 | u64 | usize | i8 | i16 | i32 | i64 | isize | f32 | f64,
-        "number"
-    );
+    assert_ts!(config, u8 | u16 | u32 | u64 | usize | i8 | i16 | i32 | i64 | isize | f32 | f64, "number");
     assert_ts!(config, String | str | char | Path | PathBuf, "string");
     assert_ts!(config, bool, "boolean");
     assert_ts!(config, Box<i32> | Rc<i32> | Arc<i32> | Cell<i32> | RefCell<i32> | Cow<'a, i32>, "number");
@@ -49,30 +45,14 @@ fn test_basic_types() {
     assert_ts!(config, (i32, String, bool), "[number, string, boolean]");
 
     assert_ts!(config, [i32; 4], "[number, number, number, number]");
-    assert_ts!(
-        config,
-        [i32; 16],
-        format!("[{}]", ["number"; 16].join(", "))
-    );
+    assert_ts!(config, [i32; 16], format!("[{}]", ["number"; 16].join(", ")));
     assert_ts!(config, [i32; 17], "number[]");
     assert_ts!(config, [i32; 1 + 1], "number[]");
 
     assert_ts!(config, Duration, "{ secs: number; nanos: number }");
-    assert_ts!(
-        config,
-        SystemTime,
-        "{ secs_since_epoch: number; nanos_since_epoch: number }"
-    );
+    assert_ts!(config, SystemTime, "{ secs_since_epoch: number; nanos_since_epoch: number }");
 
     assert_ts!(config, Range<i32>, "{ start: number; end: number }");
-    assert_ts!(
-        config,
-        Range<&'static str>,
-        "{ start: string; end: string }"
-    );
-    assert_ts!(
-        config,
-        RangeInclusive<usize>,
-        "{ start: number; end: number }"
-    );
+    assert_ts!(config, Range<&'static str>, "{ start: string; end: string }");
+    assert_ts!(config, RangeInclusive<usize>, "{ start: number; end: number }");
 }

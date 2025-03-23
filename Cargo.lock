@@ -67,6 +67,7 @@ dependencies = [
  "ankurah-storage-sled",
  "js-sys",
  "reactive_graph",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

@@ -3,7 +3,7 @@
 use ankurah_storage_postgres::Postgres;
 use anyhow::Result;
 use bb8_postgres::PostgresConnectionManager;
-use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers::ContainerAsync;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
 pub async fn create_postgres_container() -> Result<(ContainerAsync<postgres::Postgres>, ankurah_storage_postgres::Postgres)> {

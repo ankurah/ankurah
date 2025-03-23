@@ -44,7 +44,7 @@ pub fn expand(cont: &Container, decl: Decl) -> TokenStream {
             use #path as _serde;
         },
         None => quote! {
-            extern crate serde as _serde;
+            use ::ankurah::derive_deps::serde as _serde;
         },
     });
 
