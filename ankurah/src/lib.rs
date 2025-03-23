@@ -70,11 +70,14 @@
 //! ## Example: Inter-Node Subscription
 //!
 //! ```rust
+//! # #[cfg(feature="derive")]
+//! # mod doctest {
 //! # use ankurah::{Node,Model};
 //! # use ankurah_storage_sled::SledStorageEngine;
 //! # use ankurah_connector_local_process::LocalProcessConnection;
 //! # use std::sync::Arc;
-//! # #[derive(Model, Debug)]
+//! # use serde::{Serialize, Deserialize};
+//! # #[derive(Model, Debug, Serialize, Deserialize)]
 //! # pub struct Album {
 //! #     name: String,
 //! #     year: String,
@@ -108,6 +111,7 @@
 //!
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! ## Design Philosophy
@@ -161,7 +165,9 @@ where
     T: reactive_graph::traits::Get + Clone + 'static,
     T::Value: 'static,
 {
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> { Box::new(self.clone()) }
+    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> {
+        Box::new(self.clone())
+    }
 }
 
 // Re-export the derive macro
@@ -169,7 +175,7 @@ where
 pub use ankurah_derive::*;
 
 // Re-export dependencies needed by derive macros
-// #[cfg(feature = "derive")]
+#[cfg(feature = "derive")]
 #[doc(hidden)]
 pub mod derive_deps {
     #[cfg(feature = "react")]
@@ -188,5 +194,6 @@ pub mod derive_deps {
     #[cfg(feature = "react")]
     pub use ::wasm_bindgen_futures;
 
+    pub use ::serde;
     pub use ::serde_json;
 }
