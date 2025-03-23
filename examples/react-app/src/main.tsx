@@ -2,15 +2,16 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./App.tsx";
-import { AppStateProvider } from "./AppState.tsx";
-import init_bindings from "example-wasm-bindings";
+import init_bindings, { ready } from "example-wasm-bindings";
 
-init_bindings().then(async () => {
+(async () => {
+  console.log("Initializing application");
+  await init_bindings();
+
+  await ready();
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
-      <AppStateProvider>
-        <App />
-      </AppStateProvider>
+      <App />
     </StrictMode>,
   );
-});
+})();

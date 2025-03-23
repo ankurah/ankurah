@@ -3,13 +3,14 @@ use tracing::Level;
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
     model::View,
-    property::{value::LWW, YrsString},
-    proto, Model,
+    // property::{value::LWW, YrsString},
+    proto,
+    Model,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Model)]
+#[derive(Debug, Clone, Model, Serialize, Deserialize)]
 pub struct Pet {
     pub name: String,
     pub age: String,

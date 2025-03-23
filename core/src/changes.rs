@@ -90,7 +90,10 @@ where I: View
 {
     fn from(val: ChangeSet<Arc<Entity>>) -> Self {
         ChangeSet {
-            resultset: ResultSet { items: val.resultset.iter().map(|item| I::from_entity(item.clone())).collect() },
+            resultset: ResultSet {
+                loaded: val.resultset.loaded,
+                items: val.resultset.iter().map(|item| I::from_entity(item.clone())).collect(),
+            },
             changes: val.changes.into_iter().map(|change| change.into()).collect(),
         }
     }

@@ -1,3 +1,5 @@
+pub mod tsify;
+
 use ankurah_proto::{Clock, CollectionId, Event, State, ID};
 use tracing::info;
 // use futures_signals::signal::Signal;

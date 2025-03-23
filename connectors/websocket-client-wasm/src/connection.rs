@@ -207,7 +207,7 @@ impl PartialEq for Connection {
 
 #[derive(Clone)]
 struct WebSocketPeerSender {
-    recipient_node_id: proto::NodeId,
+    recipient_node_id: proto::ID,
     ws: SendWrapper<Arc<WebSocket>>,
 }
 
@@ -231,7 +231,7 @@ impl PeerSender for WebSocketPeerSender {
         }
     }
 
-    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id.clone() }
+    fn recipient_node_id(&self) -> proto::ID { self.recipient_node_id.clone() }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

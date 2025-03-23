@@ -1,14 +1,15 @@
 #[derive(Debug)]
 pub struct ResultSet<T> {
     pub items: Vec<T>,
+    pub loaded: bool,
 }
 
 impl<T: Clone> Clone for ResultSet<T> {
-    fn clone(&self) -> Self { Self { items: self.items.clone() } }
+    fn clone(&self) -> Self { Self { items: self.items.clone(), loaded: self.loaded } }
 }
 
 impl<T> Default for ResultSet<T> {
-    fn default() -> Self { Self { items: vec![] } }
+    fn default() -> Self { Self { items: vec![], loaded: false } }
 }
 
 impl<T> From<ResultSet<T>> for Vec<T> {

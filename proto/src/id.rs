@@ -30,6 +30,12 @@ impl ID {
 #[wasm_bindgen]
 impl ID {
     pub fn as_string(&self) -> String { self.to_base64() }
+
+    #[wasm_bindgen(js_name = to_base64)]
+    pub fn to_base64_js(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0.to_bytes()) }
+
+    #[wasm_bindgen(js_name = from_base64)]
+    pub fn from_base64_js(s: &str) -> Result<Self, JsValue> { Self::from_base64(s).map_err(|e| JsValue::from_str(&e.to_string())) }
 }
 
 impl fmt::Display for ID {

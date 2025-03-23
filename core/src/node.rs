@@ -78,15 +78,15 @@ impl<SE, PA> Deref for Node<SE, PA> {
 pub trait ContextData: Clone + Send + Sync + 'static {}
 
 pub struct NodeInner<SE, PA> {
-    pub id: proto::NodeId,
+    pub id: proto::ID,
     pub durable: bool,
     storage_engine: Arc<SE>,
     collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
 
     entities: Arc<RwLock<EntityMap>>,
     // peer_connections: Vec<PeerConnection>,
-    peer_connections: DashMap<proto::NodeId, PeerState>,
-    durable_peers: DashSet<proto::NodeId>,
+    peer_connections: DashMap<proto::ID, PeerState>,
+    durable_peers: DashSet<proto::ID>,
     pending_requests: DashMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 
     /// The reactor for handling subscriptions
@@ -103,7 +103,7 @@ where
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
         let reactor = Reactor::new(engine.clone(), policy_agent.clone());
-        let id = proto::NodeId::new();
+        let id = proto::ID::new();
         info!("Node {} created", id);
         let node = Node(Arc::new(NodeInner {
             id,
@@ -125,7 +125,7 @@ where
         let reactor = Reactor::new(engine.clone(), policy_agent.clone());
 
         let node = Node(Arc::new(NodeInner {
-            id: proto::NodeId::new(),
+            id: proto::ID::new(),
             storage_engine: engine,
             collections: RwLock::new(BTreeMap::new()),
             entities: Arc::new(RwLock::new(BTreeMap::new())),
@@ -160,16 +160,12 @@ where
         }
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
-    pub fn deregister_peer(&self, node_id: proto::NodeId) {
+    pub fn deregister_peer(&self, node_id: proto::ID) {
         info!("Node {} deregister peer {}", self.id, node_id);
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);
     }
-    pub async fn request(
-        &self,
-        node_id: proto::NodeId,
-        request_body: proto::NodeRequestBody,
-    ) -> Result<proto::NodeResponseBody, RequestError> {
+    pub async fn request(&self, node_id: proto::ID, request_body: proto::NodeRequestBody) -> Result<proto::NodeResponseBody, RequestError> {
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
@@ -301,7 +297,7 @@ where
         }
         Ok(())
     }
-    pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::NodeId>) -> anyhow::Result<()> {
+    pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::ID>) -> anyhow::Result<()> {
         // QUESTION: Should we fire and forget these? or do error handling?
 
         futures::future::join_all(
@@ -318,7 +314,7 @@ where
 
     async fn handle_subscribe_request(
         self: &Arc<Self>,
-        peer_id: proto::NodeId,
+        peer_id: proto::ID,
         sub_id: proto::SubscriptionId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
@@ -625,7 +621,7 @@ where
     }
 
     /// Get a random durable peer node ID
-    pub fn get_durable_peer_random(&self) -> Option<proto::NodeId> {
+    pub fn get_durable_peer_random(&self) -> Option<proto::ID> {
         let mut rng = rand::thread_rng();
         // Convert to Vec since DashSet iterator doesn't support random selection
         let peers: Vec<_> = self.durable_peers.iter().collect();
@@ -633,12 +629,12 @@ where
     }
 
     /// Get all durable peer node IDs
-    pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.durable_peers.iter().map(|id| id.clone()).collect() }
+    pub fn get_durable_peers(&self) -> Vec<proto::ID> { self.durable_peers.iter().map(|id| id.clone()).collect() }
 }
 
-impl<SE, PA> Drop for Node<SE, PA> {
+impl<SE, PA> Drop for NodeInner<SE, PA> {
     fn drop(&mut self) {
-        info!("Node {} dropped", self.id);
+        info!("NodeInner {} dropped", self.id);
     }
 }
 
