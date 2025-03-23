@@ -40,12 +40,7 @@ impl TypeGenerationConfig {
 
 impl TsifyContainerAttrs {
     pub fn from_derive_input(input: &syn::DeriveInput) -> syn::Result<Self> {
-        let mut attrs = Self {
-            into_wasm_abi: false,
-            from_wasm_abi: false,
-            namespace: false,
-            ty_config: TypeGenerationConfig::default(),
-        };
+        let mut attrs = Self { into_wasm_abi: false, from_wasm_abi: false, namespace: false, ty_config: TypeGenerationConfig::default() };
 
         for attr in &input.attrs {
             if !attr.path().is_ident("tsify") {
@@ -153,10 +148,7 @@ pub struct TsifyFieldAttrs {
 
 impl TsifyFieldAttrs {
     pub fn from_serde_field(field: &Field) -> syn::Result<Self> {
-        let mut attrs = Self {
-            type_override: None,
-            optional: false,
-        };
+        let mut attrs = Self { type_override: None, optional: false };
 
         for attr in &field.original.attrs {
             if !attr.path().is_ident("tsify") {
@@ -186,13 +178,7 @@ impl TsifyFieldAttrs {
         }
 
         if let Some(expr) = field.attrs.skip_serializing_if() {
-            let path = expr
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect::<Vec<_>>()
-                .join("::");
+            let path = expr.path.segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>().join("::");
 
             attrs.optional |= &path == "Option::is_none";
         }

@@ -30,7 +30,7 @@ ankurah-derive = { path = "../derive", version = "^0.2.2", optional = true }
 ankql          = { path = "../ankql", version = "^0.2.2" }
 serde_json     = { version = "1.0" }
 serde          = { version = "1.0" }
-tracing = { version = "0.1.40" }
+tracing        = { version = "0.1.40" }
 # Dependencies needed for derive macros
 wasm-bindgen          = { version = "0.2", optional = true }
 wasm-bindgen-futures  = { version = "0.4", optional = true }

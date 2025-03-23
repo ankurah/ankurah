@@ -1,10 +1,5 @@
 import styled from "styled-components";
-import {
-  withSignals,
-  Entry,
-  ctx,
-  ws_client,
-} from "example-wasm-bindings";
+import { withSignals, Entry, ctx, ws_client } from "example-wasm-bindings";
 import { useMemo } from "react";
 
 const Table = styled.table`
@@ -66,13 +61,10 @@ function App() {
     // const [connectionState, setConnectionState] = useState<string | null>(null);
     const connectionState = ws_client().connection_state.value?.value();
     // eslint-disable-next-line react-hooks/rules-of-hooks
-    const test_items_signal = useMemo(
-      () => {
-        console.log("initializing usememo");
-        return Entry.subscribe(ctx(), "added = '2024-01-01'");
-      },
-      [],
-    );
+    const test_items_signal = useMemo(() => {
+      console.log("initializing usememo");
+      return Entry.subscribe(ctx(), "added = '2024-01-01'");
+    }, []);
 
     const handleButtonPress = () => {
       (async () => {
@@ -105,9 +97,7 @@ function App() {
             Connection State: {connectionState}
           </div>
           <div style={{ textAlign: "center", margin: "20px 0" }}>
-            <button onClick={handleButtonPress}>
-              Create
-            </button>
+            <button onClick={handleButtonPress}>Create</button>
           </div>
           <div style={{ textAlign: "center", marginBottom: "10px" }}>
             Sessions:

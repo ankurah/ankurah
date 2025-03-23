@@ -2,8 +2,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::tsify::{
-    attrs::TypeGenerationConfig, comments::extract_doc_comments, decl::TsTypeAliasDecl,
-    error_tracker::ErrorTracker, typescript::TsType,
+    attrs::TypeGenerationConfig, comments::extract_doc_comments, decl::TsTypeAliasDecl, error_tracker::ErrorTracker, typescript::TsType,
 };
 
 /// Expand a `#[declare]` macro on a Rust `type = ...` expression.
@@ -15,11 +14,7 @@ pub fn expand(item: syn::ItemType) -> syn::Result<TokenStream> {
     let decl = TsTypeAliasDecl {
         id: item.ident.to_string(),
         export: true,
-        type_params: item
-            .generics
-            .type_params()
-            .map(|ty| ty.ident.to_string())
-            .collect(),
+        type_params: item.generics.type_params().map(|ty| ty.ident.to_string()).collect(),
         type_ann,
         comments: extract_doc_comments(&item.attrs),
     };

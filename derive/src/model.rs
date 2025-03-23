@@ -21,7 +21,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => fields.named.clone(),
-            fields => return syn::Error::new_spanned(fields, format!("Only named fields are supported this is a {:#?}", fields)).to_compile_error().into(),
+            fields => {
+                return syn::Error::new_spanned(fields, format!("Only named fields are supported this is a {:#?}", fields))
+                    .to_compile_error()
+                    .into()
+            }
         },
         _ => return syn::Error::new_spanned(&name, "Only structs are supported").to_compile_error().into(),
     };
@@ -60,7 +64,6 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
-
 
     #[cfg(feature = "wasm")]
     let wasm_impl = {
@@ -301,7 +304,6 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 ::ankurah::model::Mutable::id(self)
             }
         }
-            
     }
     .into();
 

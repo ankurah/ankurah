@@ -22,12 +22,7 @@ macro_rules! type_lit {
 
 impl TsType {
     /// Create a `TsType` from a stringified Rust identifier.
-    pub fn from_name(
-        config: &TypeGenerationConfig,
-        ident: &str,
-        args: Vec<&syn::Type>,
-        fn_output: Option<&syn::Type>,
-    ) -> Self {
+    pub fn from_name(config: &TypeGenerationConfig, ident: &str, args: Vec<&syn::Type>, fn_output: Option<&syn::Type>) -> Self {
         match ident {
             "u8" | "u16" | "u32" | "i8" | "i16" | "i32" | "f64" | "f32" => Self::NUMBER,
 
@@ -51,9 +46,7 @@ impl TsType {
 
             "bool" => Self::BOOLEAN,
 
-            "Box" | "Cow" | "Rc" | "Arc" | "Cell" | "RefCell" if args.len() == 1 => {
-                Self::from_syn_type(config, args[0])
-            }
+            "Box" | "Cow" | "Rc" | "Arc" | "Cell" | "RefCell" if args.len() == 1 => Self::from_syn_type(config, args[0]),
 
             "Vec" | "VecDeque" | "LinkedList" if args.len() == 1 => {
                 let elem = Self::from_syn_type(config, args[0]);
@@ -61,17 +54,9 @@ impl TsType {
             }
 
             "HashMap" | "BTreeMap" if args.len() == 2 => {
-                let type_params = args
-                    .iter()
-                    .map(|arg| Self::from_syn_type(config, arg))
-                    .collect();
+                let type_params = args.iter().map(|arg| Self::from_syn_type(config, arg)).collect();
 
-                let name = if cfg!(feature = "js") && !config.hashmap_as_object {
-                    "Map"
-                } else {
-                    "Record"
-                }
-                .to_string();
+                let name = if cfg!(feature = "js") && !config.hashmap_as_object { "Map" } else { "Record" }.to_string();
 
                 Self::Ref { name, type_params }
             }
@@ -81,17 +66,11 @@ impl TsType {
                 Self::Array(Box::new(elem))
             }
 
-            "Option" if args.len() == 1 => Self::Option(
-                Box::new(Self::from_syn_type(config, args[0])),
-                NullType::new(config),
-            ),
+            "Option" if args.len() == 1 => Self::Option(Box::new(Self::from_syn_type(config, args[0])), NullType::new(config)),
 
             "ByteBuf" => {
                 if cfg!(feature = "js") {
-                    Self::Ref {
-                        name: String::from("Uint8Array"),
-                        type_params: vec![],
-                    }
+                    Self::Ref { name: String::from("Uint8Array"), type_params: vec![] }
                 } else {
                     Self::Array(Box::new(Self::NUMBER))
                 }
@@ -130,28 +109,14 @@ impl TsType {
             }
 
             "Fn" | "FnOnce" | "FnMut" => {
-                let params = args
-                    .into_iter()
-                    .map(|ty| Self::from_syn_type(config, ty))
-                    .collect();
-                let type_ann = fn_output
-                    .map(|ty| Self::from_syn_type(config, ty))
-                    .unwrap_or_else(|| TsType::VOID);
+                let params = args.into_iter().map(|ty| Self::from_syn_type(config, ty)).collect();
+                let type_ann = fn_output.map(|ty| Self::from_syn_type(config, ty)).unwrap_or_else(|| TsType::VOID);
 
-                Self::Fn {
-                    params,
-                    type_ann: Box::new(type_ann),
-                }
+                Self::Fn { params, type_ann: Box::new(type_ann) }
             }
             _ => {
-                let type_params = args
-                    .into_iter()
-                    .map(|ty| Self::from_syn_type(config, ty))
-                    .collect();
-                Self::Ref {
-                    name: config.format_name(ident.to_string()),
-                    type_params,
-                }
+                let type_params = args.into_iter().map(|ty| Self::from_syn_type(config, ty)).collect();
+                Self::Ref { name: config.format_name(ident.to_string()), type_params }
             }
         }
     }
