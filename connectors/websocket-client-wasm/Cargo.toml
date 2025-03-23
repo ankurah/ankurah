@@ -23,7 +23,7 @@ ankurah-proto      = { path = "../../proto", version = "^0.2.2" }
 ankurah-derive     = { path = "../../derive", version = "^0.2.2" }
 serde              = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
-uuid               = { version = "1.7", features = ["v4", "serde"] }
+uuid               = { version = "1.7", features = ["v4", "serde", "js"] }
 
 ankurah-react-signals = { path = "../../react-signals", optional = true, version = "^0.2.2" }
 wasm-bindgen = "0.2.84"
@@ -69,6 +69,9 @@ tracing = "0.1"
 tracing-wasm = "0.2"
 thiserror = "2.0.9"
 strum = { version = "0.26.3", features = ["derive"] }
+##### patch - something is wrong with the uuid crate for wasm
+getrandom = { version = "0.3", features = ["wasm_js"] }
+###### 
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

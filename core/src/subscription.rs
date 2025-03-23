@@ -1,7 +1,7 @@
 use crate::{changes::ChangeSet, model::Entity, node::TNodeErased};
 use ankurah_proto as proto;
 use std::sync::{Arc, Mutex};
-
+use tracing::debug;
 /// A callback function that receives subscription updates
 pub type Callback<R> = Box<dyn Fn(ChangeSet<R>) + Send + Sync + 'static>;
 
@@ -21,7 +21,7 @@ pub struct Subscription<R: Clone> {
 pub struct SubscriptionHandle {
     pub(crate) id: proto::SubscriptionId,
     pub(crate) node: Box<dyn TNodeErased>,
-    pub(crate) peers: Vec<proto::NodeId>,
+    pub(crate) peers: Vec<proto::ID>,
 }
 
 impl SubscriptionHandle {
@@ -29,5 +29,12 @@ impl SubscriptionHandle {
 }
 
 impl Drop for SubscriptionHandle {
-    fn drop(&mut self) { self.node.unsubscribe(self); }
+    fn drop(&mut self) {
+        debug!("Dropping SubscriptionHandle {}", self.id);
+        self.node.unsubscribe(self);
+    }
+}
+
+impl std::fmt::Debug for SubscriptionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "SubscriptionHandle({:?})", self.id) }
 }

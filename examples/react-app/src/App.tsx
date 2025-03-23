@@ -1,9 +1,9 @@
 import styled from "styled-components";
-import { useAppState } from "./AppState";
 import {
   withSignals,
-  create_test_entity,
-  subscribe_test_items,
+  Entry,
+  ctx,
+  ws_client,
 } from "example-wasm-bindings";
 import { useMemo } from "react";
 
@@ -62,25 +62,39 @@ function App() {
   // Temporary hack - see https://github.com/ankurah/ankurah/issues/33
   return withSignals(() => {
     // eslint-disable-next-line react-hooks/rules-of-hooks
-    const appState = useAppState();
-    console.log("render 1", { appState });
 
     // const [connectionState, setConnectionState] = useState<string | null>(null);
-    const connectionState = appState?.client?.connection_state.value?.value();
+    const connectionState = ws_client().connection_state.value?.value();
     // eslint-disable-next-line react-hooks/rules-of-hooks
     const test_items_signal = useMemo(
-      () => (appState?.client ? subscribe_test_items(appState?.client) : null),
-      [appState?.client],
+      () => {
+        console.log("initializing usememo");
+        return Entry.subscribe(ctx(), "added = '2024-01-01'");
+      },
+      [],
     );
 
     const handleButtonPress = () => {
-      if (appState?.client) {
-        create_test_entity(appState.client).then(() => {
-          console.log("Session created");
+      (async () => {
+        const transaction = ctx().begin();
+        await Entry.create(transaction, {
+          added: "2024-01-01",
+          ip_address: "127.0.0.1",
+          node_id: ctx().node_id().to_base64(),
+          complex: {
+            name: "wesh",
+            value: 123,
+            thing: {
+              Bravo: {
+                b: "ça dit quoi",
+                c: 123,
+              },
+            },
+          },
         });
-      } else {
-        console.log("Client not ready");
-      }
+        console.log("Entry created", ctx().node_id());
+        transaction.commit();
+      })();
     };
 
     return (
@@ -91,7 +105,7 @@ function App() {
             Connection State: {connectionState}
           </div>
           <div style={{ textAlign: "center", margin: "20px 0" }}>
-            <button onClick={handleButtonPress} disabled={!appState?.client}>
+            <button onClick={handleButtonPress}>
               Create
             </button>
           </div>
@@ -105,15 +119,17 @@ function App() {
                 <Th>Date Connected</Th>
                 <Th>IP Address</Th>
                 <Th>Node ID</Th>
+                <Th>Complex</Th>
               </tr>
             </thead>
             <tbody>
-              {test_items_signal?.value.resultset()?.map((session) => (
-                <Tr key={session.id().as_string()}>
-                  <Td>{session.id().as_string()}</Td>
-                  <Td>{session.date_connected()}</Td>
-                  <Td>{session.ip_address()}</Td>
-                  <Td>{session.node_id()}</Td>
+              {test_items_signal.value.items.map((item) => (
+                <Tr key={item.id().as_string()}>
+                  <Td>{item.id().as_string()}</Td>
+                  <Td>{item.added()}</Td>
+                  <Td>{item.ip_address()}</Td>
+                  <Td>{item.node_id()}</Td>
+                  <Td>{JSON.stringify(item.complex())}</Td>
                 </Tr>
               ))}
             </tbody>

@@ -72,7 +72,8 @@ impl WebsocketClient {
     #[wasm_bindgen(getter, js_name = "connection_state")]
     pub fn js_connection_state(&self) -> ConnectionStateEnumSignal {
         let state = self.inner.state.read_only();
-        reactive_graph::computed::Memo::new(move |_| state.get().into()).into()
+        let signal = reactive_graph::computed::Memo::new(move |_| state.get().into());
+        ConnectionStateEnumSignal { sig: Box::new(signal), handle: Box::new(()) }
     }
 }
 

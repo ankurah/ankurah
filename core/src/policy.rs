@@ -1,6 +1,6 @@
 use crate::{
     node::ContextData,
-    proto::{CollectionId, NodeId, ID},
+    proto::{CollectionId, ID},
 };
 use ankql::ast::Predicate;
 
@@ -41,7 +41,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn can_subscribe(&self, data: &Self::ContextData, collection: &CollectionId, predicate: &Predicate) -> AccessResult;
 
     // For checking if a context can communicate with another node
-    fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &NodeId) -> AccessResult;
+    fn can_communicate_with_node(&self, data: &Self::ContextData, node_id: &ID) -> AccessResult;
 }
 
 /// A policy agent that allows all operations
@@ -67,7 +67,7 @@ impl PolicyAgent for PermissiveAgent {
         AccessResult::Allow
     }
 
-    fn can_communicate_with_node(&self, _context: &Self::ContextData, _node_id: &NodeId) -> AccessResult { AccessResult::Allow }
+    fn can_communicate_with_node(&self, _context: &Self::ContextData, _node_id: &ID) -> AccessResult { AccessResult::Allow }
 }
 
 /// A default context that is used when no context is needed

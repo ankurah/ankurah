@@ -12,7 +12,7 @@ use ankurah_core::node::{Node, WeakNode};
 /// Sender for local process connection
 pub struct LocalProcessSender {
     sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::NodeId,
+    node_id: proto::ID,
 }
 
 #[async_trait]
@@ -22,7 +22,7 @@ impl PeerSender for LocalProcessSender {
         Ok(())
     }
 
-    fn recipient_node_id(&self) -> proto::NodeId { self.node_id.clone() }
+    fn recipient_node_id(&self) -> proto::ID { self.node_id.clone() }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
@@ -37,8 +37,8 @@ where
     receiver2_task: tokio::task::JoinHandle<()>,
     node1: WeakNode<SE, PA>,
     node2: WeakNode<SE, PA>,
-    node1_id: proto::NodeId,
-    node2_id: proto::NodeId,
+    node1_id: proto::ID,
+    node2_id: proto::ID,
 }
 
 impl<SE, PA> LocalProcessConnection<SE, PA>

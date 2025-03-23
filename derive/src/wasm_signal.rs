@@ -18,21 +18,26 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
 
         #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
-        pub struct #wrapper_name(Box<dyn ::ankurah::derive_deps::GetSignalValue<Value = #name>>);
-
-        impl <T> From<T> for #wrapper_name  where T: ::ankurah::GetSignalValue<Value = #name> + 'static{
-            fn from(value: T) -> Self {
-                #wrapper_name(Box::new(value))
-            }
+        pub struct #wrapper_name{
+            pub (crate) sig: Box<dyn ::ankurah::derive_deps::GetSignalValue<Value = #name>>,
+            pub (crate) handle: ::std::boxed::Box<dyn ::std::any::Any>
         }
-        // use ::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen;
+
+        // impl <T> From<T> for #wrapper_name  where T: ::ankurah::GetSignalValue<Value = #name> + 'static{
+        //     fn from(value: T) -> Self {
+        //         #wrapper_name(Box::new(value))
+        //     }
+        // }
+
+
+
         #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         impl #wrapper_name {
 
             #[wasm_bindgen(js_name = "subscribe")]
             pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::derive_deps::ankurah_react_signals::Subscription {
                 use ::ankurah::GetSignalValue;
-                let signal : Box<dyn GetSignalValue<Value = #name>> = self.0.cloned(); // Now using the cloned() method from GetSignalValue
+                let signal : Box<dyn GetSignalValue<Value = #name>> = self.sig.cloned(); // Now using the cloned() method from GetSignalValue
                 // leave this commented out for now
                 let effect = ::ankurah::derive_deps::reactive_graph::effect::Effect::new(move |_| {
                     use ::ankurah::derive_deps::reactive_graph::traits::Get;
@@ -48,7 +53,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
             #[wasm_bindgen(getter)]
             pub fn value(&self) -> #name {
                 use ::ankurah::derive_deps::reactive_graph::traits::Get;
-                self.0.get()
+                self.sig.get()
             }
         }
     };

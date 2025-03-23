@@ -12,9 +12,11 @@ use crate::{
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use tracing::info;
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
 
 /// Type-erased context wrapper
-#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
 impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
@@ -27,7 +29,7 @@ pub struct NodeAndContext<SE, PA: PolicyAgent> {
 
 #[async_trait]
 pub trait TContext {
-    fn node_id(&self) -> proto::NodeId;
+    fn node_id(&self) -> proto::ID;
     fn next_entity_id(&self) -> proto::ID;
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Arc<Entity>>, RetrievalError>;
@@ -46,7 +48,7 @@ pub trait TContext {
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
-    fn node_id(&self) -> proto::NodeId { self.node.id.clone() }
+    fn node_id(&self) -> proto::ID { self.node.id.clone() }
     fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
         self.node.get_entity(collection, id /*&self.cdata*/).await
@@ -71,6 +73,21 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.node.collection(id).await }
 }
 
+// This whole impl is conditionalized by the wasm feature flag
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl Context {
+    #[wasm_bindgen(js_name = "node_id")]
+    pub fn js_node_id(&self) -> proto::ID { self.0.node_id() }
+}
+
+// This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
+impl Context {
+    /// Begin a transaction.
+    pub fn begin(&self) -> Transaction { Transaction::new(self.0.cloned()) }
+}
+
 impl Context {
     pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
         node: Node<SE, PA>,
@@ -79,10 +96,8 @@ impl Context {
         Self(Arc::new(NodeAndContext { node, cdata: data }))
     }
 
-    pub fn node_id(&self) -> proto::NodeId { self.0.node_id() }
+    pub fn node_id(&self) -> proto::ID { self.0.node_id() }
 
-    /// Begin a transaction.
-    pub fn begin(&self) -> Transaction { Transaction::new(self.0.cloned()) }
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
     // where
@@ -112,7 +127,7 @@ impl Context {
 
         let views = entities.into_iter().map(|entity| R::from_entity(entity)).collect();
 
-        Ok(ResultSet { items: views })
+        Ok(ResultSet { items: views, loaded: true })
     }
 
     /// Subscribe to changes in entities matching a predicate

@@ -115,7 +115,7 @@ where
         if !matching_entities.is_empty() {
             (subscription.callback)(ChangeSet {
                 changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
-                resultset: ResultSet { items: matching_entities.clone() },
+                resultset: ResultSet { loaded: true, items: matching_entities.clone() },
             });
         }
 
@@ -305,7 +305,7 @@ where
         for (sub_id, changes) in sub_changes {
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
                 (subscription.callback)(ChangeSet {
-                    resultset: ResultSet { items: subscription.matching_entities.lock().unwrap().clone() },
+                    resultset: ResultSet { loaded: true, items: subscription.matching_entities.lock().unwrap().clone() },
                     changes,
                 });
             }

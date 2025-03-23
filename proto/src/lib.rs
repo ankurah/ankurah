@@ -1,13 +1,11 @@
 pub mod human_id;
+pub mod id;
 pub mod message;
-// pub mod entity;
-pub mod entity_id;
 
-pub use human_id::*;
-pub use message::*;
-// pub use entity::*;
 use ankql::ast;
-pub use entity_id::ID;
+pub use human_id::*;
+pub use id::ID;
+pub use message::*;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,9 +13,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
-
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash)]
-pub struct NodeId(Ulid);
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -43,17 +38,6 @@ impl std::fmt::Display for DecodeError {
 }
 
 impl std::error::Error for DecodeError {}
-
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id_str = self.0.to_string();
-        write!(f, "N{}", &id_str[20..])
-    }
-}
-
-impl From<NodeId> for String {
-    fn from(node_id: NodeId) -> Self { node_id.0.to_string() }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CollectionId(String);
@@ -93,14 +77,6 @@ impl std::fmt::Display for SubscriptionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "S-{}", self.0.to_string()) }
 }
 
-impl Default for NodeId {
-    fn default() -> Self { Self::new() }
-}
-
-impl NodeId {
-    pub fn new() -> Self { Self(Ulid::new()) }
-}
-
 impl Default for RequestId {
     fn default() -> Self { Self::new() }
 }
@@ -123,8 +99,8 @@ impl SubscriptionId {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeRequest {
     pub id: RequestId,
-    pub to: NodeId,
-    pub from: NodeId,
+    pub to: ID,
+    pub from: ID,
     pub body: NodeRequestBody,
 }
 
@@ -137,8 +113,8 @@ impl std::fmt::Display for NodeRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeResponse {
     pub request_id: RequestId,
-    pub from: NodeId,
-    pub to: NodeId,
+    pub from: ID,
+    pub to: ID,
     pub body: NodeResponseBody,
 }
 
@@ -333,7 +309,7 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Presence {
-    pub node_id: NodeId,
+    pub node_id: ID,
     pub durable: bool,
 }
 

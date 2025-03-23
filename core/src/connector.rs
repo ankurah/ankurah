@@ -12,7 +12,7 @@ use crate::{node::NodeInner, policy::PolicyAgent, storage::StorageEngine, Node};
 pub trait PeerSender: Send + Sync {
     async fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
     /// The node ID of the recipient of this message
-    fn recipient_node_id(&self) -> proto::NodeId;
+    fn recipient_node_id(&self) -> proto::ID;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }
 
@@ -30,23 +30,23 @@ pub enum SendError {
 
 #[async_trait]
 pub trait NodeComms: Send + Sync {
-    fn id(&self) -> proto::NodeId;
+    fn id(&self) -> proto::ID;
     fn durable(&self) -> bool;
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>);
-    fn deregister_peer(&self, node_id: proto::NodeId);
+    fn deregister_peer(&self, node_id: proto::ID);
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
-    fn id(&self) -> proto::NodeId { self.id.clone() }
+    fn id(&self) -> proto::ID { self.id.clone() }
     fn durable(&self) -> bool { self.durable }
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         //
         NodeInner::register_peer(&self, presence, sender);
     }
-    fn deregister_peer(&self, node_id: proto::NodeId) {
+    fn deregister_peer(&self, node_id: proto::ID) {
         //
         NodeInner::deregister_peer(&self, node_id);
     }

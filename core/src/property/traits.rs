@@ -15,6 +15,11 @@ pub trait InitializeWith<T> {
 pub enum PropertyError {
     #[error("property is missing")]
     Missing,
+
+    // #[error("property is missing: {name} in collection: {collection}")]
+    // NotFoundInBackend { backend: &'static str, name: PropertyName },
+    #[error("serialization error: {0}")]
+    SerializeError(Box<dyn std::error::Error + Send + Sync>),
     #[error("deserialization error: {0}")]
     DeserializeError(Box<dyn std::error::Error + Send + Sync>),
     #[error("retrieval error: {0}")]

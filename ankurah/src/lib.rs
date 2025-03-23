@@ -179,9 +179,14 @@ pub mod derive_deps {
     #[cfg(feature = "react")]
     pub use ::js_sys;
     #[cfg(feature = "react")]
-    pub use ::reactive_graph; // Why does this fail with a Sized error: `the trait `GetSignalValue` cannot be made into an object the trait cannot be made into an object because it requires `Self: Sized``
-                              // pub use reactive_graph::traits::Get as GetSignalValue; // and this one works fine?
+    pub use ::reactive_graph;
+    pub use ::tracing; // Why does this fail with a Sized error: `the trait `GetSignalValue` cannot be made into an object the trait cannot be made into an object because it requires `Self: Sized``
+                       // pub use reactive_graph::traits::Get as GetSignalValue; // and this one works fine?
     pub use ::ankurah_proto;
     #[cfg(feature = "react")]
     pub use ::wasm_bindgen;
+    #[cfg(feature = "react")]
+    pub use ::wasm_bindgen_futures;
+
+    pub use ::serde_json;
 }
