@@ -113,12 +113,10 @@ where
         self.subscriptions.insert(sub_id, subscription.clone());
 
         // Call callback with initial state
-        if !matching_entities.is_empty() {
-            (subscription.callback)(ChangeSet {
-                changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
-                resultset: ResultSet { loaded: true, items: matching_entities.clone() },
-            });
-        }
+        (subscription.callback)(ChangeSet {
+            changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
+            resultset: ResultSet { loaded: true, items: matching_entities.clone() },
+        });
 
         Ok(())
     }
