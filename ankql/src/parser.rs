@@ -28,6 +28,14 @@ fn debug_print_pairs(pairs: Pairs<grammar::Rule>) {
 /// Parse a selection expression into a predicate AST.
 /// The selection must be a valid boolean expression using AND, OR, and comparison operators.
 pub fn parse_selection(input: &str) -> Result<ast::Predicate, ParseError> {
+    // TODO: Improve grammar to handle these cases more elegantly
+    if input.trim().is_empty() {
+        return Ok(ast::Predicate::True);
+    }
+    if input.trim().to_lowercase() == "true" {
+        return Ok(ast::Predicate::True);
+    }
+
     let pairs = grammar::AnkqlParser::parse(grammar::Rule::Selection, input).map_err(|e| ParseError::SyntaxError(format!("{}", e)))?;
 
     #[cfg(test)]
@@ -356,5 +364,19 @@ mod tests {
             parse_selection(input),
             Err(ParseError::UnexpectedRule { expected: "ExpressionInParentheses", got: grammar::Rule::ExpressionInParentheses })
         );
+    }
+
+    #[test]
+    fn test_parse_empty_string() {
+        let input = "";
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(predicate, ast::Predicate::True);
+    }
+
+    #[test]
+    fn test_parse_true_literal() {
+        let input = "true";
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(predicate, ast::Predicate::True);
     }
 }
