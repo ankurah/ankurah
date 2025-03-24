@@ -16,6 +16,8 @@ pub mod subscription;
 pub mod task;
 pub mod transaction;
 pub mod value;
+
+pub mod collectionset;
 pub use model::Model;
 pub use node::Node;
 
