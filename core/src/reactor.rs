@@ -1,5 +1,6 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
+use crate::collectionset::CollectionSet;
 use crate::model::Entity;
 use crate::node::MatchArgs;
 use crate::policy::PolicyAgent;
@@ -35,7 +36,7 @@ pub struct Reactor<SE, PA> {
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
     entity_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
     /// Reference to the storage engine
-    storage: Arc<SE>,
+    collections: CollectionSet<SE>,
     // Weak reference to the node
     // node: OnceCell<WeakNode<PA>>,
     _policy_agent: PA,
@@ -52,13 +53,13 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(storage: Arc<SE>, policy_agent: PA) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: DashMap::new(),
             index_watchers: DashMap::new(),
             wildcard_watchers: DashMap::new(),
             entity_watchers: DashMap::new(),
-            storage,
+            collections,
             _policy_agent: policy_agent,
             // node: OnceCell::new(),
         })
@@ -81,7 +82,7 @@ where
         Self::manage_watchers_recurse(self, collection_id, &args.predicate, sub_id, WatcherOp::Add);
 
         // Find initial matching entities
-        let storage_collection = self.storage.collection(collection_id).await?;
+        let storage_collection = self.collections.get(collection_id).await?;
         let states = storage_collection.fetch_states(&args.predicate).await?;
         let mut matching_entities = Vec::new();
 

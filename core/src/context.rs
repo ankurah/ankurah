@@ -43,7 +43,7 @@ pub trait TContext {
         callback: Box<dyn Fn(crate::changes::ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>;
     fn cloned(&self) -> Box<dyn TContext + Send + Sync + 'static>;
-    async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper;
+    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
 #[async_trait]
@@ -70,7 +70,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn cloned(&self) -> Box<dyn TContext + Send + Sync + 'static> {
         Box::new(NodeAndContext { node: self.node.clone(), cdata: self.cdata.clone() })
     }
-    async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.node.collection(id).await }
+    async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+        self.node.collections.get(id).await
+    }
 }
 
 // This whole impl is conditionalized by the wasm feature flag
@@ -162,5 +164,7 @@ impl Context {
             .await?;
         Ok(handle)
     }
-    pub async fn collection(&self, id: &proto::CollectionId) -> StorageCollectionWrapper { self.0.collection(id).await }
+    pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+        self.0.collection(id).await
+    }
 }

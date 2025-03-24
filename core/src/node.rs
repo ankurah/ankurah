@@ -11,6 +11,7 @@ use tokio::sync::{oneshot, RwLock};
 
 use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
+    collectionset::CollectionSet,
     connector::PeerSender,
     context::Context,
     error::{RequestError, RetrievalError},
@@ -80,8 +81,7 @@ pub trait ContextData: Clone + Send + Sync + 'static {}
 pub struct NodeInner<SE, PA> {
     pub id: proto::ID,
     pub durable: bool,
-    storage_engine: Arc<SE>,
-    collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
+    pub collections: CollectionSet<SE>,
 
     entities: Arc<RwLock<EntityMap>>,
     // peer_connections: Vec<PeerConnection>,
@@ -102,13 +102,13 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
-        let reactor = Reactor::new(engine.clone(), policy_agent.clone());
+        let collections = CollectionSet::new(engine.clone());
+        let reactor = Reactor::new(collections.clone(), policy_agent.clone());
         let id = proto::ID::new();
         info!("Node {} created", id);
         let node = Node(Arc::new(NodeInner {
             id,
-            storage_engine: engine,
-            collections: RwLock::new(BTreeMap::new()),
+            collections,
             entities: Arc::new(RwLock::new(BTreeMap::new())),
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
@@ -122,12 +122,12 @@ where
         node
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
-        let reactor = Reactor::new(engine.clone(), policy_agent.clone());
+        let collections = CollectionSet::new(engine);
+        let reactor = Reactor::new(collections.clone(), policy_agent.clone());
 
         let node = Node(Arc::new(NodeInner {
             id: proto::ID::new(),
-            storage_engine: engine,
-            collections: RwLock::new(BTreeMap::new()),
+            collections,
             entities: Arc::new(RwLock::new(BTreeMap::new())),
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
@@ -240,7 +240,7 @@ where
                 }
             }
             proto::NodeRequestBody::Fetch { collection, predicate } => {
-                let storage_collection = self.collection(&collection).await;
+                let storage_collection = self.collections.get(&collection).await?;
                 let states: Vec<_> = storage_collection.fetch_states(&predicate).await?.into_iter().collect();
                 Ok(proto::NodeResponseBody::Fetch(states))
             }
@@ -282,7 +282,7 @@ where
             {
                 proto::NodeResponseBody::Subscribe { initial, subscription_id: _ } => {
                     // Apply initial states to our storage
-                    let raw_bucket = self.collection(&collection_id).await;
+                    let raw_bucket = self.collections.get(&collection_id).await?;
                     for (id, state) in initial {
                         raw_bucket.set_state(id, &state).await.map_err(|e| anyhow!("Failed to set entity: {:?}", e))?;
                     }
@@ -320,7 +320,7 @@ where
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
         // First fetch initial state
-        let storage_collection = self.collection(&collection_id).await;
+        let storage_collection = self.collections.get(&collection_id).await?;
         let states = storage_collection.fetch_states(&predicate).await?;
 
         // Set up subscription that forwards changes to the peer
@@ -361,26 +361,6 @@ where
         Ok(proto::NodeResponseBody::Subscribe { initial: states, subscription_id: sub_id })
     }
 
-    pub async fn collection(&self, id: &CollectionId) -> StorageCollectionWrapper {
-        let collections = self.collections.read().await;
-        if let Some(store) = collections.get(id) {
-            return store.clone();
-        }
-        drop(collections);
-
-        let collection = StorageCollectionWrapper::new(self.storage_engine.collection(id).await.unwrap());
-
-        let mut collections = self.collections.write().await;
-
-        // We might have raced with another node to create this collection
-        if let Entry::Vacant(entry) = collections.entry(id.clone()) {
-            entry.insert(collection.clone());
-        }
-        drop(collections);
-
-        collection
-    }
-
     pub fn next_entity_id(&self) -> proto::ID { proto::ID::new() }
 
     pub fn context(self: &Arc<Self>, data: PA::ContextData) -> Context { Context::new(Node(self.clone()), data) }
@@ -398,7 +378,7 @@ where
 
             let state = entity.to_state()?;
             // Push the state buffers to storage.
-            let collection = self.collection(&event.collection).await;
+            let collection = self.collections.get(&event.collection).await?;
             collection.add_event(&event).await?;
             let changed = collection.set_state(event.entity_id, &state).await?;
 
@@ -511,7 +491,7 @@ where
         }
         debug!("fetch_entity 2");
 
-        let collection = self.collection(collection_id).await;
+        let collection = self.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
                 return self.assert_entity(collection_id, id, &entity_state).await;
@@ -546,7 +526,7 @@ where
         }
 
         // Fetch raw states from storage
-        let storage_collection = self.collection(&collection_id).await;
+        let storage_collection = self.collections.get(&collection_id).await?;
         let states = storage_collection.fetch_states(&args.predicate).await?;
 
         // Convert states to entities
@@ -601,7 +581,7 @@ where
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
         {
             proto::NodeResponseBody::Fetch(states) => {
-                let raw_bucket = self.collection(collection_id).await;
+                let raw_bucket = self.collections.get(collection_id).await?;
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for (id, state) in states {
