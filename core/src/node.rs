@@ -22,7 +22,7 @@ use crate::{
     subscription::SubscriptionHandle,
     task::spawn,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
@@ -219,7 +219,7 @@ where
                 }
             }
             proto::NodeMessage::Response(response) => {
-                info!("Node {} received response {}", self.id, response);
+                debug!("Node {} received response {}", self.id, response);
                 if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }

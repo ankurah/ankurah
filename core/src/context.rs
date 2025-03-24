@@ -157,7 +157,6 @@ impl Context {
                 &collection_id,
                 args,
                 Box::new(move |changeset| {
-                    info!("Node notified");
                     callback(changeset.into());
                 }),
             )

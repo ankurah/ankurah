@@ -7,6 +7,7 @@ use std::{
 
 use ankurah_proto::{Clock, ClockOrdering, Operation};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue};
 
