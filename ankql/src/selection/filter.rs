@@ -20,21 +20,21 @@ pub trait Filterable {
     fn value(&self, name: &str) -> Option<String>;
 }
 
-fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<String, Error> {
+fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<Option<String>, Error> {
     match expr {
         Expr::Literal(lit) => Ok(match lit {
-            Literal::String(s) => s.clone(),
-            Literal::Integer(i) => i.to_string(),
-            Literal::Float(f) => f.to_string(),
-            Literal::Boolean(b) => b.to_string(),
+            Literal::String(s) => Some(s.clone()),
+            Literal::Integer(i) => Some(i.to_string()),
+            Literal::Float(f) => Some(f.to_string()),
+            Literal::Boolean(b) => Some(b.to_string()),
         }),
         Expr::Identifier(id) => match id {
-            Identifier::Property(name) => item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone())),
+            Identifier::Property(name) => Ok(item.value(name)),
             Identifier::CollectionProperty(collection, name) => {
                 if collection != item.collection() {
                     return Err(Error::CollectionMismatch { expected: collection.clone(), actual: item.collection().to_string() });
                 }
-                item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone()))
+                Ok(item.value(name))
             }
         },
         _ => unimplemented!("Only literal and identifier expressions are supported"),
@@ -60,7 +60,7 @@ pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Res
         Predicate::And(left, right) => Ok(evaluate_predicate(item, left)? && evaluate_predicate(item, right)?),
         Predicate::Or(left, right) => Ok(evaluate_predicate(item, left)? || evaluate_predicate(item, right)?),
         Predicate::Not(pred) => Ok(!evaluate_predicate(item, pred)?),
-        Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr).is_err()),
+        Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr)?.is_none()),
         Predicate::True => Ok(true),
         Predicate::False => Ok(false),
     }
