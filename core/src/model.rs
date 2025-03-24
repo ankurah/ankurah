@@ -138,7 +138,6 @@ impl Entity {
         *self.head.lock().unwrap() = head.clone();
         // Hack
         *self.backends.head.lock().unwrap() = head;
-        info!("Apply event MARK 2 new head {}", self.head.lock().unwrap());
 
         Ok(())
     }

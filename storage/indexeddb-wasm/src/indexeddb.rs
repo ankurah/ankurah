@@ -150,10 +150,8 @@ impl StorageEngine for IndexedDBStorageEngine {
 impl StorageCollection for IndexedDBBucket {
     async fn set_state(&self, id: proto::ID, state: &proto::State) -> anyhow::Result<bool> {
         let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        info!("IndexedDBBucket({}) set_state({invocation}) {id} {state}", self.collection_id);
         // Lock the mutex to prevent concurrent updates
         let _lock = self.mutex.lock().await;
-        info!("IndexedDBBucket({}) set_state({invocation}) LOCKED", self.collection_id);
 
         SendWrapper::new(async move {
             // Get the old entity if it exists to check for changes
@@ -177,15 +175,8 @@ impl StorageCollection for IndexedDBBucket {
                 let old_head = js_sys::Reflect::get(&old_entity, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
                 if !old_head.is_undefined() && !old_head.is_null() {
                     let old_clock: proto::Clock = old_head.try_into().map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
-                    info!(
-                        "IndexedDBBucket({}) set_state({invocation}) MARK 1 {} {} old_clock {}",
-                        self.collection_id, id, state, old_clock
-                    );
+
                     if old_clock == state.head {
-                        info!(
-                            "IndexedDBBucket({}) set_state({invocation}) MARK 2 {} {} old_clock {}",
-                            self.collection_id, id, state, old_clock
-                        );
                         // No change in head, skip update
                         // HACK - we still need to lie and return true because there are good odds the other browser is yours
                         // and has already updated the entity 🤦
@@ -196,7 +187,6 @@ impl StorageCollection for IndexedDBBucket {
                     }
                 }
             }
-            info!("IndexedDBBucket({}) set_state({invocation}) MARK 3 ", self.collection_id);
 
             // Create a JS object to store our data
             let entity = js_sys::Object::new();

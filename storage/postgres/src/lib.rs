@@ -379,7 +379,7 @@ impl StorageCollection for PostgresBucket {
                         }
                     }
                     ErrorKind::UndefinedColumn { table, column } => {
-                        println!("Undefined column: {} in table: {:?}", column, table);
+                        info!("Undefined column: {} in table: {:?}, {}", column, table, self.state_table());
                         match table {
                             Some(table) if table == self.state_table() => {
                                 // Modify the predicate treating this column as NULL and retry
@@ -436,6 +436,7 @@ impl StorageCollection for PostgresBucket {
             Ok(affected) => affected,
             Err(err) => {
                 let kind = error_kind(&err);
+                info!("Error: {:?}", err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
                         if table == self.event_table() {
