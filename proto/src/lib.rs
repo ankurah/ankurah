@@ -167,12 +167,7 @@ impl Clock {
 
 impl From<Vec<Uuid>> for Clock {
     fn from(uuids: Vec<Uuid>) -> Self {
-        let ids = uuids
-            .into_iter()
-            .map(|uuid| {
-                ID::from_uuid(uuid)
-            })
-            .collect();
+        let ids = uuids.into_iter().map(|uuid| ID::from_uuid(uuid)).collect();
         Self(ids)
     }
 }

@@ -20,13 +20,9 @@ impl ID {
         ID::from_ulid(ulid)
     }
 
-    pub fn to_ulid(&self) -> Ulid {
-        self.0
-    }
+    pub fn to_ulid(&self) -> Ulid { self.0 }
 
-    pub fn to_uuid(&self) -> uuid::Uuid {
-        self.to_ulid().into()
-    }
+    pub fn to_uuid(&self) -> uuid::Uuid { self.to_ulid().into() }
 
     pub fn to_bytes(&self) -> [u8; 16] { self.0.to_bytes() }
 

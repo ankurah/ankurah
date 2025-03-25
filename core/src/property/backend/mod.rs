@@ -8,8 +8,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub mod lww;
 pub mod entity_ref;
+pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
 use crate::error::RetrievalError;
