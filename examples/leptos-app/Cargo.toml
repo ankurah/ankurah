@@ -1,6 +1,6 @@
 [package]
 name    = "leptos-example"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 publish = false
 
@@ -9,6 +9,6 @@ console_error_panic_hook       = "0.1.7"
 leptos                         = { version = "0.7.4", features = ["csr", "nightly"] }
 ankurah-websocket-client-wasm  = { path = "../../connectors/websocket-client-wasm" }
 ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm" }
-ankurah                        = { path = "../../ankurah", version = "^0.3.0" }
+ankurah                        = { path = "../../ankurah", version = "^0.3.1" }
 example-model                  = { path = "../model" }
 send_wrapper                   = "0.6.0"
