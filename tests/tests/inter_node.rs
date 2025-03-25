@@ -57,7 +57,7 @@ async fn server_edits_subscription() -> Result<()> {
     let (server_watcher, check_server) = common::changeset_watcher::<PetView>();
     let _server_handle = server.subscribe("name = 'Rex' OR (age > 2 and age < 5)", server_watcher).await?;
 
-    assert_eq!(check_server(), vec![] as Vec<Vec<(ID, ChangeKind)>>);
+    assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(ID, ChangeKind)>>);
 
     use ankurah::View;
     // Create initial entities on node1
@@ -185,13 +185,13 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Check server received the change
-    assert_eq!(check_server(), vec![vec![(album_id, ChangeKind::Add)]]);
+    assert_eq!(check_server(), vec![vec![], vec![(album_id, ChangeKind::Add)]]);
 
     // Wait for propagation to client_b
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Check client_b received the change
-    assert_eq!(check_client_b(), vec![vec![(album_id, ChangeKind::Add)]]);
+    assert_eq!(check_client_b(), vec![vec![], vec![(album_id, ChangeKind::Add)]]);
 
     Ok(())
 }

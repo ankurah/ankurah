@@ -88,7 +88,7 @@ async fn complex_local_subscription() {
     };
 
     // Verify initial state
-    assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
+    assert_eq!(check(), vec![vec![], vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
 
     {
         // Update Rex's age to 7
