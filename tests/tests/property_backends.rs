@@ -2,7 +2,7 @@ mod common;
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
     property::{
-        value::{ActiveRef, Ref, LWW},
+        value::{entity_ref::RefTest, ActiveRef, Ref, LWW},
         PropertyError, PropertyValue, YrsString,
     },
     Model, Mutable, Node, PermissiveAgent, Property,
@@ -15,14 +15,14 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 #[derive(Property, Serialize, Deserialize, PartialEq, Eq, Debug)]
-#[wasm_bindgen]
+//#[wasm_bindgen]
 pub enum Visibility {
     Public,
     Unlisted,
     Private,
 }
 
-#[derive(Model, Debug, Serialize, Deserialize)]
+#[derive(Model, Debug)]
 pub struct Video {
     #[active_type(YrsString)]
     pub title: String,

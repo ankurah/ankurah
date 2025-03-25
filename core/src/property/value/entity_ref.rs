@@ -2,6 +2,7 @@ use std::{marker::PhantomData, sync::Arc};
 
 use ankurah_proto::ID;
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::{
     model::{Entity, Model},
@@ -12,6 +13,19 @@ use crate::{
     },
     transaction::Transaction,
 };
+
+#[derive(Debug, Copy, Clone, Default)]
+#[wasm_bindgen()]
+pub struct RefTest {
+    id: Option<ID>,
+}
+
+impl RefTest {
+    pub fn id(id: ID) -> Self { Self { id: Some(id) } }
+    pub fn empty() -> Self { Self { id: None } }
+    pub fn optional(id: Option<ID>) -> Self { Self { id: id } }
+    pub fn get(&self) -> Option<ID> { self.id }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Ref<M: Model> {

@@ -82,7 +82,7 @@ impl PropertyBackend for RefBackend {
         values
     }
 
-    fn property_backend_name() -> String { "lww".to_owned() }
+    fn property_backend_name() -> String { "ref".to_owned() }
 
     // This is identical to [`to_operations`] for [`RefBackend`].
     fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {

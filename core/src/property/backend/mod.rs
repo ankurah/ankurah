@@ -102,6 +102,12 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
             None => LWWBackend::new(),
         };
         Ok(Arc::new(backend))
+    } else if name == "ref" {
+        let backend = match buffer {
+            Some(buffer) => RefBackend::from_state_buffer(buffer)?,
+            None => RefBackend::new(),
+        };
+        Ok(Arc::new(backend))
     }
     /*else if name == "pn" {
         let backend = match buffer {
