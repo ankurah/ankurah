@@ -15,6 +15,19 @@ impl ID {
 
     pub fn from_ulid(ulid: Ulid) -> Self { ID(ulid) }
 
+    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+        let ulid = Ulid::from(uuid);
+        ID::from_ulid(ulid)
+    }
+
+    pub fn to_ulid(&self) -> Ulid {
+        self.0
+    }
+
+    pub fn to_uuid(&self) -> uuid::Uuid {
+        self.to_ulid().into()
+    }
+
     pub fn to_bytes(&self) -> [u8; 16] { self.0.to_bytes() }
 
     pub fn from_base64(base64_string: &str) -> Result<Self, DecodeError> {

@@ -1,8 +1,11 @@
 mod common;
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
-    property::{value::LWW, YrsString},
-    Model, Node, PermissiveAgent, Property,
+    property::{
+        value::{ActiveRef, Ref, LWW},
+        PropertyError, PropertyValue, YrsString,
+    },
+    Model, Mutable, Node, PermissiveAgent, Property,
 };
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -32,13 +35,16 @@ pub struct Video {
     #[active_type(LWW)]
     pub attribution: Option<String>,
 
+    // TODO: How the hell do I get wasm to be fine with this...?
+    #[active_type(ActiveRef)]
+    pub playlist: Ref<Playlist>,
 }
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Playlist {
     pub title: String,
     pub description: Option<String>,
-    pub videos: Edge<Video>,
+    //pub videos: Vec<Ref<Video>>,
 }
 
 #[tokio::test]
@@ -53,6 +59,7 @@ async fn property_backends() -> Result<()> {
             visibility: Visibility::Public,
             //views: 0,
             attribution: None,
+            playlist: Ref::empty(),
         })
         .await;
 
@@ -82,6 +89,8 @@ async fn pg_property_backends() -> Result<()> {
     let client = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
     let trx = client.begin();
+    let cat_playlist = trx.create(&Playlist { title: "My cat videos :D".into(), description: Some("cuddly cats".into()) }).await;
+
     let cat_video = trx
         .create(&Video {
             title: "Cat video #2918".into(),
@@ -89,6 +98,7 @@ async fn pg_property_backends() -> Result<()> {
             visibility: Visibility::Public,
             //views: 0,
             attribution: None,
+            playlist: Ref::id(cat_playlist.id()),
         })
         .await;
 
@@ -99,6 +109,7 @@ async fn pg_property_backends() -> Result<()> {
             visibility: Visibility::Unlisted,
             //views: 5120,
             attribution: Some("That guy".into()),
+            playlist: Ref::id(cat_playlist.id()),
         })
         .await;
 

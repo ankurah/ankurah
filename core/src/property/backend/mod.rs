@@ -9,9 +9,11 @@ use std::{
 };
 
 pub mod lww;
+pub mod entity_ref;
 //pub mod pn_counter;
 pub mod yrs;
 use crate::error::RetrievalError;
+pub use entity_ref::RefBackend;
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
