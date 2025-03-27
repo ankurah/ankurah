@@ -19,7 +19,6 @@ pub mod transaction;
 pub mod value;
 
 pub mod collectionset;
-pub mod edge;
 pub use model::Model;
 pub use node::Node;
 
