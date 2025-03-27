@@ -89,35 +89,28 @@ async fn pg_property_backends() -> Result<()> {
     let client = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
     let trx = client.begin();
-    let cat_playlist = trx.create(&Playlist { title: "My cat videos :D".into(), description: Some("cuddly cats".into()) }).await;
+    let cat_playlist = trx.create(
+        &Playlist { title: "My cat videos :D".into(), description: Some("cuddly cats".into()) }).await;
 
     let cat_video = trx
         .create(&Video {
             title: "Cat video #2918".into(),
             description: Some("Test".into()),
             visibility: Visibility::Public,
-            //views: 0,
             attribution: None,
             playlist: Ref::id(cat_playlist.id()),
         })
         .await;
 
-    let cat_video2 = trx
-        .create(&Video {
-            title: "Cat video #9000".into(),
-            description: None,
-            visibility: Visibility::Unlisted,
-            //views: 5120,
-            attribution: Some("That guy".into()),
-            playlist: Ref::id(cat_playlist.id()),
-        })
-        .await;
-
     let id = cat_video.id();
-    //cat_video.views.add(2); // FIXME: applying twice for some reason
+    let my_video = cat_video.read();
+
     cat_video.visibility.set(&Visibility::Unlisted)?;
     cat_video.title.insert(15, " (Very cute)");
     trx.commit().await?;
+
+
+    let playlist = my_video.playlist()?.get(&trx);
 
     let video = client.get::<VideoView>(id).await?;
     //assert_eq!(video.views().unwrap(), 1);
@@ -126,3 +119,16 @@ async fn pg_property_backends() -> Result<()> {
 
     Ok(())
 }
+
+
+
+    /*let cat_video2 = trx
+        .create(&Video {
+            title: "Cat video #9000".into(),
+            description: None,
+            visibility: Visibility::Unlisted,
+            //views: 5120,
+            attribution: Some("That guy".into()),
+            playlist: Ref::id(cat_playlist.id()),
+        })
+        .await;*/
