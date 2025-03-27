@@ -180,6 +180,7 @@ impl Filterable for Entity {
                     PropertyValue::I64(i) => Some(i.to_string()),
                     PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
                     PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::Ref(id) => Some(id.as_string()),
                 },
                 None => None,
             })
