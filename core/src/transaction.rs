@@ -1,5 +1,4 @@
 use ankurah_proto as proto;
-use std::sync::Arc;
 
 use crate::{
     context::TContext,
@@ -20,7 +19,7 @@ use wasm_bindgen::prelude::*;
 pub struct Transaction {
     pub(crate) dyncontext: Box<dyn TContext + Send + Sync + 'static>,
 
-    entities: AppendOnlyVec<Arc<Entity>>,
+    entities: AppendOnlyVec<Entity>,
 
     // markers
     implicit: bool,
@@ -40,7 +39,7 @@ impl Transaction {
     }
 
     /// Fetch an entity already in the transaction.
-    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Arc<Entity>, RetrievalError> {
+    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Entity, RetrievalError> {
         if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
             return Ok(entity);
         }
@@ -49,14 +48,14 @@ impl Transaction {
         Ok(self.add_entity(upstream.snapshot()))
     }
 
-    fn add_entity(&self, entity: Arc<Entity>) -> &Arc<Entity> {
+    fn add_entity(&self, entity: Entity) -> &Entity {
         let index = self.entities.push(entity);
         &self.entities[index]
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec> {
         let id = self.dyncontext.next_entity_id();
-        let new_entity = Arc::new(model.create_entity(id));
+        let new_entity = model.create_entity(id);
         let entity_ref = self.add_entity(new_entity);
         <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
     }

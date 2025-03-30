@@ -3,6 +3,7 @@ use tracing::debug;
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 
 use crate::property::PropertyValue;
 use crate::{error::RetrievalError, property::Backends};
@@ -12,16 +13,33 @@ use anyhow::Result;
 use ankql::selection::filter::Filterable;
 
 /// An entity represents a unique thing within a collection
+#[derive(Debug, Clone)]
+pub struct Entity(Arc<EntityInner>);
+
 #[derive(Debug)]
-pub struct Entity {
+pub struct EntityInner {
     pub id: ID,
     pub collection: CollectionId,
     pub(crate) backends: Backends,
-    head: Arc<Mutex<Clock>>,
-    pub upstream: Option<Arc<Entity>>,
+    head: Mutex<Clock>,
+    pub upstream: Option<Entity>,
+}
+
+impl std::ops::Deref for Entity {
+    type Target = EntityInner;
+
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+pub struct WeakEntity(Weak<EntityInner>);
+
+impl WeakEntity {
+    pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(|inner| Entity(inner)) }
 }
 
 impl Entity {
+    pub fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
+
     pub fn collection(&self) -> CollectionId { self.collection.clone() }
 
     pub fn backends(&self) -> &Backends { &self.backends }
@@ -30,12 +48,12 @@ impl Entity {
 
     // used by the Model macro
     pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
-        Self { id, collection, backends, head: Arc::new(Mutex::new(Clock::default())), upstream: None }
+        Self(Arc::new(EntityInner { id, collection, backends, head: Mutex::new(Clock::default()), upstream: None }))
     }
     pub fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(state)?;
 
-        Ok(Self { id, collection, backends, head: Arc::new(Mutex::new(state.head.clone())), upstream: None })
+        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: Mutex::new(state.head.clone()), upstream: None })))
     }
 
     /// Collect an event which contains all operations for all backends since the last time they were collected
@@ -118,14 +136,14 @@ impl Entity {
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
-    pub fn snapshot(self: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn snapshot(&self) -> Self {
+        Self(Arc::new(EntityInner {
             id: self.id.clone(),
             collection: self.collection.clone(),
             backends: self.backends.fork(),
-            head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())),
+            head: Mutex::new(self.head.lock().unwrap().clone()),
             upstream: Some(self.clone()),
-        })
+        }))
     }
 }
 

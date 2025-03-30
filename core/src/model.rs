@@ -2,8 +2,6 @@ pub mod tsify;
 
 use ankurah_proto::{CollectionId, State, ID};
 
-use std::sync::Arc;
-
 use crate::entity::Entity;
 use crate::property::Backends;
 use crate::property::PropertyError;
@@ -26,8 +24,8 @@ pub trait View {
     fn id(&self) -> ID { self.entity().id }
     fn backends(&self) -> &Backends { self.entity().backends() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
-    fn entity(&self) -> &Arc<Entity>;
-    fn from_entity(inner: Arc<Entity>) -> Self;
+    fn entity(&self) -> &Entity;
+    fn from_entity(inner: Entity) -> Self;
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
 }
 
@@ -39,14 +37,14 @@ pub trait Mutable<'rec> {
     fn id(&self) -> ID { self.entity().id }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn backends(&self) -> &Backends { &self.entity().backends }
-    fn entity(&self) -> &Arc<Entity>;
-    fn new(inner: &'rec Arc<Entity>) -> Self
+    fn entity(&self) -> &Entity;
+    fn new(inner: &'rec Entity) -> Self
     where Self: Sized;
 
     fn state(&self) -> anyhow::Result<State> { self.entity().to_state() }
 
     fn read(&self) -> Self::View {
-        let inner: &Arc<Entity> = self.entity();
+        let inner = self.entity();
 
         let new_inner = match &inner.upstream {
             // If there is an upstream, use it
