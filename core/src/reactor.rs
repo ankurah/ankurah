@@ -1,7 +1,7 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::collectionset::CollectionSet;
-use crate::model::Entity;
+use crate::entity::Entity;
 use crate::node::MatchArgs;
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
@@ -88,7 +88,7 @@ where
 
         // Convert states to Entity and filter by predicate
         for (id, state) in states {
-            let entity = crate::model::Entity::from_state(id, collection_id.to_owned(), &state)?;
+            let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
             let entity = Arc::new(entity);
 
             // Evaluate predicate for each entity
@@ -200,7 +200,7 @@ where
     }
 
     /// Update entity watchers when an entity's matching status changes
-    fn update_entity_watchers(&self, entity: &Arc<crate::model::Entity>, matching: bool, sub_id: proto::SubscriptionId) {
+    fn update_entity_watchers(&self, entity: &Arc<Entity>, matching: bool, sub_id: proto::SubscriptionId) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
             let mut entities = subscription.matching_entities.lock().unwrap();
             let mut watchers = self.entity_watchers.entry(entity.id.clone()).or_default();

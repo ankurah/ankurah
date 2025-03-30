@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
-    model::Entity,
+    entity::Entity,
     property::{
         backend::LWWBackend,
         traits::{FromActiveType, FromEntity, PropertyError},

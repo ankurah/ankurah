@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    model::Entity,
+    entity::Entity,
     property::{
         backend::{pn_counter::PNValue, PNBackend},
         traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},
@@ -14,8 +14,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct PNCounter<I>
-where 
-    I: Into<PNValue> + From<PNValue> + Copy + Clone,
+where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
     pub property_name: PropertyName,
     pub backend: Weak<PNBackend>,
@@ -24,8 +23,7 @@ where
 
 // Starting with basic string type operations
 impl<I> PNCounter<I>
-where 
-    I: Into<PNValue> + From<PNValue> + Copy + Clone,
+where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
     pub fn new(property_name: PropertyName, backend: Arc<PNBackend>) -> Self {
         Self { property_name, backend: Arc::downgrade(&backend), phantom: PhantomData }
@@ -35,8 +33,7 @@ where
 }
 
 impl<I: From<PNValue>> PNCounter<I>
-where 
-    I: Into<PNValue> + From<PNValue> + Copy + Clone,
+where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
     pub fn value(&self) -> I {
         let pn_value = self.backend().get(self.property_name.clone());
@@ -44,9 +41,8 @@ where
     }
 }
 
-impl<I> FromEntity for PNCounter<I> 
-where 
-    I: Into<PNValue> + From<PNValue> + Copy + Clone,
+impl<I> FromEntity for PNCounter<I>
+where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.backends().get::<PNBackend>().expect("PNBackend should exist");
@@ -55,8 +51,7 @@ where
 }
 
 impl<I> FromActiveType<PNCounter<I>> for I
-where 
-    I: Into<PNValue> + From<PNValue> + Copy + Clone,
+where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
     fn from_active(active: PNCounter<I>) -> Result<Self, PropertyError>
     where Self: Sized {
@@ -65,8 +60,7 @@ where
 }
 
 impl<I> InitializeWith<I> for PNCounter<I>
-where 
-    I: Into<PNValue> + From<PNValue> + Copy + Clone,
+where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &I) -> Self {
         let new = Self::from_entity(property_name, entity);

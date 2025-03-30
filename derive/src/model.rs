@@ -170,14 +170,14 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         #wasm_attributes
         #clone_derive
         pub struct #view_name {
-            entity: std::sync::Arc<::ankurah::model::Entity>,
+            entity: std::sync::Arc<::ankurah::entity::Entity>,
             #(
                 #ephemeral_field_visibility #ephemeral_field_names: #ephemeral_field_types,
             )*
         }
         #[derive(Debug)]
         pub struct #mutable_name<'rec> {
-            entity: &'rec std::sync::Arc<::ankurah::model::Entity>,
+            entity: &'rec std::sync::Arc<::ankurah::entity::Entity>,
             #(#active_field_visibility #active_field_names: #active_field_types,)*
         }
 
@@ -188,11 +188,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             fn collection() -> ankurah::derive_deps::ankurah_proto::CollectionId {
                 #collection_str.into()
             }
-            fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::model::Entity {
+            fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::entity::Entity {
                 use ankurah::property::InitializeWith;
 
                 let backends = ankurah::property::Backends::new();
-                let entity = ankurah::model::Entity::create(
+                let entity = ankurah::entity::Entity::create(
                     id,
                     Self::collection(),
                     backends
@@ -218,11 +218,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 })
             }
 
-            fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
+            fn entity(&self) -> &std::sync::Arc<::ankurah::entity::Entity> {
                 &self.entity
             }
 
-            fn from_entity(entity: std::sync::Arc<::ankurah::model::Entity>) -> Self {
+            fn from_entity(entity: std::sync::Arc<::ankurah::entity::Entity>) -> Self {
                 use ::ankurah::model::View;
                 assert_eq!(Self::collection(), entity.collection);
                 #view_name {
@@ -266,11 +266,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             type Model = #name;
             type View = #view_name;
 
-            fn entity(&self) -> &std::sync::Arc<::ankurah::model::Entity> {
+            fn entity(&self) -> &std::sync::Arc<::ankurah::entity::Entity> {
                 &self.entity
             }
 
-            fn new(entity: &'rec std::sync::Arc<::ankurah::model::Entity>) -> Self {
+            fn new(entity: &'rec std::sync::Arc<::ankurah::entity::Entity>) -> Self {
                 use ankurah::{
                     model::Mutable,
                     property::FromEntity,
