@@ -7,7 +7,7 @@ pub use ankurah_websocket_client_wasm::WebsocketClient;
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
 use send_wrapper::SendWrapper;
-use tracing::{error, info};
+use tracing::error;
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
 pub use example_model::*;

@@ -113,7 +113,6 @@ impl PropertyBackend for YrsBackend {
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
         let state_buffer = txn.encode_state_as_update_v2(&yrs::StateVector::default());
-        // println!("state_buffer: {:?}", state_buffer);
         Ok(state_buffer)
     }
 
@@ -125,9 +124,6 @@ impl PropertyBackend for YrsBackend {
         txn.commit(); // I just don't trust `Drop` too much
         drop(txn);
         let starting_state = doc.transact().state_vector();
-
-        // let text = doc.get_or_insert_text("name"); // We only have one field in the yrs doc
-        // println!("str: {:?}", text.get_string(&doc.transact()));
 
         Ok(Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) })
     }
@@ -146,14 +142,7 @@ impl PropertyBackend for YrsBackend {
         Ok(vec![])
     }
 
-    fn apply_operations(
-        &self,
-        operations: &Vec<Operation>,
-        _current_head: &Clock,
-        _event_head: &Clock,
-        // _context: &Context,
-    ) -> anyhow::Result<()> {
-        // println!("apply operations: {:?}", operations);
+    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> anyhow::Result<()> {
         for operation in operations {
             self.apply_update(&operation.diff)?;
         }

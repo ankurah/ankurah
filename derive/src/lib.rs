@@ -2,6 +2,7 @@ mod model;
 mod property;
 #[cfg(feature = "wasm")]
 mod tsify;
+#[cfg(feature = "wasm")]
 mod wasm_signal;
 
 use proc_macro::TokenStream;

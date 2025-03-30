@@ -1,6 +1,5 @@
 use ankurah_proto::{Clock, CollectionId, Event, State, ID};
-use tracing::info;
-// use futures_signals::signal::Signal;
+use tracing::debug;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -61,7 +60,7 @@ impl Entity {
                 event
             };
 
-            info!("Commit {}", self);
+            debug!("Entity.commit {}", self);
             Ok(Some(event))
         }
     }
@@ -103,7 +102,7 @@ impl Entity {
             self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent /* , context*/)?;
         }
         // TODO figure out how to test this
-        info!("Apply event {}", event);
+        debug!("Entity.apply_event {}", event);
 
         *self.head.lock().unwrap() = head.clone();
         // Hack

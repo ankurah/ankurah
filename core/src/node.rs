@@ -105,7 +105,7 @@ where
         let collections = CollectionSet::new(engine.clone());
         let reactor = Reactor::new(collections.clone(), policy_agent.clone());
         let id = proto::ID::new();
-        info!("Node {} created", id);
+        info!("Node {id} created as ephemeral");
         let node = Node(Arc::new(NodeInner {
             id,
             collections,
@@ -125,8 +125,10 @@ where
         let collections = CollectionSet::new(engine);
         let reactor = Reactor::new(collections.clone(), policy_agent.clone());
 
+        let id = proto::ID::new();
+        info!("Node {id} created as durable");
         let node = Node(Arc::new(NodeInner {
-            id: proto::ID::new(),
+            id,
             collections,
             entities: Arc::new(RwLock::new(BTreeMap::new())),
             peer_connections: DashMap::new(),
@@ -152,7 +154,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
-        info!("Node {} register peer {}", self.id, presence.node_id);
+        info!("Node({}).register_peer {}", self.id, presence.node_id);
         self.peer_connections
             .insert(presence.node_id.clone(), PeerState { sender, _durable: presence.durable, subscriptions: BTreeSet::new() });
         if presence.durable {
@@ -161,7 +163,7 @@ where
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
     pub fn deregister_peer(&self, node_id: proto::ID) {
-        info!("Node {} deregister peer {}", self.id, node_id);
+        info!("Node({}).deregister_peer {}", self.id, node_id);
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);
     }
@@ -190,7 +192,7 @@ where
     pub async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
             proto::NodeMessage::Request(request) => {
-                info!("Node {} received request {}", self.id, request);
+                debug!("Node({}) received request {}", self.id, request);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
                 // I think we want timeouts to be handled by the node, not the connector,
@@ -366,7 +368,7 @@ where
     pub fn context(self: &Arc<Self>, data: PA::ContextData) -> Context { Context::new(Node(self.clone()), data) }
 
     async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::Event>) -> anyhow::Result<()> {
-        info!("Node {} committing events {}", self.id, events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","));
+        debug!("Node({}).commit_events_local {}", self.id, events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","));
         let mut changes = Vec::new();
 
         // First apply events locally
@@ -403,7 +405,7 @@ where
             async move {
                 match self.request(peer_id.clone(), proto::NodeRequestBody::CommitEvents(events)).await {
                     Ok(proto::NodeResponseBody::CommitComplete) => {
-                        info!("Peer {} confirmed commit", peer_id)
+                        debug!("Node({}) Peer {} confirmed commit", self.id, peer_id)
                     }
                     Ok(proto::NodeResponseBody::Error(e)) => warn!("Peer {} error: {}", peer_id, e),
                     Ok(_) => warn!("Peer {} unexpected response type", peer_id),
@@ -484,12 +486,13 @@ where
         id: proto::ID,
         // cdata: &PA::ContextData,
     ) -> Result<Arc<Entity>, RetrievalError> {
-        info!("fetch_entity {:?}-{:?}", id, collection_id);
+        debug!("Node({}).get_entity {:?}-{:?}", self.id, id, collection_id);
 
         if let Some(local) = self.fetch_entity_from_node(id, collection_id).await {
+            debug!("Node({}).get_entity found local entity - returning", self.id);
             return Ok(local);
         }
-        debug!("fetch_entity 2");
+        debug!("Node({}).get_entity fetching from storage", self.id);
 
         let collection = self.collections.get(collection_id).await?;
         match collection.get_state(id).await {
@@ -614,7 +617,7 @@ where
 
 impl<SE, PA> Drop for NodeInner<SE, PA> {
     fn drop(&mut self) {
-        info!("NodeInner {} dropped", self.id);
+        info!("Node({}) dropped", self.id);
     }
 }
 

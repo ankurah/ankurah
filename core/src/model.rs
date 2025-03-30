@@ -1,7 +1,6 @@
 pub mod tsify;
 
 use ankurah_proto::{CollectionId, State, ID};
-use tracing::info;
 
 use std::sync::Arc;
 

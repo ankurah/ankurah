@@ -33,7 +33,6 @@ impl ComparisonIndex {
                 f(entry);
             }
             ast::ComparisonOperator::NotEqual => {
-                println!("{:?}", value.to_bytes());
                 let entry = self.ne.entry(value.to_bytes()).or_default();
                 f(entry);
             }
@@ -80,7 +79,6 @@ impl ComparisonIndex {
     }
 
     pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<proto::SubscriptionId> {
-        println!("{:?}", value.to_bytes());
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
