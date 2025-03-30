@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::warn;
 
 use ankurah_core::{
     entity::Entity,
@@ -110,7 +111,6 @@ impl StorageCollection for SledStorageCollection {
         task::spawn_blocking(move || -> Result<Vec<(ID, State)>, RetrievalError> {
             let mut results = Vec::new();
             let mut seen_ids = HashSet::new();
-            // println!("SledStorageEngine: Starting fetch_states scan");
 
             // For now, do a full table scan
             for item in copied_state {
@@ -119,7 +119,7 @@ impl StorageCollection for SledStorageCollection {
 
                 // Skip if we've already seen this ID
                 if seen_ids.contains(&id) {
-                    println!("SledStorageEngine: Skipping duplicate entity with ID: {:?}", id);
+                    warn!("Skipping duplicate entity with ID: {:?}", id);
                     continue;
                 }
 
@@ -130,16 +130,11 @@ impl StorageCollection for SledStorageCollection {
 
                 // Apply predicate filter
                 if evaluate_predicate(&entity, &predicate)? {
-                    // println!("SledStorageEngine: Found matching entity with ID: {:?}", id);
                     seen_ids.insert(id);
                     results.push((id, entity_state));
                 }
             }
 
-            // println!(
-            //     "SledStorageEngine: Finished fetch_states scan, found {} matches",
-            //     results.len()
-            // );
             Ok(results)
         })
         .await

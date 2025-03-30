@@ -21,7 +21,7 @@ use ankurah_proto::{Clock, CollectionId, Event, ID};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct Postgres {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
@@ -98,11 +98,12 @@ impl PostgresBucket {
 
     /// Rebuild the cache of columns in the table.
     pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> anyhow::Result<()> {
+        debug!("PostgresBucket({}).rebuild_columns_cache", self.collection_id);
         let column_query = format!(
             r#"SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_catalog = $1 AND table_name = $2;"#,
         );
         let mut new_columns = Vec::new();
-        info!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &self.schema, &self.collection_id.as_str());
+        debug!("Querying existing columns: {:?}, [{:?}, {:?}]", column_query, &self.schema, &self.collection_id.as_str());
         let rows = client.query(&column_query, &[&self.schema, &self.collection_id.as_str()]).await?;
         for row in rows {
             let is_nullable: String = row.get("is_nullable");
@@ -138,7 +139,7 @@ impl PostgresBucket {
             self.event_table()
         );
 
-        info!("Applying DDL: {}", create_query);
+        debug!("{create_query}");
         client.execute(&create_query, &[]).await?;
         Ok(())
     }
@@ -147,11 +148,11 @@ impl PostgresBucket {
         let create_query =
             format!(r#"CREATE TABLE IF NOT EXISTS "{}"("id" UUID UNIQUE, "state_buffer" BYTEA, "head" UUID[])"#, self.state_table());
 
-        info!("Applying DDL: {}", create_query);
+        debug!("{create_query}");
         match client.execute(&create_query, &[]).await {
             Ok(_) => Ok(()),
             Err(err) => {
-                info!("Error: {}", err);
+                error!("Error: {}", err);
                 // if err.code() == Some(SqlState::UNIQUE_VIOLATION) {
                 //     Ok(())
                 // } else {
@@ -169,7 +170,7 @@ impl PostgresBucket {
         for (column, datatype) in missing {
             if Postgres::sane_name(&column) {
                 let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.state_table(), column, datatype,);
-                info!("Running: {}", alter_query);
+                info!("PostgresBucket({}).add_missing_columns: {}", self.collection_id, alter_query);
                 match client.execute(&alter_query, &[]).await {
                     Ok(_) => {}
                     Err(err) => {
@@ -266,7 +267,7 @@ impl StorageCollection for PostgresBucket {
             columns_update_str
         );
 
-        info!("Querying: {}", query);
+        debug!("PostgresBucket({}).set_state: {}", self.collection_id, query);
         let row = match client.query_one(&query, params.as_slice()).await {
             Ok(row) => row,
             Err(err) => {
@@ -295,7 +296,7 @@ impl StorageCollection for PostgresBucket {
             }
         };
 
-        info!("Changed: {}", changed);
+        debug!("PostgresBucket({}).set_state: Changed: {}", self.collection_id, changed);
         Ok(changed)
     }
 
@@ -313,7 +314,7 @@ impl StorageCollection for PostgresBucket {
             }
         };
 
-        info!("Getting state: {}", query);
+        debug!("PostgresBucket({}).get_state: {}", self.collection_id, query);
         let row = match client.query_one(&query, &[&uuid]).await {
             Ok(row) => row,
             Err(err) => {
@@ -335,7 +336,7 @@ impl StorageCollection for PostgresBucket {
             }
         };
 
-        info!("Row: {:?}", row);
+        debug!("PostgresBucket({}).get_state: Row: {:?}", self.collection_id, row);
         let row_id: uuid::Uuid = row.get("id");
         assert_eq!(row_id, uuid);
 
@@ -346,7 +347,7 @@ impl StorageCollection for PostgresBucket {
     }
 
     async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
-        println!("Fetching states for: {:?}", predicate);
+        debug!("fetch_states: {:?}", predicate);
         let client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
 
         let mut results = Vec::new();
@@ -362,7 +363,7 @@ impl StorageCollection for PostgresBucket {
             format!(r#"SELECT "id", "state_buffer", "head" FROM "{}""#, self.state_table())
         };
 
-        info!("SQL: {} with args: {:?}", filtered_query, args);
+        debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, filtered_query, args);
 
         let rows = match client.query_raw(&filtered_query, args).await {
             Ok(stream) => match stream.try_collect::<Vec<_>>().await {
@@ -379,7 +380,8 @@ impl StorageCollection for PostgresBucket {
                         }
                     }
                     ErrorKind::UndefinedColumn { table, column } => {
-                        info!("Undefined column: {} in table: {:?}, {}", column, table, self.state_table());
+                        // not an error, just didn't write the column yet
+                        debug!("Undefined column: {} in table: {:?}, {}", column, table, self.state_table());
                         match table {
                             Some(table) if table == self.state_table() => {
                                 // Modify the predicate treating this column as NULL and retry
@@ -431,12 +433,11 @@ impl StorageCollection for PostgresBucket {
         let query = format!(r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent") VALUES($1, $2, $3, $4)"#, self.event_table(),);
 
         let mut client = self.pool.get().await?;
-        info!("Running: {}", query);
+        debug!("PostgresBucket({}).add_event: {}", self.collection_id, query);
         let affected = match client.execute(&query, &[&event_id, &entity_id, &operations, &parent_uuids]).await {
             Ok(affected) => affected,
             Err(err) => {
                 let kind = error_kind(&err);
-                info!("Error: {:?}", err);
                 match kind {
                     ErrorKind::UndefinedTable { table } => {
                         if table == self.event_table() {
@@ -444,7 +445,9 @@ impl StorageCollection for PostgresBucket {
                             return self.add_event(entity_event).await; // retry
                         }
                     }
-                    _ => {}
+                    _ => {
+                        error!("PostgresBucket({}).add_event: Error: {:?}", self.collection_id, err);
+                    }
                 }
 
                 return Err(err.into());
@@ -460,7 +463,7 @@ impl StorageCollection for PostgresBucket {
         let entity_uuid = uuid::Uuid::from(ulid::Ulid::from(entity_id));
 
         let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
-        info!("Running: {}", query);
+        debug!("PostgresBucket({}).get_events: {}", self.collection_id, query);
         let rows = match client.query(&query, &[&entity_uuid]).await {
             Ok(rows) => rows,
             Err(err) => {
@@ -553,9 +556,6 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
             // "column "status" does not exist"
             let quotes = quote_indices(&string);
             let column = string[quotes[0] + 1..quotes[1]].to_owned();
-
-            println!("quotes: {:?}", quotes);
-            println!("column: {}", column);
 
             let table = if quotes.len() >= 4 {
                 // Full format with table name

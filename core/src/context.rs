@@ -12,7 +12,6 @@ use crate::{
 };
 use ankurah_proto as proto;
 use async_trait::async_trait;
-use tracing::info;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 

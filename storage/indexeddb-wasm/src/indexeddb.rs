@@ -11,6 +11,7 @@ use send_wrapper::SendWrapper;
 use std::any::Any;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use tracing::debug;
 use tracing::info;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -38,7 +39,7 @@ pub struct IndexedDBBucket {
 
 impl IndexedDBStorageEngine {
     pub async fn open(name: &str) -> anyhow::Result<Self> {
-        info!("Opening database: {}", name);
+        info!("IndexedDBStorageEngine.open({})", name);
         // Validate database name
         if name.is_empty() {
             return Err(anyhow::anyhow!("Database name cannot be empty"));
@@ -149,7 +150,7 @@ impl StorageEngine for IndexedDBStorageEngine {
 #[async_trait]
 impl StorageCollection for IndexedDBBucket {
     async fn set_state(&self, id: proto::ID, state: &proto::State) -> anyhow::Result<bool> {
-        let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Lock the mutex to prevent concurrent updates
         let _lock = self.mutex.lock().await;
 
@@ -339,9 +340,9 @@ impl StorageCollection for IndexedDBBucket {
 
     async fn add_event(&self, entity_event: &ankurah_proto::Event) -> anyhow::Result<bool> {
         let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        info!("IndexedDBBucket({}) add_event({invocation})", self.collection_id);
+        debug!("IndexedDBBucket({}).add_event({})", self.collection_id, invocation);
         let _lock = self.mutex.lock().await;
-        info!("IndexedDBBucket({}) add_event({invocation}) LOCKED", self.collection_id);
+        debug!("IndexedDBBucket({}).add_event({}) LOCKED", self.collection_id, invocation);
 
         SendWrapper::new(async move {
             let transaction = self

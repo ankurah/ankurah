@@ -4,7 +4,7 @@ use ankurah_core::connector::{PeerSender, SendError};
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::debug;
 
 // PeerSender for sending messages to a websocket client
 #[derive(Clone)]
@@ -61,7 +61,7 @@ impl PeerSender for WebSocketClientSender {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        info!("Dropping WebSocketPeerSender Inner for {}", self.recipient_node_id);
+        debug!("Dropping WebSocketPeerSender Inner for {}", self.recipient_node_id);
         self.handle.abort();
     }
 }

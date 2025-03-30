@@ -6,11 +6,12 @@ use syn::{parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArgume
 pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let input = parse_macro_input!(stream as DeriveInput);
     let name = input.ident.clone();
-    let name_str = name.to_string();
     let collection_str = name.to_string().to_lowercase();
     let view_name = format_ident!("{}View", name);
     let mutable_name = format_ident!("{}Mut", name);
+    #[cfg(feature = "wasm")]
     let resultset_name = format_ident!("{}ResultSet", name);
+    #[cfg(feature = "wasm")]
     let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
     let clone_derive = if !get_model_flag(&input.attrs, "no_clone") {
         quote! { #[derive(Clone)] }
@@ -67,8 +68,8 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
     #[cfg(feature = "wasm")]
     let wasm_impl = {
-        let namespace_struct = format_ident!("NS_{}", name_str);
-        let pojo_interface = format_ident!("{}Pojo", name_str);
+        let namespace_struct = format_ident!("NS_{}", name);
+        let pojo_interface = format_ident!("{}Pojo", name);
 
         // We have copied the internals of the `tsify` crate into the `tsify` directory.
         // The purpose of which is to generate the Wasm ABI for the model struct so the Pojo version of the struct can be used to call methods which accept the Model struct
@@ -82,7 +83,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         // We have to generate the typescript interface for the static methods because the name of the pojo interface is different from the name of the model class
         // Maybe there's a more elegant way to do this later, but this gets the job done.
-        let static_methods_ts = get_static_methods_ts(&name_str, &view_name, &resultset_signal_name, &pojo_interface);
+        let static_methods_ts = get_static_methods_ts(&name, &view_name, &resultset_signal_name, &pojo_interface);
 
         quote! {
 
@@ -470,31 +471,32 @@ pub fn expand_ts_model_type(input: &DeriveInput, interface_name: String) -> syn:
     Ok(tokens)
 }
 
+#[cfg(feature = "wasm")]
 fn get_static_methods_ts(
-    name_str: &String,
+    name: &syn::Ident,
     view_name: &syn::Ident,
     resultset_signal_name: &syn::Ident,
     pojo_interface: &syn::Ident,
 ) -> String {
     format!(
-        r#"export class {name_str} {{
+        r#"export class {name} {{
         /**
-         * Get a single {name_str} by ID
+         * Get a single {name} by ID
          */
         static get(context: Context, id: ID): Promise<{view_name}>;
 
         /**
-         * Fetch all {name_str}s that match the predicate
+         * Fetch all {name}s that match the predicate
          */
         static fetch(context: Context, predicate: string): Promise<{view_name}[]>;
 
         /**
-         * Subscribe to the set of {name_str}s that match the predicate
+         * Subscribe to the set of {name}s that match the predicate
          */
         static subscribe(context: Context, predicate: string): {resultset_signal_name};
 
         /**
-         * Create a new {name_str}
+         * Create a new {name}
          */
         static create(transaction: Transaction, me: {pojo_interface}): Promise<void>;
 }}"#

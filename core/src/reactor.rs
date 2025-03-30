@@ -13,7 +13,7 @@ use ankql::selection::filter::Filterable;
 use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::info;
+use tracing::debug;
 
 use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -143,8 +143,7 @@ where
                     match op {
                         WatcherOp::Add => {
                             let entry = self.index_watchers.entry((collection_id.clone(), field_id));
-                            let foo = entry.or_default().add((*literal).clone(), operator.clone(), sub_id);
-                            info!("recurse_predicate add: {:?}", foo);
+                            entry.or_default().add((*literal).clone(), operator.clone(), sub_id);
                         }
                         WatcherOp::Remove => {
                             if let Some(mut index) = self.index_watchers.get_mut(&(collection_id.clone(), field_id)) {
@@ -225,7 +224,7 @@ where
     /// Notify subscriptions about an entity change
 
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
-        info!("notify_change notified");
+        debug!("Reactor.notify_change({:?})", changes);
         // Group changes by subscription
         let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Arc<Entity>>>> =
             std::collections::HashMap::new();
@@ -233,7 +232,7 @@ where
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
 
-            info!("index watchers: {:?}", self.index_watchers);
+            debug!("Reactor - index watchers: {:?}", self.index_watchers);
             // Find subscriptions that might be interested based on index watchers
             for index_ref in self.index_watchers.iter() {
                 // Get the field value from the entity
@@ -245,7 +244,7 @@ where
                 }
             }
 
-            info!("wildcard watchers: {:?}", self.wildcard_watchers);
+            debug!("wildcard watchers: {:?}", self.wildcard_watchers);
             // Also check wildcard watchers for this collection
             if let Some(watchers) = self.wildcard_watchers.get(&change.entity.collection) {
                 for watcher in watchers.iter() {
@@ -260,18 +259,18 @@ where
                 }
             }
 
-            info!(" possibly_interested_subs: {possibly_interested_subs:?}");
+            debug!(" possibly_interested_subs: {possibly_interested_subs:?}");
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
                     let entity = &change.entity;
                     // Use evaluate_predicate directly on the entity instead of fetch_entities
-                    info!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
+                    debug!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
                     let matches = ankql::selection::filter::evaluate_predicate(&**entity, &subscription.predicate).unwrap_or(false);
 
                     let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id == entity.id);
                     use ankql::selection::filter::Filterable;
-                    info!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id, entity.value("status"));
+                    debug!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id, entity.value("status"));
 
                     // Update entity watchers and notify subscription if needed
                     self.update_entity_watchers(entity, matches, sub_id);

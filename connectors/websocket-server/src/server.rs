@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use std::{net::SocketAddr, ops::ControlFlow};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
-use tracing::{info, warn, Level};
+use tracing::{debug, info, warn, Level};
 
 use ankurah_core::{node::Node, policy::PolicyAgent};
 
@@ -51,7 +51,7 @@ where
         );
 
         let listener = tokio::net::TcpListener::bind(bind_address).await?;
-        info!("listening on {}", listener.local_addr()?);
+        info!("Websocket server listening on {}", listener.local_addr()?);
 
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
@@ -69,7 +69,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    info!("Upgrading connection");
+    debug!("Websocket server upgrading connection");
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
     println!("`{user_agent}` at {addr} connected.");
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
@@ -80,7 +80,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    println!("Connected to {}", who);
+    info!("Websocket server connected to {}", who);
 
     let (sender, mut receiver) = socket.split();
     let mut conn = Connection::Initial(Some(sender));
