@@ -4,7 +4,7 @@ use ankurah::{
     Mutable, Node, PermissiveAgent, ResultSet,
 };
 use ankurah_storage_sled::SledStorageEngine;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod common;
 use common::{Album, AlbumView, Pet, PetView};
@@ -24,7 +24,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     }
 
     // Set up subscription
-    let received_changesets = Arc::new(Mutex::new(Vec::new()));
+    let received_changesets = Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_changesets_clone = received_changesets.clone();
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();

@@ -1,9 +1,7 @@
 use ankurah_proto::{Clock, CollectionId, Event, State, ID};
 use tracing::debug;
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use crate::property::PropertyValue;
 use crate::{error::RetrievalError, property::Backends};
@@ -21,7 +19,7 @@ pub struct EntityInner {
     pub id: ID,
     pub collection: CollectionId,
     pub(crate) backends: Backends,
-    head: Mutex<Clock>,
+    head: std::sync::RwLock<Clock>,
     pub upstream: Option<Entity>,
 }
 
@@ -48,12 +46,12 @@ impl Entity {
 
     // used by the Model macro
     pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
-        Self(Arc::new(EntityInner { id, collection, backends, head: Mutex::new(Clock::default()), upstream: None }))
+        Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::RwLock::new(Clock::default()), upstream: None }))
     }
     pub fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(state)?;
 
-        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: Mutex::new(state.head.clone()), upstream: None })))
+        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::RwLock::new(state.head.clone()), upstream: None })))
     }
 
     /// Collect an event which contains all operations for all backends since the last time they were collected
@@ -64,19 +62,10 @@ impl Entity {
         if operations.is_empty() {
             Ok(None)
         } else {
-            let event = {
-                let event = Event {
-                    id: ID::new(),
-                    entity_id: self.id.clone(),
-                    collection: self.collection.clone(),
-                    operations,
-                    parent: self.head.lock().unwrap().clone(),
-                };
-
-                // Set the head to the event's ID
-                *self.head.lock().unwrap() = Clock::new([event.id]);
-                event
-            };
+            let mut head = self.head.write().unwrap();
+            let id = ID::new();
+            let parent = std::mem::replace(&mut *head, Clock::new([id]));
+            let event = Event { id, entity_id: self.id.clone(), collection: self.collection.clone(), operations, parent };
 
             debug!("Entity.commit {}", self);
             Ok(Some(event))
@@ -122,7 +111,7 @@ impl Entity {
         // TODO figure out how to test this
         debug!("Entity.apply_event {}", event);
 
-        *self.head.lock().unwrap() = head.clone();
+        *self.head.write().unwrap() = head.clone();
         // Hack
         *self.backends.head.lock().unwrap() = head;
 
@@ -141,7 +130,7 @@ impl Entity {
             id: self.id.clone(),
             collection: self.collection.clone(),
             backends: self.backends.fork(),
-            head: Mutex::new(self.head.lock().unwrap().clone()),
+            head: std::sync::RwLock::new(self.head.read().unwrap().clone()),
             upstream: Some(self.clone()),
         }))
     }
@@ -176,6 +165,6 @@ impl Filterable for Entity {
 
 impl std::fmt::Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
+        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.read().unwrap())
     }
 }

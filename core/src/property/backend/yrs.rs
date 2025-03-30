@@ -1,9 +1,4 @@
-use std::{
-    any::Any,
-    collections::BTreeMap,
-    fmt::Debug,
-    sync::{Arc, Mutex},
-};
+use std::{any::Any, collections::BTreeMap, fmt::Debug, sync::Arc};
 
 use ankurah_proto::Clock;
 use yrs::Update;
@@ -18,7 +13,7 @@ use crate::property::{
 #[derive(Debug, Clone)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
-    previous_state: Arc<Mutex<StateVector>>,
+    previous_state: Arc<std::sync::Mutex<StateVector>>,
 }
 
 impl Default for YrsBackend {
@@ -29,7 +24,7 @@ impl YrsBackend {
     pub fn new() -> Self {
         let doc = yrs::Doc::new();
         let starting_state = doc.transact().state_vector();
-        Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) }
+        Self { doc, previous_state: Arc::new(std::sync::Mutex::new(starting_state)) }
     }
 
     pub fn get_string(&self, property_name: impl AsRef<str>) -> Option<String> {
@@ -125,7 +120,7 @@ impl PropertyBackend for YrsBackend {
         drop(txn);
         let starting_state = doc.transact().state_vector();
 
-        Ok(Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) })
+        Ok(Self { doc, previous_state: Arc::new(std::sync::Mutex::new(starting_state)) })
     }
 
     fn to_operations(&self) -> anyhow::Result<Vec<Operation>> {

@@ -7,8 +7,8 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use js_sys::Uint8Array;
 use send_wrapper::SendWrapper;
+use std::cell::OnceCell;
 use std::sync::{Arc, Weak};
-use std::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use wasm_bindgen::prelude::*;
 use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
@@ -19,10 +19,10 @@ pub struct Connection(Arc<SendWrapper<ConnectionInner>>);
 pub struct ConnectionInner {
     ws: Arc<WebSocket>,
     url: String,
-    state: RwLock<ConnectionState>,
+    state: std::sync::RwLock<ConnectionState>,
     node: Box<dyn NodeComms>,
     client: Weak<ClientInner>,
-    _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
+    _callbacks: OnceCell<Option<Vec<Box<dyn std::any::Any>>>>,
 }
 impl std::ops::Deref for Connection {
     type Target = ConnectionInner;
@@ -44,7 +44,7 @@ impl Connection {
             state,
             node,
             client,
-            _callbacks: Mutex::new(None),
+            _callbacks: OnceCell::new(),
         })));
 
         let on_message = {
@@ -73,7 +73,7 @@ impl Connection {
         me.ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         me.ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
-        *me._callbacks.lock().unwrap() = Some(vec![Box::new(on_message), Box::new(on_error), Box::new(on_close), Box::new(on_open)]);
+        me._callbacks.set(Some(vec![Box::new(on_message), Box::new(on_error), Box::new(on_close), Box::new(on_open)])).unwrap();
 
         Ok(me)
     }
@@ -188,7 +188,6 @@ impl ConnectionInner {
         self.ws.set_onopen(None);
         // Close the WebSocket connection with a normal closure (code 1000)
         let _ = self.ws.close();
-        self._callbacks.lock().unwrap().take();
         if let ConnectionState::Connected { server_presence, .. } = &*self.state.read().unwrap() {
             self.node.deregister_peer(server_presence.node_id.clone());
         }

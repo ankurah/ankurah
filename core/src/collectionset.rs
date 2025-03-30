@@ -1,10 +1,6 @@
-use std::{
-    collections::{btree_map::Entry, BTreeMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use ankurah_proto::CollectionId;
-use tokio::sync::RwLock;
 
 use crate::{
     error::RetrievalError,
@@ -19,29 +15,27 @@ impl<SE> Clone for CollectionSet<SE> {
 
 pub struct Inner<SE> {
     storage_engine: Arc<SE>,
-    collections: RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
+    collections: std::sync::RwLock<BTreeMap<CollectionId, StorageCollectionWrapper>>,
 }
 
 impl<SE: StorageEngine> CollectionSet<SE> {
-    pub fn new(storage_engine: Arc<SE>) -> Self { Self(Arc::new(Inner { storage_engine, collections: RwLock::new(BTreeMap::new()) })) }
+    pub fn new(storage_engine: Arc<SE>) -> Self {
+        Self(Arc::new(Inner { storage_engine, collections: std::sync::RwLock::new(BTreeMap::new()) }))
+    }
 
     pub async fn get(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        let collections = self.0.collections.read().await;
-        if let Some(store) = collections.get(id) {
-            return Ok(store.clone());
+        {
+            if let Some(store) = self.0.collections.read().unwrap().get(id) {
+                return Ok(store.clone());
+            }
         }
-        drop(collections);
 
         let collection = StorageCollectionWrapper::new(self.0.storage_engine.collection(id).await?);
 
-        let mut collections = self.0.collections.write().await;
-
-        // We might have raced with another node to create this collection
-        if let Entry::Vacant(entry) = collections.entry(id.clone()) {
-            entry.insert(collection.clone());
+        {
+            // We might have raced with another node to create this collection
+            let mut collections = self.0.collections.write().unwrap();
+            Ok(collections.entry(id.clone()).or_insert_with(|| collection.clone()).clone())
         }
-        drop(collections);
-
-        Ok(collection)
     }
 }

@@ -11,15 +11,11 @@ use std::{
 pub struct Pubkey(pub [u8; 32]);
 impl Deref for Pubkey {
     type Target = [u8; 32];
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl Hash for Pubkey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
+    fn hash<H: Hasher>(&self, state: &mut H) { self.0.hash(state); }
 }
 
 pub struct ULAD {
@@ -40,26 +36,13 @@ use once_cell::sync::Lazy;
 pub static AGENT_REGISTRY: Lazy<AgentRegistry> = Lazy::new(|| AgentRegistry::new());
 
 impl From<ULAD> for ULADCompact {
-    fn from(lad: ULAD) -> Self {
-        Self {
-            timestamp: lad.timestamp,
-            agent: AGENT_REGISTRY.pubkey_to_id(&lad.agent),
-            sequence: lad.sequence,
-        }
-    }
+    fn from(lad: ULAD) -> Self { Self { timestamp: lad.timestamp, agent: AGENT_REGISTRY.pubkey_to_id(&lad.agent), sequence: lad.sequence } }
 }
 impl From<ULADCompact> for ULAD {
     fn from(lad: ULADCompact) -> Self {
-        Self {
-            timestamp: lad.timestamp,
-            agent: AGENT_REGISTRY.id_to_pubkey(lad.agent).unwrap(),
-            sequence: lad.sequence,
-        }
+        Self { timestamp: lad.timestamp, agent: AGENT_REGISTRY.id_to_pubkey(lad.agent).unwrap(), sequence: lad.sequence }
     }
 }
-
-///
-use std::sync::Mutex;
 
 pub struct AgentRegistry {
     inner: Mutex<AgentRegistryInner>,
@@ -73,13 +56,7 @@ struct AgentRegistryInner {
 
 impl AgentRegistry {
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(AgentRegistryInner {
-                agent_counter: 0,
-                forward_map: HashMap::new(),
-                reverse_map: HashMap::new(),
-            }),
-        }
+        Self { inner: Mutex::new(AgentRegistryInner { agent_counter: 0, forward_map: HashMap::new(), reverse_map: HashMap::new() }) }
     }
 
     pub fn pubkey_to_id(&self, agent: &Pubkey) -> u64 {

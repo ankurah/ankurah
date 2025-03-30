@@ -75,6 +75,8 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 //     }
 // }
 
+// TODO - consolidate struct Backends into Entity
+
 /// Holds the property backends inside of entities.
 #[derive(Debug)]
 pub struct Backends {

@@ -8,7 +8,7 @@ use ankurah::{
     Model,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Model, Serialize, Deserialize)]
 pub struct Pet {
@@ -29,7 +29,7 @@ fn init_tracing() { tracing_subscriber::fmt().with_max_level(Level::INFO).with_t
 #[allow(unused)]
 pub fn changeset_watcher<R: View + Send + Sync + 'static>(
 ) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<Vec<(proto::ID, ChangeKind)>> + Send + Sync>) {
-    let changes = Arc::new(Mutex::new(Vec::new()));
+    let changes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let watcher = {
         let changes = changes.clone();
         Box::new(move |changeset: ChangeSet<R>| {

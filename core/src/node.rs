@@ -3,11 +3,10 @@ use anyhow::anyhow;
 use dashmap::{DashMap, DashSet};
 use rand::prelude::*;
 use std::{
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
     ops::Deref,
     sync::{Arc, Weak},
 };
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::oneshot;
 
 use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
@@ -27,7 +26,7 @@ use tracing::{debug, info, warn};
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
-    subscriptions: BTreeSet<proto::SubscriptionId>,
+    subscriptions: DashSet<proto::SubscriptionId>,
 }
 
 pub struct MatchArgs {
@@ -83,7 +82,7 @@ pub struct NodeInner<SE, PA> {
     pub durable: bool,
     pub collections: CollectionSet<SE>,
 
-    entities: Arc<RwLock<EntityMap>>,
+    entities: EntityMap,
     // peer_connections: Vec<PeerConnection>,
     peer_connections: DashMap<proto::ID, PeerState>,
     durable_peers: DashSet<proto::ID>,
@@ -94,7 +93,7 @@ pub struct NodeInner<SE, PA> {
     _policy_agent: PA,
 }
 
-type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), WeakEntity>;
+type EntityMap = DashMap<(proto::ID, proto::CollectionId), WeakEntity>;
 
 impl<SE, PA> Node<SE, PA>
 where
@@ -109,7 +108,7 @@ where
         let node = Node(Arc::new(NodeInner {
             id,
             collections,
-            entities: Arc::new(RwLock::new(BTreeMap::new())),
+            entities: EntityMap::new(),
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
@@ -130,7 +129,7 @@ where
         let node = Node(Arc::new(NodeInner {
             id,
             collections,
-            entities: Arc::new(RwLock::new(BTreeMap::new())),
+            entities: EntityMap::new(),
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
@@ -156,7 +155,7 @@ where
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node({}).register_peer {}", self.id, presence.node_id);
         self.peer_connections
-            .insert(presence.node_id.clone(), PeerState { sender, _durable: presence.durable, subscriptions: BTreeSet::new() });
+            .insert(presence.node_id.clone(), PeerState { sender, _durable: presence.durable, subscriptions: DashSet::new() });
         if presence.durable {
             self.durable_peers.insert(presence.node_id.clone());
         }
@@ -252,7 +251,7 @@ where
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
                 self.reactor.unsubscribe(subscription_id);
                 // Remove and drop the subscription handle
-                if let Some(mut peer_state) = self.peer_connections.get_mut(&request.from) {
+                if let Some(peer_state) = self.peer_connections.get_mut(&request.from) {
                     peer_state.subscriptions.remove(&subscription_id);
                 }
                 Ok(proto::NodeResponseBody::Success)
@@ -356,7 +355,7 @@ where
         };
 
         // Store the subscription handle
-        if let Some(mut peer_state) = self.peer_connections.get_mut(&peer_id) {
+        if let Some(peer_state) = self.peer_connections.get_mut(&peer_id) {
             peer_state.subscriptions.insert(sub_id);
         }
 
@@ -424,7 +423,8 @@ where
     /// TODO: Discuss. The upside is that you can call .read() on a Mutable. The downside is that the behavior is inconsistent
     /// between newly created Entities and Entities that are created in a transaction scope.
     pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Entity) -> anyhow::Result<()> {
-        match self.entities.write().await.entry((entity.id, entity.collection.clone())) {
+        use dashmap::mapref::entry::Entry;
+        match self.entities.entry((entity.id, entity.collection.clone())) {
             Entry::Vacant(entry) => {
                 entry.insert(entity.weak());
                 Ok(())
@@ -443,9 +443,9 @@ where
         id: proto::ID,
         state: &proto::State,
     ) -> Result<Entity, RetrievalError> {
-        let mut entities = self.entities.write().await;
+        use dashmap::mapref::entry::Entry;
 
-        match entities.entry((id, collection_id.clone())) {
+        match self.entities.entry((id, collection_id.clone())) {
             Entry::Occupied(mut entry) => {
                 if let Some(entity) = entry.get().upgrade() {
                     entity.apply_state(state)?;
@@ -465,9 +465,8 @@ where
     }
 
     pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection_id: &CollectionId) -> Option<Entity> {
-        let entities = self.entities.read().await;
         // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(&(id, collection_id.clone())) {
+        if let Some(entity) = self.entities.get(&(id, collection_id.clone())) {
             entity.upgrade()
         } else {
             None
