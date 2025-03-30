@@ -1,7 +1,7 @@
 use ankurah_proto::{Clock, ClockOrdering};
 use anyhow::Result;
 
-use crate::{error::RetrievalError, model::Entity, property::PropertyName};
+use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
 
 use thiserror::Error;
 

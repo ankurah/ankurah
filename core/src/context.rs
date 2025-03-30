@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
+    entity::Entity,
     error::RetrievalError,
-    model::{Entity, View},
+    model::View,
     node::{MatchArgs, Node},
     policy::PolicyAgent,
     resultset::ResultSet,

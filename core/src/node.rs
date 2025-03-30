@@ -14,15 +14,15 @@ use crate::{
     collectionset::CollectionSet,
     connector::PeerSender,
     context::Context,
+    entity::Entity,
     error::{RequestError, RetrievalError},
-    model::Entity,
     policy::PolicyAgent,
     reactor::Reactor,
-    storage::{StorageCollectionWrapper, StorageEngine},
+    storage::StorageEngine,
     subscription::SubscriptionHandle,
     task::spawn,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 pub struct PeerState {
     sender: Box<dyn PeerSender>,

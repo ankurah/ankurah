@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ankurah_core::{
+    entity::Entity,
     error::RetrievalError,
-    model::Entity,
     storage::{StorageCollection, StorageEngine},
 };
 

@@ -1,7 +1,4 @@
-use crate::{
-    model::{Entity, View},
-    resultset::ResultSet,
-};
+use crate::{entity::Entity, model::View, resultset::ResultSet};
 use ankurah_proto::Event;
 use std::sync::Arc;
 

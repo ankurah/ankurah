@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use crate::{
     context::TContext,
+    entity::Entity,
     error::RetrievalError,
-    model::{Entity, Mutable},
-    Model,
+    model::{Model, Mutable},
 };
 
 use append_only_vec::AppendOnlyVec;

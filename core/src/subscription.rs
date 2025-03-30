@@ -1,4 +1,4 @@
-use crate::{changes::ChangeSet, model::Entity, node::TNodeErased};
+use crate::{changes::ChangeSet, entity::Entity, node::TNodeErased};
 use ankurah_proto as proto;
 use std::sync::{Arc, Mutex};
 use tracing::debug;

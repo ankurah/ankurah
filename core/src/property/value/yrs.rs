@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    model::Entity,
+    entity::Entity,
     property::{
         backend::YrsBackend,
         traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},

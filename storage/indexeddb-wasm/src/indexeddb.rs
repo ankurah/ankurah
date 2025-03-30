@@ -1,6 +1,6 @@
 use ankql::selection::filter::evaluate_predicate;
+use ankurah_core::entity::Entity;
 use ankurah_core::error::RetrievalError;
-use ankurah_core::model::Entity;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
 use ankurah_proto as proto;
 use anyhow::Result;

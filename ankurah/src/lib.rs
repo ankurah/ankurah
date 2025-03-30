@@ -136,18 +136,18 @@ pub use proto::ID;
 pub use ankurah_core::{
     changes,
     context::Context,
-    error,
+    entity, error,
     event::Event,
     model,
-    model::Mutable,
     model::View,
+    model::{Model, Mutable},
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
     property::{self, Property},
     resultset::ResultSet,
     storage,
     subscription::SubscriptionHandle,
-    transaction, Model,
+    transaction,
 };
 
 // TODO move this somewhere else - it's a dependency of the signal derive macro
@@ -165,7 +165,9 @@ where
     T: reactive_graph::traits::Get + Clone + 'static,
     T::Value: 'static,
 {
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> { Box::new(self.clone()) }
+    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> {
+        Box::new(self.clone())
+    }
 }
 
 // Re-export the derive macro
