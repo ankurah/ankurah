@@ -31,16 +31,16 @@ pub struct NodeAndContext<SE, PA: PolicyAgent> {
 pub trait TContext {
     fn node_id(&self) -> proto::ID;
     fn next_entity_id(&self) -> proto::ID;
-    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError>;
-    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Arc<Entity>>, RetrievalError>;
-    async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()>;
+    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError>;
+    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
+    async fn insert_entity(&self, entity: Entity) -> anyhow::Result<()>;
     async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()>;
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
         collection: &proto::CollectionId,
         args: MatchArgs,
-        callback: Box<dyn Fn(crate::changes::ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
+        callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>;
     fn cloned(&self) -> Box<dyn TContext + Send + Sync + 'static>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
@@ -50,20 +50,20 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::ID { self.node.id.clone() }
     fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
-    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Arc<Entity>, RetrievalError> {
+    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError> {
         self.node.get_entity(collection, id /*&self.cdata*/).await
     }
-    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Arc<Entity>>, RetrievalError> {
+    async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.node.fetch_entities(collection, args, &self.cdata).await
     }
-    async fn insert_entity(&self, entity: Arc<Entity>) -> anyhow::Result<()> { self.node.insert_entity(entity).await }
+    async fn insert_entity(&self, entity: Entity) -> anyhow::Result<()> { self.node.insert_entity(entity).await }
     async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()> { self.node.commit_events(events).await }
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
         collection: &proto::CollectionId,
         args: MatchArgs,
-        callback: Box<dyn Fn(crate::changes::ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
+        callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
         self.node.subscribe(sub_id, collection, args, callback).await
     }

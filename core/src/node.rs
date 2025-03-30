@@ -14,7 +14,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::PeerSender,
     context::Context,
-    entity::Entity,
+    entity::{Entity, WeakEntity},
     error::{RequestError, RetrievalError},
     policy::PolicyAgent,
     reactor::Reactor,
@@ -94,7 +94,7 @@ pub struct NodeInner<SE, PA> {
     _policy_agent: PA,
 }
 
-type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), Weak<Entity>>;
+type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), WeakEntity>;
 
 impl<SE, PA> Node<SE, PA>
 where
@@ -423,10 +423,10 @@ where
     /// so when they hand out read Entities, they have to work immediately.
     /// TODO: Discuss. The upside is that you can call .read() on a Mutable. The downside is that the behavior is inconsistent
     /// between newly created Entities and Entities that are created in a transaction scope.
-    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Arc<Entity>) -> anyhow::Result<()> {
+    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Entity) -> anyhow::Result<()> {
         match self.entities.write().await.entry((entity.id, entity.collection.clone())) {
             Entry::Vacant(entry) => {
-                entry.insert(Arc::downgrade(&entity));
+                entry.insert(entity.weak());
                 Ok(())
             }
             Entry::Occupied(_) => Err(anyhow!("Entity already exists")),
@@ -442,7 +442,7 @@ where
         collection_id: &CollectionId,
         id: proto::ID,
         state: &proto::State,
-    ) -> Result<Arc<Entity>, RetrievalError> {
+    ) -> Result<Entity, RetrievalError> {
         let mut entities = self.entities.write().await;
 
         match entities.entry((id, collection_id.clone())) {
@@ -451,25 +451,20 @@ where
                     entity.apply_state(state)?;
                     Ok(entity)
                 } else {
-                    let entity = Arc::new(Entity::from_state(id, collection_id.clone(), state)?);
-                    entry.insert(Arc::downgrade(&entity));
+                    let entity = Entity::from_state(id, collection_id.clone(), state)?;
+                    entry.insert(entity.weak());
                     Ok(entity)
                 }
             }
             Entry::Vacant(entry) => {
-                let entity = Arc::new(Entity::from_state(id, collection_id.clone(), state)?);
-                entry.insert(Arc::downgrade(&entity));
+                let entity = Entity::from_state(id, collection_id.clone(), state)?;
+                entry.insert(entity.weak());
                 Ok(entity)
             }
         }
     }
 
-    pub(crate) async fn fetch_entity_from_node(
-        &self,
-        id: proto::ID,
-        collection_id: &CollectionId,
-        // cdata: &PA::ContextData,
-    ) -> Option<Arc<Entity>> {
+    pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection_id: &CollectionId) -> Option<Entity> {
         let entities = self.entities.read().await;
         // TODO: call policy agent with cdata
         if let Some(entity) = entities.get(&(id, collection_id.clone())) {
@@ -485,7 +480,7 @@ where
         collection_id: &CollectionId,
         id: proto::ID,
         // cdata: &PA::ContextData,
-    ) -> Result<Arc<Entity>, RetrievalError> {
+    ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.id, id, collection_id);
 
         if let Some(local) = self.fetch_entity_from_node(id, collection_id).await {
@@ -516,7 +511,7 @@ where
         collection_id: &CollectionId,
         args: MatchArgs,
         _cdata: &PA::ContextData,
-    ) -> Result<Vec<Arc<Entity>>, RetrievalError> {
+    ) -> Result<Vec<Entity>, RetrievalError> {
         if !self.durable {
             // Fetch from peers and commit first response
             match self.fetch_from_peer(&collection_id, &args.predicate).await {
@@ -546,7 +541,7 @@ where
         sub_id: proto::SubscriptionId,
         collection_id: &CollectionId,
         args: MatchArgs,
-        callback: Box<dyn Fn(ChangeSet<Arc<Entity>>) + Send + Sync + 'static>,
+        callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<SubscriptionHandle, RetrievalError> {
         let mut handle = SubscriptionHandle::new(Box::new(Node(self.clone())) as Box<dyn TNodeErased>, sub_id);
 

@@ -26,7 +26,7 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<SE, PA> {
     /// Current subscriptions
-    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Arc<Entity>>>>,
+    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Entity>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: DashMap<(proto::CollectionId, FieldId), ComparisonIndex>,
     /// The set of watchers who want to be notified of any changes to a given collection
@@ -75,7 +75,7 @@ where
         sub_id: proto::SubscriptionId,
         collection_id: &proto::CollectionId,
         args: impl Into<MatchArgs>,
-        callback: impl Fn(ChangeSet<Arc<Entity>>) + Send + Sync + 'static,
+        callback: impl Fn(ChangeSet<Entity>) + Send + Sync + 'static,
     ) -> anyhow::Result<()> {
         let args = args.into();
         // Start watching the relevant indexes
@@ -89,10 +89,9 @@ where
         // Convert states to Entity and filter by predicate
         for (id, state) in states {
             let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-            let entity = Arc::new(entity);
 
             // Evaluate predicate for each entity
-            if ankql::selection::filter::evaluate_predicate(&*entity, &args.predicate).unwrap_or(false) {
+            if ankql::selection::filter::evaluate_predicate(&entity, &args.predicate).unwrap_or(false) {
                 matching_entities.push(entity.clone());
 
                 // Set up entity watchers
@@ -199,7 +198,7 @@ where
     }
 
     /// Update entity watchers when an entity's matching status changes
-    fn update_entity_watchers(&self, entity: &Arc<Entity>, matching: bool, sub_id: proto::SubscriptionId) {
+    fn update_entity_watchers(&self, entity: &Entity, matching: bool, sub_id: proto::SubscriptionId) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
             let mut entities = subscription.matching_entities.lock().unwrap();
             let mut watchers = self.entity_watchers.entry(entity.id.clone()).or_default();
@@ -226,8 +225,7 @@ where
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
         debug!("Reactor.notify_change({:?})", changes);
         // Group changes by subscription
-        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Arc<Entity>>>> =
-            std::collections::HashMap::new();
+        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Entity>>> = std::collections::HashMap::new();
 
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
@@ -266,7 +264,7 @@ where
                     let entity = &change.entity;
                     // Use evaluate_predicate directly on the entity instead of fetch_entities
                     debug!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
-                    let matches = ankql::selection::filter::evaluate_predicate(&**entity, &subscription.predicate).unwrap_or(false);
+                    let matches = ankql::selection::filter::evaluate_predicate::<Entity>(&entity, &subscription.predicate).unwrap_or(false);
 
                     let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id == entity.id);
                     use ankql::selection::filter::Filterable;
@@ -276,7 +274,7 @@ where
                     self.update_entity_watchers(entity, matches, sub_id);
 
                     // Determine the change type
-                    let new_change: Option<ItemChange<Arc<Entity>>> = if matches != did_match {
+                    let new_change: Option<ItemChange<Entity>> = if matches != did_match {
                         // Matching status changed
                         Some(if matches {
                             ItemChange::Add { item: entity.clone(), events: change.events.clone() }

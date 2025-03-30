@@ -1,10 +1,9 @@
 use crate::{entity::Entity, model::View, resultset::ResultSet};
 use ankurah_proto::Event;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
-    pub entity: Arc<Entity>,
+    pub entity: Entity,
     pub events: Vec<Event>,
 }
 
@@ -82,10 +81,10 @@ where I: View
     }
 }
 
-impl<I> From<ChangeSet<Arc<Entity>>> for ChangeSet<I>
+impl<I> From<ChangeSet<Entity>> for ChangeSet<I>
 where I: View
 {
-    fn from(val: ChangeSet<Arc<Entity>>) -> Self {
+    fn from(val: ChangeSet<Entity>) -> Self {
         ChangeSet {
             resultset: ResultSet {
                 loaded: val.resultset.loaded,
@@ -96,10 +95,10 @@ where I: View
     }
 }
 
-impl<I> From<ItemChange<Arc<Entity>>> for ItemChange<I>
+impl<I> From<ItemChange<Entity>> for ItemChange<I>
 where I: View
 {
-    fn from(change: ItemChange<Arc<Entity>>) -> Self {
+    fn from(change: ItemChange<Entity>) -> Self {
         match change {
             ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item) },
             ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item), events },
