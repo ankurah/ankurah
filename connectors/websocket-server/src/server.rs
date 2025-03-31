@@ -71,7 +71,7 @@ where
 {
     debug!("Websocket server upgrading connection");
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
-    println!("`{user_agent}` at {addr} connected.");
+    debug!("`{user_agent}` at {addr} connected.");
     ws.on_upgrade(move |socket| handle_socket(socket, addr, node))
 }
 
@@ -87,7 +87,7 @@ where
 
     // Immediately send server presence after connection
     if let Err(e) = conn.send(proto::Message::Presence(proto::Presence { node_id: node.id.clone(), durable: node.durable })).await {
-        println!("Error sending presence to {who}: {:?}", e);
+        debug!("Error sending presence to {who}: {:?}", e);
         return;
     }
 
@@ -97,7 +97,7 @@ where
                 break;
             }
         } else {
-            println!("client {who} abruptly disconnected");
+            debug!("client {who} abruptly disconnected");
             break;
         }
     }
@@ -108,7 +108,7 @@ where
         node.deregister_peer(peer_sender.recipient_node_id());
     }
 
-    println!("Websocket context {who} destroyed");
+    debug!("Websocket context {who} destroyed");
 }
 
 async fn process_message<SE, PA>(
@@ -123,7 +123,7 @@ where
 {
     match msg {
         axum::extract::ws::Message::Binary(d) => {
-            println!(">>> {} sent {} bytes", who, d.len());
+            debug!(">>> {} sent {} bytes", who, d.len());
 
             if let Ok(message) = deserialize::<proto::Message>(&d) {
                 match message {
@@ -131,7 +131,7 @@ where
                         match state {
                             Connection::Initial(sender) => {
                                 if let Some(sender) = sender.take() {
-                                    println!("Received client presence from {}", who);
+                                    debug!("Received client presence from {}", who);
 
                                     use super::sender::WebSocketClientSender;
                                     // Register peer sender for this client
@@ -148,7 +148,7 @@ where
                         if let Connection::Established(_) = state {
                             tokio::spawn(async move {
                                 if let Err(e) = node.handle_message(msg).await {
-                                    println!("Error handling message from {}: {:?}", who, e);
+                                    error!("Error handling message from {}: {:?}", who, e);
                                 }
                             });
                         } else {
@@ -157,25 +157,25 @@ where
                     }
                 }
             } else {
-                println!("Failed to deserialize message from {}", who);
+                error!("Failed to deserialize message from {}", who);
             }
         }
         axum::extract::ws::Message::Text(t) => {
-            println!(">>> {who} sent str: {t:?}");
+            debug!(">>> {who} sent str: {t:?}");
         }
         axum::extract::ws::Message::Close(c) => {
             if let Some(cf) = c {
-                println!(">>> {} sent close with code {} and reason `{}`", who, cf.code, cf.reason);
+                debug!(">>> {} sent close with code {} and reason `{}`", who, cf.code, cf.reason);
             } else {
-                println!(">>> {who} somehow sent close message without CloseFrame");
+                debug!(">>> {who} somehow sent close message without CloseFrame");
             }
             return ControlFlow::Break(());
         }
         axum::extract::ws::Message::Pong(v) => {
-            println!(">>> {who} sent pong with {v:?}");
+            debug!(">>> {who} sent pong with {v:?}");
         }
         axum::extract::ws::Message::Ping(v) => {
-            println!(">>> {who} sent ping with {v:?}");
+            debug!(">>> {who} sent ping with {v:?}");
         }
     }
     ControlFlow::Continue(())
