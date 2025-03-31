@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use std::{net::SocketAddr, ops::ControlFlow};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
-use tracing::{debug, info, warn, error, Level};
+use tracing::{debug, error, info, warn, Level};
 
 use ankurah_core::{node::Node, policy::PolicyAgent};
 
