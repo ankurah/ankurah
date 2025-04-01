@@ -3,18 +3,18 @@ use anyhow::anyhow;
 use dashmap::{DashMap, DashSet};
 use rand::prelude::*;
 use std::{
-    collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    collections::BTreeSet,
     ops::Deref,
     sync::{Arc, Weak},
 };
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::oneshot;
 
 use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
     collectionset::CollectionSet,
     connector::PeerSender,
     context::Context,
-    entity::{Entity, WeakEntity},
+    entity::{Entity, WeakEntitySet},
     error::{RequestError, RetrievalError},
     policy::PolicyAgent,
     reactor::Reactor,
@@ -83,7 +83,7 @@ pub struct NodeInner<SE, PA> {
     pub durable: bool,
     pub collections: CollectionSet<SE>,
 
-    entities: Arc<RwLock<EntityMap>>,
+    pub entities: WeakEntitySet,
     // peer_connections: Vec<PeerConnection>,
     peer_connections: DashMap<proto::ID, PeerState>,
     durable_peers: DashSet<proto::ID>,
@@ -94,8 +94,6 @@ pub struct NodeInner<SE, PA> {
     _policy_agent: PA,
 }
 
-type EntityMap = BTreeMap<(proto::ID, proto::CollectionId), WeakEntity>;
-
 impl<SE, PA> Node<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -103,13 +101,14 @@ where
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine.clone());
-        let reactor = Reactor::new(collections.clone(), policy_agent.clone());
+        let entityset: WeakEntitySet = Default::default();
+        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         let id = proto::ID::new();
         info!("Node {id} created as ephemeral");
         let node = Node(Arc::new(NodeInner {
             id,
             collections,
-            entities: Arc::new(RwLock::new(BTreeMap::new())),
+            entities: entityset,
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
@@ -117,20 +116,20 @@ where
             durable: false,
             _policy_agent: policy_agent,
         }));
-        // reactor.set_node(node.weak());
 
         node
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine);
-        let reactor = Reactor::new(collections.clone(), policy_agent.clone());
+        let entityset: WeakEntitySet = Default::default();
+        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
 
         let id = proto::ID::new();
         info!("Node {id} created as durable");
         let node = Node(Arc::new(NodeInner {
             id,
             collections,
-            entities: Arc::new(RwLock::new(BTreeMap::new())),
+            entities: entityset,
             peer_connections: DashMap::new(),
             durable_peers: DashSet::new(),
             pending_requests: DashMap::new(),
@@ -138,7 +137,7 @@ where
             durable: true,
             _policy_agent: policy_agent,
         }));
-        // reactor.set_node(node.weak());
+
         node
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -418,62 +417,6 @@ where
         Ok(())
     }
 
-    /// This should be called only by the transaction commit for newly created Entities
-    /// This is necessary because Entities created in a transaction scope have no upstream
-    /// so when they hand out read Entities, they have to work immediately.
-    /// TODO: Discuss. The upside is that you can call .read() on a Mutable. The downside is that the behavior is inconsistent
-    /// between newly created Entities and Entities that are created in a transaction scope.
-    pub(crate) async fn insert_entity(self: &Arc<Self>, entity: Entity) -> anyhow::Result<()> {
-        match self.entities.write().await.entry((entity.id, entity.collection.clone())) {
-            Entry::Vacant(entry) => {
-                entry.insert(entity.weak());
-                Ok(())
-            }
-            Entry::Occupied(_) => Err(anyhow!("Entity already exists")),
-        }
-    }
-
-    /// Register a Entity with the node, with the intention of preventing duplicate resident entities.
-    /// Returns true if the Entity was already present.
-    /// Note that this does not actually store the entity in the storage engine.
-    #[must_use]
-    pub(crate) async fn assert_entity(
-        &self,
-        collection_id: &CollectionId,
-        id: proto::ID,
-        state: &proto::State,
-    ) -> Result<Entity, RetrievalError> {
-        let mut entities = self.entities.write().await;
-
-        match entities.entry((id, collection_id.clone())) {
-            Entry::Occupied(mut entry) => {
-                if let Some(entity) = entry.get().upgrade() {
-                    entity.apply_state(state)?;
-                    Ok(entity)
-                } else {
-                    let entity = Entity::from_state(id, collection_id.clone(), state)?;
-                    entry.insert(entity.weak());
-                    Ok(entity)
-                }
-            }
-            Entry::Vacant(entry) => {
-                let entity = Entity::from_state(id, collection_id.clone(), state)?;
-                entry.insert(entity.weak());
-                Ok(entity)
-            }
-        }
-    }
-
-    pub(crate) async fn fetch_entity_from_node(&self, id: proto::ID, collection_id: &CollectionId) -> Option<Entity> {
-        let entities = self.entities.read().await;
-        // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(&(id, collection_id.clone())) {
-            entity.upgrade()
-        } else {
-            None
-        }
-    }
-
     /// Retrieve a single entity by id
     pub(crate) async fn get_entity(
         &self,
@@ -483,7 +426,7 @@ where
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.id, id, collection_id);
 
-        if let Some(local) = self.fetch_entity_from_node(id, collection_id).await {
+        if let Some(local) = self.entities.get(id) {
             debug!("Node({}).get_entity found local entity - returning", self.id);
             return Ok(local);
         }
@@ -492,13 +435,13 @@ where
         let collection = self.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                return self.assert_entity(collection_id, id, &entity_state).await;
+                return self.entities.with_state(id, collection_id.clone(), entity_state);
             }
             Err(RetrievalError::NotFound(id)) => {
                 // let scoped_entity = Entity::new(id, collection.to_string());
                 // let ref_entity = Arc::new(scoped_entity);
                 // Revisit this
-                let entity = self.assert_entity(collection_id, id, &proto::State::default()).await?;
+                let entity = self.entities.with_state(id, collection_id.clone(), proto::State::default())?;
                 Ok(entity)
             }
             Err(e) => Err(e),
@@ -530,7 +473,7 @@ where
         // Convert states to entities
         let mut entities = Vec::new();
         for (id, state) in states {
-            let entity = self.assert_entity(&collection_id, id, &state).await?;
+            let entity = self.entities.with_state(id, collection_id.clone(), state)?;
             entities.push(entity);
         }
         Ok(entities)

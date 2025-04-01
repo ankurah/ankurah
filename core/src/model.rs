@@ -14,7 +14,9 @@ pub trait Model {
     type View: View;
     type Mutable<'trx>: Mutable<'trx>;
     fn collection() -> CollectionId;
-    fn create_entity(&self, id: ID) -> Entity;
+    // TODO - this seems to be necessary, but I don't understand why
+    // Backend fields should be getting initialized on demand when the values are set
+    fn initialize_new_entity(&self, entity: &Entity);
 }
 
 /// A read only view of an Entity which offers typed accessors

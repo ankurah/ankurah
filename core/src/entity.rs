@@ -1,27 +1,26 @@
+use crate::{error::RetrievalError, property::Backends, property::PropertyValue};
+use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, Event, State, ID};
+use anyhow::{anyhow, Result};
+use std::collections::{btree_map::Entry, BTreeMap};
+use std::sync::{Arc, Weak};
 use tracing::debug;
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::Weak;
-
-use crate::property::PropertyValue;
-use crate::{error::RetrievalError, property::Backends};
-
-use anyhow::Result;
-
-use ankql::selection::filter::Filterable;
-
-/// An entity represents a unique thing within a collection
+/// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
+/// which provides duplication guarantees.
 #[derive(Debug, Clone)]
 pub struct Entity(Arc<EntityInner>);
+
+// TODO optimize this to be faster for scanning over entries in a collection
+/// Used only for reconstituting state to filter database results. No duplication guarantees are provided
+pub struct TemporaryEntity(Arc<EntityInner>);
 
 #[derive(Debug)]
 pub struct EntityInner {
     pub id: ID,
     pub collection: CollectionId,
     pub(crate) backends: Backends,
-    head: Mutex<Clock>,
+    head: std::sync::Mutex<Clock>,
     pub upstream: Option<Entity>,
 }
 
@@ -31,6 +30,7 @@ impl std::ops::Deref for Entity {
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
+/// A weak reference to an entity
 pub struct WeakEntity(Weak<EntityInner>);
 
 impl WeakEntity {
@@ -38,7 +38,7 @@ impl WeakEntity {
 }
 
 impl Entity {
-    pub fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
+    fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
 
     pub fn collection(&self) -> CollectionId { self.collection.clone() }
 
@@ -48,12 +48,13 @@ impl Entity {
 
     // used by the Model macro
     pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
-        Self(Arc::new(EntityInner { id, collection, backends, head: Mutex::new(Clock::default()), upstream: None }))
+        Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(Clock::default()), upstream: None }))
     }
-    pub fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(state)?;
 
-        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: Mutex::new(state.head.clone()), upstream: None })))
+    /// This must remain private - ONLY WeakEntitySet should be constructing Entities
+    fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+        let backends = Backends::from_state_buffers(state)?;
+        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
 
     /// Collect an event which contains all operations for all backends since the last time they were collected
@@ -82,31 +83,6 @@ impl Entity {
             Ok(Some(event))
         }
     }
-
-    /*
-        entity1: [], head: [],
-        event1: ["blah"], precursors: [],
-        entity1: ["blah"], head: [event1],
-
-        event2: [], precursor: [event1],
-        event3: [], precursor: [event1],
-        event4: [], precursor: [event2, event3],
-        [event4] == [event4, event3, event2, event1]
-
-        enum ClockOrder {
-            Descends,
-            Concurrent,
-            IsDescendedBy,
-            Divergent,
-            ComparisonBudgetExceeded,
-        }
-
-        impl Clock {
-            pub async fn compare(&self, other: &Self, node: &Node) -> ClockOrdering {
-
-            }
-        }
-    */
 
     pub fn apply_event(&self, event: &Event) -> Result<()> {
         /*
@@ -141,7 +117,7 @@ impl Entity {
             id: self.id.clone(),
             collection: self.collection.clone(),
             backends: self.backends.fork(),
-            head: Mutex::new(self.head.lock().unwrap().clone()),
+            head: std::sync::Mutex::new(self.head.lock().unwrap().clone()),
             upstream: Some(self.clone()),
         }))
     }
@@ -177,5 +153,87 @@ impl Filterable for Entity {
 impl std::fmt::Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
+    }
+}
+
+impl TemporaryEntity {
+    pub fn new(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+        let backends = Backends::from_state_buffers(state)?;
+        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
+    }
+}
+
+// TODO - clean this up and consolidate with Entity somehow, while still preventing anyone from creating unregistered (non-temporary) Entities
+impl Filterable for TemporaryEntity {
+    fn collection(&self) -> &str { self.0.collection.as_str() }
+
+    fn value(&self, name: &str) -> Option<String> {
+        if name == "id" {
+            Some(self.0.id.to_string())
+        } else {
+            // Iterate through backends to find one that has this property
+            let backends = self.0.backends.backends.lock().unwrap();
+            backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
+                Some(value) => match value {
+                    PropertyValue::String(s) => Some(s),
+                    PropertyValue::I16(i) => Some(i.to_string()),
+                    PropertyValue::I32(i) => Some(i.to_string()),
+                    PropertyValue::I64(i) => Some(i.to_string()),
+                    PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                },
+                None => None,
+            })
+        }
+    }
+}
+
+/// A set of entities held weakly
+#[derive(Clone, Default)]
+pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<ID, WeakEntity>>>);
+impl WeakEntitySet {
+    pub fn get(&self, id: ID) -> Option<Entity> {
+        let entities = self.0.read().unwrap();
+        // TODO: call policy agent with cdata
+        if let Some(entity) = entities.get(&id) {
+            entity.upgrade()
+        } else {
+            None
+        }
+    }
+
+    /// Create a brand new entity, and add it to the set
+    pub fn create(&self, collection: CollectionId) -> Entity {
+        let mut entities = self.0.write().unwrap();
+        let id = ID::new();
+        let entity = Entity::create(id, collection, Backends::new());
+        entities.insert(id, entity.weak());
+        entity
+    }
+
+    pub fn with_state(&self, id: ID, collection_id: CollectionId, state: State) -> Result<Entity, RetrievalError> {
+        let mut entities = self.0.write().unwrap();
+        match entities.entry(id) {
+            Entry::Vacant(_) => {
+                let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+                entities.insert(id, entity.weak());
+                Ok(entity)
+            }
+            Entry::Occupied(o) => match o.get().upgrade() {
+                Some(entity) => {
+                    if entity.collection == collection_id {
+                        entity.apply_state(&state)?;
+                        Ok(entity)
+                    } else {
+                        Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)))
+                    }
+                }
+                None => {
+                    let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+                    entities.insert(id, entity.weak());
+                    Ok(entity)
+                }
+            },
+        }
     }
 }

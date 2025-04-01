@@ -1,5 +1,5 @@
 use ankql::selection::filter::evaluate_predicate;
-use ankurah_core::entity::Entity;
+use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::RetrievalError;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
 use ankurah_proto as proto;
@@ -323,7 +323,7 @@ impl StorageCollection for IndexedDBBucket {
                 let entity_state = proto::State { state_buffers, head };
 
                 // Create entity to evaluate predicate
-                let entity = Entity::from_state(id, collection_id.clone(), &entity_state)?;
+                let entity = TemporaryEntity::new(id, collection_id.clone(), &entity_state)?;
 
                 // Apply predicate filter
                 if evaluate_predicate(&entity, predicate)? {

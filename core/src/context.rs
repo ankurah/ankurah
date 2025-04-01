@@ -30,10 +30,12 @@ pub struct NodeAndContext<SE, PA: PolicyAgent> {
 #[async_trait]
 pub trait TContext {
     fn node_id(&self) -> proto::ID;
-    fn next_entity_id(&self) -> proto::ID;
+    /// Create a brand new entity, and add it to the WeakEntitySet
+    /// Note that this does not actually persist the entity to the storage engine
+    /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
+    fn create_entity(&self, collection: proto::CollectionId) -> Entity;
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
-    async fn insert_entity(&self, entity: Entity) -> anyhow::Result<()>;
     async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()>;
     async fn subscribe(
         &self,
@@ -49,14 +51,13 @@ pub trait TContext {
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::ID { self.node.id.clone() }
-    fn next_entity_id(&self) -> proto::ID { self.node.next_entity_id() }
+    fn create_entity(&self, collection: proto::CollectionId) -> Entity { self.node.entities.create(collection) }
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError> {
         self.node.get_entity(collection, id /*&self.cdata*/).await
     }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.node.fetch_entities(collection, args, &self.cdata).await
     }
-    async fn insert_entity(&self, entity: Entity) -> anyhow::Result<()> { self.node.insert_entity(entity).await }
     async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()> { self.node.commit_events(events).await }
     async fn subscribe(
         &self,

@@ -149,7 +149,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 #[wasm_bindgen]
                 impl #resultset_name {
                     #[wasm_bindgen(getter)]
-                    pub fn items(&self) -> Vec<#view_name> { self.0.items.to_vec() }
+                    pub fn items(&self) -> Vec<#view_name> {
+                        self.0.items.to_vec()
+                    }
                     pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Option<#view_name> {
                         self.0.items.iter().find(|item| item.id() == id).map(|item| item.clone())
                         // todo generate a map on demand if there are more than a certain number of items (benchmark this)
@@ -189,19 +191,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             fn collection() -> ankurah::derive_deps::ankurah_proto::CollectionId {
                 #collection_str.into()
             }
-            fn create_entity(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> ::ankurah::entity::Entity {
-                use ankurah::property::InitializeWith;
-
-                let backends = ankurah::property::Backends::new();
-                let entity = ankurah::entity::Entity::create(
-                    id,
-                    Self::collection(),
-                    backends
-                );
+            fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
+                use ::ankurah::property::InitializeWith;
                 #(
                     #active_field_types_turbofish::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
                 )*
-                entity
             }
         }
 
