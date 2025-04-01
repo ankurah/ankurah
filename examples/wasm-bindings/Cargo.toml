@@ -1,18 +1,18 @@
 [package]
 name    = "example-wasm-bindings"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ankurah = { path = "../../ankurah", features = ["derive", "wasm", "react"], version = "^0.3.2" }
+ankurah = { path = "../../ankurah", features = ["derive", "wasm", "react"], version = "^0.3.3" }
 ankurah-websocket-client-wasm = { path = "../../connectors/websocket-client-wasm", features = [
     "react",
-], version = "^0.3.2" }
-ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm", version = "^0.3.2" }
-example-model = { path = "../model", features = ["wasm"], version = "0.3.2" }
+], version = "^0.3.3" }
+ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm", version = "^0.3.3" }
+example-model = { path = "../model", features = ["wasm"], version = "0.3.3" }
 wasm-bindgen = "0.2.84"
 wasm-bindgen-futures = "0.4.42"
 wasm-logger = "0.2.0"
