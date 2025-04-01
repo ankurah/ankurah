@@ -1,7 +1,7 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::collectionset::CollectionSet;
-use crate::entity::Entity;
+use crate::entity::{Entity, WeakEntitySet};
 use crate::node::MatchArgs;
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
@@ -37,6 +37,8 @@ pub struct Reactor<SE, PA> {
     entity_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
     /// Reference to the storage engine
     collections: CollectionSet<SE>,
+
+    entityset: WeakEntitySet,
     // Weak reference to the node
     // node: OnceCell<WeakNode<PA>>,
     _policy_agent: PA,
@@ -53,13 +55,14 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(collections: CollectionSet<SE>, policy_agent: PA) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: DashMap::new(),
             index_watchers: DashMap::new(),
             wildcard_watchers: DashMap::new(),
             entity_watchers: DashMap::new(),
             collections,
+            entityset,
             _policy_agent: policy_agent,
             // node: OnceCell::new(),
         })
@@ -88,7 +91,7 @@ where
 
         // Convert states to Entity and filter by predicate
         for (id, state) in states {
-            let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+            let entity = self.entityset.with_state(id, collection_id.to_owned(), state)?;
 
             // Evaluate predicate for each entity
             if ankql::selection::filter::evaluate_predicate(&entity, &args.predicate).unwrap_or(false) {

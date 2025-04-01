@@ -54,9 +54,9 @@ impl Transaction {
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec> {
-        let id = self.dyncontext.next_entity_id();
-        let new_entity = model.create_entity(id);
-        let entity_ref = self.add_entity(new_entity);
+        let entity = self.dyncontext.create_entity(M::collection());
+        model.initialize_new_entity(&entity);
+        let entity_ref = self.add_entity(entity);
         <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
     }
     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
@@ -85,7 +85,7 @@ impl Transaction {
                 if let Some(upstream) = &entity.upstream {
                     upstream.apply_event(&entity_event)?;
                 } else {
-                    self.dyncontext.insert_entity(entity.clone()).await?;
+                    // Entitity is already updated
                 }
                 entity_events.push(entity_event);
             }

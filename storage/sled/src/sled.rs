@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use ankurah_core::{
-    entity::Entity,
+    entity::TemporaryEntity,
     error::RetrievalError,
     storage::{StorageCollection, StorageEngine},
 };
@@ -126,7 +126,7 @@ impl StorageCollection for SledStorageCollection {
                 let entity_state: State = bincode::deserialize(&value_bytes)?;
 
                 // Create entity to evaluate predicate
-                let entity = Entity::from_state(id, collection_id.clone(), &entity_state)?;
+                let entity = TemporaryEntity::new(id, collection_id.clone(), &entity_state)?;
 
                 // Apply predicate filter
                 if evaluate_predicate(&entity, &predicate)? {
