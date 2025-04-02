@@ -239,7 +239,7 @@ impl StorageCollection for PostgresBucket {
                     PGValue::BigInt(number) => params.push(number),
                     PGValue::Bytea(bytes) => params.push(bytes),
                 },
-                None => params.push(&None::<i32>),
+                None => params.push(&UntypedNull),
             }
         }
 
@@ -574,4 +574,20 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
 #[allow(unused)]
 pub struct MissingMaterialized {
     pub name: String,
+}
+
+use bytes::BytesMut;
+use tokio_postgres::types::{to_sql_checked, IsNull, Type};
+
+#[derive(Debug)]
+struct UntypedNull;
+
+impl ToSql for UntypedNull {
+    fn to_sql(&self, _ty: &Type, _out: &mut BytesMut) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> { Ok(IsNull::Yes) }
+
+    fn accepts(_ty: &Type) -> bool {
+        true // Accept all types
+    }
+
+    to_sql_checked!();
 }
