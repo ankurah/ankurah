@@ -22,6 +22,9 @@ use crate::{
     subscription::SubscriptionHandle,
     task::spawn,
 };
+#[cfg(feature = "instrument")]
+use tracing::instrument;
+
 use tracing::{debug, info, warn};
 
 pub struct PeerState {
@@ -152,6 +155,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %presence.node_id, durable = %presence.durable)))]
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node({}).register_peer {}", self.id, presence.node_id);
         self.peer_connections
@@ -161,11 +165,13 @@ where
         }
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id)))]
     pub fn deregister_peer(&self, node_id: proto::ID) {
         info!("Node({}).deregister_peer {}", self.id, node_id);
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);
     }
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
     pub async fn request(&self, node_id: proto::ID, request_body: proto::NodeRequestBody) -> Result<proto::NodeResponseBody, RequestError> {
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
@@ -188,6 +194,7 @@ where
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(message = %message)))]
     pub async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
             proto::NodeMessage::Request(request) => {
@@ -229,6 +236,7 @@ where
         Ok(())
     }
 
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(request = %request)))]
     async fn handle_request(self: &Arc<Self>, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
         match request.body {
             proto::NodeRequestBody::CommitEvents(events) => {
@@ -313,6 +321,7 @@ where
         Ok(())
     }
 
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(peer_id = %peer_id, sub_id = %sub_id, collection_id = %collection_id, predicate = %predicate)))]
     async fn handle_subscribe_request(
         self: &Arc<Self>,
         peer_id: proto::ID,
@@ -366,6 +375,7 @@ where
 
     pub fn context(self: &Arc<Self>, data: PA::ContextData) -> Context { Context::new(Node(self.clone()), data) }
 
+    #[cfg_attr(feature = "instrument", instrument(skip_all))]
     async fn commit_events_local(self: &Arc<Self>, events: &Vec<proto::Event>) -> anyhow::Result<()> {
         debug!("Node({}).commit_events_local {}", self.id, events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(","));
         let mut changes = Vec::new();

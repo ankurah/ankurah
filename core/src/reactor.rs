@@ -14,6 +14,8 @@ use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::debug;
+#[cfg(feature = "instrument")]
+use tracing::instrument;
 
 use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,6 +187,7 @@ where
     }
 
     /// Remove a subscription and clean up its watchers
+    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(sub_id = %sub_id)))]
     pub(crate) fn unsubscribe(&self, sub_id: proto::SubscriptionId) {
         if let Some((_, sub)) = self.subscriptions.remove(&sub_id) {
             // Remove from index watchers

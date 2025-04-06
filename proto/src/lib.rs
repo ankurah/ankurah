@@ -301,16 +301,36 @@ pub enum NodeMessage {
     Response(NodeResponse),
 }
 
+impl std::fmt::Display for NodeMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeMessage::Request(request) => write!(f, "Request: {}", request),
+            NodeMessage::Response(response) => write!(f, "Response: {}", response),
+        }
+    }
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
     Presence(Presence),
     PeerMessage(NodeMessage),
 }
 
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::Presence(presence) => write!(f, "Presence: {}", presence),
+            Message::PeerMessage(node_message) => write!(f, "PeerMessage: {}", node_message),
+        }
+    }
+}
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Presence {
     pub node_id: ID,
     pub durable: bool,
+}
+
+impl std::fmt::Display for Presence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Presence({} {})", self.node_id, self.durable) }
 }
 
 impl TryFrom<JsValue> for Clock {
