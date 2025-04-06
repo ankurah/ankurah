@@ -16,6 +16,7 @@ pub mod storage;
 pub mod subscription;
 pub mod task;
 pub mod transaction;
+pub mod util;
 pub mod value;
 
 pub mod collectionset;

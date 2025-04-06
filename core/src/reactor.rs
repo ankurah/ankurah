@@ -7,10 +7,11 @@ use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
 use crate::storage::StorageEngine;
 use crate::subscription::Subscription;
+use crate::util::safemap::SafeMap;
+use crate::util::safeset::SafeSet;
 use crate::value::Value;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
-use dashmap::{DashMap, DashSet};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::debug;
@@ -28,15 +29,15 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<SE, PA> {
     /// Current subscriptions
-    subscriptions: DashMap<proto::SubscriptionId, Arc<Subscription<Entity>>>,
+    subscriptions: SafeMap<proto::SubscriptionId, Arc<Subscription<Entity>>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
-    index_watchers: DashMap<(proto::CollectionId, FieldId), ComparisonIndex>,
+    index_watchers: SafeMap<(proto::CollectionId, FieldId), Arc<std::sync::RwLock<ComparisonIndex>>>,
     /// The set of watchers who want to be notified of any changes to a given collection
-    wildcard_watchers: DashMap<proto::CollectionId, DashSet<proto::SubscriptionId>>,
+    wildcard_watchers: SafeMap<proto::CollectionId, Arc<std::sync::RwLock<SafeSet<proto::SubscriptionId>>>>,
     /// Index of subscriptions that presently match each entity.
     /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
-    entity_watchers: DashMap<ankurah_proto::ID, Vec<proto::SubscriptionId>>,
+    entity_watchers: SafeMap<ankurah_proto::ID, HashSet<proto::SubscriptionId>>,
     /// Reference to the storage engine
     collections: CollectionSet<SE>,
 
@@ -59,10 +60,10 @@ where
 {
     pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
-            subscriptions: DashMap::new(),
-            index_watchers: DashMap::new(),
-            wildcard_watchers: DashMap::new(),
-            entity_watchers: DashMap::new(),
+            subscriptions: SafeMap::new(),
+            index_watchers: SafeMap::new(),
+            wildcard_watchers: SafeMap::new(),
+            entity_watchers: SafeMap::new(),
             collections,
             entityset,
             _policy_agent: policy_agent,
@@ -100,7 +101,7 @@ where
                 matching_entities.push(entity.clone());
 
                 // Set up entity watchers
-                self.entity_watchers.entry(entity.id.clone()).or_default().push(sub_id);
+                self.entity_watchers.set_insert(entity.id, sub_id);
             }
         }
 
@@ -146,13 +147,12 @@ where
                     let field_id = FieldId(field_name);
                     match op {
                         WatcherOp::Add => {
-                            let entry = self.index_watchers.entry((collection_id.clone(), field_id));
-                            entry.or_default().add((*literal).clone(), operator.clone(), sub_id);
+                            let index = self.index_watchers.get_or_default((collection_id.clone(), field_id));
+                            index.write().unwrap().add((*literal).clone(), operator.clone(), sub_id);
                         }
                         WatcherOp::Remove => {
-                            if let Some(mut index) = self.index_watchers.get_mut(&(collection_id.clone(), field_id)) {
-                                index.remove((*literal).clone(), operator.clone(), sub_id);
-                            }
+                            let index = self.index_watchers.get_or_default((collection_id.clone(), field_id));
+                            index.write().unwrap().remove((*literal).clone(), operator.clone(), sub_id);
                         }
                     }
                 } else {
@@ -170,13 +170,13 @@ where
                 unimplemented!("Not sure how to implement this")
             }
             Predicate::True => {
-                let set = self.wildcard_watchers.entry(collection_id.clone()).or_default();
+                let set = self.wildcard_watchers.get_or_default(collection_id.clone());
                 match op {
                     WatcherOp::Add => {
-                        set.insert(sub_id);
+                        set.write().unwrap().insert(sub_id);
                     }
                     WatcherOp::Remove => {
-                        set.remove(&sub_id);
+                        set.write().unwrap().remove(&sub_id);
                     }
                 }
             }
@@ -189,16 +189,14 @@ where
     /// Remove a subscription and clean up its watchers
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(sub_id = %sub_id)))]
     pub(crate) fn unsubscribe(&self, sub_id: proto::SubscriptionId) {
-        if let Some((_, sub)) = self.subscriptions.remove(&sub_id) {
+        if let Some(sub) = self.subscriptions.remove(&sub_id) {
             // Remove from index watchers
             self.manage_watchers_recurse(&sub.collection_id, &sub.predicate, sub_id, WatcherOp::Remove);
 
             // Remove from entity watchers using subscription's matching_entities
             let matching = sub.matching_entities.lock().unwrap();
             for entity in matching.iter() {
-                if let Some(mut watchers) = self.entity_watchers.get_mut(&entity.id.clone()) {
-                    watchers.retain(|&id| id != sub_id);
-                }
+                self.entity_watchers.set_remove(&entity.id, &sub_id);
             }
         }
     }
@@ -207,7 +205,7 @@ where
     fn update_entity_watchers(&self, entity: &Entity, matching: bool, sub_id: proto::SubscriptionId) {
         if let Some(subscription) = self.subscriptions.get(&sub_id) {
             let mut entities = subscription.matching_entities.lock().unwrap();
-            let mut watchers = self.entity_watchers.entry(entity.id.clone()).or_default();
+            // let mut watchers = self.entity_watchers.entry(entity.id.clone()).or_default();
 
             // TODO - we can't just use the matching flag, because we need to know if the entity was in the set before
             // or after calling notify_change
@@ -215,11 +213,11 @@ where
             match (did_match, matching) {
                 (false, true) => {
                     entities.push(entity.clone());
-                    watchers.push(sub_id);
+                    self.entity_watchers.set_insert(entity.id.clone(), sub_id);
                 }
                 (true, false) => {
                     entities.retain(|r| r.id != entity.id);
-                    watchers.retain(|&id| id != sub_id);
+                    self.entity_watchers.set_remove(&entity.id, &sub_id);
                 }
                 _ => {} // No change needed
             }
@@ -236,23 +234,21 @@ where
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
 
-            debug!("Reactor - index watchers: {:?}", self.index_watchers);
+            // debug!("Reactor - index watchers: {:?}", self.index_watchers);
             // Find subscriptions that might be interested based on index watchers
-            for index_ref in self.index_watchers.iter() {
+            for ((collection_id, field_id), index_ref) in self.index_watchers.to_vec() {
                 // Get the field value from the entity
-                let (collection_id, field_id) = index_ref.key();
-                if collection_id == &(change.entity.collection) {
+                if collection_id == change.entity.collection {
                     if let Some(field_value) = change.entity.value(&field_id.0) {
-                        possibly_interested_subs.extend(index_ref.find_matching(Value::String(field_value)));
+                        possibly_interested_subs.extend(index_ref.read().unwrap().find_matching(Value::String(field_value)));
                     }
                 }
             }
 
-            debug!("wildcard watchers: {:?}", self.wildcard_watchers);
             // Also check wildcard watchers for this collection
             if let Some(watchers) = self.wildcard_watchers.get(&change.entity.collection) {
-                for watcher in watchers.iter() {
-                    possibly_interested_subs.insert(watcher.key().clone());
+                for watcher in watchers.read().unwrap().to_vec() {
+                    possibly_interested_subs.insert(watcher.clone());
                 }
             }
 

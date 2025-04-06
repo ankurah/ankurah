@@ -98,7 +98,6 @@ dependencies = [
  "async-trait",
  "bincode",
  "chrono",
- "dashmap",
  "futures",
  "futures-signals",
  "futures-util",
