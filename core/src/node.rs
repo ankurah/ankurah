@@ -1,6 +1,6 @@
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
-use dashmap::{DashMap, DashSet};
+
 use rand::prelude::*;
 use std::{
     collections::BTreeSet,
@@ -21,6 +21,7 @@ use crate::{
     storage::StorageEngine,
     subscription::SubscriptionHandle,
     task::spawn,
+    util::{safemap::SafeMap, safeset::SafeSet},
 };
 #[cfg(feature = "instrument")]
 use tracing::instrument;
@@ -30,7 +31,7 @@ use tracing::{debug, info, warn};
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
-    subscriptions: BTreeSet<proto::SubscriptionId>,
+    subscriptions: SafeSet<proto::SubscriptionId>,
 }
 
 pub struct MatchArgs {
@@ -88,9 +89,9 @@ pub struct NodeInner<SE, PA> {
 
     pub entities: WeakEntitySet,
     // peer_connections: Vec<PeerConnection>,
-    peer_connections: DashMap<proto::ID, PeerState>,
-    durable_peers: DashSet<proto::ID>,
-    pending_requests: DashMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    peer_connections: SafeMap<proto::ID, Arc<PeerState>>,
+    durable_peers: SafeSet<proto::ID>,
+    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 
     /// The reactor for handling subscriptions
     pub reactor: Arc<Reactor<SE, PA>>,
@@ -112,9 +113,9 @@ where
             id,
             collections,
             entities: entityset,
-            peer_connections: DashMap::new(),
-            durable_peers: DashSet::new(),
-            pending_requests: DashMap::new(),
+            peer_connections: SafeMap::new(),
+            durable_peers: SafeSet::new(),
+            pending_requests: SafeMap::new(),
             reactor,
             durable: false,
             _policy_agent: policy_agent,
@@ -133,9 +134,9 @@ where
             id,
             collections,
             entities: entityset,
-            peer_connections: DashMap::new(),
-            durable_peers: DashSet::new(),
-            pending_requests: DashMap::new(),
+            peer_connections: SafeMap::new(),
+            durable_peers: SafeSet::new(),
+            pending_requests: SafeMap::new(),
             reactor,
             durable: true,
             _policy_agent: policy_agent,
@@ -159,7 +160,7 @@ where
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node({}).register_peer {}", self.id, presence.node_id);
         self.peer_connections
-            .insert(presence.node_id.clone(), PeerState { sender, _durable: presence.durable, subscriptions: BTreeSet::new() });
+            .insert(presence.node_id.clone(), Arc::new(PeerState { sender, _durable: presence.durable, subscriptions: SafeSet::new() }));
         if presence.durable {
             self.durable_peers.insert(presence.node_id.clone());
         }
@@ -228,7 +229,7 @@ where
             }
             proto::NodeMessage::Response(response) => {
                 debug!("Node {} received response {}", self.id, response);
-                if let Some((_, tx)) = self.pending_requests.remove(&response.request_id) {
+                if let Some(tx) = self.pending_requests.remove(&response.request_id) {
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
@@ -259,7 +260,7 @@ where
             proto::NodeRequestBody::Unsubscribe { subscription_id } => {
                 self.reactor.unsubscribe(subscription_id);
                 // Remove and drop the subscription handle
-                if let Some(mut peer_state) = self.peer_connections.get_mut(&request.from) {
+                if let Some(peer_state) = self.peer_connections.get(&request.from) {
                     peer_state.subscriptions.remove(&subscription_id);
                 }
                 Ok(proto::NodeResponseBody::Success)
@@ -364,7 +365,7 @@ where
         };
 
         // Store the subscription handle
-        if let Some(mut peer_state) = self.peer_connections.get_mut(&peer_id) {
+        if let Some(peer_state) = self.peer_connections.get(&peer_id) {
             peer_state.subscriptions.insert(sub_id);
         }
 
@@ -407,7 +408,7 @@ where
         self.commit_events_local(events).await?;
 
         // Then propagate to all peers
-        let peer_ids: Vec<_> = self.peer_connections.iter().map(|i| i.key().clone()).collect();
+        let peer_ids: Vec<_> = self.peer_connections.to_vec().into_iter().map(|(id, _)| id).collect();
 
         futures::future::join_all(peer_ids.iter().map(|peer_id| {
             let events = events.clone();
@@ -555,12 +556,12 @@ where
     pub fn get_durable_peer_random(&self) -> Option<proto::ID> {
         let mut rng = rand::thread_rng();
         // Convert to Vec since DashSet iterator doesn't support random selection
-        let peers: Vec<_> = self.durable_peers.iter().collect();
-        peers.choose(&mut rng).map(|i| i.key().clone())
+        let peers: Vec<_> = self.durable_peers.to_vec();
+        peers.choose(&mut rng).map(|i| i.clone())
     }
 
     /// Get all durable peer node IDs
-    pub fn get_durable_peers(&self) -> Vec<proto::ID> { self.durable_peers.iter().map(|id| id.clone()).collect() }
+    pub fn get_durable_peers(&self) -> Vec<proto::ID> { self.durable_peers.to_vec() }
 }
 
 impl<SE, PA> Drop for NodeInner<SE, PA> {
