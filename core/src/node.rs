@@ -3,7 +3,6 @@ use anyhow::anyhow;
 
 use rand::prelude::*;
 use std::{
-    collections::BTreeSet,
     ops::Deref,
     sync::{Arc, Weak},
 };
@@ -12,7 +11,7 @@ use tokio::sync::oneshot;
 use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
     collectionset::CollectionSet,
-    connector::PeerSender,
+    connector::{PeerSender, SendError},
     context::Context,
     entity::{Entity, WeakEntitySet},
     error::{RequestError, RetrievalError},
@@ -32,6 +31,11 @@ pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
     subscriptions: SafeSet<proto::SubscriptionId>,
+    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+}
+
+impl PeerState {
+    pub async fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message).await }
 }
 
 pub struct MatchArgs {
@@ -88,10 +92,8 @@ pub struct NodeInner<SE, PA> {
     pub collections: CollectionSet<SE>,
 
     pub entities: WeakEntitySet,
-    // peer_connections: Vec<PeerConnection>,
     peer_connections: SafeMap<proto::ID, Arc<PeerState>>,
     durable_peers: SafeSet<proto::ID>,
-    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 
     /// The reactor for handling subscriptions
     pub reactor: Arc<Reactor<SE, PA>>,
@@ -115,7 +117,6 @@ where
             entities: entityset,
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
-            pending_requests: SafeMap::new(),
             reactor,
             durable: false,
             _policy_agent: policy_agent,
@@ -136,7 +137,6 @@ where
             entities: entityset,
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
-            pending_requests: SafeMap::new(),
             reactor,
             durable: true,
             _policy_agent: policy_agent,
@@ -159,8 +159,10 @@ where
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %presence.node_id, durable = %presence.durable)))]
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         info!("Node({}).register_peer {}", self.id, presence.node_id);
-        self.peer_connections
-            .insert(presence.node_id.clone(), Arc::new(PeerState { sender, _durable: presence.durable, subscriptions: SafeSet::new() }));
+        self.peer_connections.insert(
+            presence.node_id.clone(),
+            Arc::new(PeerState { sender, _durable: presence.durable, subscriptions: SafeSet::new(), pending_requests: SafeMap::new() }),
+        );
         if presence.durable {
             self.durable_peers.insert(presence.node_id.clone());
         }
@@ -177,19 +179,14 @@ where
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
-        // Store the response channel
-        self.pending_requests.insert(request_id.clone(), response_tx);
+        let request = proto::NodeRequest { id: request_id.clone(), to: node_id.clone(), from: self.id.clone(), body: request_body };
 
-        let request = proto::NodeRequest { id: request_id, to: node_id.clone(), from: self.id.clone(), body: request_body };
+        // Get the peer connection
 
-        {
-            // Get the peer connection
+        let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
 
-            let connection = { self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?.sender.cloned() };
-
-            // Send the request
-            connection.send_message(proto::NodeMessage::Request(request)).await?;
-        }
+        connection.pending_requests.insert(request_id, response_tx);
+        connection.send_message(proto::NodeMessage::Request(request)).await?;
 
         // Wait for response
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
@@ -229,7 +226,8 @@ where
             }
             proto::NodeMessage::Response(response) => {
                 debug!("Node {} received response {}", self.id, response);
-                if let Some(tx) = self.pending_requests.remove(&response.request_id) {
+                let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
+                if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
