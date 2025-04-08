@@ -10,6 +10,7 @@ pub enum PGValue {
     SmallInt(i16),
     Integer(i32),
     BigInt(i64),
+    UUID(uuid::Uuid),
     // Text(String),
     // Timestamp(chrono::DateTime<chrono::Utc>),
 }
@@ -22,6 +23,7 @@ impl PGValue {
             PGValue::Integer(_) => "int4",
             PGValue::BigInt(_) => "int8",
             PGValue::Bytea(_) => "bytea",
+            PGValue::UUID(_) => "uuid",
         }
     }
 }
@@ -35,6 +37,7 @@ impl From<PropertyValue> for PGValue {
             PropertyValue::I64(integer) => PGValue::BigInt(integer),
             PropertyValue::Object(items) => PGValue::Bytea(items),
             PropertyValue::Binary(items) => PGValue::Bytea(items),
+            PropertyValue::Ref(id) => PGValue::UUID(id.to_uuid()),
         }
     }
 }

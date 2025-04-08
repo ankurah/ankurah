@@ -23,6 +23,8 @@ pub enum PropertyValue {
     String(String),
     Object(Vec<u8>),
     Binary(Vec<u8>),
+
+    Ref(ID),
 }
 
 impl Display for PropertyValue {
@@ -34,6 +36,7 @@ impl Display for PropertyValue {
             PropertyValue::String(string) => write!(f, "{:?}", string),
             PropertyValue::Object(object) => write!(f, "{:?}", object),
             PropertyValue::Binary(binary) => write!(f, "{:?}", binary),
+            PropertyValue::Ref(id) => write!(f, "{:?}", id),
         }
     }
 }
@@ -80,6 +83,7 @@ into!(String => String);
 into!(i16 => I16);
 into!(i32 => I32);
 into!(i64 => I64);
+into!(ID => Ref);
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
     fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_string()))) }
@@ -87,17 +91,6 @@ impl<'a> Property for std::borrow::Cow<'a, str> {
     fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
         match value {
             Some(PropertyValue::String(value)) => Ok(value.into()),
-            Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
-            None => Err(PropertyError::Missing),
-        }
-    }
-}
-
-impl Property for ID {
-    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_base64()))) }
-    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
-        match value {
-            Some(PropertyValue::String(value)) => Ok(ID::from_base64(&value).unwrap()),
             Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
             None => Err(PropertyError::Missing),
         }

@@ -138,7 +138,7 @@ pub struct Event {
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct Clock(BTreeSet<ID>);
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClockOrdering {
     Parent,
     Child,
@@ -167,13 +167,7 @@ impl Clock {
 
 impl From<Vec<Uuid>> for Clock {
     fn from(uuids: Vec<Uuid>) -> Self {
-        let ids = uuids
-            .into_iter()
-            .map(|uuid| {
-                let ulid = Ulid::from(uuid);
-                ID::from_ulid(ulid)
-            })
-            .collect();
+        let ids = uuids.into_iter().map(|uuid| ID::from_uuid(uuid)).collect();
         Self(ids)
     }
 }
