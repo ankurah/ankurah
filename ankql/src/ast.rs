@@ -15,6 +15,7 @@ pub enum Literal {
     Integer(i64),
     Float(f64),
     Boolean(bool),
+    Id(ID),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

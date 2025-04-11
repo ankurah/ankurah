@@ -64,6 +64,7 @@ where
     }
 }
 
+#[cfg_attr(feature = "instrument", instrument(skip_all, fields(client_ip = %client_ip)))]
 async fn ws_handler<SE, PA>(
     ws: WebSocketUpgrade,
     SmartClientIp(client_ip): SmartClientIp,
@@ -97,6 +98,7 @@ where
         return;
     }
 
+    // The task is paused here when I am seeing /axum-0.8.3/src/extract/ws.rs:321:9 in tokio-console
     while let Some(msg) = receiver.next().await {
         if let Ok(msg) = msg {
             if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {

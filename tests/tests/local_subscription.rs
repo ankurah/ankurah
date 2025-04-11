@@ -141,3 +141,32 @@ async fn complex_local_subscription() {
     // Verify Rex's "removal" was received
     assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Remove)]]);
 }
+
+#[tokio::test]
+async fn subscirbe_by_id() {
+    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new()).context(c);
+
+    let trx = client.begin();
+    let artist = trx.create(&Artist { name: "AC/DC".into() }).await.read();
+    let album = trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into(), artist }).await.read();
+    trx.commit().await.unwrap();
+
+    //     pred!{artist} would generate:
+    // let predicate = ankql::ast::Predicate::new(ankql::ast::Expression::new(
+    //     ankql::ast::BinaryOperator::Equal,
+    //     ankql::ast::Expression::new(ankql::ast::Property("artist".to_string()), None),
+    //     ankql::ast::Expression::new(ankql::ast::Literal(ankql::ast::Literal::Id(artist.id())), None),
+    // ));
+
+    // or
+    // ("artist", "=", Ankql::ast::Id(artist.id))
+
+    let _handle = client
+        .subscribe(pred! {artist, status: "Active"}, move |changeset: ChangeSet<AlbumView>| {
+            println!("changeset: {:?}", changeset);
+        })
+        .await
+        .unwrap();
+
+    Ok(())
+}
