@@ -10,6 +10,7 @@ Pending Decisions:
 
 - [ ] Entity ids are random - Ulid/UUID
 - [ ] Event ids are content based (hash of entity id + precursor events)
+- [ ] beacon events should have a bloom filter containing those events since the last beacon ping (skipchain)
 
 Questions:
 

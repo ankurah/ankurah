@@ -594,6 +594,7 @@ dependencies = [
 name = "beacon"
 version = "0.1.0"
 dependencies = [
+ "hierarchical_hash_wheel_timer",
  "rand 0.9.0",
  "sha2",
  "uuid",
@@ -867,6 +868,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a97769d94ddab943e4510d138150169a2758b5ef3eb191a9ee688de3e23ef7b3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -1534,6 +1544,17 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hierarchical_hash_wheel_timer"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf653d57c559812a3d936bcb210700410c0d79c5e10fd222970d1b7d44b9defc"
+dependencies = [
+ "crossbeam-channel",
+ "rustc-hash",
+ "uuid",
+]
 
 [[package]]
 name = "hmac"
