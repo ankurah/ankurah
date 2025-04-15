@@ -1,8 +1,9 @@
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crate::network::Network;
 use crate::node::{Message, MessagePayload, Node, NodeId, Position};
-use hierarchical_hash_wheel_timer::simulation::SimulationTimer;
+use hierarchical_hash_wheel_timer::simulation::{SimulationStep, SimulationTimer};
 use hierarchical_hash_wheel_timer::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -10,7 +11,8 @@ use uuid::Uuid;
 
 pub struct Simulation {
     pub nodes: Vec<Node>,
-    pub timer: SimulationTimer<Uuid, OneShotClosureState<Uuid>, PeriodicClosureState<Uuid>>,
+    pub timer: SimulationTimer<u64, OneShotClosureState<u64>, PeriodicClosureState<u64>>,
+    pub timer_id: AtomicU64,
     pub rng: StdRng,
     pub start_variance: u64,
     pub network: Network,
@@ -20,23 +22,21 @@ impl Simulation {
     pub fn new(seed: u64) -> Self {
         let rng = StdRng::seed_from_u64(seed);
         let network = Network::new();
-        let timer = SimulationTimer::for_uuid_closures();
-        Self { nodes: Vec::new(), timer, rng, start_variance: 100, network }
+        let timer = SimulationTimer::for_closures();
+        Self { nodes: Vec::new(), timer, timer_id: AtomicU64::new(0), rng, start_variance: 100, network }
     }
 
     pub fn register_node(&mut self, node: Node) {
         self.network.register_node(node.clone());
         let start_time = self.rng.random_range(0..self.start_variance);
-        self.timer.schedule_periodic(
+        self.timer.schedule_action_periodic(
+            self.timer_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             Duration::from_millis(start_time),
             Duration::from_millis(100),
-            PeriodicClosureState::new(
-                node.id(),
-                Box::new(move |timer_id: Uuid| {
-                    node.do_work();
-                    TimerReturn::Reschedule(())
-                }),
-            ),
+            Box::new(move |timer_id: u64| {
+                node.do_work();
+                TimerReturn::Reschedule(())
+            }),
         );
         self.nodes.push(node);
     }
@@ -46,7 +46,7 @@ impl Simulation {
     pub fn create_test_peers(&mut self, count: usize) {
         for _ in 0..count {
             let position = Position::random(&mut self.rng);
-            let start_time = self.rng.gen_range(0..self.start_variance);
+            let start_time = self.rng.random_range(0..self.start_variance);
 
             // Get network reference before mutable borrow
             let network_ref = self.network.reference();
@@ -61,9 +61,12 @@ impl Simulation {
     }
 
     /// Runs the simulation until the specified time
-    pub fn run(&mut self, until: u64) -> usize {
+    pub fn run(&mut self, until: u128) -> usize {
         let mut events_processed = 0;
-        while self.timer.advance(Some(until)) {
+        while let SimulationStep::Ok = self.timer.next() {
+            if self.timer.current_time() > until {
+                break;
+            }
             events_processed += 1;
         }
         events_processed
