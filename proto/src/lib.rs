@@ -222,7 +222,7 @@ pub struct Operation {
 pub struct State {
     /// The current accumulated state of the entity inclusive of all events up to this point
     pub state_buffers: BTreeMap<String, Vec<u8>>,
-    /// The set of concurrent events (usually only one) which have been applied to the entity state above
+    /// The set of concurrent events (usually only one) which have most recently been applied to the entity state above
     pub head: Clock,
 }
 

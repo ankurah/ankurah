@@ -12,6 +12,6 @@ members = [
     "connectors/*",
     "storage/*",
     "tests",
-    "ankurah",
+    "ankurah", "bclock",
 ]
 resolver = "2"
