@@ -72,7 +72,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         Box::new(NodeAndContext { node: self.node.clone(), cdata: self.cdata.clone() })
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        self.node.collections.get(id).await
+        self.node.system.collection(id).await
     }
 }
 

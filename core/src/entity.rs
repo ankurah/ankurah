@@ -44,6 +44,8 @@ impl Entity {
 
     pub fn backends(&self) -> &Backends { &self.backends }
 
+    pub fn head(&self) -> Clock { self.head.lock().unwrap().clone() }
+
     pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
 
     // used by the Model macro

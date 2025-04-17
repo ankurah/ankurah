@@ -1,6 +1,7 @@
 pub mod human_id;
 pub mod id;
 pub mod message;
+pub mod sys;
 
 use ankql::ast;
 pub use human_id::*;
@@ -43,6 +44,11 @@ impl std::error::Error for DecodeError {}
 pub struct CollectionId(String);
 impl From<&str> for CollectionId {
     fn from(val: &str) -> Self { CollectionId(val.to_string()) }
+}
+
+impl CollectionId {
+    pub fn fixed_name(name: &str) -> Self { CollectionId(name.to_string()) }
+    // TODO implement collection entity
 }
 
 impl From<CollectionId> for String {

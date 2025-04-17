@@ -19,6 +19,7 @@ use crate::{
     reactor::Reactor,
     storage::StorageEngine,
     subscription::SubscriptionHandle,
+    system::SystemManager,
     task::spawn,
     util::{safemap::SafeMap, safeset::SafeSet},
 };
@@ -98,6 +99,7 @@ pub struct NodeInner<SE, PA> {
     /// The reactor for handling subscriptions
     pub reactor: Arc<Reactor<SE, PA>>,
     _policy_agent: PA,
+    pub system: SystemManager<SE>,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -111,6 +113,9 @@ where
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         let id = proto::ID::new();
         info!("Node {id} created as ephemeral");
+
+        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), false);
+
         let node = Node(Arc::new(NodeInner {
             id,
             collections,
@@ -120,6 +125,7 @@ where
             reactor,
             durable: false,
             _policy_agent: policy_agent,
+            system: system_manager,
         }));
 
         node
@@ -131,6 +137,9 @@ where
 
         let id = proto::ID::new();
         info!("Node {id} created as durable");
+
+        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), true);
+
         let node = Node(Arc::new(NodeInner {
             id,
             collections,
@@ -140,6 +149,7 @@ where
             reactor,
             durable: true,
             _policy_agent: policy_agent,
+            system: system_manager,
         }));
 
         node

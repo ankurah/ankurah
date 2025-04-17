@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use ankurah_proto::{DecodeError, ID};
+use ankurah_proto::{CollectionId, DecodeError, ID};
 use thiserror::Error;
 
 use crate::connector::SendError;
@@ -13,6 +13,8 @@ pub enum RetrievalError {
     NotFound(ID),
     #[error("Storage error: {0}")]
     StorageError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("Collection not found: {0}")]
+    CollectionNotFound(CollectionId),
     #[error("Update failed: {0}")]
     FailedUpdate(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Deserialization error: {0}")]

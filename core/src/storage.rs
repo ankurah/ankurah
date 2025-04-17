@@ -14,6 +14,7 @@ pub trait StorageEngine: Send + Sync {
     type Value;
     // Opens and/or creates a storage collection.
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
+    // async fn delete_collection(&self, id: &CollectionId) -> Result<(), RetrievalError>;
 }
 
 #[async_trait]
