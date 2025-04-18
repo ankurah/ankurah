@@ -11,3 +11,16 @@ pub mod request;
 pub mod subscription;
 pub mod transaction;
 pub mod update;
+
+pub use auth::*;
+pub use clock::*;
+pub use collection::*;
+pub use data::*;
+pub use error::*;
+pub use id::*;
+pub use message::*;
+pub use peering::*;
+pub use request::*;
+pub use subscription::*;
+pub use transaction::*;
+pub use update::*;
