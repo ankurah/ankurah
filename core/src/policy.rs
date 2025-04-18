@@ -181,8 +181,8 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
-        info!("PermissiveAgent check_write: {:?}", _event);
+    fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied> {
+        info!("PermissiveAgent check_write: {:?}", event);
         Ok(())
     }
 

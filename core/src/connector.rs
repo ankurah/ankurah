@@ -32,6 +32,7 @@ pub enum SendError {
 pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::ID;
     fn durable(&self) -> bool;
+    fn system_root(&self) -> Option<proto::Clock>;
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>);
     fn deregister_peer(&self, node_id: proto::ID);
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
@@ -42,6 +43,7 @@ pub trait NodeComms: Send + Sync {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
     fn id(&self) -> proto::ID { self.id.clone() }
     fn durable(&self) -> bool { self.durable }
+    fn system_root(&self) -> Option<proto::Clock> { self.system.root() }
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         //
         NodeInner::register_peer(&self, presence, sender);

@@ -56,11 +56,11 @@ where
 
         // we have to register the senders with the nodes
         node1.register_peer(
-            proto::Presence { node_id: node2.id.clone(), durable: node2.durable },
+            proto::Presence { node_id: node2.id.clone(), durable: node2.durable, system_root: node2.system.root() },
             Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id.clone() }),
         );
         node2.register_peer(
-            proto::Presence { node_id: node1.id.clone(), durable: node1.durable },
+            proto::Presence { node_id: node1.id.clone(), durable: node1.durable, system_root: node1.system.root() },
             Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id.clone() }),
         );
 

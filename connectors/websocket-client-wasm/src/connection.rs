@@ -136,7 +136,11 @@ impl Connection {
                                         ws: SendWrapper::new(self.ws.clone()),
                                     }),
                                 );
-                                let presence = proto::Presence { node_id: self.node.id(), durable: self.node.durable() };
+                                let presence = proto::Presence {
+                                    node_id: self.node.id(),
+                                    durable: self.node.durable(),
+                                    system_root: self.node.system_root(),
+                                };
                                 // Send our presence message
                                 if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
                                     info!("Failed to send presence message: {:?}", e);

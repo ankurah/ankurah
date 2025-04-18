@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CollectionId(String);
 
+impl CollectionId {
+    // Most collection ids will be entities, but system collection(s) will have a fixed name
+    pub fn fixed_name(name: &str) -> Self { CollectionId(name.to_string()) }
+}
+
 impl From<&str> for CollectionId {
     fn from(val: &str) -> Self { CollectionId(val.to_string()) }
 }

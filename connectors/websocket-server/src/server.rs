@@ -92,7 +92,14 @@ where
     let mut conn = Connection::Initial(Some(sender));
 
     // Immediately send server presence after connection
-    if let Err(e) = conn.send(proto::Message::Presence(proto::Presence { node_id: node.id.clone(), durable: node.durable })).await {
+    if let Err(e) = conn
+        .send(proto::Message::Presence(proto::Presence {
+            node_id: node.id.clone(),
+            durable: node.durable,
+            system_root: node.system.root(),
+        }))
+        .await
+    {
         debug!("Error sending presence to {client_ip}: {:?}", e);
         return;
     }

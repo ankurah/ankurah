@@ -132,6 +132,7 @@ where SE: StorageEngine + Send + Sync + 'static
             }
         }
 
+        // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
 
@@ -142,11 +143,11 @@ where SE: StorageEngine + Send + Sync + 'static
 
         let event = system_entity.commit()?.ok_or(anyhow!("Expected event"))?;
         system_entity.apply_event(&event)?;
-
-        storage.add_event(&event).await?;
-        storage.set_state(system_entity.id.clone(), &system_entity.to_state()?).await?;
-
+        //
         let root = Clock::new([event.id]);
+
+        storage.add_event(&event.into()).await?;
+        storage.set_state(system_entity.id.clone(), &system_entity.to_state()?).await?;
 
         // Update our system state
         let mut items = self.0.items.write().unwrap();
