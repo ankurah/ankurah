@@ -135,7 +135,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     // This should still trigger a ChangeKind::Remove since it no longer matches
     let trx = node.begin();
     let rex_edit = rex.edit(&trx).await.unwrap();
-    rex_edit.name().overwrite(0, 3, "NotRex");
+    rex_edit.name().overwrite(0, 3, "NotRex")?;
     trx.commit().await.unwrap();
 
     // Verify Rex's "removal" was received

@@ -251,25 +251,26 @@ where
             proto::NodeMessage::Update(update) => {
                 debug!("Node({}) received update {}", self.id, update);
 
-                // if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
-                //     let _from = update.from.clone();
-                //     let _id = update.id.clone();
-                //     if update.to != self.id {
-                //         warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
-                //         return Ok(());
-                //     }
+                if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
+                    let _from = update.from.clone();
+                    let _id = update.id.clone();
+                    if update.to != self.id {
+                        warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
+                        return Ok(());
+                    }
 
-                //     // take down the return address
-                //     let id = update.id.clone();
-                //     let to = update.from.clone();
-                //     let from = self.id.clone();
+                    // take down the return address
+                    let id = update.id.clone();
+                    let to = update.from.clone();
+                    let from = self.id.clone();
 
-                //     let body = match self.handle_update(update).await {
-                //         Ok(_) => proto::NodeUpdateAckBody::Success,
-                //         Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
-                //     };
-                //     sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body })).await?;
-                // }
+                    let body = match self.handle_update(update).await {
+                        Ok(_) => proto::NodeUpdateAckBody::Success,
+                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                    };
+
+                    sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
+                }
             }
             proto::NodeMessage::UpdateAck(ack) => {
                 debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);

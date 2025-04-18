@@ -52,13 +52,13 @@ async fn repeatable_read() -> Result<()> {
     let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu
-    album_rw2.name().delete(7, 4);
-    album_rw2.name().insert(7, "tofu");
+    album_rw2.name().delete(7, 4)?;
+    album_rw2.name().insert(7, "tofu")?;
     assert_eq!(album_rw2.name().value(), Some("I love tofu".to_string()));
 
     // tx3 love -> devour
-    album_rw3.name().delete(2, 4);
-    album_rw3.name().insert(2, "devour");
+    album_rw3.name().delete(2, 4)?;
+    album_rw3.name().insert(2, "devour")?;
     // a modest proposal
     assert_eq!(album_rw3.name().value(), Some("I devour cats".to_string()));
 
@@ -105,13 +105,13 @@ async fn pg_repeatable_read() -> Result<()> {
     let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu
-    album_rw2.name().delete(7, 4);
-    album_rw2.name().insert(7, "tofu");
+    album_rw2.name().delete(7, 4)?;
+    album_rw2.name().insert(7, "tofu")?;
     assert_eq!(album_rw2.name().value(), Some("I love tofu".to_string()));
 
     // tx3 love -> devour
-    album_rw3.name().delete(2, 4);
-    album_rw3.name().insert(2, "devour");
+    album_rw3.name().delete(2, 4)?;
+    album_rw3.name().insert(2, "devour")?;
     // a modest proposal
     assert_eq!(album_rw3.name().value(), Some("I devour cats".to_string()));
 
@@ -155,13 +155,13 @@ async fn pg_events() -> Result<()> {
     let album_rw3 = album_ro.edit(&trx3).await?;
 
     // tx2 cats -> tofu
-    album_rw2.name().delete(7, 4);
-    album_rw2.name().insert(7, "tofu");
+    album_rw2.name().delete(7, 4)?;
+    album_rw2.name().insert(7, "tofu")?;
     assert_eq!(album_rw2.name().value(), Some("I love tofu".to_string()));
 
     // tx3 love -> devour
-    album_rw3.name().delete(2, 4);
-    album_rw3.name().insert(2, "devour");
+    album_rw3.name().delete(2, 4)?;
+    album_rw3.name().insert(2, "devour")?;
     // a modest proposal
     assert_eq!(album_rw3.name().value(), Some("I devour cats".to_string()));
 

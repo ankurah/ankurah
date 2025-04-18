@@ -1,7 +1,6 @@
 use ankql::selection::filter::evaluate_predicate;
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
-use ankurah_core::policy::DEFAULT_CONTEXT as c;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
 use ankurah_proto::{self as proto, Attested};
 use anyhow::Result;

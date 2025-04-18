@@ -134,7 +134,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         })
                     }
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<(), ::wasm_bindgen::JsValue> {
-                        transaction.create(&me).await;
+                        transaction.create(&me).await?;
                         Ok(())
                     }
                 }

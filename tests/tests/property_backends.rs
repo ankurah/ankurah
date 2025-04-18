@@ -51,7 +51,7 @@ async fn property_backends() -> Result<()> {
     let id = cat_video.id();
     //cat_video.views.add(2); // FIXME: applying twice for some reason
     cat_video.visibility.set(&Visibility::Unlisted)?;
-    cat_video.title.insert(15, " (Very cute)");
+    cat_video.title.insert(15, " (Very cute)")?;
     trx.commit().await?;
 
     let video = client.get::<VideoView>(id).await?;
@@ -84,7 +84,7 @@ async fn pg_property_backends() -> Result<()> {
         })
         .await?;
 
-    let cat_video2 = trx
+    let _cat_video2 = trx
         .create(&Video {
             title: "Cat video #9000".into(),
             description: None,

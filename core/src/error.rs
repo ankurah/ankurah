@@ -101,6 +101,11 @@ pub enum MutationError {
     NoDurablePeers,
 }
 
+#[cfg(feature = "wasm")]
+impl From<MutationError> for wasm_bindgen::JsValue {
+    fn from(err: MutationError) -> Self { err.to_string().into() }
+}
+
 impl From<AccessDenied> for MutationError {
     fn from(err: AccessDenied) -> Self { MutationError::AccessDenied(err) }
 }
