@@ -5,11 +5,13 @@ use ulid::Ulid;
 
 use wasm_bindgen::prelude::*;
 
-use crate::DecodeError;
+use crate::error::DecodeError;
 // TODO - split out the different id types. Presently there's a lot of not-entities that are using this type for their ID
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
 #[wasm_bindgen]
 pub struct ID(Ulid);
+// TODO - get rid of ID in favor of EntityId and other discrete ID types
+
 impl ID {
     pub fn new() -> Self { ID(Ulid::new()) }
 
@@ -41,9 +43,7 @@ impl ID {
 impl fmt::Display for ID {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> { write!(f, "{}", self.to_base64()) }
 }
-impl Into<String> for ID {
-    fn into(self) -> String { self.to_base64() }
-}
+
 impl TryFrom<&str> for ID {
     type Error = DecodeError;
     fn try_from(id: &str) -> Result<Self, Self::Error> {
