@@ -209,7 +209,7 @@ where
         let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
 
         connection.pending_requests.insert(request_id, response_tx);
-        connection.send_message(proto::NodeMessage::Request { auth: AuthData::default(), request })?;
+        connection.send_message(proto::NodeMessage::Request { auth, request })?;
 
         // Wait for response
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?

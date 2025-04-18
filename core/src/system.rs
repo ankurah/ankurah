@@ -8,10 +8,7 @@ use tracing::error;
 use crate::collectionset::CollectionSet;
 use crate::entity::{Entity, WeakEntitySet};
 use crate::error::RetrievalError;
-use crate::property::{
-    backend::LWWBackend,
-    PropertyValue,
-};
+use crate::property::{backend::LWWBackend, PropertyValue};
 use crate::property::{Property, PropertyError};
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 
