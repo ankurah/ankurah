@@ -104,6 +104,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "thiserror 2.0.12",
  "tokio",
  "tracing",

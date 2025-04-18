@@ -84,7 +84,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.node.subscribe(&self.cdata, sub_id, collection, args, callback).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
-        self.node.collections.get(id).await
+        self.node.system.collection(id).await
     }
 }
 
