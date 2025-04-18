@@ -6,11 +6,9 @@ use ulid::Ulid;
 pub struct UpdateId(Ulid);
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum UpdateBody {
+pub enum NodeUpdateBody {
     /// New events for a subscription
     SubscriptionUpdate { subscription_id: SubscriptionId, events: Vec<Attested<Event>> },
-    /// Unsubscribe from a subscription
-    Unsubscribe { subscription_id: SubscriptionId },
 }
 
 /// An update from one node to another
@@ -19,7 +17,7 @@ pub struct NodeUpdate {
     pub id: UpdateId,
     pub from: ID,
     pub to: ID,
-    pub body: UpdateBody,
+    pub body: NodeUpdateBody,
 }
 
 /// An acknowledgement of an update from one node to another
@@ -28,11 +26,11 @@ pub struct NodeUpdateAck {
     pub id: UpdateId,
     pub from: ID,
     pub to: ID,
-    pub body: UpdateAckBody,
+    pub body: NodeUpdateAckBody,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum UpdateAckBody {
+pub enum NodeUpdateAckBody {
     Success,
     Error(String),
 }
@@ -57,28 +55,25 @@ impl std::fmt::Display for NodeUpdate {
     }
 }
 
-impl std::fmt::Display for UpdateBody {
+impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateBody::SubscriptionUpdate { subscription_id, events } => {
+            NodeUpdateBody::SubscriptionUpdate { subscription_id, events } => {
                 write!(
                     f,
                     "SubscriptionUpdate {subscription_id} [{}]",
                     events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", ")
                 )
             }
-            UpdateBody::Unsubscribe { subscription_id } => {
-                write!(f, "Unsubscribe {subscription_id}")
-            }
         }
     }
 }
 
-impl std::fmt::Display for UpdateAckBody {
+impl std::fmt::Display for NodeUpdateAckBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateAckBody::Success => write!(f, "Success"),
-            UpdateAckBody::Error(e) => write!(f, "Error: {e}"),
+            NodeUpdateAckBody::Success => write!(f, "Success"),
+            NodeUpdateAckBody::Error(e) => write!(f, "Error: {e}"),
         }
     }
 }

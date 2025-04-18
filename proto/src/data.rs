@@ -59,3 +59,7 @@ impl std::fmt::Display for State {
 impl Attested<Event> {
     pub fn collection(&self) -> &CollectionId { &self.payload.collection }
 }
+
+impl Into<Attested<Event>> for Event {
+    fn into(self) -> Attested<Event> { Attested { payload: self, attestations: vec![] } }
+}

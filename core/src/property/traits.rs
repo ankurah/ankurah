@@ -1,4 +1,4 @@
-use ankurah_proto::{Clock, ClockOrdering};
+use ankurah_proto::clock::{Clock, ClockOrdering};
 use anyhow::Result;
 
 use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
@@ -21,7 +21,7 @@ pub enum PropertyError {
     #[error("serialization error: {0}")]
     SerializeError(Box<dyn std::error::Error + Send + Sync>),
     #[error("deserialization error: {0}")]
-    DeserializeError(Box<dyn std::error::Error + Send + Sync>),
+    DeserializeError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("retrieval error: {0}")]
     RetrievalError(crate::error::RetrievalError),
     #[error("invalid variant `{given}` for `{ty}`")]

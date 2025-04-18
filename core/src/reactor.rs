@@ -71,11 +71,6 @@ where
         })
     }
 
-    // pub fn set_node(self: &Arc<Self>, node: WeakNode<PA>) { self.node.set(node); }
-    // pub fn node(&self) -> Node<PA> {
-    //     self.node.get().expect("set immediately after construction").upgrade().expect("reactor should not outlive node")
-    // }
-
     pub async fn subscribe(
         self: &Arc<Self>,
         sub_id: proto::SubscriptionId,
@@ -114,7 +109,7 @@ where
             matching_entities: std::sync::Mutex::new(matching_entities.clone()),
         });
 
-        // Store subscription
+        // TODO - is this a memory leak?
         self.subscriptions.insert(sub_id, subscription.clone());
 
         // Call callback with initial state
@@ -209,7 +204,7 @@ where
 
             // TODO - we can't just use the matching flag, because we need to know if the entity was in the set before
             // or after calling notify_change
-            let did_match = entities.iter().any(|r| r.id == entity.id);
+            let did_match = entities.iter().any(|e| e.id() == entity.id());
             match (did_match, matching) {
                 (false, true) => {
                     entities.push(entity.clone());
@@ -253,7 +248,7 @@ where
             }
 
             // Check entity watchers
-            if let Some(watchers) = self.entity_watchers.get(&change.entity.id) {
+            if let Some(watchers) = self.entity_watchers.get(&change.entity.id()) {
                 for watcher in watchers.iter() {
                     possibly_interested_subs.insert(watcher.clone());
                 }
@@ -268,7 +263,7 @@ where
                     debug!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
                     let matches = ankql::selection::filter::evaluate_predicate::<Entity>(&entity, &subscription.predicate).unwrap_or(false);
 
-                    let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id == entity.id);
+                    let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id() == entity.id());
                     use ankql::selection::filter::Filterable;
                     debug!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id, entity.value("status"));
 

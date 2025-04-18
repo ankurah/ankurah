@@ -1,12 +1,15 @@
 use std::convert::Infallible;
 
-use ankurah_proto::{DecodeError, ID};
+pub use ankurah_proto::error::DecodeError;
+use ankurah_proto::ID;
 use thiserror::Error;
 
-use crate::connector::SendError;
+use crate::{connector::SendError, policy::AccessDenied};
 
 #[derive(Error, Debug)]
 pub enum RetrievalError {
+    #[error("access denied")]
+    AccessDenied(AccessDenied),
     #[error("Parse error: {0}")]
     ParseError(ankql::error::ParseError),
     #[error("ID {0:?} not found")]
@@ -31,6 +34,8 @@ pub enum RetrievalError {
     Anyhow(anyhow::Error),
     #[error("Decode error: {0}")]
     DecodeError(DecodeError),
+    #[error("State error: {0}")]
+    StateError(StateError),
 }
 
 impl RetrievalError {
@@ -73,4 +78,78 @@ impl From<SendError> for RequestError {
 
 impl From<DecodeError> for RetrievalError {
     fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(err) }
+}
+
+#[derive(Error, Debug)]
+pub enum MutationError {
+    #[error("access denied")]
+    AccessDenied(AccessDenied),
+    #[error("already exists")]
+    AlreadyExists,
+    #[error("retrieval error: {0}")]
+    RetrievalError(RetrievalError),
+    #[error("state error: {0}")]
+    StateError(StateError),
+    #[error("failed update: {0}")]
+    UpdateFailed(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("failed step: {0}")]
+    FailedStep(&'static str),
+    #[error("general error: {0}")]
+    General(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("no durable peers available")]
+    NoDurablePeers,
+}
+
+impl From<AccessDenied> for MutationError {
+    fn from(err: AccessDenied) -> Self { MutationError::AccessDenied(err) }
+}
+
+impl From<bincode::Error> for MutationError {
+    fn from(e: bincode::Error) -> Self { MutationError::StateError(StateError::SerializationError(e)) }
+}
+
+impl From<RetrievalError> for MutationError {
+    fn from(err: RetrievalError) -> Self {
+        match err {
+            RetrievalError::AccessDenied(a) => MutationError::AccessDenied(a),
+            _ => MutationError::RetrievalError(err),
+        }
+    }
+}
+impl From<AccessDenied> for RetrievalError {
+    fn from(err: AccessDenied) -> Self { RetrievalError::AccessDenied(err) }
+}
+
+#[derive(Error, Debug)]
+pub enum StateError {
+    #[error("serialization error: {0}")]
+    SerializationError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("DDL error: {0}")]
+    DDLError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("DMLError: {0}")]
+    DMLError(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl From<bincode::Error> for StateError {
+    fn from(e: bincode::Error) -> Self { StateError::SerializationError(Box::new(e)) }
+}
+
+impl From<StateError> for MutationError {
+    fn from(err: StateError) -> Self { MutationError::StateError(err) }
+}
+
+impl From<StateError> for RetrievalError {
+    fn from(err: StateError) -> Self { RetrievalError::StateError(err) }
+}
+
+#[derive(Error, Debug)]
+pub enum ValidationError {
+    #[error("Deserialization error: {0}")]
+    Deserialization(Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("Validation failed: {0}")]
+    ValidationFailed(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    #[error("Rejected: {0}")]
+    Rejected(&'static str),
 }

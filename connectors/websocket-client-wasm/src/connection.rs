@@ -213,7 +213,7 @@ struct WebSocketPeerSender {
 
 #[async_trait]
 impl PeerSender for WebSocketPeerSender {
-    async fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
+    fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
         let message = proto::Message::PeerMessage(message);
         let data = bincode::serialize(&message).map_err(|e| {
             info!("Failed to serialize client message: {:?}", e);

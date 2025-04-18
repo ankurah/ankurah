@@ -5,7 +5,7 @@ use ankurah_proto as proto;
 use crate::{
     context::TContext,
     entity::Entity,
-    error::RetrievalError,
+    error::{MutationError, RetrievalError},
     model::{Model, Mutable},
 };
 
@@ -20,6 +20,7 @@ use wasm_bindgen::prelude::*;
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Transaction {
     pub(crate) dyncontext: Arc<dyn TContext + Send + Sync + 'static>,
+    id: proto::TransactionId,
 
     entities: AppendOnlyVec<Entity>,
 
@@ -37,7 +38,7 @@ impl Transaction {
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
-        Self { dyncontext, entities: AppendOnlyVec::new(), implicit: true, consumed: false }
+        Self { dyncontext, id: proto::TransactionId::new(), entities: AppendOnlyVec::new(), implicit: true, consumed: false }
     }
 
     /// Fetch an entity already in the transaction.
@@ -55,33 +56,33 @@ impl Transaction {
         &self.entities[index]
     }
 
-    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> M::Mutable<'rec> {
+    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<M::Mutable<'rec>, MutationError> {
         let entity = self.dyncontext.create_entity(M::collection());
         model.initialize_new_entity(&entity);
+        self.dyncontext.check_write(&entity)?;
+
         let entity_ref = self.add_entity(entity);
-        <M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref)
+        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
     }
     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
-    pub async fn edit<'rec, 'trx: 'rec, M: Model>(
-        &'trx self,
-        id: impl Into<proto::ID>,
-    ) -> Result<M::Mutable<'rec>, crate::error::RetrievalError> {
+    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::ID>) -> Result<M::Mutable<'rec>, MutationError> {
         let id = id.into();
         let entity = self.get_entity(id, &M::collection()).await?;
+        self.dyncontext.check_write(entity)?;
 
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
     }
 
     #[must_use]
-    pub async fn commit(mut self) -> anyhow::Result<()> { self.commit_mut_ref().await }
+    pub async fn commit(mut self) -> Result<(), MutationError> { self.commit_mut_ref().await }
 
     #[must_use]
     // only because Drop is &mut self not mut self
-    pub(crate) async fn commit_mut_ref(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn commit_mut_ref(&mut self) -> Result<(), MutationError> {
         tracing::debug!("trx.commit");
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
-        let mut entity_events = Vec::new();
+        let mut entity_events: Vec<proto::Event> = Vec::new();
         for entity in self.entities.iter() {
             if let Some(entity_event) = entity.commit()? {
                 if let Some(upstream) = &entity.upstream {
@@ -92,7 +93,7 @@ impl Transaction {
                 entity_events.push(entity_event);
             }
         }
-        self.dyncontext.commit_events(&entity_events).await?;
+        self.dyncontext.commit_transaction(self.id.clone(), entity_events).await?;
 
         Ok(())
     }

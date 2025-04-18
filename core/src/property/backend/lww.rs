@@ -5,10 +5,16 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{Clock, ClockOrdering, Operation};
+use ankurah_proto::{
+    clock::{Clock, ClockOrdering},
+    Operation,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue};
+use crate::{
+    error::{MutationError, StateError},
+    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue},
+};
 
 const LWW_DIFF_VERSION: u8 = 1;
 
@@ -76,7 +82,7 @@ impl PropertyBackend for LWWBackend {
     fn property_backend_name() -> String { "lww".to_owned() }
 
     // This is identical to [`to_operations`] for [`LWWBackend`].
-    fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         let property_values = self.property_values();
         let state_buffer = bincode::serialize(&property_values)?;
         Ok(state_buffer)
@@ -88,7 +94,7 @@ impl PropertyBackend for LWWBackend {
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
-    fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
+    fn to_operations(&self) -> Result<Vec<super::Operation>, MutationError> {
         let property_values = self.property_values();
         let serialized_diff = bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&property_values)? })?;
         Ok(vec![Operation { diff: serialized_diff }])
@@ -100,7 +106,7 @@ impl PropertyBackend for LWWBackend {
         current_head: &Clock,
         event_head: &Clock,
         // context: &Box<dyn TContext>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), MutationError> {
         let mut values = self.values.write().unwrap();
 
         // TODO: Figure out this comparison
@@ -115,7 +121,9 @@ impl PropertyBackend for LWWBackend {
                             values.insert(property_name, new_value);
                         }
                     }
-                    version => return Err(anyhow::anyhow!("Unknown LWW operation version: {:?}", version)),
+                    version => {
+                        return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()))
+                    }
                 }
             }
         }

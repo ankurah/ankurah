@@ -66,8 +66,8 @@ all data. The demo server currently uses the sled backend, but postgres is also 
 
 ```rust
 // Create server and client nodes
-let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?));
-let client = Node::new(Arc::new(SledStorageEngine::new_test()?));
+let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).context(c);
+let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).context(c);
 
 // Connect nodes using local process connection
 let _conn = LocalProcessConnection::new(&server, &client).await?;
@@ -79,10 +79,10 @@ let _subscription = client.subscribe::<_,_,AlbumView>("name = 'Origin of Symmetr
 
 // Create a new album on the server
 let trx = server.begin();
-trx.create(&Album {
+let album = trx.create(&Album {
     name: "Origin of Symmetry".into(),
     year: "2001".into(),
-}).await;
+}).await?;
 trx.commit().await?;
 ```
 

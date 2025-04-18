@@ -20,10 +20,10 @@ async fn inter_node_fetch() -> Result<()> {
 
     {
         let trx = ctx1.begin();
-        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
-        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
-        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
-        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
+        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
+        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
+        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
+        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
         trx.commit().await?;
     };
 
@@ -63,9 +63,9 @@ async fn server_edits_subscription() -> Result<()> {
     // Create initial entities on node1
     let (rex, snuffy, jasper) = {
         let trx = server.begin();
-        let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await;
-        let snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await;
-        let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await;
+        let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await?;
+        let snuffy = trx.create(&Pet { name: "Snuffy".to_string(), age: "2".to_string() }).await?;
+        let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await?;
 
         let read = (rex.read(), snuffy.read(), jasper.read());
         trx.commit().await?;
@@ -82,27 +82,32 @@ async fn server_edits_subscription() -> Result<()> {
     // Initial state should include Rex
     assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Initial)]]);
 
+    println!("MARK 1\n\n\n");
     // Update Rex's age to 7 on node1
     {
-        let trx = server.begin();
-        rex.edit(&trx).await?.age().overwrite(0, 1, "7");
+        let trx: ankurah::transaction::Transaction = server.begin();
+        rex.edit(&trx).await?.age().overwrite(0, 1, "7")?;
         trx.commit().await?;
     }
 
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Update)]]); // Rex still matches the predicate, but the age has changed
     assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Update)]]);
+    assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Update)]]); // Rex still matches the predicate, but the age has changed
 
-    // short circuit to simplify debugging
+    println!("MARK 2\n\n\n");
     // Update Snuffy's age to 3 on node1
     {
         let trx = server.begin();
-        snuffy.edit(&trx).await?.age().overwrite(0, 1, "3");
+        snuffy.edit(&trx).await?.age().overwrite(0, 1, "3")?;
         trx.commit().await?;
     }
 
     // Sleep for a bit to ensure the change is propagated
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // LEFT OFF HERE - determine how this ever worked. simply adding the edit event should not be enough to project the current state of snuffy for the client
+    // because the client never received the state of snuffy in the first place, and thus the edit event doesn't refer to any state that the client has.
+    // AHA! It's the change to only send committed events to durable nodes.
 
     // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
     assert_eq!(check_server(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
@@ -129,7 +134,7 @@ async fn test_client_server_propagation() -> Result<()> {
     // Create an entity on client_a
     {
         let trx = client_a.begin();
-        trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
+        trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await?;
         trx.commit().await?;
     }
 
@@ -175,7 +180,7 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     // Create an entity on client_a
     let album_id = {
         let trx = client_a.begin();
-        let album = trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await;
+        let album = trx.create(&Album { name: "Origin of Symmetry".into(), year: "2001".into() }).await?;
         let id = album.id();
         trx.commit().await?;
         id

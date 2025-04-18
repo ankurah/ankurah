@@ -14,7 +14,7 @@ async fn test_postgres() -> Result<()> {
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
     let trx = node.begin();
-    let _album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await;
+    let _album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await?;
 
     trx.commit().await?;
 

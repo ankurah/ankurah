@@ -56,7 +56,7 @@ pub struct NodeResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeResponseBody {
     // Response to CommitEvents
-    CommitComplete,
+    CommitComplete { id: TransactionId },
     Fetch(Vec<(ID, State)>),
     Subscribe { initial: Vec<(ID, State)>, subscription_id: SubscriptionId },
     Success,
@@ -93,7 +93,7 @@ impl std::fmt::Display for NodeRequestBody {
 impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeResponseBody::CommitComplete => write!(f, "CommitComplete"),
+            NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
             NodeResponseBody::Fetch(tuples) => {
                 write!(f, "Fetch [{}]", tuples.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", "))
             }

@@ -23,6 +23,15 @@ impl<K: Hash + Eq, V> SafeMap<K, V>
 where V: Clone
 {
     pub fn get(&self, k: &K) -> Option<V> { self.0.read().expect("Failed to lock the map").get(k).cloned() }
+    pub fn get_list(&self, k: impl IntoIterator<Item = K>) -> Vec<(K, Option<V>)> {
+        let read = self.0.read().expect("Failed to lock the map");
+        k.into_iter()
+            .map(|k| {
+                let v = read.get(&k).cloned();
+                (k, v)
+            })
+            .collect()
+    }
 }
 
 impl<K: Hash + Eq, V> SafeMap<K, V>

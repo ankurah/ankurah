@@ -219,7 +219,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
             fn from_entity(entity: ::ankurah::entity::Entity) -> Self {
                 use ::ankurah::model::View;
-                assert_eq!(Self::collection(), entity.collection);
+                assert_eq!(&Self::collection(), entity.collection());
                 #view_name {
                     entity,
                     #(
@@ -231,7 +231,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         // TODO wasm-bindgen this
         impl #view_name {
-            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::RetrievalError> {
+            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::MutationError> {
                 use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                 trx.edit::<#name>(self.id()).await
@@ -241,7 +241,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         #wasm_attributes
         impl #view_name {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
-                self.entity.id.clone()
+                self.entity.id().clone()
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
@@ -270,7 +270,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     model::Mutable,
                     property::FromEntity,
                 };
-                assert_eq!(entity.collection(), Self::collection());
+                assert_eq!(entity.collection(), &Self::collection());
                 Self {
                     entity,
                     #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), entity), )*
@@ -279,7 +279,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         }
         impl<'rec> #mutable_name<'rec> {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
-                self.entity.id.clone()
+                self.entity.id().clone()
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> &#active_field_types {

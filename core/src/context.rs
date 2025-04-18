@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use crate::{
     entity::Entity,
-    error::RetrievalError,
+    error::{MutationError, RetrievalError},
     model::View,
     node::{MatchArgs, Node},
-    policy::PolicyAgent,
+    policy::{AccessDenied, PolicyAgent},
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, Attested};
 use async_trait::async_trait;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -34,9 +34,10 @@ pub trait TContext {
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
     fn create_entity(&self, collection: proto::CollectionId) -> Entity;
+    fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
-    async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()>;
+    async fn commit_transaction(&self, trx_id: proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError>;
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
@@ -51,13 +52,28 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::ID { self.node.id.clone() }
     fn create_entity(&self, collection: proto::CollectionId) -> Entity { self.node.entities.create(collection) }
+    fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
+        self.node.policy_agent.check_write(&self.cdata, entity, None).into()
+    }
     async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError> {
         self.node.get_entity(collection, id /*&self.cdata*/).await
     }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.node.fetch_entities(collection, args, &self.cdata).await
     }
-    async fn commit_events(&self, events: &Vec<proto::Event>) -> anyhow::Result<()> { self.node.commit_events(events).await }
+    async fn commit_transaction(&self, trx_id: proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError> {
+        self.node.commit_transaction(&self.cdata, trx_id, events.into_iter().map(|e| e.into()).collect()).await
+    }
+    // TODO: remove this and handle commit_mut_ref differently
+    // async fn commit_transaction(&self, id: &proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError> {
+    //     self.node
+    //         .commit_transaction(
+    //             &self.cdata,
+    //             id.clone(),
+    //             events.into_iter().map(|e| proto::Attested { payload: e, attestations: vec![] }).collect(),
+    //         )
+    //         .await
+    // }
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
@@ -65,7 +81,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
-        self.node.subscribe(sub_id, collection, args, callback).await
+        self.node.subscribe(&self.cdata, sub_id, collection, args, callback).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.collections.get(id).await
@@ -136,7 +152,6 @@ impl Context {
         let result_set = self.fetch::<R>(args).await?;
         Ok(result_set.items.into_iter().next())
     }
-
     /// Subscribe to changes in entities matching a predicate
     pub async fn subscribe<F, R>(
         &self,

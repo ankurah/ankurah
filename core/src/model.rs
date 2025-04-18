@@ -3,6 +3,7 @@ pub mod tsify;
 use ankurah_proto::{CollectionId, State, ID};
 
 use crate::entity::Entity;
+use crate::error::StateError;
 use crate::property::Backends;
 use crate::property::PropertyError;
 
@@ -23,7 +24,7 @@ pub trait Model {
 pub trait View {
     type Model: Model;
     type Mutable<'trx>: Mutable<'trx>;
-    fn id(&self) -> ID { self.entity().id }
+    fn id(&self) -> ID { self.entity().id().clone() }
     fn backends(&self) -> &Backends { self.entity().backends() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Entity;
@@ -36,14 +37,14 @@ pub trait View {
 pub trait Mutable<'rec> {
     type Model: Model;
     type View: View;
-    fn id(&self) -> ID { self.entity().id }
+    fn id(&self) -> ID { self.entity().id().clone() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn backends(&self) -> &Backends { &self.entity().backends }
     fn entity(&self) -> &Entity;
     fn new(inner: &'rec Entity) -> Self
     where Self: Sized;
 
-    fn state(&self) -> anyhow::Result<State> { self.entity().to_state() }
+    fn state(&self) -> Result<State, StateError> { self.entity().to_state() }
 
     fn read(&self) -> Self::View {
         let inner = self.entity();

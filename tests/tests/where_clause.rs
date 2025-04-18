@@ -11,10 +11,10 @@ async fn basic_where_clause() -> Result<()> {
 
     let _id = {
         let trx = client.begin();
-        let id = trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await.id();
-        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
-        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
-        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
+        let id = trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?.id();
+        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
+        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
+        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
         trx.commit().await?;
         id
     };
@@ -26,6 +26,20 @@ async fn basic_where_clause() -> Result<()> {
         vec!["Walking on a Dream".to_string()]
     );
 
+    // Test IN with string literals
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch("name IN ('Walking on a Dream', 'Ice on the Dune')").await?;
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string(), "Ice on the Dune".to_string()]
+    );
+
+    // Test IN with years
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch("year IN ('2008', '2013')").await?;
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string(), "Ice on the Dune".to_string()]
+    );
+
     Ok(())
 }
 
@@ -35,7 +49,7 @@ async fn test_where_clause_with_id() -> Result<()> {
 
     let album_id = {
         let trx = client.begin();
-        let id = trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await.id();
+        let id = trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?.id();
         trx.commit().await?;
         id
     };
@@ -63,11 +77,11 @@ async fn pg_basic_where_clause() -> Result<()> {
     {
         let trx = client.begin();
 
-        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
-        trx.create(&Album { name: "Death Magnetic".into(), year: "2008".into() }).await;
-        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
-        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
-        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
+        trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
+        trx.create(&Album { name: "Death Magnetic".into(), year: "2008".into() }).await?;
+        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
+        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
+        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
 
         trx.commit().await?;
     };
@@ -90,6 +104,20 @@ async fn pg_basic_where_clause() -> Result<()> {
     let albums: ankurah::ResultSet<AlbumView> = client.fetch("name = 'Walking on a Dream' AND year = '1800'").await?;
 
     assert_eq!(albums.items.iter().map(|active_entity| active_entity.name().unwrap()).count(), 0,);
+
+    // Test IN with string literals
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch("name IN ('Walking on a Dream', 'Death Magnetic')").await?;
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string(), "Death Magnetic".to_string()]
+    );
+
+    // Test IN with years
+    let albums: ankurah::ResultSet<AlbumView> = client.fetch("year IN ('2008', '2013')").await?;
+    assert_eq!(
+        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        vec!["Walking on a Dream".to_string(), "Death Magnetic".to_string(), "Ice on the Dune".to_string()]
+    );
 
     Ok(())
 }

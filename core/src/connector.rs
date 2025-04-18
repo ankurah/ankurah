@@ -10,7 +10,7 @@ use crate::{node::NodeInner, policy::PolicyAgent, storage::StorageEngine, Node};
 
 #[async_trait]
 pub trait PeerSender: Send + Sync {
-    async fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
+    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
     /// The node ID of the recipient of this message
     fn recipient_node_id(&self) -> proto::ID;
     fn cloned(&self) -> Box<dyn PeerSender>;
@@ -52,7 +52,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         //
-        NodeInner::handle_message(&self, message).await
+        self.handle_message(message).await
     }
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }

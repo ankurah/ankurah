@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::AuthData,
+    id::ID,
     peering::Presence,
     request::{NodeRequest, NodeResponse},
+    subscription::SubscriptionId,
     update::{NodeUpdate, NodeUpdateAck},
 };
 
@@ -20,6 +22,7 @@ pub enum NodeMessage {
     Response(NodeResponse),
     Update(NodeUpdate),
     UpdateAck(NodeUpdateAck),
+    Unsubscribe { from: ID, subscription_id: SubscriptionId },
 }
 
 impl std::fmt::Display for Message {
@@ -38,6 +41,7 @@ impl std::fmt::Display for NodeMessage {
             NodeMessage::Response(response) => write!(f, "Response: {}", response),
             NodeMessage::Update(update) => write!(f, "Update: {}", update),
             NodeMessage::UpdateAck(update_ack) => write!(f, "UpdateAck: {}", update_ack),
+            NodeMessage::Unsubscribe { from, subscription_id } => write!(f, "Unsubscribe: {} {}", from, subscription_id),
         }
     }
 }

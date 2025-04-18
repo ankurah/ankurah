@@ -136,9 +136,7 @@ pub use proto::ID;
 pub use ankurah_core::{
     changes,
     context::Context,
-    entity, error,
-    event::Event,
-    model,
+    entity, error, model,
     model::View,
     model::{Model, Mutable},
     node::{MatchArgs, Node},
@@ -165,7 +163,9 @@ where
     T: reactive_graph::traits::Get + Clone + 'static,
     T::Value: 'static,
 {
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> { Box::new(self.clone()) }
+    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> {
+        Box::new(self.clone())
+    }
 }
 
 // Re-export the derive macro

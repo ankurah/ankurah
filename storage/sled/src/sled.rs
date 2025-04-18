@@ -1,4 +1,4 @@
-use ankurah_proto::{CollectionId, Event, State, ID};
+use ankurah_proto::{Attested, CollectionId, Event, State, ID};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -8,7 +8,7 @@ use tracing::warn;
 
 use ankurah_core::{
     entity::TemporaryEntity,
-    error::RetrievalError,
+    error::{MutationError, RetrievalError},
     storage::{StorageCollection, StorageEngine},
 };
 
@@ -67,21 +67,22 @@ impl StorageEngine for SledStorageEngine {
 
 #[async_trait]
 impl StorageCollection for SledStorageCollection {
-    async fn set_state(&self, id: ID, state: &State) -> anyhow::Result<bool> {
+    async fn set_state(&self, id: ID, state: &State) -> Result<bool, MutationError> {
         let tree = self.state.clone();
         let binary_state = bincode::serialize(state)?;
         let id_bytes = id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
-            let last = tree.insert(id_bytes, binary_state.clone())?;
+            let last = tree.insert(id_bytes, binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
             if let Some(last_bytes) = last {
                 Ok(last_bytes != binary_state)
             } else {
                 Ok(true)
             }
         })
-        .await?
+        .await
+        .map_err(|e| MutationError::General(Box::new(e)))?
     }
 
     async fn get_state(&self, id: ID) -> Result<State, RetrievalError> {
@@ -141,7 +142,7 @@ impl StorageCollection for SledStorageCollection {
         .map_err(RetrievalError::future_join)?
     }
 
-    async fn add_event(&self, entity_event: &Event) -> anyhow::Result<bool> {
+    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
         // Maybe it is worthwhile for us to separate the events table into
         // `collection-entityid` names until we have indices?
         let events = self.events.clone();
@@ -149,28 +150,29 @@ impl StorageCollection for SledStorageCollection {
         // TODO: Shorten `Event` struct to not include `id`/`collection`
         // since we can infer that based on key/tree respectively
         let binary_state = bincode::serialize(entity_event)?;
-        let id_bytes = entity_event.id.to_bytes();
+        let id_bytes = entity_event.payload.id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
-            let last = events.insert(id_bytes, binary_state.clone())?;
+            let last = events.insert(id_bytes, binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
             if let Some(last_bytes) = last {
                 Ok(last_bytes != binary_state)
             } else {
                 Ok(true)
             }
         })
-        .await?
+        .await
+        .map_err(|e| MutationError::General(Box::new(e)))?
     }
 
-    async fn get_events(&self, entity_id: ID) -> Result<Vec<Event>, ankurah_core::error::RetrievalError> {
+    async fn get_events(&self, entity_id: ID) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
         let mut matching_events = Vec::new();
 
         // full events table scan searching for matching entity ids
         for event_data in self.events.iter() {
             let (_key, data) = event_data.map_err(|err| SledRetrievalError::StorageError(err))?;
-            let event: Event = bincode::deserialize(&data)?;
-            if entity_id == event.entity_id {
+            let event: Attested<Event> = bincode::deserialize(&data)?;
+            if entity_id == event.payload.entity_id {
                 matching_events.push(event);
             }
         }

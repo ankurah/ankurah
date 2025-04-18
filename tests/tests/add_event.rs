@@ -14,19 +14,19 @@ async fn add_event_postgres() -> Result<()> {
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
 
     let trx = node.begin();
-    let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await;
+    let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await?;
     let album_id = album.id();
 
     trx.commit().await?;
 
     let trx1 = node.begin();
     let album1 = trx1.edit::<Album>(album_id).await?;
-    album1.name.insert(0, "(o.");
+    album1.name.insert(0, "(o.")?;
     trx1.commit().await?;
 
     let trx2 = node.begin();
     let album2 = trx2.edit::<Album>(album_id).await?;
-    album2.name.insert(3, "o) ");
+    album2.name.insert(3, "o) ")?;
     trx2.commit().await?;
 
     let albums = node.collection(&"album".into()).await?;

@@ -1,7 +1,11 @@
-use crate::{error::RetrievalError, property::Backends, property::PropertyValue};
+use crate::{
+    error::{MutationError, RetrievalError, StateError},
+    model::View,
+    property::{Backends, PropertyValue},
+};
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, Event, State, ID};
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
 use tracing::debug;
@@ -30,6 +34,12 @@ impl std::ops::Deref for Entity {
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
+impl std::ops::Deref for TemporaryEntity {
+    type Target = EntityInner;
+
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
 /// A weak reference to an entity
 pub struct WeakEntity(Weak<EntityInner>);
 
@@ -38,13 +48,16 @@ impl WeakEntity {
 }
 
 impl Entity {
+    pub fn id(&self) -> ID { self.id.clone() }
+
+    // This is intentionally private - only WeakEntitySet should be constructing Entities
     fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
 
-    pub fn collection(&self) -> CollectionId { self.collection.clone() }
+    pub fn collection(&self) -> &CollectionId { &self.collection }
 
     pub fn backends(&self) -> &Backends { &self.backends }
 
-    pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
+    pub fn to_state(&self) -> Result<State, StateError> { self.backends.to_state_buffers() }
 
     // used by the Model macro
     pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
@@ -60,7 +73,7 @@ impl Entity {
     /// Collect an event which contains all operations for all backends since the last time they were collected
     /// Used for transaction commit.
     /// TODO: We need to think about rollbacks
-    pub fn commit(&self) -> Result<Option<Event>> {
+    pub fn commit(&self) -> Result<Option<Event>, MutationError> {
         let operations = self.backends.to_operations()?;
         if operations.is_empty() {
             Ok(None)
@@ -84,7 +97,15 @@ impl Entity {
         }
     }
 
-    pub fn apply_event(&self, event: &Event) -> Result<()> {
+    pub fn view<V: View>(&self) -> Option<V> {
+        if self.collection() != &V::collection() {
+            None
+        } else {
+            Some(V::from_entity(self.clone()))
+        }
+    }
+
+    pub fn apply_event(&self, event: &Event) -> Result<(), MutationError> {
         /*
            case A: event precursor descends the current head, then set entity clock to singleton of event id
            case B: event precursor is concurrent to the current head, push event id to event head clock.
@@ -123,6 +144,12 @@ impl Entity {
     }
 }
 
+impl std::fmt::Display for Entity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
+    }
+}
+
 impl Filterable for Entity {
     fn collection(&self) -> &str { self.collection.as_str() }
 
@@ -147,12 +174,6 @@ impl Filterable for Entity {
                 None => None,
             })
         }
-    }
-}
-
-impl std::fmt::Display for Entity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
     }
 }
 
@@ -185,6 +206,12 @@ impl Filterable for TemporaryEntity {
                 None => None,
             })
         }
+    }
+}
+
+impl std::fmt::Display for TemporaryEntity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TemporaryEntity({}/{}) = {}", &self.collection, self.id, self.head.lock().unwrap())
     }
 }
 

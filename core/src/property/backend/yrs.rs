@@ -9,9 +9,12 @@ use ankurah_proto::Clock;
 use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
-use crate::property::{
-    backend::{Operation, PropertyBackend},
-    PropertyName, PropertyValue,
+use crate::{
+    error::{MutationError, StateError},
+    property::{
+       backend::{Operation, PropertyBackend},
+       PropertyName, PropertyValue,
+    },
 };
 
 /// Stores one or more properties of an entity
@@ -38,23 +41,24 @@ impl YrsBackend {
         text.map(|t| t.get_string(&txn))
     }
 
-    pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) {
+    pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) -> Result<(), MutationError> {
         let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.insert(&mut ytx, index, value);
+        Ok(())
     }
 
-    pub fn delete(&self, property_name: impl AsRef<str>, index: u32, length: u32) {
+    pub fn delete(&self, property_name: impl AsRef<str>, index: u32, length: u32) -> Result<(), MutationError> {
         let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
+        Ok(())
     }
 
-    fn apply_update(&self, update: &[u8]) -> anyhow::Result<()> {
+    fn apply_update(&self, update: &[u8]) -> Result<(), MutationError> {
         let mut txn = self.doc.transact_mut();
-        let update = Update::decode_v2(update)?;
-        txn.apply_update(update)?;
-        Ok(())
+        let update = Update::decode_v2(update).map_err(|e| StateError::SerializationError(Box::new(e)))?;
+        txn.apply_update(update).map_err(|e| MutationError::UpdateFailed(Box::new(e)))
     }
 
     fn get_property_string(&self, trx: &yrs::Transaction, property_name: &PropertyName) -> Option<PropertyValue> {
@@ -108,7 +112,7 @@ impl PropertyBackend for YrsBackend {
 
     fn property_backend_name() -> String { "yrs".to_owned() }
 
-    fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, crate::error::StateError> {
         let txn = self.doc.transact();
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
@@ -128,7 +132,7 @@ impl PropertyBackend for YrsBackend {
         Ok(Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) })
     }
 
-    fn to_operations(&self) -> anyhow::Result<Vec<Operation>> {
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
         let mut previous_state = self.previous_state.lock().unwrap();
 
         let txn = self.doc.transact_mut();
@@ -142,7 +146,7 @@ impl PropertyBackend for YrsBackend {
         Ok(vec![])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> anyhow::Result<()> {
+    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> Result<(), MutationError> {
         for operation in operations {
             self.apply_update(&operation.diff)?;
         }

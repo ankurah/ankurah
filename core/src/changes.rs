@@ -1,10 +1,10 @@
 use crate::{entity::Entity, model::View, resultset::ResultSet};
-use ankurah_proto::Event;
+use ankurah_proto::{Attested, Event};
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
     pub entity: Entity,
-    pub events: Vec<Event>,
+    pub events: Vec<Attested<Event>>,
 }
 
 #[derive(Debug, Clone)]
@@ -12,11 +12,11 @@ pub enum ItemChange<I> {
     /// Initial retrieval of an item upon subscription
     Initial { item: I },
     /// A new item was added OR changed such that it now matches the subscription
-    Add { item: I, events: Vec<Event> },
+    Add { item: I, events: Vec<Attested<Event>> },
     /// A item that previously matched the subscription has changed in a way that has not changed the matching condition
-    Update { item: I, events: Vec<Event> },
+    Update { item: I, events: Vec<Attested<Event>> },
     /// A item that previously matched the subscription has changed in a way that no longer matches the subscription
-    Remove { item: I, events: Vec<Event> },
+    Remove { item: I, events: Vec<Attested<Event>> },
 }
 
 impl<I> ItemChange<I> {
@@ -29,7 +29,7 @@ impl<I> ItemChange<I> {
         }
     }
 
-    pub fn events(&self) -> &[Event] {
+    pub fn events(&self) -> &[Attested<Event>] {
         match self {
             ItemChange::Add { events, .. } | ItemChange::Update { events, .. } | ItemChange::Remove { events, .. } => events,
             _ => &[],
@@ -61,7 +61,7 @@ where I: View
 
 impl std::fmt::Display for EntityChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityChange {}/{}", self.entity.collection, self.entity.id)
+        write!(f, "EntityChange {}/{}", self.entity.collection(), self.entity.id())
     }
 }
 
