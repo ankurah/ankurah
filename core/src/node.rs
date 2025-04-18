@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, CollectionId};
+use ankurah_proto::{self as proto, AuthData, CollectionId};
 use anyhow::anyhow;
 
 use rand::prelude::*;
@@ -186,7 +186,7 @@ where
         let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
 
         connection.pending_requests.insert(request_id, response_tx);
-        connection.send_message(proto::NodeMessage::Request(request)).await?;
+        connection.send_message(proto::NodeMessage::Request { auth: AuthData::default(), request }).await?;
 
         // Wait for response
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
@@ -195,7 +195,7 @@ where
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(message = %message)))]
     pub async fn handle_message(self: &Arc<Self>, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
-            proto::NodeMessage::Request(request) => {
+            proto::NodeMessage::Request { auth, request } => {
                 debug!("Node({}) received request {}", self.id, request);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
                 // I think this depends on how we want to handle timeouts.
