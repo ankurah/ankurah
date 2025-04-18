@@ -1,6 +1,5 @@
 use std::{collections::hash_map::Entry, collections::HashMap, hash::Hash};
 
-use super::safeset::SafeSet;
 
 /// A very basic concurrent hashmap that is hard to misuse in an async context.
 /// The number one rule is that a lock can only be held very briefly - with no calls into

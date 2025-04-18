@@ -1,7 +1,7 @@
-use ankurah_proto::{self as proto, Clock, CollectionId, Event, State, ID};
+use ankurah_proto::{self as proto, Clock, CollectionId};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Notify;
 use tracing::error;
 
@@ -9,7 +9,7 @@ use crate::collectionset::CollectionSet;
 use crate::entity::{Entity, WeakEntitySet};
 use crate::error::RetrievalError;
 use crate::property::{
-    backend::{LWWBackend, PropertyBackend},
+    backend::LWWBackend,
     PropertyValue,
 };
 use crate::property::{Property, PropertyError};

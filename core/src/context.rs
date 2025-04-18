@@ -10,7 +10,7 @@ use crate::{
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
-use ankurah_proto::{self as proto, Attested};
+use ankurah_proto::{self as proto};
 use async_trait::async_trait;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;

@@ -1,12 +1,12 @@
 mod common;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
+use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use std::sync::Arc;
 
 #[tokio::test]
 async fn test_system() -> Result<()> {
-    use common::*;
+    
     let engine = Arc::new(SledStorageEngine::new_test().unwrap());
     {
         let node = Node::new_durable(engine.clone(), PermissiveAgent::new());

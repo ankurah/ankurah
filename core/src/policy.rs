@@ -3,7 +3,7 @@ use crate::{
     error::ValidationError,
     node::{ContextData, Node, NodeInner},
     property::PropertyError,
-    proto::{self, CollectionId, ID},
+    proto::{self},
     storage::StorageEngine,
 };
 use ankql::{ast::Predicate, error::ParseError};
