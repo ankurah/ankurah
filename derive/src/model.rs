@@ -133,9 +133,10 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                             handle: Box::new(handle)
                         })
                     }
-                    pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<(), ::wasm_bindgen::JsValue> {
-                        transaction.create(&me).await;
-                        Ok(())
+                    pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                        use ankurah::Mutable;
+                        let mutable_entity = transaction.create(&me).await;
+                        Ok(mutable_entity.read())
                     }
                 }
 
@@ -492,7 +493,7 @@ fn get_static_methods_ts(
         /**
          * Create a new {name}
          */
-        static create(transaction: Transaction, me: {pojo_interface}): Promise<void>;
+        static create(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
 }}"#
     )
 }
