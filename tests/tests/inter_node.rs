@@ -98,6 +98,8 @@ async fn server_edits_subscription() -> Result<()> {
     // Update Snuffy's age to 3 on node1
     {
         let trx = server.begin();
+
+        // rex.edit(&trx).await?.age().overwrite(0, 1, "8")?;
         snuffy.edit(&trx).await?.age().overwrite(0, 1, "3")?;
         trx.commit().await?;
     }

@@ -455,6 +455,12 @@ where
             }
         }
         info!("Node {} notifying reactor of {} changes", self.id, changes.len());
+        // AH YES - this is failing because we are no longer sending the initial state to all peers
+        // and the new event doesn't seem to be enough to materialize the state. Not sure exactly why YRS doesn't have enough info,
+        // but ultimately that's immaterial - the client node needs to either fetch the precursors, or the state needs to be included in the Update from the peer.
+        // Ideally both - the peer should track whether this item was previously matched/included previously, and if not, include the state in the update.
+        // The client should ALSO be able to retrieve the precursors in the event that this state was omitted.
+        // Think about this, but it should be easily reproducible by constucting an initially-non-matching entity, and then updating it to match.
         self.reactor.notify_change(changes);
         Ok(())
     }

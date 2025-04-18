@@ -24,7 +24,7 @@ pub struct Album {
 
 // Initialize tracing for tests
 #[ctor::ctor]
-fn init_tracing() { tracing_subscriber::fmt().with_max_level(Level::INFO).with_test_writer().init(); }
+fn init_tracing() { tracing_subscriber::fmt().with_max_level(Level::TRACE).with_test_writer().init(); }
 
 #[allow(unused)]
 pub fn changeset_watcher<R: View + Send + Sync + 'static>(

@@ -144,6 +144,20 @@ impl Entity {
             upstream: Some(self.clone()),
         }))
     }
+
+    pub fn values(&self) -> Vec<(String, Option<PropertyValue>)> {
+        let backends = self.backends.backends.lock().unwrap();
+        backends
+            .values()
+            .flat_map(|backend| {
+                backend
+                    .property_values()
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect::<Vec<(String, Option<PropertyValue>)>>()
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Display for Entity {

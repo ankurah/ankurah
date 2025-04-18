@@ -222,6 +222,7 @@ where
     /// Notify subscriptions about an entity change
 
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
+        // pretty format self
         debug!("Reactor.notify_change({:?})", changes);
         // Group changes by subscription
         let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Entity>>> = std::collections::HashMap::new();
@@ -229,12 +230,15 @@ where
         for change in &changes {
             let mut possibly_interested_subs = HashSet::new();
 
-            // debug!("Reactor - index watchers: {:?}", self.index_watchers);
+            debug!("Reactor - index watchers: {:?}", self.index_watchers);
             // Find subscriptions that might be interested based on index watchers
             for ((collection_id, field_id), index_ref) in self.index_watchers.to_vec() {
                 // Get the field value from the entity
+                println!("MARK A {:?}", collection_id);
                 if collection_id == change.entity.collection {
+                    println!("MARK B {:?}, {:?}", field_id, change.entity.values());
                     if let Some(field_value) = change.entity.value(&field_id.0) {
+                        println!("MARK C {:?}", field_value);
                         possibly_interested_subs.extend(index_ref.read().unwrap().find_matching(Value::String(field_value)));
                     }
                 }
@@ -303,5 +307,15 @@ where
                 });
             }
         }
+    }
+}
+
+impl<SE, PA> std::fmt::Debug for Reactor<SE, PA> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Reactor {{ subscriptions: {:?}, index_watchers: {:?}, wildcard_watchers: {:?}, entity_watchers: {:?} }}",
+            self.subscriptions, self.index_watchers, self.wildcard_watchers, self.entity_watchers
+        )
     }
 }

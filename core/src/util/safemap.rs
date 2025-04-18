@@ -1,6 +1,5 @@
 use std::{collections::hash_map::Entry, collections::HashMap, hash::Hash};
 
-
 /// A very basic concurrent hashmap that is hard to misuse in an async context.
 /// The number one rule is that a lock can only be held very briefly - with no calls into
 /// other functions that might block.
@@ -76,5 +75,11 @@ impl<K: Hash + Eq, H: Hash + Eq> SafeMap<K, std::collections::HashSet<H>> {
             Some(v) => v.remove(value),
             None => false,
         }
+    }
+}
+
+impl<K: Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for SafeMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SafeMap {{ {:?} }}", self.0.read().expect("Failed to lock the map"))
     }
 }
