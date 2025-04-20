@@ -22,3 +22,9 @@ impl std::fmt::Display for DecodeError {
 }
 
 impl std::error::Error for DecodeError {}
+
+impl From<base64::DecodeError> for DecodeError {
+    fn from(e: base64::DecodeError) -> Self {
+        DecodeError::InvalidBase64(e)
+    }
+}

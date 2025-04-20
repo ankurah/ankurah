@@ -13,13 +13,13 @@ pub struct WebSocketClientSender {
     inner: Arc<Inner>,
 }
 struct Inner {
-    pub(crate) recipient_node_id: proto::ID,
+    pub(crate) recipient_node_id: proto::EntityID,
     handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
 impl WebSocketClientSender {
     pub fn new(
-        node_id: proto::ID,
+        node_id: proto::EntityID,
         mut sender: futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel(32);
@@ -56,7 +56,7 @@ impl PeerSender for WebSocketClientSender {
         let server_message = proto::Message::PeerMessage(message);
         self.send_message(server_message)
     }
-    fn recipient_node_id(&self) -> proto::ID { self.inner.recipient_node_id.clone() }
+    fn recipient_node_id(&self) -> proto::EntityID { self.inner.recipient_node_id.clone() }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

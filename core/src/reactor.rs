@@ -14,9 +14,9 @@ use ankql::ast;
 use ankql::selection::filter::Filterable;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::debug;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
+use tracing::{debug, info};
 
 use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,7 +37,7 @@ pub struct Reactor<SE, PA> {
     /// Index of subscriptions that presently match each entity.
     /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
-    entity_watchers: SafeMap<ankurah_proto::ID, HashSet<proto::SubscriptionId>>,
+    entity_watchers: SafeMap<ankurah_proto::EntityID, HashSet<proto::SubscriptionId>>,
     /// Reference to the storage engine
     collections: CollectionSet<SE>,
 
@@ -71,6 +71,7 @@ where
         })
     }
 
+    // TODO - update this to take a channel rather than a callback
     pub async fn subscribe(
         self: &Arc<Self>,
         sub_id: proto::SubscriptionId,
@@ -258,7 +259,7 @@ where
                 }
             }
 
-            debug!(" possibly_interested_subs: {possibly_interested_subs:?}");
+            info!(" possibly_interested_subs: {possibly_interested_subs:?}");
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {

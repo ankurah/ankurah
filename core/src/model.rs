@@ -1,6 +1,6 @@
 pub mod tsify;
 
-use ankurah_proto::{CollectionId, State, ID};
+use ankurah_proto::{CollectionId, State, EntityID};
 
 use crate::entity::Entity;
 use crate::error::StateError;
@@ -24,7 +24,7 @@ pub trait Model {
 pub trait View {
     type Model: Model;
     type Mutable<'trx>: Mutable<'trx>;
-    fn id(&self) -> ID { self.entity().id().clone() }
+    fn id(&self) -> EntityID { self.entity().id().clone() }
     fn backends(&self) -> &Backends { self.entity().backends() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Entity;
@@ -37,7 +37,7 @@ pub trait View {
 pub trait Mutable<'rec> {
     type Model: Model;
     type View: View;
-    fn id(&self) -> ID { self.entity().id().clone() }
+    fn id(&self) -> EntityID { self.entity().id().clone() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn backends(&self) -> &Backends { &self.entity().backends }
     fn entity(&self) -> &Entity;

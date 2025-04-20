@@ -2,9 +2,10 @@ use crate::{
     error::{MutationError, RetrievalError, StateError},
     model::View,
     property::{Backends, PropertyValue},
+    Node,
 };
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{Clock, CollectionId, Event, State, ID};
+use ankurah_proto::{Clock, CollectionId, EntityID, Event, EventID, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
@@ -21,11 +22,11 @@ pub struct TemporaryEntity(Arc<EntityInner>);
 
 #[derive(Debug)]
 pub struct EntityInner {
-    pub id: ID,
+    pub id: EntityID,
     pub collection: CollectionId,
     pub(crate) backends: Backends,
     head: std::sync::Mutex<Clock>,
-    pub upstream: Option<Entity>,
+    pub(crate) upstream: Option<Entity>,
 }
 
 impl std::ops::Deref for Entity {
@@ -48,7 +49,7 @@ impl WeakEntity {
 }
 
 impl Entity {
-    pub fn id(&self) -> ID { self.id.clone() }
+    pub fn id(&self) -> EntityID { self.id.clone() }
 
     // This is intentionally private - only WeakEntitySet should be constructing Entities
     fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
@@ -62,12 +63,12 @@ impl Entity {
     pub fn to_state(&self) -> Result<State, StateError> { self.backends.to_state_buffers() }
 
     // used by the Model macro
-    pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
+    pub fn create(id: EntityID, collection: CollectionId, backends: Backends) -> Self {
         Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(Clock::default()), upstream: None }))
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
-    fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    fn from_state(id: EntityID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(state)?;
         Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
@@ -81,16 +82,17 @@ impl Entity {
             Ok(None)
         } else {
             let event = {
+                let head = self.head.lock().unwrap();
                 let event = Event {
-                    id: ID::new(),
+                    id: EventID::from_parts(&self.id, &operations, &head),
                     entity_id: self.id.clone(),
                     collection: self.collection.clone(),
                     operations,
-                    parent: self.head.lock().unwrap().clone(),
+                    parent: head.clone(),
                 };
 
                 // Set the head to the event's ID
-                *self.head.lock().unwrap() = Clock::new([event.id]);
+                *self.head.lock().unwrap() = Clock::new([event.id.clone()]);
                 event
             };
 
@@ -107,13 +109,15 @@ impl Entity {
         }
     }
 
-    pub fn apply_event(&self, event: &Event) -> Result<(), MutationError> {
+    /// We're going to need a &Node arg in order to recurse, which will complicate a few things
+    /// For now just fail if we can't apply the event?
+    pub async fn apply_event(&self, event: &Event) -> Result<bool, MutationError> {
         /*
            case A: event precursor descends the current head, then set entity clock to singleton of event id
            case B: event precursor is concurrent to the current head, push event id to event head clock.
            case C: event precursor is descended by the current head
         */
-        let head = Clock::new([event.id]);
+        let head = Clock::new([event.id.clone()]);
         for (backend_name, operations) in &event.operations {
             // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
             self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent /* , context*/)?;
@@ -125,7 +129,8 @@ impl Entity {
         // Hack
         *self.backends.head.lock().unwrap() = head;
 
-        Ok(())
+        // Ok(())
+        unimplemented!()
     }
 
     /// HACK - we probably shouldn't be stomping on the backends like this
@@ -194,7 +199,7 @@ impl Filterable for Entity {
 }
 
 impl TemporaryEntity {
-    pub fn new(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    pub fn new(id: EntityID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(state)?;
         Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
@@ -233,9 +238,9 @@ impl std::fmt::Display for TemporaryEntity {
 
 /// A set of entities held weakly
 #[derive(Clone, Default)]
-pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<ID, WeakEntity>>>);
+pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityID, WeakEntity>>>);
 impl WeakEntitySet {
-    pub fn get(&self, id: ID) -> Option<Entity> {
+    pub fn get(&self, id: EntityID) -> Option<Entity> {
         let entities = self.0.read().unwrap();
         // TODO: call policy agent with cdata
         if let Some(entity) = entities.get(&id) {
@@ -248,13 +253,13 @@ impl WeakEntitySet {
     /// Create a brand new entity, and add it to the set
     pub fn create(&self, collection: CollectionId) -> Entity {
         let mut entities = self.0.write().unwrap();
-        let id = ID::new();
+        let id = EntityID::new();
         let entity = Entity::create(id, collection, Backends::new());
         entities.insert(id, entity.weak());
         entity
     }
 
-    pub fn with_state(&self, id: ID, collection_id: CollectionId, state: State) -> Result<Entity, RetrievalError> {
+    pub fn with_state(&self, id: EntityID, collection_id: CollectionId, state: State) -> Result<Entity, RetrievalError> {
         let mut entities = self.0.write().unwrap();
         match entities.entry(id) {
             Entry::Vacant(_) => {

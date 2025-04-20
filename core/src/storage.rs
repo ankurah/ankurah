@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, Event, State, ID};
+use ankurah_proto::{Attested, CollectionId, EntityID, Event, EventID, State};
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
@@ -22,22 +22,23 @@ pub trait StorageCollection: Send + Sync {
     // TODO - implement merge_states based on event history.
     // Consider whether to play events forward from a prior checkpoint (probably this)
     // or maybe to require PropertyBackends to be able to merge states.
-    async fn set_state(&self, id: ID, state: &State) -> Result<bool, MutationError>;
-    async fn get_state(&self, id: ID) -> Result<State, RetrievalError>;
+    async fn set_state(&self, id: EntityID, state: &State) -> Result<bool, MutationError>;
+    async fn get_state(&self, id: EntityID) -> Result<State, RetrievalError>;
 
     // Fetch raw entity states matching a predicate
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError>;
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(EntityID, State)>, RetrievalError>;
 
-    async fn set_states(&self, entities: Vec<(ID, &State)>) -> Result<(), MutationError> {
+    async fn set_states(&self, entities: Vec<(EntityID, &State)>) -> Result<(), MutationError> {
         for (id, state) in entities {
             self.set_state(id, state).await?;
         }
         Ok(())
     }
 
-    // TODO:
     async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError>;
-    async fn get_events(&self, id: ID) -> Result<Vec<Attested<Event>>, RetrievalError>;
+
+    async fn get_event(&self, id: EntityID, event_id: EventID) -> Result<Attested<Event>, RetrievalError>;
+    async fn get_events(&self, id: EntityID) -> Result<Vec<Attested<Event>>, RetrievalError>;
 }
 
 /// Manages the storage and state of the collection without any knowledge of the model type

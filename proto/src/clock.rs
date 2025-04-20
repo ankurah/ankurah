@@ -1,15 +1,13 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
-use uuid::Uuid;
 use wasm_bindgen::JsValue;
 
-use crate::{error::DecodeError, id::ID};
+use crate::{error::DecodeError, EventID};
 
 /// S set of event ids which create a dag of events
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
-pub struct Clock(BTreeSet<ID>);
+pub struct Clock(BTreeSet<EventID>);
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClockOrdering {
@@ -20,9 +18,9 @@ pub enum ClockOrdering {
 }
 
 impl Clock {
-    pub fn new(ids: impl Into<BTreeSet<ID>>) -> Self { Self(ids.into()) }
+    pub fn new(ids: impl Into<BTreeSet<EventID>>) -> Self { Self(ids.into()) }
 
-    pub fn as_slice(&self) -> &BTreeSet<ID> { &self.0 }
+    pub fn as_slice(&self) -> &BTreeSet<EventID> { &self.0 }
 
     pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_string()).collect() }
 
@@ -31,11 +29,20 @@ impl Clock {
         Ok(Self(ids))
     }
 
-    pub fn insert(&mut self, id: ID) { self.0.insert(id); }
+    pub fn insert(&mut self, id: EventID) { self.0.insert(id); }
 
     pub fn len(&self) -> usize { self.0.len() }
 
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
+
+    pub fn to_bytes_vec(&self) -> Vec<[u8; 32]> { self.0.iter().map(|id| id.clone().to_bytes()).collect() }
+
+    pub fn from_bytes_vec(bytes: Vec<[u8; 32]>) -> Self {
+        let ids = bytes.into_iter().map(|b| EventID::from_bytes(b)).collect();
+        Self(ids)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &EventID> { self.0.iter() }
 }
 
 impl TryFrom<JsValue> for Clock {
@@ -59,30 +66,12 @@ impl From<&Clock> for JsValue {
     }
 }
 
-impl From<Vec<Uuid>> for Clock {
-    fn from(uuids: Vec<Uuid>) -> Self {
-        let ids = uuids
-            .into_iter()
-            .map(|uuid| {
-                let ulid = Ulid::from(uuid);
-                ID::from_ulid(ulid)
-            })
-            .collect();
-        Self(ids)
-    }
+impl From<Vec<EventID>> for Clock {
+    fn from(ids: Vec<EventID>) -> Self { Self(ids.into_iter().collect()) }
 }
 
-impl From<&Clock> for Vec<Uuid> {
-    fn from(clock: &Clock) -> Self {
-        clock
-            .0
-            .iter()
-            .map(|id| {
-                let ulid: Ulid = (*id).into();
-                ulid.into()
-            })
-            .collect()
-    }
+impl From<&Clock> for Vec<EventID> {
+    fn from(clock: &Clock) -> Self { clock.0.iter().cloned().collect() }
 }
 
 impl std::fmt::Display for Clock {

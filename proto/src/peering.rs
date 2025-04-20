@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{id::ID, Clock};
+use crate::{id::EntityID, Clock};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Presence {
-    pub node_id: ID,
+    pub node_id: EntityID,
     pub durable: bool,
     pub system_root: Option<Clock>,
 }

@@ -42,7 +42,7 @@ impl Transaction {
     }
 
     /// Fetch an entity already in the transaction.
-    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<&Entity, RetrievalError> {
+    async fn get_entity(&self, id: proto::EntityID, collection: &proto::CollectionId) -> Result<&Entity, RetrievalError> {
         if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
             return Ok(entity);
         }
@@ -65,7 +65,7 @@ impl Transaction {
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
     }
     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
-    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::ID>) -> Result<M::Mutable<'rec>, MutationError> {
+    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::EntityID>) -> Result<M::Mutable<'rec>, MutationError> {
         let id = id.into();
         let entity = self.get_entity(id, &M::collection()).await?;
         self.dyncontext.check_write(entity)?;
@@ -86,7 +86,7 @@ impl Transaction {
         for entity in self.entities.iter() {
             if let Some(entity_event) = entity.commit()? {
                 if let Some(upstream) = &entity.upstream {
-                    upstream.apply_event(&entity_event)?;
+                    upstream.apply_event(&entity_event).await?;
                 } else {
                     // Entitity is already updated
                 }

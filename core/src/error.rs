@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use ankurah_proto::{CollectionId, DecodeError, ID};
+use ankurah_proto::{CollectionId, DecodeError, EntityID};
 use thiserror::Error;
 
 use crate::{connector::SendError, policy::AccessDenied};
@@ -12,7 +12,9 @@ pub enum RetrievalError {
     #[error("Parse error: {0}")]
     ParseError(ankql::error::ParseError),
     #[error("ID {0:?} not found")]
-    NotFound(ID),
+    NotFound(EntityID),
+    #[error("Event {0:?} not found")]
+    EventNotFound(EventID),
     #[error("Storage error: {0}")]
     StorageError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Collection not found: {0}")]

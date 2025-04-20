@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, MatchArgs, Mutable, Node, PermissiveAgent, ResultSet, ID};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, MatchArgs, Mutable, Node, PermissiveAgent, ResultSet, EntityID};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -57,7 +57,7 @@ async fn server_edits_subscription() -> Result<()> {
     let (server_watcher, check_server) = common::changeset_watcher::<PetView>();
     let _server_handle = server.subscribe("name = 'Rex' OR (age > 2 and age < 5)", server_watcher).await?;
 
-    assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(ID, ChangeKind)>>);
+    assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityID, ChangeKind)>>);
 
     use ankurah::View;
     // Create initial entities on node1
@@ -75,9 +75,12 @@ async fn server_edits_subscription() -> Result<()> {
     info!("rex: {}, snuffy: {}, jasper: {}", rex.entity(), snuffy.entity(), jasper.entity());
     assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Add)]]);
 
+    println!("MARK 0\n\n\n");
     // Set up subscription on node2
     let (client_watcher, check_client) = common::changeset_watcher::<PetView>();
     let _client_handle = client.subscribe("name = 'Rex' OR (age > 2 and age < 5)", client_watcher).await?;
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     // Initial state should include Rex
     assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Initial)]]);

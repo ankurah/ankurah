@@ -97,7 +97,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                 #[wasm_bindgen(js_class = #name)]
                 impl #namespace_struct {
-                    pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
                     }
                     pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<#resultset_name, ::wasm_bindgen::JsValue> {
@@ -152,7 +152,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     pub fn items(&self) -> Vec<#view_name> {
                         self.0.items.to_vec()
                     }
-                    pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Option<#view_name> {
+                    pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Option<#view_name> {
                         self.0.items.iter().find(|item| item.id() == id).map(|item| item.clone())
                         // todo generate a map on demand if there are more than a certain number of items (benchmark this)
                     }
@@ -240,7 +240,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         #wasm_attributes
         impl #view_name {
-            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
+            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 self.entity.id().clone()
             }
             #(
@@ -278,7 +278,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
         }
         impl<'rec> #mutable_name<'rec> {
-            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
+            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 self.entity.id().clone()
             }
             #(
@@ -288,14 +288,14 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             )*
         }
 
-        impl<'a> Into<ankurah::derive_deps::ankurah_proto::ID> for &'a #view_name {
-            fn into(self) -> ankurah::derive_deps::ankurah_proto::ID {
+        impl<'a> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #view_name {
+            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityIdtityId {
                 ankurah::View::id(self)
             }
         }
 
-        impl<'a, 'rec> Into<ankurah::derive_deps::ankurah_proto::ID> for &'a #mutable_name<'rec> {
-            fn into(self) -> ankurah::derive_deps::ankurah_proto::ID {
+        impl<'a, 'rec> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #mutable_name<'rec> {
+            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 ::ankurah::model::Mutable::id(self)
             }
         }

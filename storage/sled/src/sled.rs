@@ -1,7 +1,7 @@
-use ankurah_proto::{Attested, CollectionId, Event, State, ID};
+use ankurah_proto::{Attested, CollectionId, EntityID, Event, EventID, State};
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{btree_map::Keys, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::warn;
@@ -67,7 +67,7 @@ impl StorageEngine for SledStorageEngine {
 
 #[async_trait]
 impl StorageCollection for SledStorageCollection {
-    async fn set_state(&self, id: ID, state: &State) -> Result<bool, MutationError> {
+    async fn set_state(&self, id: EntityID, state: &State) -> Result<bool, MutationError> {
         let tree = self.state.clone();
         let binary_state = bincode::serialize(state)?;
         let id_bytes = id.to_bytes();
@@ -85,7 +85,7 @@ impl StorageCollection for SledStorageCollection {
         .map_err(|e| MutationError::General(Box::new(e)))?
     }
 
-    async fn get_state(&self, id: ID) -> Result<State, RetrievalError> {
+    async fn get_state(&self, id: EntityID) -> Result<State, RetrievalError> {
         let tree = self.state.clone();
         let id_bytes = id.to_bytes();
 
@@ -103,20 +103,20 @@ impl StorageCollection for SledStorageCollection {
         }
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(ID, State)>, RetrievalError> {
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(EntityID, State)>, RetrievalError> {
         let predicate = predicate.clone();
         let collection_id = self.collection_id.clone();
         let copied_state = self.state.iter().collect::<Vec<_>>();
 
         // Use spawn_blocking for the full scan operation
-        task::spawn_blocking(move || -> Result<Vec<(ID, State)>, RetrievalError> {
+        task::spawn_blocking(move || -> Result<Vec<(EntityID, State)>, RetrievalError> {
             let mut results = Vec::new();
             let mut seen_ids = HashSet::new();
 
             // For now, do a full table scan
             for item in copied_state {
                 let (key_bytes, value_bytes) = item.map_err(SledRetrievalError::StorageError)?;
-                let id = ID::from_ulid(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into().map_err(RetrievalError::storage)?));
+                let id = EntityID::from_ulid(ulid::Ulid::from_bytes(key_bytes.as_ref().try_into().map_err(RetrievalError::storage)?));
 
                 // Skip if we've already seen this ID
                 if seen_ids.contains(&id) {
@@ -150,40 +150,49 @@ impl StorageCollection for SledStorageCollection {
         // TODO: Shorten `Event` struct to not include `id`/`collection`
         // since we can infer that based on key/tree respectively
         let binary_state = bincode::serialize(entity_event)?;
-        let id_bytes = entity_event.payload.id.to_bytes();
+
+        let mut key = [0u8; 48];
+        key[..16].copy_from_slice(&entity_event.payload.entity_id.to_bytes());
+        key[16..32].copy_from_slice(entity_event.payload.id.as_bytes());
 
         // Use spawn_blocking since sled operations are not async
-        task::spawn_blocking(move || {
-            let last = events.insert(id_bytes, binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
-            if let Some(last_bytes) = last {
-                Ok(last_bytes != binary_state)
-            } else {
-                Ok(true)
-            }
-        })
-        .await
-        .map_err(|e| MutationError::General(Box::new(e)))?
+
+        let last = events.insert(key, binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
+
+        if let Some(last_bytes) = last {
+            Ok(last_bytes != binary_state)
+        } else {
+            Ok(true)
+        }
     }
 
-    async fn get_events(&self, entity_id: ID) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
-        let mut matching_events = Vec::new();
+    async fn get_event(&self, entity_id: EntityID, event_id: EventID) -> Result<Attested<Event>, RetrievalError> {
+        let mut key = [0u8; 48];
+        key[..16].copy_from_slice(&entity_id.to_bytes());
+        key[16..32].copy_from_slice(event_id.as_bytes());
 
-        // full events table scan searching for matching entity ids
-        for event_data in self.events.iter() {
+        let event =
+            self.events.get(key).map_err(|err| SledRetrievalError::StorageError(err))?.ok_or(SledRetrievalError::NotFound(entity_id))?;
+        let event: Attested<Event> = bincode::deserialize(&event)?;
+        Ok(event)
+    }
+
+    async fn get_events(&self, entity_id: EntityID) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
+        let mut events = Vec::new();
+
+        for event_data in self.events.range(entity_id.to_bytes()..) {
             let (_key, data) = event_data.map_err(|err| SledRetrievalError::StorageError(err))?;
             let event: Attested<Event> = bincode::deserialize(&data)?;
-            if entity_id == event.payload.entity_id {
-                matching_events.push(event);
-            }
+            events.push(event);
         }
 
-        Ok(matching_events)
+        Ok(events)
     }
 }
 
 enum SledRetrievalError {
     StorageError(sled::Error),
-    NotFound(ID),
+    NotFound(EntityID),
     Other(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 

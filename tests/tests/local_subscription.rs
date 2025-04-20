@@ -49,7 +49,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
         let trx = client.begin();
         let albums: ResultSet<AlbumView> = client.fetch("name = 'Ice on the Dune'").await?;
         let album = albums.items[0].edit(&trx).await?;
-        album.year().overwrite(0, 4, "2020");
+        album.year().overwrite(0, 4, "2020")?;
         trx.commit().await?;
     }
 

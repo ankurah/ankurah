@@ -24,11 +24,11 @@ pub struct Album {
 
 // Initialize tracing for tests
 #[ctor::ctor]
-fn init_tracing() { tracing_subscriber::fmt().with_max_level(Level::TRACE).with_test_writer().init(); }
+fn init_tracing() { tracing_subscriber::fmt().with_max_level(Level::INFO).with_test_writer().init(); }
 
 #[allow(unused)]
 pub fn changeset_watcher<R: View + Send + Sync + 'static>(
-) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<Vec<(proto::ID, ChangeKind)>> + Send + Sync>) {
+) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<Vec<(proto::EntityID, ChangeKind)>> + Send + Sync>) {
     let changes = Arc::new(Mutex::new(Vec::new()));
     let watcher = {
         let changes = changes.clone();
@@ -38,7 +38,7 @@ pub fn changeset_watcher<R: View + Send + Sync + 'static>(
     };
 
     let check = Box::new(move || {
-        let changes: Vec<Vec<(proto::ID, ChangeKind)>> =
+        let changes: Vec<Vec<(proto::EntityID, ChangeKind)>> =
             changes.lock().unwrap().drain(..).map(|c| c.changes.iter().map(|c| (c.entity().id(), c.into())).collect()).collect();
         changes
     });

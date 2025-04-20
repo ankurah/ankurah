@@ -14,6 +14,10 @@ pub struct Attested<T> {
     pub attestations: Vec<Attestation>,
 }
 
+impl<T> Attested<T> {
+    pub fn opt(payload: T, attestation: Option<Attestation>) -> Self { Self { payload, attestations: attestation.into_iter().collect() } }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
     // TODO

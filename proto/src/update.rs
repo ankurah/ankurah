@@ -1,4 +1,9 @@
-use crate::{auth::Attested, data::Event, id::ID, subscription::SubscriptionId};
+use crate::{
+    auth::Attested,
+    data::{EntityState, Event},
+    id::EntityID,
+    subscription::SubscriptionId,
+};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -8,15 +13,15 @@ pub struct UpdateId(Ulid);
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeUpdateBody {
     /// New events for a subscription
-    SubscriptionUpdate { subscription_id: SubscriptionId, events: Vec<Attested<Event>> },
+    SubscriptionUpdate { subscription_id: SubscriptionId, events: Vec<Attested<Event>>, states: Vec<Attested<EntityState>> },
 }
 
 /// An update from one node to another
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdate {
     pub id: UpdateId,
-    pub from: ID,
-    pub to: ID,
+    pub from: EntityID,
+    pub to: EntityID,
     pub body: NodeUpdateBody,
 }
 
@@ -24,8 +29,8 @@ pub struct NodeUpdate {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdateAck {
     pub id: UpdateId,
-    pub from: ID,
-    pub to: ID,
+    pub from: EntityID,
+    pub to: EntityID,
     pub body: NodeUpdateAckBody,
 }
 
@@ -58,11 +63,12 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeUpdateBody::SubscriptionUpdate { subscription_id, events } => {
+            NodeUpdateBody::SubscriptionUpdate { subscription_id, events, states } => {
                 write!(
                     f,
-                    "SubscriptionUpdate {subscription_id} [{}]",
-                    events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", ")
+                    "SubscriptionUpdate {subscription_id} [{}] ({})",
+                    events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "),
+                    states.iter().map(|s| format!("{}", s)).collect::<Vec<_>>().join(", ")
                 )
             }
         }

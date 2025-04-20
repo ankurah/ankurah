@@ -27,7 +27,7 @@ impl<R: Clone> std::fmt::Debug for Subscription<R> {
 pub struct SubscriptionHandle {
     pub(crate) id: proto::SubscriptionId,
     pub(crate) node: Box<dyn TNodeErased>,
-    pub(crate) peers: Vec<proto::ID>,
+    pub(crate) peers: Vec<proto::EntityID>,
 }
 
 impl SubscriptionHandle {

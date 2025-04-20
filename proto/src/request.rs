@@ -6,7 +6,7 @@ use crate::{
     auth::Attested,
     collection::CollectionId,
     data::{Event, State},
-    id::ID,
+    id::EntityID,
     subscription::SubscriptionId,
     transaction::TransactionId,
 };
@@ -29,8 +29,8 @@ impl RequestId {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeRequest {
     pub id: RequestId,
-    pub to: ID,
-    pub from: ID,
+    pub to: EntityID,
+    pub from: EntityID,
     pub body: NodeRequestBody,
 }
 
@@ -48,8 +48,8 @@ pub enum NodeRequestBody {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeResponse {
     pub request_id: RequestId,
-    pub from: ID,
-    pub to: ID,
+    pub from: EntityID,
+    pub to: EntityID,
     pub body: NodeResponseBody,
 }
 
@@ -57,8 +57,8 @@ pub struct NodeResponse {
 pub enum NodeResponseBody {
     // Response to CommitEvents
     CommitComplete { id: TransactionId },
-    Fetch(Vec<(ID, State)>),
-    Subscribe { initial: Vec<(ID, State)>, subscription_id: SubscriptionId },
+    Fetch(Vec<(EntityID, State)>),
+    Subscribed { subscription_id: SubscriptionId },
     Success,
     Error(String),
 }
@@ -97,12 +97,7 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::Fetch(tuples) => {
                 write!(f, "Fetch [{}]", tuples.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::Subscribe { initial, subscription_id } => write!(
-                f,
-                "Subscribe {} initial [{}]",
-                subscription_id,
-                initial.iter().map(|(id, state)| format!("{} {}", id, state)).collect::<Vec<_>>().join(", ")
-            ),
+            NodeResponseBody::Subscribed { subscription_id } => write!(f, "Subscribed {subscription_id}"),
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
         }

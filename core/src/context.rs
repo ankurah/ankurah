@@ -22,20 +22,24 @@ impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct NodeAndContext<SE, PA: PolicyAgent> {
+pub struct NodeAndContext<SE, PA: PolicyAgent>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     node: Node<SE, PA>,
     cdata: PA::ContextData,
 }
 
 #[async_trait]
 pub trait TContext {
-    fn node_id(&self) -> proto::ID;
+    fn node_id(&self) -> proto::EntityID;
     /// Create a brand new entity, and add it to the WeakEntitySet
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
     fn create_entity(&self, collection: proto::CollectionId) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
-    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError>;
+    async fn get_entity(&self, id: proto::EntityID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_transaction(&self, trx_id: proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError>;
     async fn subscribe(
@@ -50,12 +54,12 @@ pub trait TContext {
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
-    fn node_id(&self) -> proto::ID { self.node.id.clone() }
+    fn node_id(&self) -> proto::EntityID { self.node.id.clone() }
     fn create_entity(&self, collection: proto::CollectionId) -> Entity { self.node.entities.create(collection) }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         self.node.policy_agent.check_write(&self.cdata, entity, None).into()
     }
-    async fn get_entity(&self, id: proto::ID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError> {
+    async fn get_entity(&self, id: proto::EntityID, collection: &proto::CollectionId) -> Result<Entity, RetrievalError> {
         self.node.get_entity(collection, id /*&self.cdata*/).await
     }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
@@ -93,7 +97,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 #[wasm_bindgen]
 impl Context {
     #[wasm_bindgen(js_name = "node_id")]
-    pub fn js_node_id(&self) -> proto::ID { self.0.node_id() }
+    pub fn js_node_id(&self) -> proto::EntityID { self.0.node_id() }
 }
 
 // This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
@@ -111,7 +115,7 @@ impl Context {
         Self(Arc::new(NodeAndContext { node, cdata: data }))
     }
 
-    pub fn node_id(&self) -> proto::ID { self.0.node_id() }
+    pub fn node_id(&self) -> proto::EntityID { self.0.node_id() }
 
     // TODO: Fix this - arghhh async lifetimes
     // pub async fn trx<T, F, Fut>(self: &Arc<Self>, f: F) -> anyhow::Result<T>
@@ -125,7 +129,7 @@ impl Context {
     //     Ok(result)
     // }
 
-    pub async fn get<R: View>(&self, id: proto::ID) -> Result<R, RetrievalError> {
+    pub async fn get<R: View>(&self, id: proto::EntityID) -> Result<R, RetrievalError> {
         let entity = self.0.get_entity(id, &R::collection()).await?;
         Ok(R::from_entity(entity))
     }

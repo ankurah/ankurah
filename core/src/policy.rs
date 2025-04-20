@@ -84,8 +84,18 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::ID,
+        received_from_node: &proto::EntityID,
         event: &Attested<proto::Event>,
+    ) -> Result<(), AccessDenied>;
+
+    /// Attest a state which the caller asserts is valid. Implementation may return None if no attestation is required
+    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation>;
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        received_from_node: &proto::EntityID,
+        state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
     // For checking if a context can access a collection
@@ -164,10 +174,29 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::ID,
+        _from_node: &proto::EntityID,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         info!("PermissiveAgent validate_received_event: {:?}", _event);
+        Ok(())
+    }
+
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
+        info!("PermissiveAgent attest_state: {:?}", _state);
+        // This PolicyAgent does not require attestation, so we return None
+        // Client/Server policy agents may also return None and defer to the server identity to validate the received state
+        None
+    }
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _from_node: &proto::EntityID,
+        _state: &Attested<proto::EntityState>,
+    ) -> Result<(), AccessDenied> {
+        info!("PermissiveAgent validate_received_state: {:?}", _state);
+        // This PolicyAgent does not require validation, so we return Ok
+        // Client/Server policy agents may use the _from_node to validate the received state rather than an attestation
         Ok(())
     }
 

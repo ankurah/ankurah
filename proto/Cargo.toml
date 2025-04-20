@@ -20,3 +20,4 @@ uuid               = { version = "1.7.0", features = ["serde", "v4"] }
 wasm-bindgen       = { version = "0.2.92", features = ["serde"] }
 base64             = { version = "0.22" }
 ankql              = { path = "../ankql", version = "^0.3.5" }
+sha2 = "0.10.8"

@@ -149,7 +149,7 @@ impl StorageEngine for IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageCollection for IndexedDBBucket {
-    async fn set_state(&self, id: proto::ID, state: &proto::State) -> Result<bool, MutationError> {
+    async fn set_state(&self, id: proto::EntityID, state: &proto::State) -> Result<bool, MutationError> {
         self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Lock the mutex to prevent concurrent updates
         let _lock = self.mutex.lock().await;
@@ -222,7 +222,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_state(&self, id: proto::ID) -> Result<proto::State, RetrievalError> {
+    async fn get_state(&self, id: proto::EntityID) -> Result<proto::State, RetrievalError> {
         SendWrapper::new(async move {
             // Create transaction and get object store
             let transaction = self
@@ -278,7 +278,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(proto::ID, proto::State)>, RetrievalError> {
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(proto::EntityID, proto::State)>, RetrievalError> {
         let collection_id = self.collection_id.clone();
         SendWrapper::new(async move {
             let transaction = self.db.transaction_with_str("entities").map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
@@ -308,7 +308,7 @@ impl StorageCollection for IndexedDBBucket {
                 let entity = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
 
                 let id_str = js_sys::Reflect::get(&entity, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get entity id"))?;
-                let id: proto::ID = id_str.try_into().map_err(|_e| anyhow::anyhow!("Failed to convert id to proto::ID"))?;
+                let id: proto::EntityID = id_str.try_into().map_err(|_e| anyhow::anyhow!("Failed to convert id to proto::EntityId"))?;
 
                 let state_buffer =
                     js_sys::Reflect::get(&entity, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
@@ -404,7 +404,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_events(&self, id: ankurah_proto::ID) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+    async fn get_events(&self, id: ankurah_proto::EntityID) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
         SendWrapper::new(async move {
             let transaction = self
                 .db
@@ -486,7 +486,7 @@ impl StorageCollection for IndexedDBBucket {
                 }
                 let parent = parent_uuids
                     .into_iter()
-                    .map(|uuid| ankurah_proto::ID::from_ulid(uuid.into()))
+                    .map(|uuid| ankurah_proto::EntityID::from_ulid(uuid.into()))
                     .collect::<std::collections::BTreeSet<_>>();
                 let parent_clock = ankurah_proto::Clock::new(parent);
 
@@ -498,7 +498,7 @@ impl StorageCollection for IndexedDBBucket {
                     .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert event id to string").into()))?;
                 let event_uuid = uuid::Uuid::parse_str(&event_id_str)
                     .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to parse event UUID").into()))?;
-                let event_id = ankurah_proto::ID::from_ulid(event_uuid.into());
+                let event_id = ankurah_proto::EntityID::from_ulid(event_uuid.into());
 
                 events.push(Attested {
                     payload: ankurah_proto::Event {
@@ -587,7 +587,7 @@ mod tests {
         let bucket = engine.collection(&"albums".into()).await.expect("Failed to create bucket");
 
         // Create a test entity
-        let id = proto::ID::new();
+        let id = proto::EntityID::new();
         let mut state_buffers = std::collections::BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
         let state = proto::State { state_buffers, head: proto::Clock::default() };

@@ -150,6 +150,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde-wasm-bindgen",
+ "sha2",
  "ulid",
  "uuid",
  "wasm-bindgen",
