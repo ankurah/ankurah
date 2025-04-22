@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, MatchArgs, Mutable, Node, PermissiveAgent, ResultSet, EntityId};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, MatchArgs, Mutable, Node, PermissiveAgent, ResultSet};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -109,10 +109,6 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Sleep for a bit to ensure the change is propagated
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-
-    // LEFT OFF HERE - determine how this ever worked. simply adding the edit event should not be enough to project the current state of snuffy for the client
-    // because the client never received the state of snuffy in the first place, and thus the edit event doesn't refer to any state that the client has.
-    // AHA! It's the change to only send committed events to durable nodes.
 
     // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
     assert_eq!(check_server(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);

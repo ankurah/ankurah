@@ -39,7 +39,7 @@ async fn add_event_postgres() -> Result<()> {
 
     println!("MARK 3");
     let albums = node.collection(&"album".into()).await?;
-    let events = albums.get_events(album_id).await?;
+    let events = albums.dump_entity_events(album_id).await?;
     assert_eq!(events.len(), 3);
 
     println!("MARK 4");

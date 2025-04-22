@@ -2,11 +2,12 @@ use crate::{
     error::{MutationError, RetrievalError, StateError}, model::View, property::{Backends, PropertyValue}, storage::StorageCollectionWrapper, Node
 };
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{Clock, CollectionId, EntityId, Event, EventId, OperationSet, State};
+use ankurah_proto::{clock, Clock, CollectionId, EntityId, Event, EventId, OperationSet, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
 use tracing::debug;
+use crate::lineage;
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -82,7 +83,7 @@ impl Entity {
                 let mut head = self.head.lock().unwrap();
                 let operations = OperationSet(operations);
                 let event = Event {
-                    id: EventId::from_parts(&self.id, &operations, &head),
+                    // id: EventId::from_parts(&self.id, &operations, &head),
                     entity_id: self.id.clone(),
                     collection: self.collection.clone(),
                     operations,
@@ -91,7 +92,7 @@ impl Entity {
 
                 println!("Entity.commit pre-lock: {:?}", event);
                 // Set the head to the event's ID
-                *head = Clock::new([event.id.clone()]);
+                *head = Clock::new([event.id()]);
                 println!("Entity.commit post-lock: {:?}", event);
                 event
             };
@@ -118,7 +119,7 @@ impl Entity {
            case C: event precursor is descended by the current head
         */
         debug!("Entity.apply_event {}", event);
-        let head = Clock::new([event.id.clone()]);
+        let head = Clock::new([event.id()]);
         for (backend_name, operations) in event.operations.iter() {
             // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
             self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent /* , context*/)?;
@@ -136,16 +137,12 @@ impl Entity {
         Ok(false)
     }
 
-    /// HACK - we probably shouldn't be stomping on the backends like this
-    pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, RetrievalError> {
+    pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, MutationError> {
+        if !lineage::descends(collection, &self.head(), &state.head)? {
+            return Ok(false);
+        }
         self.backends.apply_state(state)?;
-        // ACTUALLY LEFT OFF HERE
-        //TODO compare head clock to the ehntity
-        // ONLY return true if the state descends our local state
-        // and all links are in our collection's event history back to the current head
-        // DO THIS FOR apply_event as well
-        unimplemented!()
-        Ok(false)
+        Ok(true)
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does

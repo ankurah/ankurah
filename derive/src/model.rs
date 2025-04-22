@@ -257,6 +257,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             // )*
         }
 
+        // TODO - wasm-bindgen this - ah right, we need to remove the lifetime
         impl<'rec> ::ankurah::model::Mutable<'rec> for #mutable_name<'rec> {
             type Model = #name;
             type View = #view_name;

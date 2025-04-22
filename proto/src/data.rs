@@ -62,12 +62,15 @@ impl TryFrom<Vec<u8>> for EventId {
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    pub id: EventId,
     pub collection: CollectionId,
     pub entity_id: EntityId,
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
+}
+
+impl Event {
+    pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -126,7 +129,7 @@ impl std::fmt::Display for Event {
         write!(
             f,
             "Event({} {}/{} {} {})",
-            self.id,
+            self.id(),
             self.collection,
             self.entity_id,
             self.parent,

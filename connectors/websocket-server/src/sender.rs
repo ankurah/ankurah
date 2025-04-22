@@ -61,7 +61,6 @@ impl PeerSender for WebSocketClientSender {
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-// LEFT OFF HERE:
 // Heavily audit the Websocket client and peer code
 // Update Node to consolidate pending requests into the peer map so unresolved requests get cleaned up when the node drops
 // Implement timeouts for pending requests

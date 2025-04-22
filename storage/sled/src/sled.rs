@@ -142,22 +142,19 @@ impl StorageCollection for SledStorageCollection {
         .map_err(RetrievalError::future_join)?
     }
 
-    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
+    async fn add_event(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
         // Maybe it is worthwhile for us to separate the events table into
         // `collection-entityid` names until we have indices?
-        let events = self.events.clone();
+        let tree = self.events.clone();
 
         // TODO: Shorten `Event` struct to not include `id`/`collection`
         // since we can infer that based on key/tree respectively
-        let binary_state = bincode::serialize(entity_event)?;
-
-        let mut key = [0u8; 48];
-        key[..16].copy_from_slice(&entity_event.payload.entity_id.to_bytes());
-        key[16..32].copy_from_slice(entity_event.payload.id.as_bytes());
+        let binary_state = bincode::serialize(event)?;
 
         // Use spawn_blocking since sled operations are not async
 
-        let last = events.insert(key, binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
+        let last =
+            tree.insert(event.payload.id().as_bytes(), binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
 
         if let Some(last_bytes) = last {
             Ok(last_bytes != binary_state)
@@ -166,18 +163,21 @@ impl StorageCollection for SledStorageCollection {
         }
     }
 
-    async fn get_event(&self, entity_id: EntityId, event_id: EventId) -> Result<Attested<Event>, RetrievalError> {
-        let mut key = [0u8; 48];
-        key[..16].copy_from_slice(&entity_id.to_bytes());
-        key[16..32].copy_from_slice(event_id.as_bytes());
-
-        let event =
-            self.events.get(key).map_err(|err| SledRetrievalError::StorageError(err))?.ok_or(SledRetrievalError::NotFound(entity_id))?;
-        let event: Attested<Event> = bincode::deserialize(&event)?;
-        Ok(event)
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        let mut events = Vec::new();
+        for event_id in event_ids {
+            let event = self
+                .events
+                .get(event_id.as_bytes())
+                .map_err(|err| SledRetrievalError::StorageError(err))?
+                .ok_or(SledRetrievalError::NotFound(event_id))?;
+            let event: Attested<Event> = bincode::deserialize(&event)?;
+            events.push(event);
+        }
+        Ok(events)
     }
 
-    async fn get_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
+    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
         let mut events = Vec::new();
 
         for event_data in self.events.range(entity_id.to_bytes()..) {

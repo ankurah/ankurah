@@ -441,7 +441,7 @@ where
                             let payload = &state.payload;
                             let entity = self.get_entity(&payload.collection, payload.entity_id.clone()).await?;
                             let collection = self.collections.get(&payload.collection).await?;
-                            if entity.apply_state(&payload.state).await? {
+                            if entity.apply_state(&collection, &payload.state).await? {
                                 collection.set_state(payload.entity_id, &payload.state).await?;
                                 // TODO check if this is desirable to send an empty events list
                                 changes.push(EntityChange { entity: entity.clone(), events: vec![] });

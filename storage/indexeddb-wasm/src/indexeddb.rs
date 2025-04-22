@@ -313,14 +313,14 @@ impl StorageCollection for IndexedDBBucket {
             // Create a JS object to store the event data
             let event_obj = js_sys::Object::new();
             let payload = &attested_event.payload;
-            let id: JsValue = (&payload.id).into();
+            let id: JsValue = (&payload.id()).into();
             set_property(&event_obj, &ID_KEY, &id)?;
             set_property(&event_obj, &ENTITY_ID_KEY, &(&payload.entity_id).into())?;
             set_property(&event_obj, &OPERATIONS_KEY, &(&payload.operations).try_into()?)?;
             set_property(&event_obj, &ATTESTATIONS_KEY, &(&attested_event.attestations).try_into()?)?;
             set_property(&event_obj, &PARENT_KEY, &(&payload.parent).into())?;
 
-            let request = step(store.put_with_key(&event_obj, &((&payload.id).into())), "put event in store")?;
+            let request = step(store.put_with_key(&event_obj, &(&payload.id()).into()), "put event in store")?;
 
             step(cb_future(&request, "success", "error").await, "await request")?;
             step(cb_future(&transaction, "complete", "error").await, "complete transaction")?;
@@ -330,11 +330,9 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_event(&self, entity_id: EntityId, id: EventId) -> Result<Attested<ankurah_proto::Event>, RetrievalError> {
-        unimplemented!()
-    }
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> { unimplemented!() }
 
-    async fn get_events(&self, id: ankurah_proto::EntityId) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+    async fn dump_entity_events(&self, id: ankurah_proto::EntityId) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
             res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
         }
@@ -363,7 +361,7 @@ impl StorageCollection for IndexedDBBucket {
                 let event = Attested {
                     payload: ankurah_proto::Event {
                         collection: get_property(&event_obj, &COLLECTION_KEY)?.try_into()?,
-                        id: get_property(&event_obj, &ID_KEY)?.try_into()?,
+                        // id: get_property(&event_obj, &ID_KEY)?.try_into()?,
                         entity_id: get_property(&event_obj, &ENTITY_ID_KEY)?.try_into()?,
                         operations: get_property(&event_obj, &OPERATIONS_KEY)?.try_into()?,
                         parent: get_property(&event_obj, &PARENT_KEY)?.try_into()?,

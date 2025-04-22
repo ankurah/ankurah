@@ -37,8 +37,11 @@ pub trait StorageCollection: Send + Sync {
 
     async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError>;
 
-    async fn get_event(&self, id: EntityId, event_id: EventId) -> Result<Attested<Event>, RetrievalError>;
-    async fn get_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError>;
+    /// Retrieve a list of events
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError>;
+
+    /// Retrieve all events from the collection
+    async fn dump_entity_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError>;
 }
 
 /// Manages the storage and state of the collection without any knowledge of the model type
