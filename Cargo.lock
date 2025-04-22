@@ -148,6 +148,10 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "fallible-iterator",
+ "js-sys",
+ "postgres-protocol",
+ "postgres-types",
  "serde",
  "serde-wasm-bindgen",
  "sha2",
@@ -189,6 +193,7 @@ dependencies = [
  "futures",
  "gloo-timers",
  "js-sys",
+ "lazy_static",
  "reactive_graph",
  "send_wrapper",
  "serde",
@@ -199,7 +204,6 @@ dependencies = [
  "tracing",
  "tracing-wasm",
  "ulid",
- "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -2154,7 +2158,6 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
- "uuid",
 ]
 
 [[package]]

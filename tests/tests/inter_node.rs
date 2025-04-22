@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, MatchArgs, Mutable, Node, PermissiveAgent, ResultSet, EntityID};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, MatchArgs, Mutable, Node, PermissiveAgent, ResultSet, EntityId};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -57,7 +57,7 @@ async fn server_edits_subscription() -> Result<()> {
     let (server_watcher, check_server) = common::changeset_watcher::<PetView>();
     let _server_handle = server.subscribe("name = 'Rex' OR (age > 2 and age < 5)", server_watcher).await?;
 
-    assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityID, ChangeKind)>>);
+    assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
 
     use ankurah::View;
     // Create initial entities on node1

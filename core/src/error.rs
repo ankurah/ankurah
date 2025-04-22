@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use ankurah_proto::{CollectionId, DecodeError, EntityID};
+use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
 use thiserror::Error;
 
 use crate::{connector::SendError, policy::AccessDenied};
@@ -12,9 +12,9 @@ pub enum RetrievalError {
     #[error("Parse error: {0}")]
     ParseError(ankql::error::ParseError),
     #[error("ID {0:?} not found")]
-    NotFound(EntityID),
-    #[error("Event {0:?} not found")]
-    EventNotFound(EventID),
+    NotFound(EntityId),
+    #[error("Event not found")]
+    EventNotFound,
     #[error("Storage error: {0}")]
     StorageError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Collection not found: {0}")]
@@ -95,12 +95,20 @@ pub enum MutationError {
     StateError(StateError),
     #[error("failed update: {0}")]
     UpdateFailed(Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("failed step: {0}")]
-    FailedStep(&'static str),
+    #[error("failed step: {0}: {1}")]
+    FailedStep(&'static str, String),
+    #[error("failed to set property: {0}: {1}")]
+    FailedToSetProperty(&'static str, String),
     #[error("general error: {0}")]
     General(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("no durable peers available")]
     NoDurablePeers,
+    #[error("decode error: {0}")]
+    DecodeError(DecodeError),
+}
+
+impl From<DecodeError> for MutationError {
+    fn from(err: DecodeError) -> Self { MutationError::DecodeError(err) }
 }
 
 #[cfg(feature = "wasm")]

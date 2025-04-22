@@ -1,4 +1,4 @@
-use ankurah_proto::{Clock, Operation, State};
+use ankurah_proto::{Clock, Operation, State, StateBuffers};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -165,12 +165,12 @@ impl Backends {
             let state_buffer = backend.to_state_buffer()?;
             state_buffers.insert(name.clone(), state_buffer);
         }
-        Ok(State { state_buffers, head: self.head.lock().unwrap().clone() })
+        Ok(State { state_buffers: StateBuffers(state_buffers), head: self.head.lock().unwrap().clone() })
     }
 
     pub fn from_state_buffers(entity_state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::new();
-        for (name, state_buffer) in &entity_state.state_buffers {
+        for (name, state_buffer) in entity_state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
@@ -204,7 +204,7 @@ impl Backends {
     /// HACK - this should be based on a play forward of events
     pub fn apply_state(&self, state: &State) -> Result<(), RetrievalError> {
         let mut backends = self.backends_lock();
-        for (name, state_buffer) in &state.state_buffers {
+        for (name, state_buffer) in state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }

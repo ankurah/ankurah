@@ -131,7 +131,7 @@ pub use ankurah_core as core;
 pub use ankurah_derive as derive;
 pub use ankurah_proto as proto;
 
-pub use proto::EntityID;
+pub use proto::EntityId;
 // Re-export commonly used types
 pub use ankurah_core::{
     changes,

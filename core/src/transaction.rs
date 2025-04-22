@@ -42,7 +42,7 @@ impl Transaction {
     }
 
     /// Fetch an entity already in the transaction.
-    async fn get_entity(&self, id: proto::EntityID, collection: &proto::CollectionId) -> Result<&Entity, RetrievalError> {
+    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId) -> Result<&Entity, RetrievalError> {
         if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
             return Ok(entity);
         }
@@ -65,7 +65,7 @@ impl Transaction {
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
     }
     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
-    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::EntityID>) -> Result<M::Mutable<'rec>, MutationError> {
+    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::EntityId>) -> Result<M::Mutable<'rec>, MutationError> {
         let id = id.into();
         let entity = self.get_entity(id, &M::collection()).await?;
         self.dyncontext.check_write(entity)?;
@@ -83,16 +83,22 @@ impl Transaction {
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
         let mut entity_events: Vec<proto::Event> = Vec::new();
+        println!("trx.commit.entities: {:?}", self.entities.len());
         for entity in self.entities.iter() {
+            println!("trx.commit.entity: {:?}", entity);
             if let Some(entity_event) = entity.commit()? {
+                println!("trx.commit.entity_event: {:?}", entity_event);
                 if let Some(upstream) = &entity.upstream {
+                    println!("trx.commit.upstream: {:?}", upstream);
                     upstream.apply_event(&entity_event).await?;
                 } else {
                     // Entitity is already updated
+                    println!("trx.commit.entity_event no upstream");
                 }
                 entity_events.push(entity_event);
             }
         }
+        tracing::debug!("trx.commit.entity_events: {:?}", entity_events);
         self.dyncontext.commit_transaction(self.id.clone(), entity_events).await?;
 
         Ok(())

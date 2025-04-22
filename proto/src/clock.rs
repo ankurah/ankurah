@@ -3,11 +3,11 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
-use crate::{error::DecodeError, EventID};
+use crate::{error::DecodeError, EventId};
 
 /// S set of event ids which create a dag of events
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
-pub struct Clock(BTreeSet<EventID>);
+pub struct Clock(pub(crate) BTreeSet<EventId>);
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClockOrdering {
@@ -18,9 +18,9 @@ pub enum ClockOrdering {
 }
 
 impl Clock {
-    pub fn new(ids: impl Into<BTreeSet<EventID>>) -> Self { Self(ids.into()) }
+    pub fn new(ids: impl Into<BTreeSet<EventId>>) -> Self { Self(ids.into()) }
 
-    pub fn as_slice(&self) -> &BTreeSet<EventID> { &self.0 }
+    pub fn as_slice(&self) -> &BTreeSet<EventId> { &self.0 }
 
     pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_string()).collect() }
 
@@ -29,48 +29,33 @@ impl Clock {
         Ok(Self(ids))
     }
 
-    pub fn insert(&mut self, id: EventID) { self.0.insert(id); }
+    pub fn insert(&mut self, id: EventId) { self.0.insert(id); }
 
     pub fn len(&self) -> usize { self.0.len() }
 
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
-    pub fn to_bytes_vec(&self) -> Vec<[u8; 32]> { self.0.iter().map(|id| id.clone().to_bytes()).collect() }
-
-    pub fn from_bytes_vec(bytes: Vec<[u8; 32]>) -> Self {
-        let ids = bytes.into_iter().map(|b| EventID::from_bytes(b)).collect();
-        Self(ids)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &EventID> { self.0.iter() }
+    pub fn iter(&self) -> impl Iterator<Item = &EventId> { self.0.iter() }
 }
 
-impl TryFrom<JsValue> for Clock {
+impl From<Vec<EventId>> for Clock {
+    fn from(ids: Vec<EventId>) -> Self { Self(ids.into_iter().collect()) }
+}
+impl TryInto<Clock> for Vec<Vec<u8>> {
     type Error = DecodeError;
 
-    fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        if value.is_undefined() || value.is_null() {
-            return Ok(Clock::default());
+    fn try_into(self) -> Result<Clock, Self::Error> {
+        let mut ids: Vec<EventId> = Vec::new();
+        for id_bytes in self {
+            let bytes: [u8; 32] = id_bytes.try_into().map_err(|_| DecodeError::InvalidLength)?;
+            let id = EventId::from_bytes(bytes);
+            ids.push(id);
         }
-        let ids: Vec<String> =
-            serde_wasm_bindgen::from_value(value).map_err(|e| DecodeError::Other(anyhow::anyhow!("Failed to parse clock: {}", e)))?;
-        Self::from_strings(ids)
+        Ok(Clock(ids.into_iter().collect()))
     }
 }
 
-impl From<&Clock> for JsValue {
-    fn from(val: &Clock) -> Self {
-        let strings = val.to_strings();
-        // This should not be able to fail
-        serde_wasm_bindgen::to_value(&strings).expect("Failed to serialize clock")
-    }
-}
-
-impl From<Vec<EventID>> for Clock {
-    fn from(ids: Vec<EventID>) -> Self { Self(ids.into_iter().collect()) }
-}
-
-impl From<&Clock> for Vec<EventID> {
+impl From<&Clock> for Vec<EventId> {
     fn from(clock: &Clock) -> Self { clock.0.iter().cloned().collect() }
 }
 

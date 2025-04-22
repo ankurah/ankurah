@@ -6,7 +6,7 @@ use crate::{
     auth::Attested,
     collection::CollectionId,
     data::{Event, State},
-    id::EntityID,
+    id::EntityId,
     subscription::SubscriptionId,
     transaction::TransactionId,
 };
@@ -29,8 +29,8 @@ impl RequestId {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeRequest {
     pub id: RequestId,
-    pub to: EntityID,
-    pub from: EntityID,
+    pub to: EntityId,
+    pub from: EntityId,
     pub body: NodeRequestBody,
 }
 
@@ -48,8 +48,8 @@ pub enum NodeRequestBody {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeResponse {
     pub request_id: RequestId,
-    pub from: EntityID,
-    pub to: EntityID,
+    pub from: EntityId,
+    pub to: EntityId,
     pub body: NodeResponseBody,
 }
 
@@ -57,7 +57,7 @@ pub struct NodeResponse {
 pub enum NodeResponseBody {
     // Response to CommitEvents
     CommitComplete { id: TransactionId },
-    Fetch(Vec<(EntityID, State)>),
+    Fetch(Vec<(EntityId, State)>),
     Subscribed { subscription_id: SubscriptionId },
     Success,
     Error(String),

@@ -84,7 +84,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityID,
+        received_from_node: &proto::EntityId,
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
@@ -94,7 +94,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityID,
+        received_from_node: &proto::EntityId,
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
@@ -174,7 +174,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityID,
+        _from_node: &proto::EntityId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         info!("PermissiveAgent validate_received_event: {:?}", _event);
@@ -191,7 +191,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityID,
+        _from_node: &proto::EntityId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         info!("PermissiveAgent validate_received_state: {:?}", _state);

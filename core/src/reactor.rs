@@ -37,7 +37,7 @@ pub struct Reactor<SE, PA> {
     /// Index of subscriptions that presently match each entity.
     /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
-    entity_watchers: SafeMap<ankurah_proto::EntityID, HashSet<proto::SubscriptionId>>,
+    entity_watchers: SafeMap<ankurah_proto::EntityId, HashSet<proto::SubscriptionId>>,
     /// Reference to the storage engine
     collections: CollectionSet<SE>,
 

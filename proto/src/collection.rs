@@ -15,6 +15,9 @@ impl PartialEq<str> for CollectionId {
     fn eq(&self, other: &str) -> bool { self.0 == other }
 }
 
+impl From<String> for CollectionId {
+    fn from(val: String) -> Self { CollectionId(val) }
+}
 impl From<CollectionId> for String {
     fn from(collection_id: CollectionId) -> Self { collection_id.0 }
 }

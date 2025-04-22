@@ -5,6 +5,7 @@ pub enum DecodeError {
     InvalidLength,
     InvalidUlid,
     InvalidFallback,
+    InvalidFormat,
     Other(anyhow::Error),
 }
 
@@ -17,6 +18,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidUlid => write!(f, "Invalid ULID"),
             DecodeError::InvalidFallback => write!(f, "Invalid Fallback"),
             DecodeError::Other(e) => write!(f, "Other: {}", e),
+            DecodeError::InvalidFormat => write!(f, "Invalid Format"),
         }
     }
 }
@@ -24,7 +26,5 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 impl From<base64::DecodeError> for DecodeError {
-    fn from(e: base64::DecodeError) -> Self {
-        DecodeError::InvalidBase64(e)
-    }
+    fn from(e: base64::DecodeError) -> Self { DecodeError::InvalidBase64(e) }
 }

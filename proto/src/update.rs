@@ -1,7 +1,7 @@
 use crate::{
     auth::Attested,
     data::{EntityState, Event},
-    id::EntityID,
+    id::EntityId,
     subscription::SubscriptionId,
 };
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,8 @@ pub enum NodeUpdateBody {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdate {
     pub id: UpdateId,
-    pub from: EntityID,
-    pub to: EntityID,
+    pub from: EntityId,
+    pub to: EntityId,
     pub body: NodeUpdateBody,
 }
 
@@ -29,8 +29,8 @@ pub struct NodeUpdate {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdateAck {
     pub id: UpdateId,
-    pub from: EntityID,
-    pub to: EntityID,
+    pub from: EntityId,
+    pub to: EntityId,
     pub body: NodeUpdateAckBody,
 }
 

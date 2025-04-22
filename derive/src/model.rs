@@ -289,7 +289,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         }
 
         impl<'a> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #view_name {
-            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityIdtityId {
+            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 ankurah::View::id(self)
             }
         }

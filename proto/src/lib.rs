@@ -13,6 +13,12 @@ pub mod sys;
 pub mod transaction;
 pub mod update;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 pub use auth::*;
 pub use clock::*;
 pub use collection::*;

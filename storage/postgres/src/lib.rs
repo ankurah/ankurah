@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, RwLock},
 };
 
@@ -8,7 +8,7 @@ use ankurah_core::{
     property::Backends,
     storage::{StorageCollection, StorageEngine},
 };
-use ankurah_proto::{Attestation, Attested, EventID, State};
+use ankurah_proto::{Attestation, AttestationSet, Attested, EventId, State, StateBuffers};
 
 use futures_util::TryStreamExt;
 
@@ -17,7 +17,7 @@ pub mod value;
 
 use value::PGValue;
 
-use ankurah_proto::{Clock, CollectionId, EntityID, Event};
+use ankurah_proto::{Clock, CollectionId, EntityId, Event};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
@@ -44,42 +44,6 @@ impl Postgres {
 
         true
     }
-
-    async fn ensure_event_id_domain(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
-        let domain_exists = client
-            .query_one(
-                "SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'event_id_bytes' AND n.nspname = 'public'",
-                &[],
-            )
-            .await
-            .is_ok();
-
-        if !domain_exists {
-            client
-                .execute("CREATE DOMAIN event_id_bytes AS bytea CHECK (octet_length(value) = 32)", &[])
-                .await
-                .map_err(|err| StateError::DDLError(Box::new(err)))?;
-        }
-        Ok(())
-    }
-
-    async fn ensure_entity_id_domain(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
-        let domain_exists = client
-            .query_one(
-                "SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE t.typname = 'entity_id_bytes' AND n.nspname = 'public'",
-                &[],
-            )
-            .await
-            .is_ok();
-
-        if !domain_exists {
-            client
-                .execute("CREATE DOMAIN entity_id_bytes AS bytea CHECK (octet_length(value) = 16)", &[])
-                .await
-                .map_err(|err| StateError::DDLError(Box::new(err)))?;
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -104,11 +68,7 @@ impl StorageEngine for Postgres {
             columns: Arc::new(RwLock::new(Vec::new())),
         };
 
-        // TODO: run this on startup
-        self.ensure_event_id_domain(&mut client).await?;
-        self.ensure_entity_id_domain(&mut client).await?;
-
-        // Try to create the table if it doesn't exist
+        // Create tables if they don't exist
         bucket.create_state_table(&mut client).await?;
         bucket.create_event_table(&mut client).await?;
         bucket.rebuild_columns_cache(&mut client).await?;
@@ -179,10 +139,10 @@ impl PostgresBucket {
     pub async fn create_event_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"(
-                "id" event_id_bytes UNIQUE,
-                "entity_id" entity_id_bytes,
+                "id" character(43) UNIQUE,
+                "entity_id" character(22),
                 "operations" bytea,
-                "parent" event_id_bytes[],
+                "parent" character(43)[],
                 "attestations" bytea
             )"#,
             self.event_table()
@@ -196,9 +156,9 @@ impl PostgresBucket {
     pub async fn create_state_table(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
         let create_query = format!(
             r#"CREATE TABLE IF NOT EXISTS "{}"(
-                "id" entity_id_bytes UNIQUE,
+                "id" character(22) UNIQUE,
                 "state_buffer" BYTEA,
-                "head" event_id_bytes[]
+                "head" character(43)[]
             )"#,
             self.state_table()
         );
@@ -240,13 +200,11 @@ impl PostgresBucket {
 
 #[async_trait]
 impl StorageCollection for PostgresBucket {
-    async fn set_state(&self, id: EntityID, state: &State) -> Result<bool, MutationError> {
+    async fn set_state(&self, id: EntityId, state: &State) -> Result<bool, MutationError> {
         let state_buffers = bincode::serialize(&state.state_buffers)?;
-        let id_bytes = &id.to_bytes()[..];
-        let head_bytes: Vec<[u8; 32]> = state.head.to_bytes_vec().into();
 
         // Ensure head is not empty for new records
-        if head_bytes.is_empty() {
+        if state.head.is_empty() {
             warn!("Warning: Empty head detected for entity {}", id);
         }
 
@@ -255,9 +213,9 @@ impl StorageCollection for PostgresBucket {
         let backends = Backends::from_state_buffers(state)?;
         let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned()];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
-        params.push(&id_bytes);
+        params.push(&id);
         params.push(&state_buffers);
-        params.push(&head_bytes);
+        params.push(&state.head);
 
         let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
         for (column, value) in backends.property_values() {
@@ -336,22 +294,17 @@ impl StorageCollection for PostgresBucket {
         };
 
         // If this is a new entity (no old_head), or if the heads are different, return true
-        let old_head: Option<Vec<[u8; 32]>> = row.get("old_head");
+        let old_head: Option<Clock> = row.get("old_head");
         let changed = match old_head {
             None => true, // New entity
-            Some(old_head) => {
-                let old_clock: Clock = old_head.into();
-                old_clock != state.head
-            }
+            Some(old_head) => old_head != state.head,
         };
 
         debug!("PostgresBucket({}).set_state: Changed: {}", self.collection_id, changed);
         Ok(changed)
     }
 
-    async fn get_state(&self, id: EntityID) -> Result<State, RetrievalError> {
-        let id_bytes = id.to_bytes();
-
+    async fn get_state(&self, id: EntityId) -> Result<State, RetrievalError> {
         // be careful with sql injection via bucket name
         let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.state_table());
 
@@ -363,7 +316,7 @@ impl StorageCollection for PostgresBucket {
         };
 
         debug!("PostgresBucket({}).get_state: {}", self.collection_id, query);
-        let row = match client.query_one(&query, &[&id_bytes]).await {
+        let row = match client.query_one(&query, &[&id]).await {
             Ok(row) => row,
             Err(err) => {
                 let kind = error_kind(&err);
@@ -385,18 +338,18 @@ impl StorageCollection for PostgresBucket {
         };
 
         debug!("PostgresBucket({}).get_state: Row: {:?}", self.collection_id, row);
-        let row_id: Vec<u8> = row.get("id");
-        assert_eq!(row_id, id_bytes);
+        let row_id: EntityId = row.try_get("id").map_err(|err| RetrievalError::storage(err))?;
+        assert_eq!(row_id, id);
 
-        let serialized_buffers: Vec<u8> = row.get("state_buffer");
-        let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers)?;
-        let head_bytes: Vec<Vec<u8>> = row.get("head");
-        let head = head_bytes.into_iter().map(|bytes| EventID::from_bytes(bytes)).collect();
+        let serialized_buffers: Vec<u8> = row.try_get("state_buffer").map_err(|err| RetrievalError::storage(err))?;
+        let state_buffers: BTreeMap<String, Vec<u8>> =
+            bincode::deserialize(&serialized_buffers).map_err(|err| RetrievalError::storage(err))?;
+        let head: Clock = row.try_get("head").map_err(|err| RetrievalError::storage(err))?;
 
-        Ok(State { state_buffers, head })
+        Ok(State { state_buffers: StateBuffers(state_buffers), head })
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(EntityID, State)>, RetrievalError> {
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(EntityId, State)>, RetrievalError> {
         debug!("fetch_states: {:?}", predicate);
         let client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
 
@@ -451,14 +404,12 @@ impl StorageCollection for PostgresBucket {
         };
 
         for row in rows {
-            let uuid: [u8; 16] = row.get(0);
-            let state_buffer: Vec<u8> = row.get(1);
-            let id = EntityID::from_bytes(uuid);
-
-            let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer)?;
-
-            let entity_state = State { state_buffers, head: row.get::<_, Vec<[u8; 32]>>("head").into() };
-
+            let id: EntityId = row.try_get(0).map_err(|err| RetrievalError::storage(err))?;
+            let state_buffer: Vec<u8> = row.try_get(1).map_err(|err| RetrievalError::storage(err))?;
+            let state_buffers: BTreeMap<String, Vec<u8>> =
+                bincode::deserialize(&state_buffer).map_err(|err| RetrievalError::storage(err))?;
+            let head: Clock = row.try_get("head").map_err(|err| RetrievalError::storage(err))?;
+            let entity_state = State { state_buffers: StateBuffers(state_buffers), head };
             results.push((id, entity_state));
         }
 
@@ -472,14 +423,9 @@ impl StorageCollection for PostgresBucket {
     /// operations bytea, // `Vec<Operation>`
     /// clock bytea, // `Clock`
     async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
-        let event_id_bytes = entity_event.payload.id.to_bytes();
-        let entity_id_bytes = entity_event.payload.entity_id.to_bytes();
         let operations = bincode::serialize(&entity_event.payload.operations)?;
-        let parent_bytes: Vec<[u8; 32]> = entity_event.payload.parent.iter().map(|id| id.to_bytes()).collect();
         let attestations = bincode::serialize(&entity_event.attestations)?;
-        // Does it even matter if this conflicts?
-        // One peers event should match any duplicates, so taking the first
-        // event we receive from a peer should be fine.
+
         let query = format!(
             r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent", "attestations") VALUES($1, $2, $3, $4, $5)"#,
             self.event_table(),
@@ -487,7 +433,13 @@ impl StorageCollection for PostgresBucket {
 
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
         debug!("PostgresBucket({}).add_event: {}", self.collection_id, query);
-        let affected = match client.execute(&query, &[&event_id_bytes, &entity_id_bytes, &operations, &parent_bytes, &attestations]).await {
+        let affected = match client
+            .execute(
+                &query,
+                &[&entity_event.payload.id, &entity_event.payload.entity_id, &operations, &entity_event.payload.parent, &attestations],
+            )
+            .await
+        {
             Ok(affected) => affected,
             Err(err) => {
                 let kind = error_kind(&err);
@@ -510,39 +462,26 @@ impl StorageCollection for PostgresBucket {
         Ok(affected > 0)
     }
 
-    async fn get_event(&self, entity_id: EntityID, event_id: EventID) -> Result<Attested<Event>, RetrievalError> {
+    async fn get_event(&self, entity_id: EntityId, event_id: EventId) -> Result<Attested<Event>, RetrievalError> {
         let query = format!(
             r#"SELECT "id", "operations", "parent", "attestations" FROM "{0}" WHERE "entity_id" = $1 AND "id" = $2"#,
             self.event_table(),
         );
 
-        let entity_id_bytes = entity_id.to_bytes();
-        let event_id_bytes = event_id.to_bytes();
-
-        let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
-        let row = match client.query_one(&query, &[&entity_id_bytes, &event_id_bytes]).await {
-            Ok(row) => row,
-            Err(err) => {
-                let kind = error_kind(&err);
-                match kind {
-                    ErrorKind::UndefinedTable { table } => {
-                        if table == self.event_table() {
-                            return Err(RetrievalError::EventNotFound(event_id));
-                        }
-                    }
-                    _ => {
-                        return Err(RetrievalError::storage(err));
-                    }
-                }
+        let client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
+        let row = client.query_one(&query, &[&entity_id, &event_id]).await.map_err(|err| {
+            let kind = error_kind(&err);
+            match kind {
+                ErrorKind::UndefinedTable { table } if table == self.event_table() => RetrievalError::EventNotFound,
+                _ => RetrievalError::storage(err),
             }
-        };
+        })?;
 
-        let operations_binary: Vec<u8> = row.get("operations");
-        let operations = bincode::deserialize(&operations_binary)?;
-        let parent_bytes: Vec<[u8; 32]> = row.get("parent");
-        let parent = parent_bytes.into_iter().map(|bytes| EventID::from_bytes(bytes)).collect();
-        let attestations_binary: Vec<u8> = row.get("attestations");
-        let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary)?;
+        let operations_binary: Vec<u8> = row.try_get("operations").map_err(|err| RetrievalError::storage(err))?;
+        let operations = bincode::deserialize(&operations_binary).map_err(|err| RetrievalError::storage(err))?;
+        let parent: Clock = row.try_get("parent").map_err(|err| RetrievalError::storage(err))?;
+        let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(|err| RetrievalError::storage(err))?;
+        let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(|err| RetrievalError::storage(err))?;
 
         let event = Attested {
             payload: Event {
@@ -552,21 +491,19 @@ impl StorageCollection for PostgresBucket {
                 operations: operations,
                 parent: parent,
             },
-            attestations: attestations,
+            attestations: AttestationSet(attestations),
         };
 
         Ok(event)
     }
 
-    async fn get_events(&self, entity_id: EntityID) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
+    async fn get_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
         let query =
             format!(r#"SELECT "id", "operations", "parent", "attestations" FROM "{0}" WHERE "entity_id" = $1"#, self.event_table(),);
 
-        let entity_id_bytes = entity_id.to_bytes();
-
-        let mut client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
+        let client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
         debug!("PostgresBucket({}).get_events: {}", self.collection_id, query);
-        let rows = match client.query(&query, &[&entity_id_bytes]).await {
+        let rows = match client.query(&query, &[&entity_id]).await {
             Ok(rows) => rows,
             Err(err) => {
                 let kind = error_kind(&err);
@@ -585,14 +522,12 @@ impl StorageCollection for PostgresBucket {
 
         let mut events = Vec::new();
         for row in rows {
-            let event_id_bytes: [u8; 32] = row.get("id");
-            let event_id = EventID::from_bytes(event_id_bytes);
-            let operations_binary: Vec<u8> = row.get("operations");
-            let operations = bincode::deserialize(&operations_binary)?;
-            let parent_bytes: Vec<[u8; 32]> = row.get("parent");
-            let parent = parent_bytes.into_iter().map(|bytes| EventID::from_bytes(bytes)).collect();
-            let attestations_binary: Vec<u8> = row.get("attestations");
-            let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary)?;
+            let event_id: EventId = row.try_get("id").map_err(|err| RetrievalError::storage(err))?;
+            let operations_binary: Vec<u8> = row.try_get("operations").map_err(|err| RetrievalError::storage(err))?;
+            let operations = bincode::deserialize(&operations_binary).map_err(|err| RetrievalError::storage(err))?;
+            let parent: Clock = row.try_get("parent").map_err(|err| RetrievalError::storage(err))?;
+            let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(|err| RetrievalError::storage(err))?;
+            let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(|err| RetrievalError::storage(err))?;
 
             events.push(Attested {
                 payload: Event {
@@ -602,8 +537,8 @@ impl StorageCollection for PostgresBucket {
                     operations: operations,
                     parent: parent,
                 },
-                attestations: attestations,
-            })
+                attestations: AttestationSet(attestations),
+            });
         }
 
         Ok(events)

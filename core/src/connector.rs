@@ -12,7 +12,7 @@ use crate::{node::NodeInner, policy::PolicyAgent, storage::StorageEngine, Node};
 pub trait PeerSender: Send + Sync {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
     /// The node ID of the recipient of this message
-    fn recipient_node_id(&self) -> proto::EntityID;
+    fn recipient_node_id(&self) -> proto::EntityId;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }
 
@@ -30,25 +30,25 @@ pub enum SendError {
 
 #[async_trait]
 pub trait NodeComms: Send + Sync {
-    fn id(&self) -> proto::EntityID;
+    fn id(&self) -> proto::EntityId;
     fn durable(&self) -> bool;
     fn system_root(&self) -> Option<proto::Clock>;
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>);
-    fn deregister_peer(&self, node_id: proto::EntityID);
+    fn deregister_peer(&self, node_id: proto::EntityId);
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
-    fn id(&self) -> proto::EntityID { self.id.clone() }
+    fn id(&self) -> proto::EntityId { self.id.clone() }
     fn durable(&self) -> bool { self.durable }
     fn system_root(&self) -> Option<proto::Clock> { self.system.root() }
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         //
         self.register_peer(presence, sender);
     }
-    fn deregister_peer(&self, node_id: proto::EntityID) {
+    fn deregister_peer(&self, node_id: proto::EntityId) {
         //
         self.deregister_peer(node_id);
     }

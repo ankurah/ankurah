@@ -3,15 +3,19 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityID, DecodeError};
+use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Hash)]
-pub struct EventID([u8; 32]);
+#[derive(Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct EventId([u8; 32]);
 
-impl EventID {
+impl std::fmt::Debug for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "EventId({})", self.to_base64()) }
+}
+
+impl EventId {
     /// Generate an EventID from the parts of an Event
     /// notably, we are not including the collection in the hash because collection is getting excised from identity
-    pub fn from_parts(entity_id: &EntityID, operations: &BTreeMap<String, Vec<Operation>>, parent: &Clock) -> Self {
+    pub fn from_parts(entity_id: &EntityId, operations: &BTreeMap<String, Vec<Operation>>, parent: &Clock) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
         hasher.update(bincode::serialize(&operations).unwrap());
@@ -22,9 +26,9 @@ impl EventID {
         use base64::{engine::general_purpose, Engine as _};
         general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }
-    pub fn from_base64(s: &str) -> Result<Self, DecodeError> {
+    pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {
         use base64::{engine::general_purpose, Engine as _};
-        let decoded = general_purpose::URL_SAFE_NO_PAD.decode(s)?;
+        let decoded = general_purpose::URL_SAFE_NO_PAD.decode(input)?;
         let v: [u8; 32] = decoded.try_into().map_err(|_| DecodeError::InvalidLength)?;
 
         Ok(Self(v))
@@ -34,24 +38,43 @@ impl EventID {
     pub fn as_bytes(&self) -> &[u8] { &self.0 }
 }
 
-impl std::fmt::Display for EventID {
+impl std::fmt::Display for EventId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.to_base64()) }
 }
 
-impl TryFrom<String> for EventID {
+impl TryFrom<String> for EventId {
     type Error = DecodeError;
 
     fn try_from(s: String) -> Result<Self, Self::Error> { Self::from_base64(&s) }
 }
 
+impl From<[u8; 32]> for EventId {
+    fn from(bytes: [u8; 32]) -> Self { Self(bytes) }
+}
+impl TryFrom<Vec<u8>> for EventId {
+    type Error = DecodeError;
+
+    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+        let v: [u8; 32] = bytes.try_into().map_err(|_| DecodeError::InvalidLength)?;
+        Ok(Self(v))
+    }
+}
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
-    pub id: EventID,
+    pub id: EventId,
     pub collection: CollectionId,
-    pub entity_id: EntityID,
-    pub operations: BTreeMap<String, Vec<Operation>>,
+    pub entity_id: EntityId,
+    pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OperationSet(pub BTreeMap<String, Vec<Operation>>);
+
+impl std::ops::Deref for OperationSet {
+    type Target = BTreeMap<String, Vec<Operation>>;
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
@@ -61,7 +84,7 @@ pub struct Operation {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EntityState {
-    pub entity_id: EntityID,
+    pub entity_id: EntityId,
     pub collection: CollectionId,
     pub state: State,
     pub head: Clock,
@@ -70,9 +93,17 @@ pub struct EntityState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct State {
     /// The current accumulated state of the entity inclusive of all events up to this point
-    pub state_buffers: BTreeMap<String, Vec<u8>>,
+    pub state_buffers: StateBuffers,
     /// The set of concurrent events (usually only one) which have been applied to the entity state above
     pub head: Clock,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct StateBuffers(pub BTreeMap<String, Vec<u8>>);
+
+impl std::ops::Deref for StateBuffers {
+    type Target = BTreeMap<String, Vec<u8>>;
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 
 impl std::fmt::Display for Event {
@@ -113,5 +144,5 @@ impl Attested<Event> {
 }
 
 impl Into<Attested<Event>> for Event {
-    fn into(self) -> Attested<Event> { Attested { payload: self, attestations: vec![] } }
+    fn into(self) -> Attested<Event> { Attested { payload: self, attestations: AttestationSet::default() } }
 }

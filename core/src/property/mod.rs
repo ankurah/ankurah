@@ -4,7 +4,7 @@ pub mod value;
 
 use std::fmt::Display;
 
-use ankurah_proto::EntityID;
+use ankurah_proto::EntityId;
 pub use backend::Backends;
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
 pub use value::YrsString;
@@ -93,11 +93,11 @@ impl<'a> Property for std::borrow::Cow<'a, str> {
     }
 }
 
-impl Property for EntityID {
+impl Property for EntityId {
     fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_base64()))) }
     fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
         match value {
-            Some(PropertyValue::String(value)) => Ok(EntityID::from_base64(&value).unwrap()),
+            Some(PropertyValue::String(value)) => Ok(EntityId::from_base64(&value).unwrap()),
             Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
             None => Err(PropertyError::Missing),
         }

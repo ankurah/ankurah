@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::AuthData,
-    id::EntityID,
+    id::EntityId,
     peering::Presence,
     request::{NodeRequest, NodeResponse},
     subscription::SubscriptionId,
@@ -22,7 +22,7 @@ pub enum NodeMessage {
     Response(NodeResponse),
     Update(NodeUpdate),
     UpdateAck(NodeUpdateAck),
-    Unsubscribe { from: EntityID, subscription_id: SubscriptionId },
+    Unsubscribe { from: EntityId, subscription_id: SubscriptionId },
 }
 
 impl std::fmt::Display for Message {

@@ -94,13 +94,13 @@ impl<SE, PA> Deref for Node<SE, PA> {
 pub trait ContextData: Send + Sync + 'static {}
 
 pub struct NodeInner<SE, PA> {
-    pub id: proto::EntityID,
+    pub id: proto::EntityId,
     pub durable: bool,
     pub collections: CollectionSet<SE>,
 
     pub(crate) entities: WeakEntitySet,
-    peer_connections: SafeMap<proto::EntityID, Arc<PeerState>>,
-    durable_peers: SafeSet<proto::EntityID>,
+    peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
+    durable_peers: SafeSet<proto::EntityId>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
@@ -117,7 +117,7 @@ where
         let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
-        let id = proto::EntityID::new();
+        let id = proto::EntityId::new();
         info!("Node {id} created as ephemeral");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), false);
@@ -141,7 +141,7 @@ where
         let entityset: WeakEntitySet = Default::default();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
 
-        let id = proto::EntityID::new();
+        let id = proto::EntityId::new();
         info!("Node {id} created as durable");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), true);
@@ -181,7 +181,7 @@ where
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id)))]
-    pub fn deregister_peer(&self, node_id: proto::EntityID) {
+    pub fn deregister_peer(&self, node_id: proto::EntityId) {
         info!("Node({}).deregister_peer {}", self.id, node_id);
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);
@@ -189,7 +189,7 @@ where
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
     pub async fn request(
         &self,
-        node_id: proto::EntityID,
+        node_id: proto::EntityId,
         cdata: &PA::ContextData,
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError> {
@@ -210,10 +210,10 @@ where
     }
 
     // TODO LATER: rework this to be retried in the background some number of times
-    pub fn send_update(&self, node_id: proto::EntityID, notification: proto::NodeUpdateBody) {
+    pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
         // same as request, minus cdata and the sign_request step
         info!("Node({}).send_update to {}", self.id, node_id);
-        let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
+        let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let id = proto::UpdateId::new();
 
         // Get the peer connection
@@ -433,10 +433,11 @@ where
             updates.push((entity, event.clone()));
         }
 
+        self.commit_events_local(&events).await?;
+        // TODO review this
         // If we're not a durable node, send the transaction to a durable peer and wait for confirmation
         // if !self.durable {
         // let peer_id: proto::NodeId = self.get_durable_peers().pop().ok_or(MutationError::NoDurablePeers)?;
-        // HACK - sendding all events to all peers is wrong, but we were doing it before, and I'm reproducing that behavior here temporarily.
         // TODO - these need to race each other, and run concurrently.
         for peer_id in self.get_durable_peers() {
             match self
@@ -474,7 +475,7 @@ where
     // we also don't need to fan events out to peers because we're receiving them from a peer
     pub async fn apply_events_from_peer(
         &self,
-        from_peer_id: &proto::EntityID,
+        from_peer_id: &proto::EntityId,
         events: Vec<proto::Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
         let mut changes = Vec::new();
@@ -550,7 +551,7 @@ where
     async fn handle_subscribe_request(
         &self,
         cdata: &PA::ContextData,
-        peer_id: proto::EntityID,
+        peer_id: proto::EntityId,
         sub_id: proto::SubscriptionId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
@@ -615,7 +616,7 @@ where
         Ok(proto::NodeResponseBody::Subscribed { subscription_id: sub_id })
     }
 
-    pub fn next_entity_id(&self) -> proto::EntityID { proto::EntityID::new() }
+    pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }
 
     pub fn context(&self, data: PA::ContextData) -> Context { Context::new(Node::clone(self), data) }
 
@@ -629,13 +630,13 @@ where
             // Apply Events to the Node's registered Entities first.
             let entity = self.get_entity(&event.payload.collection, event.payload.entity_id.clone()).await?;
 
-            entity.apply_event(&event.payload).await?;
+            let changed = entity.apply_event(&event.payload).await?;
 
             let state = entity.to_state()?;
             // Push the state buffers to storage.
             let collection = self.collections.get(&event.payload.collection).await?;
             collection.add_event(&event).await?;
-            let changed = collection.set_state(event.payload.entity_id, &state).await?;
+            collection.set_state(event.payload.entity_id, &state).await?;
 
             if changed {
                 changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });
@@ -650,7 +651,7 @@ where
     pub(crate) async fn get_entity(
         &self,
         collection_id: &CollectionId,
-        id: proto::EntityID,
+        id: proto::EntityId,
         // cdata: &PA::ContextData,
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.id, id, collection_id);
@@ -770,7 +771,7 @@ where
     }
 
     /// Get a random durable peer node ID
-    pub fn get_durable_peer_random(&self) -> Option<proto::EntityID> {
+    pub fn get_durable_peer_random(&self) -> Option<proto::EntityId> {
         let mut rng = rand::thread_rng();
         // Convert to Vec since DashSet iterator doesn't support random selection
         let peers: Vec<_> = self.durable_peers.to_vec();
@@ -778,7 +779,7 @@ where
     }
 
     /// Get all durable peer node IDs
-    pub fn get_durable_peers(&self) -> Vec<proto::EntityID> { self.durable_peers.to_vec() }
+    pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.durable_peers.to_vec() }
 }
 
 impl<SE, PA> NodeInner<SE, PA>
@@ -786,7 +787,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::EntityID>) -> anyhow::Result<()> {
+    pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
             if let Some(connection) = item {
                 let sub_id = sub_id.clone();
