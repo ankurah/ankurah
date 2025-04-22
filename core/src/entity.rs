@@ -1,8 +1,5 @@
 use crate::{
-    error::{MutationError, RetrievalError, StateError},
-    model::View,
-    property::{Backends, PropertyValue},
-    Node,
+    error::{MutationError, RetrievalError, StateError}, model::View, property::{Backends, PropertyValue}, storage::StorageCollectionWrapper, Node
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, EntityId, Event, EventId, OperationSet, State};
@@ -83,11 +80,12 @@ impl Entity {
         } else {
             let event = {
                 let mut head = self.head.lock().unwrap();
+                let operations = OperationSet(operations);
                 let event = Event {
                     id: EventId::from_parts(&self.id, &operations, &head),
                     entity_id: self.id.clone(),
                     collection: self.collection.clone(),
-                    operations: OperationSet(operations),
+                    operations,
                     parent: head.clone(),
                 };
 
@@ -113,7 +111,7 @@ impl Entity {
 
     /// We're going to need a &Node arg in order to recurse, which will complicate a few things
     /// For now just fail if we can't apply the event?
-    pub async fn apply_event(&self, event: &Event) -> Result<bool, MutationError> {
+    pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
         /*
            case A: event precursor descends the current head, then set entity clock to singleton of event id
            case B: event precursor is concurrent to the current head, push event id to event head clock.
@@ -132,14 +130,22 @@ impl Entity {
         // Hack
         *self.backends.head.lock().unwrap() = head;
 
-        Ok(true)
-        // unimplemented!()
+        unimplemented!()
+        // only return true if the event descends our local state
+        // and all links are in our collection's event history back to the current head
+        Ok(false)
     }
 
     /// HACK - we probably shouldn't be stomping on the backends like this
-    pub fn apply_state(&self, state: &State) -> Result<(), RetrievalError> {
+    pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, RetrievalError> {
         self.backends.apply_state(state)?;
-        Ok(())
+        // ACTUALLY LEFT OFF HERE
+        //TODO compare head clock to the ehntity
+        // ONLY return true if the state descends our local state
+        // and all links are in our collection's event history back to the current head
+        // DO THIS FOR apply_event as well
+        unimplemented!()
+        Ok(false)
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does

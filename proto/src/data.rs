@@ -15,7 +15,8 @@ impl std::fmt::Debug for EventId {
 impl EventId {
     /// Generate an EventID from the parts of an Event
     /// notably, we are not including the collection in the hash because collection is getting excised from identity
-    pub fn from_parts(entity_id: &EntityId, operations: &BTreeMap<String, Vec<Operation>>, parent: &Clock) -> Self {
+    pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
+        println!("EventId::from_parts {entity_id} {operations} {parent}");
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
         hasher.update(bincode::serialize(&operations).unwrap());
@@ -71,6 +72,20 @@ pub struct Event {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OperationSet(pub BTreeMap<String, Vec<Operation>>);
+
+impl std::fmt::Display for OperationSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OperationSet({})",
+            self.0
+                .iter()
+                .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+}
 
 impl std::ops::Deref for OperationSet {
     type Target = BTreeMap<String, Vec<Operation>>;
