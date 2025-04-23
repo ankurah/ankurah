@@ -3,7 +3,7 @@ use base64::write::EncoderWriter;
 use postgres_protocol::types;
 use postgres_types::{to_sql_checked, FromSql, IsNull, Kind, ToSql, Type};
 
-use crate::{Clock, EntityId, EventId};
+use crate::{Clock, DecodeError, EntityId, EventId, OperationSet};
 use bytes::{BufMut, BytesMut};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -127,11 +127,15 @@ impl<'a> FromSql<'a> for Clock {
             return Err("array contains too many dimensions".into());
         }
 
-        let mut event_ids = BTreeSet::new();
+        let mut event_ids = Vec::new();
         let mut values = array.values();
         while let Some(v) = values.next()? {
             if let Some(v) = v {
-                event_ids.insert(EventId::from_sql(member_type, v)?);
+                // binary search for the insertion point, and don't insert if it's already present
+                let index = event_ids.binary_search(&EventId::from_sql(member_type, v)?).unwrap_or_else(|i| i);
+                if index == event_ids.len() || event_ids[index] != EventId::from_sql(member_type, v)? {
+                    event_ids.insert(index, EventId::from_sql(member_type, v)?);
+                }
             }
         }
 
@@ -145,6 +149,46 @@ impl<'a> FromSql<'a> for Clock {
                 "bpchar" => true,
                 _ => false,
             },
+            _ => false,
+        }
+    }
+}
+
+// use bytea and bincode to serialize and deserialize OperationSet - do not base64 encode the bytea
+impl ToSql for OperationSet {
+    fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>>
+    where Self: Sized {
+        if ty.name() != "bytea" {
+            return Err("expected bytea type".into());
+        }
+        out.put_slice(&bincode::serialize(self).map_err(|_| DecodeError::InvalidFormat)?);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool
+    where Self: Sized {
+        // bytea
+        match ty.name() {
+            "bytea" => true,
+            _ => false,
+        }
+    }
+
+    to_sql_checked!();
+}
+impl<'a> FromSql<'a> for OperationSet {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        if ty.name() != "bytea" {
+            return Err("expected bytea type".into());
+        }
+        let set: OperationSet = bincode::deserialize(raw).map_err(|_| DecodeError::InvalidFormat)?;
+        Ok(set)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        // bytea
+        match ty.name() {
+            "bytea" => true,
             _ => false,
         }
     }

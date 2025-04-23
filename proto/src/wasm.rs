@@ -44,11 +44,15 @@ impl TryFrom<JsValue> for Clock {
         let array: js_sys::Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
 
         // Convert each array element to an EventID
-        let mut event_ids = BTreeSet::new();
+        let mut event_ids = Vec::new();
         for i in 0..array.length() {
             let id_str = array.get(i).as_string().ok_or(DecodeError::NotStringValue)?;
             let event_id = EventId::from_base64(&id_str)?;
-            event_ids.insert(event_id);
+            // binary search for the insertion point, and don't insert if it's already present
+            let index = event_ids.binary_search(&event_id).unwrap_or_else(|i| i);
+            if index == event_ids.len() || event_ids[index] != event_id {
+                event_ids.insert(index, event_id);
+            }
         }
 
         Ok(Clock(event_ids))

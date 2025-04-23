@@ -99,7 +99,7 @@ impl StorageCollection for SledStorageCollection {
                 let entity_state = bincode::deserialize(&ivec)?;
                 Ok(entity_state)
             }
-            None => Err(SledRetrievalError::NotFound(id).into()),
+            None => Err(SledRetrievalError::EntityNotFound(id).into()),
         }
     }
 
@@ -170,7 +170,7 @@ impl StorageCollection for SledStorageCollection {
                 .events
                 .get(event_id.as_bytes())
                 .map_err(|err| SledRetrievalError::StorageError(err))?
-                .ok_or(SledRetrievalError::NotFound(event_id))?;
+                .ok_or(SledRetrievalError::EventNotFound(event_id))?;
             let event: Attested<Event> = bincode::deserialize(&event)?;
             events.push(event);
         }
@@ -192,7 +192,8 @@ impl StorageCollection for SledStorageCollection {
 
 enum SledRetrievalError {
     StorageError(sled::Error),
-    NotFound(EntityId),
+    EntityNotFound(EntityId),
+    EventNotFound(EventId),
     Other(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
@@ -204,7 +205,8 @@ impl From<SledRetrievalError> for RetrievalError {
     fn from(err: SledRetrievalError) -> Self {
         match err {
             SledRetrievalError::StorageError(e) => RetrievalError::StorageError(Box::new(e)),
-            SledRetrievalError::NotFound(id) => RetrievalError::NotFound(id),
+            SledRetrievalError::EntityNotFound(id) => RetrievalError::EntityNotFound(id),
+            SledRetrievalError::EventNotFound(id) => RetrievalError::EventNotFound(id),
             SledRetrievalError::Other(e) => RetrievalError::StorageError(e),
         }
     }

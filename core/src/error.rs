@@ -11,10 +11,10 @@ pub enum RetrievalError {
     AccessDenied(AccessDenied),
     #[error("Parse error: {0}")]
     ParseError(ankql::error::ParseError),
-    #[error("ID {0:?} not found")]
-    NotFound(EntityId),
-    #[error("Event not found")]
-    EventNotFound,
+    #[error("Entity not found: {0:?}")]
+    EntityNotFound(EntityId),
+    #[error("Event not found: {0:?}")]
+    EventNotFound(EventId),
     #[error("Storage error: {0}")]
     StorageError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("Collection not found: {0}")]

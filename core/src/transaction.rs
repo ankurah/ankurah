@@ -90,7 +90,8 @@ impl Transaction {
                 println!("trx.commit.entity_event: {:?}", entity_event);
                 if let Some(upstream) = &entity.upstream {
                     println!("trx.commit.upstream: {:?}", upstream);
-                    upstream.apply_event(&entity_event).await?;
+                    unimplemented!()
+                    // upstream.apply_event(&self.dyncontext.storage_collection(upstream.collection), &entity_event).await?;
                 } else {
                     // Entitity is already updated
                     println!("trx.commit.entity_event no upstream");

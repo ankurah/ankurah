@@ -408,12 +408,13 @@ where
         let mut changes = Vec::new();
         // finally, apply events locally
         for (entity, event) in updates {
-            let changed = entity.apply_event(&event.payload).await?;
+            let payload = &event.payload;
+            let collection = self.collections.get(&payload.collection).await?;
+            let changed = entity.apply_event(&collection, &payload).await?;
             // Push the state buffers to storage.
-            let collection = self.collections.get(&event.payload.collection).await?;
             let state = entity.to_state()?;
             collection.add_event(&event).await?;
-            collection.set_state(event.payload.entity_id, &state).await?;
+            collection.set_state(payload.entity_id, &state).await?;
 
             if changed {
                 changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });
@@ -454,52 +455,58 @@ where
                 }
                 proto::SubscriptionUpdateItem::Add { state, events } => {
                     // check with policy agentif this is a valid attested state
-                    if let Err(e) = self.policy_agent.validate_received_state(self, &notification.from, &state) {
+                    if let Err(e) = self.policy_agent.validate_received_state(self, &from_peer_id, &state) {
                         warn!("Node {} received invalid state from peer {} - {}", self.id, from_peer_id, e);
                         continue;
                     }
 
-                    let entity = self.get_entity(&state.collection, state.entity_id.clone()).await?;
-                    if entity.apply_state(&state.state).await? {
-                        collection.set_state(state.entity_id, &state.state).await?;
+                    let payload = &state.payload;
+                    let entity = self.get_entity(&payload.collection, payload.entity_id.clone()).await?;
+                    let collection = self.collections.get(&payload.collection).await?;
+                    if entity.apply_state(&collection, &payload.state).await? {
+                        collection.set_state(payload.entity_id, &payload.state).await?;
                     }
 
                     for event in events {
-                        if let Err(e) = self.policy_agent.validate_received_event(self, &notification.from, &event) {
-                            vevents = false;
-                            break;
+                        if let Err(e) = self.policy_agent.validate_received_event(self, &from_peer_id, &event) {
+                            warn!("Node {} received invalid event from peer {} - {}", self.id, from_peer_id, e);
+                            continue;
                         }
                     }
 
-                    match self.policy_agent.validate_received_state(self, &notification.from, &state) {
+                    match self.policy_agent.validate_received_state(self, &from_peer_id, &state) {
                         Ok(()) => {
-                            let entity = self.get_entity(&state.collection, state.entity_id.clone()).await?;
+                            let entity = self.get_entity(&payload.collection, payload.entity_id.clone()).await?;
+                        }
+                        Err(e) => {
+                            warn!("Node {} received invalid state from peer {} - {}", self.id, from_peer_id, e);
                         }
                     }
                 }
                 proto::SubscriptionUpdateItem::Change { events } => {
                     // check with policy agentif this is a valid attested state
-
-                    match self.policy_agent.validate_received_event(self, from_peer_id, &update) {
-                        Ok(()) => {
-                            let entity = self.get_entity(&update.payload.collection, update.payload.entity_id.clone()).await?;
-                            entity.apply_event(&update.payload).await?;
-                            let collection = self.collections.get(&update.payload.collection).await?;
-                            let state = entity.to_state()?;
-                            collection.add_event(&update).await?;
-                            info!(
-                                "Node {} set_state for entity {} in collection {}",
-                                self.id, update.payload.entity_id, update.payload.collection
-                            );
-                            let changed = collection.set_state(update.payload.entity_id, &state).await?;
-                            if changed {
-                                changes.push(EntityChange { entity: entity.clone(), events: vec![update.clone()] });
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Node {} received invalid event from peer {} - {}", self.id, from_peer_id, e);
-                        }
-                    }
+                    unimplemented!()
+                    // HERE! - Should we take the aggragation we are given and assume/validate they are are the same entity, emitting a single EntityChange?
+                    // match self.policy_agent.validate_received_event(self, from_peer_id, &update) {
+                    //     Ok(()) => {
+                    //         let entity = self.get_entity(&update.payload.collection, update.payload.entity_id.clone()).await?;
+                    //         entity.apply_event(&update.payload).await?;
+                    //         let collection = self.collections.get(&update.payload.collection).await?;
+                    //         let state = entity.to_state()?;
+                    //         collection.add_event(&update).await?;
+                    //         info!(
+                    //             "Node {} set_state for entity {} in collection {}",
+                    //             self.id, update.payload.entity_id, update.payload.collection
+                    //         );
+                    //         let changed = collection.set_state(update.payload.entity_id, &state).await?;
+                    //         if changed {
+                    //             changes.push(EntityChange { entity: entity.clone(), events: vec![update.clone()] });
+                    //         }
+                    //     }
+                    //     Err(e) => {
+                    //         warn!("Node {} received invalid event from peer {} - {}", self.id, from_peer_id, e);
+                    //     }
+                    // }
                 }
             }
         }
@@ -655,7 +662,7 @@ where
             Ok(entity_state) => {
                 return self.entities.with_state(id, collection_id.clone(), entity_state);
             }
-            Err(RetrievalError::NotFound(id)) => {
+            Err(RetrievalError::EntityNotFound(id)) => {
                 // let scoped_entity = Entity::new(id, collection.to_string());
                 // let ref_entity = Arc::new(scoped_entity);
                 // Revisit this

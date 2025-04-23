@@ -8,7 +8,7 @@ use ankurah_core::{
     property::Backends,
     storage::{StorageCollection, StorageEngine},
 };
-use ankurah_proto::{Attestation, AttestationSet, Attested, EventId, State, StateBuffers};
+use ankurah_proto::{Attestation, AttestationSet, Attested, EventId, OperationSet, State, StateBuffers};
 
 use futures_util::TryStreamExt;
 
@@ -322,12 +322,12 @@ impl StorageCollection for PostgresBucket {
                 let kind = error_kind(&err);
                 match kind {
                     ErrorKind::RowCount => {
-                        return Err(RetrievalError::NotFound(id));
+                        return Err(RetrievalError::EntityNotFound(id));
                     }
                     ErrorKind::UndefinedTable { table } => {
                         if table == self.state_table() {
                             self.create_state_table(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
-                            return Err(RetrievalError::NotFound(id));
+                            return Err(RetrievalError::EntityNotFound(id));
                         }
                     }
                     _ => {}
@@ -463,29 +463,38 @@ impl StorageCollection for PostgresBucket {
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
-        let query = format!(r#"SELECT "id", "operations", "parent", "attestations" FROM "{0}" WHERE "id" = ANY($1)"#, self.event_table(),);
+        let query = format!(
+            r#"SELECT "id", "entity_id", "operations", "parent", "attestations" FROM "{0}" WHERE "id" = ANY($1)"#,
+            self.event_table(),
+        );
 
         let client = self.pool.get().await.map_err(|err| RetrievalError::storage(err))?;
-        let row = client.query_one(&query, &[&entity_id, &event_ids]).await.map_err(|err| {
-            let kind = error_kind(&err);
-            match kind {
-                ErrorKind::UndefinedTable { table } if table == self.event_table() => RetrievalError::EventNotFound,
-                _ => RetrievalError::storage(err),
+        let rows = match client.query(&query, &[&event_ids]).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                let kind = error_kind(&err);
+                match kind {
+                    ErrorKind::UndefinedTable { table } if table == self.event_table() => return Ok(Vec::new()),
+                    _ => return Err(RetrievalError::storage(err)),
+                }
             }
-        })?;
-
-        let operations_binary: Vec<u8> = row.try_get("operations").map_err(|err| RetrievalError::storage(err))?;
-        let operations = bincode::deserialize(&operations_binary).map_err(|err| RetrievalError::storage(err))?;
-        let parent: Clock = row.try_get("parent").map_err(|err| RetrievalError::storage(err))?;
-        let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(|err| RetrievalError::storage(err))?;
-        let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(|err| RetrievalError::storage(err))?;
-
-        let event = Attested {
-            payload: Event { collection: self.collection_id.clone(), entity_id: entity_id, operations: operations, parent: parent },
-            attestations: AttestationSet(attestations),
         };
 
-        Ok(event)
+        let mut events = Vec::new();
+        for row in rows {
+            let entity_id: EntityId = row.try_get("entity_id").map_err(|err| RetrievalError::storage(err))?;
+            let operations: OperationSet = row.try_get("operations").map_err(|err| RetrievalError::storage(err))?;
+            let parent: Clock = row.try_get("parent").map_err(|err| RetrievalError::storage(err))?;
+            let attestations_binary: Vec<u8> = row.try_get("attestations").map_err(|err| RetrievalError::storage(err))?;
+            let attestations: Vec<Attestation> = bincode::deserialize(&attestations_binary).map_err(|err| RetrievalError::storage(err))?;
+
+            let event = Attested {
+                payload: Event { collection: self.collection_id.clone(), entity_id: entity_id, operations: operations, parent: parent },
+                attestations: AttestationSet(attestations),
+            };
+            events.push(event);
+        }
+        Ok(events)
     }
 
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {

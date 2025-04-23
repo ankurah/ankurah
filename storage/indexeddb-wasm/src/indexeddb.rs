@@ -233,7 +233,7 @@ impl StorageCollection for IndexedDBBucket {
 
             // Check if the entity exists
             if result.is_undefined() || result.is_null() {
-                return Err(RetrievalError::NotFound(id));
+                return Err(RetrievalError::EntityNotFound(id));
             }
 
             let entity: web_sys::js_sys::Object = step(result.dyn_into(), "dyn into")?;

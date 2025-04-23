@@ -7,7 +7,7 @@ use crate::{error::DecodeError, EventId};
 
 /// S set of event ids which create a dag of events
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
-pub struct Clock(pub(crate) BTreeSet<EventId>);
+pub struct Clock(pub(crate) Vec<EventId>);
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClockOrdering {
@@ -18,18 +18,25 @@ pub enum ClockOrdering {
 }
 
 impl Clock {
-    pub fn new(ids: impl Into<BTreeSet<EventId>>) -> Self { Self(ids.into()) }
+    pub fn new(ids: impl Into<Vec<EventId>>) -> Self { Self(ids.into()) }
 
-    pub fn as_slice(&self) -> &BTreeSet<EventId> { &self.0 }
+    pub fn as_slice(&self) -> &[EventId] { &self.0 }
 
     pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_string()).collect() }
 
     pub fn from_strings(strings: Vec<String>) -> Result<Self, DecodeError> {
-        let ids = strings.into_iter().map(|s| s.try_into()).collect::<Result<BTreeSet<_>, _>>()?;
+        let mut ids = strings.into_iter().map(|s| s.try_into()).collect::<Result<Vec<_>, _>>()?;
+        ids.sort();
         Ok(Self(ids))
     }
 
-    pub fn insert(&mut self, id: EventId) { self.0.insert(id); }
+    pub fn insert(&mut self, id: EventId) {
+        // binary search for the insertion point, and don't insert if it's already present
+        let index = self.0.binary_search(&id).unwrap_or_else(|i| i);
+        if index == self.0.len() || self.0[index] != id {
+            self.0.insert(index, id);
+        }
+    }
 
     pub fn len(&self) -> usize { self.0.len() }
 

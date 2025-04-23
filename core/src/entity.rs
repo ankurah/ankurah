@@ -1,5 +1,10 @@
+use crate::lineage;
 use crate::{
-    error::{MutationError, RetrievalError, StateError}, model::View, property::{Backends, PropertyValue}, storage::StorageCollectionWrapper, Node
+    error::{MutationError, RetrievalError, StateError},
+    model::View,
+    property::{Backends, PropertyValue},
+    storage::StorageCollectionWrapper,
+    Node,
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{clock, Clock, CollectionId, EntityId, Event, EventId, OperationSet, State};
@@ -7,7 +12,6 @@ use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
 use tracing::debug;
-use crate::lineage;
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -131,16 +135,17 @@ impl Entity {
         // Hack
         *self.backends.head.lock().unwrap() = head;
 
-        unimplemented!()
+        unimplemented!();
         // only return true if the event descends our local state
         // and all links are in our collection's event history back to the current head
         Ok(false)
     }
 
     pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, MutationError> {
-        if !lineage::descends(collection, &self.head(), &state.head)? {
-            return Ok(false);
-        }
+        unimplemented!();
+        // if !lineage::descends(&*collection, &self.head(), &state.head)? {
+        //     return Ok(false);
+        // }
         self.backends.apply_state(state)?;
         Ok(true)
     }
@@ -276,7 +281,8 @@ impl WeakEntitySet {
             Entry::Occupied(o) => match o.get().upgrade() {
                 Some(entity) => {
                     if entity.collection == collection_id {
-                        entity.apply_state(&state)?;
+                        unimplemented!();
+                        // entity.apply_state(&state)?;
                         Ok(entity)
                     } else {
                         Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)))
