@@ -20,6 +20,7 @@ pub enum PropertyValue {
     I32(i32),
     I64(i64),
 
+    Bool(bool),
     String(String),
     Object(Vec<u8>),
     Binary(Vec<u8>),
@@ -31,6 +32,7 @@ impl Display for PropertyValue {
             PropertyValue::I16(int) => write!(f, "{:?}", int),
             PropertyValue::I32(int) => write!(f, "{:?}", int),
             PropertyValue::I64(int) => write!(f, "{:?}", int),
+            PropertyValue::Bool(bool) => write!(f, "{:?}", bool),
             PropertyValue::String(string) => write!(f, "{:?}", string),
             PropertyValue::Object(object) => write!(f, "{:?}", object),
             PropertyValue::Binary(binary) => write!(f, "{:?}", binary),
@@ -80,6 +82,7 @@ into!(String => String);
 into!(i16 => I16);
 into!(i32 => I32);
 into!(i64 => I64);
+into!(bool => Bool);
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
     fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_string()))) }

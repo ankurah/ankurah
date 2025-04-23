@@ -10,6 +10,7 @@ pub enum PGValue {
     SmallInt(i16),
     Integer(i32),
     BigInt(i64),
+    Boolean(bool),
     // Text(String),
     // Timestamp(chrono::DateTime<chrono::Utc>),
 }
@@ -22,6 +23,7 @@ impl PGValue {
             PGValue::Integer(_) => "int4",
             PGValue::BigInt(_) => "int8",
             PGValue::Bytea(_) => "bytea",
+            PGValue::Boolean(_) => "boolean",
         }
     }
 }
@@ -33,6 +35,7 @@ impl From<PropertyValue> for PGValue {
             PropertyValue::I16(integer) => PGValue::SmallInt(integer),
             PropertyValue::I32(integer) => PGValue::Integer(integer),
             PropertyValue::I64(integer) => PGValue::BigInt(integer),
+            PropertyValue::Bool(bool) => PGValue::Boolean(bool),
             PropertyValue::Object(items) => PGValue::Bytea(items),
             PropertyValue::Binary(items) => PGValue::Bytea(items),
         }
