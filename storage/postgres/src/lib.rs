@@ -238,6 +238,7 @@ impl StorageCollection for PostgresBucket {
                     PGValue::Integer(number) => params.push(number),
                     PGValue::BigInt(number) => params.push(number),
                     PGValue::Bytea(bytes) => params.push(bytes),
+                    PGValue::Boolean(bool) => params.push(bool),
                 },
                 None => params.push(&UntypedNull),
             }
