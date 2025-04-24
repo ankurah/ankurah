@@ -69,7 +69,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     #[cfg(feature = "wasm")]
     let wasm_impl = {
         let namespace_struct = format_ident!("NS{}", name);
-        let pojo_interface = format_ident!("{}Pojo", name);
+        let pojo_interface = format_ident!("{}", name);
 
         // We have copied the internals of the `tsify` crate into the `tsify` directory.
         // The purpose of which is to generate the Wasm ABI for the model struct so the Pojo version of the struct can be used to call methods which accept the Model struct
@@ -91,6 +91,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
             const _: () = {
                 use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
+
                 // These methods are only available via wasm bindgen, so it's ok that we're inside a const block
                 #[wasm_bindgen(js_name = #name, skip_typescript)]
                 pub struct #namespace_struct {}
@@ -100,10 +101,12 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
                     }
+
                     pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<#resultset_name, ::wasm_bindgen::JsValue> {
                         let resultset = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                         Ok(#resultset_name(::std::sync::Arc::new(resultset)))
                     }
+
                     pub fn subscribe (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
                         let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
                         let (signal, rwsignal) = ::ankurah::derive_deps::reactive_graph::signal::RwSignal::new(#resultset_name::default()).split();
@@ -133,10 +136,20 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                             handle: Box::new(handle)
                         })
                     }
+
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         use ankurah::Mutable;
                         let mutable_entity = transaction.create(&me).await;
                         Ok(mutable_entity.read())
+                    }
+
+                    pub async fn create_one(context: &::ankurah::core::context::Context, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                        use ankurah::Mutable;
+                        let tx = context.begin();
+                        let mutable_entity = tx.create(&me).await;
+                        let read = mutable_entity.read();
+                        tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                        Ok(read)
                     }
                 }
 
@@ -179,6 +192,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 #ephemeral_field_visibility #ephemeral_field_names: #ephemeral_field_types,
             )*
         }
+
         #[derive(Debug)]
         pub struct #mutable_name<'rec> {
             entity: &'rec ::ankurah::entity::Entity,
@@ -494,6 +508,11 @@ fn get_static_methods_ts(
          * Create a new {name}
          */
         static create(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
+
+        /**
+         * Create a new {name} within an automatically created and committed transaction.
+         */
+        static create_one(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
 }}"#
     )
 }
