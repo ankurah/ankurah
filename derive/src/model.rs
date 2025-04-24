@@ -512,7 +512,7 @@ fn get_static_methods_ts(
         /**
          * Create a new {name} within an automatically created and committed transaction.
          */
-        static create_one(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
+        static create_one(context: Context, me: {pojo_interface}): Promise<{view_name}>;
 }}"#
     )
 }
