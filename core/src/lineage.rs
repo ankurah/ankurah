@@ -1,7 +1,7 @@
 use crate::{error::RetrievalError, storage::StorageCollection};
-use ankurah_proto::{Attested, Clock, Event, EventId};
+use ankurah_proto::{Attested, Clock, EventId};
 use async_trait::async_trait;
-use std::collections::{HashSet, VecDeque};
+use std::collections::BTreeSet;
 
 /// a trait for events and eventlike things that can be descended
 pub trait TEvent {
@@ -16,11 +16,20 @@ pub trait TClock {
     type Id: Eq + PartialEq + Clone;
     fn members(&self) -> &[Self::Id];
 }
+
 #[async_trait]
 pub trait GetEvents {
-    type Id: Eq + PartialEq + Clone;
+    type Id: Eq + PartialEq + Clone + std::fmt::Debug;
     type Event: TEvent<Id = Self::Id>;
     type Error;
+
+    /// Estimate the budget cost for retrieving a batch of events
+    /// This allows different implementations to model their cost structure
+    fn estimate_cost(&self, _batch: &[Self::Id]) -> usize {
+        // Default implementation: fixed cost of 1 per batch
+        1
+    }
+
     /// retrieve the events from the store, returning the budget consumed by this operation and the events retrieved
     async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), Self::Error>;
 }
@@ -62,8 +71,8 @@ pub enum Ordering<Id> {
     /// subject does not descend from comparison, but there exists a path to a common ancestor
     /// we don't care right now, but notably: when the common ancestor equals the subject, it can be said to Ascend/Precede the comparison
     NotDescends {
-        /// The closest common full(identical) ancestor of comparison and subject
-        common_ancestor: Vec<Id>,
+        /// The closest common full(identical) ancestor event ids
+        common_ancestors: Vec<Id>,
     },
 
     /// subject and comparison have no common ancestor whatsoever
@@ -72,8 +81,8 @@ pub enum Ordering<Id> {
     /// subject partially descends from comparison (some but not all events in comparison are in subject's history)
     /// This means there exists a path from some events in comparison to some (but not all) events in subject
     PartiallyDescends {
-        /// The closest common full(identical) ancestor of a and b
-        common_ancestor: Vec<Id>,
+        /// The closest common full(identical) ancestor event ids
+        common_ancestors: Vec<Id>,
         /// The immediate descendents of the common ancestor that are in b's history but not in a's history
         concurrent_events: Vec<Id>,
     },
@@ -85,202 +94,189 @@ pub enum Ordering<Id> {
     },
 }
 
-/// Compares two clocks to determine their relationship in the event DAG.
+/// Compares two clocks to determine their relationship in the directed acyclic graph (DAG).
 ///
-/// The algorithm uses a two-phase breadth-first search (BFS) approach:
-///
-/// Phase 1: From subject toward ancestors
-/// - Traverse the DAG upward from subject events
-/// - If all comparison events are encountered, subject fully descends from comparison
-/// - If some but not all comparison events are found, subject partially descends
-/// - Track root ancestors (events with no parents) for determining common ancestry
-///
-/// Phase 2: From comparison toward ancestors (only if needed)
-/// - Start BFS from comparison events and look for overlap with subject's traversal history
-/// - This identifies common ancestors when subject doesn't fully descend from comparison
-///
-/// Correctness:
-/// - BFS guarantees we find the shortest path to any comparison event
-/// - Two traversals ensure we find common ancestry even when direct descent doesn't exist
-/// - The budget constraint ensures termination even in large or cyclic graphs
-/// - Batch processing optimizes for IO-bound event retrieval
-pub async fn compare<G, C>(getter: &G, subject: &C, comparison: &C, budget: usize) -> Result<Ordering<G::Id>, G::Error>
+/// This function determines whether the subject clock descends from, shares ancestry with,
+/// or is incomparable to the comparison clock by traversing the event history.
+pub async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, G::Error>
 where
     G: GetEvents,
     G::Event: TEvent<Id = G::Id>,
     C: TClock<Id = G::Id>,
     G::Id: std::hash::Hash + Ord,
 {
-    // Handle empty cases - empty clocks are incomparable, even with themselves
-    if subject.members().is_empty() || comparison.members().is_empty() {
+    // REQUIREMENTS:
+    // 0. Keep it simple as possible. We want to make this code elegant, efficient, correct, and easy to understand.
+    // 1. Do not implement any visit tracking for the purposes of detecting cycles. The actual use case for this involves content-based ids, which cannot be cyclical.
+    // For the test case, the budget mechanism can be a sufficient backstop against infinite loops.
+    // 2. Travel light. Try to process things on a streaming basis as much as possible.
+    // Event histories will tend to be fairly linear, but with occasional concurrencies which may remain concurrent for several generations.
+    // 3. When you detect that any of the events in the comparison have no common history, you can return Incomparable immediately.
+    // 4. when the budget is exceeded, return BudgetExceeded, even if we've found a partial answer. We need to give the Correct answer or nothing (BudgetExceeded).
+    // 5. Equality is not descendency
+    // 6. Early return whenever a conclusive determination can be made.
+    // 7. Stretch goal: when the budget is exceeded, think about what we might be able to include in the BudgetExceeded result to help the caller resume the comparison later if they choose to. Can that be feed into subject and comparison clocks?
+
+    // bail out right away for the obvious cases
+    if subject.members().is_empty() || other.members().is_empty() {
         return Ok(Ordering::Incomparable);
     }
 
-    // Check for equality
-    if subject.members() == comparison.members() {
+    if subject.members() == other.members() {
         return Ok(Ordering::Equal);
     }
 
-    // Create a set of comparison event IDs for quick lookups
-    let comparison_ids: HashSet<_> = comparison.members().iter().cloned().collect();
+    let mut comparison = Comparison::new(getter, subject, other, budget);
 
-    // Track which comparison events have been found in subject's history
-    let mut found_comparison_events = HashSet::new();
+    loop {
+        if let Some(ordering) = comparison.step().await? {
+            return Ok(ordering);
+        }
+    }
+}
 
-    // Track visited events to avoid redundant work
-    let mut visited = HashSet::new();
+pub struct Comparison<'a, G, C>
+where
+    G: GetEvents + 'a,
+    G::Event: TEvent<Id = G::Id>,
+    C: TClock<Id = G::Id>,
+    G::Id: std::hash::Hash + Ord + std::fmt::Debug,
+{
+    getter: &'a G,
+    subject_working_set: BTreeSet<C::Id>,
+    other_working_set: BTreeSet<C::Id>,
+    lookup_queue: Vec<C::Id>,
+    remaining_budget: usize,
+    common_ancestors: BTreeSet<C::Id>,
+    common_temp: Vec<C::Id>,         // Reusable Vec to avoid allocations
+    original_other: BTreeSet<C::Id>, // Track original elements of other to determine descendency
+}
 
-    // Queue for BFS traversal starting from subject
-    let mut queue = VecDeque::new();
-    for id in subject.members() {
-        queue.push_back(id.clone());
-        visited.insert(id.clone());
+impl<'a, G, C> Comparison<'a, G, C>
+where
+    G: GetEvents + 'a,
+    G::Event: TEvent<Id = G::Id>,
+    C: TClock<Id = G::Id>,
+    G::Id: std::hash::Hash + Ord + std::fmt::Debug,
+{
+    pub fn new(getter: &'a G, subject: &C, other: &C, budget: usize) -> Self {
+        println!("Creating comparison with subject: {:?}, other: {:?}", subject.members(), other.members());
+        let subject_working_set = subject.members().iter().cloned().collect();
+        let other_working_set = other.members().iter().cloned().collect();
+        let original_other: BTreeSet<C::Id> = other.members().iter().cloned().collect();
+
+        let mut me = Self {
+            getter,
+            subject_working_set,
+            other_working_set,
+            lookup_queue: Vec::new(),
+            common_ancestors: BTreeSet::new(),
+            remaining_budget: budget,
+            common_temp: Vec::new(),
+            original_other,
+        };
+
+        me.process_frontier();
+        println!(
+            "After process_frontier - subject_ws: {:?}, other_ws: {:?}, common_ancestors: {:?}",
+            me.subject_working_set, me.other_working_set, me.common_ancestors
+        );
+
+        me
     }
 
-    // Track our remaining budget
-    let mut remaining_budget = budget;
+    fn process_frontier(&mut self) {
+        // Fill with intersection elements
+        self.common_temp.extend(self.subject_working_set.intersection(&self.other_working_set).cloned());
 
-    // For finding root ancestors during BFS traversal
-    let mut root_ancestors = HashSet::new();
-    let mut has_requested_more_parents = false;
+        // Process common elements and drain the Vec in one operation
+        for id in self.common_temp.drain(..) {
+            // remove from working sets
+            self.subject_working_set.remove(&id);
+            self.other_working_set.remove(&id);
 
-    // Perform BFS traversal to find ancestry relationship
-    while !queue.is_empty() && remaining_budget > 0 {
-        // Get a batch of events to process (more efficient than one at a time)
-        let batch_size = std::cmp::min(queue.len(), remaining_budget);
-        let batch: Vec<_> = (0..batch_size).filter_map(|_| queue.pop_front()).collect();
-
-        // Check if any of the current batch are comparison events
-        for id in &batch {
-            if comparison_ids.contains(id) {
-                found_comparison_events.insert(id.clone());
-            }
+            // Add to common_ancestors
+            self.common_ancestors.insert(id);
         }
 
-        // If we've found all comparison events, subject fully descends from comparison
-        if found_comparison_events.len() == comparison_ids.len() {
-            return Ok(Ordering::Descends);
+        // Populate lookup queue
+        self.lookup_queue.extend(self.subject_working_set.iter().cloned());
+        self.lookup_queue.extend(self.other_working_set.iter().cloned());
+    }
+
+    // runs one step of the comparison, returning Some(ordering) if a conclusive determination can be made, or None if it needs more steps
+    pub async fn step(&mut self) -> Result<Option<Ordering<G::Id>>, G::Error> {
+        println!(
+            "Step called - subject_ws: {:?}, other_ws: {:?}, common_ancestors: {:?}",
+            self.subject_working_set, self.other_working_set, self.common_ancestors
+        );
+
+        if self.remaining_budget == 0 {
+            return Ok(Some(Ordering::BudgetExceeded {}));
         }
 
-        // Retrieve parent events
-        let (budget_used, events) = getter.get_events(batch).await?;
-        remaining_budget = remaining_budget.saturating_sub(budget_used);
+        // Both working sets empty but subject doesn't descend from other
+        if self.lookup_queue.is_empty() {
+            println!("lookup_queue empty - common_ancestors: {:?}", self.common_ancestors);
 
-        // Add parent events to the queue
-        has_requested_more_parents = false;
-        for event in events {
-            let parent_clock = event.payload.parent();
-
-            // If an event has no parents, it's a root ancestor
-            if parent_clock.members().is_empty() {
-                root_ancestors.insert(event.payload.id());
+            // Even if both sets are empty, we need to check if we found any common ancestors during traversal
+            if !self.common_ancestors.is_empty() {
+                println!("Found common ancestors: {:?}", self.common_ancestors);
+                // They have common ancestors but not full descendency
+                return Ok(Some(Ordering::NotDescends { common_ancestors: self.common_ancestors.iter().cloned().collect() }));
             } else {
-                has_requested_more_parents = true;
+                println!("No common ancestors found");
+                // No common ancestors found after traversal, they're incomparable
+                return Ok(Some(Ordering::Incomparable));
             }
+        }
 
-            for parent_id in parent_clock.members() {
-                if !visited.contains(parent_id) {
-                    visited.insert(parent_id.clone());
-                    queue.push_back(parent_id.clone());
+        let estimate = self.getter.estimate_cost(&self.lookup_queue);
+        if estimate > self.remaining_budget {
+            return Ok(Some(Ordering::BudgetExceeded {}));
+        }
+
+        println!("Getting events: {:?}", self.lookup_queue);
+        let (cost, events) = self.getter.get_events(self.lookup_queue.drain(..).collect()).await?;
+        let events = events.iter().map(|e| (e.payload.id(), e.payload.parent().members())).collect::<Vec<_>>();
+        println!("Got events: {:?}", events.iter().map(|e| &e.0).collect::<Vec<_>>());
+        let _ = self.remaining_budget.saturating_sub(cost);
+
+        Self::regress(&mut self.subject_working_set, &events, "subject");
+
+        println!("\t descends check {:?} == {:?}", self.subject_working_set, self.original_other);
+        // Check for descendency - subject working set equals original other
+        if self.subject_working_set == self.original_other {
+            println!("Found subject descends from other");
+            return Ok(Some(Ordering::Descends));
+        }
+
+        Self::regress(&mut self.other_working_set, &events, "other");
+
+        self.process_frontier();
+        println!(
+            "After process_frontier - subject_ws: {:?}, other_ws: {:?}, common_ancestors: {:?}",
+            self.subject_working_set, self.other_working_set, self.common_ancestors
+        );
+
+        // Continue the process
+        Ok(None)
+    }
+
+    #[inline(always)]
+    fn regress(working_set: &mut BTreeSet<C::Id>, events: &[(G::Id, &[G::Id])], label: &'static str) {
+        println!("regressing {} working set: {:?}", label, working_set);
+        for (event_id, parent_ids) in events {
+            // replace the ids in the working sets with their parent ids - stopping at the root
+            if working_set.remove(event_id) {
+                for parent_id in parent_ids.iter() {
+                    working_set.insert(parent_id.clone());
                 }
             }
         }
 
-        // If we didn't request more parents, we've reached root ancestors
-        if !has_requested_more_parents && !root_ancestors.is_empty() && remaining_budget > 0 {
-            // Put the root ancestors in the visited set
-            for id in &root_ancestors {
-                visited.insert(id.clone());
-            }
-        }
+        println!("\t after regress {:?}", working_set);
     }
-
-    // If budget exceeded, return that
-    if !queue.is_empty() && remaining_budget == 0 {
-        return Ok(Ordering::BudgetExceeded {});
-    }
-
-    // If we found some but not all comparison events, it's a partial descent
-    if !found_comparison_events.is_empty() && found_comparison_events.len() < comparison_ids.len() {
-        // Find concurrent events (comparison events not in subject's history)
-        let concurrent_events: Vec<_> = comparison_ids.iter().filter(|id| !found_comparison_events.contains(*id)).cloned().collect();
-
-        // The test expects common_ancestor to be [1] in the PartiallyDescends case
-        // This is a special case for the test. In a real implementation, we'd need a more
-        // sophisticated approach to find the common ancestors properly.
-        // Here, we'll get the lowest ID from root_ancestors, which should be 1 for the test case
-        let mut common_ancestor_vec = Vec::new();
-        if !root_ancestors.is_empty() {
-            let mut roots: Vec<_> = root_ancestors.into_iter().collect();
-            roots.sort();
-            common_ancestor_vec.push(roots[0].clone());
-        }
-
-        return Ok(Ordering::PartiallyDescends { common_ancestor: common_ancestor_vec, concurrent_events });
-    }
-
-    // Now we need to check if they have a common ancestor
-    // We've already traversed from subject, so let's traverse from comparison
-
-    // Reset visited to only include what we've already seen
-    let subject_history = visited;
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-
-    // Start from comparison events
-    for id in comparison.members() {
-        queue.push_back(id.clone());
-        visited.insert(id.clone());
-    }
-
-    // Reset budget for this phase
-    remaining_budget = budget;
-    let mut common_ancestors = HashSet::new();
-
-    // Perform BFS from comparison to find common ancestors
-    while !queue.is_empty() && remaining_budget > 0 {
-        let batch_size = std::cmp::min(queue.len(), remaining_budget);
-        let batch: Vec<_> = (0..batch_size).filter_map(|_| queue.pop_front()).collect();
-
-        // Check for common ancestors
-        for id in &batch {
-            if subject_history.contains(id) {
-                common_ancestors.insert(id.clone());
-            }
-        }
-
-        // If we found common ancestors, we can return NotDescends
-        if !common_ancestors.is_empty() {
-            // Sort common ancestors to ensure consistent ordering
-            let mut common_ancestor_vec: Vec<_> = common_ancestors.into_iter().collect();
-            common_ancestor_vec.sort(); // Sort for deterministic order
-
-            return Ok(Ordering::NotDescends { common_ancestor: common_ancestor_vec });
-        }
-
-        // Retrieve parent events
-        let (budget_used, events) = getter.get_events(batch).await?;
-        remaining_budget = remaining_budget.saturating_sub(budget_used);
-
-        // Add parent events to the queue
-        for event in events {
-            let parent_clock = event.payload.parent();
-            for parent_id in parent_clock.members() {
-                if !visited.contains(parent_id) {
-                    visited.insert(parent_id.clone());
-                    queue.push_back(parent_id.clone());
-                }
-            }
-        }
-    }
-
-    // If budget exceeded during common ancestor search
-    if !queue.is_empty() && remaining_budget == 0 {
-        return Ok(Ordering::BudgetExceeded {});
-    }
-
-    // If no common ancestors found and budget not exceeded, they're incomparable
-    Ok(Ordering::Incomparable)
 }
 
 #[cfg(test)]
@@ -364,8 +360,14 @@ mod tests {
 
         // descendant descends from ancestor
         assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap(), Ordering::Descends);
+
+        println!("\n\n\n");
+
+        // LEFT OFF HERE - THink about whether we need to store all the ancestors to determine if there are any common ancestors
+        // or if we can do it in a streaming manner. At present it's failing to detect that 1 and 3 have a common ancestor: [1]
+
         // ancestor does not descend from descendant, but they both have a common ancestor: [1]
-        assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), Ordering::NotDescends { common_ancestor: vec![1] });
+        assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), Ordering::NotDescends { common_ancestors: vec![1] });
     }
 
     #[tokio::test]
@@ -394,7 +396,7 @@ mod tests {
             let descendant = TestClock { members: vec![5] };
             assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap(), Ordering::Descends);
             // a is the common ancestor of this comparison. They are comparable, but a does not descend from b
-            assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), Ordering::NotDescends { common_ancestor: vec![1] });
+            assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), Ordering::NotDescends { common_ancestors: vec![1] });
         }
         {
             // this ancestor clock has internal concurrency, but is fully descended by the descendant clock
@@ -402,15 +404,15 @@ mod tests {
             let descendant = TestClock { members: vec![5] };
 
             assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap(), Ordering::Descends);
-            assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), Ordering::NotDescends { common_ancestor: vec![2, 3] });
+            assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), Ordering::NotDescends { common_ancestors: vec![2, 3] });
         }
 
         {
             // a and b are fully concurrent, but still comparable
             let a = TestClock { members: vec![2] };
             let b = TestClock { members: vec![3] };
-            assert_eq!(compare(&store, &a, &b, 100).await.unwrap(), Ordering::NotDescends { common_ancestor: vec![1] });
-            assert_eq!(compare(&store, &b, &a, 100).await.unwrap(), Ordering::NotDescends { common_ancestor: vec![1] });
+            assert_eq!(compare(&store, &a, &b, 100).await.unwrap(), Ordering::NotDescends { common_ancestors: vec![1] });
+            assert_eq!(compare(&store, &b, &a, 100).await.unwrap(), Ordering::NotDescends { common_ancestors: vec![1] });
         }
 
         {
@@ -422,7 +424,7 @@ mod tests {
                 // concurrent_events 2 is fairly conclusively correct
                 // It's a little less clear whether common_ancestor should be 1, or 1,3, because 3 is not an "ancestor" of 2,3 per se
                 // but this would be consistent with the internal concurrency ancestor test above. maybe `common` is a better term
-                Ordering::PartiallyDescends { common_ancestor: vec![1], concurrent_events: vec![2] }
+                Ordering::PartiallyDescends { common_ancestors: vec![1], concurrent_events: vec![2] }
             );
         }
     }
@@ -431,27 +433,38 @@ mod tests {
     async fn test_incomparable() {
         let mut store = MockEventStore::new();
 
-        //   1        4
-        //   ↓        ↓
-        //   2        5
-        //   ↓        ↓
-        //   3        6
+        //   1        6
+        //   ↓  ↘     ↓
+        //   2   4    7
+        //   ↓   ↓    ↓
+        //   3   5    8
         store.add(1, &[]);
         store.add(2, &[1]);
         store.add(3, &[2]);
-
-        store.add(4, &[]);
+        store.add(4, &[1]);
         store.add(5, &[4]);
-        store.add(6, &[5]);
+
+        // 6 is an unrelated root event
+        store.add(6, &[]);
+        store.add(7, &[6]);
+        store.add(8, &[7]);
 
         {
+            // fully incomparable
             let a = TestClock { members: vec![3] };
-            let b = TestClock { members: vec![6] };
+            let b = TestClock { members: vec![8] };
             assert_eq!(compare(&store, &a, &b, 100).await.unwrap(), Ordering::Incomparable);
         }
         {
+            // fully incomparable (just a different tier)
             let a = TestClock { members: vec![2] };
-            let b = TestClock { members: vec![6] };
+            let b = TestClock { members: vec![8] };
+            assert_eq!(compare(&store, &a, &b, 100).await.unwrap(), Ordering::Incomparable);
+        }
+        {
+            // partially incomparable is still incomparable (consider adding a report of common ancestor elements for cases of partial comparability)
+            let a = TestClock { members: vec![3] };
+            let b = TestClock { members: vec![5, 8] };
             assert_eq!(compare(&store, &a, &b, 100).await.unwrap(), Ordering::Incomparable);
         }
     }
@@ -474,20 +487,40 @@ mod tests {
     async fn test_budget_exceeded() {
         let mut store = MockEventStore::new();
 
-        // linear chain that exceeds budget
+        //   1
+        //   ↓  ↘
+        //   2   5
+        //   ↓   ↓  ↘
+        //   3   6   8
+        //   ↓   ↓
+        //   4   7
+
         store.add(1, &[]);
         store.add(2, &[1]);
         store.add(3, &[2]);
         store.add(4, &[3]);
+        store.add(5, &[1]);
+        store.add(6, &[5]);
+        store.add(7, &[6]);
+        store.add(8, &[5]);
 
-        let ancestor = TestClock { members: vec![1] };
-        let descendant = TestClock { members: vec![4] };
+        {
+            // simple linear chain
+            let ancestor = TestClock { members: vec![1] };
+            let descendant = TestClock { members: vec![4] };
 
-        match compare(&store, &ancestor, &descendant, 2).await.unwrap() {
-            Ordering::BudgetExceeded {} => {
-                assert!(true); // Haven't found 1 yet when budget exceeded
-            }
-            _ => panic!("Expected BudgetExceeded"),
+            assert_eq!(compare(&store, &descendant, &ancestor, 2).await.unwrap(), Ordering::BudgetExceeded {});
+        }
+        {
+            let ancestor = TestClock { members: vec![1] };
+            let descendant = TestClock { members: vec![4, 5] };
+
+            //  with a high enough budget, we can see that the descendant fully descends from the ancestor
+            assert_eq!(compare(&store, &descendant, &ancestor, 10).await.unwrap(), Ordering::Descends);
+
+            // when multiple paths are split across the budget, we can determine there's at least partial descent, but that's not accurate.
+            // We can't declare partial descent until we've found a common ancestor, otherwise they might be incomparable.
+            assert_eq!(compare(&store, &ancestor, &descendant, 2).await.unwrap(), Ordering::BudgetExceeded {});
         }
     }
 
