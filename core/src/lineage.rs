@@ -64,12 +64,10 @@ impl<T: StorageCollection> GetEvents for T {
 pub enum Ordering<Id> {
     Equal,
 
-    /// subject fully descends from comparison (all events in comparison are in subject's history)
     /// This means there exists a path in the DAG from each event in comparison to every event in subject
     Descends,
 
     /// subject does not descend from comparison, but there exists a path to a common ancestor
-    /// we don't care right now, but notably: when the common ancestor equals the subject, it can be said to Ascend/Precede the comparison
     NotDescends {
         /// The greatest lower bound of the two sets
         meet: Vec<Id>,
@@ -83,8 +81,8 @@ pub enum Ordering<Id> {
     PartiallyDescends {
         /// The greatest lower bound of the two sets
         meet: Vec<Id>,
-        // The immediate descendents of the common ancestor that are in b's history but not in a's history
-        // concurrent_events: Vec<Id>,
+        // LATER: The immediate descendents of the common ancestor that are in b's history but not in a's history
+        // difference: Vec<Id>,
     },
 
     /// Recursion budget was exceeded before a determination could be made
@@ -95,10 +93,30 @@ pub enum Ordering<Id> {
     },
 }
 
-/// Compares two clocks to determine their relationship in the directed acyclic graph (DAG).
+/// Compares two Clocks, traversing the event history to classify their
+/// causal relationship.
 ///
-/// This function determines whether the subject clock descends from, shares ancestry with,
-/// or is incomparable to the comparison clock by traversing the event history.
+/// The function performs a **simultaneous, breadth-first walk** from the head
+/// sets of `subject` and `other`, fetching parents in batches.
+///
+/// `budget` reflects whatever appetite we have for traversal, which is costly
+/// In practice, the node may decline an event with too high of a comparison cost.
+///
+/// As it walks it records which side first reached each node, incrementally
+/// constructs the set of **minimal common ancestors** (the "meet"), and keeps a
+/// checklist so it can decide without a second pass whether every event
+/// in 'other' found a common ancestor.
+///
+/// The moment the relationship is clear, it returns an Ordering.
+///
+/// If the budget is exhausted before a definite answer is reached, the partially explored
+/// frontiers are returned in `BudgetExceeded`, allowing the caller to resume
+/// later with a higher budget. (This bit is under-baked, and needs to be revisited)
+///
+/// The intention is for this to operate on a streaming basis, storing the minimal state
+/// required to make a conclusive comparison. I think we can probably purge the `state`
+/// map for a given entity once visited by both sides, and the id is removed from the checklist
+/// but this needs a bit more thought.
 pub async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, G::Error>
 where
     G: GetEvents,
@@ -106,8 +124,6 @@ where
     C: TClock<Id = G::Id>,
     G::Id: std::hash::Hash + Ord,
 {
-    println!("[DEBUG] comparing {:?} and {:?}", subject.members(), other.members());
-
     // bail out right away for the obvious cases
     if subject.members().is_empty() || other.members().is_empty() {
         return Ok(Ordering::Incomparable);
@@ -126,7 +142,60 @@ where
     }
 }
 
-type Origins<Id> = SmallVec<[Id; 8]>;
+#[derive(Debug, Clone, Default)]
+struct Origins<Id>(SmallVec<[Id; 8]>);
+
+impl<Id> Origins<Id> {
+    fn new() -> Self { Self(SmallVec::new()) }
+}
+
+impl<Id: Clone + PartialEq> Origins<Id> {
+    fn add(&mut self, id: Id) {
+        if !self.0.contains(&id) {
+            self.0.push(id);
+        }
+    }
+
+    fn augment(&mut self, other: &Self) {
+        for h in other.0.iter() {
+            if !self.0.contains(h) {
+                self.0.push(h.clone());
+            }
+        }
+    }
+}
+
+impl<Id> std::ops::Deref for Origins<Id> {
+    type Target = [Id];
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+#[derive(Debug, Clone)]
+struct State<Id> {
+    seen_from_subject: bool,
+    seen_from_other: bool,
+    common_child_count: usize,
+    origins: Origins<Id>,
+}
+
+impl<Id> Default for State<Id> {
+    fn default() -> Self { Self { seen_from_subject: false, seen_from_other: false, common_child_count: 0, origins: Origins::new() } }
+}
+
+impl<Id> State<Id>
+where Id: Clone + PartialEq
+{
+    fn is_common(&self) -> bool { self.seen_from_subject && self.seen_from_other }
+
+    fn mark_seen_from(&mut self, from_subject: bool, from_other: bool) {
+        if from_subject {
+            self.seen_from_subject = true;
+        }
+        if from_other {
+            self.seen_from_other = true;
+        }
+    }
+}
 
 pub(crate) struct Comparison<'a, G>
 where
@@ -134,26 +203,27 @@ where
     G::Event: TEvent<Id = G::Id>,
     G::Id: std::hash::Hash + Ord + std::fmt::Debug,
 {
-    /* external inputs */
+    /// The event store to fetch events from
     getter: &'a G,
+
+    /// The original set of `other` events
     original_other_events: BTreeSet<G::Id>, // immutable snapshot
 
-    /* mutable checklist: heads still looking for a common ancestor */
+    /// The set of `other` heads still looking for a common ancestor
     outstanding_heads: BTreeSet<G::Id>,
 
+    /// The remaining budget for fetching events
     remaining_budget: usize,
 
     /* search frontiers */
     subject_frontier: BTreeSet<G::Id>,
     other_frontier: BTreeSet<G::Id>,
 
-    /* per-node bookkeeping: (seen_from_subject, seen_from_other, origin heads) */
-    seen: HashMap<G::Id, (bool, bool)>,
-    origins: HashMap<G::Id, Origins<G::Id>>,
+    /* per-node bookkeeping */
+    states: HashMap<G::Id, State<G::Id>>,
 
     /* incremental meet construction */
     meet_candidates: BTreeSet<G::Id>,
-    common_child_cnt: HashMap<G::Id, usize>,
 
     /* enum-decision flags */
     unseen_other_heads: usize,
@@ -168,8 +238,6 @@ where
     G::Id: std::hash::Hash + Ord + std::fmt::Debug,
 {
     pub fn new<C: TClock<Id = G::Id>>(getter: &'a G, subject: &C, other: &C, budget: usize) -> Self {
-        // println!("Creating comparison with subject: {:?}, other: {:?}", subject.members(), other.members());
-        // Initialize working sets with the initial events
         let subject_frontier: BTreeSet<_> = subject.members().iter().cloned().collect();
         let other: BTreeSet<_> = other.members().iter().cloned().collect();
         let original_other_events = other.clone();
@@ -187,11 +255,9 @@ where
             head_overlap: false,
             any_common: false,
 
-            seen: HashMap::new(),
-            origins: HashMap::new(),
-            outstanding_heads: other,
+            states: HashMap::new(),
             meet_candidates: BTreeSet::new(),
-            common_child_cnt: HashMap::new(),
+            outstanding_heads: other,
         }
     }
 
@@ -204,7 +270,9 @@ where
         let (cost, events) = self.getter.get_events(ids).await?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
-        self.process_events(&events);
+        for event in events {
+            self.process_event(event.payload.id(), event.payload.parent().members());
+        }
 
         if let Some(ordering) = self.check_result() {
             return Ok(Some(ordering));
@@ -213,92 +281,63 @@ where
         // keep going
         Ok(None)
     }
-    fn process_events(&mut self, events: &[Attested<G::Event>]) {
-        for event in events {
-            let id = event.payload.id();
-            let parents = event.payload.parent().members().to_vec();
-            /* ── get (or insert) entries in the two maps ───────────────────── */
+    fn process_event(&mut self, id: G::Id, parents: &[G::Id]) {
+        let from_subject = self.subject_frontier.remove(&id);
+        let from_other = self.other_frontier.remove(&id);
 
-            let origins_entry = self.origins.entry(id.clone()).or_insert(Origins::<G::Id>::new());
+        // Process the current node and capture relevant state
+        let (is_common, origins) = {
+            let node_state = self.states.entry(id.clone()).or_default();
+            node_state.mark_seen_from(from_subject, from_other);
 
-            /* ── mark which side(s) we came from ───────────────────────────── */
-            let from_subject = self.subject_frontier.remove(&id);
-            let from_other = self.other_frontier.remove(&id);
-
-            let seen_entry = {
-                let seen_entry = self.seen.entry(id.clone()).or_insert((false, false));
-
-                if from_subject {
-                    seen_entry.0 = true;
-                }
-                if from_other {
-                    seen_entry.1 = true;
-                }
-                seen_entry.clone()
-            };
-            /* ── add the head itself to the origin list if this is an “other” head ─ */
+            // Handle origins for "other" heads
             if from_other && self.original_other_events.contains(&id) {
-                if !origins_entry.contains(&id) {
-                    origins_entry.push(id.clone());
-                    println!("origins_entry: {:?}", origins_entry);
-                }
+                node_state.origins.add(id.clone());
             }
 
-            /* grab the tag slice and drop the mutable borrow before looping parents */
-            let tag_slice = origins_entry.clone();
+            // Capture state before dropping borrow
+            (node_state.is_common(), node_state.origins.clone())
+        };
 
-            /* ── propagate origin tags *only* when the visit was via OTHER side ─── */
-            if from_other {
-                for p in parents.iter() {
-                    let parent_orig = self.origins.entry(p.clone()).or_insert(Origins::<G::Id>::new());
-                    // let mut added = false;
-                    for h in tag_slice.iter() {
-                        if !parent_orig.contains(h) {
-                            parent_orig.push(h.clone());
-                            println!("parent_orig: {:?}", parent_orig);
-                        }
-                    }
-                }
+        // Handle common node and parent updates
+        if is_common && self.meet_candidates.insert(id.clone()) {
+            self.any_common = true;
+
+            // remove satisfied heads from the checklist
+            for h in origins.iter() {
+                self.outstanding_heads.remove(h);
             }
 
-            /* ── extend the frontier(s) we came from ───────────────────────── */
-            if from_subject {
-                self.subject_frontier.extend(parents.iter().cloned());
-
-                if self.original_other_events.contains(&id) {
-                    self.unseen_other_heads -= 1;
-                    self.head_overlap = true;
+            // Update common child count and propagate origins in one pass over parents
+            for p in parents {
+                let parent_state = self.states.entry(p.clone()).or_default();
+                if from_other {
+                    parent_state.origins.augment(&origins);
                 }
+                parent_state.common_child_count += 1;
             }
-            if from_other {
-                self.other_frontier.extend(parents.iter().cloned());
+        } else if from_other {
+            // Just propagate origins if not a common node
+            for p in parents {
+                let parent_state = self.states.entry(p.clone()).or_default();
+                parent_state.origins.augment(&origins);
             }
+        }
 
-            /* ── did this node just become common? ─────────────────────────── */
-            if seen_entry.0 && seen_entry.1 && self.meet_candidates.insert(id.clone()) {
-                eprintln!(
-                    "[DEBUG] COMMON node {:?}: origins = {:?}; outstanding_heads left = {}",
-                    id,
-                    tag_slice,
-                    self.outstanding_heads.len()
-                );
-                self.any_common = true;
+        // Extend frontiers
+        if from_subject {
+            self.subject_frontier.extend(parents.iter().cloned());
 
-                // remove satisfied heads from the checklist
-                for h in tag_slice.iter() {
-                    self.outstanding_heads.remove(h);
-                }
-
-                for p in parents {
-                    *self.common_child_cnt.entry(p.clone()).or_default() += 1;
-                }
+            if self.original_other_events.contains(&id) {
+                self.unseen_other_heads -= 1;
+                self.head_overlap = true;
             }
+        }
+        if from_other {
+            self.other_frontier.extend(parents.iter().cloned());
         }
     }
 
-    /*───────────────────────────────────────────────────────────────*/
-    /* 2.  decide once queues drain (unchanged from earlier)         */
-    /*───────────────────────────────────────────────────────────────*/
     fn check_result(&mut self) -> Option<Ordering<G::Id>> {
         if self.unseen_other_heads == 0 {
             return Some(Ordering::Descends);
@@ -306,8 +345,12 @@ where
 
         if self.subject_frontier.is_empty() && self.other_frontier.is_empty() {
             // prune to minimal common ancestors
-            let meet: Vec<_> =
-                self.meet_candidates.iter().filter(|id| self.common_child_cnt.get(*id).copied().unwrap_or(0) == 0).cloned().collect();
+            let meet: Vec<_> = self
+                .meet_candidates
+                .iter()
+                .filter(|id| self.states.get(*id).map_or(0, |state| state.common_child_count) == 0)
+                .cloned()
+                .collect();
 
             if !self.any_common {
                 return Some(Ordering::Incomparable);
@@ -585,26 +628,21 @@ mod tests {
         // A clock does NOT descend itself
         assert_eq!(compare(&store, &clock, &clock, 100).await.unwrap(), Ordering::Equal);
     }
-    ///
-    // DAG structure
-    //
-    //   1   2   3   4   5   6       ← six independent heads (other-clock)
-    //   │   │   │   │   │   │
-    //   ╰─┬─┴─┬─┴─┬─┴─┬─┴─┬─╯
-    //     │   │   │   │   │
-    //     7 (fan-in node)
-    //     │
-    //     8       ← subject head (descends only from 1)
-    //
-    //  meet({8},{2-6})  = [1]
-    //  direction 8→{2-6}:  NotDescends
-    //  direction {2-6}→8:  PartiallyDescends
-    ///
+
     #[tokio::test]
-    async fn test_many_heads_meet_at_merge() {
-        // Why this stresses the design
-        // The merge node 7 carries six origin tags upward, forcing a heap spill in the SmallVec‐based Origins.
-        // All six heads are removed from outstanding_heads in a single step when node 1‥6 first become common, stressing the “check-list” logic.
+    async fn multiple_roots() {
+        //   1   2   3   4   5   6  ← six independent roots
+        //   ↓   ↓   ↓   ↓   ↓   ↓
+        //   ╰───────────────────╯
+        //           ↓
+        //           7
+        //           ↓
+        //           8
+        //
+        // This test is supposed to stress two aspects of the design:
+        // 1. The merge node 7 carries six origin tags upward, forcing a heap spill in the SmallVec‐based Origins
+        // 2. All six heads are removed from outstanding_heads in a single step when they become common
+        // TODO: validate this empirically
         let mut store = MockEventStore::new();
 
         // six independent roots
@@ -621,11 +659,10 @@ mod tests {
         let subject = TestClock { members: vec![8] };
         let big_other = TestClock { members: vec![1, 2, 3, 4, 5, 6] };
 
-        // 8 shares ancestor 7 with every head in big_other, but does not contain them.
+        // 8 descends from all heads in big_other via 7
         assert_eq!(compare(&store, &subject, &big_other, 1_000).await.unwrap(), Ordering::Descends);
 
-        // In the opposite direction, big_other partially descends from subject’s history
-        // because one of its heads (1) is on the path to 8, while the others are not.
+        // In the opposite direction, none of the heads descend from 8, but they are comparable
         assert_eq!(compare(&store, &big_other, &subject, 1_000).await.unwrap(), Ordering::NotDescends { meet: vec![1, 2, 3, 4, 5, 6] });
     }
 }
