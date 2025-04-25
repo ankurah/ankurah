@@ -103,6 +103,7 @@ where
     C: TClock<Id = G::Id>,
     G::Id: std::hash::Hash + Ord,
 {
+    println!("[DEBUG] comparing {:?} and {:?}", subject.members(), other.members());
     // REQUIREMENTS:
     // 0. Keep it simple as possible. We want to make this code elegant, efficient, correct, and easy to understand.
     // 1. Do not implement any visit tracking for the purposes of detecting cycles. The actual use case for this involves content-based ids, which cannot be cyclical.
@@ -225,7 +226,6 @@ where
             let id = event.payload.id();
             let parents = event.payload.parent().members().to_vec();
             /* ── get (or insert) entries in the two maps ───────────────────── */
-            let seen_entry = self.seen.entry(id.clone()).or_insert((false, false));
 
             let origins_entry = self.origins.entry(id.clone()).or_insert(Origins::<G::Id>::new());
 
@@ -233,13 +233,17 @@ where
             let from_subject = self.subject_frontier.remove(&id);
             let from_other = self.other_frontier.remove(&id);
 
-            if from_subject {
-                seen_entry.0 = true;
-            }
-            if from_other {
-                seen_entry.1 = true;
-            }
+            let seen_entry = {
+                let seen_entry = self.seen.entry(id.clone()).or_insert((false, false));
 
+                if from_subject {
+                    seen_entry.0 = true;
+                }
+                if from_other {
+                    seen_entry.1 = true;
+                }
+                seen_entry.clone()
+            };
             /* ── add the head itself to the origin list if this is an “other” head ─ */
             if from_other && self.original_other_events.contains(&id) {
                 if !origins_entry.contains(&id) {
@@ -255,12 +259,26 @@ where
             if from_other {
                 for p in parents.iter() {
                     let parent_orig = self.origins.entry(p.clone()).or_insert(Origins::<G::Id>::new());
-
+                    // let mut added = false;
                     for h in tag_slice.iter() {
                         if !parent_orig.contains(h) {
                             parent_orig.push(h.clone());
+                            if parent_orig.len() == 5 {
+                                // 5 == inline-cap (4) + 1 → heap spill
+                                eprintln!("[DEBUG] node {:?} spilled Origins; len = {} (heads: {:?})", p, parent_orig.len(), parent_orig);
+                            }
+                            // added = true;
+                            // /* NEW: head `h` just reached a *common* node ⇒ checklist satisfied */
+                            // if matches!(self.seen.get(&p), Some((true, true))) {
+                            //     self.outstanding_heads.remove(h);
+                            // }
                         }
                     }
+
+                    // // This doesn’t “fudge” the search—BFS simply revisits the node from the side that gained new information, a standard incremental-fixpoint trick.
+                    // if added && !self.other_frontier.contains(p) {
+                    //     self.other_frontier.insert(p.clone());
+                    // }
                 }
             }
 
@@ -279,6 +297,12 @@ where
 
             /* ── did this node just become common? ─────────────────────────── */
             if seen_entry.0 && seen_entry.1 && self.meet_candidates.insert(id.clone()) {
+                eprintln!(
+                    "[DEBUG] COMMON node {:?}: origins = {:?}; outstanding_heads left = {}",
+                    id,
+                    tag_slice,
+                    self.outstanding_heads.len()
+                );
                 self.any_common = true;
 
                 // remove satisfied heads from the checklist
@@ -404,8 +428,6 @@ mod tests {
 
         // descendant descends from ancestor
         assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap(), Ordering::Descends);
-
-        println!("\n\n\n");
 
         // ancestor does not descend from descendant, but they both have a common ancestor: [1]
         assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), Ordering::NotDescends { meet: vec![1] });
@@ -582,5 +604,48 @@ mod tests {
 
         // A clock does NOT descend itself
         assert_eq!(compare(&store, &clock, &clock, 100).await.unwrap(), Ordering::Equal);
+    }
+    ///
+    // DAG structure
+    //
+    //   1   2   3   4   5   6       ← six independent heads (other-clock)
+    //   │   │   │   │   │   │
+    //   ╰─┬─┴─┬─┴─┬─┴─┬─┴─┬─╯
+    //     │   │   │   │   │
+    //     7 (fan-in node)
+    //     │
+    //     8       ← subject head (descends only from 1)
+    //
+    //  meet({8},{2-6})  = [1]
+    //  direction 8→{2-6}:  NotDescends
+    //  direction {2-6}→8:  PartiallyDescends
+    ///
+    #[tokio::test]
+    async fn test_many_heads_meet_at_merge() {
+        // Why this stresses the design
+        // The merge node 7 carries six origin tags upward, forcing a heap spill in the SmallVec‐based Origins.
+        // All six heads are removed from outstanding_heads in a single step when node 1‥6 first become common, stressing the “check-list” logic.
+        let mut store = MockEventStore::new();
+
+        // six independent roots
+        for id in 1..=6 {
+            store.add(id, &[]);
+        }
+
+        // merge-point 7 references all six heads
+        store.add(7, &[1, 2, 3, 4, 5, 6]);
+
+        // subject head 8 descends only from 7
+        store.add(8, &[7]);
+
+        let subject = TestClock { members: vec![8] };
+        let big_other = TestClock { members: vec![1, 2, 3, 4, 5, 6] };
+
+        // 8 shares ancestor 7 with every head in big_other, but does not contain them.
+        assert_eq!(compare(&store, &subject, &big_other, 1_000).await.unwrap(), Ordering::Descends);
+
+        // In the opposite direction, big_other partially descends from subject’s history
+        // because one of its heads (1) is on the path to 8, while the others are not.
+        assert_eq!(compare(&store, &big_other, &subject, 1_000).await.unwrap(), Ordering::NotDescends { meet: vec![1, 2, 3, 4, 5, 6] });
     }
 }
