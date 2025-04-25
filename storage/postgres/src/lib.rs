@@ -463,6 +463,10 @@ impl StorageCollection for PostgresBucket {
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let query = format!(
             r#"SELECT "id", "entity_id", "operations", "parent", "attestations" FROM "{0}" WHERE "id" = ANY($1)"#,
             self.event_table(),

@@ -17,15 +17,14 @@ pub trait TClock {
     fn members(&self) -> &[Self::Id];
 }
 
-#[async_trait]
 pub trait GetEvents {
-    type Id: Eq + PartialEq + Clone + std::fmt::Debug;
+    type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
     type Event: TEvent<Id = Self::Id>;
     type Error;
 
     /// Estimate the budget cost for retrieving a batch of events
     /// This allows different implementations to model their cost structure
-    fn estimate_cost(&self, _batch: &[Self::Id]) -> usize {
+    fn estimate_cost(&self, batch_size: usize) -> usize {
         // Default implementation: fixed cost of 1 per batch
         1
     }
@@ -47,7 +46,6 @@ impl TEvent for ankurah_proto::Event {
     fn parent(&self) -> &Clock { &self.parent }
 }
 
-#[async_trait]
 impl<T: StorageCollection> GetEvents for T {
     type Id = EventId;
     type Event = ankurah_proto::Event;
@@ -55,8 +53,7 @@ impl<T: StorageCollection> GetEvents for T {
 
     async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), Self::Error> {
         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
-        let events = self.get_events(event_ids).await?;
-        Ok((1, events))
+        Ok((1, self.get_events(event_ids).await?))
     }
 }
 
@@ -83,8 +80,8 @@ pub enum Ordering<Id> {
     PartiallyDescends {
         /// The closest common full(identical) ancestor event ids
         common_ancestors: Vec<Id>,
-        /// The immediate descendents of the common ancestor that are in b's history but not in a's history
-        concurrent_events: Vec<Id>,
+        // The immediate descendents of the common ancestor that are in b's history but not in a's history
+        // concurrent_events: Vec<Id>,
     },
 
     /// Recursion budget was exceeded before a determination could be made
@@ -142,14 +139,26 @@ where
     C: TClock<Id = G::Id>,
     G::Id: std::hash::Hash + Ord + std::fmt::Debug,
 {
+    /// The event provider for retrieving event data during traversal
     getter: &'a G,
-    subject_working_set: BTreeSet<C::Id>,
-    other_working_set: BTreeSet<C::Id>,
-    lookup_queue: Vec<C::Id>,
+
+    /// Current subject events frontier that changes as we traverse to parents
+    subject_frontier: BTreeSet<C::Id>,
+
+    /// Current other events frontier that changes as we traverse to parents
+    other_frontier: BTreeSet<C::Id>,
+
+    /// Remaining budget for event lookups before we stop traversal
     remaining_budget: usize,
-    common_ancestors: BTreeSet<C::Id>,
-    common_temp: Vec<C::Id>,         // Reusable Vec to avoid allocations
-    original_other: BTreeSet<C::Id>, // Track original elements of other to determine descendency
+
+    /// Original "other" clock events, preserved to determine descendency
+    original_other_events: BTreeSet<C::Id>,
+
+    /// All events in other's causal set, including discovered ancestors
+    other_set: BTreeSet<C::Id>,
+
+    /// All events in subject's causal set, including discovered ancestors
+    subject_set: BTreeSet<C::Id>,
 }
 
 impl<'a, G, C> Comparison<'a, G, C>
@@ -161,121 +170,85 @@ where
 {
     pub fn new(getter: &'a G, subject: &C, other: &C, budget: usize) -> Self {
         println!("Creating comparison with subject: {:?}, other: {:?}", subject.members(), other.members());
-        let subject_working_set = subject.members().iter().cloned().collect();
-        let other_working_set = other.members().iter().cloned().collect();
-        let original_other: BTreeSet<C::Id> = other.members().iter().cloned().collect();
+        // Initialize working sets with the initial events
+        let subject_frontier = subject.members().iter().cloned().collect();
+        let other_frontier = other.members().iter().cloned().collect();
+        let original_other_events: BTreeSet<C::Id> = other.members().iter().cloned().collect();
 
-        let mut me = Self {
-            getter,
-            subject_working_set,
-            other_working_set,
-            lookup_queue: Vec::new(),
-            common_ancestors: BTreeSet::new(),
-            remaining_budget: budget,
-            common_temp: Vec::new(),
-            original_other,
-        };
+        // Initialize causal sets with initial events
+        let other_set: BTreeSet<C::Id> = other.members().iter().cloned().collect();
+        let subject_set: BTreeSet<C::Id> = subject.members().iter().cloned().collect();
 
-        me.process_frontier();
-        println!(
-            "After process_frontier - subject_ws: {:?}, other_ws: {:?}, common_ancestors: {:?}",
-            me.subject_working_set, me.other_working_set, me.common_ancestors
-        );
-
-        me
-    }
-
-    fn process_frontier(&mut self) {
-        // Fill with intersection elements
-        self.common_temp.extend(self.subject_working_set.intersection(&self.other_working_set).cloned());
-
-        // Process common elements and drain the Vec in one operation
-        for id in self.common_temp.drain(..) {
-            // remove from working sets
-            self.subject_working_set.remove(&id);
-            self.other_working_set.remove(&id);
-
-            // Add to common_ancestors
-            self.common_ancestors.insert(id);
-        }
-
-        // Populate lookup queue
-        self.lookup_queue.extend(self.subject_working_set.iter().cloned());
-        self.lookup_queue.extend(self.other_working_set.iter().cloned());
+        Self { getter, subject_frontier, other_frontier, remaining_budget: budget, original_other_events, other_set, subject_set }
     }
 
     // runs one step of the comparison, returning Some(ordering) if a conclusive determination can be made, or None if it needs more steps
     pub async fn step(&mut self) -> Result<Option<Ordering<G::Id>>, G::Error> {
-        println!(
-            "Step called - subject_ws: {:?}, other_ws: {:?}, common_ancestors: {:?}",
-            self.subject_working_set, self.other_working_set, self.common_ancestors
-        );
+        println!("Step called - subject_ws: {:?}, other_ws: {:?}", self.subject_frontier, self.other_frontier);
 
-        if self.remaining_budget == 0 {
-            return Ok(Some(Ordering::BudgetExceeded {}));
+        // Create an iterator over both frontiers
+        let ids: Vec<G::Id> = self.subject_frontier.union(&self.other_frontier).cloned().collect();
+        let (cost, events) = self.getter.get_events(ids).await?;
+        self.remaining_budget = self.remaining_budget.saturating_sub(cost);
+
+        self.process_events(&events);
+        if let Some(ordering) = self.check_result() {
+            return Ok(Some(ordering));
         }
 
-        // Both working sets empty but subject doesn't descend from other
-        if self.lookup_queue.is_empty() {
-            println!("lookup_queue empty - common_ancestors: {:?}", self.common_ancestors);
-
-            // Even if both sets are empty, we need to check if we found any common ancestors during traversal
-            if !self.common_ancestors.is_empty() {
-                println!("Found common ancestors: {:?}", self.common_ancestors);
-                // They have common ancestors but not full descendency
-                return Ok(Some(Ordering::NotDescends { common_ancestors: self.common_ancestors.iter().cloned().collect() }));
-            } else {
-                println!("No common ancestors found");
-                // No common ancestors found after traversal, they're incomparable
-                return Ok(Some(Ordering::Incomparable));
-            }
-        }
-
-        let estimate = self.getter.estimate_cost(&self.lookup_queue);
-        if estimate > self.remaining_budget {
-            return Ok(Some(Ordering::BudgetExceeded {}));
-        }
-
-        println!("Getting events: {:?}", self.lookup_queue);
-        let (cost, events) = self.getter.get_events(self.lookup_queue.drain(..).collect()).await?;
-        let events = events.iter().map(|e| (e.payload.id(), e.payload.parent().members())).collect::<Vec<_>>();
-        println!("Got events: {:?}", events.iter().map(|e| &e.0).collect::<Vec<_>>());
-        let _ = self.remaining_budget.saturating_sub(cost);
-
-        Self::regress(&mut self.subject_working_set, &events, "subject");
-
-        println!("\t descends check {:?} == {:?}", self.subject_working_set, self.original_other);
-        // Check for descendency - subject working set equals original other
-        if self.subject_working_set == self.original_other {
-            println!("Found subject descends from other");
-            return Ok(Some(Ordering::Descends));
-        }
-
-        Self::regress(&mut self.other_working_set, &events, "other");
-
-        self.process_frontier();
-        println!(
-            "After process_frontier - subject_ws: {:?}, other_ws: {:?}, common_ancestors: {:?}",
-            self.subject_working_set, self.other_working_set, self.common_ancestors
-        );
-
-        // Continue the process
         Ok(None)
     }
 
-    #[inline(always)]
-    fn regress(working_set: &mut BTreeSet<C::Id>, events: &[(G::Id, &[G::Id])], label: &'static str) {
-        println!("regressing {} working set: {:?}", label, working_set);
-        for (event_id, parent_ids) in events {
-            // replace the ids in the working sets with their parent ids - stopping at the root
-            if working_set.remove(event_id) {
-                for parent_id in parent_ids.iter() {
-                    working_set.insert(parent_id.clone());
-                }
+    // Process events in a single pass - update causal sets and regress frontiers
+    fn process_events(&mut self, events: &[Attested<G::Event>]) {
+        for event in events {
+            let event_id = event.payload.id();
+            let parent_ids = event.payload.parent().members();
+
+            // Handle subject-side processing
+            if self.subject_frontier.remove(&event_id) {
+                // Add parent events to frontier and the set
+                self.subject_frontier.extend(parent_ids.iter().cloned());
+                self.subject_set.extend(parent_ids.iter().cloned());
+            }
+
+            // Handle other-side processing
+            if self.other_frontier.remove(&event_id) {
+                // Add parent events to frontier and the set
+                self.other_frontier.extend(parent_ids.iter().cloned());
+                self.other_set.extend(parent_ids.iter().cloned());
             }
         }
 
-        println!("\t after regress {:?}", working_set);
+        println!("After regression - subject frontier: {:?}, other frontier: {:?}", self.subject_frontier, self.other_frontier);
+    }
+
+    // Check if we can make a conclusive ordering determination
+    fn check_result(&self) -> Option<Ordering<G::Id>> {
+        // Descends can be determined at any time - it's our happy path
+        if self.original_other_events.is_subset(&self.subject_set) {
+            println!("Subject descends from all elements in other");
+            return Some(Ordering::Descends);
+        }
+
+        // All other orderings require complete exploration
+        if self.subject_frontier.is_empty() && self.other_frontier.is_empty() {
+            // Both frontiers are exhausted - time to pick a consolation prize
+
+            let common_ancestors: Vec<G::Id> = self.subject_set.intersection(&self.other_set).cloned().collect();
+            if common_ancestors.len() > 0 {
+                if self.original_other_events.intersection(&self.subject_set).count() > 0 {
+                    Some(Ordering::PartiallyDescends { common_ancestors })
+                } else {
+                    Some(Ordering::NotDescends { common_ancestors })
+                }
+            } else {
+                Some(Ordering::Incomparable)
+            }
+        } else {
+            // Keep exploring
+            None
+        }
     }
 }
 
@@ -329,7 +302,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl GetEvents for MockEventStore {
         type Id = TestId;
         type Event = TestEvent;
@@ -424,7 +396,7 @@ mod tests {
                 // concurrent_events 2 is fairly conclusively correct
                 // It's a little less clear whether common_ancestor should be 1, or 1,3, because 3 is not an "ancestor" of 2,3 per se
                 // but this would be consistent with the internal concurrency ancestor test above. maybe `common` is a better term
-                Ordering::PartiallyDescends { common_ancestors: vec![1], concurrent_events: vec![2] }
+                Ordering::PartiallyDescends { common_ancestors: vec![1] /* , concurrent_events: vec![2] */ }
             );
         }
     }
