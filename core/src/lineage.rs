@@ -234,7 +234,6 @@ where
         // All other orderings require complete exploration
         if self.subject_frontier.is_empty() && self.other_frontier.is_empty() {
             // Both frontiers are exhausted - time to pick a consolation prize
-
             let common_ancestors: Vec<G::Id> = self.subject_set.intersection(&self.other_set).cloned().collect();
             if common_ancestors.len() > 0 {
                 if self.original_other_events.intersection(&self.subject_set).count() > 0 {
@@ -245,6 +244,10 @@ where
             } else {
                 Some(Ordering::Incomparable)
             }
+        } else if self.remaining_budget == 0 {
+            // We need more exploration but are out of budget
+            println!("Budget exceeded");
+            Some(Ordering::BudgetExceeded {})
         } else {
             // Keep exploring
             None
@@ -255,7 +258,6 @@ where
 #[cfg(test)]
 mod tests {
     use ankurah_proto::AttestationSet;
-    use async_trait::async_trait;
 
     use super::*;
     use std::collections::HashMap;
