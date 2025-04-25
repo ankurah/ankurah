@@ -1,5 +1,6 @@
 use crate::{error::RetrievalError, storage::StorageCollection};
 use ankurah_proto::{Attested, Clock, EventId};
+use async_trait::async_trait;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap};
 
@@ -17,7 +18,8 @@ pub trait TClock {
     fn members(&self) -> &[Self::Id];
 }
 
-pub(crate) trait GetEvents {
+#[async_trait]
+pub trait GetEvents {
     type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
     type Event: TEvent<Id = Self::Id>;
     type Error;
@@ -46,6 +48,7 @@ impl TEvent for ankurah_proto::Event {
     fn parent(&self) -> &Clock { &self.parent }
 }
 
+#[async_trait]
 impl<T: StorageCollection> GetEvents for T {
     type Id = EventId;
     type Event = ankurah_proto::Event;
@@ -96,7 +99,7 @@ pub enum Ordering<Id> {
 ///
 /// This function determines whether the subject clock descends from, shares ancestry with,
 /// or is incomparable to the comparison clock by traversing the event history.
-pub(crate) async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, G::Error>
+pub async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, G::Error>
 where
     G: GetEvents,
     G::Event: TEvent<Id = G::Id>,
@@ -104,17 +107,6 @@ where
     G::Id: std::hash::Hash + Ord,
 {
     println!("[DEBUG] comparing {:?} and {:?}", subject.members(), other.members());
-    // REQUIREMENTS:
-    // 0. Keep it simple as possible. We want to make this code elegant, efficient, correct, and easy to understand.
-    // 1. Do not implement any visit tracking for the purposes of detecting cycles. The actual use case for this involves content-based ids, which cannot be cyclical.
-    // For the test case, the budget mechanism can be a sufficient backstop against infinite loops.
-    // 2. Travel light. Try to process things on a streaming basis as much as possible.
-    // Event histories will tend to be fairly linear, but with occasional concurrencies which may remain concurrent for several generations.
-    // 3. When you detect that any of the events in the comparison have no common history, you can return Incomparable immediately.
-    // 4. when the budget is exceeded, return BudgetExceeded, even if we've found a partial answer. We need to give the Correct answer or nothing (BudgetExceeded).
-    // 5. Equality is not descendency
-    // 6. Early return whenever a conclusive determination can be made.
-    // 7. Stretch goal: when the budget is exceeded, think about what we might be able to include in the BudgetExceeded result to help the caller resume the comparison later if they choose to. Can that be feed into subject and comparison clocks?
 
     // bail out right away for the obvious cases
     if subject.members().is_empty() || other.members().is_empty() {
@@ -248,12 +240,12 @@ where
             if from_other && self.original_other_events.contains(&id) {
                 if !origins_entry.contains(&id) {
                     origins_entry.push(id.clone());
+                    println!("origins_entry: {:?}", origins_entry);
                 }
             }
 
             /* grab the tag slice and drop the mutable borrow before looping parents */
             let tag_slice = origins_entry.clone();
-            drop(origins_entry); // release borrow of self.origins[id]
 
             /* ── propagate origin tags *only* when the visit was via OTHER side ─── */
             if from_other {
@@ -263,22 +255,9 @@ where
                     for h in tag_slice.iter() {
                         if !parent_orig.contains(h) {
                             parent_orig.push(h.clone());
-                            if parent_orig.len() == 5 {
-                                // 5 == inline-cap (4) + 1 → heap spill
-                                eprintln!("[DEBUG] node {:?} spilled Origins; len = {} (heads: {:?})", p, parent_orig.len(), parent_orig);
-                            }
-                            // added = true;
-                            // /* NEW: head `h` just reached a *common* node ⇒ checklist satisfied */
-                            // if matches!(self.seen.get(&p), Some((true, true))) {
-                            //     self.outstanding_heads.remove(h);
-                            // }
+                            println!("parent_orig: {:?}", parent_orig);
                         }
                     }
-
-                    // // This doesn’t “fudge” the search—BFS simply revisits the node from the side that gained new information, a standard incremental-fixpoint trick.
-                    // if added && !self.other_frontier.contains(p) {
-                    //     self.other_frontier.insert(p.clone());
-                    // }
                 }
             }
 
@@ -398,6 +377,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl GetEvents for MockEventStore {
         type Id = TestId;
         type Event = TestEvent;
