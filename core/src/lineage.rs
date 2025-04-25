@@ -1,5 +1,6 @@
 use crate::{error::RetrievalError, storage::StorageCollection};
 use ankurah_proto::{Attested, Clock, EventId};
+use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap};
 
 /// a trait for events and eventlike things that can be descended
@@ -132,6 +133,8 @@ where
     }
 }
 
+type Origins<Id> = SmallVec<[Id; 8]>;
+
 pub(crate) struct Comparison<'a, G>
 where
     G: GetEvents + 'a,
@@ -140,22 +143,26 @@ where
 {
     /* external inputs */
     getter: &'a G,
-    original_other_events: BTreeSet<G::Id>,
+    original_other_events: BTreeSet<G::Id>, // immutable snapshot
+
+    /* mutable checklist: heads still looking for a common ancestor */
+    outstanding_heads: BTreeSet<G::Id>,
+
     remaining_budget: usize,
 
-    /* frontiers */
+    /* search frontiers */
     subject_frontier: BTreeSet<G::Id>,
     other_frontier: BTreeSet<G::Id>,
 
-    /* per-node state */
-    seen: HashMap<G::Id, (bool /*subject*/, bool /*other*/)>,
-    parent_map: HashMap<G::Id, Vec<G::Id>>, // ← simple, readable
+    /* per-node bookkeeping: (seen_from_subject, seen_from_other, origin heads) */
+    seen: HashMap<G::Id, (bool, bool)>,
+    origins: HashMap<G::Id, Origins<G::Id>>,
 
-    /* GLB construction */
+    /* incremental meet construction */
     meet_candidates: BTreeSet<G::Id>,
     common_child_cnt: HashMap<G::Id, usize>,
 
-    /* decision flags */
+    /* enum-decision flags */
     unseen_other_heads: usize,
     head_overlap: bool,
     any_common: bool,
@@ -171,16 +178,16 @@ where
         // println!("Creating comparison with subject: {:?}, other: {:?}", subject.members(), other.members());
         // Initialize working sets with the initial events
         let subject_frontier: BTreeSet<_> = subject.members().iter().cloned().collect();
-        let other_frontier: BTreeSet<_> = other.members().iter().cloned().collect();
-        let original_other_events = other_frontier.clone();
+        let other: BTreeSet<_> = other.members().iter().cloned().collect();
+        let original_other_events = other.clone();
 
         Self {
             getter,
 
-            unseen_other_heads: other_frontier.len(),
+            unseen_other_heads: other.len(),
 
             subject_frontier,
-            other_frontier,
+            other_frontier: other.clone(),
             remaining_budget: budget,
             original_other_events,
 
@@ -188,7 +195,8 @@ where
             any_common: false,
 
             seen: HashMap::new(),
-            parent_map: HashMap::new(),
+            origins: HashMap::new(),
+            outstanding_heads: other,
             meet_candidates: BTreeSet::new(),
             common_child_cnt: HashMap::new(),
         }
@@ -216,23 +224,47 @@ where
         for event in events {
             let id = event.payload.id();
             let parents = event.payload.parent().members().to_vec();
+            /* ── get (or insert) entries in the two maps ───────────────────── */
+            let seen_entry = self.seen.entry(id.clone()).or_insert((false, false));
 
-            /* cache parents so we can DFS later without I/O */
-            self.parent_map.insert(id.clone(), parents.clone());
+            let origins_entry = self.origins.entry(id.clone()).or_insert(Origins::<G::Id>::new());
 
-            let entry = self.seen.entry(id.clone()).or_insert((false, false));
-
+            /* ── mark which side(s) we came from ───────────────────────────── */
             let from_subject = self.subject_frontier.remove(&id);
             let from_other = self.other_frontier.remove(&id);
 
             if from_subject {
-                entry.0 = true;
+                seen_entry.0 = true;
             }
             if from_other {
-                entry.1 = true;
+                seen_entry.1 = true;
             }
 
-            /* extend the frontier(s) we came from */
+            /* ── add the head itself to the origin list if this is an “other” head ─ */
+            if from_other && self.original_other_events.contains(&id) {
+                if !origins_entry.contains(&id) {
+                    origins_entry.push(id.clone());
+                }
+            }
+
+            /* grab the tag slice and drop the mutable borrow before looping parents */
+            let tag_slice = origins_entry.clone();
+            drop(origins_entry); // release borrow of self.origins[id]
+
+            /* ── propagate origin tags *only* when the visit was via OTHER side ─── */
+            if from_other {
+                for p in parents.iter() {
+                    let parent_orig = self.origins.entry(p.clone()).or_insert(Origins::<G::Id>::new());
+
+                    for h in tag_slice.iter() {
+                        if !parent_orig.contains(h) {
+                            parent_orig.push(h.clone());
+                        }
+                    }
+                }
+            }
+
+            /* ── extend the frontier(s) we came from ───────────────────────── */
             if from_subject {
                 self.subject_frontier.extend(parents.iter().cloned());
 
@@ -245,9 +277,15 @@ where
                 self.other_frontier.extend(parents.iter().cloned());
             }
 
-            /* brand-new common node? */
-            if entry.0 && entry.1 && self.meet_candidates.insert(id.clone()) {
+            /* ── did this node just become common? ─────────────────────────── */
+            if seen_entry.0 && seen_entry.1 && self.meet_candidates.insert(id.clone()) {
                 self.any_common = true;
+
+                // remove satisfied heads from the checklist
+                for h in tag_slice.iter() {
+                    self.outstanding_heads.remove(h);
+                }
+
                 for p in parents {
                     *self.common_child_cnt.entry(p.clone()).or_default() += 1;
                 }
@@ -255,32 +293,25 @@ where
         }
     }
 
-    /* ------------------------------------------------------------ */
+    /*───────────────────────────────────────────────────────────────*/
+    /* 2.  decide once queues drain (unchanged from earlier)         */
+    /*───────────────────────────────────────────────────────────────*/
     fn check_result(&mut self) -> Option<Ordering<G::Id>> {
-        /* 1️⃣  full-descent shortcut */
         if self.unseen_other_heads == 0 {
             return Some(Ordering::Descends);
         }
 
-        /* 2️⃣  are both frontiers empty? */
         if self.subject_frontier.is_empty() && self.other_frontier.is_empty() {
-            /* prune to minimal common ancestors */
+            // prune to minimal common ancestors
             let meet: Vec<_> =
                 self.meet_candidates.iter().filter(|id| self.common_child_cnt.get(*id).copied().unwrap_or(0) == 0).cloned().collect();
 
-            /* no common ancestors at all */
             if !self.any_common {
                 return Some(Ordering::Incomparable);
             }
-
-            /* 3️⃣  isolate heads that never found *any* common ancestor */
-            let unmatched_heads = self.original_other_events.iter().filter(|h| !self.head_has_common(*h)).count();
-
-            if unmatched_heads > 0 {
-                return Some(Ordering::Incomparable);
+            if !self.outstanding_heads.is_empty() {
+                return Some(Ordering::Incomparable); // ≥ 1 head stayed isolated
             }
-
-            /* 4️⃣  decide between NotDescends vs PartiallyDescends */
             if self.head_overlap {
                 Some(Ordering::PartiallyDescends { meet })
             } else {
@@ -291,25 +322,6 @@ where
         } else {
             None
         }
-    }
-
-    /* DFS from a single other-head through cached parents */
-    fn head_has_common(&self, head: &G::Id) -> bool {
-        let mut stack = vec![head.clone()];
-        let mut visited = BTreeSet::new();
-
-        while let Some(id) = stack.pop() {
-            if !visited.insert(id.clone()) {
-                continue;
-            }
-            if matches!(self.seen.get(&id), Some((true, true))) {
-                return true; // reached a common node
-            }
-            if let Some(parents) = self.parent_map.get(&id) {
-                stack.extend(parents.iter().cloned());
-            }
-        }
-        false // walked to the root without hitting common ancestry
     }
 }
 
@@ -449,7 +461,6 @@ mod tests {
             let a = TestClock { members: vec![6] };
             let b = TestClock { members: vec![2, 3] };
             assert_eq!(
-                // This is line 425 - the assertions above are passing
                 compare(&store, &a, &b, 100).await.unwrap(),
                 // concurrent_events 2 is fairly conclusively correct
                 // It's a little less clear whether common_ancestor should be 1, or 1,3, because 3 is not an "ancestor" of 2,3 per se
@@ -496,7 +507,7 @@ mod tests {
             let a = TestClock { members: vec![3] };
             let b = TestClock { members: vec![5, 8] };
             assert_eq!(compare(&store, &a, &b, 100).await.unwrap(), Ordering::Incomparable);
-            // This is line 471 - the assertions above are passing
+            // line 509 - the assertions above are passing
         }
     }
 
