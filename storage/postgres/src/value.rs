@@ -4,7 +4,6 @@ use ankurah_core::property::PropertyValue;
 
 #[derive(Debug)]
 pub enum PGValue {
-    // Boolean(bool),
     Bytea(Vec<u8>),
     CharacterVarying(String),
     SmallInt(i16),
@@ -12,7 +11,7 @@ pub enum PGValue {
     BigInt(i64),
     Boolean(bool),
     // Text(String),
-    // Timestamp(chrono::DateTime<chrono::Utc>),
+    Timestamp(chrono::DateTime<chrono::Utc>),
 }
 
 impl PGValue {
@@ -24,6 +23,7 @@ impl PGValue {
             PGValue::BigInt(_) => "int8",
             PGValue::Bytea(_) => "bytea",
             PGValue::Boolean(_) => "boolean",
+            PGValue::Timestamp(_) => "timestamp(0)",
         }
     }
 }
@@ -38,6 +38,7 @@ impl From<PropertyValue> for PGValue {
             PropertyValue::Bool(bool) => PGValue::Boolean(bool),
             PropertyValue::Object(items) => PGValue::Bytea(items),
             PropertyValue::Binary(items) => PGValue::Bytea(items),
+            PropertyValue::DateTime(date_time) => todo!(),
         }
     }
 }

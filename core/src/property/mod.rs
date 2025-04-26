@@ -6,6 +6,7 @@ use std::fmt::Display;
 
 use ankurah_proto::ID;
 pub use backend::Backends;
+use chrono::{DateTime, Utc};
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
 pub use value::YrsString;
 
@@ -24,6 +25,7 @@ pub enum PropertyValue {
     String(String),
     Object(Vec<u8>),
     Binary(Vec<u8>),
+    DateTime(DateTime<Utc>),
 }
 
 impl Display for PropertyValue {
@@ -36,6 +38,7 @@ impl Display for PropertyValue {
             PropertyValue::String(string) => write!(f, "{:?}", string),
             PropertyValue::Object(object) => write!(f, "{:?}", object),
             PropertyValue::Binary(binary) => write!(f, "{:?}", binary),
+            PropertyValue::DateTime(date_time) =>write!(f, "{:?}", date_time),
         }
     }
 }
@@ -83,6 +86,7 @@ into!(i16 => I16);
 into!(i32 => I32);
 into!(i64 => I64);
 into!(bool => Bool);
+into!(DateTime<Utc> => DateTime);
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
     fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_string()))) }

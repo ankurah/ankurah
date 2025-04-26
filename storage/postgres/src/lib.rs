@@ -239,6 +239,7 @@ impl StorageCollection for PostgresBucket {
                     PGValue::BigInt(number) => params.push(number),
                     PGValue::Bytea(bytes) => params.push(bytes),
                     PGValue::Boolean(bool) => params.push(bool),
+                    PGValue::Timestamp(date_time) => params.push(date_time),
                 },
                 None => params.push(&UntypedNull),
             }
