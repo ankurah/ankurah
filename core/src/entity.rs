@@ -144,6 +144,7 @@ impl Filterable for Entity {
                     PropertyValue::Bool(i) => Some(i.to_string()),
                     PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
                     PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::DateTime(date_time) => Some(date_time.format("%Y-%m-%dT%H:%M:%S%.f%z").to_string()),
                 },
                 None => None,
             })
@@ -183,6 +184,7 @@ impl Filterable for TemporaryEntity {
                     PropertyValue::Bool(i) => Some(i.to_string()),
                     PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
                     PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::DateTime(date_time) => Some(date_time.format("%Y-%m-%dT%H:%M:%S%.f%z").to_string()),
                 },
                 None => None,
             })
