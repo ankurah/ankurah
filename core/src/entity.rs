@@ -168,30 +168,41 @@ impl Entity {
         let head = self.head();
         let new_head = state.head.clone();
 
+        tracing::info!("Entity {} apply_state - current head: {}, new head: {}", self.id, head, new_head);
+
         match crate::lineage::compare(collection, &head, &new_head, 100).await? {
             lineage::Ordering::Equal => {
-                debug!("Equal - skip");
+                tracing::info!("Entity {} apply_state - heads are equal, skipping", self.id);
                 return Ok(false);
             }
             lineage::Ordering::Descends => {
+                tracing::info!("Entity {} apply_state - new head descends from current, applying", self.id);
                 self.backends.apply_state(&state)?;
                 *self.head.lock().unwrap() = new_head;
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                debug!("NotDescends - skip {self} meet: {meet:?}");
+                tracing::info!("Entity {} apply_state - new head does not descend, meet: {:?}", self.id, meet);
                 return Ok(false);
             }
             lineage::Ordering::Incomparable => {
+                tracing::info!("Entity {} apply_state - heads are incomparable", self.id);
                 // total apples and oranges - take a hike buddy
                 Err(LineageError::Incomparable.into())
             }
             lineage::Ordering::PartiallyDescends { meet } => {
+                tracing::info!("Entity {} apply_state - heads partially descend, meet: {:?}", self.id, meet);
                 // TODO - figure out how to handle this. I don't think we need to materialize a new event
                 // but it requires that we update the propertybackends to support this
                 Err(LineageError::PartiallyDescends { meet }.into())
             }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                tracing::info!(
+                    "Entity {} apply_state - budget exceeded. subject: {:?}, other: {:?}",
+                    self.id,
+                    subject_frontier,
+                    other_frontier
+                );
                 Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
             }
         }
@@ -323,14 +334,14 @@ impl WeakEntitySet {
         id: EntityId,
         collection_id: CollectionId,
         state: State,
-    ) -> Result<Entity, RetrievalError> {
+    ) -> Result<(Option<bool>, Entity), RetrievalError> {
         let entity = {
             let mut entities = self.0.write().unwrap();
             match entities.entry(id) {
                 Entry::Vacant(_) => {
                     let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                     entities.insert(id, entity.weak());
-                    entity
+                    return Ok((None, entity));
                 }
                 Entry::Occupied(o) => match o.get().upgrade() {
                     Some(entity) => {
@@ -343,15 +354,14 @@ impl WeakEntitySet {
                         let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                         entities.insert(id, entity.weak());
                         // just created the entity with the state, so we do not need to apply the state
-                        return Ok(entity);
+                        return Ok((None, entity));
                     }
                 },
             }
         };
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        entity.apply_state(collection, &state).await?;
-
-        Ok(entity)
+        let changed = entity.apply_state(collection, &state).await?;
+        Ok((Some(changed), entity))
     }
 }

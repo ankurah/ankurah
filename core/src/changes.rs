@@ -1,10 +1,31 @@
-use crate::{entity::Entity, model::View, resultset::ResultSet};
+use crate::{entity::Entity, error::MutationError, model::View, resultset::ResultSet};
 use ankurah_proto::{Attested, Event};
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
-    pub entity: Entity,
-    pub events: Vec<Attested<Event>>,
+    entity: Entity,
+    events: Vec<Attested<Event>>,
+}
+
+// TODO consider a flattened version of EntityChange that includes the entity and Vec<(operations, parent, attestations)> rather than a Vec<Attested<Event>>
+impl EntityChange {
+    pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationError> {
+        // validate that all events have the same entity id as the entity
+        // and that the event ids are present in the entity's head clock
+        for event in &events {
+            let head = entity.head();
+            if event.payload.entity_id != entity.id {
+                return Err(MutationError::InvalidEvent);
+            }
+            if !head.contains(&event.payload.id()) {
+                return Err(MutationError::InvalidEvent);
+            }
+        }
+        Ok(Self { entity, events })
+    }
+    pub fn entity(&self) -> &Entity { &self.entity }
+    pub fn events(&self) -> &[Attested<Event>] { &self.events }
+    pub fn into_parts(self) -> (Entity, Vec<Attested<Event>>) { (self.entity, self.events) }
 }
 
 #[derive(Debug, Clone)]

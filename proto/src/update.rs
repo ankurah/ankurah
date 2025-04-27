@@ -1,8 +1,9 @@
 use crate::{
     auth::Attested,
-    data::{EntityState, Event},
-    id::EntityId,
+    data::{EntityState, Event, State},
+    id::{CollectionId, EntityId},
     subscription::SubscriptionId,
+    Attestation, EventFragment, StateFragment,
 };
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -18,18 +19,9 @@ pub enum NodeUpdateBody {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SubscriptionUpdateItem {
-    /// LEFT OFF HERE - there's a weird tension between Attested<EntityState> and grouping events / states together.
-    /// arguably we don't really need the event and the entitystate to be grouped together
-    Initial {
-        state: Attested<EntityState>,
-    },
-    Add {
-        state: Attested<EntityState>,
-        events: Vec<Attested<Event>>,
-    },
-    Change {
-        events: Vec<Attested<Event>>,
-    },
+    Initial { entity_id: EntityId, collection: CollectionId, state: StateFragment },
+    Add { entity_id: EntityId, collection: CollectionId, state: StateFragment, events: Vec<EventFragment> },
+    Change { entity_id: EntityId, collection: CollectionId, events: Vec<EventFragment> },
     // Note: this is not a resultset change, it's a subscription change
     // that means we don't care about removes, because the reactor handles that
 }

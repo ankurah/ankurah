@@ -69,6 +69,19 @@ pub struct Event {
     pub parent: Clock,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EventFragment {
+    pub operations: OperationSet,
+    pub parent: Clock,
+    pub attestations: AttestationSet,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StateFragment {
+    pub state: State,
+    pub attestations: AttestationSet,
+}
+
 impl Event {
     pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
 }
@@ -105,7 +118,6 @@ pub struct EntityState {
     pub entity_id: EntityId,
     pub collection: CollectionId,
     pub state: State,
-    pub head: Clock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

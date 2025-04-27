@@ -30,6 +30,8 @@ impl Clock {
         Ok(Self(ids))
     }
 
+    pub fn contains(&self, id: &EventId) -> bool { self.0.binary_search(id).is_ok() }
+
     pub fn insert(&mut self, id: EventId) {
         // binary search for the insertion point, and don't insert if it's already present
         let index = self.0.binary_search(&id).unwrap_or_else(|i| i);

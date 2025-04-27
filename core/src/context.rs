@@ -118,6 +118,7 @@ impl Context {
     // }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        todo!("node.get_entity isn't actually fetching the entity from the remote node, only the local storage. This is wrong");
         let entity = self.0.get_entity(id, &R::collection()).await?;
         Ok(R::from_entity(entity))
     }

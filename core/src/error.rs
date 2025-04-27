@@ -115,6 +115,8 @@ pub enum MutationError {
     LineageError(LineageError),
     #[error("peer rejected transaction")]
     PeerRejected,
+    #[error("invalid event")]
+    InvalidEvent,
 }
 
 #[derive(Error, Debug)]

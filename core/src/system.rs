@@ -220,7 +220,7 @@ where SE: StorageEngine + Send + Sync + 'static
         let mut root_clock = None;
 
         for (id, state) in storage.fetch_states(&ankql::ast::Predicate::True).await? {
-            let entity = self.0.entities.with_state(&storage, id, collection_id.clone(), state).await?;
+            let (_entity_changed, entity) = self.0.entities.with_state(&storage, id, collection_id.clone(), state).await?;
             let lww_backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");

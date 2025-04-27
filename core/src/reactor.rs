@@ -90,7 +90,7 @@ where
 
         // Convert states to Entity and filter by predicate
         for (id, state) in states {
-            let entity = self.entityset.with_state(&storage_collection, id, collection_id.to_owned(), state).await?;
+            let (_entity_changed, entity) = self.entityset.with_state(&storage_collection, id, collection_id.to_owned(), state).await?;
 
             // Evaluate predicate for each entity
             if ankql::selection::filter::evaluate_predicate(&entity, &args.predicate).unwrap_or(false) {
@@ -228,7 +228,9 @@ where
         // Group changes by subscription
         let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Entity>>> = std::collections::HashMap::new();
 
-        for change in &changes {
+        for change in changes {
+            let (entity, events) = change.into_parts();
+
             let mut possibly_interested_subs = HashSet::new();
 
             debug!("Reactor - index watchers: {:?}", self.index_watchers);
@@ -236,9 +238,9 @@ where
             for ((collection_id, field_id), index_ref) in self.index_watchers.to_vec() {
                 // Get the field value from the entity
                 println!("MARK A {:?}", collection_id);
-                if collection_id == change.entity.collection {
-                    println!("MARK B {:?}, {:?}", field_id, change.entity.values());
-                    if let Some(field_value) = change.entity.value(&field_id.0) {
+                if collection_id == entity.collection {
+                    println!("MARK B {:?}, {:?}", field_id, entity.values());
+                    if let Some(field_value) = entity.value(&field_id.0) {
                         println!("MARK C {:?}", field_value);
                         possibly_interested_subs.extend(index_ref.read().unwrap().find_matching(Value::String(field_value)));
                     }
@@ -246,14 +248,14 @@ where
             }
 
             // Also check wildcard watchers for this collection
-            if let Some(watchers) = self.wildcard_watchers.get(&change.entity.collection) {
+            if let Some(watchers) = self.wildcard_watchers.get(&entity.collection) {
                 for watcher in watchers.read().unwrap().to_vec() {
                     possibly_interested_subs.insert(watcher.clone());
                 }
             }
 
             // Check entity watchers
-            if let Some(watchers) = self.entity_watchers.get(&change.entity.id()) {
+            if let Some(watchers) = self.entity_watchers.get(&entity.id()) {
                 for watcher in watchers.iter() {
                     possibly_interested_subs.insert(watcher.clone());
                 }
@@ -263,7 +265,6 @@ where
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                    let entity = &change.entity;
                     // Use evaluate_predicate directly on the entity instead of fetch_entities
                     debug!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
                     let matches = ankql::selection::filter::evaluate_predicate::<Entity>(&entity, &subscription.predicate).unwrap_or(false);
@@ -273,19 +274,19 @@ where
                     debug!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id, entity.value("status"));
 
                     // Update entity watchers and notify subscription if needed
-                    self.update_entity_watchers(entity, matches, sub_id);
+                    self.update_entity_watchers(&entity, matches, sub_id);
 
                     // Determine the change type
                     let new_change: Option<ItemChange<Entity>> = if matches != did_match {
                         // Matching status changed
                         Some(if matches {
-                            ItemChange::Add { item: entity.clone(), events: change.events.clone() }
+                            ItemChange::Add { item: entity.clone(), events: events.clone() }
                         } else {
-                            ItemChange::Remove { item: entity.clone(), events: change.events.clone() }
+                            ItemChange::Remove { item: entity.clone(), events: events.clone() }
                         })
                     } else if matches {
                         // Entity still matches but was updated
-                        Some(ItemChange::Update { item: entity.clone(), events: change.events.clone() })
+                        Some(ItemChange::Update { item: entity.clone(), events: events.clone() })
                     } else {
                         // Entity didn't match before and still doesn't match
                         None
