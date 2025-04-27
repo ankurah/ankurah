@@ -113,6 +113,8 @@ pub enum MutationError {
     DecodeError(DecodeError),
     #[error("lineage error: {0}")]
     LineageError(LineageError),
+    #[error("peer rejected transaction")]
+    PeerRejected,
 }
 
 #[derive(Error, Debug)]

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use ankurah_proto as proto;
+use ankurah_proto::Event;
 
 use crate::{
     context::TContext,
@@ -19,26 +20,27 @@ use wasm_bindgen::prelude::*;
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Transaction {
-    pub(crate) dyncontext: Arc<dyn TContext + Send + Sync + 'static>,
+    pub(crate) dyncontext: Option<Arc<dyn TContext + Send + Sync + 'static>>,
     id: proto::TransactionId,
-
     entities: AppendOnlyVec<Entity>,
-
-    // markers
+    // marker for whether this transaction was created implicitly
     implicit: bool,
-    consumed: bool,
 }
 
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl Transaction {
     #[wasm_bindgen(js_name = "commit")]
-    pub async fn js_commit(mut self) -> Result<(), JsValue> { self.commit_mut_ref().await.map_err(|e| JsValue::from_str(&e.to_string())) }
+    pub async fn js_commit(mut self) -> Result<(), JsValue> {
+        let context = self.dyncontext.take().expect("Transaction already consumed");
+        context.commit_local_trx(self).await?;
+        Ok(())
+    }
 }
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
-        Self { dyncontext, id: proto::TransactionId::new(), entities: AppendOnlyVec::new(), implicit: true, consumed: false }
+        Self { dyncontext: Some(dyncontext), id: proto::TransactionId::new(), entities: AppendOnlyVec::new(), implicit: true }
     }
 
     /// Fetch an entity already in the transaction.
@@ -47,7 +49,7 @@ impl Transaction {
             return Ok(entity);
         }
 
-        let upstream = self.dyncontext.get_entity(id, collection).await?;
+        let upstream = self.dyncontext.as_ref().expect("Transaction already consumed").get_entity(id, collection).await?;
         Ok(self.add_entity(upstream.snapshot()))
     }
 
@@ -56,10 +58,22 @@ impl Transaction {
         &self.entities[index]
     }
 
+    /// Consumes the transaction and returns the transaction id and a list of entities and events to be committed
+    pub(crate) fn into_parts(self) -> Result<(proto::TransactionId, Vec<(Entity, Event)>), MutationError> {
+        let mut events = Vec::new();
+        for entity in self.entities.iter() {
+            if let Some(event) = entity.generate_commit_event()? {
+                events.push((entity.clone(), event));
+            }
+        }
+        Ok((self.id.clone(), events))
+    }
+
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<M::Mutable<'rec>, MutationError> {
-        let entity = self.dyncontext.create_entity(M::collection());
+        let context = self.dyncontext.as_ref().expect("Transaction already consumed");
+        let entity = context.create_entity(M::collection());
         model.initialize_new_entity(&entity);
-        self.dyncontext.check_write(&entity)?;
+        context.check_write(&entity)?;
 
         let entity_ref = self.add_entity(entity);
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
@@ -68,57 +82,20 @@ impl Transaction {
     pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::EntityId>) -> Result<M::Mutable<'rec>, MutationError> {
         let id = id.into();
         let entity = self.get_entity(id, &M::collection()).await?;
-        self.dyncontext.check_write(entity)?;
+        self.dyncontext.as_ref().expect("Transaction already consumed").check_write(entity)?;
 
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
     }
 
     #[must_use]
-    pub async fn commit(mut self) -> Result<(), MutationError> { self.commit_mut_ref().await }
-
-    #[must_use]
-    // only because Drop is &mut self not mut self
-    pub(crate) async fn commit_mut_ref(&mut self) -> Result<(), MutationError> {
-        tracing::debug!("trx.commit");
-        self.consumed = true;
-        // this should probably be done in parallel, but microoptimizations
-        let mut entity_events: Vec<proto::Event> = Vec::new();
-        println!("trx.commit.entities: {}", self.entities.len());
-        for entity in self.entities.iter() {
-            println!("trx.commit.entity: {}", entity);
-            // LEFT OFF HERE - changed = entity.apply_event is false in node.commit_transaction
-            // because entity.commit is applying the event to the entity here.
-            // so the call to entity.apply_event in node.commit_transaction is getting a false
-            // negative, and the notification is not being sent.
-
-            // this plumbing needs a bit of a rethink - because I'd really rather not
-            // have to wrap the events with an ActuallyThisEntityChanged wrapper
-
-            // I think the right answer is to rename entity.commit to
-            if let Some(entity_event) = entity.take_event()? {
-                println!("trx.commit.entity_event: {}", entity_event);
-                if let Some(upstream) = &entity.upstream {
-                    println!("trx.commit.upstream: {}", upstream);
-
-                    let collection = self.dyncontext.collection(&upstream.collection).await?;
-
-                    upstream.apply_event(&collection, &entity_event).await?;
-                } else {
-                    // Entitity is already updated
-                    println!("trx.commit.entity_event no upstream {}", entity.head());
-                }
-                entity_events.push(entity_event);
-            }
-        }
-        tracing::debug!("trx.commit.entity_events: {:?}", entity_events);
-        self.dyncontext.commit_transaction(self.id.clone(), entity_events).await?;
-
-        Ok(())
+    pub async fn commit(mut self) -> Result<(), MutationError> {
+        let context = self.dyncontext.take().expect("Transaction already consumed");
+        context.commit_local_trx(self).await
     }
 
     pub fn rollback(mut self) {
         tracing::info!("trx.rollback");
-        self.consumed = true; // just do nothing on drop
+        // The transaction will be dropped without committing
     }
 
     // TODO: Implement delete functionality after core query/edit operations are stable
@@ -139,24 +116,6 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if self.implicit && !self.consumed {
-            // Since we can't make drop async, we'll need to block on the commit
-            // This is not ideal, but necessary for the implicit transaction case
-            // TODO: Make this a rollback, which will also mean we don't need use block_on
-            // #[cfg(not(target_arch = "wasm32"))]
-            // tokio::spawn(async move {
-            //     self.commit_mut_ref()
-            //         .await
-            //         .expect("Failed to commit implicit transaction");
-            // });
-
-            // #[cfg(target_arch = "wasm32")]
-            // wasm_bindgen_futures::spawn_local(async move {
-            //     if let Err(e) = fut.await {
-            //         tracing::error!("Failed to commit implicit transaction: {}", e);
-            //     }
-            // });
-            // todo!()
-        }
+        // how do we want to do the rollback?
     }
 }

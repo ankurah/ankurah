@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, Attested, AuthData, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use anyhow::anyhow;
 
 use async_trait::async_trait;
@@ -22,6 +22,7 @@ use crate::{
     subscription::SubscriptionHandle,
     system::SystemManager,
     task::spawn,
+    transaction::Transaction,
     util::{safemap::SafeMap, safeset::SafeSet},
 };
 #[cfg(feature = "instrument")]
@@ -332,7 +333,7 @@ where
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message
-                match self.commit_transaction(&cdata, id.clone(), events).await {
+                match self.commit_remote_transaction(&cdata, id.clone(), events).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete { id }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
@@ -365,8 +366,81 @@ where
         }
     }
 
-    /// Commit events associated with a pending write transaction (which may be local or remote)
-    pub async fn commit_transaction(
+    async fn relay_to_required_peers(
+        &self,
+        cdata: &PA::ContextData,
+        id: proto::TransactionId,
+        events: &[Attested<proto::Event>],
+    ) -> Result<(), MutationError> {
+        // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
+        // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
+        for peer_id in self.get_durable_peers() {
+            match self
+                .request(peer_id.clone(), cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.to_vec() })
+                .await
+            {
+                Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
+                Ok(proto::NodeResponseBody::Error(e)) => {
+                    return Err(MutationError::General(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Peer {} rejected: {}", peer_id, e),
+                    ))));
+                }
+                _ => {
+                    return Err(MutationError::General(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Peer {} returned unexpected response", peer_id),
+                    ))));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Does all the things necessary to commit a local transaction
+    /// notably, the application of events to Entities works differently versus remote transactions
+    pub async fn commit_local_trx(&self, cdata: &PA::ContextData, trx: Transaction) -> Result<(), MutationError> {
+        let (trx_id, entity_events) = trx.into_parts()?;
+        let mut attested_events = Vec::new();
+        let mut entity_attested_events = Vec::new();
+
+        // Check policy and collect attestations
+        for (entity, event) in entity_events {
+            let attestation = self.policy_agent.check_event(self, cdata, &entity, &event)?;
+            let attested = Attested::opt(event.clone(), attestation);
+            attested_events.push(attested.clone());
+            entity_attested_events.push((entity, attested));
+        }
+
+        // Relay to peers and wait for confirmation
+        self.relay_to_required_peers(cdata, trx_id, &attested_events).await?;
+
+        // All peers confirmed, now we can update local state
+        let mut changes = Vec::new();
+        for (entity, attested_event) in entity_attested_events {
+            // Update head
+            entity.commit_head(Clock::new([attested_event.payload.id()]));
+
+            // If this entity has an upstream, propagate the changes
+            if let Some(ref upstream) = entity.upstream {
+                upstream.apply_event(&self.collections.get(&attested_event.payload.collection).await?, &attested_event.payload).await?;
+            }
+
+            // Persist
+            let collection = self.collections.get(&attested_event.payload.collection).await?;
+            collection.add_event(&attested_event).await?;
+            collection.set_state(attested_event.payload.entity_id.clone(), &entity.to_state()?).await?;
+
+            changes.push(EntityChange { entity: entity.clone(), events: vec![attested_event] });
+        }
+
+        // Notify reactor of ALL changes
+        self.reactor.notify_change(changes);
+        Ok(())
+    }
+
+    /// Does all the things necessary to commit a remote transaction
+    pub async fn commit_remote_transaction(
         &self,
         cdata: &PA::ContextData,
         id: proto::TransactionId,
@@ -374,55 +448,33 @@ where
     ) -> Result<(), MutationError> {
         info!("Node {} committing transaction {} with {} events", self.id, id, events.len());
 
-        // first check if all events are allowed by the local policy agent
         let mut updates: Vec<(Entity, Attested<proto::Event>)> = Vec::new();
         for event in events.iter_mut() {
-            // Apply Events to the Node's registered Entities first.
             let entity = self.get_entity(&event.payload.collection, event.payload.entity_id.clone()).await?;
-            let attestation = self.policy_agent.check_event(self, cdata, &entity, &event.payload)?;
-
-            if let Some(attestation) = attestation {
+            // The policy agent may or may not decide to attest this event
+            // but it must bail out with an error if the event is forbidden
+            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
                 event.attestations.push(attestation);
             }
             updates.push((entity, event.clone()));
         }
-        // TODO review this
-        // If we're not a durable node, send the transaction to a durable peer and wait for confirmation
-        // if !self.durable {
-        // let peer_id: proto::NodeId = self.get_durable_peers().pop().ok_or(MutationError::NoDurablePeers)?;
-        // TODO - these need to race each other, and run concurrently.
-        for peer_id in self.get_durable_peers() {
-            match self
-                .request(peer_id.clone(), cdata, proto::NodeRequestBody::CommitTransaction { id: id.clone(), events: events.clone() })
-                .await
-            {
-                Ok(proto::NodeResponseBody::CommitComplete { id }) => {
-                    info!("Peer {} confirmed transaction {} commit", peer_id, id)
-                }
-                Ok(proto::NodeResponseBody::Error(e)) => warn!("Peer {} error: {}", peer_id, e),
-                Ok(_) => warn!("Peer {} unexpected response type", peer_id),
-                Err(_) => warn!("Peer {} internal channel closed", peer_id),
-            }
-        }
+
+        // TODO - do we need to relay anything to other durable peers?
+        // presumably we are only getting called if we are a durable peer
+        // consider if we need to call relay_to_required_peers here
+        // Note that such relaying would be for ensureing durability
+        // guarantees, not for notifying subscribers, which is handled below
 
         let mut changes = Vec::new();
         // finally, apply events locally
         for (entity, event) in updates {
             let payload = &event.payload;
             let collection = self.collections.get(&payload.collection).await?;
-            // This is kind of whacky, that we're applying the event to the entity here,
-            // but getting the state it already has? The interaction between this and transaction
-            // commit_mut_ref needs a bit of a rethink.
-            let changed = entity.apply_event(&collection, &payload).await?;
-            println!("entity.apply_event {} changed: {}", entity.id(), changed);
-            // Push the state buffers to storage.
-            let state = entity.to_state()?;
-            info!("add_event {}", event);
-            collection.add_event(&event).await?;
-            info!("set_state {}", state);
-            collection.set_state(payload.entity_id, &state).await?;
-
-            if changed {
+            // only persist the event and the state change if the apply_event actually changed the entity
+            if entity.apply_event(&collection, &payload).await? {
+                let state = entity.to_state()?;
+                collection.add_event(&event).await?;
+                collection.set_state(payload.entity_id, &state).await?;
                 changes.push(EntityChange { entity: entity.clone(), events: vec![event.clone()] });
             }
         }

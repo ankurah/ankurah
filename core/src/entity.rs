@@ -28,6 +28,10 @@ pub struct EntityInner {
     pub collection: CollectionId,
     pub(crate) backends: Backends,
     head: std::sync::Mutex<Clock>,
+    // TODO when a transaction creates a downstream entity, we needf to provide a weak reference back to the transaction
+    // so we can error in the case that the transaction has been committed/rolled back (dropped)
+    // This is necessary for JsMutables (to be created) which cannot have a borrow of the transaction
+    // Standard Mutables will have a borrow of the transaction so it should not be possible for them to outlive the transaction
     pub(crate) upstream: Option<Entity>,
 }
 
@@ -78,36 +82,22 @@ impl Entity {
         Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
 
-    /// Collect an event which contains all operations for all backends since the last time they were collected
-    /// Used for transaction commit.
-    /// TODO: We need to think about rollbacks
-    pub fn take_event(&self) -> Result<Option<Event>, MutationError> {
+    /// Generate an event which contains all operations for all backends since the last time they were collected
+    /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
+    /// using commit_head
+    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
         let operations = self.backends.take_accumulated_operations()?;
         if operations.is_empty() {
             Ok(None)
         } else {
-            let event = {
-                let operations = OperationSet(operations);
-                let event = Event { entity_id: self.id.clone(), collection: self.collection.clone(), operations, parent: self.head() };
-
-                // Do we rename this back to fn commit so the backend state matches the head?
-                // I think the answer is to consolidate trx.commit_mut_ref and entity.commit_transaction
-                // into a single function, and we can either rename this back to commit, or at least
-                // more explicitly track whether each item is a local edit (in which case we are
-                // merely generating the new head and recording the operations  applied to this
-                // or a remote edit. in  which case we need to apply the operations+head to the entity
-
-                // println!("Entity.commit pre-lock: {:?}", event);
-                // Set the head to the event's ID
-                // *head = Clock::new([event.id()]);
-                // println!("Entity.commit post-lock: {:?}", event);
-                event
-            };
-
-            debug!("Entity.commit {}", self);
+            let operations = OperationSet(operations);
+            let event = Event { entity_id: self.id.clone(), collection: self.collection.clone(), operations, parent: self.head() };
             Ok(Some(event))
         }
     }
+
+    /// Updates the head of the entity to the given clock, which should come exclusively from generate_commit_event
+    pub(crate) fn commit_head(&self, new_head: Clock) { *self.head.lock().unwrap() = new_head; }
 
     pub fn view<V: View>(&self) -> Option<V> {
         if self.collection() != &V::collection() {

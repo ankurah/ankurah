@@ -41,7 +41,7 @@ pub trait TContext {
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId) -> Result<Entity, RetrievalError>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
-    async fn commit_transaction(&self, trx_id: proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError>;
+    async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
@@ -65,19 +65,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.node.fetch_entities(collection, args, &self.cdata).await
     }
-    async fn commit_transaction(&self, trx_id: proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError> {
-        self.node.commit_transaction(&self.cdata, trx_id, events.into_iter().map(|e| e.into()).collect()).await
-    }
-    // TODO: remove this and handle commit_mut_ref differently
-    // async fn commit_transaction(&self, id: &proto::TransactionId, events: Vec<proto::Event>) -> Result<(), MutationError> {
-    //     self.node
-    //         .commit_transaction(
-    //             &self.cdata,
-    //             id.clone(),
-    //             events.into_iter().map(|e| proto::Attested { payload: e, attestations: vec![] }).collect(),
-    //         )
-    //         .await
-    // }
+    async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.node.commit_local_trx(&self.cdata, trx).await }
     async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,

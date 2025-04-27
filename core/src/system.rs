@@ -138,13 +138,14 @@ where SE: StorageEngine + Send + Sync + 'static
         let lww_backend = system_entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
 
-        let event = system_entity.take_event()?.ok_or(anyhow!("Expected event"))?;
-        system_entity.apply_event(&storage, &event).await?;
+        let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
 
         let root = Clock::new([event.id()]);
 
         storage.add_event(&event.into()).await?;
         storage.set_state(system_entity.id.clone(), &system_entity.to_state()?).await?;
+
+        system_entity.commit_head(root.clone());
 
         // Update our system state
         let mut items = self.0.items.write().unwrap();
