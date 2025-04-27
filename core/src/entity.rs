@@ -81,26 +81,26 @@ impl Entity {
     /// Collect an event which contains all operations for all backends since the last time they were collected
     /// Used for transaction commit.
     /// TODO: We need to think about rollbacks
-    pub fn commit(&self) -> Result<Option<Event>, MutationError> {
-        let operations = self.backends.to_operations()?;
+    pub fn take_event(&self) -> Result<Option<Event>, MutationError> {
+        let operations = self.backends.take_accumulated_operations()?;
         if operations.is_empty() {
             Ok(None)
         } else {
             let event = {
-                let mut head = self.head.lock().unwrap();
                 let operations = OperationSet(operations);
-                let event = Event {
-                    // id: EventId::from_parts(&self.id, &operations, &head),
-                    entity_id: self.id.clone(),
-                    collection: self.collection.clone(),
-                    operations,
-                    parent: head.clone(),
-                };
+                let event = Event { entity_id: self.id.clone(), collection: self.collection.clone(), operations, parent: self.head() };
 
-                println!("Entity.commit pre-lock: {:?}", event);
+                // Do we rename this back to fn commit so the backend state matches the head?
+                // I think the answer is to consolidate trx.commit_mut_ref and entity.commit_transaction
+                // into a single function, and we can either rename this back to commit, or at least
+                // more explicitly track whether each item is a local edit (in which case we are
+                // merely generating the new head and recording the operations  applied to this
+                // or a remote edit. in  which case we need to apply the operations+head to the entity
+
+                // println!("Entity.commit pre-lock: {:?}", event);
                 // Set the head to the event's ID
-                *head = Clock::new([event.id()]);
-                println!("Entity.commit post-lock: {:?}", event);
+                // *head = Clock::new([event.id()]);
+                // println!("Entity.commit post-lock: {:?}", event);
                 event
             };
 

@@ -86,7 +86,16 @@ impl Transaction {
         println!("trx.commit.entities: {}", self.entities.len());
         for entity in self.entities.iter() {
             println!("trx.commit.entity: {}", entity);
-            if let Some(entity_event) = entity.commit()? {
+            // LEFT OFF HERE - changed = entity.apply_event is false in node.commit_transaction
+            // because entity.commit is applying the event to the entity here.
+            // so the call to entity.apply_event in node.commit_transaction is getting a false
+            // negative, and the notification is not being sent.
+
+            // this plumbing needs a bit of a rethink - because I'd really rather not
+            // have to wrap the events with an ActuallyThisEntityChanged wrapper
+
+            // I think the right answer is to rename entity.commit to
+            if let Some(entity_event) = entity.take_event()? {
                 println!("trx.commit.entity_event: {}", entity_event);
                 if let Some(upstream) = &entity.upstream {
                     println!("trx.commit.upstream: {}", upstream);

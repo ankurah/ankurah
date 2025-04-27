@@ -152,7 +152,7 @@ impl Backends {
         Ok(backends)
     }
 
-    pub fn to_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>, MutationError> {
+    pub fn take_accumulated_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>, MutationError> {
         let backends = self.backends_lock();
         let mut operations = BTreeMap::<String, Vec<Operation>>::new();
         for (name, backend) in &*backends {

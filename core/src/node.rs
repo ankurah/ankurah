@@ -410,7 +410,11 @@ where
         for (entity, event) in updates {
             let payload = &event.payload;
             let collection = self.collections.get(&payload.collection).await?;
+            // This is kind of whacky, that we're applying the event to the entity here,
+            // but getting the state it already has? The interaction between this and transaction
+            // commit_mut_ref needs a bit of a rethink.
             let changed = entity.apply_event(&collection, &payload).await?;
+            println!("entity.apply_event {} changed: {}", entity.id(), changed);
             // Push the state buffers to storage.
             let state = entity.to_state()?;
             info!("add_event {}", event);
