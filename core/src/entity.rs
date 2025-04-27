@@ -1,6 +1,6 @@
 use crate::lineage;
 use crate::{
-    error::{MutationError, RetrievalError, StateError},
+    error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
     property::{Backends, PropertyValue},
     storage::StorageCollectionWrapper,
@@ -114,40 +114,76 @@ impl Entity {
         }
     }
 
-    /// We're going to need a &Node arg in order to recurse, which will complicate a few things
-    /// For now just fail if we can't apply the event?
+    /// Attempt to apply an event to the entity
+    #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
-        /*
-           case A: event precursor descends the current head, then set entity clock to singleton of event id
-           case B: event precursor is concurrent to the current head, push event id to event head clock.
-           case C: event precursor is descended by the current head
-        */
-        debug!("Entity.apply_event {}", event);
-        let head = Clock::new([event.id()]);
-        for (backend_name, operations) in event.operations.iter() {
-            // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
-            self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent /* , context*/)?;
+        let head = self.head();
+        let new_head = event.id().into();
+        match crate::lineage::compare(collection, &head, &new_head, 100).await? {
+            lineage::Ordering::Equal => {
+                debug!("Equal - skip");
+                return Ok(false);
+            }
+            lineage::Ordering::Descends => {
+                debug!("Descends - apply");
+                for (backend_name, operations) in event.operations.iter() {
+                    // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
+                    self.backends.apply_operations((*backend_name).to_owned(), operations, &new_head, &event.parent /* , context*/)?;
+                }
+                *self.head.lock().unwrap() = new_head.clone();
+                *self.backends.head.lock().unwrap() = new_head;
+                Ok(true)
+            }
+            lineage::Ordering::NotDescends { meet } => {
+                debug!("NotDescends - skip");
+                return Ok(false);
+            }
+            lineage::Ordering::Incomparable => {
+                // total apples and oranges - take a hike buddy
+                Err(LineageError::Incomparable.into())
+            }
+            lineage::Ordering::PartiallyDescends { meet } => {
+                // TODO - figure out how to handle this. I don't think we need to materialize a new event
+                // but it requires that we update the propertybackends to support this
+                Err(LineageError::PartiallyDescends { meet }.into())
+            }
+            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
+            }
         }
-        // TODO figure out how to test this
-        debug!("Entity.apply_event {}", event);
-
-        *self.head.lock().unwrap() = head.clone();
-        // Hack
-        *self.backends.head.lock().unwrap() = head;
-
-        unimplemented!();
-        // only return true if the event descends our local state
-        // and all links are in our collection's event history back to the current head
-        Ok(false)
     }
 
     pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, MutationError> {
-        unimplemented!();
-        // if !lineage::descends(&*collection, &self.head(), &state.head)? {
-        //     return Ok(false);
-        // }
-        self.backends.apply_state(state)?;
-        Ok(true)
+        let head = self.head();
+        let new_head = state.head.clone();
+
+        match crate::lineage::compare(collection, &head, &new_head, 100).await? {
+            lineage::Ordering::Equal => {
+                debug!("Equal - skip");
+                return Ok(false);
+            }
+            lineage::Ordering::Descends => {
+                self.backends.apply_state(&state)?;
+                *self.head.lock().unwrap() = new_head;
+                Ok(true)
+            }
+            lineage::Ordering::NotDescends { meet } => {
+                debug!("NotDescends - skip {self} meet: {meet:?}");
+                return Ok(false);
+            }
+            lineage::Ordering::Incomparable => {
+                // total apples and oranges - take a hike buddy
+                Err(LineageError::Incomparable.into())
+            }
+            lineage::Ordering::PartiallyDescends { meet } => {
+                // TODO - figure out how to handle this. I don't think we need to materialize a new event
+                // but it requires that we update the propertybackends to support this
+                Err(LineageError::PartiallyDescends { meet }.into())
+            }
+            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
+            }
+        }
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
@@ -270,30 +306,41 @@ impl WeakEntitySet {
         entity
     }
 
-    pub fn with_state(&self, id: EntityId, collection_id: CollectionId, state: State) -> Result<Entity, RetrievalError> {
-        let mut entities = self.0.write().unwrap();
-        match entities.entry(id) {
-            Entry::Vacant(_) => {
-                let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-                entities.insert(id, entity.weak());
-                Ok(entity)
-            }
-            Entry::Occupied(o) => match o.get().upgrade() {
-                Some(entity) => {
-                    if entity.collection == collection_id {
-                        unimplemented!();
-                        // entity.apply_state(&state)?;
-                        Ok(entity)
-                    } else {
-                        Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)))
-                    }
-                }
-                None => {
+    pub async fn with_state(
+        &self,
+        collection: &StorageCollectionWrapper,
+        id: EntityId,
+        collection_id: CollectionId,
+        state: State,
+    ) -> Result<Entity, RetrievalError> {
+        let entity = {
+            let mut entities = self.0.write().unwrap();
+            match entities.entry(id) {
+                Entry::Vacant(_) => {
                     let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                     entities.insert(id, entity.weak());
-                    Ok(entity)
+                    entity
                 }
-            },
-        }
+                Entry::Occupied(o) => match o.get().upgrade() {
+                    Some(entity) => {
+                        if entity.collection != collection_id {
+                            return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
+                        }
+                        entity
+                    }
+                    None => {
+                        let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+                        entities.insert(id, entity.weak());
+                        // just created the entity with the state, so we do not need to apply the state
+                        return Ok(entity);
+                    }
+                },
+            }
+        };
+
+        // if we're here, we've retrieved the entity from the set and need to apply the state
+        entity.apply_state(collection, &state).await?;
+
+        Ok(entity)
     }
 }

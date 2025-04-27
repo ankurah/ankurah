@@ -1,4 +1,7 @@
-use crate::{error::RetrievalError, storage::StorageCollection};
+use crate::{
+    error::RetrievalError,
+    storage::{StorageCollection, StorageCollectionWrapper},
+};
 use ankurah_proto::{Attested, Clock, EventId};
 use async_trait::async_trait;
 use smallvec::SmallVec;
@@ -49,14 +52,14 @@ impl TEvent for ankurah_proto::Event {
 }
 
 #[async_trait]
-impl<T: StorageCollection> GetEvents for T {
+impl GetEvents for StorageCollectionWrapper {
     type Id = EventId;
     type Event = ankurah_proto::Event;
     type Error = RetrievalError;
 
     async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), Self::Error> {
         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
-        Ok((1, self.get_events(event_ids).await?))
+        Ok((1, self.0.get_events(event_ids).await?))
     }
 }
 
@@ -197,8 +200,12 @@ where Id: Clone + PartialEq
     }
 }
 
-// TODO - benchmark and optimize this. the way Origin tracking works is pretty goofy, and we're doing more hashmap lookups than we need to.
-// But the tests pass, so I'm moving on for now.
+// TODOs
+// [ ] benchmark and audit this
+// [ ] consider moving `fn compare` into a static Comparison struct method
+// [ ] the way Origin tracking works is pretty goofy, and we're doing more hashmap lookups than we need to
+// [ ] implement skip links with bloom filters so we can traverse longer histories with a smaller budget
+// [ ] replace StorageCollectionWrapper with an EventRetriever that can retrive from local or remote storage
 pub(crate) struct Comparison<'a, G>
 where
     G: GetEvents + 'a,

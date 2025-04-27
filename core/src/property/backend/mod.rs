@@ -202,7 +202,7 @@ impl Backends {
     }
 
     /// HACK - this should be based on a play forward of events
-    pub fn apply_state(&self, state: &State) -> Result<(), RetrievalError> {
+    pub fn apply_state(&self, state: &State) -> Result<(), MutationError> {
         let mut backends = self.backends_lock();
         for (name, state_buffer) in state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;

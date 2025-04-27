@@ -27,7 +27,7 @@ futures-signals      = "0.3"
 serde                = "1.0"
 ulid                 = { version = "1.1", features = ["serde", "uuid"] }
 uuid                 = "1.1"
-tracing              = "0.1.40"
+tracing              = { version = "0.1.40", features = ["max_level_debug", "release_max_level_warn"] }
 bincode              = "1.3.3"
 append-only-vec      = "0.1"
 async-trait          = "0.1"

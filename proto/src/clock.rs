@@ -65,6 +65,9 @@ impl TryInto<Clock> for Vec<Vec<u8>> {
 impl From<&Clock> for Vec<EventId> {
     fn from(clock: &Clock) -> Self { clock.0.iter().cloned().collect() }
 }
+impl From<EventId> for Clock {
+    fn from(id: EventId) -> Self { Self(vec![id]) }
+}
 
 impl std::fmt::Display for Clock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}]", self.to_strings().join(", ")) }

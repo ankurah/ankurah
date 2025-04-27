@@ -90,7 +90,7 @@ where
 
         // Convert states to Entity and filter by predicate
         for (id, state) in states {
-            let entity = self.entityset.with_state(id, collection_id.to_owned(), state)?;
+            let entity = self.entityset.with_state(&storage_collection, id, collection_id.to_owned(), state).await?;
 
             // Evaluate predicate for each entity
             if ankql::selection::filter::evaluate_predicate(&entity, &args.predicate).unwrap_or(false) {

@@ -642,7 +642,7 @@ where
 
     pub fn context(&self, data: PA::ContextData) -> Context { Context::new(Node::clone(self), data) }
 
-    /// Retrieve a single entity by id
+    /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
     pub(crate) async fn get_entity(
         &self,
         collection_id: &CollectionId,
@@ -660,13 +660,10 @@ where
         let collection = self.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                return self.entities.with_state(id, collection_id.clone(), entity_state);
+                return self.entities.with_state(&collection, id, collection_id.clone(), entity_state).await;
             }
             Err(RetrievalError::EntityNotFound(id)) => {
-                // let scoped_entity = Entity::new(id, collection.to_string());
-                // let ref_entity = Arc::new(scoped_entity);
-                // Revisit this
-                let entity = self.entities.with_state(id, collection_id.clone(), proto::State::default())?;
+                let entity = self.entities.with_state(&collection, id, collection_id.clone(), proto::State::default()).await?;
                 Ok(entity)
             }
             Err(e) => Err(e),
@@ -700,7 +697,7 @@ where
         // Convert states to entities
         let mut entities = Vec::new();
         for (id, state) in states {
-            let entity = self.entities.with_state(id, collection_id.clone(), state)?;
+            let entity = self.entities.with_state(&storage_collection, id, collection_id.clone(), state).await?;
             entities.push(entity);
         }
         Ok(entities)

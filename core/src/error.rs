@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{collections::BTreeSet, convert::Infallible};
 
 use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
 use thiserror::Error;
@@ -39,6 +39,12 @@ pub enum RetrievalError {
     DecodeError(DecodeError),
     #[error("State error: {0}")]
     StateError(StateError),
+    #[error("Mutation error: {0}")]
+    MutationError(Box<MutationError>),
+}
+
+impl From<MutationError> for RetrievalError {
+    fn from(err: MutationError) -> Self { RetrievalError::MutationError(Box::new(err)) }
 }
 
 impl RetrievalError {
@@ -105,6 +111,22 @@ pub enum MutationError {
     NoDurablePeers,
     #[error("decode error: {0}")]
     DecodeError(DecodeError),
+    #[error("lineage error: {0}")]
+    LineageError(LineageError),
+}
+
+#[derive(Error, Debug)]
+pub enum LineageError {
+    #[error("incomparable")]
+    Incomparable,
+    #[error("partially descends: {meet:?}")]
+    PartiallyDescends { meet: Vec<EventId> },
+    #[error("budget exceeded: {subject_frontier:?} {other_frontier:?}")]
+    BudgetExceeded { subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
+}
+
+impl From<LineageError> for MutationError {
+    fn from(err: LineageError) -> Self { MutationError::LineageError(err) }
 }
 
 impl From<DecodeError> for MutationError {
