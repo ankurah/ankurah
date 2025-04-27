@@ -197,6 +197,8 @@ where Id: Clone + PartialEq
     }
 }
 
+// TODO - benchmark and optimize this. the way Origin tracking works is pretty goofy, and we're doing more hashmap lookups than we need to.
+// But the tests pass, so I'm moving on for now.
 pub(crate) struct Comparison<'a, G>
 where
     G: GetEvents + 'a,
