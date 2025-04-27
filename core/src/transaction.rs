@@ -83,18 +83,20 @@ impl Transaction {
         self.consumed = true;
         // this should probably be done in parallel, but microoptimizations
         let mut entity_events: Vec<proto::Event> = Vec::new();
-        println!("trx.commit.entities: {:?}", self.entities.len());
+        println!("trx.commit.entities: {}", self.entities.len());
         for entity in self.entities.iter() {
-            println!("trx.commit.entity: {:?}", entity);
+            println!("trx.commit.entity: {}", entity);
             if let Some(entity_event) = entity.commit()? {
-                println!("trx.commit.entity_event: {:?}", entity_event);
+                println!("trx.commit.entity_event: {}", entity_event);
                 if let Some(upstream) = &entity.upstream {
-                    println!("trx.commit.upstream: {:?}", upstream);
-                    unimplemented!()
-                    // upstream.apply_event(&self.dyncontext.storage_collection(upstream.collection), &entity_event).await?;
+                    println!("trx.commit.upstream: {}", upstream);
+
+                    let collection = self.dyncontext.collection(&upstream.collection).await?;
+
+                    upstream.apply_event(&collection, &entity_event).await?;
                 } else {
                     // Entitity is already updated
-                    println!("trx.commit.entity_event no upstream");
+                    println!("trx.commit.entity_event no upstream {} vs {}", entity.head(), entity.backends().head());
                 }
                 entity_events.push(entity_event);
             }

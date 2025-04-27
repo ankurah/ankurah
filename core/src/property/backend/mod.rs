@@ -120,6 +120,7 @@ impl Default for Backends {
 impl Backends {
     pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())), head: Arc::new(Mutex::new(Clock::default())) } }
 
+    pub fn head(&self) -> Clock { self.head.lock().unwrap().clone() }
     fn backends_lock(&self) -> MutexGuard<BTreeMap<String, Arc<dyn PropertyBackend>>> {
         self.backends.lock().expect("other thread panicked, panic here too")
     }

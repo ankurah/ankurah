@@ -413,7 +413,9 @@ where
             let changed = entity.apply_event(&collection, &payload).await?;
             // Push the state buffers to storage.
             let state = entity.to_state()?;
+            info!("add_event {}", event);
             collection.add_event(&event).await?;
+            info!("set_state {}", state);
             collection.set_state(payload.entity_id, &state).await?;
 
             if changed {

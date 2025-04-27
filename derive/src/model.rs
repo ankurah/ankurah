@@ -180,7 +180,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         }
         #[derive(Debug)]
         pub struct #mutable_name<'rec> {
-            entity: &'rec ::ankurah::entity::Entity,
+            pub entity: &'rec ::ankurah::entity::Entity,
             #(#active_field_visibility #active_field_names: #active_field_types,)*
         }
 

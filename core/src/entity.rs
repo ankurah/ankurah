@@ -119,6 +119,7 @@ impl Entity {
     pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
         let head = self.head();
         let new_head = event.id().into();
+        println!("OLD VS NEW {} <> {}", head, new_head);
         match crate::lineage::compare(collection, &head, &new_head, 100).await? {
             lineage::Ordering::Equal => {
                 debug!("Equal - skip");
