@@ -210,7 +210,7 @@ impl StorageCollection for PostgresBucket {
 
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
 
-        let backends = Backends::from_state_buffers(state)?;
+        let backends = Backends::from_state_buffers(&state.state_buffers)?;
         let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned()];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
         params.push(&id);

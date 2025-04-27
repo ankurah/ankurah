@@ -2,10 +2,11 @@ use crate::{
     error::RetrievalError,
     storage::{StorageCollection, StorageCollectionWrapper},
 };
-use ankurah_proto::{Attested, Clock, EventId};
+use ankurah_proto::{Attested, Clock, Event, EventId};
 use async_trait::async_trait;
 use smallvec::SmallVec;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use tracing::info;
 
 /// a trait for events and eventlike things that can be descended
 pub trait TEvent {
@@ -25,7 +26,6 @@ pub trait TClock {
 pub trait GetEvents {
     type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
     type Event: TEvent<Id = Self::Id>;
-    type Error;
 
     /// Estimate the budget cost for retrieving a batch of events
     /// This allows different implementations to model their cost structure
@@ -35,7 +35,7 @@ pub trait GetEvents {
     }
 
     /// retrieve the events from the store, returning the budget consumed by this operation and the events retrieved
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), Self::Error>;
+    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
 }
 
 impl TClock for Clock {
@@ -55,9 +55,8 @@ impl TEvent for ankurah_proto::Event {
 impl GetEvents for StorageCollectionWrapper {
     type Id = EventId;
     type Event = ankurah_proto::Event;
-    type Error = RetrievalError;
 
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), Self::Error> {
+    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
         Ok((1, self.0.get_events(event_ids).await?))
     }
@@ -96,6 +95,19 @@ pub enum Ordering<Id> {
     },
 }
 
+pub async fn compare_event(
+    getter: &StorageCollectionWrapper,
+    subject: &Event,
+    other: &Clock,
+    budget: usize,
+) -> Result<Ordering<EventId>, RetrievalError> {
+    if subject.parent().members() == other.members() {
+        return Ok(Ordering::Descends);
+    }
+    let subject = subject.id().into();
+    Ok(compare(getter, &subject, other, budget).await?)
+}
+
 /// Compares two Clocks, traversing the event history to classify their
 /// causal relationship.
 ///
@@ -120,12 +132,12 @@ pub enum Ordering<Id> {
 /// required to make a conclusive comparison. I think we can probably purge the `state`
 /// map for a given entity once visited by both sides, and the id is removed from the checklist
 /// but this needs a bit more thought.
-pub async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, G::Error>
+pub async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, RetrievalError>
 where
     G: GetEvents,
     G::Event: TEvent<Id = G::Id>,
     C: TClock<Id = G::Id>,
-    G::Id: std::hash::Hash + Ord,
+    G::Id: std::hash::Hash + Ord + std::fmt::Display,
 {
     // bail out right away for the obvious cases
     if subject.members().is_empty() || other.members().is_empty() {
@@ -244,7 +256,7 @@ impl<'a, G> Comparison<'a, G>
 where
     G: GetEvents + 'a,
     G::Event: TEvent<Id = G::Id>,
-    G::Id: std::hash::Hash + Ord + std::fmt::Debug,
+    G::Id: std::hash::Hash + Ord + std::fmt::Debug + std::fmt::Display,
 {
     pub fn new<C: TClock<Id = G::Id>>(getter: &'a G, subject: &C, other: &C, budget: usize) -> Self {
         let subject_frontier: BTreeSet<_> = subject.members().iter().cloned().collect();
@@ -271,16 +283,26 @@ where
     }
 
     // runs one step of the comparison, returning Some(ordering) if a conclusive determination can be made, or None if it needs more steps
-    pub async fn step(&mut self) -> Result<Option<Ordering<G::Id>>, G::Error> {
+    pub async fn step(&mut self) -> Result<Option<Ordering<G::Id>>, RetrievalError> {
         // println!("Step called - subject_ws: {:?}, other_ws: {:?}", self.subject_frontier, self.other_frontier);
 
         // look up events in both frontiers
         let ids: Vec<G::Id> = self.subject_frontier.union(&self.other_frontier).cloned().collect();
+        // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
+        // so we can pass the HashSet as a borrow and don't have to alloc this twice
+        let mut result_checklist: HashSet<G::Id> = ids.iter().cloned().collect();
+        info!("step -> get_events {:?}", ids);
         let (cost, events) = self.getter.get_events(ids).await?;
+        info!("step -> get_events result {:?}", events.iter().map(|e| e.payload.id()).collect::<Vec<_>>());
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
         for event in events {
-            self.process_event(event.payload.id(), event.payload.parent().members());
+            if result_checklist.remove(&event.payload.id()) {
+                self.process_event(event.payload.id(), event.payload.parent().members());
+            }
+        }
+        if !result_checklist.is_empty() {
+            return Err(RetrievalError::StorageError(format!("Events not found: {:?}", result_checklist).into()));
         }
 
         if let Some(ordering) = self.check_result() {
@@ -433,9 +455,8 @@ mod tests {
     impl GetEvents for MockEventStore {
         type Id = TestId;
         type Event = TestEvent;
-        type Error = ();
 
-        async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), Self::Error> {
+        async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
             let mut result = Vec::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {

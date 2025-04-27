@@ -62,7 +62,10 @@ impl Entity {
 
     pub fn head(&self) -> Clock { self.head.lock().unwrap().clone() }
 
-    pub fn to_state(&self) -> Result<State, StateError> { self.backends.to_state_buffers() }
+    pub fn to_state(&self) -> Result<State, StateError> {
+        let state_buffers = self.backends.to_state_buffers()?;
+        Ok(State { state_buffers, head: self.head() })
+    }
 
     // used by the Model macro
     pub fn create(id: EntityId, collection: CollectionId, backends: Backends) -> Self {
@@ -71,7 +74,7 @@ impl Entity {
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
     fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(state)?;
+        let backends = Backends::from_state_buffers(&state.state_buffers)?;
         Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
 
@@ -118,21 +121,38 @@ impl Entity {
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
         let head = self.head();
-        let new_head = event.id().into();
-        println!("OLD VS NEW {} <> {}", head, new_head);
-        match crate::lineage::compare(collection, &head, &new_head, 100).await? {
+        println!("OLD VS NEW {} <> {}", head, event);
+        match crate::lineage::compare_event(collection, &event, &head, 100).await? {
             lineage::Ordering::Equal => {
                 debug!("Equal - skip");
                 return Ok(false);
             }
             lineage::Ordering::Descends => {
                 debug!("Descends - apply");
+                let new_head = event.id().into();
                 for (backend_name, operations) in event.operations.iter() {
-                    // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
+                    // IMPORTANT TODO - we might descend the entity head by more than one event,
+                    // therefore we need to play forward events one by one, not just the latest
+                    // set operations, the current head and the parent of that.
+                    // We have to play forward all events from the current entity/backend state
+                    // to the latest event. At this point we know this lineage is connected,
+                    // else we would get back an Ordering::Incomparable.
+                    // So we just need to fiure out how to scan through those events here.
+                    // Probably the easiest thing would be to update Ordering::Descends to provide
+                    // the list of events to play forward, but ideally we'd do it on a streaming
+                    // basis instead. of materializing what could potentially be a large number
+                    // of events in some cases.
+
+                    // we can't do this in the lineage comparison, because its looking backwards
+                    // not forwards - and we need to replay the events in order.
+                    // Maybe the best approach is to have Descends return the list of event ids
+                    // connecting the current head to the new event, and use a modest LRU cache
+                    // on the event geter (which needs to abstract storage collection anyway,
+                    // due to the need for remote event retrieval)
+                    // ...so we get a cache hit in the most common cases, and it can paginate the rest.
                     self.backends.apply_operations((*backend_name).to_owned(), operations, &new_head, &event.parent /* , context*/)?;
                 }
-                *self.head.lock().unwrap() = new_head.clone();
-                *self.backends.head.lock().unwrap() = new_head;
+                *self.head.lock().unwrap() = new_head;
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
@@ -248,7 +268,7 @@ impl Filterable for Entity {
 
 impl TemporaryEntity {
     pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(state)?;
+        let backends = Backends::from_state_buffers(&state.state_buffers)?;
         Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
 }

@@ -96,7 +96,7 @@ impl Transaction {
                     upstream.apply_event(&collection, &entity_event).await?;
                 } else {
                     // Entitity is already updated
-                    println!("trx.commit.entity_event no upstream {} vs {}", entity.head(), entity.backends().head());
+                    println!("trx.commit.entity_event no upstream {}", entity.head());
                 }
                 entity_events.push(entity_event);
             }

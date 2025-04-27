@@ -51,35 +51,10 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     ) -> Result<(), MutationError>;
 }
 
-// impl Event {
-//     pub fn push(&mut self, property_backend: &'static str, operation: Operation) {
-//         match self.operations.entry(property_backend.to_owned()) {
-//             Entry::Occupied(mut entry) => {
-//                 entry.get_mut().push(operation);
-//             }
-//             Entry::Vacant(entry) => {
-//                 entry.insert(vec![operation]);
-//             }
-//         }
-//     }
-
-//     pub fn extend(&mut self, property_backend: &'static str, operations: Vec<Operation>) {
-//         match self.operations.entry(property_backend.to_owned()) {
-//             Entry::Occupied(mut entry) => {
-//                 entry.get_mut().extend(operations);
-//             }
-//             Entry::Vacant(entry) => {
-//                 entry.insert(operations);
-//             }
-//         }
-//     }
-// }
-
 /// Holds the property backends inside of entities.
 #[derive(Debug)]
 pub struct Backends {
     pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
-    pub head: Arc<Mutex<Clock>>,
 }
 
 // This is where this gets a bit tough.
@@ -118,9 +93,8 @@ impl Default for Backends {
 }
 
 impl Backends {
-    pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())), head: Arc::new(Mutex::new(Clock::default())) } }
+    pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())) } }
 
-    pub fn head(&self) -> Clock { self.head.lock().unwrap().clone() }
     fn backends_lock(&self) -> MutexGuard<BTreeMap<String, Arc<dyn PropertyBackend>>> {
         self.backends.lock().expect("other thread panicked, panic here too")
     }
@@ -151,7 +125,7 @@ impl Backends {
             forked.insert(name.clone(), backend.fork().into());
         }
 
-        Self { backends: Arc::new(Mutex::new(forked)), head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())) }
+        Self { backends: Arc::new(Mutex::new(forked)) }
     }
 
     fn insert(&self, backend_name: String, backend: Arc<dyn PropertyBackend>) {
@@ -159,23 +133,22 @@ impl Backends {
         backends.insert(backend_name, backend);
     }
 
-    pub fn to_state_buffers(&self) -> Result<State, StateError> {
+    pub fn to_state_buffers(&self) -> Result<StateBuffers, StateError> {
         let backends = self.backends_lock();
         let mut state_buffers = BTreeMap::default();
         for (name, backend) in &*backends {
             let state_buffer = backend.to_state_buffer()?;
             state_buffers.insert(name.clone(), state_buffer);
         }
-        Ok(State { state_buffers: StateBuffers(state_buffers), head: self.head.lock().unwrap().clone() })
+        Ok(StateBuffers(state_buffers))
     }
 
-    pub fn from_state_buffers(entity_state: &State) -> Result<Self, RetrievalError> {
+    pub fn from_state_buffers(state_buffers: &StateBuffers) -> Result<Self, RetrievalError> {
         let backends = Backends::new();
-        for (name, state_buffer) in entity_state.state_buffers.iter() {
+        for (name, state_buffer) in state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
-        *backends.head.lock().unwrap() = entity_state.head.clone();
         Ok(backends)
     }
 
@@ -209,7 +182,6 @@ impl Backends {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
-        *self.head.lock().unwrap() = state.head.clone();
         Ok(())
     }
 
