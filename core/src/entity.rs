@@ -116,7 +116,18 @@ impl Entity {
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
         let head = self.head();
+
         println!("OLD VS NEW {} <> {}", head, event);
+
+        if event.is_entity_root() && event.parent.is_empty() {
+            // this is the creation event for a new entity, so we simply accept it
+            for (backend_name, operations) in event.operations.iter() {
+                self.backends.apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent)?;
+            }
+            *self.head.lock().unwrap() = event.id().into();
+            return Ok(true);
+        }
+
         match crate::lineage::compare_event(collection, &event, &head, 100).await? {
             lineage::Ordering::Equal => {
                 debug!("Equal - skip");
@@ -314,10 +325,10 @@ impl std::fmt::Display for TemporaryEntity {
 #[derive(Clone, Default)]
 pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
 impl WeakEntitySet {
-    pub fn get(&self, id: EntityId) -> Option<Entity> {
+    pub fn get(&self, id: &EntityId) -> Option<Entity> {
         let entities = self.0.read().unwrap();
         // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(&id) {
+        if let Some(entity) = entities.get(id) {
             entity.upgrade()
         } else {
             None
@@ -326,23 +337,46 @@ impl WeakEntitySet {
 
     pub async fn get_or_retrieve(
         &self,
-        collection_id: CollectionId,
+        collection_id: &CollectionId,
         collection: &StorageCollectionWrapper,
-        id: EntityId,
+        id: &EntityId,
     ) -> Result<Option<Entity>, RetrievalError> {
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get(id) {
             Some(entity) => Ok(Some(entity)),
-            None => match collection.get_state(id).await {
+            None => match collection.get_state(id.clone()).await {
                 Err(RetrievalError::EntityNotFound(_)) => Ok(None),
                 Err(e) => Err(e),
                 Ok(state) => {
                     // technically someone could have added the entity since we last checked, so it's better to use the
                     // with_state method to re-check
-                    let (_, entity) = self.with_state(collection, id, collection_id, state.payload.state).await?;
+                    let (_, entity) = self.with_state(collection, id.clone(), collection_id.to_owned(), state.payload.state).await?;
                     Ok(Some(entity))
                 }
             },
+        }
+    }
+    /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
+    pub async fn get_retrieve_or_create(
+        &self,
+        collection_id: &CollectionId,
+        collection: &StorageCollectionWrapper,
+        id: &EntityId,
+    ) -> Result<Entity, RetrievalError> {
+        match self.get_or_retrieve(collection_id, collection, id).await? {
+            Some(entity) => Ok(entity),
+            None => {
+                let mut entities = self.0.write().unwrap();
+                // TODO: call policy agent with cdata
+                if let Some(entity) = entities.get(&id) {
+                    if let Some(entity) = entity.upgrade() {
+                        return Ok(entity);
+                    }
+                }
+                let entity = Entity::create(id.clone(), collection_id.to_owned(), Backends::new());
+                entities.insert(id.clone(), entity.weak());
+                Ok(entity)
+            }
         }
     }
     /// Create a brand new entity, and add it to the set

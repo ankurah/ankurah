@@ -23,6 +23,7 @@ pub struct Album {
 async fn repeatable_read() -> Result<()> {
     let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new()).context(c);
 
+    println!("MARK 0");
     let id;
     {
         let trx = client.begin();
@@ -34,6 +35,7 @@ async fn repeatable_read() -> Result<()> {
 
         trx.commit().await?;
     }
+    println!("MARK 1");
 
     println!("_____________");
     println!("REFETCHING");
@@ -45,32 +47,40 @@ async fn repeatable_read() -> Result<()> {
     println!("name: {:?}", album_ro.name());
     println!("_____________");
 
+    println!("MARK 2");
     let trx2 = client.begin();
     let album_rw2 = album_ro.edit(&trx2)?;
 
+    println!("MARK 3");
     let trx3 = client.begin();
     let album_rw3 = album_ro.edit(&trx3)?;
 
+    println!("MARK 4");
     // tx2 cats -> tofu
     album_rw2.name().delete(7, 4)?;
     album_rw2.name().insert(7, "tofu")?;
     assert_eq!(album_rw2.name().value(), Some("I love tofu".to_string()));
 
+    println!("MARK 5");
     // tx3 love -> devour
     album_rw3.name().delete(2, 4)?;
     album_rw3.name().insert(2, "devour")?;
     // a modest proposal
     assert_eq!(album_rw3.name().value(), Some("I devour cats".to_string()));
 
+    println!("MARK 6");
     // trx2 and 3 are uncommited, so the value should not be updated
     assert_eq!(album_ro.name().unwrap(), "I love cats");
     trx2.commit().await?;
 
+    println!("MARK 7");
     // FAIL - the value must be updated now
     assert_eq!(album_ro.name().unwrap(), "I love tofu");
 
+    println!("MARK 8");
     trx3.commit().await?;
 
+    println!("MARK 9");
     // FAIL - the value must be updated now
     assert_eq!(album_ro.name().unwrap(), "I devour tofu");
 

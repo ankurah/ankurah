@@ -16,7 +16,6 @@ impl EventId {
     /// Generate an EventID from the parts of an Event
     /// notably, we are not including the collection in the hash because collection is getting excised from identity
     pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
-        println!("EventId::from_parts {entity_id} {operations} {parent}");
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
         hasher.update(bincode::serialize(&operations).unwrap());
@@ -67,6 +66,11 @@ pub struct Event {
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
+}
+
+impl Event {
+    // TODO: figure out how we actually want to signify entity creation. This is a hack for now
+    pub fn is_entity_root(&self) -> bool { self.parent.is_empty() }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -14,7 +14,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::Context,
-    entity::{Entity, WeakEntitySet},
+    entity::{Entity, TemporaryEntity, WeakEntitySet},
     error::{MutationError, RequestError, RetrievalError},
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
@@ -446,6 +446,7 @@ where
 
         // Check policy and collect attestations
         for (entity, event) in entity_events {
+            println!("Entity: {}, event: {}", entity, event);
             let attestation = self.policy_agent.check_event(self, cdata, &entity, &event)?;
             let attested = Attested::opt(event.clone(), attestation);
             attested_events.push(attested.clone());
@@ -458,17 +459,20 @@ where
         // All peers confirmed, now we can update local state
         let mut changes: Vec<EntityChange> = Vec::new();
         for (entity, attested_event) in entity_attested_events {
-            // Update head
+            let collection = self.collections.get(&attested_event.payload.collection).await?;
+            collection.add_event(&attested_event).await?;
             entity.commit_head(Clock::new([attested_event.payload.id()]));
 
+            println!("ALPHA 1");
             // If this entity has an upstream, propagate the changes
             if let Some(ref upstream) = entity.upstream {
+                println!("ALPHA 2");
                 upstream.apply_event(&self.collections.get(&attested_event.payload.collection).await?, &attested_event.payload).await?;
+                println!("ALPHA 3");
             }
 
             // Persist
-            let collection = self.collections.get(&attested_event.payload.collection).await?;
-            collection.add_event(&attested_event).await?;
+
             let state = entity.to_state()?;
 
             let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
@@ -492,39 +496,17 @@ where
         mut events: Vec<Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
         info!("Node {} committing transaction {} with {} events", self.id, id, events.len());
+        let mut changes = Vec::new();
 
-        let mut updates: Vec<(Entity, Attested<proto::Event>)> = Vec::new();
         for event in events.iter_mut() {
             let collection = self.collections.get(&event.payload.collection).await?;
+            let entity = self.entities.get_retrieve_or_create(&event.payload.collection, &collection, &event.payload.entity_id).await?;
 
-            match self.entities.get_or_retrieve(event.payload.collection.clone(), &collection, event.payload.entity_id.clone()).await? {
-                Some(entity) => {
-                    // The policy agent may or may not decide to attest this event
-                    // but it must bail out with an error if the event is forbidden
-                    if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
-                        event.attestations.push(attestation);
-                    }
-                    updates.push((entity, event.clone()));
-                }
-                None => {
-                    warn!("Node {} received event for entity {} but no entity was found", self.id, event.payload.entity_id);
-                }
+            // we have the entity, so we can check access, optionally atteste, and apply/save the event;
+            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
+                event.attestations.push(attestation);
             }
-        }
-
-        // TODO - do we need to relay anything to other durable peers?
-        // presumably we are only getting called if we are a durable peer
-        // consider if we need to call relay_to_required_peers here
-        // Note that such relaying would be for ensureing durability
-        // guarantees, not for notifying subscribers, which is handled below
-
-        let mut changes = Vec::new();
-        // finally, apply events locally
-        for (entity, event) in updates {
-            let payload = &event.payload;
-            let collection = self.collections.get(&payload.collection).await?;
-            // only persist the event and the state change if the apply_event actually changed the entity
-            if entity.apply_event(&collection, &payload).await? {
+            if entity.apply_event(&collection, &event.payload).await? {
                 let state = entity.to_state()?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
@@ -534,6 +516,7 @@ where
                 changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
             }
         }
+
         self.reactor.notify_change(changes);
 
         Ok(())
@@ -672,23 +655,16 @@ where
                     attested_events.push(event);
                 }
 
-                match self.entities.get_or_retrieve(collection_id, &collection, entity_id).await? {
-                    Some(entity) => {
-                        let mut changed = false;
-                        for event in attested_events.iter() {
-                            changed = entity.apply_event(&collection, &event.payload).await?;
-                        }
-                        if changed {
-                            Ok(Some(EntityChange::new(entity, attested_events)?))
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    None => {
-                        // TODO - retrieve the state and apply the events
-                        warn!("Node {} received change for entity {} but no entity was found", self.id, entity_id);
-                        return Ok(None);
-                    }
+                let entity = self.entities.get_retrieve_or_create(&collection_id, &collection, &entity_id).await?;
+
+                let mut changed = false;
+                for event in attested_events.iter() {
+                    changed = entity.apply_event(&collection, &event.payload).await?;
+                }
+                if changed {
+                    Ok(Some(EntityChange::new(entity, attested_events)?))
+                } else {
+                    Ok(None)
                 }
             }
         }
@@ -843,7 +819,7 @@ where
             }
         }
 
-        if let Some(local) = self.entities.get(id) {
+        if let Some(local) = self.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", self.id);
             return Ok(local);
         }
