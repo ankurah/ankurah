@@ -200,7 +200,7 @@ impl StorageCollection for IndexedDBBucket {
             }
 
             let entity = js_sys::Object::new();
-            set_property(&entity, &ID_KEY, &state.payload.entity_id.into())?;
+            set_property(&entity, &ID_KEY, &state.payload.entity_id.as_string().into())?;
             set_property(&entity, &COLLECTION_KEY, &self.collection_id.as_str().into())?;
             set_property(&entity, &STATE_BUFFER_KEY, &(&state.payload.state.state_buffers).try_into()?)?;
             set_property(&entity, &HEAD_KEY, &(&(state.payload.state.head)).into())?;

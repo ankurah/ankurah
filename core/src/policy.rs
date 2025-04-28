@@ -186,15 +186,15 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
-        _event: &proto::Attested<proto::Event>,
+        from_node: &proto::EntityId,
+        event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
-        info!("PermissiveAgent validate_received_event: {:?}", _event);
+        debug!("PermissiveAgent validate_received_event {} from {}", event, from_node);
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
-        info!("PermissiveAgent attest_state: {:?}", _state);
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation> {
+        debug!("PermissiveAgent attest_state: {}", state);
         // This PolicyAgent does not require attestation, so we return None
         // Client/Server policy agents may also return None and defer to the server identity to validate the received state
         None
@@ -204,40 +204,40 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _node: &Node<SE, Self>,
         _from_node: &proto::EntityId,
-        _state: &Attested<proto::EntityState>,
+        state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
-        info!("PermissiveAgent validate_received_state: {:?}", _state);
+        debug!("PermissiveAgent validate_received_state: {}", state);
         // This PolicyAgent does not require validation, so we return Ok
         // Client/Server policy agents may use the _from_node to validate the received state rather than an attestation
         Ok(())
     }
 
-    fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> {
-        info!("PermissiveAgent can_access_collection: {:?}", _collection);
+    fn can_access_collection(&self, _context: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied> {
+        debug!("PermissiveAgent can_access_collection: {}", collection);
         Ok(())
     }
 
     fn check_read(
         &self,
         _context: &Self::ContextData,
-        _id: &proto::EntityId,
+        id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
     ) -> Result<(), AccessDenied> {
         // If your policy agent wants to inspect the entity properties, it can do so with either TemporaryEntity::new or entityset.with_state
-        info!("PermissiveAgent check_read: {:?}", _id);
+        debug!("PermissiveAgent check_read: {}", id);
         Ok(())
     }
 
-    fn check_read_event(&self, _context: &Self::ContextData, _event: &Attested<proto::Event>) -> Result<(), AccessDenied> {
+    fn check_read_event(&self, _context: &Self::ContextData, event: &Attested<proto::Event>) -> Result<(), AccessDenied> {
         // TODO - think about the best way to get the entity properties for cases where we want to inspect
         // presumably this would need to be changed to async, and we'd need a way to retrieve entity state from storage, or possibly even a remote node
-        info!("PermissiveAgent check_read_event: {:?}", _event);
+        debug!("PermissiveAgent check_read_event: {}", event);
         Ok(())
     }
 
     fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied> {
-        info!("PermissiveAgent check_write: {:?}", event);
+        debug!("PermissiveAgent check_write: {}", event.map_or_else(String::new, |e| e.id().to_string()));
         Ok(())
     }
 
@@ -247,7 +247,7 @@ impl PolicyAgent for PermissiveAgent {
         _collection: &proto::CollectionId,
         predicate: Predicate,
     ) -> Result<Predicate, AccessDenied> {
-        info!("PermissiveAgent filter_predicate: {:?}", predicate);
+        debug!("PermissiveAgent filter_predicate: {}", predicate);
         Ok(predicate)
     }
 
