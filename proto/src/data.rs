@@ -76,10 +76,33 @@ pub struct EventFragment {
     pub attestations: AttestationSet,
 }
 
+impl From<Attested<Event>> for EventFragment {
+    fn from(attested: Attested<Event>) -> Self {
+        Self { operations: attested.payload.operations, parent: attested.payload.parent, attestations: attested.attestations }
+    }
+}
+
+impl From<(EntityId, CollectionId, EventFragment)> for Attested<Event> {
+    fn from(value: (EntityId, CollectionId, EventFragment)) -> Self {
+        let event = Event { entity_id: value.0, collection: value.1, operations: value.2.operations, parent: value.2.parent };
+        Attested { payload: event, attestations: value.2.attestations }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StateFragment {
     pub state: State,
     pub attestations: AttestationSet,
+}
+
+impl From<Attested<EntityState>> for StateFragment {
+    fn from(attested: Attested<EntityState>) -> Self { Self { state: attested.payload.state, attestations: attested.attestations } }
+}
+impl From<(EntityId, CollectionId, StateFragment)> for Attested<EntityState> {
+    fn from(value: (EntityId, CollectionId, StateFragment)) -> Self {
+        let entity_state = EntityState { entity_id: value.0, collection: value.1, state: value.2.state };
+        Attested { payload: entity_state, attestations: value.2.attestations }
+    }
 }
 
 impl Event {
@@ -154,6 +177,12 @@ impl std::fmt::Display for Event {
     }
 }
 
+impl std::fmt::Display for EventFragment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EventFragment(parent {} operations {})", self.parent, self.operations)
+    }
+}
+
 impl std::fmt::Display for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -162,6 +191,12 @@ impl std::fmt::Display for State {
             self.head,
             self.state_buffers.iter().map(|(backend, buf)| format!("{} => {}b", backend, buf.len())).collect::<Vec<_>>().join(" ")
         )
+    }
+}
+
+impl std::fmt::Display for StateFragment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StateFragment(state {} attestations: {})", self.state, self.attestations.len())
     }
 }
 

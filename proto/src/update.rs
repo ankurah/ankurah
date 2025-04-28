@@ -1,9 +1,9 @@
 use crate::{
     auth::Attested,
     data::{EntityState, Event, State},
-    id::{CollectionId, EntityId},
+    id::EntityId,
     subscription::SubscriptionId,
-    Attestation, EventFragment, StateFragment,
+    Attestation, CollectionId, EventFragment, StateFragment,
 };
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -24,6 +24,19 @@ pub enum SubscriptionUpdateItem {
     Change { entity_id: EntityId, collection: CollectionId, events: Vec<EventFragment> },
     // Note: this is not a resultset change, it's a subscription change
     // that means we don't care about removes, because the reactor handles that
+}
+
+impl SubscriptionUpdateItem {
+    pub fn initial(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>) -> Self {
+        Self::Initial { entity_id, collection, state: state.into() }
+    }
+    pub fn add(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>, events: Vec<Attested<Event>>) -> Self {
+        // TODO sanity check to make sure the events are for the same entity
+        Self::Add { entity_id, collection, state: state.into(), events: events.into_iter().map(|e| e.into()).collect() }
+    }
+    pub fn change(entity_id: EntityId, collection: CollectionId, events: Vec<Attested<Event>>) -> Self {
+        Self::Change { entity_id, collection, events: events.into_iter().map(|e| e.into()).collect() }
+    }
 }
 
 /// An update from one node to another
@@ -87,12 +100,14 @@ impl std::fmt::Display for NodeUpdateBody {
 impl std::fmt::Display for SubscriptionUpdateItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SubscriptionUpdateItem::Initial { state } => write!(f, "Initial: {}", state),
-            SubscriptionUpdateItem::Add { state, events } => {
-                write!(f, "Add: {} {}", state, events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
+            SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
+                write!(f, "Initial: {} {} {}", entity_id, collection, state)
             }
-            SubscriptionUpdateItem::Change { events } => {
-                write!(f, "Change: {}", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
+            SubscriptionUpdateItem::Add { entity_id, collection, state, events } => {
+                write!(f, "Add: {} {} {}", entity_id, collection, state)
+            }
+            SubscriptionUpdateItem::Change { entity_id, collection, events } => {
+                write!(f, "Change: {} {} {}", entity_id, collection, events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
             }
         }
     }

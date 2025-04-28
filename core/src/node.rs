@@ -524,6 +524,7 @@ where
     ) -> Result<Option<EntityChange>, MutationError> {
         match update {
             proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
+                let state = (entity_id, collection, state).into();
                 self.policy_agent.validate_received_state(self, &from_peer_id, &state)?;
 
                 let payload = state.payload;
@@ -531,7 +532,7 @@ where
 
                 match self.entities.with_state(&collection, payload.entity_id.clone(), payload.collection, payload.state).await? {
                     (Some(true), entity) => {
-                        // We had the entity already, and this state is newer than the one we have
+                        // We had the entity already, and this state is newer than the one we have, so save it to the collection
                         collection.set_state(payload.entity_id, &entity.to_state()?).await?;
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
@@ -540,82 +541,83 @@ where
                         Ok(None)
                     }
                     (None, entity) => {
-                        // We did not have the entity yet, so we created it
+                        // We did not have the entity yet, so we created it, so save it to the collection
                         collection.set_state(payload.entity_id, &entity.to_state()?).await?;
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
                 }
             }
-            proto::SubscriptionUpdateItem::Add { entity_id, collection, state, events } => {
-                // sanity check - validate that the events all belong to the same entity as the state
-                // and return an error if they don't. See comment in EntityChange for details on how we might do better than this.
-                for event in events.iter() {
-                    if &state.payload.entity_id != &event.payload.entity_id {
-                        return Err(MutationError::InvalidEvent);
-                    }
-                }
+            proto::SubscriptionUpdateItem::Add { entity_id, collection: collection_id, state, events } => {
+                let collection = self.collections.get(&collection_id).await?;
 
-                let collection = self.collections.get(&state.payload.collection).await?;
+                // validate and store the events, in case we need them for lineage comparison
+                let mut attested_events = Vec::new();
                 for event in events.iter() {
+                    let event = (entity_id.clone(), collection_id.clone(), event.clone()).into();
                     self.policy_agent.validate_received_event(self, &from_peer_id, &event)?;
                     // store the validated event in case we need it for lineage comparison
                     collection.add_event(&event).await?;
+                    attested_events.push(event);
                 }
-                self.policy_agent.validate_received_state(self, &from_peer_id, &state)?;
-                let entity_id = state.payload.entity_id;
-                let collection_id = state.payload.collection;
-                let state = state.payload.state;
 
-                match self.entities.with_state(&collection, entity_id, collection_id, state).await? {
+                let state = (entity_id.clone(), collection_id.clone(), state).into();
+                self.policy_agent.validate_received_state(self, &from_peer_id, &state)?;
+
+                match self.entities.with_state(&collection, entity_id, collection_id, state.payload.state).await? {
                     (Some(false), _entity) => {
                         // had it already, and the state is not newer than the one we have
                         Ok(None)
                     }
                     (Some(true), entity) => {
                         // had it already, and the state is newer than the one we have, and was applied successfully, so save it and return the change
-                        collection.set_state(entity.id(), &entity.to_state()?).await?;
-                        Ok(Some(EntityChange::new(entity, events)?))
+                        // reduce the probability of error by reprojecting the state - is this necessary if we've validated the attestation?
+                        let state = entity.to_state()?;
+                        // TODO - either way, we should store the attested state, either by attesting the reprojected
+                        // version ourselves, or by storing the original attested state without reprojecting. Discuss.
+                        // let state = self.policy_agent.attest_state(self, &state);
+                        // just storing the unattested state for now
+                        collection.set_state(entity.id(), &state).await?;
+                        Ok(Some(EntityChange::new(entity, attested_events)?))
                     }
 
                     (None, entity) => {
                         // did not have it, so we created it, so save it and return the change
+                        // Ditto the same thing as above regarding attestation/reprojection
                         collection.set_state(entity.id(), &entity.to_state()?).await?;
-                        Ok(Some(EntityChange::new(entity, events)?))
+                        Ok(Some(EntityChange::new(entity, attested_events)?))
                     }
                 }
             }
-            proto::SubscriptionUpdateItem::Change { entity_id, collection, events } => {
-                let collection = self.collections.get(&state.payload.collection).await?;
+            proto::SubscriptionUpdateItem::Change { entity_id, collection: collection_id, events } => {
+                let collection = self.collections.get(&collection_id).await?;
+                let mut attested_events = Vec::new();
                 for event in events.iter() {
+                    let event = (entity_id.clone(), collection_id.clone(), event.clone()).into();
+
                     self.policy_agent.validate_received_event(self, &from_peer_id, &event)?;
                     // store the validated event in case we need it for lineage comparison
                     collection.add_event(&event).await?;
+                    attested_events.push(event);
                 }
 
-                // self.entities.get
-                //     // check with policy agentif this is a valid attested state
-                //     unimplemented!()
-                //     // HERE! - Should we take the aggragation we are given and assume/validate they are are the same entity, emitting a single EntityChange?
-                //     // match self.policy_agent.validate_received_event(self, from_peer_id, &update) {
-                //     //     Ok(()) => {
-                //     //         let entity = self.get_entity(&update.payload.collection, update.payload.entity_id.clone()).await?;
-                //     //         entity.apply_event(&update.payload).await?;
-                //     //         let collection = self.collections.get(&update.payload.collection).await?;
-                //     //         let state = entity.to_state()?;
-                //     //         collection.add_event(&update).await?;
-                //     //         info!(
-                //     //             "Node {} set_state for entity {} in collection {}",
-                //     //             self.id, update.payload.entity_id, update.payload.collection
-                //     //         );
-                //     //         let changed = collection.set_state(update.payload.entity_id, &state).await?;
-                //     //         if changed {
-                //     //             changes.push(EntityChange { entity: entity.clone(), events: vec![update.clone()] });
-                //     //         }
-                //     //     }
-                //     //     Err(e) => {
-                //     //         warn!("Node {} received invalid event from peer {} - {}", self.id, from_peer_id, e);
-                //     //     }
-                //     // }
+                match self.entities.get_or_retrieve(collection_id, &collection, entity_id).await? {
+                    Some(entity) => {
+                        let mut changed = false;
+                        for event in attested_events.iter() {
+                            changed = entity.apply_event(&collection, &event.payload).await?;
+                        }
+                        if changed {
+                            Ok(Some(EntityChange::new(entity, attested_events)?))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    None => {
+                        // TODO - retrieve the state and apply the events
+                        warn!("Node {} received change for entity {} but no entity was found", self.id, entity_id);
+                        return Ok(None);
+                    }
+                }
             }
         }
     }
@@ -688,12 +690,14 @@ where
                         match change {
                             ItemChange::Initial { item } => {
                                 // For initial state, include both events and state
-                                if let Ok(state) = item.to_state() {
-                                    let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
+                                if let Ok(es) = item.to_entity_state() {
                                     let attestation = node.policy_agent.attest_state(&node, &es);
 
-                                    // LEFT OFF HERE - need a constructor for SubscriptionUpdateItems that converts attested entity and events into fragments for SubscriptionUpdateItem
-                                    updates.push(proto::SubscriptionUpdateItem::Initial { state: Attested::opt(es, attestation) });
+                                    updates.push(proto::SubscriptionUpdateItem::initial(
+                                        item.id(),
+                                        item.collection.clone(),
+                                        Attested::opt(es, attestation),
+                                    ));
                                 }
                             }
                             ItemChange::Add { item, events } => {
@@ -713,10 +717,15 @@ where
                                 let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
                                 let attestation = node.policy_agent.attest_state(&node, &es);
 
-                                updates.push(proto::SubscriptionUpdateItem::Add { state: Attested::opt(es, attestation), events });
+                                updates.push(proto::SubscriptionUpdateItem::add(
+                                    item.id,
+                                    item.collection.clone(),
+                                    Attested::opt(es, attestation),
+                                    events,
+                                ));
                             }
-                            ItemChange::Update { events, .. } | ItemChange::Remove { events, .. } => {
-                                updates.push(proto::SubscriptionUpdateItem::Change { events });
+                            ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
+                                updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
                             }
                         }
                     }

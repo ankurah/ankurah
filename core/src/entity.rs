@@ -7,7 +7,7 @@ use crate::{
     Node,
 };
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{clock, Clock, CollectionId, EntityId, Event, EventId, OperationSet, State};
+use ankurah_proto::{clock, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
@@ -69,6 +69,11 @@ impl Entity {
     pub fn to_state(&self) -> Result<State, StateError> {
         let state_buffers = self.backends.to_state_buffers()?;
         Ok(State { state_buffers, head: self.head() })
+    }
+
+    pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
+        let state = self.to_state()?;
+        Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
     }
 
     // used by the Model macro
@@ -319,6 +324,27 @@ impl WeakEntitySet {
         }
     }
 
+    pub async fn get_or_retrieve(
+        &self,
+        collection_id: CollectionId,
+        collection: &StorageCollectionWrapper,
+        id: EntityId,
+    ) -> Result<Option<Entity>, RetrievalError> {
+        // do it in two phases to avoid holding the lock while waiting for the collection
+        match self.get(id) {
+            Some(entity) => Ok(Some(entity)),
+            None => match collection.get_state(id).await {
+                Err(RetrievalError::EntityNotFound(_)) => Ok(None),
+                Err(e) => Err(e),
+                Ok(state) => {
+                    // technically someone could have added the entity since we last checked, so it's better to use the
+                    // with_state method to re-check
+                    let (_, entity) = self.with_state(collection, id, collection_id, state).await?;
+                    Ok(Some(entity))
+                }
+            },
+        }
+    }
     /// Create a brand new entity, and add it to the set
     pub fn create(&self, collection: CollectionId) -> Entity {
         let mut entities = self.0.write().unwrap();

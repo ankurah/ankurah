@@ -14,7 +14,7 @@ pub struct Attested<T> {
     pub attestations: AttestationSet,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AttestationSet(pub Vec<Attestation>);
 
 impl std::ops::Deref for AttestationSet {
