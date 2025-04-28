@@ -11,7 +11,7 @@ use ankurah_proto::{clock, Clock, CollectionId, EntityId, EntityState, Event, Ev
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
-use tracing::debug;
+use tracing::{debug, error};
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -162,7 +162,17 @@ impl Entity {
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                debug!("NotDescends - skip");
+                // TODOs:
+                // [ ] we should probably have some rules about when a non-descending (concurrent) event is allowed. In a way, this is the same question as Descends with a gap, as discussed above
+                // [ ] update LWW backend determine which value to keep based on its deterministic last write win strategy. (just lexicographic winner, I think?)
+                // [ ] differentiate NotDescends into Ascends and Concurrent. we should ignore the former, and apply the latter
+                // just doing the needful for now
+                debug!("NotDescends - applying");
+                for (backend_name, operations) in event.operations.iter() {
+                    self.backends.apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent)?;
+                }
+                // concurrent - so augment the head
+                self.head.lock().unwrap().insert(event.id());
                 return Ok(false);
             }
             lineage::Ordering::Incomparable => {
@@ -170,6 +180,7 @@ impl Entity {
                 Err(LineageError::Incomparable.into())
             }
             lineage::Ordering::PartiallyDescends { meet } => {
+                error!("PartiallyDescends - skipping this event, but we should probably be handling this");
                 // TODO - figure out how to handle this. I don't think we need to materialize a new event
                 // but it requires that we update the propertybackends to support this
                 Err(LineageError::PartiallyDescends { meet }.into())
@@ -192,22 +203,22 @@ impl Entity {
                 return Ok(false);
             }
             lineage::Ordering::Descends => {
-                tracing::info!("Entity {} apply_state - new head descends from current, applying", self.id);
+                tracing::debug!("Entity {} apply_state - new head descends from current, applying", self.id);
                 self.backends.apply_state(&state)?;
                 *self.head.lock().unwrap() = new_head;
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                tracing::info!("Entity {} apply_state - new head does not descend, meet: {:?}", self.id, meet);
+                tracing::warn!("Entity {} apply_state - new head does not descend, meet: {:?}", self.id, meet);
                 return Ok(false);
             }
             lineage::Ordering::Incomparable => {
-                tracing::info!("Entity {} apply_state - heads are incomparable", self.id);
+                tracing::error!("Entity {} apply_state - heads are incomparable", self.id);
                 // total apples and oranges - take a hike buddy
                 Err(LineageError::Incomparable.into())
             }
             lineage::Ordering::PartiallyDescends { meet } => {
-                tracing::info!("Entity {} apply_state - heads partially descend, meet: {:?}", self.id, meet);
+                tracing::error!("Entity {} apply_state - heads partially descend, meet: {:?}", self.id, meet);
                 // TODO - figure out how to handle this. I don't think we need to materialize a new event
                 // but it requires that we update the propertybackends to support this
                 Err(LineageError::PartiallyDescends { meet }.into())
