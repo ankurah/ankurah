@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use ankurah_proto as proto;
 use ankurah_proto::Event;
+use ankurah_proto::{self as proto, EntityId};
 
 use crate::{
     context::TContext,
@@ -68,8 +68,28 @@ impl Transaction {
         let entity_ref = self.add_entity(entity);
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
     }
+    fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
+    pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<M::Mutable<'rec>, MutationError> {
+        match self.get_trx_entity(id) {
+            Some(entity) => Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity)),
+            None => {
+                // go fetch the entity from the context
+                let retrieved_entity =
+                    self.dyncontext.as_ref().expect("Transaction already consumed").get_entity(id.clone(), &M::collection(), false).await?;
+                // double check to make sure somebody didn't add the entity to the trx during the await
+                // because we're forking the entity, we need to make sure we aren't adding the same entity twice
+                if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
+                    // if this happens, I don't think we want to refresh the entity, because it's already snapshotted in the trx
+                    // and we should leave it that way to honor the consistency model
+                    Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
+                } else {
+                    Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(self.add_entity(retrieved_entity.snapshot())))
+                }
+            }
+        }
+    }
     pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<M::Mutable<'rec>, MutationError> {
-        if let Some(entity) = self.entities.iter().find(|e| e.id == entity.id && e.collection == entity.collection) {
+        if let Some(entity) = self.get_trx_entity(&entity.id) {
             return Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity));
         }
         self.dyncontext.as_ref().expect("Transaction already consumed").check_write(entity)?;

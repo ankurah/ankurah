@@ -2,7 +2,7 @@ use ankql::selection::filter::evaluate_predicate;
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::storage::{StorageCollection, StorageEngine};
-use ankurah_proto::{self as proto, Attested, EntityId, EventId};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState, EventId, State};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -164,7 +164,7 @@ impl StorageEngine for IndexedDBStorageEngine {
 
 #[async_trait]
 impl StorageCollection for IndexedDBBucket {
-    async fn set_state(&self, id: proto::EntityId, state: &proto::State) -> Result<bool, MutationError> {
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, MutationError> {
             res.map_err(|e| MutationError::FailedStep(msg, e.into().as_string().unwrap_or_default()))
         }
@@ -178,7 +178,7 @@ impl StorageCollection for IndexedDBBucket {
             // Get the old entity if it exists to check for changes
             let transaction = step(self.db.transaction_with_str_and_mode("entities", Readwrite), "create transaction")?;
             let store = step(transaction.object_store("entities"), "get object store")?;
-            let old_request = step(store.get(&id.as_string().into()), "get old entity")?;
+            let old_request = step(store.get(&state.payload.entity_id.as_string().into()), "get old entity")?;
             let foo = CBFuture::new(&old_request, "success", "error").await;
             let _: () = step(foo, "get old entity")?;
 
@@ -190,7 +190,7 @@ impl StorageCollection for IndexedDBBucket {
 
                 if !old_head.is_undefined() && !old_head.is_null() {
                     let old_clock: proto::Clock = old_head.try_into()?;
-                    if old_clock == state.head {
+                    if old_clock == state.payload.state.head {
                         // return false if the head is the same. This was formerly disabled for IndexedDB because it was breaking things
                         // by *accurately* reporting that the stored entity had not changed, because it was applied by another browser window moments earlier.
                         // Now we are checking the resident entity to see if it has been updated, which is more correct.
@@ -200,13 +200,14 @@ impl StorageCollection for IndexedDBBucket {
             }
 
             let entity = js_sys::Object::new();
-            set_property(&entity, &ID_KEY, &id.into())?;
+            set_property(&entity, &ID_KEY, &state.payload.entity_id.into())?;
             set_property(&entity, &COLLECTION_KEY, &self.collection_id.as_str().into())?;
-            set_property(&entity, &STATE_BUFFER_KEY, &(&state.state_buffers).try_into()?)?;
-            set_property(&entity, &HEAD_KEY, &(&(state.head)).into())?;
+            set_property(&entity, &STATE_BUFFER_KEY, &(&state.payload.state.state_buffers).try_into()?)?;
+            set_property(&entity, &HEAD_KEY, &(&(state.payload.state.head)).into())?;
+            set_property(&entity, &ATTESTATIONS_KEY, &(&state.attestations).try_into()?)?;
 
             // Put the entity in the store
-            let request = step(store.put_with_key(&entity, &id.as_string().into()), "put entity in store")?;
+            let request = step(store.put_with_key(&entity, &state.payload.entity_id.as_string().into()), "put entity in store")?;
 
             step(CBFuture::new(&request, "success", "error").await, "put entity in store")?;
             step(CBFuture::new(&transaction, "complete", "error").await, "complete transaction")?;
@@ -216,7 +217,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_state(&self, id: proto::EntityId) -> Result<proto::State, RetrievalError> {
+    async fn get_state(&self, id: proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
             res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
         }
@@ -238,15 +239,22 @@ impl StorageCollection for IndexedDBBucket {
 
             let entity: web_sys::js_sys::Object = step(result.dyn_into(), "dyn into")?;
 
-            Ok(proto::State {
-                state_buffers: get_property(&entity, &STATE_BUFFER_KEY)?.try_into()?,
-                head: get_property(&entity, &HEAD_KEY)?.try_into()?,
+            Ok(Attested {
+                payload: EntityState {
+                    entity_id: id,
+                    collection: self.collection_id.clone(),
+                    state: State {
+                        state_buffers: get_property(&entity, &STATE_BUFFER_KEY)?.try_into()?,
+                        head: get_property(&entity, &HEAD_KEY)?.try_into()?,
+                    },
+                },
+                attestations: get_property(&entity, &ATTESTATIONS_KEY)?.try_into()?,
             })
         })
         .await
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(proto::EntityId, proto::State)>, RetrievalError> {
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let collection_id = self.collection_id.clone();
 
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
@@ -260,7 +268,7 @@ impl StorageCollection for IndexedDBBucket {
             let key_range = step(web_sys::IdbKeyRange::only(&(&collection_id).as_str().into()), "create key range")?;
             let request = step(index.open_cursor_with_range(&key_range), "open cursor")?;
 
-            let mut tuples = Vec::new();
+            let mut output: Vec<Attested<EntityState>> = Vec::new();
             let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
 
             while let Some(result) = stream.next().await {
@@ -274,22 +282,28 @@ impl StorageCollection for IndexedDBBucket {
                 let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
                 let entity = step(cursor.value(), "get cursor value")?;
                 let id = get_property(&entity, &ID_KEY)?.try_into()?;
-                let entity_state = proto::State {
-                    state_buffers: get_property(&entity, &STATE_BUFFER_KEY)?.try_into()?,
-                    head: get_property(&entity, &HEAD_KEY)?.try_into()?,
+                let entity_state = EntityState {
+                    collection: collection_id.clone(),
+                    entity_id: id,
+                    state: State {
+                        state_buffers: get_property(&entity, &STATE_BUFFER_KEY)?.try_into()?,
+                        head: get_property(&entity, &HEAD_KEY)?.try_into()?,
+                    },
                 };
+                let attestations = get_property(&entity, &ATTESTATIONS_KEY)?.try_into()?;
+                let attested_state = Attested { payload: entity_state, attestations };
 
                 // Create entity to evaluate predicate
-                let entity = TemporaryEntity::new(id, collection_id.clone(), &entity_state)?;
+                let entity = TemporaryEntity::new(id, collection_id.clone(), &attested_state.payload.state)?;
                 // Apply predicate filter
                 if evaluate_predicate(&entity, predicate)? {
-                    tuples.push((id, entity_state));
+                    output.push(attested_state);
                 }
 
                 step(cursor.continue_(), "advance cursor")?;
             }
 
-            Ok(tuples)
+            Ok(output)
         })
         .await
     }
@@ -397,7 +411,7 @@ mod tests {
 
     use super::*;
     use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Mutable, Node, PermissiveAgent};
-    use ankurah_proto::StateBuffers;
+    use ankurah_proto::{AttestationSet, StateBuffers};
     use serde::{Deserialize, Serialize};
     use wasm_bindgen_test::*;
 
@@ -462,15 +476,18 @@ mod tests {
         let mut state_buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
         let state = proto::State { state_buffers: StateBuffers(state_buffers), head: proto::Clock::default() };
-
+        let attested_state = Attested {
+            payload: EntityState { entity_id: id, collection: "albums".into(), state },
+            attestations: AttestationSet::default(),
+        };
         // Set the entity
-        bucket.set_state(id.clone(), &state).await.expect("Failed to set entity");
+        bucket.set_state(attested_state.clone()).await.expect("Failed to set entity");
 
         // Get the entity back
         let retrieved_state = bucket.get_state(id).await.expect("Failed to get entity 6");
         tracing::info!("Retrieved state: {:?}", retrieved_state);
 
-        assert_eq!(state.state_buffers, retrieved_state.state_buffers);
+        assert_eq!(attested_state.payload.state.state_buffers, retrieved_state.payload.state.state_buffers);
 
         // Drop the bucket and engine to close connections
         drop(bucket);
