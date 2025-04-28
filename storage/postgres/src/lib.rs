@@ -8,7 +8,7 @@ use ankurah_core::{
     property::Backends,
     storage::{StorageCollection, StorageEngine},
 };
-use ankurah_proto::{Attestation, AttestationSet, Attested, EventId, OperationSet, State, StateBuffers};
+use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
 
 use futures_util::TryStreamExt;
 
@@ -158,7 +158,8 @@ impl PostgresBucket {
             r#"CREATE TABLE IF NOT EXISTS "{}"(
                 "id" character(22) PRIMARY KEY,
                 "state_buffer" BYTEA,
-                "head" character(43)[]
+                "head" character(43)[],
+                "attestations" BYTEA[]
             )"#,
             self.state_table()
         );
@@ -200,22 +201,26 @@ impl PostgresBucket {
 
 #[async_trait]
 impl StorageCollection for PostgresBucket {
-    async fn set_state(&self, id: EntityId, state: &State) -> Result<bool, MutationError> {
-        let state_buffers = bincode::serialize(&state.state_buffers)?;
+    async fn set_state(&self, state: &Attested<EntityState>) -> Result<bool, MutationError> {
+        let state_buffers = bincode::serialize(&state.payload.state.state_buffers)?;
+        let attestations: Vec<Vec<u8>> =
+            state.attestations.iter().map(|attestation| bincode::serialize(attestation)).collect::<Result<Vec<_>, _>>()?;
+        let id = state.payload.entity_id.clone();
 
         // Ensure head is not empty for new records
-        if state.head.is_empty() {
+        if state.payload.state.head.is_empty() {
             warn!("Warning: Empty head detected for entity {}", id);
         }
 
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
 
-        let backends = Backends::from_state_buffers(&state.state_buffers)?;
-        let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned()];
+        let backends = Backends::from_state_buffers(&state.payload.state.state_buffers)?;
+        let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned(), "attestations".to_owned()];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
         params.push(&id);
         params.push(&state_buffers);
-        params.push(&state.head);
+        params.push(&state.payload.state.head);
+        params.push(&attestations);
 
         let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
         for (column, value) in backends.property_values() {
@@ -283,7 +288,7 @@ impl StorageCollection for PostgresBucket {
                     ErrorKind::UndefinedTable { table } => {
                         if table == self.state_table() {
                             self.create_state_table(&mut *client).await?;
-                            return self.set_state(id, state).await; // retry
+                            return self.set_state(state).await; // retry
                         }
                     }
                     _ => {}
@@ -297,16 +302,16 @@ impl StorageCollection for PostgresBucket {
         let old_head: Option<Clock> = row.get("old_head");
         let changed = match old_head {
             None => true, // New entity
-            Some(old_head) => old_head != state.head,
+            Some(old_head) => old_head != state.payload.state.head,
         };
 
         debug!("PostgresBucket({}).set_state: Changed: {}", self.collection_id, changed);
         Ok(changed)
     }
 
-    async fn get_state(&self, id: EntityId) -> Result<State, RetrievalError> {
+    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         // be careful with sql injection via bucket name
-        let query = format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE "id" = $1"#, self.state_table());
+        let query = format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}" WHERE "id" = $1"#, self.state_table());
 
         let mut client = match self.pool.get().await {
             Ok(client) => client,
@@ -345,11 +350,24 @@ impl StorageCollection for PostgresBucket {
         let state_buffers: BTreeMap<String, Vec<u8>> =
             bincode::deserialize(&serialized_buffers).map_err(|err| RetrievalError::storage(err))?;
         let head: Clock = row.try_get("head").map_err(|err| RetrievalError::storage(err))?;
+        let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(|err| RetrievalError::storage(err))?;
+        let attestations = attestation_bytes
+            .into_iter()
+            .map(|bytes| bincode::deserialize(&bytes))
+            .collect::<Result<Vec<Attestation>, _>>()
+            .map_err(|err| RetrievalError::storage(err))?;
 
-        Ok(State { state_buffers: StateBuffers(state_buffers), head })
+        Ok(Attested {
+            payload: EntityState {
+                entity_id: id,
+                collection: self.collection_id.clone(),
+                state: State { state_buffers: StateBuffers(state_buffers), head },
+            },
+            attestations: AttestationSet(attestations),
+        })
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(EntityId, State)>, RetrievalError> {
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         debug!("fetch_states: {:?}", predicate);
         let client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
 
@@ -361,9 +379,9 @@ impl StorageCollection for PostgresBucket {
         let (sql, args) = ankql_sql.collapse();
 
         let filtered_query = if !sql.is_empty() {
-            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}" WHERE {}"#, self.state_table(), sql,)
+            format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}" WHERE {}"#, self.state_table(), sql,)
         } else {
-            format!(r#"SELECT "id", "state_buffer", "head" FROM "{}""#, self.state_table())
+            format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}""#, self.state_table())
         };
 
         debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, filtered_query, args);
@@ -409,8 +427,21 @@ impl StorageCollection for PostgresBucket {
             let state_buffers: BTreeMap<String, Vec<u8>> =
                 bincode::deserialize(&state_buffer).map_err(|err| RetrievalError::storage(err))?;
             let head: Clock = row.try_get("head").map_err(|err| RetrievalError::storage(err))?;
-            let entity_state = State { state_buffers: StateBuffers(state_buffers), head };
-            results.push((id, entity_state));
+            let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(|err| RetrievalError::storage(err))?;
+            let attestations = attestation_bytes
+                .into_iter()
+                .map(|bytes| bincode::deserialize(&bytes))
+                .collect::<Result<Vec<Attestation>, _>>()
+                .map_err(|err| RetrievalError::storage(err))?;
+
+            results.push(Attested {
+                payload: EntityState {
+                    entity_id: id,
+                    collection: self.collection_id.clone(),
+                    state: State { state_buffers: StateBuffers(state_buffers), head },
+                },
+                attestations: AttestationSet(attestations),
+            });
         }
 
         Ok(results)

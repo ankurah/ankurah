@@ -43,16 +43,6 @@ impl Transaction {
         Self { dyncontext: Some(dyncontext), id: proto::TransactionId::new(), entities: AppendOnlyVec::new(), implicit: true }
     }
 
-    /// Fetch an entity already in the transaction.
-    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId) -> Result<&Entity, RetrievalError> {
-        if let Some(entity) = self.entities.iter().find(|entity| entity.id == id && entity.collection == *collection) {
-            return Ok(entity);
-        }
-
-        let upstream = self.dyncontext.as_ref().expect("Transaction already consumed").get_entity(id, collection).await?;
-        Ok(self.add_entity(upstream.snapshot()))
-    }
-
     fn add_entity(&self, entity: Entity) -> &Entity {
         let index = self.entities.push(entity);
         &self.entities[index]
@@ -78,13 +68,13 @@ impl Transaction {
         let entity_ref = self.add_entity(entity);
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
     }
-    // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
-    pub async fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, id: impl Into<proto::EntityId>) -> Result<M::Mutable<'rec>, MutationError> {
-        let id = id.into();
-        let entity = self.get_entity(id, &M::collection()).await?;
+    pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<M::Mutable<'rec>, MutationError> {
+        if let Some(entity) = self.entities.iter().find(|e| e.id == entity.id && e.collection == entity.collection) {
+            return Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity));
+        }
         self.dyncontext.as_ref().expect("Transaction already consumed").check_write(entity)?;
 
-        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
+        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(self.add_entity(entity.snapshot())))
     }
 
     #[must_use]

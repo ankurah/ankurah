@@ -143,7 +143,8 @@ where SE: StorageEngine + Send + Sync + 'static
         let root = Clock::new([event.id()]);
 
         storage.add_event(&event.into()).await?;
-        storage.set_state(system_entity.id.clone(), &system_entity.to_state()?).await?;
+        let attested_state = system_entity.to_entity_state()?.into();
+        storage.set_state(&attested_state).await?;
 
         system_entity.commit_head(root.clone());
 
@@ -219,8 +220,9 @@ where SE: StorageEngine + Send + Sync + 'static
         let mut entities = Vec::new();
         let mut root_clock = None;
 
-        for (id, state) in storage.fetch_states(&ankql::ast::Predicate::True).await? {
-            let (_entity_changed, entity) = self.0.entities.with_state(&storage, id, collection_id.clone(), state).await?;
+        for state in storage.fetch_states(&ankql::ast::Predicate::True).await? {
+            let (_entity_changed, entity) =
+                self.0.entities.with_state(&storage, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
             let lww_backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");

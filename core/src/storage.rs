@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
-use ankurah_proto::{Attested, CollectionId, EntityId, Event, EventId, State};
+use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId, State};
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 
@@ -20,27 +20,24 @@ pub trait StorageEngine: Send + Sync {
 
 #[async_trait]
 pub trait StorageCollection: Send + Sync {
-    // TODO - implement merge_states based on event history.
-    // Consider whether to play events forward from a prior checkpoint (probably this)
-    // or maybe to require PropertyBackends to be able to merge states.
-    async fn set_state(&self, id: EntityId, state: &State) -> Result<bool, MutationError>;
-    async fn get_state(&self, id: EntityId) -> Result<State, RetrievalError>;
+    async fn set_state(&self, state: &Attested<EntityState>) -> Result<bool, MutationError>;
+    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
     // Fetch raw entity states matching a predicate
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(EntityId, State)>, RetrievalError>;
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
-    async fn set_states(&self, entities: Vec<(EntityId, &State)>) -> Result<(), MutationError> {
-        for (id, state) in entities {
-            self.set_state(id, state).await?;
+    async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), MutationError> {
+        for state in states {
+            self.set_state(&state).await?;
         }
         Ok(())
     }
 
-    async fn get_states(&self, ids: Vec<EntityId>) -> Result<Vec<(EntityId, State)>, RetrievalError> {
+    async fn get_states(&self, ids: Vec<EntityId>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let mut states = Vec::new();
         for id in ids {
             match self.get_state(id).await {
-                Ok(state) => states.push((id, state)),
+                Ok(state) => states.push(state),
                 Err(RetrievalError::EntityNotFound(_)) => {
                     warn!("Entity not found: {:?}", id);
                 }

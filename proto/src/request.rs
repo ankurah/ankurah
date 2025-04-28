@@ -9,6 +9,7 @@ use crate::{
     id::EntityId,
     subscription::SubscriptionId,
     transaction::TransactionId,
+    EntityState, EventId,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -40,6 +41,8 @@ pub enum NodeRequestBody {
     // Request that the Events to be committed on the remote node
     CommitTransaction { id: TransactionId, events: Vec<Attested<Event>> },
     // Request to fetch entities matching a predicate
+    Get { collection: CollectionId, ids: Vec<EntityId> },
+    GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
     Fetch { collection: CollectionId, predicate: ast::Predicate },
     Subscribe { subscription_id: SubscriptionId, collection: CollectionId, predicate: ast::Predicate },
 }
@@ -57,7 +60,9 @@ pub struct NodeResponse {
 pub enum NodeResponseBody {
     // Response to CommitEvents
     CommitComplete { id: TransactionId },
-    Fetch(Vec<(EntityId, State)>),
+    Fetch(Vec<Attested<EntityState>>),
+    Get(Vec<Attested<EntityState>>),
+    GetEvents(Vec<Attested<Event>>),
     Subscribed { subscription_id: SubscriptionId },
     Success,
     Error(String),
@@ -81,6 +86,12 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::CommitTransaction { id, events } => {
                 write!(f, "CommitTransaction {id} [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
             }
+            NodeRequestBody::Get { collection, ids } => {
+                write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "))
+            }
+            NodeRequestBody::GetEvents { collection, event_ids } => {
+                write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "))
+            }
             NodeRequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")
             }
@@ -94,8 +105,14 @@ impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
-            NodeResponseBody::Fetch(tuples) => {
-                write!(f, "Fetch [{}]", tuples.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", "))
+            NodeResponseBody::Fetch(states) => {
+                write!(f, "Fetch [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
+            }
+            NodeResponseBody::Get(states) => {
+                write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
+            }
+            NodeResponseBody::GetEvents(events) => {
+                write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::Subscribed { subscription_id } => write!(f, "Subscribed {subscription_id}"),
             NodeResponseBody::Success => write!(f, "Success"),

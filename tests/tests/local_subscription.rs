@@ -48,7 +48,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     {
         let trx = client.begin();
         let albums: ResultSet<AlbumView> = client.fetch("name = 'Ice on the Dune'").await?;
-        let album = albums.items[0].edit(&trx).await?;
+        let album = albums.items[0].edit(&trx)?;
         album.year().overwrite(0, 4, "2020")?;
         trx.commit().await?;
     }
@@ -93,7 +93,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     {
         // Update Rex's age to 7
         let trx = node.begin();
-        rex.edit(&trx).await.unwrap().age().overwrite(0, 1, "7")?;
+        rex.edit(&trx).unwrap().age().overwrite(0, 1, "7")?;
         trx.commit().await.unwrap();
     }
 
@@ -103,7 +103,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     {
         // Update Snuffy's age to 3
         let trx = node.begin();
-        snuffy.edit(&trx).await.unwrap().age().overwrite(0, 1, "3")?;
+        snuffy.edit(&trx).unwrap().age().overwrite(0, 1, "3")?;
         trx.commit().await.unwrap();
     }
 
@@ -113,7 +113,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     // Update Jasper's age to 4
     {
         let trx = node.begin();
-        jasper.edit(&trx).await.unwrap().age().overwrite(0, 1, "4")?;
+        jasper.edit(&trx).unwrap().age().overwrite(0, 1, "4")?;
         trx.commit().await.unwrap();
     }
 
@@ -122,9 +122,9 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
 
     // Update Snuffy and Jasper to ages outside the range
     let trx = node.begin();
-    let snuffy_edit = snuffy.edit(&trx).await.unwrap();
+    let snuffy_edit = snuffy.edit(&trx).unwrap();
     snuffy_edit.age().overwrite(0, 1, "5")?;
-    let jasper_edit = jasper.edit(&trx).await.unwrap();
+    let jasper_edit = jasper.edit(&trx).unwrap();
     jasper_edit.age().overwrite(0, 1, "6")?;
     trx.commit().await.unwrap();
 
@@ -134,7 +134,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches
     let trx = node.begin();
-    let rex_edit = rex.edit(&trx).await.unwrap();
+    let rex_edit = rex.edit(&trx).unwrap();
     rex_edit.name().overwrite(0, 3, "NotRex")?;
     trx.commit().await.unwrap();
 

@@ -46,10 +46,10 @@ async fn repeatable_read() -> Result<()> {
     println!("_____________");
 
     let trx2 = client.begin();
-    let album_rw2 = album_ro.edit(&trx2).await?;
+    let album_rw2 = album_ro.edit(&trx2)?;
 
     let trx3 = client.begin();
-    let album_rw3 = album_ro.edit(&trx3).await?;
+    let album_rw3 = album_ro.edit(&trx3)?;
 
     // tx2 cats -> tofu
     album_rw2.name().delete(7, 4)?;
@@ -99,10 +99,10 @@ async fn pg_repeatable_read() -> Result<()> {
     let album_ro: AlbumView = client.get(id).await?;
 
     let trx2 = client.begin();
-    let album_rw2 = album_ro.edit(&trx2).await?;
+    let album_rw2 = album_ro.edit(&trx2)?;
 
     let trx3 = client.begin();
-    let album_rw3 = album_ro.edit(&trx3).await?;
+    let album_rw3 = album_ro.edit(&trx3)?;
 
     // tx2 cats -> tofu
     album_rw2.name().delete(7, 4)?;
@@ -149,10 +149,10 @@ async fn pg_events() -> Result<()> {
     let album_ro: AlbumView = client.get(id).await?;
 
     let trx2 = client.begin();
-    let album_rw2 = album_ro.edit(&trx2).await?;
+    let album_rw2 = album_ro.edit(&trx2)?;
 
     let trx3 = client.begin();
-    let album_rw3 = album_ro.edit(&trx3).await?;
+    let album_rw3 = album_ro.edit(&trx3)?;
 
     // tx2 cats -> tofu
     album_rw2.name().delete(7, 4)?;

@@ -339,7 +339,7 @@ impl WeakEntitySet {
                 Ok(state) => {
                     // technically someone could have added the entity since we last checked, so it's better to use the
                     // with_state method to re-check
-                    let (_, entity) = self.with_state(collection, id, collection_id, state).await?;
+                    let (_, entity) = self.with_state(collection, id, collection_id, state.payload.state).await?;
                     Ok(Some(entity))
                 }
             },

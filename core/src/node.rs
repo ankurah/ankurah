@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attestation, Attested, Clock, CollectionId, EntityState};
 use anyhow::anyhow;
 
 use async_trait::async_trait;
@@ -16,7 +16,7 @@ use crate::{
     context::Context,
     entity::{Entity, WeakEntitySet},
     error::{MutationError, RequestError, RetrievalError},
-    policy::PolicyAgent,
+    policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
     storage::StorageEngine,
     subscription::SubscriptionHandle,
@@ -342,8 +342,48 @@ where
                 self.policy_agent.can_access_collection(&cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
                 let predicate = self.policy_agent.filter_predicate(&cdata, &collection, predicate)?;
-                let states: Vec<_> = storage_collection.fetch_states(&predicate).await?.into_iter().collect();
+
+                let mut states = Vec::new();
+                for state in storage_collection.fetch_states(&predicate).await? {
+                    if self.policy_agent.check_read(&cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
+                        states.push(state);
+                    }
+                }
                 Ok(proto::NodeResponseBody::Fetch(states))
+            }
+            proto::NodeRequestBody::Get { collection, ids } => {
+                self.policy_agent.can_access_collection(&cdata, &collection)?;
+                let storage_collection = self.collections.get(&collection).await?;
+
+                // filter out any that the policy agent says we don't have access to
+                let mut states = Vec::new();
+                for state in storage_collection.get_states(ids).await? {
+                    match self.policy_agent.check_read(&cdata, &state.payload.entity_id, &collection, &state.payload.state) {
+                        Ok(_) => states.push(state),
+                        Err(AccessDenied::ByPolicy(_)) => {}
+                        // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
+                        Err(e) => return Err(anyhow!("Error from peer get: {}", e)),
+                    }
+                }
+
+                Ok(proto::NodeResponseBody::Get(states))
+            }
+            proto::NodeRequestBody::GetEvents { collection, event_ids } => {
+                self.policy_agent.can_access_collection(&cdata, &collection)?;
+                let storage_collection = self.collections.get(&collection).await?;
+
+                // filter out any that the policy agent says we don't have access to
+                let mut events = Vec::new();
+                for event in storage_collection.get_events(event_ids).await? {
+                    match self.policy_agent.check_read_event(&cdata, &event) {
+                        Ok(_) => events.push(event),
+                        Err(AccessDenied::ByPolicy(_)) => {}
+                        // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
+                        Err(e) => return Err(anyhow!("Error from peer subscription: {}", e)),
+                    }
+                }
+
+                Ok(proto::NodeResponseBody::GetEvents(events))
             }
             proto::NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
                 self.handle_subscribe_request(&cdata, request.from, subscription_id, collection, predicate).await
@@ -429,7 +469,12 @@ where
             // Persist
             let collection = self.collections.get(&attested_event.payload.collection).await?;
             collection.add_event(&attested_event).await?;
-            collection.set_state(attested_event.payload.entity_id.clone(), &entity.to_state()?).await?;
+            let state = entity.to_state()?;
+
+            let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+            let attestation = self.policy_agent.attest_state(self, &entity_state);
+            let attested = Attested::opt(entity_state, attestation);
+            collection.set_state(&attested).await?;
 
             changes.push(EntityChange::new(entity.clone(), vec![attested_event])?);
         }
@@ -450,13 +495,21 @@ where
 
         let mut updates: Vec<(Entity, Attested<proto::Event>)> = Vec::new();
         for event in events.iter_mut() {
-            let entity = self.get_entity(&event.payload.collection, event.payload.entity_id.clone()).await?;
-            // The policy agent may or may not decide to attest this event
-            // but it must bail out with an error if the event is forbidden
-            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
-                event.attestations.push(attestation);
+            let collection = self.collections.get(&event.payload.collection).await?;
+
+            match self.entities.get_or_retrieve(event.payload.collection.clone(), &collection, event.payload.entity_id.clone()).await? {
+                Some(entity) => {
+                    // The policy agent may or may not decide to attest this event
+                    // but it must bail out with an error if the event is forbidden
+                    if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
+                        event.attestations.push(attestation);
+                    }
+                    updates.push((entity, event.clone()));
+                }
+                None => {
+                    warn!("Node {} received event for entity {} but no entity was found", self.id, event.payload.entity_id);
+                }
             }
-            updates.push((entity, event.clone()));
         }
 
         // TODO - do we need to relay anything to other durable peers?
@@ -473,8 +526,11 @@ where
             // only persist the event and the state change if the apply_event actually changed the entity
             if entity.apply_event(&collection, &payload).await? {
                 let state = entity.to_state()?;
+                let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                let attestation = self.policy_agent.attest_state(self, &entity_state);
+                let attested = Attested::opt(entity_state, attestation);
                 collection.add_event(&event).await?;
-                collection.set_state(payload.entity_id, &state).await?;
+                collection.set_state(&attested).await?;
                 changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
             }
         }
@@ -525,6 +581,7 @@ where
         match update {
             proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
                 let state = (entity_id, collection, state).into();
+                // validate that we trust the state given to us
                 self.policy_agent.validate_received_state(self, &from_peer_id, &state)?;
 
                 let payload = state.payload;
@@ -533,7 +590,13 @@ where
                 match self.entities.with_state(&collection, payload.entity_id.clone(), payload.collection, payload.state).await? {
                     (Some(true), entity) => {
                         // We had the entity already, and this state is newer than the one we have, so save it to the collection
-                        collection.set_state(payload.entity_id, &entity.to_state()?).await?;
+                        // Not sure if we should reproject the state - discuss
+                        // however, if we do reproject, we need to re-attest the state
+                        let state = entity.to_state()?;
+                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                        let attestation = self.policy_agent.attest_state(self, &entity_state);
+                        let attested = Attested::opt(entity_state, attestation);
+                        collection.set_state(&attested).await?;
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
                     (Some(false), _entity) => {
@@ -542,7 +605,12 @@ where
                     }
                     (None, entity) => {
                         // We did not have the entity yet, so we created it, so save it to the collection
-                        collection.set_state(payload.entity_id, &entity.to_state()?).await?;
+                        // see notes as above regarding reprojecting and re-attesting the state
+                        let state = entity.to_state()?;
+                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                        let attestation = self.policy_agent.attest_state(self, &entity_state);
+                        let attested = Attested::opt(entity_state, attestation);
+                        collection.set_state(&attested).await?;
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
                 }
@@ -571,19 +639,23 @@ where
                     (Some(true), entity) => {
                         // had it already, and the state is newer than the one we have, and was applied successfully, so save it and return the change
                         // reduce the probability of error by reprojecting the state - is this necessary if we've validated the attestation?
+                        // See notes above regarding reprojecting and re-attesting the state
                         let state = entity.to_state()?;
-                        // TODO - either way, we should store the attested state, either by attesting the reprojected
-                        // version ourselves, or by storing the original attested state without reprojecting. Discuss.
-                        // let state = self.policy_agent.attest_state(self, &state);
-                        // just storing the unattested state for now
-                        collection.set_state(entity.id(), &state).await?;
+                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                        let attestation = self.policy_agent.attest_state(self, &entity_state);
+                        let attested = Attested::opt(entity_state, attestation);
+                        collection.set_state(&attested).await?;
                         Ok(Some(EntityChange::new(entity, attested_events)?))
                     }
 
                     (None, entity) => {
                         // did not have it, so we created it, so save it and return the change
-                        // Ditto the same thing as above regarding attestation/reprojection
-                        collection.set_state(entity.id(), &entity.to_state()?).await?;
+                        // See notes above regarding attestation/reprojection
+                        let state = entity.to_state()?;
+                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                        let attestation = self.policy_agent.attest_state(self, &entity_state);
+                        let attested = Attested::opt(entity_state, attestation);
+                        collection.set_state(&attested).await?;
                         Ok(Some(EntityChange::new(entity, attested_events)?))
                     }
                 }
@@ -627,7 +699,7 @@ where
         cdata: &PA::ContextData,
         sub: &mut SubscriptionHandle,
         collection_id: &CollectionId,
-        predicate: &ankql::ast::Predicate,
+        predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<()> {
         // First, find any durable nodes to subscribe to
         let durable_peer_id = self.get_durable_peer_random();
@@ -641,7 +713,7 @@ where
                     proto::NodeRequestBody::Subscribe {
                         subscription_id: sub.id.clone(),
                         collection: collection_id.clone(),
-                        predicate: predicate.clone(),
+                        predicate: predicate,
                     },
                 )
                 .await?
@@ -755,9 +827,21 @@ where
         &self,
         collection_id: &CollectionId,
         id: proto::EntityId,
-        // cdata: &PA::ContextData,
+        cdata: &PA::ContextData,
+        cached: bool,
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.id, id, collection_id);
+
+        if !self.durable {
+            // Fetch from peers and commit first response
+            match self.get_from_peer(&collection_id, vec![id.clone()], cdata).await {
+                Ok(_) => (),
+                Err(RetrievalError::NoDurablePeers) if cached => (),
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
 
         if let Some(local) = self.entities.get(id) {
             debug!("Node({}).get_entity found local entity - returning", self.id);
@@ -768,7 +852,8 @@ where
         let collection = self.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                let (_changed, entity) = self.entities.with_state(&collection, id, collection_id.clone(), entity_state).await?;
+                let (_changed, entity) =
+                    self.entities.with_state(&collection, id, collection_id.clone(), entity_state.payload.state).await?;
                 return Ok(entity);
             }
             Err(RetrievalError::EntityNotFound(id)) => {
@@ -786,9 +871,10 @@ where
         args: MatchArgs,
         cdata: &PA::ContextData,
     ) -> Result<Vec<Entity>, RetrievalError> {
+        // TODO implement cached: true
         if !self.durable {
             // Fetch from peers and commit first response
-            match self.fetch_from_peer(&collection_id, &args.predicate, cdata).await {
+            match self.fetch_from_peer(&collection_id, args.predicate.clone(), cdata).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if args.cached => (),
                 Err(e) => {
@@ -805,8 +891,9 @@ where
 
         // Convert states to entities
         let mut entities = Vec::new();
-        for (id, state) in states {
-            let (_, entity) = self.entities.with_state(&storage_collection, id, collection_id.clone(), state).await?;
+        for state in states {
+            let (_, entity) =
+                self.entities.with_state(&storage_collection, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
             entities.push(entity);
         }
         Ok(entities)
@@ -827,7 +914,7 @@ where
 
         // TODO spawn a task for these and make this fn syncrhonous - Pending error handling refinement / retry logic
         // spawn(async move {
-        self.request_remote_subscribe(cdata, &mut handle, &collection_id, &args.predicate).await?;
+        self.request_remote_subscribe(cdata, &mut handle, &collection_id, args.predicate.clone()).await?;
         self.reactor.subscribe(handle.id, &collection_id, args, callback).await?;
         // });
 
@@ -837,26 +924,23 @@ where
     async fn fetch_from_peer(
         &self,
         collection_id: &CollectionId,
-        predicate: &ankql::ast::Predicate,
+        predicate: ankql::ast::Predicate,
         cdata: &PA::ContextData,
     ) -> anyhow::Result<(), RetrievalError> {
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self
-            .request(
-                peer_id.clone(),
-                cdata,
-                proto::NodeRequestBody::Fetch { collection: collection_id.clone(), predicate: predicate.clone() },
-            )
+            .request(peer_id.clone(), cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), predicate })
             .await
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
         {
             proto::NodeResponseBody::Fetch(states) => {
-                let raw_bucket = self.collections.get(collection_id).await?;
+                let collection = self.collections.get(collection_id).await?;
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
-                for (id, state) in states {
-                    raw_bucket.set_state(id, &state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                for state in states {
+                    self.policy_agent.validate_received_state(self, &peer_id, &state)?;
+                    collection.set_state(&state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
             }
@@ -866,6 +950,41 @@ where
             }
             _ => {
                 debug!("Unexpected response type from peer fetch");
+                Err(RetrievalError::Other("Unexpected response type".to_string()))
+            }
+        }
+    }
+
+    async fn get_from_peer(
+        &self,
+        collection_id: &CollectionId,
+        ids: Vec<proto::EntityId>,
+        cdata: &PA::ContextData,
+    ) -> Result<(), RetrievalError> {
+        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+
+        match self
+            .request(peer_id.clone(), cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
+            .await
+            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+        {
+            proto::NodeResponseBody::Get(states) => {
+                let collection = self.collections.get(collection_id).await?;
+
+                // do we have the ability to merge states?
+                // because that's what we have to do I think
+                for state in states {
+                    self.policy_agent.validate_received_state(self, &peer_id, &state)?;
+                    collection.set_state(&state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                }
+                Ok(())
+            }
+            proto::NodeResponseBody::Error(e) => {
+                debug!("Error from peer fetch: {}", e);
+                Err(RetrievalError::Other(format!("{:?}", e)))
+            }
+            _ => {
+                debug!("Unexpected response type from peer get");
                 Err(RetrievalError::Other("Unexpected response type".to_string()))
             }
         }

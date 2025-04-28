@@ -89,8 +89,11 @@ where
         let mut matching_entities = Vec::new();
 
         // Convert states to Entity and filter by predicate
-        for (id, state) in states {
-            let (_entity_changed, entity) = self.entityset.with_state(&storage_collection, id, collection_id.to_owned(), state).await?;
+        for state in states {
+            let (_entity_changed, entity) = self
+                .entityset
+                .with_state(&storage_collection, state.payload.entity_id, collection_id.to_owned(), state.payload.state)
+                .await?;
 
             // Evaluate predicate for each entity
             if ankql::selection::filter::evaluate_predicate(&entity, &args.predicate).unwrap_or(false) {

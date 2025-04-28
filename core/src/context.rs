@@ -39,7 +39,8 @@ pub trait TContext {
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
     fn create_entity(&self, collection: proto::CollectionId) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
-    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId) -> Result<Entity, RetrievalError>;
+    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
+    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
     async fn subscribe(
@@ -59,9 +60,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         self.node.policy_agent.check_write(&self.cdata, entity, None).into()
     }
-    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId) -> Result<Entity, RetrievalError> {
-        self.node.get_entity(collection, id /*&self.cdata*/).await
+    async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
+        self.node.get_entity(collection, id, &self.cdata, cached).await
     }
+    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity> { self.node.entities.get(id) }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.node.fetch_entities(collection, args, &self.cdata).await
     }
@@ -118,8 +120,13 @@ impl Context {
     // }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
-        todo!("node.get_entity isn't actually fetching the entity from the remote node, only the local storage. This is wrong");
-        let entity = self.0.get_entity(id, &R::collection()).await?;
+        let entity = self.0.get_entity(id, &R::collection(), false).await?;
+        Ok(R::from_entity(entity))
+    }
+
+    /// Get an entity, but its ok to return early if the entity is already in the local node storage
+    pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
 

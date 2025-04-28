@@ -126,8 +126,8 @@
 //     // 5. Charlie is sneaky and tries to edit his own role, but is blocked
 //     let user1 = all_users.items.iter().find(|u| u.username().unwrap() == "charlie").unwrap();
 //     let trx = c_charlie.begin();
-//     // assert!(matches!(user1.edit(&trx).await?.role.replace("admin"), Err(MutationError::AccessDenied(_))));
-//     assert!(matches!(user1.edit(&trx).await, Err(MutationError::AccessDenied(_))));
+//     // assert!(matches!(user1.edit(&trx)?.role.replace("admin"), Err(MutationError::AccessDenied(_))));
+//     assert!(matches!(user1.edit(&trx), Err(MutationError::AccessDenied(_))));
 //     trx.commit().await?;
 
 //     // 6. Charlie tries to create a user - but is blocked
@@ -183,8 +183,8 @@
 //     // 5. Charlie is sneaky and tries to edit his own role, but is blocked
 //     let user1 = all_users.items.iter().find(|u| u.username().unwrap() == "charlie").unwrap();
 //     let trx = c_charlie.begin();
-//     // assert!(matches!(user1.edit(&trx).await?.role.replace("admin"), Err(MutationError::AccessDenied(_))));
-//     assert!(matches!(user1.edit(&trx).await, Err(MutationError::AccessDenied(_))));
+//     // assert!(matches!(user1.edit(&trx)?.role.replace("admin"), Err(MutationError::AccessDenied(_))));
+//     assert!(matches!(user1.edit(&trx), Err(MutationError::AccessDenied(_))));
 //     trx.commit().await?;
 
 //     // 6. Charlie tries to create a user - but is blocked

@@ -89,7 +89,7 @@ async fn server_edits_subscription() -> Result<()> {
     // Update Rex's age to 7 on node1
     {
         let trx: ankurah::transaction::Transaction = server.begin();
-        rex.edit(&trx).await?.age().overwrite(0, 1, "7")?;
+        rex.edit(&trx)?.age().overwrite(0, 1, "7")?;
         trx.commit().await?;
     }
 
@@ -102,8 +102,8 @@ async fn server_edits_subscription() -> Result<()> {
     {
         let trx = server.begin();
 
-        // rex.edit(&trx).await?.age().overwrite(0, 1, "8")?;
-        snuffy.edit(&trx).await?.age().overwrite(0, 1, "3")?;
+        // rex.edit(&trx)?.age().overwrite(0, 1, "8")?;
+        snuffy.edit(&trx)?.age().overwrite(0, 1, "3")?;
         trx.commit().await?;
     }
 

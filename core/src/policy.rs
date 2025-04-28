@@ -111,7 +111,19 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     ) -> Result<Predicate, AccessDenied>;
 
     /// Check if a context can read an entity
-    fn check_read(&self, data: &Self::ContextData, entity: &Entity) -> Result<(), AccessDenied>;
+    /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
+    /// Optimization: Consider adding a common trait implemented by Entity and TemporaryEntity returned by entityset.get_evaluation_entity that
+    /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
+    fn check_read(
+        &self,
+        data: &Self::ContextData,
+        id: &proto::EntityId,
+        collection: &proto::CollectionId,
+        state: &proto::State,
+    ) -> Result<(), AccessDenied>;
+
+    /// Check if a context can read an event
+    fn check_read_event(&self, data: &Self::ContextData, event: &Attested<proto::Event>) -> Result<(), AccessDenied>;
 
     /// Check if a context can edit an entity
     fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
@@ -205,8 +217,22 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read(&self, _context: &Self::ContextData, _entity: &Entity) -> Result<(), AccessDenied> {
-        info!("PermissiveAgent check_read: {:?}", _entity);
+    fn check_read(
+        &self,
+        _context: &Self::ContextData,
+        _id: &proto::EntityId,
+        _collection: &proto::CollectionId,
+        _state: &proto::State,
+    ) -> Result<(), AccessDenied> {
+        // If your policy agent wants to inspect the entity properties, it can do so with either TemporaryEntity::new or entityset.with_state
+        info!("PermissiveAgent check_read: {:?}", _id);
+        Ok(())
+    }
+
+    fn check_read_event(&self, _context: &Self::ContextData, _event: &Attested<proto::Event>) -> Result<(), AccessDenied> {
+        // TODO - think about the best way to get the entity properties for cases where we want to inspect
+        // presumably this would need to be changed to async, and we'd need a way to retrieve entity state from storage, or possibly even a remote node
+        info!("PermissiveAgent check_read_event: {:?}", _event);
         Ok(())
     }
 

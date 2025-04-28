@@ -29,7 +29,7 @@ async fn add_event_postgres() -> Result<()> {
     let trx1 = node.begin();
 
     println!("MARK 1.2");
-    let album1 = trx1.edit::<Album>(album_id).await?;
+    let album1 = trx1.edit::<Album>(album_id)?;
     println!("MARK 1.2.1 {}", album1.entity.head());
 
     album1.name.insert(0, "(o.")?;
@@ -39,7 +39,7 @@ async fn add_event_postgres() -> Result<()> {
     println!("MARK 2");
 
     let trx2 = node.begin();
-    let album2 = trx2.edit::<Album>(album_id).await?;
+    let album2 = trx2.edit::<Album>(album_id)?;
     album2.name.insert(3, "o) ")?;
     trx2.commit().await?;
 
