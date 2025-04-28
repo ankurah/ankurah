@@ -12,8 +12,8 @@ use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Trans
 use crate::{
     error::{MutationError, StateError},
     property::{
-       backend::{Operation, PropertyBackend},
-       PropertyName, PropertyValue,
+        backend::{Operation, PropertyBackend},
+        PropertyName, PropertyValue,
     },
 };
 

@@ -344,7 +344,49 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> { unimplemented!() }
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
+        }
+
+        SendWrapper::new(async move {
+            let transaction = step(self.db.transaction_with_str("events"), "create transaction")?;
+            let store = step(transaction.object_store("events"), "get object store")?;
+
+            // TODO - do we want to use a cursor? The id space is pretty sparse, so we would probably need benchmarks to see if it's worth it
+            let mut events = Vec::new();
+            for event_id in event_ids {
+                let request = step(store.get(&event_id.to_string().into()), "get event")?;
+                step(CBFuture::new(&request, "success", "error").await, "await event request")?;
+                let result = step(request.result(), "get result")?;
+
+                // Skip if event not found
+                if result.is_undefined() || result.is_null() {
+                    continue;
+                }
+
+                let event_obj: web_sys::js_sys::Object = step(result.dyn_into(), "cast event object")?;
+
+                let event = Attested {
+                    payload: ankurah_proto::Event {
+                        collection: get_property(&event_obj, &COLLECTION_KEY)?.try_into()?,
+                        entity_id: get_property(&event_obj, &ENTITY_ID_KEY)?.try_into()?,
+                        operations: get_property(&event_obj, &OPERATIONS_KEY)?.try_into()?,
+                        parent: get_property(&event_obj, &PARENT_KEY)?.try_into()?,
+                    },
+                    attestations: get_property(&event_obj, &ATTESTATIONS_KEY)?.try_into()?,
+                };
+                events.push(event);
+            }
+
+            Ok(events)
+        })
+        .await
+    }
 
     async fn dump_entity_events(&self, id: ankurah_proto::EntityId) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
