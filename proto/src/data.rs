@@ -215,3 +215,12 @@ impl Into<Attested<Event>> for Event {
 impl Into<Attested<EntityState>> for EntityState {
     fn into(self) -> Attested<EntityState> { Attested { payload: self, attestations: AttestationSet::default() } }
 }
+
+impl Attested<EntityState> {
+    pub fn to_parts(self) -> (EntityId, CollectionId, StateFragment) {
+        (self.payload.entity_id, self.payload.collection, StateFragment { state: self.payload.state, attestations: self.attestations })
+    }
+    pub fn from_parts(entity_id: EntityId, collection: CollectionId, fragment: StateFragment) -> Self {
+        Self { payload: EntityState { entity_id, collection, state: fragment.state }, attestations: fragment.attestations }
+    }
+}

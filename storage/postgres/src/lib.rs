@@ -201,7 +201,7 @@ impl PostgresBucket {
 
 #[async_trait]
 impl StorageCollection for PostgresBucket {
-    async fn set_state(&self, state: &Attested<EntityState>) -> Result<bool, MutationError> {
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
         let state_buffers = bincode::serialize(&state.payload.state.state_buffers)?;
         let attestations: Vec<Vec<u8>> =
             state.attestations.iter().map(|attestation| bincode::serialize(attestation)).collect::<Result<Vec<_>, _>>()?;

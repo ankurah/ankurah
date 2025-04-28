@@ -474,7 +474,7 @@ where
             let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
             let attestation = self.policy_agent.attest_state(self, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(&attested).await?;
+            collection.set_state(attested).await?;
 
             changes.push(EntityChange::new(entity.clone(), vec![attested_event])?);
         }
@@ -530,7 +530,7 @@ where
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
                 let attested = Attested::opt(entity_state, attestation);
                 collection.add_event(&event).await?;
-                collection.set_state(&attested).await?;
+                collection.set_state(attested).await?;
                 changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
             }
         }
@@ -596,7 +596,7 @@ where
                         let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                         let attestation = self.policy_agent.attest_state(self, &entity_state);
                         let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(&attested).await?;
+                        collection.set_state(attested).await?;
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
                     (Some(false), _entity) => {
@@ -610,7 +610,7 @@ where
                         let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                         let attestation = self.policy_agent.attest_state(self, &entity_state);
                         let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(&attested).await?;
+                        collection.set_state(attested).await?;
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
                 }
@@ -644,7 +644,7 @@ where
                         let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                         let attestation = self.policy_agent.attest_state(self, &entity_state);
                         let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(&attested).await?;
+                        collection.set_state(attested).await?;
                         Ok(Some(EntityChange::new(entity, attested_events)?))
                     }
 
@@ -655,7 +655,7 @@ where
                         let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                         let attestation = self.policy_agent.attest_state(self, &entity_state);
                         let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(&attested).await?;
+                        collection.set_state(attested).await?;
                         Ok(Some(EntityChange::new(entity, attested_events)?))
                     }
                 }
@@ -940,7 +940,7 @@ where
                 // because that's what we have to do I think
                 for state in states {
                     self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    collection.set_state(&state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
             }
@@ -975,7 +975,7 @@ where
                 // because that's what we have to do I think
                 for state in states {
                     self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    collection.set_state(&state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 Ok(())
             }

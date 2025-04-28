@@ -144,7 +144,7 @@ where SE: StorageEngine + Send + Sync + 'static
 
         storage.add_event(&event.into()).await?;
         let attested_state = system_entity.to_entity_state()?.into();
-        storage.set_state(&attested_state).await?;
+        storage.set_state(attested_state).await?;
 
         system_entity.commit_head(root.clone());
 

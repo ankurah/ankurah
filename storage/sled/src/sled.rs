@@ -1,4 +1,4 @@
-use ankurah_proto::{Attested, CollectionId, EntityId, Event, EventId, State};
+use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId, State, StateFragment};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -67,10 +67,11 @@ impl StorageEngine for SledStorageEngine {
 
 #[async_trait]
 impl StorageCollection for SledStorageCollection {
-    async fn set_state(&self, id: EntityId, state: &State) -> Result<bool, MutationError> {
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
         let tree = self.state.clone();
-        let binary_state = bincode::serialize(state)?;
-        let id_bytes = id.to_bytes();
+        let (entity_id, _collection, sfrag) = state.to_parts();
+        let binary_state = bincode::serialize(&sfrag)?;
+        let id_bytes = entity_id.to_bytes();
 
         // Use spawn_blocking since sled operations are not async
         task::spawn_blocking(move || {
@@ -85,7 +86,7 @@ impl StorageCollection for SledStorageCollection {
         .map_err(|e| MutationError::General(Box::new(e)))?
     }
 
-    async fn get_state(&self, id: EntityId) -> Result<State, RetrievalError> {
+    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         let tree = self.state.clone();
         let id_bytes = id.to_bytes();
 
@@ -96,21 +97,22 @@ impl StorageCollection for SledStorageCollection {
 
         match result.map_err(SledRetrievalError::StorageError)? {
             Some(ivec) => {
-                let entity_state = bincode::deserialize(&ivec)?;
-                Ok(entity_state)
+                let sfrag: StateFragment = bincode::deserialize(&ivec)?;
+                let es = Attested::from_parts(id, self.collection_id.clone(), sfrag);
+                Ok(es)
             }
             None => Err(SledRetrievalError::EntityNotFound(id).into()),
         }
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(EntityId, State)>, RetrievalError> {
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let predicate = predicate.clone();
         let collection_id = self.collection_id.clone();
         let copied_state = self.state.iter().collect::<Vec<_>>();
 
         // Use spawn_blocking for the full scan operation
-        task::spawn_blocking(move || -> Result<Vec<(EntityId, State)>, RetrievalError> {
-            let mut results = Vec::new();
+        task::spawn_blocking(move || -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+            let mut results: Vec<Attested<EntityState>> = Vec::new();
             let mut seen_ids = HashSet::new();
 
             // For now, do a full table scan
@@ -124,15 +126,16 @@ impl StorageCollection for SledStorageCollection {
                     continue;
                 }
 
-                let entity_state: State = bincode::deserialize(&value_bytes)?;
+                let sfrag: StateFragment = bincode::deserialize(&value_bytes)?;
+                let es = Attested::from_parts(id, collection_id.clone(), sfrag);
 
                 // Create entity to evaluate predicate
-                let entity = TemporaryEntity::new(id, collection_id.clone(), &entity_state)?;
+                let entity = TemporaryEntity::new(id, collection_id.clone(), &es.payload.state)?;
 
                 // Apply predicate filter
                 if evaluate_predicate(&entity, &predicate)? {
                     seen_ids.insert(id);
-                    results.push((id, entity_state));
+                    results.push(es);
                 }
             }
 

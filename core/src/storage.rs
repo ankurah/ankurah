@@ -20,7 +20,7 @@ pub trait StorageEngine: Send + Sync {
 
 #[async_trait]
 pub trait StorageCollection: Send + Sync {
-    async fn set_state(&self, state: &Attested<EntityState>) -> Result<bool, MutationError>;
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError>;
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
     // Fetch raw entity states matching a predicate
@@ -28,7 +28,7 @@ pub trait StorageCollection: Send + Sync {
 
     async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), MutationError> {
         for state in states {
-            self.set_state(&state).await?;
+            self.set_state(state).await?;
         }
         Ok(())
     }
