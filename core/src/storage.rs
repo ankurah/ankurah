@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tracing::warn;
 
 use crate::error::{MutationError, RetrievalError};
 use ankurah_proto::{Attested, CollectionId, EntityId, Event, EventId, State};
@@ -33,6 +34,20 @@ pub trait StorageCollection: Send + Sync {
             self.set_state(id, state).await?;
         }
         Ok(())
+    }
+
+    async fn get_states(&self, ids: Vec<EntityId>) -> Result<Vec<(EntityId, State)>, RetrievalError> {
+        let mut states = Vec::new();
+        for id in ids {
+            match self.get_state(id).await {
+                Ok(state) => states.push((id, state)),
+                Err(RetrievalError::EntityNotFound(_)) => {
+                    warn!("Entity not found: {:?}", id);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(states)
     }
 
     async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError>;
