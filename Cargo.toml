@@ -13,5 +13,6 @@ members = [
     "storage/*",
     "tests",
     "ankurah",
+    "test-browser",
 ]
 resolver = "2"

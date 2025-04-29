@@ -1,0 +1,26 @@
+[package]
+name = "ankurah-test-browser"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+anyhow = "1.0"
+tracing = "0.1"
+ankql = { path = "../ankql", version = "^0.3.5" }
+ankurah = { path = "../ankurah", features = ["derive", "react", "wasm"], version = "^0.3.5" }
+ankurah-storage-indexeddb-wasm = { path = "../storage/indexeddb-wasm", version = "^0.3.5" }
+tokio = { version = "1.40", features = ["sync"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-web = "0.1"
+console_error_panic_hook = "0.1"
+ctor = "0.2"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+ankurah-react-signals = { path = "../react-signals", version = "^0.3.5" }
+reactive_graph = { version = "0.1.4", features = ["effects"] }
+serde = { version = "1.0", features = ["derive"] }
+itertools = "0.14"
+async-trait = "0.1"
+serde_json = "1.0"
+wasm-bindgen-test = "0.3.50"
+getrandom = { version = "0.3", features = ["wasm_js"] }
