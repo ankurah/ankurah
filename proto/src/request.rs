@@ -82,10 +82,10 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "CommitTransaction {id} [{}]", events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
             }
             NodeRequestBody::Get { collection, ids } => {
-                write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "))
+                write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
             NodeRequestBody::GetEvents { collection, event_ids } => {
-                write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "))
+                write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
             NodeRequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")

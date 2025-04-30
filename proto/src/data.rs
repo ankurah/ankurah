@@ -26,6 +26,11 @@ impl EventId {
         use base64::{engine::general_purpose, Engine as _};
         general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }
+    pub fn to_base64_short(&self) -> String {
+        // take the last 6 characters of the base64 encoded string
+        let value = self.to_base64();
+        value[value.len() - 6..].to_string()
+    }
     pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {
         use base64::{engine::general_purpose, Engine as _};
         let decoded = general_purpose::URL_SAFE_NO_PAD.decode(input)?;

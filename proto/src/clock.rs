@@ -19,7 +19,7 @@ impl Clock {
 
     pub fn as_slice(&self) -> &[EventId] { &self.0 }
 
-    pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_string()).collect() }
+    pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_base64()).collect() }
 
     pub fn from_strings(strings: Vec<String>) -> Result<Self, DecodeError> {
         let mut ids = strings.into_iter().map(|s| s.try_into()).collect::<Result<Vec<_>, _>>()?;
