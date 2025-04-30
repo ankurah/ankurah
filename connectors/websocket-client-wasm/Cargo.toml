@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-websocket-client-wasm"
-version       = "0.4.0"
+version       = "0.4.1"
 authors       = ["Daniel Norman <daniel@danielnorman.net>"]
 edition       = "2021"
 description   = "Ankurah WebSocket Client - A WebSocket client for Ankurah"
@@ -17,15 +17,15 @@ default = []
 react   = ["ankurah-react-signals"]
 
 [dependencies]
-ankurah            = { path = "../../ankurah", features = ["derive", "wasm", "react"], version = "^0.4.0" }
-ankurah-core       = { path = "../../core", version = "^0.4.0" }
-ankurah-proto      = { path = "../../proto", version = "^0.4.0" }
-ankurah-derive     = { path = "../../derive", version = "^0.4.0" }
+ankurah            = { path = "../../ankurah", features = ["derive", "wasm", "react"], version = "^0.4.1" }
+ankurah-core       = { path = "../../core", version = "^0.4.1" }
+ankurah-proto      = { path = "../../proto", version = "^0.4.1" }
+ankurah-derive     = { path = "../../derive", version = "^0.4.1" }
 serde              = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 uuid               = { version = "1.7", features = ["v4", "serde", "js"] }
 
-ankurah-react-signals = { path = "../../react-signals", optional = true, version = "^0.4.0" }
+ankurah-react-signals = { path = "../../react-signals", optional = true, version = "^0.4.1" }
 wasm-bindgen = "0.2.84"
 futures = "0.3.30"
 js-sys = "0.3.69"
