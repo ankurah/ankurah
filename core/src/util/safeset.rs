@@ -23,3 +23,9 @@ impl<T: Hash + Eq> SafeSet<T> {
 impl<T: Hash + Eq + Clone> SafeSet<T> {
     pub fn to_vec(&self) -> Vec<T> { self.0.read().expect("Failed to lock the set").iter().cloned().collect() }
 }
+
+impl<T: Hash + Eq + std::fmt::Debug> std::fmt::Debug for SafeSet<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SafeSet {{ {:?} }}", self.0.read().expect("Failed to lock the set"))
+    }
+}

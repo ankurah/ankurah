@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     entity::Entity,
+    error::MutationError,
     property::{
         backend::YrsBackend,
         traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},
@@ -29,15 +30,17 @@ impl<Projected> YrsString<Projected> {
     }
     pub fn backend(&self) -> Arc<YrsBackend> { self.backend.upgrade().expect("Expected `Yrs` property backend to exist") }
     pub fn value(&self) -> Option<String> { self.backend().get_string(&self.property_name) }
-    pub fn insert(&self, index: u32, value: &str) { self.backend().insert(&self.property_name, index, value); }
-    pub fn delete(&self, index: u32, length: u32) { self.backend().delete(&self.property_name, index, length); }
-    pub fn overwrite(&self, start: u32, length: u32, value: &str) {
-        self.backend().delete(&self.property_name, start, length);
-        self.backend().insert(&self.property_name, start, value);
+    pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> { self.backend().insert(&self.property_name, index, value) }
+    pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> { self.backend().delete(&self.property_name, index, length) }
+    pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
+        self.backend().delete(&self.property_name, start, length)?;
+        self.backend().insert(&self.property_name, start, value)?;
+        Ok(())
     }
-    pub fn replace(&self, value: &str) {
-        self.backend().delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32);
-        self.backend().insert(&self.property_name, 0, value);
+    pub fn replace(&self, value: &str) -> Result<(), MutationError> {
+        self.backend().delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32)?;
+        self.backend().insert(&self.property_name, 0, value)?;
+        Ok(())
     }
 }
 
@@ -79,7 +82,7 @@ impl<'a, Projected> FromActiveType<YrsString<Projected>> for std::borrow::Cow<'a
 impl<Projected> InitializeWith<String> for YrsString<Projected> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &String) -> Self {
         let new_string = Self::from_entity(property_name, entity);
-        new_string.insert(0, value);
+        new_string.insert(0, value).unwrap();
         new_string
     }
 }
@@ -88,7 +91,7 @@ impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Option<String>) -> Self {
         let new_string = Self::from_entity(property_name, entity);
         if let Some(value) = value {
-            new_string.insert(0, value);
+            new_string.insert(0, value).unwrap();
         }
         new_string
     }

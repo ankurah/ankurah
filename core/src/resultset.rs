@@ -21,3 +21,7 @@ impl<R> core::ops::Deref for ResultSet<R> {
 
     fn deref(&self) -> &Self::Target { &self.items }
 }
+
+// impl<T> ResultSet<T> {
+//     pub fn map<'a, U>(&'a self, f: impl Fn(&'a T) -> U + 'a) -> impl Iterator<Item = U> + 'a { self.items.iter().map(f) }
+// }

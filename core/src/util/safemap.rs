@@ -1,7 +1,5 @@
 use std::{collections::hash_map::Entry, collections::HashMap, hash::Hash};
 
-use super::safeset::SafeSet;
-
 /// A very basic concurrent hashmap that is hard to misuse in an async context.
 /// The number one rule is that a lock can only be held very briefly - with no calls into
 /// other functions that might block.
@@ -17,12 +15,23 @@ impl<K: Hash + Eq, V> SafeMap<K, V> {
 
     pub fn is_empty(&self) -> bool { self.0.read().expect("Failed to lock the map").is_empty() }
     pub fn len(&self) -> usize { self.0.read().expect("Failed to lock the map").len() }
+
+    pub fn clear(&self) { self.0.write().expect("Failed to lock the map").clear(); }
 }
 
 impl<K: Hash + Eq, V> SafeMap<K, V>
 where V: Clone
 {
     pub fn get(&self, k: &K) -> Option<V> { self.0.read().expect("Failed to lock the map").get(k).cloned() }
+    pub fn get_list(&self, k: impl IntoIterator<Item = K>) -> Vec<(K, Option<V>)> {
+        let read = self.0.read().expect("Failed to lock the map");
+        k.into_iter()
+            .map(|k| {
+                let v = read.get(&k).cloned();
+                (k, v)
+            })
+            .collect()
+    }
 }
 
 impl<K: Hash + Eq, V> SafeMap<K, V>
@@ -54,9 +63,8 @@ impl<K: Hash + Eq, H: PartialEq> SafeMap<K, Vec<H>> {
     }
     /// Retain only the elements specified by the predicate. NoOp if the key is not present.
     pub fn remove_eq(&self, key: &K, value: &H) {
-        match self.0.write().expect("Failed to lock the map").get_mut(key) {
-            Some(v) => v.retain(|h| h != value),
-            None => (),
+        if let Some(v) = self.0.write().expect("Failed to lock the map").get_mut(key) {
+            v.retain(|h| h != value)
         }
     }
 }
@@ -68,5 +76,11 @@ impl<K: Hash + Eq, H: Hash + Eq> SafeMap<K, std::collections::HashSet<H>> {
             Some(v) => v.remove(value),
             None => false,
         }
+    }
+}
+
+impl<K: Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for SafeMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SafeMap {{ {:?} }}", self.0.read().expect("Failed to lock the map"))
     }
 }

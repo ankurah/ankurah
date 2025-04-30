@@ -15,17 +15,20 @@ pub struct Entry {
 }
 
 use ankurah::Property;
+#[cfg(feature = "wasm")]
 use tsify::Tsify;
-#[derive(Property, Serialize, Deserialize, Debug, Tsify)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[derive(Property, Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub struct Complex {
     name: String,
     value: i32,
     thing: Thing,
 }
 
-#[derive(Property, Serialize, Deserialize, Debug, Tsify)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[derive(Property, Serialize, Deserialize, Debug)]
+#[cfg_attr(feature = "wasm", derive(Tsify))]
+#[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
 pub enum Thing {
     Alpha(String),
     Bravo { b: String, c: i32 },

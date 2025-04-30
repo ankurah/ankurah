@@ -98,7 +98,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                 #[wasm_bindgen(js_class = #name)]
                 impl #namespace_struct {
-                    pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
                     }
 
@@ -139,14 +139,14 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         use ankurah::Mutable;
-                        let mutable_entity = transaction.create(&me).await;
+                        let mutable_entity = transaction.create(&me).await?;
                         Ok(mutable_entity.read())
                     }
 
                     pub async fn create_one(context: &::ankurah::core::context::Context, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         use ankurah::Mutable;
                         let tx = context.begin();
-                        let mutable_entity = tx.create(&me).await;
+                        let mutable_entity = tx.create(&me).await?;
                         let read = mutable_entity.read();
                         tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                         Ok(read)
@@ -166,7 +166,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     pub fn items(&self) -> Vec<#view_name> {
                         self.0.items.to_vec()
                     }
-                    pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::ID) -> Option<#view_name> {
+                    pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Option<#view_name> {
                         self.0.items.iter().find(|item| item.id() == id).map(|item| item.clone())
                         // todo generate a map on demand if there are more than a certain number of items (benchmark this)
                     }
@@ -195,7 +195,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         #[derive(Debug)]
         pub struct #mutable_name<'rec> {
-            entity: &'rec ::ankurah::entity::Entity,
+            pub entity: &'rec ::ankurah::entity::Entity,
             #(#active_field_visibility #active_field_names: #active_field_types,)*
         }
 
@@ -234,7 +234,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
             fn from_entity(entity: ::ankurah::entity::Entity) -> Self {
                 use ::ankurah::model::View;
-                assert_eq!(Self::collection(), entity.collection);
+                assert_eq!(&Self::collection(), entity.collection());
                 #view_name {
                     entity,
                     #(
@@ -246,17 +246,17 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         // TODO wasm-bindgen this
         impl #view_name {
-            pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::RetrievalError> {
+            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::MutationError> {
                 use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
-                trx.edit::<#name>(self.id()).await
+                trx.edit::<#name>(&self.entity)
             }
         }
 
         #wasm_attributes
         impl #view_name {
-            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
-                self.entity.id.clone()
+            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
+                self.entity.id().clone()
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
@@ -272,6 +272,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             // )*
         }
 
+        // TODO - wasm-bindgen this - ah right, we need to remove the lifetime
         impl<'rec> ::ankurah::model::Mutable<'rec> for #mutable_name<'rec> {
             type Model = #name;
             type View = #view_name;
@@ -285,7 +286,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     model::Mutable,
                     property::FromEntity,
                 };
-                assert_eq!(entity.collection(), Self::collection());
+                assert_eq!(entity.collection(), &Self::collection());
                 Self {
                     entity,
                     #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), entity), )*
@@ -293,8 +294,8 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
         }
         impl<'rec> #mutable_name<'rec> {
-            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::ID {
-                self.entity.id.clone()
+            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
+                self.entity.id().clone()
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> &#active_field_types {
@@ -303,14 +304,14 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             )*
         }
 
-        impl<'a> Into<ankurah::derive_deps::ankurah_proto::ID> for &'a #view_name {
-            fn into(self) -> ankurah::derive_deps::ankurah_proto::ID {
+        impl<'a> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #view_name {
+            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 ankurah::View::id(self)
             }
         }
 
-        impl<'a, 'rec> Into<ankurah::derive_deps::ankurah_proto::ID> for &'a #mutable_name<'rec> {
-            fn into(self) -> ankurah::derive_deps::ankurah_proto::ID {
+        impl<'a, 'rec> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #mutable_name<'rec> {
+            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 ::ankurah::model::Mutable::id(self)
             }
         }
@@ -352,7 +353,7 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
     }
 
     if let Some(active_type) = active_type {
-        return Ok(ActiveFieldType::convert_type_with_projected(&active_type, &field.ty));
+        Ok(ActiveFieldType::convert_type_with_projected(&active_type, &field.ty))
     } else {
         // If we get here, we don't have a supported default Active type
         let field_name = field.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "unnamed".to_string());
@@ -371,7 +372,7 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
 fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
     attrs.iter().any(|attr| {
         attr.path().segments.iter().any(|seg| seg.ident == "model")
-            && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).map_or(false, |ident| ident == flag_name)
+            && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).is_some_and(|ident| ident == flag_name)
     })
 }
 
@@ -397,7 +398,7 @@ impl ActiveFieldType {
             }
         }
 
-        return Self { base: ty.clone(), generics: None };
+        Self { base: ty.clone(), generics: None }
     }
 
     pub fn with_projected(&mut self, ty: &syn::Type) {
@@ -467,7 +468,7 @@ fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {
 /// The original license files are preserved in the `tsify` directory.
 #[cfg(feature = "wasm")]
 pub fn expand_ts_model_type(input: &DeriveInput, interface_name: String) -> syn::Result<proc_macro2::TokenStream> {
-    let cont = crate::tsify::container::Container::from_derive_input(&input)?;
+    let cont = crate::tsify::container::Container::from_derive_input(input)?;
 
     let parser = crate::tsify::parser::Parser::new(&cont);
     let mut decl = parser.parse();

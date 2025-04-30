@@ -1,4 +1,4 @@
-use ankurah_proto::{Clock, ClockOrdering};
+use ankurah_proto::clock::{Clock, ClockOrdering};
 use anyhow::Result;
 
 use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
@@ -21,7 +21,7 @@ pub enum PropertyError {
     #[error("serialization error: {0}")]
     SerializeError(Box<dyn std::error::Error + Send + Sync>),
     #[error("deserialization error: {0}")]
-    DeserializeError(Box<dyn std::error::Error + Send + Sync>),
+    DeserializeError(Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("retrieval error: {0}")]
     RetrievalError(crate::error::RetrievalError),
     #[error("invalid variant `{given}` for `{ty}`")]
@@ -39,8 +39,8 @@ impl From<PropertyError> for std::fmt::Error {
 }
 
 #[cfg(feature = "wasm")]
-impl Into<wasm_bindgen::JsValue> for PropertyError {
-    fn into(self) -> wasm_bindgen::JsValue { wasm_bindgen::JsValue::from_str(&self.to_string()) }
+impl From<PropertyError> for wasm_bindgen::JsValue {
+    fn from(val: PropertyError) -> Self { wasm_bindgen::JsValue::from_str(&val.to_string()) }
 }
 
 impl From<RetrievalError> for PropertyError {

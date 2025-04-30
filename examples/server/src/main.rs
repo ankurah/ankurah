@@ -14,6 +14,11 @@ async fn main() -> Result<()> {
     let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
 
+    node.system.wait_loaded().await;
+    if node.system.root().is_none() {
+        node.system.create().await?;
+    }
+
     // Create and start the websocket server
     let mut server = WebsocketServer::new(node);
     server.run("0.0.0.0:9797").await?;

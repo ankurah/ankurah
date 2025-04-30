@@ -9,6 +9,7 @@ use std::{
 use ankurah_proto::Clock;
 
 use crate::{
+    error::MutationError,
     property::{
         backend::{Operation, PropertyBackend},
         PropertyName, PropertyValue,
@@ -74,7 +75,7 @@ impl PropertyBackend for PNBackend {
 
     fn property_backend_name() -> String { "pn".to_owned() }
 
-    fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, crate::error::StateError> {
         let values = self.values.read().unwrap();
         let serializable = values.iter().map(|(key, value)| (key, value.value)).collect::<BTreeMap<_, _>>();
         let serialized = bincode::serialize(&serializable)?;
@@ -86,7 +87,7 @@ impl PropertyBackend for PNBackend {
         Ok(Self { values: Arc::new(RwLock::new(values)) })
     }
 
-    fn to_operations(&self) -> anyhow::Result<Vec<Operation>> {
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
         let values = self.values.read().unwrap();
         let diffs = values.iter().map(|(key, value)| (key, value.diff())).collect::<BTreeMap<_, _>>();
 
@@ -100,7 +101,7 @@ impl PropertyBackend for PNBackend {
         _current_head: &Clock,
         _event_head: &Clock,
         // _context: &Box<dyn TContext>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), MutationError> {
         for operation in operations {
             let diffs = bincode::deserialize::<BTreeMap<PropertyName, i64>>(&operation.diff)?;
 

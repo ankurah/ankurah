@@ -395,6 +395,8 @@ mod tests {
         let predicate = parse_selection(input).unwrap();
         assert_eq!(predicate, ast::Predicate::True);
     }
+
+    #[test]
     fn test_parse_selection_in_clause() {
         let input = r#"status IN ('active', 'pending')"#;
         let predicate = parse_selection(input).unwrap();

@@ -8,6 +8,10 @@ pub enum SqlExpr {
 
 pub struct Sql(Vec<SqlExpr>);
 
+impl Default for Sql {
+    fn default() -> Self { Self::new() }
+}
+
 impl Sql {
     pub fn new() -> Self { Self(Vec::new()) }
 

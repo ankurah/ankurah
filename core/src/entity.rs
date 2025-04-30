@@ -1,10 +1,16 @@
-use crate::{error::RetrievalError, property::Backends, property::PropertyValue};
+use crate::lineage;
+use crate::{
+    error::{LineageError, MutationError, RetrievalError, StateError},
+    model::View,
+    property::{Backends, PropertyValue},
+    storage::StorageCollectionWrapper,
+};
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{Clock, CollectionId, Event, State, ID};
-use anyhow::{anyhow, Result};
+use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, OperationSet, State};
+use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
-use tracing::debug;
+use tracing::{debug, error};
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -17,14 +23,24 @@ pub struct TemporaryEntity(Arc<EntityInner>);
 
 #[derive(Debug)]
 pub struct EntityInner {
-    pub id: ID,
+    pub id: EntityId,
     pub collection: CollectionId,
     pub(crate) backends: Backends,
     head: std::sync::Mutex<Clock>,
-    pub upstream: Option<Entity>,
+    // TODO when a transaction creates a downstream entity, we needf to provide a weak reference back to the transaction
+    // so we can error in the case that the transaction has been committed/rolled back (dropped)
+    // This is necessary for JsMutables (to be created) which cannot have a borrow of the transaction
+    // Standard Mutables will have a borrow of the transaction so it should not be possible for them to outlive the transaction
+    pub(crate) upstream: Option<Entity>,
 }
 
 impl std::ops::Deref for Entity {
+    type Target = EntityInner;
+
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl std::ops::Deref for TemporaryEntity {
     type Target = EntityInner;
 
     fn deref(&self) -> &Self::Target { &self.0 }
@@ -34,92 +50,217 @@ impl std::ops::Deref for Entity {
 pub struct WeakEntity(Weak<EntityInner>);
 
 impl WeakEntity {
-    pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(|inner| Entity(inner)) }
+    pub fn upgrade(&self) -> Option<Entity> { self.0.upgrade().map(Entity) }
 }
 
 impl Entity {
+    pub fn id(&self) -> EntityId { self.id }
+
+    // This is intentionally private - only WeakEntitySet should be constructing Entities
     fn weak(&self) -> WeakEntity { WeakEntity(Arc::downgrade(&self.0)) }
 
-    pub fn collection(&self) -> CollectionId { self.collection.clone() }
+    pub fn collection(&self) -> &CollectionId { &self.collection }
 
     pub fn backends(&self) -> &Backends { &self.backends }
 
-    pub fn to_state(&self) -> Result<State> { self.backends.to_state_buffers() }
+    pub fn head(&self) -> Clock { self.head.lock().unwrap().clone() }
+
+    pub fn to_state(&self) -> Result<State, StateError> {
+        let state_buffers = self.backends.to_state_buffers()?;
+        Ok(State { state_buffers, head: self.head() })
+    }
+
+    pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
+        let state = self.to_state()?;
+        Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
+    }
 
     // used by the Model macro
-    pub fn create(id: ID, collection: CollectionId, backends: Backends) -> Self {
+    pub fn create(id: EntityId, collection: CollectionId, backends: Backends) -> Self {
         Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(Clock::default()), upstream: None }))
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
-    fn from_state(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(state)?;
+    fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+        let backends = Backends::from_state_buffers(&state.state_buffers)?;
         Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
 
-    /// Collect an event which contains all operations for all backends since the last time they were collected
-    /// Used for transaction commit.
-    /// TODO: We need to think about rollbacks
-    pub fn commit(&self) -> Result<Option<Event>> {
-        let operations = self.backends.to_operations()?;
+    /// Generate an event which contains all operations for all backends since the last time they were collected
+    /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
+    /// using commit_head
+    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+        let operations = self.backends.take_accumulated_operations()?;
         if operations.is_empty() {
             Ok(None)
         } else {
-            let event = {
-                let event = Event {
-                    id: ID::new(),
-                    entity_id: self.id.clone(),
-                    collection: self.collection.clone(),
-                    operations,
-                    parent: self.head.lock().unwrap().clone(),
-                };
-
-                // Set the head to the event's ID
-                *self.head.lock().unwrap() = Clock::new([event.id]);
-                event
-            };
-
-            debug!("Entity.commit {}", self);
+            let operations = OperationSet(operations);
+            let event = Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: self.head() };
             Ok(Some(event))
         }
     }
 
-    pub fn apply_event(&self, event: &Event) -> Result<()> {
-        /*
-           case A: event precursor descends the current head, then set entity clock to singleton of event id
-           case B: event precursor is concurrent to the current head, push event id to event head clock.
-           case C: event precursor is descended by the current head
-        */
-        let head = Clock::new([event.id]);
-        for (backend_name, operations) in &event.operations {
-            // TODO - backends and Entity should not have two copies of the head. Figure out how to unify them
-            self.backends.apply_operations((*backend_name).to_owned(), operations, &head, &event.parent /* , context*/)?;
+    /// Updates the head of the entity to the given clock, which should come exclusively from generate_commit_event
+    pub(crate) fn commit_head(&self, new_head: Clock) { *self.head.lock().unwrap() = new_head; }
+
+    pub fn view<V: View>(&self) -> Option<V> {
+        if self.collection() != &V::collection() {
+            None
+        } else {
+            Some(V::from_entity(self.clone()))
         }
-        // TODO figure out how to test this
-        debug!("Entity.apply_event {}", event);
-
-        *self.head.lock().unwrap() = head.clone();
-        // Hack
-        *self.backends.head.lock().unwrap() = head;
-
-        Ok(())
     }
 
-    /// HACK - we probably shouldn't be stomping on the backends like this
-    pub fn apply_state(&self, state: &State) -> Result<(), RetrievalError> {
-        self.backends.apply_state(state)?;
-        Ok(())
+    /// Attempt to apply an event to the entity
+    #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
+    pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
+        let head = self.head();
+
+        if event.is_entity_root() && event.parent.is_empty() {
+            // this is the creation event for a new entity, so we simply accept it
+            for (backend_name, operations) in event.operations.iter() {
+                self.backends.apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent)?;
+            }
+            *self.head.lock().unwrap() = event.id().into();
+            return Ok(true);
+        }
+
+        match crate::lineage::compare_event(collection, event, &head, 100).await? {
+            lineage::Ordering::Equal => {
+                debug!("Equal - skip");
+                Ok(false)
+            }
+            lineage::Ordering::Descends => {
+                debug!("Descends - apply");
+                let new_head = event.id().into();
+                for (backend_name, operations) in event.operations.iter() {
+                    // IMPORTANT TODO - we might descend the entity head by more than one event,
+                    // therefore we need to play forward events one by one, not just the latest
+                    // set operations, the current head and the parent of that.
+                    // We have to play forward all events from the current entity/backend state
+                    // to the latest event. At this point we know this lineage is connected,
+                    // else we would get back an Ordering::Incomparable.
+                    // So we just need to fiure out how to scan through those events here.
+                    // Probably the easiest thing would be to update Ordering::Descends to provide
+                    // the list of events to play forward, but ideally we'd do it on a streaming
+                    // basis instead. of materializing what could potentially be a large number
+                    // of events in some cases.
+
+                    // we can't do this in the lineage comparison, because its looking backwards
+                    // not forwards - and we need to replay the events in order.
+                    // Maybe the best approach is to have Descends return the list of event ids
+                    // connecting the current head to the new event, and use a modest LRU cache
+                    // on the event geter (which needs to abstract storage collection anyway,
+                    // due to the need for remote event retrieval)
+                    // ...so we get a cache hit in the most common cases, and it can paginate the rest.
+                    self.backends.apply_operations((*backend_name).to_owned(), operations, &new_head, &event.parent /* , context*/)?;
+                }
+                *self.head.lock().unwrap() = new_head;
+                Ok(true)
+            }
+            lineage::Ordering::NotDescends { meet: _ } => {
+                // TODOs:
+                // [ ] we should probably have some rules about when a non-descending (concurrent) event is allowed. In a way, this is the same question as Descends with a gap, as discussed above
+                // [ ] update LWW backend determine which value to keep based on its deterministic last write win strategy. (just lexicographic winner, I think?)
+                // [ ] differentiate NotDescends into Ascends and Concurrent. we should ignore the former, and apply the latter
+                // just doing the needful for now
+                debug!("NotDescends - applying");
+                for (backend_name, operations) in event.operations.iter() {
+                    self.backends.apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent)?;
+                }
+                // concurrent - so augment the head
+                self.head.lock().unwrap().insert(event.id());
+                Ok(false)
+            }
+            lineage::Ordering::Incomparable => {
+                // total apples and oranges - take a hike buddy
+                Err(LineageError::Incomparable.into())
+            }
+            lineage::Ordering::PartiallyDescends { meet } => {
+                error!("PartiallyDescends - skipping this event, but we should probably be handling this");
+                // TODO - figure out how to handle this. I don't think we need to materialize a new event
+                // but it requires that we update the propertybackends to support this
+                Err(LineageError::PartiallyDescends { meet }.into())
+            }
+            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
+            }
+        }
+    }
+
+    pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, MutationError> {
+        let head = self.head();
+        let new_head = state.head.clone();
+
+        tracing::info!("Entity {} apply_state - current head: {}, new head: {}", self.id, head, new_head);
+
+        match crate::lineage::compare(collection, &head, &new_head, 100).await? {
+            lineage::Ordering::Equal => {
+                tracing::info!("Entity {} apply_state - heads are equal, skipping", self.id);
+                Ok(false)
+            }
+            lineage::Ordering::Descends => {
+                tracing::debug!("Entity {} apply_state - new head descends from current, applying", self.id);
+                self.backends.apply_state(state)?;
+                *self.head.lock().unwrap() = new_head;
+                Ok(true)
+            }
+            lineage::Ordering::NotDescends { meet } => {
+                tracing::warn!("Entity {} apply_state - new head does not descend, meet: {:?}", self.id, meet);
+                Ok(false)
+            }
+            lineage::Ordering::Incomparable => {
+                tracing::error!("Entity {} apply_state - heads are incomparable", self.id);
+                // total apples and oranges - take a hike buddy
+                Err(LineageError::Incomparable.into())
+            }
+            lineage::Ordering::PartiallyDescends { meet } => {
+                tracing::error!("Entity {} apply_state - heads partially descend, meet: {:?}", self.id, meet);
+                // TODO - figure out how to handle this. I don't think we need to materialize a new event
+                // but it requires that we update the propertybackends to support this
+                Err(LineageError::PartiallyDescends { meet }.into())
+            }
+            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                tracing::info!(
+                    "Entity {} apply_state - budget exceeded. subject: {:?}, other: {:?}",
+                    self.id,
+                    subject_frontier,
+                    other_frontier
+                );
+                Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
+            }
+        }
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
     pub fn snapshot(&self) -> Self {
         Self(Arc::new(EntityInner {
-            id: self.id.clone(),
+            id: self.id,
             collection: self.collection.clone(),
             backends: self.backends.fork(),
             head: std::sync::Mutex::new(self.head.lock().unwrap().clone()),
             upstream: Some(self.clone()),
         }))
+    }
+
+    pub fn values(&self) -> Vec<(String, Option<PropertyValue>)> {
+        let backends = self.backends.backends.lock().unwrap();
+        backends
+            .values()
+            .flat_map(|backend| {
+                backend
+                    .property_values()
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect::<Vec<(String, Option<PropertyValue>)>>()
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Entity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
     }
 }
 
@@ -151,15 +292,9 @@ impl Filterable for Entity {
     }
 }
 
-impl std::fmt::Display for Entity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
-    }
-}
-
 impl TemporaryEntity {
-    pub fn new(id: ID, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(state)?;
+    pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+        let backends = Backends::from_state_buffers(&state.state_buffers)?;
         Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
     }
 }
@@ -190,52 +325,113 @@ impl Filterable for TemporaryEntity {
     }
 }
 
+impl std::fmt::Display for TemporaryEntity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TemporaryEntity({}/{}) = {}", &self.collection, self.id, self.head.lock().unwrap())
+    }
+}
+
 /// A set of entities held weakly
 #[derive(Clone, Default)]
-pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<ID, WeakEntity>>>);
+pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
 impl WeakEntitySet {
-    pub fn get(&self, id: ID) -> Option<Entity> {
+    pub fn get(&self, id: &EntityId) -> Option<Entity> {
         let entities = self.0.read().unwrap();
         // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(&id) {
+        if let Some(entity) = entities.get(id) {
             entity.upgrade()
         } else {
             None
         }
     }
 
+    pub async fn get_or_retrieve(
+        &self,
+        collection_id: &CollectionId,
+        collection: &StorageCollectionWrapper,
+        id: &EntityId,
+    ) -> Result<Option<Entity>, RetrievalError> {
+        // do it in two phases to avoid holding the lock while waiting for the collection
+        match self.get(id) {
+            Some(entity) => Ok(Some(entity)),
+            None => match collection.get_state(*id).await {
+                Err(RetrievalError::EntityNotFound(_)) => Ok(None),
+                Err(e) => Err(e),
+                Ok(state) => {
+                    // technically someone could have added the entity since we last checked, so it's better to use the
+                    // with_state method to re-check
+                    let (_, entity) = self.with_state(collection, *id, collection_id.to_owned(), state.payload.state).await?;
+                    Ok(Some(entity))
+                }
+            },
+        }
+    }
+    /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
+    pub async fn get_retrieve_or_create(
+        &self,
+        collection_id: &CollectionId,
+        collection: &StorageCollectionWrapper,
+        id: &EntityId,
+    ) -> Result<Entity, RetrievalError> {
+        match self.get_or_retrieve(collection_id, collection, id).await? {
+            Some(entity) => Ok(entity),
+            None => {
+                let mut entities = self.0.write().unwrap();
+                // TODO: call policy agent with cdata
+                if let Some(entity) = entities.get(id) {
+                    if let Some(entity) = entity.upgrade() {
+                        return Ok(entity);
+                    }
+                }
+                let entity = Entity::create(*id, collection_id.to_owned(), Backends::new());
+                entities.insert(*id, entity.weak());
+                Ok(entity)
+            }
+        }
+    }
     /// Create a brand new entity, and add it to the set
     pub fn create(&self, collection: CollectionId) -> Entity {
         let mut entities = self.0.write().unwrap();
-        let id = ID::new();
+        let id = EntityId::new();
         let entity = Entity::create(id, collection, Backends::new());
         entities.insert(id, entity.weak());
         entity
     }
 
-    pub fn with_state(&self, id: ID, collection_id: CollectionId, state: State) -> Result<Entity, RetrievalError> {
-        let mut entities = self.0.write().unwrap();
-        match entities.entry(id) {
-            Entry::Vacant(_) => {
-                let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-                entities.insert(id, entity.weak());
-                Ok(entity)
-            }
-            Entry::Occupied(o) => match o.get().upgrade() {
-                Some(entity) => {
-                    if entity.collection == collection_id {
-                        entity.apply_state(&state)?;
-                        Ok(entity)
-                    } else {
-                        Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)))
-                    }
-                }
-                None => {
+    pub async fn with_state(
+        &self,
+        collection: &StorageCollectionWrapper,
+        id: EntityId,
+        collection_id: CollectionId,
+        state: State,
+    ) -> Result<(Option<bool>, Entity), RetrievalError> {
+        let entity = {
+            let mut entities = self.0.write().unwrap();
+            match entities.entry(id) {
+                Entry::Vacant(_) => {
                     let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                     entities.insert(id, entity.weak());
-                    Ok(entity)
+                    return Ok((None, entity));
                 }
-            },
-        }
+                Entry::Occupied(o) => match o.get().upgrade() {
+                    Some(entity) => {
+                        if entity.collection != collection_id {
+                            return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
+                        }
+                        entity
+                    }
+                    None => {
+                        let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+                        entities.insert(id, entity.weak());
+                        // just created the entity with the state, so we do not need to apply the state
+                        return Ok((None, entity));
+                    }
+                },
+            }
+        };
+
+        // if we're here, we've retrieved the entity from the set and need to apply the state
+        let changed = entity.apply_state(collection, &state).await?;
+        Ok((Some(changed), entity))
     }
 }

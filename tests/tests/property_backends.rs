@@ -35,9 +35,11 @@ pub struct Video {
 
 #[tokio::test]
 async fn property_backends() -> Result<()> {
-    let client = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new()).context(c);
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context(c)?;
 
-    let trx = client.begin();
+    let trx = ctx.begin();
     let cat_video = trx
         .create(&Video {
             title: "Cat video #2918".into(),
@@ -46,15 +48,15 @@ async fn property_backends() -> Result<()> {
             //views: 0,
             attribution: None,
         })
-        .await;
+        .await?;
 
     let id = cat_video.id();
     //cat_video.views.add(2); // FIXME: applying twice for some reason
     cat_video.visibility.set(&Visibility::Unlisted)?;
-    cat_video.title.insert(15, " (Very cute)");
+    cat_video.title.insert(15, " (Very cute)")?;
     trx.commit().await?;
 
-    let video = client.get::<VideoView>(id).await?;
+    let video = ctx.get::<VideoView>(id).await?;
     //assert_eq!(video.views().unwrap(), 1);
     assert_eq!(video.visibility().unwrap(), Visibility::Unlisted);
     assert_eq!(video.title().unwrap(), "Cat video #2918 (Very cute)");
@@ -71,9 +73,11 @@ async fn pg_property_backends() -> Result<()> {
     use ankurah::PermissiveAgent;
 
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let client = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
+    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context(c)?;
 
-    let trx = client.begin();
+    let trx = ctx.begin();
     let cat_video = trx
         .create(&Video {
             title: "Cat video #2918".into(),
@@ -82,9 +86,9 @@ async fn pg_property_backends() -> Result<()> {
             //views: 0,
             attribution: None,
         })
-        .await;
+        .await?;
 
-    let cat_video2 = trx
+    let _cat_video2 = trx
         .create(&Video {
             title: "Cat video #9000".into(),
             description: None,
@@ -92,15 +96,15 @@ async fn pg_property_backends() -> Result<()> {
             //views: 5120,
             attribution: Some("That guy".into()),
         })
-        .await;
+        .await?;
 
     let id = cat_video.id();
     //cat_video.views.add(2); // FIXME: applying twice for some reason
     cat_video.visibility.set(&Visibility::Unlisted)?;
-    cat_video.title.insert(15, " (Very cute)");
+    cat_video.title.insert(15, " (Very cute)")?;
     trx.commit().await?;
 
-    let video = client.get::<VideoView>(id).await?;
+    let video = ctx.get::<VideoView>(id).await?;
     //assert_eq!(video.views().unwrap(), 1);
     assert_eq!(video.visibility().unwrap(), Visibility::Unlisted);
     assert_eq!(video.title().unwrap(), "Cat video #2918 (Very cute)");

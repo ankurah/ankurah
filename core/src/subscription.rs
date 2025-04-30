@@ -17,11 +17,17 @@ pub struct Subscription<R: Clone> {
     pub(crate) matching_entities: Mutex<Vec<Entity>>,
 }
 
+impl<R: Clone> std::fmt::Debug for Subscription<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Subscription {{ id: {:?}, collection_id: {:?}, predicate: {:?} }}", self.id, self.collection_id, self.predicate)
+    }
+}
+
 /// A handle to a subscription that can be used to register callbacks
 pub struct SubscriptionHandle {
     pub(crate) id: proto::SubscriptionId,
     pub(crate) node: Box<dyn TNodeErased>,
-    pub(crate) peers: Vec<proto::ID>,
+    pub(crate) peers: Vec<proto::EntityId>,
 }
 
 impl SubscriptionHandle {

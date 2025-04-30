@@ -13,13 +13,13 @@ pub struct WebSocketClientSender {
     inner: Arc<Inner>,
 }
 struct Inner {
-    pub(crate) recipient_node_id: proto::ID,
+    pub(crate) recipient_node_id: proto::EntityId,
     handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
 impl WebSocketClientSender {
     pub fn new(
-        node_id: proto::ID,
+        node_id: proto::EntityId,
         mut sender: futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel(32);
@@ -37,12 +37,12 @@ impl WebSocketClientSender {
     }
 
     #[tracing::instrument(skip(self, message), fields(recipient = %self.inner.recipient_node_id, msg = %message))]
-    pub async fn send_message(&self, message: proto::Message) -> Result<(), SendError> {
+    pub fn send_message(&self, message: proto::Message) -> Result<(), SendError> {
         debug!("Serializing message");
         let data = bincode::serialize(&message).map_err(|e| SendError::Other(anyhow::anyhow!("Serialization error: {}", e)))?;
 
         debug!(bytes = data.len(), "Sending message through channel");
-        self.tx.send(axum::extract::ws::Message::Binary(data.into())).await.map_err(|_| SendError::Unknown)?;
+        self.tx.try_send(axum::extract::ws::Message::Binary(data.into())).map_err(|_| SendError::Unknown)?;
         debug!("Message sent successfully");
 
         Ok(())
@@ -52,16 +52,15 @@ impl WebSocketClientSender {
 #[async_trait]
 impl PeerSender for WebSocketClientSender {
     #[tracing::instrument(skip(self, message), fields(recipient = %self.inner.recipient_node_id))]
-    async fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         let server_message = proto::Message::PeerMessage(message);
-        self.send_message(server_message).await
+        self.send_message(server_message)
     }
-    fn recipient_node_id(&self) -> proto::ID { self.inner.recipient_node_id.clone() }
+    fn recipient_node_id(&self) -> proto::EntityId { self.inner.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-// LEFT OFF HERE:
 // Heavily audit the Websocket client and peer code
 // Update Node to consolidate pending requests into the peer map so unresolved requests get cleaned up when the node drops
 // Implement timeouts for pending requests

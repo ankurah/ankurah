@@ -1,7 +1,7 @@
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, Attested, EntityState};
 use async_trait::async_trait;
 
-use crate::{node::NodeInner, policy::PolicyAgent, storage::StorageEngine, Node};
+use crate::{policy::PolicyAgent, storage::StorageEngine, Node};
 
 // TODO redesign this such that:
 // - the sender and receiver are disconnected at the same time
@@ -10,9 +10,9 @@ use crate::{node::NodeInner, policy::PolicyAgent, storage::StorageEngine, Node};
 
 #[async_trait]
 pub trait PeerSender: Send + Sync {
-    async fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
+    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
     /// The node ID of the recipient of this message
-    fn recipient_node_id(&self) -> proto::ID;
+    fn recipient_node_id(&self) -> proto::EntityId;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }
 
@@ -30,29 +30,31 @@ pub enum SendError {
 
 #[async_trait]
 pub trait NodeComms: Send + Sync {
-    fn id(&self) -> proto::ID;
+    fn id(&self) -> proto::EntityId;
     fn durable(&self) -> bool;
+    fn system_root(&self) -> Option<Attested<EntityState>>;
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>);
-    fn deregister_peer(&self, node_id: proto::ID);
+    fn deregister_peer(&self, node_id: proto::EntityId);
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
-    fn id(&self) -> proto::ID { self.id.clone() }
+    fn id(&self) -> proto::EntityId { self.id }
     fn durable(&self) -> bool { self.durable }
+    fn system_root(&self) -> Option<Attested<EntityState>> { self.system.root() }
     fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         //
-        NodeInner::register_peer(&self, presence, sender);
+        self.register_peer(presence, sender);
     }
-    fn deregister_peer(&self, node_id: proto::ID) {
+    fn deregister_peer(&self, node_id: proto::EntityId) {
         //
-        NodeInner::deregister_peer(&self, node_id);
+        self.deregister_peer(node_id);
     }
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         //
-        NodeInner::handle_message(&self, message).await
+        self.handle_message(message).await
     }
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }

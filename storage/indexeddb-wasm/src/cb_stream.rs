@@ -8,7 +8,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{Event, EventTarget};
 
 pub struct CBStream {
-    receiver: mpsc::UnboundedReceiver<Result<JsValue, String>>,
+    receiver: mpsc::UnboundedReceiver<Result<JsValue, Event>>,
     _callbacks: Vec<(Closure<dyn FnMut(Event)>, EventTarget)>,
 }
 
@@ -36,7 +36,7 @@ impl CBStream {
             move |event: Event| {
                 web_sys::console::error_2(&JsValue::from_str("CB Stream error"), &event);
                 if let Some(sender) = sender.borrow().as_ref() {
-                    let _ = sender.unbounded_send(Err(event.as_string().unwrap_or_else(|| "Unknown error".to_string())));
+                    let _ = sender.unbounded_send(Err(event));
                 }
             }
         }) as Box<dyn FnMut(_)>);
@@ -53,7 +53,7 @@ impl CBStream {
 }
 
 impl Stream for CBStream {
-    type Item = Result<JsValue, String>;
+    type Item = Result<JsValue, Event>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> { Pin::new(&mut self.receiver).poll_next(cx) }
 }

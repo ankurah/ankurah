@@ -1,4 +1,4 @@
-use ankurah_proto::{Clock, Operation, State};
+use ankurah_proto::{Clock, Operation, State, StateBuffers};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -11,7 +11,7 @@ use std::{
 pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
-use crate::error::RetrievalError;
+use crate::error::{MutationError, RetrievalError, StateError};
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -35,51 +35,26 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     where Self: Sized;
 
     /// Get the latest state buffer for this property backend.
-    fn to_state_buffer(&self) -> Result<Vec<u8>>;
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError>;
     /// Construct a property backend from a state buffer.
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized;
 
     /// Retrieve operations applied to this backend since the last time we called this method.
-    fn to_operations(&self) -> anyhow::Result<Vec<Operation>>;
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError>;
     fn apply_operations(
         &self,
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_precursors: &Clock,
         // context: &Box<dyn TContext>,
-    ) -> anyhow::Result<()>;
+    ) -> Result<(), MutationError>;
 }
-
-// impl Event {
-//     pub fn push(&mut self, property_backend: &'static str, operation: Operation) {
-//         match self.operations.entry(property_backend.to_owned()) {
-//             Entry::Occupied(mut entry) => {
-//                 entry.get_mut().push(operation);
-//             }
-//             Entry::Vacant(entry) => {
-//                 entry.insert(vec![operation]);
-//             }
-//         }
-//     }
-
-//     pub fn extend(&mut self, property_backend: &'static str, operations: Vec<Operation>) {
-//         match self.operations.entry(property_backend.to_owned()) {
-//             Entry::Occupied(mut entry) => {
-//                 entry.get_mut().extend(operations);
-//             }
-//             Entry::Vacant(entry) => {
-//                 entry.insert(operations);
-//             }
-//         }
-//     }
-// }
 
 /// Holds the property backends inside of entities.
 #[derive(Debug)]
 pub struct Backends {
     pub backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
-    pub head: Arc<Mutex<Clock>>,
 }
 
 // This is where this gets a bit tough.
@@ -118,7 +93,7 @@ impl Default for Backends {
 }
 
 impl Backends {
-    pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())), head: Arc::new(Mutex::new(Clock::default())) } }
+    pub fn new() -> Self { Self { backends: Arc::new(Mutex::new(BTreeMap::default())) } }
 
     fn backends_lock(&self) -> MutexGuard<BTreeMap<String, Arc<dyn PropertyBackend>>> {
         self.backends.lock().expect("other thread panicked, panic here too")
@@ -150,7 +125,7 @@ impl Backends {
             forked.insert(name.clone(), backend.fork().into());
         }
 
-        Self { backends: Arc::new(Mutex::new(forked)), head: Arc::new(Mutex::new(self.head.lock().unwrap().clone())) }
+        Self { backends: Arc::new(Mutex::new(forked)) }
     }
 
     fn insert(&self, backend_name: String, backend: Arc<dyn PropertyBackend>) {
@@ -158,27 +133,26 @@ impl Backends {
         backends.insert(backend_name, backend);
     }
 
-    pub fn to_state_buffers(&self) -> Result<State> {
+    pub fn to_state_buffers(&self) -> Result<StateBuffers, StateError> {
         let backends = self.backends_lock();
         let mut state_buffers = BTreeMap::default();
         for (name, backend) in &*backends {
             let state_buffer = backend.to_state_buffer()?;
             state_buffers.insert(name.clone(), state_buffer);
         }
-        Ok(State { state_buffers, head: self.head.lock().unwrap().clone() })
+        Ok(StateBuffers(state_buffers))
     }
 
-    pub fn from_state_buffers(entity_state: &State) -> Result<Self, RetrievalError> {
+    pub fn from_state_buffers(state_buffers: &StateBuffers) -> Result<Self, RetrievalError> {
         let backends = Backends::new();
-        for (name, state_buffer) in &entity_state.state_buffers {
+        for (name, state_buffer) in state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
-        *backends.head.lock().unwrap() = entity_state.head.clone();
         Ok(backends)
     }
 
-    pub fn to_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>> {
+    pub fn take_accumulated_operations(&self) -> Result<BTreeMap<String, Vec<Operation>>, MutationError> {
         let backends = self.backends_lock();
         let mut operations = BTreeMap::<String, Vec<Operation>>::new();
         for (name, backend) in &*backends {
@@ -195,20 +169,19 @@ impl Backends {
         current_head: &Clock,
         event_precursors: &Clock,
         // context: &Box<dyn TContext>,
-    ) -> Result<()> {
+    ) -> Result<(), MutationError> {
         let backend = self.get_raw(backend_name)?;
         backend.apply_operations(operations, current_head, event_precursors /*context*/)?;
         Ok(())
     }
 
     /// HACK - this should be based on a play forward of events
-    pub fn apply_state(&self, state: &State) -> Result<(), RetrievalError> {
+    pub fn apply_state(&self, state: &State) -> Result<(), MutationError> {
         let mut backends = self.backends_lock();
-        for (name, state_buffer) in &state.state_buffers {
+        for (name, state_buffer) in state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
             backends.insert(name.to_owned(), backend);
         }
-        *self.head.lock().unwrap() = state.head.clone();
         Ok(())
     }
 
