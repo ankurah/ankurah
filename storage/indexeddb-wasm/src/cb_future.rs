@@ -8,8 +8,18 @@ use std::task::{Context, Poll};
 use wasm_bindgen::prelude::*;
 use web_sys::{Event, EventTarget};
 
+/// Adds event listeners to the target for the given events, and returns a future that resolves when one of the events are triggered.
+pub fn cb_future<'a, T: AsRef<EventTarget>, S: Into<EventNames<'a>>, E: Into<EventNames<'a>>>(
+    target: &T,
+    success_events: S,
+    error_events: E,
+) -> CBFuture {
+    CBFuture::new(target, success_events, error_events)
+}
+
+/// A future that resolves when one of the given events are triggered.
 pub struct CBFuture {
-    receiver: oneshot::Receiver<Result<(), String>>,
+    receiver: oneshot::Receiver<Result<(), Event>>,
     _callbacks: Vec<(Closure<dyn FnMut(Event)>, EventTarget)>, // Store target to prevent early drop
 }
 
@@ -70,7 +80,7 @@ impl CBFuture {
             move |event: Event| {
                 web_sys::console::error_2(&JsValue::from_str("CB Future error"), &event);
                 if let Some(sender) = sender.borrow_mut().take() {
-                    let _ = sender.send(Err(event.as_string().unwrap_or_else(|| "Unknown error".to_string())));
+                    let _ = sender.send(Err(event));
                 }
             }
         }) as Box<dyn FnMut(_)>);
@@ -89,7 +99,7 @@ impl CBFuture {
 }
 
 impl Future for CBFuture {
-    type Output = Result<(), String>;
+    type Output = Result<(), Event>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // we don't cancel the future, so we can just unwrap the result

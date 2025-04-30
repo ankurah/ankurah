@@ -87,14 +87,17 @@
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create server and client nodes
 //!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
+//!     server.system.create().await?;
 //!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
 //!
 //!     // Connect nodes using local process connection
 //!     let _conn = LocalProcessConnection::new(&server, &client).await?;
+//!     client.system.wait_system_ready().await; // Wait for the client to join the server "system"
 //!
 //!     // Get contexts for the server and client
-//!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT);
-//!     let client = client.context(ankurah::policy::DEFAULT_CONTEXT);
+//!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT)?;
+//!     let client = client.context(ankurah::policy::DEFAULT_CONTEXT)?;
+//!
 //!
 //!     // Subscribe to changes on the client
 //!     let _subscription = client.subscribe::<_,AlbumView>("name = 'Origin of Symmetry'", |changes| {
@@ -131,14 +134,12 @@ pub use ankurah_core as core;
 pub use ankurah_derive as derive;
 pub use ankurah_proto as proto;
 
-pub use proto::ID;
+pub use proto::EntityId;
 // Re-export commonly used types
 pub use ankurah_core::{
     changes,
     context::Context,
-    entity, error,
-    event::Event,
-    model,
+    entity, error, model,
     model::View,
     model::{Model, Mutable},
     node::{MatchArgs, Node},

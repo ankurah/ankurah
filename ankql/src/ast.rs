@@ -16,6 +16,7 @@ pub enum Literal {
     Integer(i64),
     Float(f64),
     Boolean(bool),
+    // Id(EntityId), // TODO consolidate ast into proto crate so we can directly reference EntityId
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

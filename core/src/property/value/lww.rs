@@ -40,7 +40,7 @@ impl<T: Property> LWW<T> {
 impl<T: Property> FromEntity for LWW<T> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
-        Self { property_name: property_name, backend: backend, phantom: PhantomData }
+        Self { property_name, backend, phantom: PhantomData }
     }
 }
 

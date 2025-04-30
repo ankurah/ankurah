@@ -92,7 +92,10 @@ where
     let mut conn = Connection::Initial(Some(sender));
 
     // Immediately send server presence after connection
-    if let Err(e) = conn.send(proto::Message::Presence(proto::Presence { node_id: node.id.clone(), durable: node.durable })).await {
+    if let Err(e) = conn
+        .send(proto::Message::Presence(proto::Presence { node_id: node.id, durable: node.durable, system_root: node.system.root() }))
+        .await
+    {
         debug!("Error sending presence to {client_ip}: {:?}", e);
         return;
     }
@@ -142,7 +145,7 @@ where
 
                                     use super::sender::WebSocketClientSender;
                                     // Register peer sender for this client
-                                    let sender = WebSocketClientSender::new(presence.node_id.clone(), sender);
+                                    let sender = WebSocketClientSender::new(presence.node_id, sender);
 
                                     node.register_peer(presence, Box::new(sender.clone()));
                                     *state = Connection::Established(sender);

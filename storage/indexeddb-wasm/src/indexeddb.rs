@@ -1,12 +1,13 @@
 use ankql::selection::filter::evaluate_predicate;
 use ankurah_core::entity::TemporaryEntity;
-use ankurah_core::error::RetrievalError;
+use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::storage::{StorageCollection, StorageEngine};
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, Attested, EntityState, EventId, State};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use js_sys::Function;
+use lazy_static::lazy_static;
 use send_wrapper::SendWrapper;
 use std::any::Any;
 use std::sync::atomic::AtomicUsize;
@@ -16,7 +17,21 @@ use tracing::info;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Event, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent};
+use web_sys::{IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent};
+
+use crate::cb_future::{cb_future, CBFuture};
+
+// Cache the property keys so we only have to create the js values once
+lazy_static! {
+    static ref ID_KEY: Property = Property::new("id");
+    static ref HEAD_KEY: Property = Property::new("head");
+    static ref COLLECTION_KEY: Property = Property::new("collection");
+    static ref STATE_BUFFER_KEY: Property = Property::new("state_buffer");
+    static ref ENTITY_ID_KEY: Property = Property::new("entity_id");
+    static ref OPERATIONS_KEY: Property = Property::new("operations");
+    static ref ATTESTATIONS_KEY: Property = Property::new("attestations");
+    static ref PARENT_KEY: Property = Property::new("parent");
+}
 
 pub struct IndexedDBStorageEngine {
     // We need SendWrapper because despite the ability to declare an async trait as ?Send,
@@ -88,13 +103,13 @@ impl IndexedDBStorageEngine {
                 }
             }) as Box<dyn FnMut(_)>);
 
-            let onsuccess = Closure::wrap(Box::new(move |event: Event| {
+            let onsuccess = Closure::wrap(Box::new(move |event: web_sys::Event| {
                 let target: IdbRequest = event.target().unwrap().unchecked_into();
                 let db: IdbDatabase = target.result().unwrap().unchecked_into();
                 resolve.call1(&JsValue::NULL, &JsValue::from(db)).unwrap();
             }) as Box<dyn FnMut(_)>);
 
-            let onerror = Closure::wrap(Box::new(move |event: Event| {
+            let onerror = Closure::wrap(Box::new(move |event: web_sys::Event| {
                 let target: IdbRequest = event.target().unwrap().unchecked_into();
                 let error = target.error().unwrap();
                 reject.call1(&JsValue::NULL, &error.into()).unwrap();
@@ -126,7 +141,7 @@ impl IndexedDBStorageEngine {
 
         let delete_request = idb.delete_database(name).map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
 
-        let future = crate::cb_future::CBFuture::new(&delete_request, &["success", "blocked"], "error");
+        let future = CBFuture::new(&delete_request, &["success", "blocked"], "error");
 
         future.await.map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
 
@@ -145,353 +160,303 @@ impl StorageEngine for IndexedDBStorageEngine {
             invocation_count: AtomicUsize::new(0),
         }))
     }
+
+    async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, MutationError> {
+            res.map_err(|e| MutationError::FailedStep(msg, e.into().as_string().unwrap_or_default()))
+        }
+
+        SendWrapper::new(async move {
+            // Clear entities store
+            let entities_transaction = step(
+                self.db.transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readwrite),
+                "create entities transaction",
+            )?;
+            let entities_store = step(entities_transaction.object_store("entities"), "get entities store")?;
+            let entities_request = step(entities_store.clear(), "clear entities store")?;
+            step(CBFuture::new(&entities_request, "success", "error").await, "await entities clear")?;
+            step(CBFuture::new(&entities_transaction, "complete", "error").await, "complete entities transaction")?;
+
+            // Clear events store
+            let events_transaction =
+                step(self.db.transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite), "create events transaction")?;
+            let events_store = step(events_transaction.object_store("events"), "get events store")?;
+            let events_request = step(events_store.clear(), "clear events store")?;
+            step(CBFuture::new(&events_request, "success", "error").await, "await events clear")?;
+            step(CBFuture::new(&events_transaction, "complete", "error").await, "complete events transaction")?;
+
+            // Return true since we cleared everything
+            Ok(true)
+        })
+        .await
+    }
 }
 
 #[async_trait]
 impl StorageCollection for IndexedDBBucket {
-    async fn set_state(&self, id: proto::ID, state: &proto::State) -> anyhow::Result<bool> {
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, MutationError> {
+            res.map_err(|e| MutationError::FailedStep(msg, e.into().as_string().unwrap_or_default()))
+        }
+
         self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Lock the mutex to prevent concurrent updates
         let _lock = self.mutex.lock().await;
 
         SendWrapper::new(async move {
+            use web_sys::IdbTransactionMode::Readwrite;
             // Get the old entity if it exists to check for changes
-            let transaction = self
-                .db
-                .transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readwrite)
-                .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+            let transaction = step(self.db.transaction_with_str_and_mode("entities", Readwrite), "create transaction")?;
+            let store = step(transaction.object_store("entities"), "get object store")?;
+            let old_request = step(store.get(&state.payload.entity_id.as_string().into()), "get old entity")?;
+            let foo = CBFuture::new(&old_request, "success", "error").await;
+            let _: () = step(foo, "get old entity")?;
 
-            let store = transaction.object_store("entities").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
-
-            let old_request = store.get(&id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to get old entity"))?;
-
-            crate::cb_future::CBFuture::new(&old_request, "success", "error")
-                .await
-                .map_err(|_e| anyhow::anyhow!("Failed to get old entity"))?;
-
-            let old_entity: JsValue = old_request.result().unwrap();
+            let old_entity: JsValue = step(old_request.result(), "get old entity result")?;
 
             // Check if the entity changed
             if !old_entity.is_undefined() && !old_entity.is_null() {
-                let old_head = js_sys::Reflect::get(&old_entity, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get old head"))?;
-                if !old_head.is_undefined() && !old_head.is_null() {
-                    let old_clock: proto::Clock = old_head.try_into().map_err(|e| anyhow::anyhow!("Failed to parse old head: {}", e))?;
+                let old_head = get_property(&old_entity, &HEAD_KEY)?;
 
-                    if old_clock == state.head {
-                        // No change in head, skip update
-                        // HACK - we still need to lie and return true because there are good odds the other browser is yours
-                        // and has already updated the entity 🤦
-                        // ...andd this breaks subscription notification
-                        // Ideally we'd use the node to check for changes, but we can't assume that the subscriber is keeping the entities resident
-                        // and the node is using weak references so they might be freed
-                        return Ok(true);
+                if !old_head.is_undefined() && !old_head.is_null() {
+                    let old_clock: proto::Clock = old_head.try_into()?;
+                    if old_clock == state.payload.state.head {
+                        // return false if the head is the same. This was formerly disabled for IndexedDB because it was breaking things
+                        // by *accurately* reporting that the stored entity had not changed, because it was applied by another browser window moments earlier.
+                        // Now we are checking the resident entity to see if it has been updated, which is more correct.
+                        return Ok(false);
                     }
                 }
             }
 
-            // Create a JS object to store our data
             let entity = js_sys::Object::new();
-            js_sys::Reflect::set(&entity, &"id".into(), &id.as_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set id on entity"))?;
-            js_sys::Reflect::set(&entity, &"collection".into(), &self.collection_id.as_str().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set collection on entity"))?;
-
-            // Store state_buffers
-            let state_buffer = bincode::serialize(&state.state_buffers)?;
-            js_sys::Reflect::set(&entity, &"state_buffer".into(), &js_sys::Uint8Array::from(&state_buffer[..]).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set data on entity"))?;
-
-            js_sys::Reflect::set(&entity, &"head".into(), &(&(state.head)).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set head on entity"))?;
+            set_property(&entity, &ID_KEY, &state.payload.entity_id.as_string().into())?;
+            set_property(&entity, &COLLECTION_KEY, &self.collection_id.as_str().into())?;
+            set_property(&entity, &STATE_BUFFER_KEY, &(&state.payload.state.state_buffers).try_into()?)?;
+            set_property(&entity, &HEAD_KEY, &(&(state.payload.state.head)).into())?;
+            set_property(&entity, &ATTESTATIONS_KEY, &(&state.attestations).try_into()?)?;
 
             // Put the entity in the store
-            let request =
-                store.put_with_key(&entity, &id.as_string().into()).map_err(|_e| anyhow::anyhow!("Failed to put entity in store"))?;
+            let request = step(store.put_with_key(&entity, &state.payload.entity_id.as_string().into()), "put entity in store")?;
 
-            let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
-            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put entity in store"))?;
-
-            let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
-            trx_fut.await.map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
+            step(CBFuture::new(&request, "success", "error").await, "put entity in store")?;
+            step(CBFuture::new(&transaction, "complete", "error").await, "complete transaction")?;
 
             Ok(true) // It was updated
         })
         .await
     }
 
-    async fn get_state(&self, id: proto::ID) -> Result<proto::State, RetrievalError> {
+    async fn get_state(&self, id: proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
+        }
+
         SendWrapper::new(async move {
             // Create transaction and get object store
-            let transaction = self
-                .db
-                .transaction_with_str("entities")
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to create transaction").into()))?;
+            let transaction = step(self.db.transaction_with_str("entities"), "create transaction")?;
+            let store = step(transaction.object_store("entities"), "get object store")?;
+            let request = step(store.get(&id.as_string().into()), "get entity")?;
 
-            let store = transaction
-                .object_store("entities")
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get object store").into()))?;
+            step(CBFuture::new(&request, "success", "error").await, "await request")?;
 
-            // Get the entity
-            let request = store
-                .get(&id.as_string().into())
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 1").into()))?;
-
-            crate::cb_future::CBFuture::new(&request, "success", "error")
-                .await
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 2").into()))?;
-
-            let result = request.result().unwrap();
+            let result = step(request.result(), "get result")?;
 
             // Check if the entity exists
             if result.is_undefined() || result.is_null() {
-                return Err(RetrievalError::NotFound(id));
+                return Err(RetrievalError::EntityNotFound(id));
             }
 
-            // Get the data from the JS object
-            let entity: web_sys::js_sys::Object =
-                result.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 3").into()))?;
+            let entity: web_sys::js_sys::Object = step(result.dyn_into(), "dyn into")?;
 
-            let data = js_sys::Reflect::get(&entity, &"state_buffer".into())
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 4").into()))?;
-
-            let array: js_sys::Uint8Array =
-                data.dyn_into().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity 5").into()))?;
-
-            let mut buffer = vec![0; array.length() as usize];
-            array.copy_to(&mut buffer);
-
-            // Deserialize the state
-            let state_buffers = bincode::deserialize(&buffer)?;
-
-            // Get the head array
-            let head_data = js_sys::Reflect::get(&entity, &"head".into())
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get head").into()))?;
-            let head: proto::Clock = head_data
-                .try_into()
-                .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to deserialize head: {}", e).into()))?;
-
-            Ok(proto::State { state_buffers, head })
+            Ok(Attested {
+                payload: EntityState {
+                    entity_id: id,
+                    collection: self.collection_id.clone(),
+                    state: State {
+                        state_buffers: get_property(&entity, &STATE_BUFFER_KEY)?.try_into()?,
+                        head: get_property(&entity, &HEAD_KEY)?.try_into()?,
+                    },
+                },
+                attestations: get_property(&entity, &ATTESTATIONS_KEY)?.try_into()?,
+            })
         })
         .await
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<(proto::ID, proto::State)>, RetrievalError> {
+    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let collection_id = self.collection_id.clone();
+
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
+        }
+
         SendWrapper::new(async move {
-            let transaction = self.db.transaction_with_str("entities").map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+            let transaction = step(self.db.transaction_with_str("entities"), "create transaction")?;
+            let store = step(transaction.object_store("entities"), "get object store")?;
+            let index = step(store.index("by_collection"), "get collection index")?;
+            let key_range = step(web_sys::IdbKeyRange::only(&collection_id.as_str().into()), "create key range")?;
+            let request = step(index.open_cursor_with_range(&key_range), "open cursor")?;
 
-            let store = transaction.object_store("entities").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
-
-            let index = store.index("by_collection").map_err(|_e| anyhow::anyhow!("Failed to get collection index"))?;
-
-            let key_range = web_sys::IdbKeyRange::only(&(&collection_id).as_str().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to create key range"))?;
-
-            let request = index.open_cursor_with_range(&key_range).map_err(|_e| anyhow::anyhow!("Failed to open cursor"))?;
-
-            let mut tuples = Vec::new();
+            let mut output: Vec<Attested<EntityState>> = Vec::new();
             let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
 
             while let Some(result) = stream.next().await {
-                let cursor_result = result.map_err(|e| anyhow::anyhow!("Cursor error: {}", e))?;
+                let cursor_result = step(result, "cursor error")?;
 
                 // Check if we've reached the end
                 if cursor_result.is_null() || cursor_result.is_undefined() {
                     break;
                 }
 
-                let cursor: web_sys::IdbCursorWithValue = cursor_result.dyn_into().map_err(|_| anyhow::anyhow!("Failed to cast cursor"))?;
-
-                let entity = cursor.value().map_err(|e| anyhow::anyhow!("Failed to get cursor value: {:?}", e))?;
-
-                let id_str = js_sys::Reflect::get(&entity, &"id".into()).map_err(|_e| anyhow::anyhow!("Failed to get entity id"))?;
-                let id: proto::ID = id_str.try_into().map_err(|_e| anyhow::anyhow!("Failed to convert id to proto::ID"))?;
-
-                let state_buffer =
-                    js_sys::Reflect::get(&entity, &"state_buffer".into()).map_err(|_e| anyhow::anyhow!("Failed to get state buffer"))?;
-                let array: js_sys::Uint8Array = state_buffer.dyn_into().map_err(|_e| anyhow::anyhow!("Failed to convert state buffer"))?;
-
-                let mut buffer = vec![0; array.length() as usize];
-                array.copy_to(&mut buffer);
-
-                let state_buffers: std::collections::BTreeMap<String, Vec<u8>> = bincode::deserialize(&buffer)?;
-
-                // Get the head array
-                let head_data = js_sys::Reflect::get(&entity, &"head".into()).map_err(|_e| anyhow::anyhow!("Failed to get head"))?;
-                let head: proto::Clock = head_data.try_into().map_err(|e| anyhow::anyhow!("Failed to deserialize head: {}", e))?;
-
-                let entity_state = proto::State { state_buffers, head };
+                let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
+                let entity = step(cursor.value(), "get cursor value")?;
+                let id = get_property(&entity, &ID_KEY)?.try_into()?;
+                let entity_state = EntityState {
+                    collection: collection_id.clone(),
+                    entity_id: id,
+                    state: State {
+                        state_buffers: get_property(&entity, &STATE_BUFFER_KEY)?.try_into()?,
+                        head: get_property(&entity, &HEAD_KEY)?.try_into()?,
+                    },
+                };
+                let attestations = get_property(&entity, &ATTESTATIONS_KEY)?.try_into()?;
+                let attested_state = Attested { payload: entity_state, attestations };
 
                 // Create entity to evaluate predicate
-                let entity = TemporaryEntity::new(id, collection_id.clone(), &entity_state)?;
-
+                let entity = TemporaryEntity::new(id, collection_id.clone(), &attested_state.payload.state)?;
                 // Apply predicate filter
                 if evaluate_predicate(&entity, predicate)? {
-                    tuples.push((id, entity_state));
+                    output.push(attested_state);
                 }
 
-                cursor.continue_().map_err(|_e| anyhow::anyhow!("Failed to advance cursor"))?;
+                step(cursor.continue_(), "advance cursor")?;
             }
 
-            Ok(tuples)
+            Ok(output)
         })
         .await
     }
 
-    async fn add_event(&self, entity_event: &ankurah_proto::Event) -> anyhow::Result<bool> {
+    async fn add_event(&self, attested_event: &Attested<ankurah_proto::Event>) -> Result<bool, MutationError> {
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, MutationError> {
+            res.map_err(|e| MutationError::FailedStep(msg, e.into().as_string().unwrap_or_default()))
+        }
+
         let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("IndexedDBBucket({}).add_event({})", self.collection_id, invocation);
         let _lock = self.mutex.lock().await;
         debug!("IndexedDBBucket({}).add_event({}) LOCKED", self.collection_id, invocation);
 
         SendWrapper::new(async move {
-            let transaction = self
-                .db
-                .transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite)
-                .map_err(|_e| anyhow::anyhow!("Failed to create transaction"))?;
+            let transaction =
+                step(self.db.transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite), "create transaction")?;
 
-            let store = transaction.object_store("events").map_err(|_e| anyhow::anyhow!("Failed to get object store"))?;
+            let store = step(transaction.object_store("events"), "get object store")?;
 
             // Create a JS object to store the event data
             let event_obj = js_sys::Object::new();
+            let payload = &attested_event.payload;
+            let id: JsValue = (&payload.id()).into();
+            set_property(&event_obj, &ID_KEY, &id)?;
+            set_property(&event_obj, &ENTITY_ID_KEY, &(&payload.entity_id).into())?;
+            set_property(&event_obj, &OPERATIONS_KEY, &(&payload.operations).try_into()?)?;
+            set_property(&event_obj, &ATTESTATIONS_KEY, &(&attested_event.attestations).try_into()?)?;
+            set_property(&event_obj, &PARENT_KEY, &(&payload.parent).into())?;
 
-            // Convert IDs to UUIDs for consistent storage
-            let event_id = ulid::Ulid::from(entity_event.id);
-            let event_uuid = uuid::Uuid::from(event_id);
-            let entity_id = ulid::Ulid::from(entity_event.entity_id);
-            let entity_uuid = uuid::Uuid::from(entity_id);
+            let request = step(store.put_with_key(&event_obj, &(&payload.id()).into()), "put event in store")?;
 
-            js_sys::Reflect::set(&event_obj, &"id".into(), &event_uuid.to_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set id on event"))?;
-            js_sys::Reflect::set(&event_obj, &"entity_id".into(), &entity_uuid.to_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set entity_id on event"))?;
-
-            // Serialize operations
-            let operations = bincode::serialize(&entity_event.operations)?;
-            js_sys::Reflect::set(&event_obj, &"operations".into(), &js_sys::Uint8Array::from(&operations[..]).into())
-                .map_err(|_e| anyhow::anyhow!("Failed to set operations on event"))?;
-
-            // Convert parent clock to UUIDs and then to a JS array of strings
-            let parent_uuids: Vec<uuid::Uuid> = (&entity_event.parent).into();
-            let parent_array = js_sys::Array::new();
-            for uuid in parent_uuids {
-                let js_str = wasm_bindgen::JsValue::from_str(&uuid.to_string());
-                parent_array.push(&js_str);
-            }
-            js_sys::Reflect::set(&event_obj, &"parent".into(), &parent_array)
-                .map_err(|_e| anyhow::anyhow!("Failed to set parent on event"))?;
-
-            // Store the event
-            let request = store
-                .put_with_key(&event_obj, &event_uuid.to_string().into())
-                .map_err(|_e| anyhow::anyhow!("Failed to put event in store"))?;
-
-            let request_fut = crate::cb_future::CBFuture::new(&request, "success", "error");
-            request_fut.await.map_err(|_e| anyhow::anyhow!("Failed to put event in store"))?;
-
-            let trx_fut = crate::cb_future::CBFuture::new(&transaction, "complete", "error");
-            trx_fut.await.map_err(|_e| anyhow::anyhow!("Failed to complete transaction"))?;
+            step(cb_future(&request, "success", "error").await, "await request")?;
+            step(cb_future(&transaction, "complete", "error").await, "complete transaction")?;
 
             Ok(true)
         })
         .await
     }
 
-    async fn get_events(&self, id: ankurah_proto::ID) -> Result<Vec<ankurah_proto::Event>, ankurah_core::error::RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+        if event_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
+        }
+
         SendWrapper::new(async move {
-            let transaction = self
-                .db
-                .transaction_with_str("events")
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to create transaction").into()))?;
+            let transaction = step(self.db.transaction_with_str("events"), "create transaction")?;
+            let store = step(transaction.object_store("events"), "get object store")?;
 
-            let store = transaction
-                .object_store("events")
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get object store").into()))?;
+            // TODO - do we want to use a cursor? The id space is pretty sparse, so we would probably need benchmarks to see if it's worth it
+            let mut events = Vec::new();
+            for event_id in event_ids {
+                let request = step(store.get(&event_id.to_string().into()), "get event")?;
+                step(CBFuture::new(&request, "success", "error").await, "await event request")?;
+                let result = step(request.result(), "get result")?;
 
-            let index = store
-                .index("by_entity_id")
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get entity_id index").into()))?;
+                // Skip if event not found
+                if result.is_undefined() || result.is_null() {
+                    continue;
+                }
 
-            // Convert ID to UUID for lookup
-            let entity_id = ulid::Ulid::from(id);
-            let entity_uuid = uuid::Uuid::from(entity_id);
+                let event_obj: web_sys::js_sys::Object = step(result.dyn_into(), "cast event object")?;
 
-            let key_range = web_sys::IdbKeyRange::only(&entity_uuid.to_string().into())
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to create key range").into()))?;
+                let event = Attested {
+                    payload: ankurah_proto::Event {
+                        collection: get_property(&event_obj, &COLLECTION_KEY)?.try_into()?,
+                        entity_id: get_property(&event_obj, &ENTITY_ID_KEY)?.try_into()?,
+                        operations: get_property(&event_obj, &OPERATIONS_KEY)?.try_into()?,
+                        parent: get_property(&event_obj, &PARENT_KEY)?.try_into()?,
+                    },
+                    attestations: get_property(&event_obj, &ATTESTATIONS_KEY)?.try_into()?,
+                };
+                events.push(event);
+            }
 
-            let request = index
-                .open_cursor_with_range(&key_range)
-                .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to open cursor").into()))?;
+            Ok(events)
+        })
+        .await
+    }
+
+    async fn dump_entity_events(&self, id: ankurah_proto::EntityId) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
+        }
+
+        SendWrapper::new(async move {
+            let transaction = step(self.db.transaction_with_str("events"), "create transaction")?;
+            let store = step(transaction.object_store("events"), "get object store")?;
+            let index = step(store.index("by_entity_id"), "get entity_id index")?;
+            let key_range = step(web_sys::IdbKeyRange::only(&id.into()), "create key range")?;
+            let request = step(index.open_cursor_with_range(&key_range), "open cursor")?;
 
             let mut events = Vec::new();
             let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
 
             while let Some(result) = stream.next().await {
-                let cursor_result = result.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Cursor error: {}", e).into()))?;
+                let cursor_result = step(result, "Cursor error")?;
 
                 // Check if we've reached the end
                 if cursor_result.is_null() || cursor_result.is_undefined() {
                     break;
                 }
 
-                let cursor: web_sys::IdbCursorWithValue =
-                    cursor_result.dyn_into().map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("Failed to cast cursor").into()))?;
+                let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
+                let event_obj = step(cursor.value(), "get cursor value")?;
 
-                let event_obj = cursor
-                    .value()
-                    .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get cursor value: {:?}", e).into()))?;
+                let event = Attested {
+                    payload: ankurah_proto::Event {
+                        collection: get_property(&event_obj, &COLLECTION_KEY)?.try_into()?,
+                        // id: get_property(&event_obj, &ID_KEY)?.try_into()?,
+                        entity_id: get_property(&event_obj, &ENTITY_ID_KEY)?.try_into()?,
+                        operations: get_property(&event_obj, &OPERATIONS_KEY)?.try_into()?,
+                        parent: get_property(&event_obj, &PARENT_KEY)?.try_into()?,
+                    },
+                    attestations: get_property(&event_obj, &ATTESTATIONS_KEY)?.try_into()?,
+                };
+                events.push(event);
 
-                // Get operations
-                let operations_data = js_sys::Reflect::get(&event_obj, &"operations".into())
-                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get operations").into()))?;
-                let array: js_sys::Uint8Array = operations_data
-                    .dyn_into()
-                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert operations").into()))?;
-                let mut buffer = vec![0; array.length() as usize];
-                array.copy_to(&mut buffer);
-                let operations = bincode::deserialize(&buffer)?;
-
-                // Get parent clock from JS array of UUID strings
-                let parent_data = js_sys::Reflect::get(&event_obj, &"parent".into())
-                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get parent").into()))?;
-                let parent_array: js_sys::Array = parent_data
-                    .dyn_into()
-                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert parent to array").into()))?;
-                let mut parent_uuids = Vec::new();
-                for i in 0..parent_array.length() {
-                    let uuid_str: String = parent_array
-                        .get(i)
-                        .as_string()
-                        .ok_or_else(|| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert UUID string").into()))?;
-                    let uuid = uuid::Uuid::parse_str(&uuid_str)
-                        .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to parse UUID: {}", e).into()))?;
-                    parent_uuids.push(uuid);
-                }
-                let parent = parent_uuids
-                    .into_iter()
-                    .map(|uuid| ankurah_proto::ID::from_ulid(uuid.into()))
-                    .collect::<std::collections::BTreeSet<_>>();
-                let parent_clock = ankurah_proto::Clock::new(parent);
-
-                // Get event ID
-                let event_id_str = js_sys::Reflect::get(&event_obj, &"id".into())
-                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get event id").into()))?;
-                let event_id_str: String = event_id_str
-                    .try_into()
-                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert event id to string").into()))?;
-                let event_uuid = uuid::Uuid::parse_str(&event_id_str)
-                    .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to parse event UUID").into()))?;
-                let event_id = ankurah_proto::ID::from_ulid(event_uuid.into());
-
-                events.push(ankurah_proto::Event {
-                    id: event_id,
-                    collection: self.collection_id.clone(),
-                    entity_id: id,
-                    operations,
-                    parent: parent_clock,
-                });
-
-                cursor.continue_().map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to advance cursor").into()))?;
+                step(cursor.continue_(), "Failed to advance cursor")?;
             }
 
             Ok(events)
@@ -500,13 +465,40 @@ impl StorageCollection for IndexedDBBucket {
     }
 }
 
+fn get_property(obj: &JsValue, key: &Property) -> Result<JsValue, RetrievalError> {
+    js_sys::Reflect::get(obj, key).map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key).into()))
+}
+
+fn set_property(obj: &JsValue, key: &Property, value: &JsValue) -> Result<bool, MutationError> {
+    js_sys::Reflect::set(obj, key, value).map_err(|_e| MutationError::FailedToSetProperty(key.name, value.as_string().unwrap_or_default()))
+}
+
+struct Property {
+    key: SendWrapper<JsValue>,
+    name: &'static str,
+}
+
+impl Property {
+    fn new(key: &'static str) -> Self { Self { key: SendWrapper::new(key.into()), name: key } }
+}
+impl std::ops::Deref for Property {
+    type Target = JsValue;
+    fn deref(&self) -> &Self::Target { &self.key }
+}
+impl std::fmt::Display for Property {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.name) }
+}
+
 // #[cfg(target_arch = "wasm32")]
 #[cfg(test)]
 mod tests {
     #![allow(unused)]
 
+    use std::collections::BTreeMap;
+
     use super::*;
     use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Mutable, Node, PermissiveAgent};
+    use ankurah_proto::{AttestationSet, StateBuffers};
     use serde::{Deserialize, Serialize};
     use wasm_bindgen_test::*;
 
@@ -567,19 +559,22 @@ mod tests {
         let bucket = engine.collection(&"albums".into()).await.expect("Failed to create bucket");
 
         // Create a test entity
-        let id = proto::ID::new();
-        let mut state_buffers = std::collections::BTreeMap::new();
+        let id = proto::EntityId::new();
+        let mut state_buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         state_buffers.insert("propertybackend_yrs".to_string(), vec![1, 2, 3]);
-        let state = proto::State { state_buffers, head: proto::Clock::default() };
-
+        let state = proto::State { state_buffers: StateBuffers(state_buffers), head: proto::Clock::default() };
+        let attested_state = Attested {
+            payload: EntityState { entity_id: id, collection: "albums".into(), state },
+            attestations: AttestationSet::default(),
+        };
         // Set the entity
-        bucket.set_state(id.clone(), &state).await.expect("Failed to set entity");
+        bucket.set_state(attested_state.clone()).await.expect("Failed to set entity");
 
         // Get the entity back
         let retrieved_state = bucket.get_state(id).await.expect("Failed to get entity 6");
         tracing::info!("Retrieved state: {:?}", retrieved_state);
 
-        assert_eq!(state.state_buffers, retrieved_state.state_buffers);
+        assert_eq!(attested_state.payload.state.state_buffers, retrieved_state.payload.state.state_buffers);
 
         // Drop the bucket and engine to close connections
         drop(bucket);
@@ -597,14 +592,16 @@ mod tests {
         tracing::info!("Starting test_basic_workflow");
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
         tracing::info!("Storage engine opened");
-        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
+        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+        node.system.create().await?;
+        let ctx = node.context(c)?;
 
         let id;
         {
             tracing::info!("Creating transaction");
-            let trx = node.begin();
+            let trx = ctx.begin();
             tracing::info!("Transaction created");
-            let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await;
+            let album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await?;
             assert_eq!(album.name().value(), Some("The rest of the owl".to_string()));
 
             id = album.id();
@@ -615,12 +612,12 @@ mod tests {
         }
 
         // Retrieve the entity
-        let album_ro: AlbumView = node.get(id).await?;
+        let album_ro: AlbumView = ctx.get(id).await?;
         assert_eq!(album_ro.name().unwrap(), "The rest of the owl");
         assert_eq!(album_ro.year().unwrap(), "2024");
 
         // Drop the node to close the connection
-        drop(node);
+        drop(ctx);
 
         // Cleanup
         IndexedDBStorageEngine::cleanup(&db_name).await?;
@@ -634,23 +631,25 @@ mod tests {
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
-        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new()).context(c);
+        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+        node.system.create().await?;
+        let ctx = node.context(c)?;
 
         {
-            let trx = node.begin();
+            let trx = ctx.begin();
 
-            trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await;
+            trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
 
-            trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await;
+            trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
 
-            trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await;
+            trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
 
-            trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await;
+            trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
 
             trx.commit().await?;
         }
 
-        let albums: ankurah_core::resultset::ResultSet<AlbumView> = node.fetch("name = 'Walking on a Dream'").await?;
+        let albums: ankurah_core::resultset::ResultSet<AlbumView> = ctx.fetch("name = 'Walking on a Dream'").await?;
 
         assert_eq!(
             albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
@@ -658,7 +657,7 @@ mod tests {
         );
 
         // Drop the node to close the connection
-        drop(node);
+        drop(ctx);
 
         // Cleanup
         IndexedDBStorageEngine::cleanup(&db_name).await?;

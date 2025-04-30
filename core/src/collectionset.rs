@@ -7,7 +7,7 @@ use ankurah_proto::CollectionId;
 use tokio::sync::RwLock;
 
 use crate::{
-    error::RetrievalError,
+    error::{MutationError, RetrievalError},
     storage::{StorageCollectionWrapper, StorageEngine},
 };
 
@@ -43,5 +43,22 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         drop(collections);
 
         Ok(collection)
+    }
+
+    pub async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+        // Just return collections we have in memory
+        let memory_collections = self.0.collections.read().await;
+        Ok(memory_collections.keys().cloned().collect())
+    }
+
+    pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+        // Clear in-memory collections first
+        {
+            let mut collections = self.0.collections.write().await;
+            collections.clear();
+        }
+
+        // Then delete all collections from storage
+        self.0.storage_engine.delete_all_collections().await
     }
 }

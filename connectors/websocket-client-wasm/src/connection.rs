@@ -83,7 +83,7 @@ impl Connection {
             *state = new_state.clone();
         }
         if let Some(client) = self.client.upgrade() {
-            client.handle_state_change(&self, new_state)
+            client.handle_state_change(self, new_state)
         } else {
             false
         }
@@ -96,6 +96,7 @@ impl Connection {
     }
     fn handle_close(&self, e: CloseEvent) {
         info!("Connection closed: {}", e.code());
+        self.disconnect();
         self.set_state(ConnectionState::Closed);
     }
 
@@ -136,7 +137,11 @@ impl Connection {
                                         ws: SendWrapper::new(self.ws.clone()),
                                     }),
                                 );
-                                let presence = proto::Presence { node_id: self.node.id(), durable: self.node.durable() };
+                                let presence = proto::Presence {
+                                    node_id: self.node.id(),
+                                    durable: self.node.durable(),
+                                    system_root: self.node.system_root(),
+                                };
                                 // Send our presence message
                                 if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
                                     info!("Failed to send presence message: {:?}", e);
@@ -190,7 +195,7 @@ impl ConnectionInner {
         let _ = self.ws.close();
         self._callbacks.lock().unwrap().take();
         if let ConnectionState::Connected { server_presence, .. } = &*self.state.read().unwrap() {
-            self.node.deregister_peer(server_presence.node_id.clone());
+            self.node.deregister_peer(server_presence.node_id);
         }
     }
 }
@@ -207,13 +212,13 @@ impl PartialEq for Connection {
 
 #[derive(Clone)]
 struct WebSocketPeerSender {
-    recipient_node_id: proto::ID,
+    recipient_node_id: proto::EntityId,
     ws: SendWrapper<Arc<WebSocket>>,
 }
 
 #[async_trait]
 impl PeerSender for WebSocketPeerSender {
-    async fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
+    fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
         let message = proto::Message::PeerMessage(message);
         let data = bincode::serialize(&message).map_err(|e| {
             info!("Failed to serialize client message: {:?}", e);
@@ -231,7 +236,7 @@ impl PeerSender for WebSocketPeerSender {
         }
     }
 
-    fn recipient_node_id(&self) -> proto::ID { self.recipient_node_id.clone() }
+    fn recipient_node_id(&self) -> proto::EntityId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

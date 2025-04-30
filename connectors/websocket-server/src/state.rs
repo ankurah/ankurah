@@ -24,7 +24,7 @@ impl Connection {
                     Err(SendError::Other(anyhow::anyhow!("Serialization error")))
                 }
             }
-            Connection::Established(peer_sender) => peer_sender.send_message(message).await,
+            Connection::Established(peer_sender) => peer_sender.send_message(message),
         }
     }
 }

@@ -31,7 +31,7 @@ pub struct ConnectionStateEnum(ConnectionState);
 impl ConnectionStateEnum {
     pub fn value(&self) -> String {
         match self.0 {
-            ConnectionState::None { .. } => "None",
+            ConnectionState::None => "None",
             ConnectionState::Connecting { .. } => "Connecting",
             ConnectionState::Connected { .. } => "Connected",
             ConnectionState::Closed => "Closed",
