@@ -390,7 +390,7 @@ impl StorageCollection for IndexedDBBucket {
             // TODO - do we want to use a cursor? The id space is pretty sparse, so we would probably need benchmarks to see if it's worth it
             let mut events = Vec::new();
             for event_id in event_ids {
-                let request = step(store.get(&event_id.to_string().into()), "get event")?;
+                let request = step(store.get(&event_id.to_base64().into()), "get event")?;
                 step(CBFuture::new(&request, "success", "error").await, "await event request")?;
                 let result = step(request.result(), "get result")?;
 

@@ -272,7 +272,7 @@ impl Filterable for Entity {
     /// to the requested type. (need to think about the rust type system here more)
     fn value(&self, name: &str) -> Option<String> {
         if name == "id" {
-            Some(self.id.to_string())
+            Some(self.id.to_base64())
         } else {
             // Iterate through backends to find one that has this property
             let backends = self.backends.backends.lock().unwrap();
@@ -305,7 +305,7 @@ impl Filterable for TemporaryEntity {
 
     fn value(&self, name: &str) -> Option<String> {
         if name == "id" {
-            Some(self.0.id.to_string())
+            Some(self.0.id.to_base64())
         } else {
             // Iterate through backends to find one that has this property
             let backends = self.0.backends.backends.lock().unwrap();

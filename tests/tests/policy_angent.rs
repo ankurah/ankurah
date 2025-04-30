@@ -315,7 +315,7 @@
 //     ) -> Result<Option<proto::Attestation>, AccessDenied> {
 //         self.check_write(cdata, entity, Some(event))?;
 //         Ok(Some(proto::Attestation(
-//             serde_json::to_vec(&MyAttestation { node_id: node.id.to_string(), signature: "shibboleet".to_string() }).unwrap(),
+//             serde_json::to_vec(&MyAttestation { node_id: node.id.to_base64(), signature: "shibboleet".to_string() }).unwrap(),
 //         )))
 //     }
 
