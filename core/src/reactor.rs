@@ -14,9 +14,9 @@ use ankql::ast;
 use ankql::selection::filter::Filterable;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::debug;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
-use tracing::{debug, info};
 
 use ankurah_proto as proto;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -261,7 +261,7 @@ where
                 }
             }
 
-            info!(" possibly_interested_subs: {possibly_interested_subs:?}");
+            debug!(" possibly_interested_subs: {possibly_interested_subs:?}");
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {

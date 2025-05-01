@@ -9,12 +9,12 @@ use crate::collectionset::CollectionSet;
 use crate::entity::{Entity, WeakEntitySet};
 use crate::error::MutationError;
 use crate::error::RetrievalError;
+use crate::notice_info;
 use crate::policy::PolicyAgent;
 use crate::property::{backend::LWWBackend, PropertyValue};
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
-
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
 
@@ -158,12 +158,11 @@ where
         }
 
         let root_state = self.root();
-        tracing::info!("Joining system with root state: {:?}", root_state);
 
         // If we have a matching root, we're already in sync - just mark ready and return
         if let Some(root) = root_state {
             if root.payload.state.head == state.payload.state.head {
-                tracing::info!("Found matching root, system is already in sync");
+                notice_info!("Found matching root - Node is part of the same system");
                 *self.0.system_ready.write().unwrap() = true;
                 self.0.system_ready_notify.notify_waiters();
                 return Ok(());

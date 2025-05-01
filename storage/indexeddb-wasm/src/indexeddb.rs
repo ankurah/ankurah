@@ -2,6 +2,7 @@ use ankql::selection::filter::evaluate_predicate;
 use ankurah_core::entity::TemporaryEntity;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::storage::{StorageCollection, StorageEngine};
+use ankurah_core::{action_debug, notice_info};
 use ankurah_proto::{self as proto, Attested, EntityState, EventId, State};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,7 +14,6 @@ use std::any::Any;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::debug;
-use tracing::info;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -52,9 +52,13 @@ pub struct IndexedDBBucket {
     invocation_count: AtomicUsize,
 }
 
+impl std::fmt::Display for IndexedDBBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "IndexedDBBucket({})", self.collection_id) }
+}
+
 impl IndexedDBStorageEngine {
     pub async fn open(name: &str) -> anyhow::Result<Self> {
-        info!("IndexedDBStorageEngine.open({})", name);
+        notice_info!("IndexedDBStorageEngine.open({})", name);
         // Validate database name
         if name.is_empty() {
             return Err(anyhow::anyhow!("Database name cannot be empty"));
@@ -205,6 +209,7 @@ impl StorageCollection for IndexedDBBucket {
 
         SendWrapper::new(async move {
             use web_sys::IdbTransactionMode::Readwrite;
+            action_debug!(self, "set_state {}", "{}", &self.collection_id);
             // Get the old entity if it exists to check for changes
             let transaction = step(self.db.transaction_with_str_and_mode("entities", Readwrite), "create transaction")?;
             let store = step(transaction.object_store("entities"), "get object store")?;

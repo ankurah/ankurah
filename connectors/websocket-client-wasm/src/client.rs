@@ -1,12 +1,13 @@
 use ankurah::policy::PolicyAgent;
 use ankurah::storage::StorageEngine;
 use ankurah_core::connector::NodeComms;
-use ankurah_core::Node;
+use ankurah_core::{action_info, notice_info, Node};
 
 use crate::connection_state::*;
 use gloo_timers::future::sleep;
 use reactive_graph::prelude::*;
 use std::cell::RefCell;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ impl WebsocketClient {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        info!("Created new websocket client for node {}", node.id);
+        notice_info!("Created new websocket client");
         let inner = Arc::new(ClientInner {
             server_url: server_url.to_string(),
             node: Box::new(node),
@@ -77,6 +78,10 @@ impl WebsocketClient {
     }
 }
 
+impl fmt::Display for ClientInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "Client") }
+}
+
 impl ClientInner {
     pub(crate) fn handle_state_change(self: &Arc<Self>, connection: &Connection, new_state: ConnectionState) -> bool {
         // we are only interested in state changes for the current connection
@@ -94,7 +99,7 @@ impl ClientInner {
 
         self.state.set(new_state.clone());
 
-        info!("State changed: {:?}", new_state);
+        action_info!(self, "state changed", "{}", &new_state);
         match new_state {
             ConnectionState::Connected { .. } => {
                 *self.reconnect_delay.borrow_mut() = 0;
@@ -125,11 +130,10 @@ impl ClientInner {
     pub fn connect(self: &Arc<Self>) -> Result<(), JsValue> {
         let connection = Connection::new(self.node.cloned(), self.server_url.clone(), Arc::downgrade(self))?;
 
-        info!("Connecting to {}", self.server_url);
+        action_info!(self, "connecting to", "{}", &self.server_url);
         *self.connection.borrow_mut() = Some(connection);
         self.state.set(ConnectionState::Connecting { url: self.server_url.clone() });
 
-        info!("Connecting to websocket");
         Ok(())
     }
 

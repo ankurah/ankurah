@@ -4,18 +4,21 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use rand::prelude::*;
 use std::{
+    fmt,
     ops::Deref,
     sync::{Arc, Weak},
 };
 use tokio::sync::oneshot;
 
 use crate::{
+    action_debug, action_error, action_info, action_warn,
     changes::{ChangeSet, EntityChange, ItemChange},
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::Context,
     entity::{Entity, WeakEntitySet},
     error::{MutationError, RequestError, RetrievalError},
+    notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
     storage::StorageEngine,
@@ -119,7 +122,7 @@ where
         let entityset: WeakEntitySet = Default::default();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         let id = proto::EntityId::new();
-        info!("Node {id} created as ephemeral");
+        notice_info!("Node {id} created as ephemeral");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
 
@@ -161,9 +164,7 @@ where
 
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %presence.node_id, durable = %presence.durable)))]
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
-        info!("Node({}).register_peer {}", self.id, presence.node_id);
-        info!("Node({}) system ready state before peer registration: {}", self.id, self.system.is_system_ready());
-        info!("Registering peer {} (durable={}) with system_root={:?}", presence.node_id, presence.durable, presence.system_root);
+        action_info!(self, "register_peer", "{}", &presence);
 
         self.peer_connections.insert(
             presence.node_id,
@@ -176,18 +177,16 @@ where
             }),
         );
         if presence.durable {
-            info!("Node({}) registering durable peer {}", self.id, presence.node_id);
             self.durable_peers.insert(presence.node_id);
             if !self.durable {
-                info!("Node({}) is ephemeral, checking for system root from durable peer", self.id);
                 if let Some(system_root) = presence.system_root {
-                    info!("Node({}) received system root {:?} from durable peer, joining system", self.id, system_root);
+                    action_info!(self, "received system root", "{}", &system_root.payload);
                     let me = self.clone();
                     crate::task::spawn(async move {
                         if let Err(e) = me.system.join_system(system_root).await {
-                            error!("Node({}) failed to join system: {}", me.id, e);
+                            action_error!(me, "failed to join system", "{}", &e);
                         } else {
-                            info!("Node({}) successfully joined system", me.id);
+                            action_info!(me, "successfully joined system");
                         }
                     });
                 } else {
@@ -195,7 +194,6 @@ where
                 }
             }
         }
-        info!("Node({}) system ready state after peer registration: {}", self.id, self.system.is_system_ready());
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id)))]
@@ -415,7 +413,7 @@ where
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: _, items } => {
                 // TODO check if this is a valid subscription
-                info!("Node {} received subscription update for {} items", self.id, items.len());
+                action_debug!(self, "received subscription update for {} items", "{}", items.len());
                 self.apply_subscription_updates(&notification.from, items).await?;
                 Ok(())
             }
@@ -546,11 +544,11 @@ where
                     continue;
                 }
                 Err(e) => {
-                    warn!("Node {} received invalid update from peer {} - {}", self.id, from_peer_id, e);
+                    action_warn!(self, "received invalid update from peer", "{}: {}", from_peer_id.to_base64_short(), e);
                 }
             }
         }
-        info!("Node {} notifying reactor of {} changes", self.id, changes.len());
+        debug!("Node {} notifying reactor of {} changes", self.id, changes.len());
         self.reactor.notify_change(changes);
         Ok(())
     }
@@ -698,7 +696,7 @@ where
                 .await?
             {
                 proto::NodeResponseBody::Subscribed { subscription_id: _ } => {
-                    info!("Node {} subscribed to peer {}", self.id, peer_id);
+                    debug!("Node {} subscribed to peer {}", self.id, peer_id);
                 }
                 proto::NodeResponseBody::Error(e) => {
                     return Err(anyhow!("Error from peer subscription: {}", e));
@@ -1039,4 +1037,16 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     fn unsubscribe(&self, handle: &SubscriptionHandle) { let _ = self.0.unsubscribe(handle); }
+}
+
+impl<SE, PA> fmt::Display for Node<SE, PA> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            // Alternate/pretty version with bold blue, dimmed brackets
+            write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
+        } else {
+            // Simple version
+            write!(f, "Node[{}]", self.id.to_base64_short())
+        }
+    }
 }

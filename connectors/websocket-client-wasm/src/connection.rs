@@ -1,5 +1,6 @@
 use crate::client::ClientInner;
 use crate::connection_state::ConnectionState;
+use ankurah_core::action_info;
 use ankurah_core::connector::NodeComms;
 use ankurah_core::connector::PeerSender;
 use ankurah_proto::{self as proto};
@@ -7,8 +8,10 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use js_sys::Uint8Array;
 use send_wrapper::SendWrapper;
+use std::fmt;
 use std::sync::{Arc, Weak};
 use std::sync::{Mutex, RwLock};
+use tracing::error;
 use tracing::{info, warn};
 use wasm_bindgen::prelude::*;
 use web_sys::{CloseEvent, ErrorEvent, Event, MessageEvent, WebSocket};
@@ -27,6 +30,10 @@ pub struct ConnectionInner {
 impl std::ops::Deref for Connection {
     type Target = ConnectionInner;
     fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl fmt::Display for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "Connection") }
 }
 
 impl Connection {
@@ -92,10 +99,10 @@ impl Connection {
     // fn get_state(&self) -> ConnectionState { self.state.read().map(|state| state.clone()).unwrap_or(ConnectionState::None) }
 
     fn handle_open(&self, e: Event) {
-        info!("Connection opened (event): {:?}", e);
+        action_info!(self, "connection open", "{}", &e.type_());
     }
     fn handle_close(&self, e: CloseEvent) {
-        info!("Connection closed: {}", e.code());
+        action_info!(self, "connection closed", "{}", &e.code());
         self.disconnect();
         self.set_state(ConnectionState::Closed);
     }
@@ -126,7 +133,6 @@ impl Connection {
                     match state {
                         ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
                         ConnectionState::Connecting { .. } => {
-                            info!("Received server presence, {server_presence:?}");
                             if self
                                 .set_state(ConnectionState::Connected { url: self.url.clone(), server_presence: server_presence.clone() })
                             {
@@ -144,7 +150,7 @@ impl Connection {
                                 };
                                 // Send our presence message
                                 if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
-                                    info!("Failed to send presence message: {:?}", e);
+                                    error!("Failed to send presence message: {:?}", e);
                                 }
                             }
                         }

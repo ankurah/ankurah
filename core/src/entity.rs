@@ -192,11 +192,11 @@ impl Entity {
         let head = self.head();
         let new_head = state.head.clone();
 
-        tracing::info!("Entity {} apply_state - current head: {}, new head: {}", self.id, head, new_head);
+        tracing::debug!("Entity {} apply_state - current head: {}, new head: {}", self.id, head, new_head);
 
         match crate::lineage::compare(collection, &head, &new_head, 100).await? {
             lineage::Ordering::Equal => {
-                tracing::info!("Entity {} apply_state - heads are equal, skipping", self.id);
+                tracing::debug!("Entity {} apply_state - heads are equal, skipping", self.id);
                 Ok(false)
             }
             lineage::Ordering::Descends => {
@@ -206,7 +206,7 @@ impl Entity {
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                tracing::warn!("Entity {} apply_state - new head does not descend, meet: {:?}", self.id, meet);
+                tracing::error!("Entity {} apply_state - new head does not descend, meet: {:?}", self.id, meet);
                 Ok(false)
             }
             lineage::Ordering::Incomparable => {
@@ -221,7 +221,7 @@ impl Entity {
                 Err(LineageError::PartiallyDescends { meet }.into())
             }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::info!(
+                tracing::debug!(
                     "Entity {} apply_state - budget exceeded. subject: {:?}, other: {:?}",
                     self.id,
                     subject_frontier,

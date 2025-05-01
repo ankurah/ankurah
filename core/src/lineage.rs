@@ -3,7 +3,6 @@ use ankurah_proto::{Attested, Clock, Event, EventId};
 use async_trait::async_trait;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use tracing::info;
 
 /// a trait for events and eventlike things that can be descended
 pub trait TEvent {
@@ -286,9 +285,9 @@ where
         // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
         // so we can pass the HashSet as a borrow and don't have to alloc this twice
         let mut result_checklist: HashSet<G::Id> = ids.iter().cloned().collect();
-        info!("step -> get_events {:?}", ids);
+        // info!("step -> get_events {:?}", ids);
         let (cost, events) = self.getter.get_events(ids).await?;
-        info!("step -> get_events result {:?}", events.iter().map(|e| e.payload.id()).collect::<Vec<_>>());
+        // info!("step -> get_events result {:?}", events.iter().map(|e| e.payload.id()).collect::<Vec<_>>());
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
         for event in events {

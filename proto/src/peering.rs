@@ -11,6 +11,13 @@ pub struct Presence {
 
 impl std::fmt::Display for Presence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Presence(node_id {} durable {} system_root: {:?})", self.node_id, self.durable, self.system_root)
+        match &self.system_root {
+            Some(r) => {
+                write!(f, "Presence[{}: durable {} system_root: {}]", self.node_id.to_base64_short(), self.durable, r.payload)
+            }
+            None => {
+                write!(f, "Presence[{}: durable {}]", self.node_id.to_base64_short(), self.durable)
+            }
+        }
     }
 }
