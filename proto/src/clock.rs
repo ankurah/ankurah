@@ -21,6 +21,8 @@ impl Clock {
 
     pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_base64()).collect() }
 
+    pub fn to_base64_short(&self) -> String { self.0.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(",") }
+
     pub fn from_strings(strings: Vec<String>) -> Result<Self, DecodeError> {
         let mut ids = strings.into_iter().map(|s| s.try_into()).collect::<Result<Vec<_>, _>>()?;
         ids.sort();
@@ -69,5 +71,5 @@ impl From<EventId> for Clock {
 }
 
 impl std::fmt::Display for Clock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}]", self.to_strings().join(", ")) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}]", self.to_base64_short()) }
 }

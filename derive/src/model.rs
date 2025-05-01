@@ -125,7 +125,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                                     handle2.set(h).unwrap();
                                 }
                                 Err(e) => {
-                                    error!("Failed to subscribe to changes: {}", e);
+                                    error!("Failed to subscribe to changes: {} for predicate: {}", e, predicate);
                                 }
                             }
                         });

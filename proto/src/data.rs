@@ -210,7 +210,9 @@ impl std::fmt::Display for StateFragment {
 }
 
 impl std::fmt::Display for EntityState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "EntityState({} {})", self.entity_id, self.state) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EntityState({} {})", self.entity_id.to_base64_short(), self.state)
+    }
 }
 
 impl Attested<Event> {
