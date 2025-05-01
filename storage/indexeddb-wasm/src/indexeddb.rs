@@ -403,7 +403,7 @@ impl StorageCollection for IndexedDBBucket {
 
                 let event = Attested {
                     payload: ankurah_proto::Event {
-                        collection: get_property(&event_obj, &COLLECTION_KEY)?.try_into()?,
+                        collection: self.collection_id.clone(),
                         entity_id: get_property(&event_obj, &ENTITY_ID_KEY)?.try_into()?,
                         operations: get_property(&event_obj, &OPERATIONS_KEY)?.try_into()?,
                         parent: get_property(&event_obj, &PARENT_KEY)?.try_into()?,
@@ -446,7 +446,7 @@ impl StorageCollection for IndexedDBBucket {
 
                 let event = Attested {
                     payload: ankurah_proto::Event {
-                        collection: get_property(&event_obj, &COLLECTION_KEY)?.try_into()?,
+                        collection: self.collection_id.clone(),
                         // id: get_property(&event_obj, &ID_KEY)?.try_into()?,
                         entity_id: get_property(&event_obj, &ENTITY_ID_KEY)?.try_into()?,
                         operations: get_property(&event_obj, &OPERATIONS_KEY)?.try_into()?,
