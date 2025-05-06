@@ -141,6 +141,10 @@ impl From<DecodeError> for MutationError {
 impl From<MutationError> for wasm_bindgen::JsValue {
     fn from(err: MutationError) -> Self { err.to_string().into() }
 }
+#[cfg(feature = "wasm")]
+impl From<RetrievalError> for wasm_bindgen::JsValue {
+    fn from(err: RetrievalError) -> Self { err.to_string().into() }
+}
 
 impl From<AccessDenied> for MutationError {
     fn from(err: AccessDenied) -> Self { MutationError::AccessDenied(err) }
