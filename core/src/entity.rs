@@ -119,7 +119,9 @@ impl Entity {
         if event.is_entity_root() && event.parent.is_empty() {
             // this is the creation event for a new entity, so we simply accept it
             for (backend_name, operations) in event.operations.iter() {
-                self.backends.apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent)?;
+                self.backends
+                    .apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent, collection)
+                    .await?;
             }
             *self.head.lock().unwrap() = event.id().into();
             return Ok(true);
@@ -153,7 +155,7 @@ impl Entity {
                     // on the event geter (which needs to abstract storage collection anyway,
                     // due to the need for remote event retrieval)
                     // ...so we get a cache hit in the most common cases, and it can paginate the rest.
-                    self.backends.apply_operations((*backend_name).to_owned(), operations, &new_head, &event.parent /* , context*/)?;
+                    self.backends.apply_operations((*backend_name).to_owned(), operations, &new_head, &event.parent, collection).await?;
                 }
                 *self.head.lock().unwrap() = new_head;
                 Ok(true)
@@ -166,7 +168,9 @@ impl Entity {
                 // just doing the needful for now
                 debug!("NotDescends - applying");
                 for (backend_name, operations) in event.operations.iter() {
-                    self.backends.apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent)?;
+                    self.backends
+                        .apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent, collection)
+                        .await?;
                 }
                 // concurrent - so augment the head
                 self.head.lock().unwrap().insert(event.id());
@@ -285,6 +289,7 @@ impl Filterable for Entity {
                     PropertyValue::Bool(i) => Some(i.to_string()),
                     PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
                     PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::EntityId(id) => Some(id.to_base64()),
                 },
                 None => None,
             })
@@ -318,6 +323,7 @@ impl Filterable for TemporaryEntity {
                     PropertyValue::Bool(i) => Some(i.to_string()),
                     PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
                     PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::EntityId(id) => Some(id.to_base64()),
                 },
                 None => None,
             })

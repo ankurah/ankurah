@@ -16,6 +16,8 @@ impl EntityId {
 
     pub fn from_bytes(bytes: [u8; 16]) -> Self { EntityId(Ulid::from_bytes(bytes)) }
 
+    pub fn to_ulid(&self) -> Ulid { self.0 }
+
     pub fn to_bytes(&self) -> [u8; 16] { self.0.to_bytes() }
 
     pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {

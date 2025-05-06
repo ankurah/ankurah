@@ -4,7 +4,6 @@ use ankurah_core::property::PropertyValue;
 
 #[derive(Debug)]
 pub enum PGValue {
-    // Boolean(bool),
     Bytea(Vec<u8>),
     CharacterVarying(String),
     SmallInt(i16),
@@ -38,6 +37,7 @@ impl From<PropertyValue> for PGValue {
             PropertyValue::Bool(bool) => PGValue::Boolean(bool),
             PropertyValue::Object(items) => PGValue::Bytea(items),
             PropertyValue::Binary(items) => PGValue::Bytea(items),
+            PropertyValue::EntityId(id) => PGValue::CharacterVarying(id.to_base64()),
         }
     }
 }

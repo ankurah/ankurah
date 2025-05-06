@@ -8,16 +8,22 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod entity_ref;
 pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
-use crate::error::{MutationError, RetrievalError, StateError};
+use crate::{
+    error::{MutationError, RetrievalError, StateError},
+    storage::StorageCollectionWrapper,
+};
+pub use entity_ref::RefBackend;
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
 
 use super::{PropertyName, PropertyValue};
 
+#[async_trait::async_trait]
 pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
     fn as_debug(&self) -> &dyn Debug;
@@ -42,12 +48,13 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Retrieve operations applied to this backend since the last time we called this method.
     fn to_operations(&self) -> Result<Vec<Operation>, MutationError>;
-    fn apply_operations(
+
+    async fn apply_operations(
         &self,
         operations: &Vec<Operation>,
         current_head: &Clock,
-        event_precursors: &Clock,
-        // context: &Box<dyn TContext>,
+        event_head: &Clock,
+        getter: &StorageCollectionWrapper,
     ) -> Result<(), MutationError>;
 }
 
@@ -73,6 +80,12 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
         let backend = match buffer {
             Some(buffer) => LWWBackend::from_state_buffer(buffer)?,
             None => LWWBackend::new(),
+        };
+        Ok(Arc::new(backend))
+    } else if name == "ref" {
+        let backend = match buffer {
+            Some(buffer) => RefBackend::from_state_buffer(buffer)?,
+            None => RefBackend::new(),
         };
         Ok(Arc::new(backend))
     }
@@ -162,16 +175,16 @@ impl Backends {
         Ok(operations)
     }
 
-    pub fn apply_operations(
+    pub async fn apply_operations(
         &self,
         backend_name: String,
         operations: &Vec<Operation>,
         current_head: &Clock,
-        event_precursors: &Clock,
-        // context: &Box<dyn TContext>,
+        event_head: &Clock,
+        getter: &StorageCollectionWrapper,
     ) -> Result<(), MutationError> {
         let backend = self.get_raw(backend_name)?;
-        backend.apply_operations(operations, current_head, event_precursors /*context*/)?;
+        backend.apply_operations(operations, current_head, event_head, getter).await?;
         Ok(())
     }
 

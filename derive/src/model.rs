@@ -13,7 +13,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let resultset_name = format_ident!("{}ResultSet", name);
     #[cfg(feature = "wasm")]
     let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
-    let clone_derive = if !get_model_flag(&input.attrs, "no_clone") {
+    let clone_derive = if !has_flag(&input.attrs, "no_clone") {
         quote! { #[derive(Clone)] }
     } else {
         quote! {}
@@ -22,6 +22,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => fields.named.clone(),
+            Fields::Unit => Punctuated::new(),
             fields => {
                 return syn::Error::new_spanned(fields, format!("Only named fields are supported this is a {:#?}", fields))
                     .to_compile_error()
@@ -34,8 +35,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     // Split fields into active and ephemeral
     let mut active_fields = Vec::new();
     let mut ephemeral_fields = Vec::new();
+
     for field in fields.into_iter() {
-        if get_model_flag(&field.attrs, "ephemeral") {
+        if has_flag(&field.attrs, "ephemeral") {
             ephemeral_fields.push(field);
         } else {
             active_fields.push(field);
@@ -59,9 +61,12 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let ephemeral_field_visibility = ephemeral_fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
 
     let wasm_attributes = if cfg!(feature = "wasm") {
+        quote! {}
+        /*
         quote! {
             #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         }
+        */
     } else {
         quote! {}
     };
@@ -246,7 +251,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         // TODO wasm-bindgen this
         impl #view_name {
-            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::MutationError> {
+            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::policy::AccessDenied> {
                 use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                 trx.edit::<#name>(&self.entity)
@@ -369,11 +374,16 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
     }
 }
 
-fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().segments.iter().any(|seg| seg.ident == "model")
-            && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).is_some_and(|ident| ident == flag_name)
-    })
+fn has_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
+    for attr in attrs {
+        if let Some(ident) = attr.path().get_ident() {
+            if ident == flag_name {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 // Parse the active field type
