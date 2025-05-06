@@ -5,15 +5,14 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{
-    clock::{Clock, ClockOrdering},
-    Operation,
-};
+use ankurah_proto::{clock::Clock, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{MutationError, StateError},
-    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue},
+    error::{LineageError, MutationError, StateError},
+    lineage,
+    property::{backend::PropertyBackend, PropertyName, PropertyValue},
+    storage::StorageCollectionWrapper,
 };
 
 const LWW_DIFF_VERSION: u8 = 1;
@@ -54,6 +53,7 @@ impl LWWBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl PropertyBackend for LWWBackend {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> { self as Arc<dyn Any + Send + Sync + 'static> }
 
@@ -81,7 +81,6 @@ impl PropertyBackend for LWWBackend {
 
     fn property_backend_name() -> String { "lww".to_owned() }
 
-    // This is identical to [`to_operations`] for [`LWWBackend`].
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         let property_values = self.property_values();
         let state_buffer = bincode::serialize(&property_values)?;
@@ -94,41 +93,53 @@ impl PropertyBackend for LWWBackend {
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
-    fn to_operations(&self) -> Result<Vec<super::Operation>, MutationError> {
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
         let property_values = self.property_values();
         let serialized_diff = bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&property_values)? })?;
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
-    fn apply_operations(
+    async fn apply_operations(
         &self,
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_head: &Clock,
-        // context: &Box<dyn TContext>,
+        getter: &StorageCollectionWrapper,
     ) -> Result<(), MutationError> {
-        let mut values = self.values.write().unwrap();
+        match crate::lineage::compare(getter, current_head, event_head, 100).await? {
+            lineage::Ordering::Equal => {
+                // No change needed
+                Ok(())
+            }
+            lineage::Ordering::Descends => {
+                for operation in operations {
+                    let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
+                    match version {
+                        1 => {
+                            let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&data)?;
 
-        // TODO: Figure out this comparison
-        // This'll probably require looking at the events table.
-        if compare_clocks(current_head, event_head /*, context*/) == ClockOrdering::Child {
-            for operation in operations {
-                let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
-                match version {
-                    1 => {
-                        let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&data)?;
-                        for (property_name, new_value) in map {
-                            values.insert(property_name, new_value);
+                            let mut values = self.values.write().unwrap();
+                            for (property_name, new_value) in map {
+                                values.insert(property_name, new_value);
+                            }
+                        }
+                        version => {
+                            return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()))
                         }
                     }
-                    version => {
-                        return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()))
-                    }
                 }
+                Ok(())
+            }
+            lineage::Ordering::NotDescends { meet: _ } => {
+                // Don't apply operations from a non-descending event
+                Ok(())
+            }
+            lineage::Ordering::Incomparable => Err(MutationError::LineageError(LineageError::Incomparable)),
+            lineage::Ordering::PartiallyDescends { meet } => Err(MutationError::LineageError(LineageError::PartiallyDescends { meet })),
+            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                Err(MutationError::LineageError(LineageError::BudgetExceeded { subject_frontier, other_frontier }))
             }
         }
-
-        Ok(())
     }
 }
 

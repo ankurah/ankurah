@@ -1,15 +1,16 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use ankurah_proto::ID;
+use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::{
-    model::{Entity, Model},
+    entity::Entity,
+    model::Model,
     property::{
         backend::RefBackend,
         traits::{FromActiveType, FromEntity, PropertyError},
-        InitializeWith, Property, PropertyName, PropertyValue,
+        InitializeWith, PropertyName,
     },
     transaction::Transaction,
 };
@@ -17,27 +18,27 @@ use crate::{
 #[derive(Debug, Copy, Clone, Default)]
 #[wasm_bindgen()]
 pub struct RefTest {
-    id: Option<ID>,
+    id: Option<EntityId>,
 }
 
 impl RefTest {
-    pub fn id(id: ID) -> Self { Self { id: Some(id) } }
+    pub fn id(id: EntityId) -> Self { Self { id: Some(id) } }
     pub fn empty() -> Self { Self { id: None } }
-    pub fn optional(id: Option<ID>) -> Self { Self { id: id } }
-    pub fn get(&self) -> Option<ID> { self.id }
+    pub fn optional(id: Option<EntityId>) -> Self { Self { id: id } }
+    pub fn get(&self) -> Option<EntityId> { self.id }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Ref<M: Model> {
-    id: Option<ID>,
+    id: Option<EntityId>,
     phantom: PhantomData<M>,
 }
 
 impl<M: Model> Ref<M> {
-    pub fn id(id: ID) -> Self { Self { id: Some(id), phantom: PhantomData } }
+    pub fn id(id: EntityId) -> Self { Self { id: Some(id), phantom: PhantomData } }
     pub fn empty() -> Self { Self { id: None, phantom: PhantomData } }
-    pub fn optional(id: Option<ID>) -> Self { Self { id: id, phantom: PhantomData } }
-    pub fn get(&self) -> Option<ID> { self.id }
+    pub fn optional(id: Option<EntityId>) -> Self { Self { id: id, phantom: PhantomData } }
+    pub fn get(&self) -> Option<EntityId> { self.id }
 }
 
 impl<M: Model> std::fmt::Debug for Ref<M> {
@@ -66,7 +67,7 @@ impl<M: ModelRef> std::fmt::Debug for ActiveRef<M> {
 }
 
 impl<M: ModelRef> ActiveRef<M> {
-    pub fn set(&self, id: Option<ID>) -> Result<(), PropertyError> {
+    pub fn set(&self, id: Option<EntityId>) -> Result<(), PropertyError> {
         self.backend.set(self.property_name.clone(), id);
         Ok(())
     }
@@ -77,14 +78,14 @@ impl<M: ModelRef> ActiveRef<M> {
     ) -> Result<Option<<M::Model as Model>::Mutable<'rec>>, PropertyError> {
         match self.get_value() {
             Some(id) => {
-                let rec = trx.edit::<M::Model>(id).await?;
+                let rec = trx.get::<M::Model>(&id).await?;
                 Ok(Some(rec))
             }
             None => Ok(None),
         }
     }
 
-    pub fn get_value(&self) -> Option<ID> { self.backend.get(&self.property_name) }
+    pub fn get_value(&self) -> Option<EntityId> { self.backend.get(&self.property_name) }
 }
 
 impl<M: ModelRef> FromEntity for ActiveRef<M> {

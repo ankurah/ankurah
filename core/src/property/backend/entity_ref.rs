@@ -5,16 +5,21 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{Clock, ClockOrdering, Operation, ID};
+use ankurah_proto::{Clock, EntityId, Operation};
 use serde::{Deserialize, Serialize};
 
-use crate::property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue};
+use crate::{
+    error::{LineageError, MutationError, StateError},
+    lineage,
+    property::{backend::PropertyBackend, PropertyName, PropertyValue},
+    storage::StorageCollectionWrapper,
+};
 
 const REF_DIFF_VERSION: u8 = 1;
 
 #[derive(Clone, Debug)]
 pub struct RefBackend {
-    values: Arc<RwLock<BTreeMap<PropertyName, Option<ID>>>>,
+    values: Arc<RwLock<BTreeMap<PropertyName, Option<EntityId>>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,7 +35,7 @@ impl Default for RefBackend {
 impl RefBackend {
     pub fn new() -> RefBackend { Self { values: Arc::new(RwLock::new(BTreeMap::default())) } }
 
-    pub fn set(&self, property_name: PropertyName, value: Option<ID>) {
+    pub fn set(&self, property_name: PropertyName, value: Option<EntityId>) {
         let mut values = self.values.write().unwrap();
         match values.entry(property_name) {
             Entry::Occupied(mut entry) => {
@@ -42,12 +47,13 @@ impl RefBackend {
         }
     }
 
-    pub fn get(&self, property_name: &PropertyName) -> Option<ID> {
+    pub fn get(&self, property_name: &PropertyName) -> Option<EntityId> {
         let values = self.values.read().unwrap();
         values.get(property_name).cloned().flatten()
     }
 }
 
+#[async_trait::async_trait]
 impl PropertyBackend for RefBackend {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> { self as Arc<dyn Any + Send + Sync + 'static> }
 
@@ -67,7 +73,7 @@ impl PropertyBackend for RefBackend {
     }
 
     fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
-        self.get(property_name).map(|id| PropertyValue::Ref(id))
+        self.get(property_name).map(|id| PropertyValue::EntityId(id))
     }
 
     fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
@@ -75,7 +81,7 @@ impl PropertyBackend for RefBackend {
 
         let mut values = BTreeMap::new();
         for (property_name, id) in ids.iter() {
-            let value = id.map(|id| PropertyValue::Ref(id));
+            let value = id.map(|id| PropertyValue::EntityId(id));
             values.insert(property_name.clone(), value);
         }
 
@@ -84,8 +90,7 @@ impl PropertyBackend for RefBackend {
 
     fn property_backend_name() -> String { "ref".to_owned() }
 
-    // This is identical to [`to_operations`] for [`RefBackend`].
-    fn to_state_buffer(&self) -> anyhow::Result<Vec<u8>> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         let ids = self.values.read().unwrap();
         let state_buffer = bincode::serialize(&*ids)?;
         Ok(state_buffer)
@@ -93,43 +98,58 @@ impl PropertyBackend for RefBackend {
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        let map = bincode::deserialize::<BTreeMap<PropertyName, Option<ID>>>(state_buffer)?;
+        let map = bincode::deserialize::<BTreeMap<PropertyName, Option<EntityId>>>(state_buffer)?;
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
-    fn to_operations(&self) -> anyhow::Result<Vec<super::Operation>> {
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
         let values = self.values.read().unwrap();
         let serialized_diff = bincode::serialize(&RefDiff { version: REF_DIFF_VERSION, data: bincode::serialize(&*values)? })?;
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
-    fn apply_operations(
+    async fn apply_operations(
         &self,
         operations: &Vec<Operation>,
         current_head: &Clock,
         event_head: &Clock,
-        // context: &Box<dyn TContext>,
-    ) -> anyhow::Result<()> {
-        let mut values = self.values.write().unwrap();
-
+        getter: &StorageCollectionWrapper,
+    ) -> Result<(), MutationError> {
         // TODO: Figure out this comparison
         // This'll probably require looking at the events table.
-        if compare_clocks(&current_head, &event_head /*, context*/) == ClockOrdering::Child {
-            for operation in operations {
-                let RefDiff { version, data } = bincode::deserialize(&operation.diff)?;
-                match version {
-                    1 => {
-                        let map: BTreeMap<PropertyName, Option<ID>> = bincode::deserialize(&data)?;
-                        for (property_name, new_value) in map {
-                            values.insert(property_name, new_value);
+        match crate::lineage::compare(getter, current_head, event_head, 100).await? {
+            lineage::Ordering::Equal => {
+                // No change needed
+                Ok(())
+            }
+            lineage::Ordering::Descends => {
+                for operation in operations {
+                    let RefDiff { version, data } = bincode::deserialize(&operation.diff)?;
+                    match version {
+                        1 => {
+                            let map: BTreeMap<PropertyName, Option<EntityId>> = bincode::deserialize(&data)?;
+                            let mut values = self.values.write().unwrap();
+                            for (property_name, new_value) in map {
+                                values.insert(property_name, new_value);
+                            }
+                        }
+                        version => {
+                            return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown Ref operation version: {:?}", version).into()))
                         }
                     }
-                    version => return Err(anyhow::anyhow!("Unknown Ref operation version: {:?}", version)),
                 }
+                Ok(())
+            }
+            lineage::Ordering::NotDescends { meet: _ } => {
+                // Don't apply operations from a non-descending event
+                Ok(())
+            }
+            lineage::Ordering::Incomparable => Err(MutationError::LineageError(LineageError::Incomparable)),
+            lineage::Ordering::PartiallyDescends { meet } => Err(MutationError::LineageError(LineageError::PartiallyDescends { meet })),
+            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                Err(MutationError::LineageError(LineageError::BudgetExceeded { subject_frontier, other_frontier }))
             }
         }
-
-        Ok(())
     }
 }
 
@@ -139,17 +159,17 @@ impl PropertyBackend for RefBackend {
 mod tests {
     use super::*;
 
-    #[test]
-    fn property_backend() {
+    #[tokio::test]
+    async fn property_backend() {
         let backend = RefBackend::new();
         let prop1 = "Property 1".to_owned();
         let prop2 = "Property 2".to_owned();
-        let id1 = ID::new();
-        let id2 = ID::new();
+        let id1 = EntityId::new();
+        let id2 = EntityId::new();
         backend.set(prop1.clone(), Some(id1));
         backend.set(prop2.clone(), Some(id2));
         assert_eq!(backend.get(&prop1), Some(id1));
-        assert_eq!(backend.property_value(&prop1), Some(PropertyValue::Ref(id1)));
+        assert_eq!(backend.property_value(&prop1), Some(PropertyValue::EntityId(id1)));
         assert_eq!(backend.properties(), vec![prop1, prop2]);
 
         let state_buffer = backend.to_state_buffer().unwrap();
@@ -158,10 +178,12 @@ mod tests {
 
         let new_backend = RefBackend::new();
         let operations = backend.to_operations().unwrap();
-        let commit_id = ID::new();
-        let commit_clock = Clock::new([commit_id]);
+        // TODO - fix this
+        // let commit_id = ID::new();
+        // let commit_clock = Clock::new([commit_id]);
 
-        new_backend.apply_operations(&operations, &Clock::new([]), &commit_clock).unwrap();
+        // TODO: Abstract Getter from StorageCollectionWrapper
+        // new_backend.apply_operations(&operations, &Clock::new([]), &commit_clock, &getter).await.unwrap();
         assert_eq!(backend.property_values(), new_backend.property_values());
 
         // TODO: More robust event tests:

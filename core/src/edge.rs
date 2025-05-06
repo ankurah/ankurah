@@ -1,4 +1,4 @@
-use ankurah_proto::ID;
+use ankurah_proto::EntityId;
 
 use crate::{
     model::View,

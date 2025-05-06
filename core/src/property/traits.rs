@@ -1,4 +1,4 @@
-use ankurah_proto::clock::{Clock, ClockOrdering};
+use ankurah_proto::clock::Clock;
 use anyhow::Result;
 
 use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
@@ -54,19 +54,6 @@ pub trait FromEntity {
 pub trait FromActiveType<A> {
     fn from_active(active: A) -> Result<Self, PropertyError>
     where Self: Sized;
-}
-
-pub fn compare_clocks(clock: &Clock, other: &Clock /*, context: &Box<dyn TContext>*/) -> ClockOrdering {
-    let ulid1 = clock.as_slice().iter().max();
-    let ulid2 = other.as_slice().iter().max();
-
-    if ulid1 > ulid2 {
-        ClockOrdering::Parent
-    } else if ulid1 < ulid2 {
-        ClockOrdering::Child
-    } else {
-        ClockOrdering::Sibling
-    }
 }
 
 /*

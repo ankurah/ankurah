@@ -10,11 +10,13 @@ use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
 use crate::{
-    error::{MutationError, StateError},
+    error::{LineageError, MutationError, StateError},
+    lineage,
     property::{
         backend::{Operation, PropertyBackend},
         PropertyName, PropertyValue,
     },
+    storage::StorageCollectionWrapper,
 };
 
 /// Stores one or more properties of an entity
@@ -74,6 +76,7 @@ impl YrsBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl PropertyBackend for YrsBackend {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> { self as Arc<dyn Any + Send + Sync + 'static> }
 
@@ -112,7 +115,7 @@ impl PropertyBackend for YrsBackend {
 
     fn property_backend_name() -> String { "yrs".to_owned() }
 
-    fn to_state_buffer(&self) -> Result<Vec<u8>, crate::error::StateError> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         let txn = self.doc.transact();
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
@@ -120,7 +123,8 @@ impl PropertyBackend for YrsBackend {
         Ok(state_buffer)
     }
 
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError> {
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
+    where Self: Sized {
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
         let update = yrs::Update::decode_v2(state_buffer).map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
@@ -146,11 +150,33 @@ impl PropertyBackend for YrsBackend {
         Ok(vec![])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> Result<(), MutationError> {
-        for operation in operations {
-            self.apply_update(&operation.diff)?;
+    async fn apply_operations(
+        &self,
+        operations: &Vec<Operation>,
+        current_head: &Clock,
+        event_head: &Clock,
+        getter: &StorageCollectionWrapper,
+    ) -> Result<(), MutationError> {
+        match crate::lineage::compare(getter, current_head, event_head, 100).await? {
+            lineage::Ordering::Equal => {
+                // No change needed
+                Ok(())
+            }
+            lineage::Ordering::Descends => {
+                for operation in operations {
+                    self.apply_update(&operation.diff)?;
+                }
+                Ok(())
+            }
+            lineage::Ordering::NotDescends { meet: _ } => {
+                // Don't apply operations from a non-descending event
+                Ok(())
+            }
+            lineage::Ordering::Incomparable => Err(MutationError::LineageError(LineageError::Incomparable)),
+            lineage::Ordering::PartiallyDescends { meet } => Err(MutationError::LineageError(LineageError::PartiallyDescends { meet })),
+            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                Err(MutationError::LineageError(LineageError::BudgetExceeded { subject_frontier, other_frontier }))
+            }
         }
-
-        Ok(())
     }
 }
