@@ -38,6 +38,7 @@ impl From<PropertyValue> for PGValue {
             PropertyValue::Bool(bool) => PGValue::Boolean(bool),
             PropertyValue::Object(items) => PGValue::Bytea(items),
             PropertyValue::Binary(items) => PGValue::Bytea(items),
+            PropertyValue::EntityId(id) => PGValue::CharacterVarying(id.to_base64()),
         }
     }
 }

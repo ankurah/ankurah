@@ -285,6 +285,7 @@ impl Filterable for Entity {
                     PropertyValue::Bool(i) => Some(i.to_string()),
                     PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
                     PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::EntityId(id) => Some(id.to_base64()),
                 },
                 None => None,
             })
@@ -318,6 +319,7 @@ impl Filterable for TemporaryEntity {
                     PropertyValue::Bool(i) => Some(i.to_string()),
                     PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
                     PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    PropertyValue::EntityId(id) => Some(id.to_base64()),
                 },
                 None => None,
             })
