@@ -75,7 +75,7 @@ pub struct Event {
 
 impl Event {
     // TODO: figure out how we actually want to signify entity creation. This is a hack for now
-    pub fn is_entity_root(&self) -> bool { self.parent.is_empty() }
+    pub fn is_entity_create(&self) -> bool { self.parent.is_empty() }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -176,7 +176,7 @@ impl std::fmt::Display for Event {
             self.id().to_base64_short(),
             self.collection,
             self.entity_id.to_base64_short(),
-            if self.is_entity_root() { "(create) " } else { "" },
+            if self.is_entity_create() { "(create) " } else { "" },
             self.parent.to_base64_short(),
             self.operations
                 .iter()
