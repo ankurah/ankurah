@@ -116,7 +116,7 @@ impl Entity {
     pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
         let head = self.head();
 
-        if event.is_entity_root() && event.parent.is_empty() {
+        if head.is_empty() && event.is_entity_create() {
             // this is the creation event for a new entity, so we simply accept it
             for (backend_name, operations) in event.operations.iter() {
                 self.backends.apply_operations((*backend_name).to_owned(), operations, &event.id().into(), &event.parent)?;
