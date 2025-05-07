@@ -1,4 +1,4 @@
-use ankurah_proto::{Clock, Operation, State, StateBuffers};
+use ankurah_proto::{Operation, State, StateBuffers};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -42,13 +42,8 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Retrieve operations applied to this backend since the last time we called this method.
     fn to_operations(&self) -> Result<Vec<Operation>, MutationError>;
-    fn apply_operations(
-        &self,
-        operations: &Vec<Operation>,
-        current_head: &Clock,
-        event_precursors: &Clock,
-        // context: &Box<dyn TContext>,
-    ) -> Result<(), MutationError>;
+
+    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError>;
 }
 
 /// Holds the property backends inside of entities.
@@ -162,16 +157,9 @@ impl Backends {
         Ok(operations)
     }
 
-    pub fn apply_operations(
-        &self,
-        backend_name: String,
-        operations: &Vec<Operation>,
-        current_head: &Clock,
-        event_precursors: &Clock,
-        // context: &Box<dyn TContext>,
-    ) -> Result<(), MutationError> {
+    pub fn apply_operations(&self, backend_name: String, operations: &Vec<Operation>) -> Result<(), MutationError> {
         let backend = self.get_raw(backend_name)?;
-        backend.apply_operations(operations, current_head, event_precursors /*context*/)?;
+        backend.apply_operations(operations)?;
         Ok(())
     }
 

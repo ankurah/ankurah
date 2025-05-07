@@ -3,6 +3,8 @@ use std::sync::Arc;
 use ankurah_proto::Event;
 use ankurah_proto::{self as proto, EntityId};
 
+use crate::error::RetrievalError;
+use crate::policy::AccessDenied;
 use crate::{
     context::TContext,
     entity::Entity,
@@ -67,7 +69,7 @@ impl Transaction {
         Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
-    pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<M::Mutable<'rec>, MutationError> {
+    pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<M::Mutable<'rec>, RetrievalError> {
         match self.get_trx_entity(id) {
             Some(entity) => Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity)),
             None => {
@@ -86,7 +88,7 @@ impl Transaction {
             }
         }
     }
-    pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<M::Mutable<'rec>, MutationError> {
+    pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<M::Mutable<'rec>, AccessDenied> {
         if let Some(entity) = self.get_trx_entity(&entity.id) {
             return Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity));
         }

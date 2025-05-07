@@ -75,7 +75,7 @@ pub struct Event {
 
 impl Event {
     // TODO: figure out how we actually want to signify entity creation. This is a hack for now
-    pub fn is_entity_root(&self) -> bool { self.parent.is_empty() }
+    pub fn is_entity_create(&self) -> bool { self.parent.is_empty() }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

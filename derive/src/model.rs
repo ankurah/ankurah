@@ -246,7 +246,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         // TODO wasm-bindgen this
         impl #view_name {
-            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::MutationError> {
+            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::policy::AccessDenied> {
                 use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                 trx.edit::<#name>(&self.entity)

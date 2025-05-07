@@ -6,14 +6,6 @@ use crate::{error::DecodeError, EventId};
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct Clock(pub(crate) Vec<EventId>);
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ClockOrdering {
-    Parent,
-    Child,
-    Sibling,
-    Unrelated,
-}
-
 impl Clock {
     pub fn new(ids: impl Into<Vec<EventId>>) -> Self { Self(ids.into()) }
 
