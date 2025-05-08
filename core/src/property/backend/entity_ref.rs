@@ -150,12 +150,7 @@ mod tests {
 
         let new_backend = RefBackend::new();
         let operations = backend.to_operations().unwrap();
-        // TODO - fix this
-        // let commit_id = ID::new();
-        // let commit_clock = Clock::new([commit_id]);
-
-        // TODO: Abstract Getter from StorageCollectionWrapper
-        // new_backend.apply_operations(&operations, &Clock::new([]), &commit_clock, &getter).await.unwrap();
+        new_backend.apply_operations(&operations).unwrap();
         assert_eq!(backend.property_values(), new_backend.property_values());
 
         // TODO: More robust event tests:
