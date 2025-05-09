@@ -17,7 +17,6 @@ tsify          = { version = "0.4" }
 
 ##### patch - something is wrong with the uuid crate for wasm
 getrandom = { version = "0.3", features = ["wasm_js"] }
-uuid      = { version = "1.7", features = ["v4", "serde", "js"] }
 chrono    = { version = "0.4", features = ["serde"] }
 ###### 
 

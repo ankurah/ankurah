@@ -27,7 +27,6 @@ lazy_static = "1.4.0"
 once_cell = "1.19.0"
 ##### patch - something is wrong with the uuid crate for wasm
 getrandom = { version = "0.3", features = ["wasm_js"] }
-uuid      = { version = "1.7", features = ["v4", "serde", "js"] }
 ###### 
 
     [package.metadata.wasm-pack.profile.dev.wasm-bindgen]

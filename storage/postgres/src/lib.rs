@@ -473,12 +473,6 @@ impl StorageCollection for PostgresBucket {
         Ok(results)
     }
 
-    /// Postgres Event Table:
-    /// {bucket_name}_event
-    /// event_id uuid, // `ID`/`ULID`
-    /// entity_id uuid, // `ID`/`ULID`
-    /// operations bytea, // `Vec<Operation>`
-    /// clock bytea, // `Clock`
     async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
         let operations = bincode::serialize(&entity_event.payload.operations)?;
         let attestations = bincode::serialize(&entity_event.attestations)?;

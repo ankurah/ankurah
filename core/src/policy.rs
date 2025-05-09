@@ -33,6 +33,11 @@ impl From<ParseError> for AccessDenied {
     fn from(error: ParseError) -> Self { AccessDenied::ParseError(error) }
 }
 
+#[cfg(feature = "wasm")]
+impl Into<wasm_bindgen::JsValue> for AccessDenied {
+    fn into(self) -> wasm_bindgen::JsValue { wasm_bindgen::JsValue::from_str(&self.to_string()) }
+}
+
 impl AccessDenied {}
 
 /// PolicyAgents control access to resources, by:

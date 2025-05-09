@@ -3,6 +3,7 @@ pub mod collation;
 pub mod comparison_index;
 pub mod connector;
 pub mod context;
+pub mod edge;
 pub mod entity;
 pub mod error;
 // pub mod event;

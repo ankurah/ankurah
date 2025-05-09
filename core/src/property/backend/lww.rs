@@ -5,15 +5,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{
-    clock::{Clock, ClockOrdering},
-    Operation,
-};
+use ankurah_proto::Operation;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
-    property::{backend::PropertyBackend, traits::compare_clocks, PropertyName, PropertyValue},
+    property::{backend::PropertyBackend, PropertyName, PropertyValue},
 };
 
 const LWW_DIFF_VERSION: u8 = 1;
@@ -94,40 +91,27 @@ impl PropertyBackend for LWWBackend {
         Ok(Self { values: Arc::new(RwLock::new(map)) })
     }
 
-    fn to_operations(&self) -> Result<Vec<super::Operation>, MutationError> {
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
         let property_values = self.property_values();
         let serialized_diff = bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&property_values)? })?;
         Ok(vec![Operation { diff: serialized_diff }])
     }
 
-    fn apply_operations(
-        &self,
-        operations: &Vec<Operation>,
-        current_head: &Clock,
-        event_head: &Clock,
-        // context: &Box<dyn TContext>,
-    ) -> Result<(), MutationError> {
-        let mut values = self.values.write().unwrap();
+    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
+        for operation in operations {
+            let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
+            match version {
+                1 => {
+                    let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&data)?;
 
-        // TODO: Figure out this comparison
-        // This'll probably require looking at the events table.
-        if compare_clocks(current_head, event_head /*, context*/) == ClockOrdering::Child {
-            for operation in operations {
-                let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
-                match version {
-                    1 => {
-                        let map: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&data)?;
-                        for (property_name, new_value) in map {
-                            values.insert(property_name, new_value);
-                        }
-                    }
-                    version => {
-                        return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()))
+                    let mut values = self.values.write().unwrap();
+                    for (property_name, new_value) in map {
+                        values.insert(property_name, new_value);
                     }
                 }
+                version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
             }
         }
-
         Ok(())
     }
 }
