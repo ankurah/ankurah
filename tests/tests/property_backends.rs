@@ -1,8 +1,11 @@
 mod common;
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
-    property::{value::LWW, YrsString},
-    Model, Node, PermissiveAgent, Property,
+    property::{
+        value::{entity_ref::RefTest, ActiveRef, Ref, LWW},
+        PropertyError, PropertyValue, YrsString,
+    },
+    Model, Mutable, Node, PermissiveAgent, Property,
 };
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -12,14 +15,14 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 #[derive(Property, Serialize, Deserialize, PartialEq, Eq, Debug)]
-#[wasm_bindgen]
+//#[wasm_bindgen]
 pub enum Visibility {
     Public,
     Unlisted,
     Private,
 }
 
-#[derive(Model, Debug, Serialize, Deserialize)]
+#[derive(Model, Debug)]
 pub struct Video {
     #[active_type(YrsString)]
     pub title: String,
@@ -31,6 +34,17 @@ pub struct Video {
     pub views: i32,*/
     #[active_type(LWW)]
     pub attribution: Option<String>,
+
+    // TODO: How the hell do I get wasm to be fine with this...?
+    #[active_type(ActiveRef)]
+    pub playlist: Ref<Playlist>,
+}
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Playlist {
+    pub title: String,
+    pub description: Option<String>,
+    //pub videos: Vec<Ref<Video>>,
 }
 
 #[tokio::test]
@@ -47,6 +61,7 @@ async fn property_backends() -> Result<()> {
             visibility: Visibility::Public,
             //views: 0,
             attribution: None,
+            playlist: Ref::empty(),
         })
         .await?;
 
@@ -78,13 +93,15 @@ async fn pg_property_backends() -> Result<()> {
     let ctx = node.context(c)?;
 
     let trx = ctx.begin();
+    let cat_playlist = trx.create(&Playlist { title: "My cat videos :D".into(), description: Some("cuddly cats".into()) }).await?;
+
     let cat_video = trx
         .create(&Video {
             title: "Cat video #2918".into(),
             description: Some("Test".into()),
             visibility: Visibility::Public,
-            //views: 0,
             attribution: None,
+            playlist: Ref::id(cat_playlist.id()),
         })
         .await?;
 
@@ -95,14 +112,18 @@ async fn pg_property_backends() -> Result<()> {
             visibility: Visibility::Unlisted,
             //views: 5120,
             attribution: Some("That guy".into()),
+            playlist: Ref::id(cat_playlist.id()),
         })
         .await?;
 
     let id = cat_video.id();
-    //cat_video.views.add(2); // FIXME: applying twice for some reason
+    let my_video = cat_video.read();
+
     cat_video.visibility.set(&Visibility::Unlisted)?;
     cat_video.title.insert(15, " (Very cute)")?;
     trx.commit().await?;
+
+    let playlist = my_video.playlist()?.get().await?;
 
     let video = ctx.get::<VideoView>(id).await?;
     //assert_eq!(video.views().unwrap(), 1);
@@ -111,3 +132,14 @@ async fn pg_property_backends() -> Result<()> {
 
     Ok(())
 }
+
+/*let cat_video2 = trx
+.create(&Video {
+    title: "Cat video #9000".into(),
+    description: None,
+    visibility: Visibility::Unlisted,
+    //views: 5120,
+    attribution: Some("That guy".into()),
+    playlist: Ref::id(cat_playlist.id()),
+})
+.await;*/
