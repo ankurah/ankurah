@@ -255,7 +255,6 @@ dependencies = [
  "ankql",
  "ankurah",
  "ankurah-connector-local-process",
- "ankurah-react-signals",
  "ankurah-storage-postgres",
  "ankurah-storage-sled",
  "anyhow",

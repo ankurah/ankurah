@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [features]
-default = ["wasm"]
-wasm    = ["dep:wasm-bindgen", "ankurah/wasm", "ankurah/react"]
+default = []
+wasm    = ["dep:wasm-bindgen", "ankurah/wasm"]
 
 [dependencies]
 ankurah        = { path = "../../ankurah", features = ["derive"], version = "^0.4.2" }

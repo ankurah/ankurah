@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ankurah = { path = "../../ankurah", features = ["derive", "wasm", "react"], version = "^0.4.2" }
+ankurah = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.4.2" }
 ankurah-websocket-client-wasm = { path = "../../connectors/websocket-client-wasm", features = [
     "react",
 ], version = "^0.4.2" }

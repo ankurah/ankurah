@@ -1,4 +1,3 @@
-use ankurah_proto::clock::Clock;
 use anyhow::Result;
 
 use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
