@@ -3,6 +3,8 @@ use crate::collation::Collatable;
 /// A dynamically typed value
 /// This is a short term expedience. Ideally we would NOT have one canonical set of types, but rather a pairwise mapping between the
 /// storage engine types and the backend types.
+///
+/// TODO: Consolidate this with PropertyValue and stop using String for all matching
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     String(String),

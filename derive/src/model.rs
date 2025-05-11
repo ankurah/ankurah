@@ -81,7 +81,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         // Over time, this code will diverge from the original code sufficiently that
         // the distinction between tsify and the rest of the ankurah code will be indistinguishable.
         // We thank the authors of the `tsify` crate for their work. Please see the license files in the `tsify` directory for more information
-        let tsify_impl = expand_ts_model_type(&input, pojo_interface.to_string()).unwrap_or_else(syn::Error::into_compile_error);
+        // let tsify_impl = expand_ts_model_type(&input, pojo_interface.to_string()).unwrap_or_else(syn::Error::into_compile_error);
 
         // We have to generate the typescript interface for the static methods because the name of the pojo interface is different from the name of the model class
         // Maybe there's a more elegant way to do this later, but this gets the job done.
@@ -89,7 +89,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         quote! {
 
-            #tsify_impl
+            // #tsify_impl
 
             const _: () = {
                 use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
@@ -139,16 +139,18 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         })
                     }
 
-                    pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    pub async fn create(transaction: &::ankurah::transaction::Transaction, model: JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                        let model = model.into_serde::<#name>().map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                         use ankurah::Mutable;
-                        let mutable_entity = transaction.create(&me).await?;
+                        let mutable_entity = transaction.create(&model).await?;
                         Ok(mutable_entity.read())
                     }
 
-                    pub async fn create_one(context: &::ankurah::core::context::Context, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    pub async fn create_one(context: &::ankurah::core::context::Context, model: JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         use ankurah::Mutable;
+                        let model = model.into_serde::<#name>().map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                         let tx = context.begin();
-                        let mutable_entity = tx.create(&me).await?;
+                        let mutable_entity = tx.create(&model).await?;
                         let read = mutable_entity.read();
                         tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                         Ok(read)
@@ -244,6 +246,10 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     )*
                 }
             }
+
+            fn reference(&self) -> Ref<Self::Model> {
+                Ref { id: self.id(), phantom: ::std::marker::PhantomData }
+            }
         }
 
         // TODO wasm-bindgen this
@@ -293,6 +299,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     entity,
                     #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), entity), )*
                 }
+            }
+            fn reference(&self) -> Ref<Self::Model> {
+                Ref { id: self.id(), phantom: ::std::marker::PhantomData }
             }
         }
         impl<'rec> #mutable_name<'rec> {

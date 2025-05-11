@@ -5,14 +5,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{Clock, EntityId, Event, EventId, Operation};
+use ankurah_proto::{EntityId, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{LineageError, MutationError, StateError},
-    lineage::{self, GetEvents},
+    error::{MutationError, StateError},
     property::{backend::PropertyBackend, PropertyName, PropertyValue},
-    storage::StorageCollectionWrapper,
 };
 
 const REF_DIFF_VERSION: u8 = 1;

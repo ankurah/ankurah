@@ -144,7 +144,7 @@ pub use ankurah_core::{
     model::{Model, Mutable},
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
-    property::{self, Property},
+    property::{self, value::Ref, Property},
     resultset::ResultSet,
     storage,
     subscription::SubscriptionHandle,
@@ -166,7 +166,9 @@ where
     T: reactive_graph::traits::Get + Clone + 'static,
     T::Value: 'static,
 {
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> { Box::new(self.clone()) }
+    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> {
+        Box::new(self.clone())
+    }
 }
 
 // Re-export the derive macro

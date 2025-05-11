@@ -1,9 +1,12 @@
 pub mod tsify;
 
+use std::marker::PhantomData;
+
 use ankurah_proto::{CollectionId, EntityId, State};
 
 use crate::entity::Entity;
 use crate::error::StateError;
+use crate::property::value::Ref;
 use crate::property::Backends;
 use crate::property::PropertyError;
 
@@ -11,25 +14,40 @@ use anyhow::Result;
 
 /// A model is a struct that represents the present values for a given entity
 /// Schema is defined primarily by the Model object, and the View is derived from that via macro.
+/// It is used primarily to create a new Entity
+/// Occasionally you might want to call myview.to_model() to extract all the properties at the same time into a Model struct
+/// but most of the time you'll probably want to use the accessors on the View to access the properties instead.
 pub trait Model {
+    /// The read only view of the model
     type View: View;
+    /// The mutable view of the model
     type Mutable<'trx>: Mutable<'trx>;
+    /// The collection id of the model
     fn collection() -> CollectionId;
-    // TODO - this seems to be necessary, but I don't understand why
-    // Backend fields should be getting initialized on demand when the values are set
+    /// Populates the entity properties from the model fields on creation of a new entity
     fn initialize_new_entity(&self, entity: &Entity);
 }
 
 /// A read only view of an Entity which offers typed accessors
 pub trait View {
+    /// The model type
     type Model: Model;
+    /// The mutable view of the model
     type Mutable<'trx>: Mutable<'trx>;
+    /// The entity id of the view
     fn id(&self) -> EntityId { self.entity().id() }
+    /// The property backends of the entity
     fn backends(&self) -> &Backends { self.entity().backends() }
+    /// The collection id associated with the model definition
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
+    /// Returns the (dynamically typed) Entity
     fn entity(&self) -> &Entity;
+    /// Creates a new view from an entity
     fn from_entity(inner: Entity) -> Self;
+    /// Converts the view to the model type
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
+    /// Returns a reference to the entity
+    fn reference(&self) -> Ref<Self::Model> { Ref { id: self.id(), phantom: PhantomData } }
 }
 
 /// A mutable Model instance for an Entity with typed accessors.
@@ -58,4 +76,6 @@ pub trait Mutable<'rec> {
 
         Self::View::from_entity(new_inner)
     }
+
+    fn reference(&self) -> Ref<Self::Model> { Ref { id: self.id(), phantom: PhantomData } }
 }

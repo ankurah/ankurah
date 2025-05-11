@@ -1,5 +1,5 @@
 import styled from "styled-components";
-import { withSignals, Entry, ctx, ws_client } from "example-wasm-bindings";
+import { withSignals, MyModel, ctx, ws_client } from "example-wasm-bindings";
 import { useMemo } from "react";
 
 const Table = styled.table`
@@ -57,34 +57,26 @@ function App() {
   // Temporary hack - see https://github.com/ankurah/ankurah/issues/33
   return withSignals(() => {
     // eslint-disable-next-line react-hooks/rules-of-hooks
-
-    // const [connectionState, setConnectionState] = useState<string | null>(null);
     const connectionState = ws_client().connection_state.value?.value();
+
     // eslint-disable-next-line react-hooks/rules-of-hooks
     const test_items_signal = useMemo(() => {
       console.log("initializing usememo");
-      return Entry.subscribe(ctx(), "added = '2024-01-01'");
+      return MyModel.subscribe(ctx(), "added = '2024-01-01'");
     }, []);
 
     const handleButtonPress = () => {
       (async () => {
         const transaction = ctx().begin();
-        await Entry.create(transaction, {
+        await MyModel.create(transaction, {
           added: "2024-01-01",
           ip_address: "127.0.0.1",
           node_id: ctx().node_id().to_base64(),
-          complex: {
-            name: "wesh",
-            value: 123,
-            thing: {
-              Bravo: {
-                b: "ça dit quoi",
-                c: 123,
-              },
-            },
+          years_active: {
+            start: 1990,
+            end: 2024,
           },
         });
-        console.log("Entry created", ctx().node_id());
         transaction.commit();
       })();
     };

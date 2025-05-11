@@ -2,8 +2,8 @@ mod common;
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
     property::{
-        value::{entity_ref::RefTest, ActiveRef, Ref, LWW},
-        PropertyError, PropertyValue, YrsString,
+        value::{Ref, LWW},
+        YrsString,
     },
     Model, Mutable, Node, PermissiveAgent, Property,
 };
@@ -22,7 +22,7 @@ pub enum Visibility {
     Private,
 }
 
-#[derive(Model, Debug)]
+#[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Video {
     #[active_type(YrsString)]
     pub title: String,
@@ -30,21 +30,15 @@ pub struct Video {
     pub description: Option<String>,
     #[active_type(LWW<_>)]
     pub visibility: Visibility,
-    /*#[active_type(PNCounter)]
-    pub views: i32,*/
     #[active_type(LWW)]
     pub attribution: Option<String>,
-
-    // TODO: How the hell do I get wasm to be fine with this...?
-    #[active_type(ActiveRef)]
-    pub playlist: Ref<Playlist>,
+    pub playlist: Option<Ref<Playlist>>,
 }
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Playlist {
     pub title: String,
     pub description: Option<String>,
-    //pub videos: Vec<Ref<Video>>,
 }
 
 #[tokio::test]
@@ -59,9 +53,8 @@ async fn property_backends() -> Result<()> {
             title: "Cat video #2918".into(),
             description: Some("Test".into()),
             visibility: Visibility::Public,
-            //views: 0,
             attribution: None,
-            playlist: Ref::empty(),
+            playlist: None,
         })
         .await?;
 
@@ -101,7 +94,7 @@ async fn pg_property_backends() -> Result<()> {
             description: Some("Test".into()),
             visibility: Visibility::Public,
             attribution: None,
-            playlist: Ref::id(cat_playlist.id()),
+            playlist: Some(cat_playlist.reference()),
         })
         .await?;
 
@@ -112,7 +105,7 @@ async fn pg_property_backends() -> Result<()> {
             visibility: Visibility::Unlisted,
             //views: 5120,
             attribution: Some("That guy".into()),
-            playlist: Ref::id(cat_playlist.id()),
+            playlist: Some(cat_playlist.reference()),
         })
         .await?;
 

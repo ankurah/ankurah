@@ -2,110 +2,143 @@ use std::{marker::PhantomData, sync::Arc};
 
 use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::prelude::wasm_bindgen;
+
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
 
 use crate::{
+    context::Context,
     entity::Entity,
+    error::RetrievalError,
     model::Model,
     property::{
         backend::RefBackend,
         traits::{FromActiveType, FromEntity, PropertyError},
-        InitializeWith, PropertyName,
+        InitializeWith, Property, PropertyName, PropertyValue,
     },
     transaction::Transaction,
 };
 
-#[derive(Debug, Copy, Clone, Default)]
-#[wasm_bindgen()]
-pub struct RefTest {
-    id: Option<EntityId>,
-}
-
-impl RefTest {
-    pub fn id(id: EntityId) -> Self { Self { id: Some(id) } }
-    pub fn empty() -> Self { Self { id: None } }
-    pub fn optional(id: Option<EntityId>) -> Self { Self { id: id } }
-    pub fn get(&self) -> Option<EntityId> { self.id }
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct Ref<M: Model> {
-    id: Option<EntityId>,
-    phantom: PhantomData<M>,
+    pub id: EntityId,
+    pub phantom: PhantomData<M>,
 }
 
-impl<M: Model> Ref<M> {
-    pub fn id(id: EntityId) -> Self { Self { id: Some(id), phantom: PhantomData } }
-    pub fn empty() -> Self { Self { id: None, phantom: PhantomData } }
-    pub fn optional(id: Option<EntityId>) -> Self { Self { id: id, phantom: PhantomData } }
-    pub fn get(&self) -> Option<EntityId> { self.id }
-}
+impl<M: Model> Property for Ref<M> {
+    fn into_value(&self) -> Result<Option<crate::property::PropertyValue>, PropertyError> {
+        Ok(Some(PropertyValue::EntityId(self.id.clone())))
+    }
 
-impl<M: Model> std::fmt::Debug for Ref<M> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_tuple("Ref").field(&self.id).finish() }
-}
-
-pub trait ModelRef {
-    type Model: Model;
-}
-
-impl<M: Model> ModelRef for Ref<M> {
-    type Model = M;
-}
-
-pub struct ActiveRef<M: ModelRef> {
-    pub property_name: PropertyName,
-    pub backend: Arc<RefBackend>,
-
-    phantom: PhantomData<M>,
-}
-
-impl<M: ModelRef> std::fmt::Debug for ActiveRef<M> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Ref").field("property_name", &self.property_name).finish()
+    fn from_value(value: Option<crate::property::PropertyValue>) -> Result<Self, PropertyError> {
+        if let Some(PropertyValue::EntityId(id)) = value {
+            Ok(Ref { id, phantom: PhantomData })
+        } else {
+            Err(PropertyError::InvalidValue { value: value.map_or_else(|| "None".to_string(), |v| v.to_string()), ty: "Ref".to_string() })
+        }
     }
 }
 
-impl<M: ModelRef> ActiveRef<M> {
-    pub fn set(&self, id: Option<EntityId>) -> Result<(), PropertyError> {
-        self.backend.set(self.property_name.clone(), id);
+pub struct ActiveRef<M: Model> {
+    pub property_name: PropertyName,
+    pub backend: Arc<RefBackend>,
+    // pub context: Context,
+    phantom: PhantomData<M>,
+}
+pub struct OptionalActiveRef<M: Model> {
+    pub property_name: PropertyName,
+    pub backend: Arc<RefBackend>,
+    // pub context: Context,
+    phantom: PhantomData<M>,
+}
+
+impl<M: Model> ActiveRef<M> {
+    /// Temporarily passing in context to get the entity - this should probably be removed
+    /// in favor of an EntityAndContext type of some kind that transports the context along side the entity
+    pub async fn get(&self, context: &Context) -> Result<M::View, RetrievalError> {
+        let id = self.entity_id()?;
+        let rec = context.get::<M::View>(id).await?;
+        Ok(rec)
+    }
+    pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx Transaction) -> Result<M::Mutable<'rec>, PropertyError> {
+        let id = self.entity_id()?;
+        let rec = trx.get::<M>(&id).await?;
+        Ok(rec)
+    }
+    pub fn set(&self, id: impl Into<EntityId>) -> Result<(), PropertyError> {
+        self.backend.set(self.property_name.clone(), Some(id.into()));
         Ok(())
     }
 
-    pub async fn edit<'rec, 'trx: 'rec>(
-        &self,
-        trx: &'trx Transaction,
-    ) -> Result<Option<<M::Model as Model>::Mutable<'rec>>, PropertyError> {
-        match self.get_value() {
-            Some(id) => {
-                let rec = trx.get::<M::Model>(&id).await?;
-                Ok(Some(rec))
-            }
+    pub fn entity_id(&self) -> Result<EntityId, PropertyError> { self.backend.get(&self.property_name).ok_or(PropertyError::Missing) }
+}
+impl<M: Model> OptionalActiveRef<M> {
+    pub async fn get(&self, context: &Context) -> Result<Option<M::View>, RetrievalError> {
+        match self.entity_id()? {
+            Some(id) => Ok(Some(context.get::<M::View>(id).await?)),
             None => Ok(None),
         }
     }
+    pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx Transaction) -> Result<Option<M::Mutable<'rec>>, PropertyError> {
+        match self.entity_id()? {
+            Some(id) => Ok(Some(trx.get::<M>(&id).await?)),
+            None => Ok(None),
+        }
+    }
+    pub fn set(&self, id: impl Into<EntityId>) -> Result<(), PropertyError> {
+        self.backend.set(self.property_name.clone(), Some(id.into()));
+        Ok(())
+    }
 
-    pub fn get_value(&self) -> Option<EntityId> { self.backend.get(&self.property_name) }
+    pub fn entity_id(&self) -> Result<Option<EntityId>, PropertyError> { Ok(self.backend.get(&self.property_name)) }
 }
 
-impl<M: ModelRef> FromEntity for ActiveRef<M> {
+impl<M: Model> FromEntity for ActiveRef<M> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.backends().get::<RefBackend>().expect("Ref Backend should exist");
         Self { property_name: property_name, backend: backend, phantom: PhantomData }
     }
 }
 
-impl<M: Model> FromActiveType<ActiveRef<Ref<M>>> for Ref<M> {
-    fn from_active(active: ActiveRef<Ref<M>>) -> Result<Self, PropertyError>
-    where Self: Sized {
-        Ok(Ref::<M>::optional(active.get_value()))
+impl<M: Model> FromEntity for OptionalActiveRef<M> {
+    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+        let backend = entity.backends().get::<RefBackend>().expect("Ref Backend should exist");
+        Self { property_name: property_name, backend: backend, phantom: PhantomData }
     }
 }
 
-impl<M: Model> InitializeWith<Ref<M>> for ActiveRef<Ref<M>> {
+impl<M: Model> InitializeWith<Ref<M>> for ActiveRef<M> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Ref<M>) -> Self {
         let new = Self::from_entity(property_name, entity);
-        new.set(value.get()).unwrap();
+        new.set(value.id).unwrap();
         new
     }
+}
+
+impl<M: Model> InitializeWith<Ref<M>> for OptionalActiveRef<M> {
+    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Ref<M>) -> Self {
+        let new = Self::from_entity(property_name, entity);
+        new.set(value.id).unwrap();
+        new
+    }
+}
+
+impl<M: Model> FromActiveType<ActiveRef<M>> for Ref<M> {
+    fn from_active(active: ActiveRef<M>) -> Result<Self, PropertyError>
+    where Self: Sized {
+        Ok(Ref { id: active.entity_id()?, phantom: PhantomData })
+    }
+}
+
+impl<M: Model> std::fmt::Debug for Ref<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_tuple("Ref").field(&self.id).finish() }
+}
+
+impl<M: Model> std::fmt::Debug for ActiveRef<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ref").field("property_name", &self.property_name).finish()
+    }
+}
+impl<M: Model> std::fmt::Display for ActiveRef<M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Ref {}: {}", self.property_name, self.entity_id()?) }
 }
