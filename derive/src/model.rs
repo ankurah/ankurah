@@ -139,22 +139,22 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         })
                     }
 
-                    pub async fn create(transaction: &::ankurah::transaction::Transaction, model: JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
-                        let model = model.into_serde::<#name>().map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        use ankurah::Mutable;
-                        let mutable_entity = transaction.create(&model).await?;
-                        Ok(mutable_entity.read())
-                    }
+                    // pub async fn create(transaction: &::ankurah::transaction::Transaction, model: JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    //     let model = model.into_serde::<#name>().map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                    //     use ankurah::Mutable;
+                    //     let mutable_entity = transaction.create(&model).await?;
+                    //     Ok(mutable_entity.read())
+                    // }
 
-                    pub async fn create_one(context: &::ankurah::core::context::Context, model: JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
-                        use ankurah::Mutable;
-                        let model = model.into_serde::<#name>().map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        let tx = context.begin();
-                        let mutable_entity = tx.create(&model).await?;
-                        let read = mutable_entity.read();
-                        tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        Ok(read)
-                    }
+                    // pub async fn create_one(context: &::ankurah::core::context::Context, model: JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    //     use ankurah::Mutable;
+                    //     let model = model.into_serde::<#name>().map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                    //     let tx = context.begin();
+                    //     let mutable_entity = tx.create(&model).await?;
+                    //     let read = mutable_entity.read();
+                    //     tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                    //     Ok(read)
+                    // }
                 }
 
                 #[wasm_bindgen(typescript_custom_section)]
