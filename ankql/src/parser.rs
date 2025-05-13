@@ -190,6 +190,8 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
     match pair.as_rule() {
         grammar::Rule::IdentifierWithOptionalContinuation => parse_identifier(pair),
         grammar::Rule::SingleQuotedString => parse_string_literal(pair),
+        grammar::Rule::True => Ok(ast::Expr::Literal(ast::Literal::Boolean(true))),
+        grammar::Rule::False => Ok(ast::Expr::Literal(ast::Literal::Boolean(false))),
         grammar::Rule::Unsigned => parse_number(pair),
         grammar::Rule::ExpressionInParentheses => {
             let inner = pair.into_inner().next().ok_or(ParseError::EmptyExpression)?;
@@ -427,6 +429,48 @@ mod tests {
                     ast::Expr::Literal(ast::Literal::Integer(2)),
                     ast::Expr::Literal(ast::Literal::Integer(3)),
                 ]))
+            }
+        );
+    }
+
+    #[test]
+    fn test_comparison_to_true() {
+        let input = r#"bool_field = true"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(
+            predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::Boolean(true)))
+            }
+        );
+    }
+
+    #[test]
+    fn test_comparison_to_false() {
+        let input = r#"bool_field <> false"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(
+            predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
+                operator: ast::ComparisonOperator::NotEqual,
+                right: Box::new(ast::Expr::Literal(ast::Literal::Boolean(false)))
+            }
+        );
+    }
+
+    #[test]
+    fn test_comparison_to_left_operand_boolean() {
+        let input = r#"false <> bool_field"#;
+        let predicate = parse_selection(input).unwrap();
+        assert_eq!(
+            predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Literal(ast::Literal::Boolean(false))),
+                operator: ast::ComparisonOperator::NotEqual,
+                right: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string())))
             }
         );
     }
