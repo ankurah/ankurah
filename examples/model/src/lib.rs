@@ -12,10 +12,10 @@ pub struct Artist {
 
 #[derive(Model, Serialize, Deserialize)]
 pub struct Album {
-    // pub artist: Ref<Artist>,
+    pub artist: Ref<Artist>,
     pub name: String,
-    // pub year: u32,
-    // pub producer: Option<Ref<Producer>>,
+    pub year: u32,
+    pub producer: Option<Ref<Producer>>,
 }
 
 #[derive(Model, Serialize, Deserialize)]
