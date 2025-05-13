@@ -1,12 +1,9 @@
 use quote::{format_ident, quote};
 
-pub fn wasm_impl(
-    name: &syn::Ident,
-    view_name: &syn::Ident,
-    resultset_name: &syn::Ident,
-    resultset_signal_name: &syn::Ident,
-) -> proc_macro2::TokenStream {
+pub fn wasm_impl(name: &syn::Ident, view_name: &syn::Ident) -> proc_macro2::TokenStream {
     eprintln!("WASM IMPL");
+    let resultset_name = format_ident!("{}ResultSet", name);
+    let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
     let namespace_struct = format_ident!("NS{}", name);
     let pojo_interface = format_ident!("{}", name);
 

@@ -12,10 +12,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let collection_str = name.to_string().to_lowercase();
     let view_name = format_ident!("{}View", name);
     let mutable_name = format_ident!("{}Mut", name);
-    #[cfg(feature = "wasm")]
-    let resultset_name = format_ident!("{}ResultSet", name);
-    #[cfg(feature = "wasm")]
-    let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
+
     let clone_derive = if !has_flag(&input.attrs, "no_clone") {
         quote! { #[derive(Clone)] }
     } else {
@@ -72,7 +69,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     };
 
     #[cfg(feature = "wasm")]
-    let wasm_impl = wasm::wasm_impl(&name, &view_name, &resultset_name, &resultset_signal_name);
+    let wasm_impl = wasm::wasm_impl(&name, &view_name);
     #[cfg(not(feature = "wasm"))]
     let wasm_impl = quote! {};
 
