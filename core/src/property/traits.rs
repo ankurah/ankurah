@@ -1,4 +1,3 @@
-use ankurah_proto::clock::{Clock, ClockOrdering};
 use anyhow::Result;
 
 use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
@@ -7,6 +6,7 @@ use thiserror::Error;
 
 use super::PropertyValue;
 
+/// Populate the entity backend with the model value upon creation of a new entity
 pub trait InitializeWith<T> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
 }
@@ -51,35 +51,9 @@ pub trait FromEntity {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
 }
 
+/// Get the current value from an active value
+/// TODO: Can we flip the terms here?
 pub trait FromActiveType<A> {
     fn from_active(active: A) -> Result<Self, PropertyError>
     where Self: Sized;
 }
-
-pub fn compare_clocks(clock: &Clock, other: &Clock /*, context: &Box<dyn TContext>*/) -> ClockOrdering {
-    let ulid1 = clock.as_slice().iter().max();
-    let ulid2 = other.as_slice().iter().max();
-
-    if ulid1 > ulid2 {
-        ClockOrdering::Child
-    } else if ulid1 < ulid2 {
-        ClockOrdering::Parent
-    } else {
-        ClockOrdering::Sibling
-    }
-}
-
-/*
-impl<A, T> FromActiveType<A> for Option<T>
-where T: FromActiveType<A> {
-    fn from_active(active: Result<A, PropertyError>) -> Result<Option<T>, PropertyError> {
-        match T::from_active(active) {
-            Ok(projected) => {
-                Ok(Some(projected))
-            }
-            Err(PropertyError::Missing) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-}
-*/

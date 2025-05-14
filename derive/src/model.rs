@@ -1,3 +1,6 @@
+// #[cfg(feature = "wasm")]
+// mod wasm;
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{parse_macro_input, punctuated::Punctuated, AngleBracketedGenericArguments, Data, DeriveInput, Fields, Type};
@@ -9,11 +12,8 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let collection_str = name.to_string().to_lowercase();
     let view_name = format_ident!("{}View", name);
     let mutable_name = format_ident!("{}Mut", name);
-    #[cfg(feature = "wasm")]
-    let resultset_name = format_ident!("{}ResultSet", name);
-    #[cfg(feature = "wasm")]
-    let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
-    let clone_derive = if !get_model_flag(&input.attrs, "no_clone") {
+
+    let clone_derive = if !has_flag(&input.attrs, "no_clone") {
         quote! { #[derive(Clone)] }
     } else {
         quote! {}
@@ -21,7 +21,8 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
-            Fields::Named(fields) => fields.named.clone(),
+            Fields::Named(fields) => &fields.named,
+            Fields::Unit => return syn::Error::new_spanned(&name, "Unit structs are not supported").to_compile_error().into(),
             fields => {
                 return syn::Error::new_spanned(fields, format!("Only named fields are supported this is a {:#?}", fields))
                     .to_compile_error()
@@ -31,32 +32,15 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         _ => return syn::Error::new_spanned(&name, "Only structs are supported").to_compile_error().into(),
     };
 
-    // Split fields into active and ephemeral
-    let mut active_fields = Vec::new();
-    let mut ephemeral_fields = Vec::new();
-    for field in fields.into_iter() {
-        if get_model_flag(&field.attrs, "ephemeral") {
-            ephemeral_fields.push(field);
-        } else {
-            active_fields.push(field);
-        }
-    }
-
-    let active_field_visibility = active_fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
-    let active_field_names = active_fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
-    let active_field_name_strs = active_fields.iter().map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase()).collect::<Vec<_>>();
-    let projected_field_types = active_fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>();
-    let active_field_types = match active_fields.iter().map(get_active_type).collect::<Result<Vec<_>, _>>() {
-        Ok(values) => values,
-        Err(e) => return e.to_compile_error().into(),
-    };
-
-    let projected_field_types_turbofish = projected_field_types.iter().map(as_turbofish).collect::<Vec<_>>();
-    let active_field_types_turbofish = active_field_types.iter().map(as_turbofish).collect::<Vec<_>>();
-
-    let ephemeral_field_names = ephemeral_fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
-    let ephemeral_field_types = ephemeral_fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
-    let ephemeral_field_visibility = ephemeral_fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
+    let GeneratedFields {
+        view_accessors,
+        mutable_accessors,
+        ephemeral_fields,
+        entity_initializers,
+        model_extractors,
+        field_declarations,
+        default_initializers,
+    } = process_fields(fields).map_err(|e| e.to_compile_error().into())?;
 
     let wasm_attributes = if cfg!(feature = "wasm") {
         quote! {
@@ -66,137 +50,21 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    #[cfg(feature = "wasm")]
-    let wasm_impl = {
-        let namespace_struct = format_ident!("NS{}", name);
-        let pojo_interface = format_ident!("{}", name);
-
-        // We have copied the internals of the `tsify` crate into the `tsify` directory.
-        // The purpose of which is to generate the Wasm ABI for the model struct so the Pojo version of the struct can be used to call methods which accept the Model struct
-        // and the pojo will be automatically converted to the Model struct.
-        // This has been modified to use a different name for the typescript interface,
-        // so as not to conflict with the namespace that matches the model struct.
-        // Over time, this code will diverge from the original code sufficiently that
-        // the distinction between tsify and the rest of the ankurah code will be indistinguishable.
-        // We thank the authors of the `tsify` crate for their work. Please see the license files in the `tsify` directory for more information
-        let tsify_impl = expand_ts_model_type(&input, pojo_interface.to_string()).unwrap_or_else(syn::Error::into_compile_error);
-
-        // We have to generate the typescript interface for the static methods because the name of the pojo interface is different from the name of the model class
-        // Maybe there's a more elegant way to do this later, but this gets the job done.
-        let static_methods_ts = get_static_methods_ts(&name, &view_name, &resultset_signal_name, &pojo_interface);
-
-        quote! {
-
-            #tsify_impl
-
-            const _: () = {
-                use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
-
-                // These methods are only available via wasm bindgen, so it's ok that we're inside a const block
-                #[wasm_bindgen(js_name = #name, skip_typescript)]
-                pub struct #namespace_struct {}
-
-                #[wasm_bindgen(js_class = #name)]
-                impl #namespace_struct {
-                    pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Result<#view_name, ::wasm_bindgen::JsValue> {
-                        context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
-                    }
-
-                    pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<#resultset_name, ::wasm_bindgen::JsValue> {
-                        let resultset = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        Ok(#resultset_name(::std::sync::Arc::new(resultset)))
-                    }
-
-                    pub fn subscribe (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
-                        let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
-                        let (signal, rwsignal) = ::ankurah::derive_deps::reactive_graph::signal::RwSignal::new(#resultset_name::default()).split();
-
-                        let context2 = (*context).clone();
-                        let handle2 = handle.clone();
-                        let future = Box::pin(async move {
-                            use ::ankurah::derive_deps::reactive_graph::traits::Set;
-                            let handle = context2
-                                .subscribe(predicate.as_str(), move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                                    rwsignal.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
-                                })
-                                .await;
-                            match handle {
-                                Ok(h) => {
-                                    handle2.set(h).unwrap();
-                                }
-                                Err(e) => {
-                                    error!("Failed to subscribe to changes: {} for predicate: {}", e, predicate);
-                                }
-                            }
-                        });
-                        wasm_bindgen_futures::spawn_local(future);
-
-                        Ok(#resultset_signal_name{
-                            sig: Box::new(signal),
-                            handle: Box::new(handle)
-                        })
-                    }
-
-                    pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
-                        use ankurah::Mutable;
-                        let mutable_entity = transaction.create(&me).await?;
-                        Ok(mutable_entity.read())
-                    }
-
-                    pub async fn create_one(context: &::ankurah::core::context::Context, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
-                        use ankurah::Mutable;
-                        let tx = context.begin();
-                        let mutable_entity = tx.create(&me).await?;
-                        let read = mutable_entity.read();
-                        tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        Ok(read)
-                    }
-                }
-
-                #[wasm_bindgen(typescript_custom_section)]
-                const TS_APPEND_CONTENT: &'static str = #static_methods_ts;
-
-                #[wasm_bindgen]
-                #[derive(ankurah::WasmSignal, Clone, Default)]
-                pub struct #resultset_name(::std::sync::Arc<::ankurah::core::resultset::ResultSet<#view_name>>);
-
-                #[wasm_bindgen]
-                impl #resultset_name {
-                    #[wasm_bindgen(getter)]
-                    pub fn items(&self) -> Vec<#view_name> {
-                        self.0.items.to_vec()
-                    }
-                    pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Option<#view_name> {
-                        self.0.items.iter().find(|item| item.id() == id).map(|item| item.clone())
-                        // todo generate a map on demand if there are more than a certain number of items (benchmark this)
-                    }
-                    #[wasm_bindgen(getter)]
-                    pub fn loaded(&self) -> bool {
-                        self.0.loaded
-                    }
-                }
-            };
-        }
-    };
-
-    #[cfg(not(feature = "wasm"))]
+    // #[cfg(feature = "wasm")]
+    // let wasm_impl = wasm::wasm_impl(&name, &view_name);
+    // #[cfg(not(feature = "wasm"))]
     let wasm_impl = quote! {};
 
     let expanded: proc_macro::TokenStream = quote! {
-
         #wasm_attributes
         #clone_derive
         pub struct #view_name {
             entity: ::ankurah::entity::Entity,
-            #(
-                #ephemeral_field_visibility #ephemeral_field_names: #ephemeral_field_types,
-            )*
+            #(#field_declarations),*
         }
 
-        #[derive(Debug)]
         pub struct #mutable_name<'rec> {
             pub entity: &'rec ::ankurah::entity::Entity,
-            #(#active_field_visibility #active_field_names: #active_field_types,)*
         }
 
         #wasm_impl
@@ -208,9 +76,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
             fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
                 use ::ankurah::property::InitializeWith;
-                #(
-                    #active_field_types_turbofish::initialize_with(&entity, #active_field_name_strs.into(), &self.#active_field_names);
-                )*
+                #(#entity_initializers)*
             }
         }
 
@@ -223,8 +89,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             // Also: nothing seems to be using this. Maybe it could be opt in
             fn to_model(&self) -> Result<Self::Model, ankurah::property::PropertyError> {
                 Ok(#name {
-                    #( #active_field_names: self.#active_field_names()?, )*
-                    #( #ephemeral_field_names: self.#ephemeral_field_names.clone(), )*
+                    #(#model_extractors),*
                 })
             }
 
@@ -237,16 +102,18 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 assert_eq!(&Self::collection(), entity.collection());
                 #view_name {
                     entity,
-                    #(
-                        #ephemeral_field_names: Default::default(),
-                    )*
+                    #(#default_initializers),*
                 }
+            }
+
+            fn reference(&self) -> ::ankurah::core::property::value::Ref<Self::Model> {
+                ::ankurah::core::property::value::Ref { id: self.id(), phantom: ::std::marker::PhantomData }
             }
         }
 
         // TODO wasm-bindgen this
         impl #view_name {
-            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::error::MutationError> {
+            pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::policy::AccessDenied> {
                 use ::ankurah::model::View;
                 // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                 trx.edit::<#name>(&self.entity)
@@ -258,18 +125,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 self.entity.id().clone()
             }
-            #(
-                #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
-                    use ankurah::property::{FromActiveType, FromEntity};
-                    let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity);
-                    #projected_field_types_turbofish::from_active(active_result)
-                }
-            )*
-            // #(
-            //     #ephemeral_field_visibility fn #ephemeral_field_names(&self) -> &#ephemeral_field_types {
-            //         &self.#ephemeral_field_names
-            //     }
-            // )*
+            #(#view_accessors)*
         }
 
         // TODO - wasm-bindgen this - ah right, we need to remove the lifetime
@@ -282,26 +138,17 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
 
             fn new(entity: &'rec ::ankurah::entity::Entity) -> Self {
-                use ankurah::{
-                    model::Mutable,
-                    property::FromEntity,
-                };
-                assert_eq!(entity.collection(), &Self::collection());
-                Self {
-                    entity,
-                    #( #active_field_names: #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), entity), )*
-                }
+                Self { entity }
+            }
+            fn reference(&self) -> ::ankurah::core::property::value::Ref<Self::Model> {
+                ::ankurah::core::property::value::Ref { id: self.id(), phantom: ::std::marker::PhantomData }
             }
         }
         impl<'rec> #mutable_name<'rec> {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 self.entity.id().clone()
             }
-            #(
-                #active_field_visibility fn #active_field_names(&self) -> &#active_field_types {
-                    &self.#active_field_names
-                }
-            )*
+            #(#mutable_accessors)*
         }
 
         impl<'a> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #view_name {
@@ -369,11 +216,16 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
     }
 }
 
-fn get_model_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().segments.iter().any(|seg| seg.ident == "model")
-            && attr.meta.require_list().ok().and_then(|list| list.parse_args::<syn::Ident>().ok()).is_some_and(|ident| ident == flag_name)
-    })
+fn has_flag(attrs: &Vec<syn::Attribute>, flag_name: &str) -> bool {
+    for attr in attrs {
+        if let Some(ident) = attr.path().get_ident() {
+            if ident == flag_name {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 // Parse the active field type
@@ -481,39 +333,187 @@ pub fn expand_ts_model_type(input: &DeriveInput, interface_name: String) -> syn:
     Ok(tokens)
 }
 
-#[cfg(feature = "wasm")]
-fn get_static_methods_ts(
-    name: &syn::Ident,
-    view_name: &syn::Ident,
-    resultset_signal_name: &syn::Ident,
-    pojo_interface: &syn::Ident,
-) -> String {
-    format!(
-        r#"export class {name} {{
-        /**
-         * Get a single {name} by ID
-         */
-        static get(context: Context, id: ID): Promise<{view_name}>;
+// Replace the type_is_ref function
+fn type_is_ref(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(path) => {
+            if let Some(last_segment) = path.path.segments.last() {
+                let ident = &last_segment.ident;
+                if ident == "Ref" {
+                    return true;
+                }
+                // Check for Option<Ref<T>>
+                if ident == "Option" {
+                    if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
+                        if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) = args.args.first() {
+                            if let Some(inner_segment) = inner_path.path.segments.last() {
+                                return inner_segment.ident == "Ref";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
 
-        /**
-         * Fetch all {name}s that match the predicate
-         */
-        static fetch(context: Context, predicate: string): Promise<{view_name}[]>;
+fn get_ref_segment_and_args(path: &syn::TypePath) -> Option<(&syn::PathSegment, &syn::PathArguments)> {
+    let last_segment = path.path.segments.last()?;
+    if last_segment.ident == "Ref" {
+        return Some((last_segment, &last_segment.arguments));
+    }
 
-        /**
-         * Subscribe to the set of {name}s that match the predicate
-         */
-        static subscribe(context: Context, predicate: string): {resultset_signal_name};
+    if last_segment.ident == "Option" {
+        let args = match &last_segment.arguments {
+            syn::PathArguments::AngleBracketed(args) => args,
+            _ => return None,
+        };
 
-        /**
-         * Create a new {name}
-         */
-        static create(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
+        let inner_type = match args.args.first() {
+            Some(syn::GenericArgument::Type(syn::Type::Path(ref_path))) => ref_path,
+            _ => return None,
+        };
 
-        /**
-         * Create a new {name} within an automatically created and committed transaction.
-         */
-        static create_one(context: Context, me: {pojo_interface}): Promise<{view_name}>;
-}}"#
-    )
+        let ref_segment = inner_type.path.segments.last()?;
+        if ref_segment.ident == "Ref" {
+            return Some((ref_segment, &ref_segment.arguments));
+        }
+    }
+    None
+}
+
+fn get_ref_type_name(is_optional: bool, make_mutable: bool) -> &'static str {
+    match (is_optional, make_mutable) {
+        (true, true) => "OptionalMutableRef",
+        (true, false) => "OptionalActiveRef",
+        (false, true) => "MutableRef",
+        (false, false) => "ActiveRef",
+    }
+}
+
+fn build_ref_type(field: &syn::Field, make_mutable: bool) -> Result<syn::Type, syn::Error> {
+    let ty = &field.ty;
+    let type_path = match ty {
+        syn::Type::Path(p) => p,
+        _ => return Err(syn::Error::new_spanned(field, "Expected a type path")),
+    };
+
+    let is_optional = type_path.path.segments.last().map_or(false, |s| s.ident == "Option");
+
+    // Get the Ref segment and its type arguments
+    let (ref_segment, ref_args) =
+        get_ref_segment_and_args(type_path).ok_or_else(|| syn::Error::new_spanned(field, "Expected Ref or Option<Ref>"))?;
+
+    // Create a new path that's identical except for the last segment
+    let mut new_path = type_path.clone();
+    if let Some(last) = new_path.path.segments.last_mut() {
+        last.ident = format_ident!("{}", get_ref_type_name(is_optional, make_mutable));
+        last.arguments = ref_args.clone();
+    }
+
+    Ok(syn::Type::Path(new_path))
+}
+
+fn get_view_field_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
+    if type_is_ref(&field.ty) {
+        build_ref_type(field, false)
+    } else {
+        Ok(field.ty.clone())
+    }
+}
+
+fn get_mutable_field_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
+    if type_is_ref(&field.ty) {
+        build_ref_type(field, true)
+    } else {
+        get_active_type(field)
+    }
+}
+
+#[derive(Default)]
+struct GeneratedFields {
+    view_accessors: Vec<proc_macro2::TokenStream>,
+    mutable_accessors: Vec<proc_macro2::TokenStream>,
+    ephemeral_fields: Vec<syn::Field>,
+    entity_initializers: Vec<proc_macro2::TokenStream>,
+    model_extractors: Vec<proc_macro2::TokenStream>,
+    field_declarations: Vec<proc_macro2::TokenStream>,
+    default_initializers: Vec<proc_macro2::TokenStream>,
+}
+
+fn process_fields(fields: &Punctuated<syn::Field, syn::token::Comma>) -> Result<GeneratedFields, syn::Error> {
+    let mut result = GeneratedFields::default();
+
+    for field in fields {
+        let name = &field.ident;
+        let vis = &field.vis;
+        let ty = &field.ty;
+        let name_str = name.as_ref().unwrap().to_string().to_lowercase();
+
+        if has_flag(&field.attrs, "ephemeral") {
+            result.ephemeral_fields.push(field.clone());
+            result.model_extractors.push(quote! {
+                #name: self.#name.clone()
+            });
+            result.field_declarations.push(quote! {
+                #vis #name: #ty
+            });
+            result.default_initializers.push(quote! {
+                #name: Default::default()
+            });
+            continue;
+        }
+
+        // Generate model extractor for active fields
+        result.model_extractors.push(quote! {
+            #name: self.#name()?
+        });
+
+        // Generate entity initializer for non-ephemeral fields
+        let active_type = if type_is_ref(&field.ty) { build_ref_type(field, false)? } else { get_active_type(field)? };
+        let active_type_turbofish = as_turbofish(&active_type);
+
+        result.entity_initializers.push(quote! {
+            #active_type_turbofish::initialize_with(&entity, #name_str.into(), &self.#name);
+        });
+
+        if type_is_ref(&field.ty) {
+            let active_type = build_ref_type(field, false)?;
+            let mutable_type = build_ref_type(field, true)?;
+            let mutable_type_turbofish = as_turbofish(&mutable_type);
+
+            result.view_accessors.push(quote! {
+                #vis fn #name(&self) -> Result<#active_type, ::ankurah::property::PropertyError> {
+                    ::ankurah::property::FromEntity::from_entity(#name_str.into(), &self.entity)
+                }
+            });
+
+            result.mutable_accessors.push(quote! {
+                #vis fn #name(&self) -> #mutable_type {
+                    #mutable_type_turbofish::from_entity(#name_str.into(), self.entity)
+                }
+            });
+        } else {
+            let projected_type = &field.ty;
+            let active_type = get_active_type(field)?;
+            let active_type_turbofish = as_turbofish(&active_type);
+
+            result.view_accessors.push(quote! {
+                #vis fn #name(&self) -> Result<#projected_type, ::ankurah::property::PropertyError> {
+                    let active_result = <#active_type>::from_entity(#name_str.into(), &self.entity);
+                    <#projected_type>::from_active(active_result)
+                }
+            });
+
+            result.mutable_accessors.push(quote! {
+                #vis fn #name(&self) -> #active_type {
+                    #active_type_turbofish::from_entity(#name_str.into(), self.entity)
+                }
+            });
+        }
+    }
+
+    Ok(result)
 }

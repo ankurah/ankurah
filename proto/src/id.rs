@@ -3,12 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use ulid::Ulid;
 
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
 use crate::error::DecodeError;
 // TODO - split out the different id types. Presently there's a lot of not-entities that are using this type for their ID
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
-#[wasm_bindgen]
+#[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct EntityId(pub(crate) Ulid);
 
 impl EntityId {
@@ -38,6 +39,7 @@ impl EntityId {
 impl EntityId {
     pub fn as_string(&self) -> String { self.to_base64() }
 
+    #[cfg(feature = "wasm")]
     #[wasm_bindgen(js_name = to_base64)]
     pub fn to_base64_js(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0.to_bytes()) }
 

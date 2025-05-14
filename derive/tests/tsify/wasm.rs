@@ -1,3 +1,5 @@
+#![cfg(feature = "wasm")]
+
 use core::panic;
 
 use serde::{Deserialize, Serialize};
@@ -52,22 +54,13 @@ module.exports = { validate, validateArray, noop };
 "#)]
 extern "C" {
     #[wasm_bindgen(catch, js_name = "validate")]
-    pub fn validate_simple_data(
-        value: SimpleData,
-        validation: &dyn Fn(SimpleData),
-    ) -> Result<(), JsValue>;
+    pub fn validate_simple_data(value: SimpleData, validation: &dyn Fn(SimpleData)) -> Result<(), JsValue>;
 
     #[wasm_bindgen(catch, js_name = "validate")]
-    pub fn validate_simple_data_ref(
-        value: SimpleData,
-        validation: &dyn Fn(&SimpleData),
-    ) -> Result<(), JsValue>;
+    pub fn validate_simple_data_ref(value: SimpleData, validation: &dyn Fn(&SimpleData)) -> Result<(), JsValue>;
 
     #[wasm_bindgen(catch, js_name = "validateArray")]
-    pub fn validate_array(
-        value: Vec<SimpleData>,
-        validation: &dyn Fn(Box<[SimpleData]>),
-    ) -> Result<(), JsValue>;
+    pub fn validate_array(value: Vec<SimpleData>, validation: &dyn Fn(Box<[SimpleData]>)) -> Result<(), JsValue>;
 
     #[wasm_bindgen(catch, js_name = "noop")]
     pub fn do_not_serialize(value: CantBeSerialized) -> Result<(), JsValue>;
@@ -78,20 +71,11 @@ extern "C" {
 
 #[wasm_bindgen_test]
 fn test_convert_simple_value_type() {
-    let first_value = SimpleData {
-        value: 42,
-        text: "Hello".to_string(),
-    };
+    let first_value = SimpleData { value: 42, text: "Hello".to_string() };
 
-    let second_value = SimpleData {
-        value: 25,
-        text: "World".to_string(),
-    };
+    let second_value = SimpleData { value: 25, text: "World".to_string() };
 
-    let third_value = SimpleData {
-        value: 271828,
-        text: "Haskell".to_string(),
-    };
+    let third_value = SimpleData { value: 271828, text: "Haskell".to_string() };
 
     validate_simple_data(first_value.clone(), &|val_after| {
         assert_eq!(val_after, first_value);
@@ -103,11 +87,7 @@ fn test_convert_simple_value_type() {
     })
     .unwrap_throw();
 
-    let values = vec![
-        first_value.clone(),
-        second_value.clone(),
-        third_value.clone(),
-    ];
+    let values = vec![first_value.clone(), second_value.clone(), third_value.clone()];
     validate_array(values, &|values| {
         assert_eq!(values.len(), 3);
         assert_eq!(values[0], first_value);
@@ -124,12 +104,8 @@ struct CantBeSerialized {
 
 impl Serialize for CantBeSerialized {
     fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        Err(serde::ser::Error::custom(
-            "This type can't be serialized NO_SERIALIZE",
-        ))
+    where S: serde::Serializer {
+        Err(serde::ser::Error::custom("This type can't be serialized NO_SERIALIZE"))
     }
 }
 

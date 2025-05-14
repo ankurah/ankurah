@@ -111,7 +111,6 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
- "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "yrs",
@@ -158,7 +157,6 @@ dependencies = [
  "serde-wasm-bindgen",
  "sha2",
  "ulid",
- "uuid",
  "wasm-bindgen",
 ]
 
@@ -231,7 +229,6 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "ulid",
- "uuid",
 ]
 
 [[package]]
@@ -258,7 +255,6 @@ dependencies = [
  "ankql",
  "ankurah",
  "ankurah-connector-local-process",
- "ankurah-react-signals",
  "ankurah-storage-postgres",
  "ankurah-storage-sled",
  "anyhow",
@@ -278,6 +274,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+]
+
+[[package]]
+name = "ankurah-types"
+version = "0.4.2"
+dependencies = [
+ "chrono",
+ "js-sys",
  "wasm-bindgen",
 ]
 
@@ -308,7 +312,6 @@ dependencies = [
  "tracing",
  "tracing-wasm",
  "ulid",
- "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -1003,13 +1006,13 @@ name = "example-model"
 version = "0.4.2"
 dependencies = [
  "ankurah",
+ "ankurah-types",
  "chrono",
  "getrandom 0.3.2",
  "reactive_graph",
  "serde",
  "tracing",
  "tsify",
- "uuid",
  "wasm-bindgen",
 ]
 
@@ -1031,7 +1034,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-wasm",
- "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-logger",
@@ -3289,7 +3291,6 @@ checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
 dependencies = [
  "rand 0.9.0",
  "serde",
- "uuid",
  "web-time",
 ]
 
@@ -3369,9 +3370,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "458f7a779bf54acc9f347480ac654f68407d3aab21269a6e3c9f922acd9e2da9"
 dependencies = [
  "getrandom 0.3.2",
- "js-sys",
- "serde",
- "wasm-bindgen",
 ]
 
 [[package]]

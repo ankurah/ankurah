@@ -3,7 +3,6 @@ use wasm_bindgen::prelude::*;
 
 use ankurah_proto as proto;
 
-// #[cfg_attr(feature = "react", derive(WasmSignal))]
 #[derive(Debug, Clone, PartialEq, strum::Display)]
 pub enum ConnectionState {
     None,

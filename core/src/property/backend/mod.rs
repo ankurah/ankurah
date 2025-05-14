@@ -1,4 +1,4 @@
-use ankurah_proto::{Clock, Operation, State, StateBuffers};
+use ankurah_proto::{Operation, State, StateBuffers};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -8,10 +8,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod entity_ref;
 pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
 use crate::error::{MutationError, RetrievalError, StateError};
+
+pub use entity_ref::RefBackend;
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -42,13 +45,8 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Retrieve operations applied to this backend since the last time we called this method.
     fn to_operations(&self) -> Result<Vec<Operation>, MutationError>;
-    fn apply_operations(
-        &self,
-        operations: &Vec<Operation>,
-        current_head: &Clock,
-        event_precursors: &Clock,
-        // context: &Box<dyn TContext>,
-    ) -> Result<(), MutationError>;
+
+    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError>;
 }
 
 /// Holds the property backends inside of entities.
@@ -73,6 +71,12 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
         let backend = match buffer {
             Some(buffer) => LWWBackend::from_state_buffer(buffer)?,
             None => LWWBackend::new(),
+        };
+        Ok(Arc::new(backend))
+    } else if name == "ref" {
+        let backend = match buffer {
+            Some(buffer) => RefBackend::from_state_buffer(buffer)?,
+            None => RefBackend::new(),
         };
         Ok(Arc::new(backend))
     }
@@ -162,16 +166,9 @@ impl Backends {
         Ok(operations)
     }
 
-    pub fn apply_operations(
-        &self,
-        backend_name: String,
-        operations: &Vec<Operation>,
-        current_head: &Clock,
-        event_precursors: &Clock,
-        // context: &Box<dyn TContext>,
-    ) -> Result<(), MutationError> {
+    pub fn apply_operations(&self, backend_name: String, operations: &Vec<Operation>) -> Result<(), MutationError> {
         let backend = self.get_raw(backend_name)?;
-        backend.apply_operations(operations, current_head, event_precursors /*context*/)?;
+        backend.apply_operations(operations)?;
         Ok(())
     }
 

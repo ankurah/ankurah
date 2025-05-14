@@ -5,11 +5,13 @@ edition = "2021"
 publish = false
 
 [features]
-default = ["wasm"]
-wasm    = ["dep:wasm-bindgen", "ankurah/wasm", "ankurah/react"]
+default = []
+wasm    = ["dep:wasm-bindgen", "ankurah/wasm"]
 
 [dependencies]
 ankurah        = { path = "../../ankurah", features = ["derive"], version = "^0.4.2" }
+ankurah-types = { path = "../../types", features = ["wasm"], version = "^0.4.2" }
+
 serde          = { version = "1.0", features = ["derive"] }
 wasm-bindgen   = { version = "0.2", optional = true }
 reactive_graph = { version = "0.1.4", features = ["effects"], optional = true }
@@ -17,7 +19,6 @@ tsify          = { version = "0.4" }
 
 ##### patch - something is wrong with the uuid crate for wasm
 getrandom = { version = "0.3", features = ["wasm_js"] }
-uuid      = { version = "1.7", features = ["v4", "serde", "js"] }
 chrono    = { version = "0.4", features = ["serde"] }
 ###### 
 

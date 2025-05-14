@@ -10,7 +10,6 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-react = ["dep:ankurah-react-signals", "wasm"]
 wasm = [
     "derive",
     "ankurah-derive?/wasm",
@@ -18,7 +17,6 @@ wasm = [
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
     "dep:ankurah-react-signals",
-    "dep:reactive_graph",
     "ankurah-core/wasm",
 ]
 derive = ["dep:ankurah-derive"]
@@ -37,7 +35,7 @@ wasm-bindgen          = { version = "0.2", optional = true }
 wasm-bindgen-futures  = { version = "0.4", optional = true }
 js-sys                = { version = "0.3", optional = true }
 ankurah-react-signals = { path = "../react-signals", optional = true, version = "^0.4.2" }
-reactive_graph        = { version = "0.1.4", features = ["effects"], optional = true }
+reactive_graph        = { version = "0.1.4", features = ["effects"] }
 
 [dev-dependencies]
 ankurah-storage-sled            = { path = "../storage/sled" }

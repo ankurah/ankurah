@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, convert::Infallible};
 use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
 use thiserror::Error;
 
-use crate::{connector::SendError, policy::AccessDenied};
+use crate::{connector::SendError, policy::AccessDenied, property::PropertyError};
 
 #[derive(Error, Debug)]
 pub enum RetrievalError {
@@ -41,10 +41,16 @@ pub enum RetrievalError {
     StateError(StateError),
     #[error("Mutation error: {0}")]
     MutationError(Box<MutationError>),
+    #[error("Property error: {0}")]
+    PropertyError(Box<PropertyError>),
 }
 
 impl From<MutationError> for RetrievalError {
     fn from(err: MutationError) -> Self { RetrievalError::MutationError(Box::new(err)) }
+}
+
+impl From<PropertyError> for RetrievalError {
+    fn from(err: PropertyError) -> Self { RetrievalError::PropertyError(Box::new(err)) }
 }
 
 impl RetrievalError {

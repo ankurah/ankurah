@@ -144,7 +144,7 @@ pub use ankurah_core::{
     model::{Model, Mutable},
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
-    property::{self, Property},
+    property::{self, value::Ref, Property},
     resultset::ResultSet,
     storage,
     subscription::SubscriptionHandle,
@@ -153,20 +153,22 @@ pub use ankurah_core::{
 
 // TODO move this somewhere else - it's a dependency of the signal derive macro
 #[doc(hidden)]
-#[cfg(feature = "react")]
+#[cfg(feature = "wasm")]
 pub trait GetSignalValue: reactive_graph::traits::Get {
     fn cloned(&self) -> Box<dyn GetSignalValue<Value = Self::Value>>;
 }
 
 // Add a blanket implementation for any type that implements Get + Clone
 #[doc(hidden)]
-#[cfg(feature = "react")]
+#[cfg(feature = "wasm")]
 impl<T> GetSignalValue for T
 where
     T: reactive_graph::traits::Get + Clone + 'static,
     T::Value: 'static,
 {
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> { Box::new(self.clone()) }
+    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> {
+        Box::new(self.clone())
+    }
 }
 
 // Re-export the derive macro
@@ -177,20 +179,19 @@ pub use ankurah_derive::*;
 #[cfg(feature = "derive")]
 #[doc(hidden)]
 pub mod derive_deps {
-    #[cfg(feature = "react")]
+    #[cfg(feature = "wasm")]
     pub use crate::GetSignalValue;
-    #[cfg(feature = "react")]
+    #[cfg(feature = "wasm")]
     pub use ::ankurah_react_signals;
-    #[cfg(feature = "react")]
+    #[cfg(feature = "wasm")]
     pub use ::js_sys;
-    #[cfg(feature = "react")]
     pub use ::reactive_graph;
     pub use ::tracing; // Why does this fail with a Sized error: `the trait `GetSignalValue` cannot be made into an object the trait cannot be made into an object because it requires `Self: Sized``
                        // pub use reactive_graph::traits::Get as GetSignalValue; // and this one works fine?
     pub use ::ankurah_proto;
-    #[cfg(feature = "react")]
+    #[cfg(feature = "wasm")]
     pub use ::wasm_bindgen;
-    #[cfg(feature = "react")]
+    #[cfg(feature = "wasm")]
     pub use ::wasm_bindgen_futures;
 
     pub use ::serde;

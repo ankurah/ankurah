@@ -5,7 +5,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ankurah_proto::Clock;
 use yrs::Update;
 use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
 
@@ -112,7 +111,7 @@ impl PropertyBackend for YrsBackend {
 
     fn property_backend_name() -> String { "yrs".to_owned() }
 
-    fn to_state_buffer(&self) -> Result<Vec<u8>, crate::error::StateError> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         let txn = self.doc.transact();
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
@@ -146,11 +145,10 @@ impl PropertyBackend for YrsBackend {
         Ok(vec![])
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>, _current_head: &Clock, _event_head: &Clock) -> Result<(), MutationError> {
+    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
         for operation in operations {
             self.apply_update(&operation.diff)?;
         }
-
         Ok(())
     }
 }
