@@ -29,6 +29,13 @@ pub trait Model {
 }
 
 /// A read only view of an Entity which offers typed accessors
+///
+/// View accessors return Results to indicate whether the property's current value could be successfully read.
+/// For regular properties, this means the value exists and is of the correct type.
+/// For Ref properties, this means a valid entity ID exists in the property.
+///
+/// Note that for Ref properties, this is separate from the async operation of actually retrieving
+/// the referenced entity, which can fail independently (e.g. network issues, entity deleted, etc).
 pub trait View {
     /// The model type
     type Model: Model;

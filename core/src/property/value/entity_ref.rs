@@ -52,9 +52,53 @@ pub struct OptionalActiveRef<M: Model> {
     phantom: PhantomData<M>,
 }
 
+pub struct MutableRef<M: Model> {
+    pub property_name: PropertyName,
+    pub backend: Arc<RefBackend>,
+    phantom: PhantomData<M>,
+}
+
+pub struct OptionalMutableRef<M: Model> {
+    pub property_name: PropertyName,
+    pub backend: Arc<RefBackend>,
+    phantom: PhantomData<M>,
+}
+
 impl<M: Model> ActiveRef<M> {
     /// Temporarily passing in context to get the entity - this should probably be removed
     /// in favor of an EntityAndContext type of some kind that transports the context along side the entity
+    pub async fn get(&self, context: &Context) -> Result<M::View, RetrievalError> {
+        let id = self.entity_id()?;
+        let rec = context.get::<M::View>(id).await?;
+        Ok(rec)
+    }
+    pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx Transaction) -> Result<M::Mutable<'rec>, PropertyError> {
+        let id = self.entity_id()?;
+        let rec = trx.get::<M>(&id).await?;
+        Ok(rec)
+    }
+
+    pub fn entity_id(&self) -> Result<EntityId, PropertyError> { self.backend.get(&self.property_name).ok_or(PropertyError::Missing) }
+}
+
+impl<M: Model> OptionalActiveRef<M> {
+    pub async fn get(&self, context: &Context) -> Result<Option<M::View>, RetrievalError> {
+        match self.entity_id()? {
+            Some(id) => Ok(Some(context.get::<M::View>(id).await?)),
+            None => Ok(None),
+        }
+    }
+    pub async fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx Transaction) -> Result<Option<M::Mutable<'rec>>, PropertyError> {
+        match self.entity_id()? {
+            Some(id) => Ok(Some(trx.get::<M>(&id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn entity_id(&self) -> Result<Option<EntityId>, PropertyError> { Ok(self.backend.get(&self.property_name)) }
+}
+
+impl<M: Model> MutableRef<M> {
     pub async fn get(&self, context: &Context) -> Result<M::View, RetrievalError> {
         let id = self.entity_id()?;
         let rec = context.get::<M::View>(id).await?;
@@ -72,7 +116,8 @@ impl<M: Model> ActiveRef<M> {
 
     pub fn entity_id(&self) -> Result<EntityId, PropertyError> { self.backend.get(&self.property_name).ok_or(PropertyError::Missing) }
 }
-impl<M: Model> OptionalActiveRef<M> {
+
+impl<M: Model> OptionalMutableRef<M> {
     pub async fn get(&self, context: &Context) -> Result<Option<M::View>, RetrievalError> {
         match self.entity_id()? {
             Some(id) => Ok(Some(context.get::<M::View>(id).await?)),
@@ -109,17 +154,47 @@ impl<M: Model> FromEntity for OptionalActiveRef<M> {
 
 impl<M: Model> InitializeWith<Ref<M>> for ActiveRef<M> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Ref<M>) -> Self {
+        let mutable = MutableRef::from_entity(property_name.clone(), entity);
+        mutable.set(value.id).unwrap();
+        Self::from_entity(property_name, entity)
+    }
+}
+
+impl<M: Model> InitializeWith<Ref<M>> for OptionalActiveRef<M> {
+    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Ref<M>) -> Self {
+        let mutable = OptionalMutableRef::from_entity(property_name.clone(), entity);
+        mutable.set(value.id).unwrap();
+        Self::from_entity(property_name, entity)
+    }
+}
+
+impl<M: Model> InitializeWith<Ref<M>> for MutableRef<M> {
+    fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Ref<M>) -> Self {
         let new = Self::from_entity(property_name, entity);
         new.set(value.id).unwrap();
         new
     }
 }
 
-impl<M: Model> InitializeWith<Ref<M>> for OptionalActiveRef<M> {
+impl<M: Model> InitializeWith<Ref<M>> for OptionalMutableRef<M> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &Ref<M>) -> Self {
         let new = Self::from_entity(property_name, entity);
         new.set(value.id).unwrap();
         new
+    }
+}
+
+impl<M: Model> FromEntity for MutableRef<M> {
+    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+        let backend = entity.backends().get::<RefBackend>().expect("Ref Backend should exist");
+        Self { property_name: property_name, backend: backend, phantom: PhantomData }
+    }
+}
+
+impl<M: Model> FromEntity for OptionalMutableRef<M> {
+    fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
+        let backend = entity.backends().get::<RefBackend>().expect("Ref Backend should exist");
+        Self { property_name: property_name, backend: backend, phantom: PhantomData }
     }
 }
 
