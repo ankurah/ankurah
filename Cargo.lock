@@ -274,6 +274,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+]
+
+[[package]]
+name = "ankurah-types"
+version = "0.4.2"
+dependencies = [
+ "chrono",
+ "js-sys",
  "wasm-bindgen",
 ]
 
@@ -998,6 +1006,7 @@ name = "example-model"
 version = "0.4.2"
 dependencies = [
  "ankurah",
+ "ankurah-types",
  "chrono",
  "getrandom 0.3.2",
  "reactive_graph",

@@ -1,0 +1,13 @@
+[package]
+name = "ankurah-types"
+version = "0.4.2"
+edition = "2024"
+
+[features]
+default = []
+wasm = ["wasm-bindgen", "js-sys"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
