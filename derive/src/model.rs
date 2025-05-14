@@ -32,14 +32,15 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         _ => return syn::Error::new_spanned(&name, "Only structs are supported").to_compile_error().into(),
     };
 
-    let generated = match process_fields(fields) {
-        Ok(g) => g,
-        Err(e) => return e.to_compile_error().into(),
-    };
-
-    let ephemeral_field_names = generated.ephemeral_fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
-    let ephemeral_field_types = generated.ephemeral_fields.iter().map(|f| &f.ty).collect::<Vec<_>>();
-    let ephemeral_field_visibility = generated.ephemeral_fields.iter().map(|f| &f.vis).collect::<Vec<_>>();
+    let GeneratedFields {
+        view_accessors,
+        mutable_accessors,
+        ephemeral_fields,
+        entity_initializers,
+        model_extractors,
+        field_declarations,
+        default_initializers,
+    } = process_fields(fields).map_err(|e| e.to_compile_error().into())?;
 
     let wasm_attributes = if cfg!(feature = "wasm") {
         quote! {
@@ -59,7 +60,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         #clone_derive
         pub struct #view_name {
             entity: ::ankurah::entity::Entity,
-            #(#generated.field_declarations,)*
+            #(#field_declarations),*
         }
 
         pub struct #mutable_name<'rec> {
@@ -75,7 +76,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
             fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
                 use ::ankurah::property::InitializeWith;
-                #(#generated.entity_initializers)*
+                #(#entity_initializers)*
             }
         }
 
@@ -88,7 +89,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             // Also: nothing seems to be using this. Maybe it could be opt in
             fn to_model(&self) -> Result<Self::Model, ankurah::property::PropertyError> {
                 Ok(#name {
-                    #(#generated.model_extractors),*
+                    #(#model_extractors),*
                 })
             }
 
@@ -101,7 +102,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 assert_eq!(&Self::collection(), entity.collection());
                 #view_name {
                     entity,
-                    #(#generated.default_initializers),*
+                    #(#default_initializers),*
                 }
             }
 
@@ -124,7 +125,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 self.entity.id().clone()
             }
-            #(#generated.view_accessors)*
+            #(#view_accessors)*
         }
 
         // TODO - wasm-bindgen this - ah right, we need to remove the lifetime
@@ -147,7 +148,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
                 self.entity.id().clone()
             }
-            #(#generated.mutable_accessors)*
+            #(#mutable_accessors)*
         }
 
         impl<'a> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #view_name {
