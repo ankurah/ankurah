@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-storage-indexeddb-wasm"
-version       = "0.4.2"
+version       = "0.4.3"
 edition       = "2021"
 description   = "Ankurah storage engine using IndexedDB in the browser"
 license       = "MIT OR Apache-2.0"
@@ -12,10 +12,10 @@ repository    = "https://github.com/ankurah/ankurah"
 default = []
 
 [dependencies]
-ankurah-core       = { path = "../../core", version = "^0.4.2" }
-ankurah-proto      = { path = "../../proto", version = "^0.4.2" }
-ankql              = { path = "../../ankql", version = "^0.4.2" }
-ankurah-derive     = { path = "../../derive", version = "^0.4.2" }
+ankurah-core       = { path = "../../core", version = "^0.4.3" }
+ankurah-proto      = { path = "../../proto", version = "^0.4.3" }
+ankql              = { path = "../../ankql", version = "^0.4.3" }
+ankurah-derive     = { path = "../../derive", version = "^0.4.3" }
 serde              = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 tokio              = { version = "1.39", features = ["sync"] }
@@ -68,7 +68,7 @@ lazy_static = "1.5.0"
 #[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-ankurah           = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.4.2" }
+ankurah           = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.4.3" }
 
 
     [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
