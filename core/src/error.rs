@@ -179,6 +179,9 @@ pub enum StateError {
 impl From<bincode::Error> for StateError {
     fn from(e: bincode::Error) -> Self { StateError::SerializationError(Box::new(e)) }
 }
+impl From<serde_json::Error> for StateError{
+    fn from(e: serde_json::Error) -> Self { StateError::SerializationError(Box::new(e))}
+}
 
 impl From<StateError> for MutationError {
     fn from(err: StateError) -> Self { MutationError::StateError(err) }

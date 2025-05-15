@@ -161,10 +161,10 @@ pub struct State {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct StateBuffers(pub BTreeMap<String, Vec<u8>>);
+pub struct StateBuffers(pub BTreeMap<String, String>);
 
 impl std::ops::Deref for StateBuffers {
-    type Target = BTreeMap<String, Vec<u8>>;
+    type Target = BTreeMap<String, String>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 

@@ -112,15 +112,19 @@ impl PropertyBackend for YrsBackend {
 
     fn property_backend_name() -> String { "yrs".to_owned() }
 
-    fn to_state_buffer(&self) -> Result<Vec<u8>, crate::error::StateError> {
+    fn to_state_buffer(&self) -> Result<String, crate::error::StateError> {
         let txn = self.doc.transact();
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
         let state_buffer = txn.encode_state_as_update_v2(&yrs::StateVector::default());
-        Ok(state_buffer)
+        let string = serde_json::to_string(&state_buffer)?;
+        Ok(string)
     }
 
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError> {
+    fn from_state_buffer(string: &str) -> std::result::Result<Self, crate::error::RetrievalError> {
+
+        let state_buffer = serde_json::from_str(&string)?;
+
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
         let update = yrs::Update::decode_v2(state_buffer).map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;

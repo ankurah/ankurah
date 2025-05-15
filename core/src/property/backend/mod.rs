@@ -35,7 +35,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     where Self: Sized;
 
     /// Get the latest state buffer for this property backend.
-    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError>;
+    fn to_state_buffer(&self) -> Result<String, StateError>;
     /// Construct a property backend from a state buffer.
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized;

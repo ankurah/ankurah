@@ -82,9 +82,9 @@ impl PropertyBackend for LWWBackend {
     fn property_backend_name() -> String { "lww".to_owned() }
 
     // This is identical to [`to_operations`] for [`LWWBackend`].
-    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
+    fn to_state_buffer(&self) -> Result<String, StateError> {
         let property_values = self.property_values();
-        let state_buffer = bincode::serialize(&property_values)?;
+        let state_buffer = serde_json::to_string(&property_values)?;
         Ok(state_buffer)
     }
 

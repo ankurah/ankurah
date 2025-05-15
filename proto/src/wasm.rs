@@ -99,10 +99,11 @@ impl TryFrom<JsValue> for OperationSet {
     type Error = DecodeError;
 
     fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
-        let mut buffer = vec![0; array.length() as usize];
-        array.copy_to(&mut buffer);
-        let set: OperationSet = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
+        // let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
+        // let mut buffer = vec![0; array.length() as usize];
+        // array.copy_to(&mut buffer);
+        let string = value.as_string().ok_or_else(|| DecodeError::InvalidFormat)?;
+        let set: OperationSet = serde_json::from_str(&string).map_err(|_| DecodeError::InvalidFormat)?;
 
         Ok(set)
     }
@@ -112,10 +113,11 @@ impl TryFrom<&OperationSet> for JsValue {
     type Error = DecodeError;
 
     fn try_from(val: &OperationSet) -> Result<Self, Self::Error> {
-        let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
-        let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
-        array.copy_from(&buffer);
-        Ok(array.into())
+        let string = serde_json::to_string(&val).map_err(|_| DecodeError::InvalidFormat)?;
+        // let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
+        // array.copy_from(&buffer);
+        // Ok(array.into())
+        Ok(string.into())
     }
 }
 
@@ -123,10 +125,12 @@ impl TryFrom<JsValue> for StateBuffers {
     type Error = DecodeError;
 
     fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-        let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
-        let mut buffer = vec![0; array.length() as usize];
-        array.copy_to(&mut buffer);
-        let set: StateBuffers = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
+        let string = value.as_string().ok_or_else(|| DecodeError::InvalidFormat)?;
+
+        // let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
+        // let mut buffer = vec![0; array.length() as usize];
+        // array.copy_to(&mut buffer);
+        let set: StateBuffers = serde_json::from_str(&string).map_err(|_| DecodeError::InvalidFormat)?;
 
         Ok(set)
     }
@@ -136,10 +140,12 @@ impl TryFrom<&StateBuffers> for JsValue {
     type Error = DecodeError;
 
     fn try_from(val: &StateBuffers) -> Result<Self, Self::Error> {
-        let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
-        let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
-        array.copy_from(&buffer);
-        Ok(array.into())
+        // let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
+        let string = serde_json::to_string(&val).map_err(|_| DecodeError::InvalidFormat)?;
+        // let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
+        // array.copy_from(&buffer);
+        // Ok(array.into())
+        Ok(string.into())
     }
 }
 
