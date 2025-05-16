@@ -34,8 +34,8 @@ impl From<ParseError> for AccessDenied {
 }
 
 #[cfg(feature = "wasm")]
-impl Into<wasm_bindgen::JsValue> for AccessDenied {
-    fn into(self) -> wasm_bindgen::JsValue { wasm_bindgen::JsValue::from_str(&self.to_string()) }
+impl From<AccessDenied> for wasm_bindgen::JsValue {
+    fn from(error: AccessDenied) -> Self { wasm_bindgen::JsValue::from_str(&error.to_string()) }
 }
 
 impl AccessDenied {}
