@@ -21,7 +21,7 @@ impl Clock {
 
     pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_base64()).collect() }
 
-    pub fn to_base64_short(&self) -> String { self.0.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(",") }
+    pub fn to_base64_short(&self) -> String { format!("[{}]", self.0.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(",")) }
 
     pub fn from_strings(strings: Vec<String>) -> Result<Self, DecodeError> {
         let mut ids = strings.into_iter().map(|s| s.try_into()).collect::<Result<Vec<_>, _>>()?;
