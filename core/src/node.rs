@@ -199,6 +199,20 @@ where
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id)))]
     pub fn deregister_peer(&self, node_id: proto::EntityId) {
         info!("Node({}).deregister_peer {}", self.id, node_id);
+
+        // Get and cleanup subscriptions before removing the peer
+        if let Some(peer_state) = self.peer_connections.get(&node_id) {
+            // Get all subscription IDs
+            let subscriptions = peer_state.subscriptions.to_vec();
+
+            // Unsubscribe each one from the reactor
+            for sub_id in subscriptions {
+                action_info!(self, "unsubscribing", "subscription {} for peer {}", sub_id, node_id);
+                self.reactor.unsubscribe(sub_id);
+            }
+        }
+
+        // Remove the peer connection and durable status
         self.peer_connections.remove(&node_id);
         self.durable_peers.remove(&node_id);
     }
