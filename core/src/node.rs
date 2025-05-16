@@ -122,7 +122,7 @@ where
         let entityset: WeakEntitySet = Default::default();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         let id = proto::EntityId::new();
-        notice_info!("Node {id} created as ephemeral");
+        notice_info!("Node {id:#} created as ephemeral");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
 
@@ -257,7 +257,7 @@ where
     // TODO add a node id argument to this function rather than getting it from the message
     // (does this actually make it more secure? or just move the place they could lie to us to the handshake?)
     // Not if its signed by a node key.
-    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(message = %message)))]
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
     pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         match message {
             proto::NodeMessage::Update(update) => {

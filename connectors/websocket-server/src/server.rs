@@ -80,7 +80,7 @@ where
     ws.on_upgrade(move |socket| handle_websocket(socket, client_ip, node))
 }
 
-#[cfg_attr(feature = "instrument", instrument(skip_all, fields(client_ip = %client_ip)))]
+#[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(client_ip = %client_ip)))]
 async fn handle_websocket<SE, PA>(socket: WebSocket, client_ip: IpAddr, node: Node<SE, PA>)
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -120,7 +120,7 @@ where
     debug!("Websocket context {client_ip} destroyed");
 }
 
-#[cfg_attr(feature = "instrument", instrument(skip_all, fields(client_ip = %client_ip)))]
+#[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(client_ip = %client_ip)))]
 async fn process_message<SE, PA>(
     msg: axum::extract::ws::Message,
     client_ip: IpAddr,
