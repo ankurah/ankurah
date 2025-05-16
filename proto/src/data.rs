@@ -172,11 +172,12 @@ impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Event({} {}/{} {} {})",
-            self.id(),
+            "Event({} {}/{} {}{} {})",
+            self.id().to_base64_short(),
             self.collection,
-            self.entity_id,
-            self.parent,
+            self.entity_id.to_base64_short(),
+            if self.is_entity_root() { "(create) " } else { "" },
+            self.parent.to_base64_short(),
             self.operations
                 .iter()
                 .map(|(backend, ops)| format!("{} => {}b", backend, ops.iter().map(|op| op.diff.len()).sum::<usize>()))
