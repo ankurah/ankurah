@@ -47,7 +47,13 @@ impl EntityId {
 }
 
 impl fmt::Display for EntityId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> { write!(f, "{}", self.to_base64()) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        if f.alternate() {
+            write!(f, "{}", self.to_base64_short())
+        } else {
+            write!(f, "{}", self.to_base64())
+        }
+    }
 }
 
 impl TryFrom<&str> for EntityId {

@@ -57,12 +57,7 @@ macro_rules! action_error {
 /// The message is displayed in bold yellow to make it stand out.
 #[macro_export]
 macro_rules! notice_info {
-    // Simple message
-    ($msg:expr) => {
-        tracing::info!("\x1b[1;33m{}\x1b[0m", $msg)
-    };
-    // Message with format args
-    ($fmt:literal, $($arg:expr),+) => {
-        tracing::info!("\x1b[1;33m{}\x1b[0m", format!($fmt, $($arg),+))
+    ($($arg:tt)*) => {
+        tracing::info!("\x1b[1;33m{}\x1b[0m", format!($($arg)*))
     };
 }
