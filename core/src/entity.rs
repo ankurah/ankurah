@@ -194,7 +194,7 @@ impl Entity {
 
         tracing::debug!("Entity {} apply_state - current head: {}, new head: {}", self.id, head, new_head);
 
-        match crate::lineage::compare(collection, &head, &new_head, 100).await? {
+        match crate::lineage::compare(collection, &new_head, &head, 100).await? {
             lineage::Ordering::Equal => {
                 tracing::debug!("Entity {} apply_state - heads are equal, skipping", self.id);
                 Ok(false)
@@ -206,7 +206,7 @@ impl Entity {
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                tracing::error!("Entity {} apply_state - new head does not descend, meet: {:?}", self.id, meet);
+                tracing::error!("Entity {} apply_state - new head {} does not descend {}, meet: {:?}", self.id, new_head, head, meet);
                 Ok(false)
             }
             lineage::Ordering::Incomparable => {
