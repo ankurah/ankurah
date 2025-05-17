@@ -354,7 +354,7 @@ where
         Ok(())
     }
 
-    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(request = %request)))]
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
     async fn handle_request(&self, cdata: &PA::ContextData, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
