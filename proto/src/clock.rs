@@ -63,5 +63,5 @@ impl From<EventId> for Clock {
 }
 
 impl std::fmt::Display for Clock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}]", self.to_base64_short()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.to_base64_short()) }
 }
