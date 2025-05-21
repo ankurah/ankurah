@@ -1,0 +1,28 @@
+---
+description: debugging practices
+globs: 
+alwaysApply: false
+---
+Rules for debugging ankurah:
+
+- When debugging multi-node scenarios, print the short node id for all nodes involved and use those identifiers to understand which node is doing what.
+- if you see long node ids or event ids that are printing to the log, shorten them to save mental effort
+- If needed, enable debug logging on the test case with LOG_LEVEL=debug environment variable
+- Run just one test at a time, eg: `cargo test --package ankurah-tests --test the_test_file -- the_test_name --exact --show-output`
+- Be concise in any logs you add. Don't sentences, just "noun.verb noun" etc.
+- Sometimes "MARK 1", "MARK 2" etc are all you need to understand execution flow (and very greppable) - these logs are throwaway, just go ahead and add what you need.
+
+MOST IMPORTANTLY:
+Good debugging is all about iteratively improving the signal-to-noise ratio. Manipulate the logs as needed to have the test case tell you a very concise story about what specifically is going wrong. Even if you have a high degree of confidence, Each debugging session should result in 5-10 (short) lines that clearly indicate the smoking gun.
+
+Notes:
+Most structs like Node, Entity, Event, etc impl Display - which unlike the Debug trait, prints the most relevant/concise representation for debugging.
+
+Debugging Process:
+1. Start every cycle with a clear mental model of how the system SHOULD work
+2. Add focused logging to verify/refute that model
+3. Actively filter noise - comment out or remove logs which are distracting/unrelated (We'll clean it up before committing)
+4. Shorten IDs and other verbose output
+5. Make small, targeted changes to test hypotheses
+6. Don't make changes without a clear theoretical basis
+7. Don't ask permission for logging changes - just make them focused and clear 

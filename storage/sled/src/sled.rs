@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use ankurah_core::{
     entity::TemporaryEntity,
@@ -188,18 +188,14 @@ impl StorageCollection for SledStorageCollection {
     }
 
     async fn add_event(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
-        // Maybe it is worthwhile for us to separate the events table into
-        // `collection-entityid` names until we have indices?
-        let tree = self.events.clone();
+        info!("MARK add_event {} <- {:#}", self.collection_id, event.payload.id());
 
-        // TODO: Shorten `Event` struct to not include `id`/`collection`
-        // since we can infer that based on key/tree respectively
         let binary_state = bincode::serialize(event)?;
 
-        // Use spawn_blocking since sled operations are not async
-
-        let last =
-            tree.insert(event.payload.id().as_bytes(), binary_state.clone()).map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
+        let last = self
+            .events
+            .insert(event.payload.id().as_bytes(), binary_state.clone())
+            .map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
 
         if let Some(last_bytes) = last {
             Ok(last_bytes != binary_state)
@@ -222,13 +218,15 @@ impl StorageCollection for SledStorageCollection {
         Ok(events)
     }
 
-    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, ankurah_core::error::RetrievalError> {
+    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
         let mut events = Vec::new();
 
         for event_data in self.events.range(entity_id.to_bytes()..) {
             let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
             let event: Attested<Event> = bincode::deserialize(&data)?;
-            events.push(event);
+            if event.payload.entity_id == entity_id {
+                events.push(event);
+            }
         }
 
         Ok(events)

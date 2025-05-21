@@ -15,10 +15,11 @@ use ankql::selection::filter::Filterable;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::debug;
+use tracing::info;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, EntityId};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 
@@ -45,6 +46,7 @@ pub struct Reactor<SE, PA> {
     // Weak reference to the node
     // node: OnceCell<WeakNode<PA>>,
     _policy_agent: PA,
+    node_id: EntityId,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -58,7 +60,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA, node_id: EntityId) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: SafeMap::new(),
             index_watchers: SafeMap::new(),
@@ -67,6 +69,7 @@ where
             collections,
             entityset,
             _policy_agent: policy_agent,
+            node_id,
             // node: OnceCell::new(),
         })
     }
@@ -188,6 +191,11 @@ where
     /// Remove a subscription and clean up its watchers
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(sub_id = %sub_id)))]
     pub(crate) fn unsubscribe(&self, sub_id: proto::SubscriptionId) {
+        if let Some(sub) = self.subscriptions.get(&sub_id) {
+            info!("MARK reactor.unsubscribe {:#} sub_id={:?} collection_id={:?}", self.node_id, sub_id, sub.collection_id);
+        } else {
+            info!("MARK reactor.unsubscribe {:#} sub_id={:?} (not found)", self.node_id, sub_id);
+        }
         if let Some(sub) = self.subscriptions.remove(&sub_id) {
             // Remove from index watchers
             self.manage_watchers_recurse(&sub.collection_id, &sub.predicate, sub_id, WatcherOp::Remove);

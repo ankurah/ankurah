@@ -1,8 +1,11 @@
-use crate::{error::RetrievalError, storage::StorageCollectionWrapper};
+use crate::error::RetrievalError;
+use crate::lineage::get_events::GetEvents;
 use ankurah_proto::{Attested, Clock, Event, EventId};
 use async_trait::async_trait;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+mod get_events;
 
 /// a trait for events and eventlike things that can be descended
 pub trait TEvent {
@@ -18,22 +21,6 @@ pub trait TClock {
     fn members(&self) -> &[Self::Id];
 }
 
-#[async_trait]
-pub trait GetEvents {
-    type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
-    type Event: TEvent<Id = Self::Id>;
-
-    /// Estimate the budget cost for retrieving a batch of events
-    /// This allows different implementations to model their cost structure
-    fn estimate_cost(&self, _batch_size: usize) -> usize {
-        // Default implementation: fixed cost of 1 per batch
-        1
-    }
-
-    /// retrieve the events from the store, returning the budget consumed by this operation and the events retrieved
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
-}
-
 impl TClock for Clock {
     type Id = EventId;
     fn members(&self) -> &[Self::Id] { self.as_slice() }
@@ -45,17 +32,6 @@ impl TEvent for ankurah_proto::Event {
 
     fn id(&self) -> EventId { self.id() }
     fn parent(&self) -> &Clock { &self.parent }
-}
-
-#[async_trait]
-impl GetEvents for StorageCollectionWrapper {
-    type Id = EventId;
-    type Event = ankurah_proto::Event;
-
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-        // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
-        Ok((1, self.0.get_events(event_ids).await?))
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,12 +67,8 @@ pub enum Ordering<Id> {
     },
 }
 
-pub async fn compare_event(
-    getter: &StorageCollectionWrapper,
-    subject: &Event,
-    other: &Clock,
-    budget: usize,
-) -> Result<Ordering<EventId>, RetrievalError> {
+pub async fn compare_event<G>(getter: &G, subject: &Event, other: &Clock, budget: usize) -> Result<Ordering<EventId>, RetrievalError>
+where G: GetEvents<Id = EventId, Event = Event> {
     if subject.parent().members() == other.members() {
         return Ok(Ordering::Descends);
     }

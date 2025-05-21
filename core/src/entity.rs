@@ -1,4 +1,4 @@
-use crate::lineage;
+use crate::lineage::{self, GetEvents};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
@@ -6,7 +6,7 @@ use crate::{
     storage::StorageCollectionWrapper,
 };
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, OperationSet, State};
+use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
@@ -113,7 +113,8 @@ impl Entity {
 
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
-    pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
+    pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
+    where G: GetEvents<Id = EventId, Event = Event> {
         let head = self.head();
 
         if head.is_empty() && event.is_entity_create() {
@@ -125,7 +126,7 @@ impl Entity {
             return Ok(true);
         }
 
-        match crate::lineage::compare_event(collection, event, &head, 100).await? {
+        match crate::lineage::compare_event(getter, event, &head, 100).await? {
             lineage::Ordering::Equal => {
                 debug!("Equal - skip");
                 Ok(false)
@@ -188,13 +189,14 @@ impl Entity {
         }
     }
 
-    pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, MutationError> {
+    pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
+    where G: GetEvents<Id = EventId, Event = Event> {
         let head = self.head();
         let new_head = state.head.clone();
 
-        tracing::debug!("Entity {} apply_state - current head: {}, new head: {}", self.id, head, new_head);
+        tracing::info!("Entity {:#} apply_state - current head: {}, new head: {}", self.id, head, new_head);
 
-        match crate::lineage::compare(collection, &new_head, &head, 100).await? {
+        match crate::lineage::compare(getter, &new_head, &head, 100).await? {
             lineage::Ordering::Equal => {
                 tracing::debug!("Entity {} apply_state - heads are equal, skipping", self.id);
                 Ok(false)
@@ -398,29 +400,35 @@ impl WeakEntitySet {
         entity
     }
 
-    pub async fn with_state(
+    pub async fn with_state<G>(
         &self,
-        collection: &StorageCollectionWrapper,
+        getter: &G,
         id: EntityId,
         collection_id: CollectionId,
         state: State,
-    ) -> Result<(Option<bool>, Entity), RetrievalError> {
+    ) -> Result<(Option<bool>, Entity), RetrievalError>
+    where
+        G: GetEvents<Id = EventId, Event = Event>,
+    {
         let entity = {
             let mut entities = self.0.write().unwrap();
             match entities.entry(id) {
                 Entry::Vacant(_) => {
+                    println!("VACANT");
                     let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                     entities.insert(id, entity.weak());
                     return Ok((None, entity));
                 }
                 Entry::Occupied(o) => match o.get().upgrade() {
                     Some(entity) => {
+                        println!("OCCUPIED SOME");
                         if entity.collection != collection_id {
                             return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
                         }
                         entity
                     }
                     None => {
+                        println!("OCCUPIED NONE");
                         let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                         entities.insert(id, entity.weak());
                         // just created the entity with the state, so we do not need to apply the state
@@ -429,9 +437,9 @@ impl WeakEntitySet {
                 },
             }
         };
-
+        println!("APPLYING STATE");
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let changed = entity.apply_state(collection, &state).await?;
+        let changed = entity.apply_state(getter, &state).await?;
         Ok((Some(changed), entity))
     }
 }

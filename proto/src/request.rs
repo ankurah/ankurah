@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, collection::CollectionId, data::Event, id::EntityId, subscription::SubscriptionId, transaction::TransactionId,
+    auth::Attested, collection::CollectionId, data::Event, id::EntityId, subscription::SubscriptionId, transaction::TransactionId, Clock,
     EntityState, EventId,
 };
 
@@ -34,12 +34,40 @@ pub struct NodeRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeRequestBody {
     // Request that the Events to be committed on the remote node
-    CommitTransaction { id: TransactionId, events: Vec<Attested<Event>> },
+    CommitTransaction {
+        id: TransactionId,
+        events: Vec<Attested<Event>>,
+    },
     // Request to fetch entities matching a predicate
-    Get { collection: CollectionId, ids: Vec<EntityId> },
-    GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
-    Fetch { collection: CollectionId, predicate: ast::Predicate },
-    Subscribe { subscription_id: SubscriptionId, collection: CollectionId, predicate: ast::Predicate },
+    Get {
+        collection: CollectionId,
+        ids: Vec<EntityId>,
+    },
+    GetEvents {
+        collection: CollectionId,
+        event_ids: Vec<EventId>,
+        // include the motivation in case the server wants to include additional events as well
+        motivation: Option<ClockComparision>,
+    },
+    Fetch {
+        collection: CollectionId,
+        predicate: ast::Predicate,
+    },
+    Subscribe {
+        subscription_id: SubscriptionId,
+        collection: CollectionId,
+        predicate: ast::Predicate,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClockComparision {
+    subject: Clock,
+    other: Clock,
+}
+
+impl std::fmt::Display for ClockComparision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "ClockComparision {} vs {}", self.subject, self.other) }
 }
 
 /// A response from one node to another
@@ -84,8 +112,13 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::Get { collection, ids } => {
                 write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
-            NodeRequestBody::GetEvents { collection, event_ids } => {
-                write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
+            NodeRequestBody::GetEvents { collection, event_ids, motivation } => {
+                write!(
+                    f,
+                    "GetEvents {collection} {} {}",
+                    event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),
+                    motivation.as_ref().map(|c| format!("motivation: {c}")).unwrap_or_default()
+                )
             }
             NodeRequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")

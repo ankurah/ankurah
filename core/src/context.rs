@@ -27,8 +27,8 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    node: Node<SE, PA>,
-    cdata: PA::ContextData,
+    pub node: Node<SE, PA>,
+    pub cdata: PA::ContextData,
 }
 
 #[async_trait]
