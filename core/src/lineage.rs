@@ -1,11 +1,11 @@
 use crate::error::RetrievalError;
-use crate::lineage::get_events::GetEvents;
-use ankurah_proto::{Attested, Clock, Event, EventId};
+use ankurah_proto::{Clock, Event, EventId};
 use async_trait::async_trait;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 mod get_events;
+pub use get_events::GetEvents;
 
 /// a trait for events and eventlike things that can be descended
 pub trait TEvent {
@@ -370,7 +370,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ankurah_proto::AttestationSet;
+    use ankurah_proto::{AttestationSet, Attested};
 
     use super::*;
     use std::collections::HashMap;

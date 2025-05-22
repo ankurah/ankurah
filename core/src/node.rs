@@ -940,12 +940,13 @@ where
         self.policy_agent.can_access_collection(cdata, collection_id)?;
         args.predicate = self.policy_agent.filter_predicate(cdata, collection_id, args.predicate)?;
 
-        info!("{self}.subscribe MARK 1 {sub_id} {collection_id}");
+        println!("{self}.subscribe MARK 1 {sub_id} {collection_id}");
+        // TODO BEFORE MERGE - this should be after reactor.subscribe but I think LocalProcess is executing the server side subscribe in the same task
+        self.subscription_context.insert(sub_id, cdata.clone());
         self.request_remote_subscribe(cdata, &mut handle, collection_id, args.predicate.clone()).await?;
-        info!("{self}.subscribe MARK 2 {sub_id} {collection_id}");
+        println!("{self}.subscribe MARK 2 {sub_id} {collection_id}");
         self.reactor.subscribe(handle.id, collection_id, args, callback).await?;
-        info!("{self}.subscribe MARK 3 {sub_id} {collection_id}");
-        // });
+        println!("{self}.subscribe MARK 3 {sub_id} {collection_id}");
 
         Ok(handle)
     }
@@ -1054,6 +1055,7 @@ where
         let peers = handle.peers.clone();
         let sub_id = handle.id;
         spawn(async move {
+            node.subscription_context.remove(&sub_id);
             node.reactor.unsubscribe(sub_id);
             if let Err(e) = node.request_remote_unsubscribe(sub_id, peers).await {
                 warn!("Error unsubscribing from peers: {}", e);
