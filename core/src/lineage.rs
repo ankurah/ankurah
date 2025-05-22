@@ -257,9 +257,7 @@ where
         // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
         // so we can pass the HashSet as a borrow and don't have to alloc this twice
         let mut result_checklist: HashSet<G::Id> = ids.iter().cloned().collect();
-        // info!("step -> get_events {:?}", ids);
-        let (cost, events) = self.getter.get_events(ids).await?;
-        // info!("step -> get_events result {:?}", events.iter().map(|e| e.payload.id()).collect::<Vec<_>>());
+        let (cost, events) = self.getter.event_get(ids).await?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
         for event in events {
@@ -422,7 +420,7 @@ mod tests {
         type Id = TestId;
         type Event = TestEvent;
 
-        async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+        async fn event_get(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
             let mut result = Vec::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {

@@ -188,8 +188,6 @@ impl StorageCollection for SledStorageCollection {
     }
 
     async fn add_event(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
-        info!("MARK add_event {} <- {:#}", self.collection_id, event.payload.id());
-
         let binary_state = bincode::serialize(event)?;
 
         let last = self

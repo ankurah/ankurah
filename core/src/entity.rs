@@ -115,6 +115,7 @@ impl Entity {
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
     where G: GetEvents<Id = EventId, Event = Event> {
+        println!("Entity::apply_event head: {event} to {self}");
         let head = self.head();
 
         if head.is_empty() && event.is_entity_create() {
@@ -198,17 +199,17 @@ impl Entity {
 
         match crate::lineage::compare(getter, &new_head, &head, 100).await? {
             lineage::Ordering::Equal => {
-                tracing::debug!("Entity {} apply_state - heads are equal, skipping", self.id);
+                tracing::info!("Entity {} apply_state - heads are equal, skipping", self.id);
                 Ok(false)
             }
             lineage::Ordering::Descends => {
-                tracing::debug!("Entity {} apply_state - new head descends from current, applying", self.id);
+                tracing::info!("Entity {} apply_state - new head descends from current, applying", self.id);
                 self.backends.apply_state(state)?;
                 *self.head.lock().unwrap() = new_head;
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                tracing::error!("Entity {} apply_state - new head {} does not descend {}, meet: {:?}", self.id, new_head, head, meet);
+                tracing::warn!("Entity {} apply_state - new head {} does not descend {}, meet: {:?}", self.id, new_head, head, meet);
                 Ok(false)
             }
             lineage::Ordering::Incomparable => {
@@ -223,7 +224,7 @@ impl Entity {
                 Err(LineageError::PartiallyDescends { meet }.into())
             }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::debug!(
+                tracing::warn!(
                     "Entity {} apply_state - budget exceeded. subject: {:?}, other: {:?}",
                     self.id,
                     subject_frontier,
@@ -400,6 +401,9 @@ impl WeakEntitySet {
         entity
     }
 
+    /// Returns a tuple of (changed, entity)
+    /// changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
+    /// None if the entity was not previously in the set
     pub async fn with_state<G>(
         &self,
         getter: &G,
@@ -414,21 +418,21 @@ impl WeakEntitySet {
             let mut entities = self.0.write().unwrap();
             match entities.entry(id) {
                 Entry::Vacant(_) => {
-                    println!("VACANT");
+                    println!("VACANT {id}");
                     let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                     entities.insert(id, entity.weak());
                     return Ok((None, entity));
                 }
                 Entry::Occupied(o) => match o.get().upgrade() {
                     Some(entity) => {
-                        println!("OCCUPIED SOME");
+                        println!("OCCUPIED SOME {id}");
                         if entity.collection != collection_id {
                             return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
                         }
                         entity
                     }
                     None => {
-                        println!("OCCUPIED NONE");
+                        println!("OCCUPIED NONE {id}");
                         let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                         entities.insert(id, entity.weak());
                         // just created the entity with the state, so we do not need to apply the state

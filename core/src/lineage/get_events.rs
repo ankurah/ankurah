@@ -25,7 +25,7 @@ pub trait GetEvents {
     }
 
     /// retrieve the events from the store, returning the budget consumed by this operation and the events retrieved
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
+    async fn event_get(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
 }
 
 #[async_trait]
@@ -33,7 +33,8 @@ impl GetEvents for StorageCollectionWrapper {
     type Id = EventId;
     type Event = ankurah_proto::Event;
 
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+    async fn event_get(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+        println!("StorageCollectionWrapper.GetEvents {:?}", event_ids);
         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
         Ok((1, self.0.get_events(event_ids).await?))
     }
@@ -48,26 +49,18 @@ where
     type Id = EventId;
     type Event = Event;
 
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-        println!("GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "));
+    async fn event_get(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
         // First try to get events from local storage
         let collection = self.1.node.system.collection(&self.0).await?;
-        let (mut cost, mut events) = collection.get_events(event_ids.clone()).await?;
-        // let mut cost = 1; // Cost for local retrieval
+        let mut events = collection.get_events(event_ids.clone()).await?;
+        let mut cost = 1; // Cost for local retrieval
 
         // Check which IDs are missing from the returned events
         let missing_ids: Vec<_> = event_ids.into_iter().filter(|id| !events.iter().any(|e| e.payload.id() == *id)).collect();
-        println!(
-            "GetEvents found {} - missing: {}",
-            events.iter().map(|e| e.payload.id().to_base64_short()).collect::<Vec<_>>().join(", "),
-            missing_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", ")
-        );
 
         // If we have missing events and a durable peer, try to fetch them
         if !missing_ids.is_empty() {
-            println!("GetEvents fetching from peer {}", missing_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "));
             if let Some(peer_id) = self.1.node.get_durable_peer_random() {
-                println!("GetEvents sending request to peer {}", peer_id.to_base64_short());
                 match self
                     .1
                     .node
@@ -80,10 +73,9 @@ where
                     .map_err(|e| RetrievalError::StorageError(format!("Request failed: {}", e).into()))?
                 {
                     proto::NodeResponseBody::GetEvents(peer_events) => {
-                        println!(
-                            "GetEvents found {}",
-                            peer_events.iter().map(|e| e.payload.id().to_base64_short()).collect::<Vec<_>>().join(", ")
-                        );
+                        for event in peer_events.iter() {
+                            collection.add_event(event).await?;
+                        }
                         events.extend(peer_events);
                         cost += 1; // Additional cost for remote retrieval
                     }

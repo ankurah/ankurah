@@ -176,7 +176,6 @@ impl PolicyAgent for PermissiveAgent {
         _auth: &proto::AuthData,
         _request: &proto::NodeRequest,
     ) -> Result<Self::ContextData, ValidationError> {
-        debug!("PermissiveAgent check_request: {:?}", _request);
         Ok(DEFAULT_CONTEXT)
     }
 
@@ -188,7 +187,6 @@ impl PolicyAgent for PermissiveAgent {
         _entity: &Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        info!("PermissiveAgent check_event: {}", event);
         Ok(None)
     }
 
@@ -198,12 +196,10 @@ impl PolicyAgent for PermissiveAgent {
         from_node: &proto::EntityId,
         event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
-        debug!("PermissiveAgent validate_received_event {} from {}", event, from_node);
         Ok(())
     }
 
     fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation> {
-        debug!("PermissiveAgent attest_state: {}", state);
         // This PolicyAgent does not require attestation, so we return None
         // Client/Server policy agents may also return None and defer to the server identity to validate the received state
         None
@@ -215,16 +211,12 @@ impl PolicyAgent for PermissiveAgent {
         _from_node: &proto::EntityId,
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
-        debug!("PermissiveAgent validate_received_state: {}", state);
         // This PolicyAgent does not require validation, so we return Ok
         // Client/Server policy agents may use the _from_node to validate the received state rather than an attestation
         Ok(())
     }
 
-    fn can_access_collection(&self, _context: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied> {
-        debug!("PermissiveAgent can_access_collection: {}", collection);
-        Ok(())
-    }
+    fn can_access_collection(&self, _context: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
 
     fn check_read(
         &self,
@@ -234,19 +226,16 @@ impl PolicyAgent for PermissiveAgent {
         _state: &proto::State,
     ) -> Result<(), AccessDenied> {
         // If your policy agent wants to inspect the entity properties, it can do so with either TemporaryEntity::new or entityset.with_state
-        debug!("PermissiveAgent check_read: {}", id);
         Ok(())
     }
 
     fn check_read_event(&self, _context: &Self::ContextData, event: &Attested<proto::Event>) -> Result<(), AccessDenied> {
         // TODO - think about the best way to get the entity properties for cases where we want to inspect
         // presumably this would need to be changed to async, and we'd need a way to retrieve entity state from storage, or possibly even a remote node
-        debug!("PermissiveAgent check_read_event: {}", event);
         Ok(())
     }
 
     fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied> {
-        debug!("PermissiveAgent check_write: {}", event.map_or_else(String::new, |e| e.id().to_string()));
         Ok(())
     }
 
@@ -256,7 +245,6 @@ impl PolicyAgent for PermissiveAgent {
         _collection: &proto::CollectionId,
         predicate: Predicate,
     ) -> Result<Predicate, AccessDenied> {
-        debug!("PermissiveAgent filter_predicate: {}", predicate);
         Ok(predicate)
     }
 

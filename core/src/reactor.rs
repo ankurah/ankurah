@@ -14,10 +14,10 @@ use ankql::ast;
 use ankql::selection::filter::Filterable;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::debug;
 use tracing::info;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
+use tracing::{debug, warn};
 
 use ankurah_proto::{self as proto, EntityId};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -93,7 +93,7 @@ where
 
         // Convert states to Entity and filter by predicate
         for state in states {
-            let (_entity_changed, entity) = self
+            let (_, entity) = self
                 .entityset
                 .with_state(&storage_collection, state.payload.entity_id, collection_id.to_owned(), state.payload.state)
                 .await?;
@@ -191,11 +191,6 @@ where
     /// Remove a subscription and clean up its watchers
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(sub_id = %sub_id)))]
     pub(crate) fn unsubscribe(&self, sub_id: proto::SubscriptionId) {
-        if let Some(sub) = self.subscriptions.get(&sub_id) {
-            info!("MARK reactor.unsubscribe {:#} sub_id={:?} collection_id={:?}", self.node_id, sub_id, sub.collection_id);
-        } else {
-            info!("MARK reactor.unsubscribe {:#} sub_id={:?} (not found)", self.node_id, sub_id);
-        }
         if let Some(sub) = self.subscriptions.remove(&sub_id) {
             // Remove from index watchers
             self.manage_watchers_recurse(&sub.collection_id, &sub.predicate, sub_id, WatcherOp::Remove);

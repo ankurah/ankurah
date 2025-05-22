@@ -583,7 +583,7 @@ where
                 }
             }
         }
-        debug!("Node {} notifying reactor of {} changes", self.id, changes.len());
+        info!("Node {} notifying reactor of {} changes", self.id, changes.len());
         self.reactor.notify_change(changes);
         Ok(())
     }
@@ -602,7 +602,7 @@ where
         update: proto::SubscriptionUpdateItem,
         nodeandcontext: &NodeAndContext<SE, PA>,
     ) -> Result<Option<EntityChange>, MutationError> {
-        info!("MARK apply_subscription_update {} type={:?} from={}", self.id.to_base64_short(), update, from_peer_id.to_base64_short());
+        info!("MARK apply_subscription_update {self} type={:?} from={}", update, from_peer_id.to_base64_short());
         match update {
             proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
                 info!("MARK apply_subscription_update.Initial entity={} state={:?}", entity_id.to_base64_short(), state);
@@ -617,6 +617,7 @@ where
                 info!("MARK apply_subscription_update.with_state entity={entity_id:#} head={}", payload.state.head);
                 match self.entities.with_state(&getter, payload.entity_id, payload.collection, payload.state).await? {
                     (Some(true), entity) => {
+                        println!("Some(true)");
                         // We had the entity already, and this state is newer than the one we have, so save it to the collection
                         // Not sure if we should reproject the state - discuss
                         // however, if we do reproject, we need to re-attest the state
@@ -628,10 +629,14 @@ where
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
                     (Some(false), _entity) => {
+                        println!("Some(false)");
+                        // LEFT OFF HERE
+                        // I think the issue is that because we are intentionally holding on to a copy of the entity in the test case, we are hitting this
                         // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
                         Ok(None)
                     }
                     (None, entity) => {
+                        println!("None");
                         // We did not have the entity yet, so we created it, so save it to the collection
                         // see notes as above regarding reprojecting and re-attesting the state
                         let state = entity.to_state()?;
@@ -659,7 +664,11 @@ where
                 let state = (entity_id, collection_id.clone(), state).into();
                 self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
 
-                match self.entities.with_state(&collection, entity_id, collection_id, state.payload.state).await? {
+                match self
+                    .entities
+                    .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, state.payload.state)
+                    .await?
+                {
                     (Some(false), _entity) => {
                         // had it already, and the state is not newer than the one we have
                         Ok(None)
@@ -943,9 +952,27 @@ where
         println!("{self}.subscribe MARK 1 {sub_id} {collection_id}");
         // TODO BEFORE MERGE - this should be after reactor.subscribe but I think LocalProcess is executing the server side subscribe in the same task
         self.subscription_context.insert(sub_id, cdata.clone());
-        self.request_remote_subscribe(cdata, &mut handle, collection_id, args.predicate.clone()).await?;
-        println!("{self}.subscribe MARK 2 {sub_id} {collection_id}");
+
+        // LEFT OFF HERE - I Think the issue we're having is that the LocalProcess connector is too dammed fast, and we're getting a response back before the subscription is actually set up
+        // it seems reasonable to subscribe locally first, and then remotely, but this will tend to return a cached result rapidly. This isn't a bad thing per se
+        // but there is a MatchArgs.cached flag that we should be honoring
+
+        // 2025-05-22T04:53:05.461212Z  INFO ankurah_core::node: MARK apply_subscription_update.with_state entity=XxNQmg head=[PubcoM]
+        // VACANT AZb2Vn00JbqC1YuYXxNQmg
+        // None
+        // node[6scUNg].subscribe MARK 2 S-01JVV5CZ9MEG5154EDHXEDK6VF album
+        // 2025-05-22T04:53:05.461351Z  INFO ankurah_core::node: Node AZb2Vn0zuvfGy80e6scUNg notifying reactor of 1 changes
+        // node[6scUNg].subscribe MARK 3 S-01JVV5CZ9MEG5154EDHXEDK6VF album
+
+        // TODO: also, rather than trying to tear down the local subscription if the remote subscription fails
+        // we should implement remote subscription retrying, which is necessary for reconnection anyway
+        // Maybe we implement subscription consolidation at the same time, but that could potentially be handled separately
+        // that should at least have an issue created before we merge this
+        let predicate = args.predicate.clone();
         self.reactor.subscribe(handle.id, collection_id, args, callback).await?;
+        self.request_remote_subscribe(cdata, &mut handle, collection_id, predicate).await?;
+        println!("{self}.subscribe MARK 2 {sub_id} {collection_id}");
+        // moved local subscribe above remote subscribe.
         println!("{self}.subscribe MARK 3 {sub_id} {collection_id}");
 
         Ok(handle)
