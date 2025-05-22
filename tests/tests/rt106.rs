@@ -35,17 +35,14 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client
-    let (watcher, check) = common::watcher::<AlbumView, AlbumView, _>(|change: &_| (*change.entity()).clone());
+    let (watcher, check) = common::watcher::<AlbumView, String, _>(|change: &_| {
+        let foo = change.entity();
+        foo.year().expect("year is not set")
+    });
     let handle = client_ctx.subscribe("name = 'Test Album'", watcher).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    // we have to hold on to the album to reproduce the issue
-    // because the Entity has to be in the WeakEntitySet when the StateFragment is received on resubscribe
-    // TODO BEFORE MERGE: this is intermittently failing. WHY?
-    let mut first = check();
-    println!("first: {}", first.len());
-    let client_album = first.remove(0).remove(0);
-    assert_eq!("2020", client_album.year().unwrap());
+    assert_eq!(vec![vec!["2020"]], check());
 
     // actually zero events because we receive a state from ItemChange::Initial
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after subscribe

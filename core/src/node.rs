@@ -23,6 +23,7 @@ use crate::{
     reactor::Reactor,
     storage::StorageEngine,
     subscription::SubscriptionHandle,
+    subscription_relay::SubscriptionRelay,
     system::SystemManager,
     task::spawn,
     transaction::Transaction,
@@ -120,10 +121,15 @@ where PA: PolicyAgent
 
     subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
 
+    /// Pending subscriptions waiting for first remote update
+    pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<()>>,
+
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
+
+    subscription_relay: Option<SubscriptionRelay<PA::ContextData>>,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -140,7 +146,10 @@ where
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
 
-        Node(Arc::new(NodeInner {
+        // Create subscription relay for ephemeral nodes
+        let subscription_relay = Some(SubscriptionRelay::new());
+
+        let node = Node(Arc::new(NodeInner {
             id,
             collections,
             entities: entityset,
@@ -151,7 +160,19 @@ where
             policy_agent,
             system: system_manager,
             subscription_context: SafeMap::new(),
-        }))
+            subscription_relay,
+            pending_subs: SafeMap::new(),
+        }));
+
+        // Set up the message sender for the subscription relay
+        if let Some(ref relay) = node.subscription_relay {
+            let weak_node = node.weak();
+            if let Err(_) = relay.set_message_sender(Arc::new(weak_node)) {
+                warn!("Failed to set message sender for subscription relay");
+            }
+        }
+
+        node
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine);
@@ -173,6 +194,8 @@ where
             policy_agent,
             system: system_manager,
             subscription_context: SafeMap::new(),
+            subscription_relay: None,
+            pending_subs: SafeMap::new(),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -193,6 +216,12 @@ where
         );
         if presence.durable {
             self.durable_peers.insert(presence.node_id);
+
+            // Notify subscription relay of new durable peer connection
+            if let Some(ref relay) = self.subscription_relay {
+                relay.notify_peer_connected(presence.node_id);
+            }
+
             if !self.durable {
                 if let Some(system_root) = presence.system_root {
                     action_info!(self, "received system root", "{}", &system_root.payload);
@@ -225,6 +254,11 @@ where
                 action_info!(self, "unsubscribing", "subscription {} for peer {}", sub_id, node_id);
                 self.reactor.unsubscribe(sub_id);
             }
+        }
+
+        // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)
+        if let Some(ref relay) = self.subscription_relay {
+            relay.notify_peer_disconnected(node_id);
         }
 
         // Remove the peer connection and durable status
@@ -444,11 +478,17 @@ where
                 action_debug!(self, "received subscription update for {} items", "{}", items.len());
                 if let Some(cdata) = self.subscription_context.get(&subscription_id) {
                     let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
+
                     self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
+                    // Signal any pending subscription waiting for first update
+                    if let Some(tx) = self.pending_subs.remove(&subscription_id) {
+                        let _ = tx.send(()); // Ignore if receiver was dropped
+                    }
                 } else {
                     error!("Received subscription update for unknown subscription {}", subscription_id);
                     return Err(anyhow!("Received subscription update for unknown subscription {}", subscription_id));
                 }
+
                 Ok(())
             }
         }
@@ -630,9 +670,6 @@ where
                     }
                     (Some(false), _entity) => {
                         println!("Some(false)");
-                        // LEFT OFF HERE
-                        // I think the issue is that because we are intentionally holding on to a copy of the entity in the test case, we are hitting this
-                        // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
                         Ok(None)
                     }
                     (None, entity) => {
@@ -724,42 +761,6 @@ where
         }
     }
 
-    pub async fn request_remote_subscribe(
-        &self,
-        cdata: &PA::ContextData,
-        sub: &mut SubscriptionHandle,
-        collection_id: &CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) -> anyhow::Result<()> {
-        // First, find any durable nodes to subscribe to
-        let durable_peer_id = self.get_durable_peer_random();
-
-        // If we have a durable node, send a subscription request to it
-        if let Some(peer_id) = durable_peer_id {
-            match self
-                .request(
-                    peer_id,
-                    cdata,
-                    proto::NodeRequestBody::Subscribe { subscription_id: sub.id, collection: collection_id.clone(), predicate },
-                )
-                .await?
-            {
-                proto::NodeResponseBody::Subscribed { subscription_id: _ } => {
-                    debug!("Node {} subscribed to peer {}", self.id, peer_id);
-                    // Add the peer to the subscription handle's peers list
-                    sub.peers.push(peer_id);
-                }
-                proto::NodeResponseBody::Error(e) => {
-                    return Err(anyhow!("Error from peer subscription: {}", e));
-                }
-                _ => {
-                    return Err(anyhow!("Unexpected response type from peer subscription"));
-                }
-            }
-        }
-        Ok(())
-    }
-
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(peer_id = %peer_id.to_base64_short(), sub_id = %sub_id, collection_id = %collection_id, predicate = %predicate)))]
     async fn handle_subscribe_request(
         &self,
@@ -780,61 +781,60 @@ where
         let node = self.clone();
         {
             let peer_id = peer_id;
-            self.reactor
-                .subscribe(sub_id, &collection_id, predicate, move |changeset| {
-                    // TODO move this into a task being fed by a channel and reorg into a function
-                    let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
+            let subscription = self.reactor.register(sub_id, &collection_id, predicate, move |changeset| {
+                // TODO move this into a task being fed by a channel and reorg into a function
+                let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
 
-                    // When changes occur, collect events and states
-                    for change in changeset.changes.into_iter() {
-                        match change {
-                            ItemChange::Initial { item } => {
-                                // For initial state, include both events and state
-                                if let Ok(es) = item.to_entity_state() {
-                                    let attestation = node.policy_agent.attest_state(&node, &es);
-
-                                    updates.push(proto::SubscriptionUpdateItem::initial(
-                                        item.id(),
-                                        item.collection.clone(),
-                                        Attested::opt(es, attestation),
-                                    ));
-                                }
-                            }
-                            ItemChange::Add { item, events } => {
-                                // For entities which were not previously matched, state AND events should be included
-                                // but it's weird because EntityState and Event redundantly include entity_id and collection
-                                // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
-                                // it has to have the entity_id
-
-                                let state = match item.to_state() {
-                                    Ok(state) => state,
-                                    Err(e) => {
-                                        warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
-                                        continue;
-                                    }
-                                };
-
-                                let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
+                // When changes occur, collect events and states
+                for change in changeset.changes.into_iter() {
+                    match change {
+                        ItemChange::Initial { item } => {
+                            // For initial state, include both events and state
+                            if let Ok(es) = item.to_entity_state() {
                                 let attestation = node.policy_agent.attest_state(&node, &es);
 
-                                updates.push(proto::SubscriptionUpdateItem::add(
-                                    item.id,
+                                updates.push(proto::SubscriptionUpdateItem::initial(
+                                    item.id(),
                                     item.collection.clone(),
                                     Attested::opt(es, attestation),
-                                    events,
                                 ));
                             }
-                            ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
-                                updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
-                            }
+                        }
+                        ItemChange::Add { item, events } => {
+                            // For entities which were not previously matched, state AND events should be included
+                            // but it's weird because EntityState and Event redundantly include entity_id and collection
+                            // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
+                            // it has to have the entity_id
+
+                            let state = match item.to_state() {
+                                Ok(state) => state,
+                                Err(e) => {
+                                    warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
+                                    continue;
+                                }
+                            };
+
+                            let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
+                            let attestation = node.policy_agent.attest_state(&node, &es);
+
+                            updates.push(proto::SubscriptionUpdateItem::add(
+                                item.id,
+                                item.collection.clone(),
+                                Attested::opt(es, attestation),
+                                events,
+                            ));
+                        }
+                        ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
+                            updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
                         }
                     }
+                }
 
-                    if !updates.is_empty() {
-                        node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates });
-                    }
-                })
-                .await?;
+                // Always send subscription update, even if empty
+                node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates });
+            });
+
+            self.reactor.initialize(subscription).await?;
         };
 
         // Store the subscription handle
@@ -950,30 +950,36 @@ where
         args.predicate = self.policy_agent.filter_predicate(cdata, collection_id, args.predicate)?;
 
         println!("{self}.subscribe MARK 1 {sub_id} {collection_id}");
-        // TODO BEFORE MERGE - this should be after reactor.subscribe but I think LocalProcess is executing the server side subscribe in the same task
+        // Store subscription context for event requests
         self.subscription_context.insert(sub_id, cdata.clone());
 
-        // LEFT OFF HERE - I Think the issue we're having is that the LocalProcess connector is too dammed fast, and we're getting a response back before the subscription is actually set up
-        // it seems reasonable to subscribe locally first, and then remotely, but this will tend to return a cached result rapidly. This isn't a bad thing per se
-        // but there is a MatchArgs.cached flag that we should be honoring
-
-        // 2025-05-22T04:53:05.461212Z  INFO ankurah_core::node: MARK apply_subscription_update.with_state entity=XxNQmg head=[PubcoM]
-        // VACANT AZb2Vn00JbqC1YuYXxNQmg
-        // None
-        // node[6scUNg].subscribe MARK 2 S-01JVV5CZ9MEG5154EDHXEDK6VF album
-        // 2025-05-22T04:53:05.461351Z  INFO ankurah_core::node: Node AZb2Vn0zuvfGy80e6scUNg notifying reactor of 1 changes
-        // node[6scUNg].subscribe MARK 3 S-01JVV5CZ9MEG5154EDHXEDK6VF album
-
-        // TODO: also, rather than trying to tear down the local subscription if the remote subscription fails
-        // we should implement remote subscription retrying, which is necessary for reconnection anyway
-        // Maybe we implement subscription consolidation at the same time, but that could potentially be handled separately
-        // that should at least have an issue created before we merge this
         let predicate = args.predicate.clone();
-        self.reactor.subscribe(handle.id, collection_id, args, callback).await?;
-        self.request_remote_subscribe(cdata, &mut handle, collection_id, predicate).await?;
+        let cached = args.cached;
+
+        // Register subscription with reactor (synchronous)
+        let subscription = self.reactor.register(handle.id, collection_id, args.predicate, callback);
+
+        // Handle remote subscription setup
+        if let Some(ref relay) = self.subscription_relay {
+            relay.notify_subscribe(sub_id, collection_id.clone(), predicate, cdata.clone());
+
+            if !cached {
+                // Create oneshot channel to wait for first remote update
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.pending_subs.insert(sub_id, tx);
+
+                // Wait for first remote update before initializing
+                if let Err(_) = rx.await {
+                    // Channel was dropped, proceed with local initialization anyway
+                    warn!("Failed to receive first remote update for subscription {}", sub_id);
+                }
+            }
+        }
+
+        // Always initialize the subscription
+        self.reactor.initialize(subscription).await?;
+
         println!("{self}.subscribe MARK 2 {sub_id} {collection_id}");
-        // moved local subscribe above remote subscribe.
-        println!("{self}.subscribe MARK 3 {sub_id} {collection_id}");
 
         Ok(handle)
     }
@@ -1079,13 +1085,20 @@ where
 
     pub fn unsubscribe(self: &Arc<Self>, handle: &SubscriptionHandle) -> anyhow::Result<()> {
         let node = Node(self.clone());
-        let peers = handle.peers.clone();
         let sub_id = handle.id;
         spawn(async move {
+            // Clean up subscription context
             node.subscription_context.remove(&sub_id);
+
+            // Clean up any pending oneshot channel
+            node.pending_subs.remove(&sub_id);
+
+            // Unsubscribe from local reactor
             node.reactor.unsubscribe(sub_id);
-            if let Err(e) = node.request_remote_unsubscribe(sub_id, peers).await {
-                warn!("Error unsubscribing from peers: {}", e);
+
+            // Notify subscription relay for remote cleanup
+            if let Some(ref relay) = node.subscription_relay {
+                relay.notify_unsubscribe(sub_id);
             }
         });
         Ok(())

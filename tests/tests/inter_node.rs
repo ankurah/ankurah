@@ -107,7 +107,7 @@ async fn server_edits_subscription() -> Result<()> {
     let (client_watcher, check_client) = common::changeset_watcher::<PetView>();
     let _client_handle = client.subscribe("name = 'Rex' OR (age > 2 and age < 5)", client_watcher).await?;
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Initial state should include Rex
     assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Initial)]]);
@@ -119,7 +119,7 @@ async fn server_edits_subscription() -> Result<()> {
         trx.commit().await?;
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Update)]]);
     assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Update)]]); // Rex still matches the predicate, but the age has changed
 
@@ -133,7 +133,7 @@ async fn server_edits_subscription() -> Result<()> {
     }
 
     // Sleep for a bit to ensure the change is propagated
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
     assert_eq!(check_server(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
