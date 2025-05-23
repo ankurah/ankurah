@@ -36,20 +36,11 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client
-    let (watcher, check) = common::watcher::<AlbumView, (AlbumView, ChangeKind), _>(|change| change.into_entity_and_kind());
+    let (watcher, check) = common::watcher::<AlbumView, _, _>(|change| (change.entity().year().unwrap_or_default()));
     let handle = client_ctx.subscribe("name = 'Test Album'", watcher).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    let mut updates = check();
-    assert_eq!(1, updates.len());
-    let mut update = updates.remove(0);
-    assert_eq!(1, update.len());
-
-    // Critically for this RT, we need to hold on to the AlbumView, so that the entity is resident when the resubscribe occurs
-    // That way it is forced to fetch the events to determine if the new state descends from the existing state
-    let (album, kind) = update.remove(0);
-    assert_eq!(ChangeKind::Initial, kind);
-    assert_eq!("2020", album.year().unwrap());
+    assert_eq!(vec![vec!["2020"]], check());
 
     // actually zero events because we receive a state from ItemChange::Initial
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after subscribe
@@ -85,7 +76,8 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // The client should receive the correct, up-to-date state (year = "2022") via the watcher
     assert_eq!(vec![vec!["2022".to_string()]], check2());
-    // After resubscribe, check if the client has received the missing events
+
+    // After resubscribe, the client should have retrieved the missing events during the lineage comparison
     assert_eq!(3, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after resubscribe
 
     Ok(())

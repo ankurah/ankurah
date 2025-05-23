@@ -1,4 +1,4 @@
-use crate::lineage::{self, GetEvents};
+use crate::lineage::{self, GetEvents, Retrieve};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
@@ -399,46 +399,65 @@ impl WeakEntitySet {
     /// Returns a tuple of (changed, entity)
     /// changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
     /// None if the entity was not previously in the set
-    pub async fn with_state<G>(
+    pub async fn with_state<R>(
         &self,
-        getter: &G,
+        retriever: &R,
         id: EntityId,
         collection_id: CollectionId,
         state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where
-        G: GetEvents<Id = EventId, Event = Event>,
+        R: Retrieve<Id = EventId, Event = Event>,
     {
         let entity = {
             let mut entities = self.0.write().unwrap();
             match entities.entry(id) {
-                Entry::Vacant(_) => {
-                    println!("Vacant {id}");
-                    let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-                    entities.insert(id, entity.weak());
-                    return Ok((None, entity));
-                }
+                Entry::Vacant(_) => None,
                 Entry::Occupied(o) => match o.get().upgrade() {
                     Some(entity) => {
                         println!("Resident {id}");
                         if entity.collection != collection_id {
                             return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
                         }
-                        entity
+                        Some(entity)
                     }
                     None => {
                         println!("Deallocated {id}");
-                        let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-                        entities.insert(id, entity.weak());
-                        // just created the entity with the state, so we do not need to apply the state
-                        return Ok((None, entity));
+                        None
                     }
                 },
             }
         };
+
+        // Handle the case where entity is not resident (either vacant or deallocated)
+        let Some(entity) = entity else {
+            // Check if there's existing state in storage before creating a new entity
+            if let Some(existing_state) = retriever.get_local_state(id).await? {
+                println!("Found existing state in storage for {id}");
+                let entity = Entity::from_state(id, collection_id.to_owned(), &existing_state.payload.state)?;
+
+                {
+                    self.0.write().unwrap().insert(id, entity.weak());
+                }
+
+                // We need to apply the new state to check lineage
+                let changed = entity.apply_state(retriever, &state).await?;
+                return Ok((Some(changed), entity));
+            } else {
+                println!("No existing state in storage for {id}");
+                let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+
+                {
+                    self.0.write().unwrap().insert(id, entity.weak());
+                }
+
+                return Ok((None, entity));
+            }
+        };
+
         println!("APPLYING STATE");
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let changed = entity.apply_state(getter, &state).await?;
+        let changed = entity.apply_state(retriever, &state).await?;
         Ok((Some(changed), entity))
     }
 }

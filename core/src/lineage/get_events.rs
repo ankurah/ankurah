@@ -7,7 +7,7 @@ use crate::{
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
 };
-use ankurah_proto::{self as proto, Attested, Event, EventId};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState, Event, EventId};
 use async_trait::async_trait;
 
 use super::TEvent;
@@ -24,8 +24,14 @@ pub trait GetEvents {
         1
     }
 
-    /// retrieve the events from the store, returning the budget consumed by this operation and the events retrieved
-    async fn event_get(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
+    /// retrieve the events from the store OR the remote peer
+    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
+}
+
+#[async_trait]
+pub trait Retrieve: GetEvents {
+    /// get the entity state from the local store, but do not try to retrieve it from the remote peer
+    async fn get_local_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError>;
 }
 
 #[async_trait]
@@ -33,10 +39,21 @@ impl GetEvents for StorageCollectionWrapper {
     type Id = EventId;
     type Event = ankurah_proto::Event;
 
-    async fn event_get(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
         println!("StorageCollectionWrapper.GetEvents {:?}", event_ids);
         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
         Ok((1, self.0.get_events(event_ids).await?))
+    }
+}
+
+#[async_trait]
+impl Retrieve for StorageCollectionWrapper {
+    async fn get_local_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
+        match self.0.get_state(entity_id).await {
+            Ok(state) => Ok(Some(state)),
+            Err(RetrievalError::EntityNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -49,7 +66,7 @@ where
     type Id = EventId;
     type Event = Event;
 
-    async fn event_get(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
         // First try to get events from local storage
         let collection = self.1.node.system.collection(&self.0).await?;
         let mut events = collection.get_events(event_ids.clone()).await?;
@@ -90,5 +107,21 @@ where
         }
 
         Ok((cost, events))
+    }
+}
+
+#[async_trait]
+impl<SE, PA> Retrieve for (proto::CollectionId, &NodeAndContext<SE, PA>)
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    async fn get_local_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
+        let collection = self.1.node.collections.get(&self.0).await?;
+        match collection.get_state(entity_id).await {
+            Ok(state) => Ok(Some(state)),
+            Err(RetrievalError::EntityNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
