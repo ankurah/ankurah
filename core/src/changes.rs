@@ -57,6 +57,14 @@ impl<I> ItemChange<I> {
         }
     }
     pub fn kind(&self) -> ChangeKind { ChangeKind::from(self) }
+    pub fn into_entity_and_kind(self) -> (I, ChangeKind) {
+        match self {
+            ItemChange::Initial { item } => (item, ChangeKind::Initial),
+            ItemChange::Add { item, .. } => (item, ChangeKind::Add),
+            ItemChange::Update { item, .. } => (item, ChangeKind::Update),
+            ItemChange::Remove { item, .. } => (item, ChangeKind::Remove),
+        }
+    }
 }
 
 impl<I> std::fmt::Display for ItemChange<I>

@@ -195,41 +195,36 @@ impl Entity {
         let head = self.head();
         let new_head = state.head.clone();
 
-        tracing::info!("Entity {:#} apply_state - current head: {}, new head: {}", self.id, head, new_head);
+        tracing::info!("{self} apply_state - new head: {new_head}");
 
         match crate::lineage::compare(getter, &new_head, &head, 100).await? {
             lineage::Ordering::Equal => {
-                tracing::info!("Entity {} apply_state - heads are equal, skipping", self.id);
+                tracing::info!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
             }
             lineage::Ordering::Descends => {
-                tracing::info!("Entity {} apply_state - new head descends from current, applying", self.id);
+                tracing::info!("{self} apply_state - new head descends from current, applying");
                 self.backends.apply_state(state)?;
                 *self.head.lock().unwrap() = new_head;
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                tracing::warn!("Entity {} apply_state - new head {} does not descend {}, meet: {:?}", self.id, new_head, head, meet);
+                tracing::warn!("{self} apply_state - new head {new_head} does not descend {head}, meet: {meet:?}");
                 Ok(false)
             }
             lineage::Ordering::Incomparable => {
-                tracing::error!("Entity {} apply_state - heads are incomparable", self.id);
+                tracing::error!("{self} apply_state - heads are incomparable");
                 // total apples and oranges - take a hike buddy
                 Err(LineageError::Incomparable.into())
             }
             lineage::Ordering::PartiallyDescends { meet } => {
-                tracing::error!("Entity {} apply_state - heads partially descend, meet: {:?}", self.id, meet);
+                tracing::error!("{self} apply_state - heads partially descend, meet: {meet:?}");
                 // TODO - figure out how to handle this. I don't think we need to materialize a new event
                 // but it requires that we update the propertybackends to support this
                 Err(LineageError::PartiallyDescends { meet }.into())
             }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::warn!(
-                    "Entity {} apply_state - budget exceeded. subject: {:?}, other: {:?}",
-                    self.id,
-                    subject_frontier,
-                    other_frontier
-                );
+                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
                 Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
             }
         }
@@ -263,7 +258,7 @@ impl Entity {
 
 impl std::fmt::Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
+        write!(f, "Entity({}/{} {})", self.collection, self.id.to_base64_short(), self.head.lock().unwrap())
     }
 }
 
@@ -418,21 +413,21 @@ impl WeakEntitySet {
             let mut entities = self.0.write().unwrap();
             match entities.entry(id) {
                 Entry::Vacant(_) => {
-                    println!("VACANT {id}");
+                    println!("Vacant {id}");
                     let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                     entities.insert(id, entity.weak());
                     return Ok((None, entity));
                 }
                 Entry::Occupied(o) => match o.get().upgrade() {
                     Some(entity) => {
-                        println!("OCCUPIED SOME {id}");
+                        println!("Resident {id}");
                         if entity.collection != collection_id {
                             return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
                         }
                         entity
                     }
                     None => {
-                        println!("OCCUPIED NONE {id}");
+                        println!("Deallocated {id}");
                         let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
                         entities.insert(id, entity.weak());
                         // just created the entity with the state, so we do not need to apply the state

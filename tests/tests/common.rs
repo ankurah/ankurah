@@ -57,11 +57,12 @@ pub fn changeset_watcher<R: View + Send + Sync + 'static>(
 }
 
 /// A generic watcher that allows extracting arbitrary data from the ChangeSet via a user-provided closure over ItemChange.
+#[allow(unused)]
 pub fn watcher<R, T, F>(extract: F) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<Vec<T>> + Send + Sync>)
 where
     R: View + Send + Sync + 'static,
     T: Send + 'static,
-    F: Fn(&ankurah::changes::ItemChange<R>) -> T + Send + Sync + 'static,
+    F: Fn(ankurah::changes::ItemChange<R>) -> T + Send + Sync + 'static,
 {
     let changes = Arc::new(Mutex::new(Vec::new()));
     let watcher = {
@@ -73,7 +74,7 @@ where
 
     let check = Box::new(move || {
         let changes: Vec<Vec<T>> =
-            changes.lock().unwrap().drain(..).map(|cset| cset.changes.iter().map(|c| extract(c)).collect()).collect();
+            changes.lock().unwrap().drain(..).map(|mut cset| cset.changes.into_iter().map(|c| extract(c)).collect()).collect();
         changes
     });
 

@@ -1,3 +1,4 @@
+use ankurah::changes::ChangeKind;
 use ankurah::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
@@ -35,14 +36,20 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client
-    let (watcher, check) = common::watcher::<AlbumView, String, _>(|change: &_| {
-        let foo = change.entity();
-        foo.year().expect("year is not set")
-    });
+    let (watcher, check) = common::watcher::<AlbumView, (AlbumView, ChangeKind), _>(|change| change.into_entity_and_kind());
     let handle = client_ctx.subscribe("name = 'Test Album'", watcher).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    assert_eq!(vec![vec!["2020"]], check());
+    let mut updates = check();
+    assert_eq!(1, updates.len());
+    let mut update = updates.remove(0);
+    assert_eq!(1, update.len());
+
+    // Critically for this RT, we need to hold on to the AlbumView, so that the entity is resident when the resubscribe occurs
+    // That way it is forced to fetch the events to determine if the new state descends from the existing state
+    let (album, kind) = update.remove(0);
+    assert_eq!(ChangeKind::Initial, kind);
+    assert_eq!("2020", album.year().unwrap());
 
     // actually zero events because we receive a state from ItemChange::Initial
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after subscribe
@@ -69,9 +76,9 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    info!("MARK test.resubscribe");
+    println!("MARK test.resubscribe");
     // Resubscribe on the client
-    let (watcher2, check2) = common::watcher::<AlbumView, String, _>(|change: &_| change.entity().year().unwrap_or_default());
+    let (watcher2, check2) = common::watcher::<AlbumView, String, _>(|change| change.entity().year().unwrap_or_default());
     // in the repro, it's failling here rather than on the arrival of the StateFragment
     let _handle2 = client_ctx.subscribe("name = 'Test Album'", watcher2).await.expect("failed to resubscribe");
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
