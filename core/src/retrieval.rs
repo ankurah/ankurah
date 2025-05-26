@@ -11,7 +11,7 @@ use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event
 use async_trait::async_trait;
 
 /// a trait for events and eventlike things that can be descended
-pub trait TEvent {
+pub trait TEvent: std::fmt::Display {
     type Id: Eq + PartialEq + Clone;
     type Parent: TClock<Id = Self::Id>;
 
@@ -40,7 +40,7 @@ impl TEvent for ankurah_proto::Event {
 #[async_trait]
 pub trait GetEvents {
     type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
-    type Event: TEvent<Id = Self::Id>;
+    type Event: TEvent<Id = Self::Id> + std::fmt::Display;
 
     /// Estimate the budget cost for retrieving a batch of events
     /// This allows different implementations to model their cost structure
