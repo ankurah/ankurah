@@ -13,6 +13,7 @@ pub mod policy;
 pub mod property;
 pub mod reactor;
 pub mod resultset;
+pub mod retrieval;
 pub mod storage;
 pub mod subscription;
 pub mod system;

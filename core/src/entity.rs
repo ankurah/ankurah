@@ -1,4 +1,4 @@
-use crate::lineage;
+use crate::lineage::{self, GetEvents, Retrieve};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
@@ -6,11 +6,11 @@ use crate::{
     storage::StorageCollectionWrapper,
 };
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, OperationSet, State};
+use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -113,7 +113,9 @@ impl Entity {
 
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
-    pub async fn apply_event(&self, collection: &StorageCollectionWrapper, event: &Event) -> Result<bool, MutationError> {
+    pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
+    where G: GetEvents<Id = EventId, Event = Event> {
+        debug!("apply_event head: {event} to {self}");
         let head = self.head();
 
         if head.is_empty() && event.is_entity_create() {
@@ -125,7 +127,7 @@ impl Entity {
             return Ok(true);
         }
 
-        match crate::lineage::compare_event(collection, event, &head, 100).await? {
+        match crate::lineage::compare_event(getter, event, &head, 100).await? {
             lineage::Ordering::Equal => {
                 debug!("Equal - skip");
                 Ok(false)
@@ -188,45 +190,41 @@ impl Entity {
         }
     }
 
-    pub async fn apply_state(&self, collection: &StorageCollectionWrapper, state: &State) -> Result<bool, MutationError> {
+    pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
+    where G: GetEvents<Id = EventId, Event = Event> {
         let head = self.head();
         let new_head = state.head.clone();
 
-        tracing::debug!("Entity {} apply_state - current head: {}, new head: {}", self.id, head, new_head);
+        debug!("{self} apply_state - new head: {new_head}");
 
-        match crate::lineage::compare(collection, &new_head, &head, 100).await? {
+        match crate::lineage::compare(getter, &new_head, &head, 100).await? {
             lineage::Ordering::Equal => {
-                tracing::debug!("Entity {} apply_state - heads are equal, skipping", self.id);
+                debug!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
             }
             lineage::Ordering::Descends => {
-                tracing::debug!("Entity {} apply_state - new head descends from current, applying", self.id);
+                debug!("{self} apply_state - new head descends from current, applying");
                 self.backends.apply_state(state)?;
                 *self.head.lock().unwrap() = new_head;
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
-                tracing::error!("Entity {} apply_state - new head {} does not descend {}, meet: {:?}", self.id, new_head, head, meet);
+                warn!("{self} apply_state - new head {new_head} does not descend {head}, meet: {meet:?}");
                 Ok(false)
             }
             lineage::Ordering::Incomparable => {
-                tracing::error!("Entity {} apply_state - heads are incomparable", self.id);
+                error!("{self} apply_state - heads are incomparable");
                 // total apples and oranges - take a hike buddy
                 Err(LineageError::Incomparable.into())
             }
             lineage::Ordering::PartiallyDescends { meet } => {
-                tracing::error!("Entity {} apply_state - heads partially descend, meet: {:?}", self.id, meet);
+                error!("{self} apply_state - heads partially descend, meet: {meet:?}");
                 // TODO - figure out how to handle this. I don't think we need to materialize a new event
                 // but it requires that we update the propertybackends to support this
                 Err(LineageError::PartiallyDescends { meet }.into())
             }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::debug!(
-                    "Entity {} apply_state - budget exceeded. subject: {:?}, other: {:?}",
-                    self.id,
-                    subject_frontier,
-                    other_frontier
-                );
+                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
                 Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
             }
         }
@@ -260,7 +258,7 @@ impl Entity {
 
 impl std::fmt::Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Entity({}/{}) = {}", self.collection, self.id, self.head.lock().unwrap())
+        write!(f, "Entity({}/{} {})", self.collection, self.id.to_base64_short(), self.head.lock().unwrap())
     }
 }
 
@@ -398,40 +396,67 @@ impl WeakEntitySet {
         entity
     }
 
-    pub async fn with_state(
+    /// Returns a tuple of (changed, entity)
+    /// changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
+    /// None if the entity was not previously on the local node (either in the WeakEntitySet or in storage)
+    pub async fn with_state<R>(
         &self,
-        collection: &StorageCollectionWrapper,
+        retriever: &R,
         id: EntityId,
         collection_id: CollectionId,
         state: State,
-    ) -> Result<(Option<bool>, Entity), RetrievalError> {
+    ) -> Result<(Option<bool>, Entity), RetrievalError>
+    where
+        R: Retrieve<Id = EventId, Event = Event>,
+    {
         let entity = {
             let mut entities = self.0.write().unwrap();
             match entities.entry(id) {
-                Entry::Vacant(_) => {
-                    let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-                    entities.insert(id, entity.weak());
-                    return Ok((None, entity));
-                }
+                Entry::Vacant(_) => None,
                 Entry::Occupied(o) => match o.get().upgrade() {
                     Some(entity) => {
+                        debug!("Entity {id} was resident");
                         if entity.collection != collection_id {
                             return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
                         }
-                        entity
+                        Some(entity)
                     }
                     None => {
-                        let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-                        entities.insert(id, entity.weak());
-                        // just created the entity with the state, so we do not need to apply the state
-                        return Ok((None, entity));
+                        debug!("Entity {id} was deallocated");
+                        None
                     }
                 },
             }
         };
 
+        // Handle the case where entity is not resident (either vacant or deallocated)
+        let Some(entity) = entity else {
+            // Check if there's existing state in storage before creating a new entity
+            if let Some(existing_state) = retriever.get_local_state(id).await? {
+                debug!("Found existing state in storage for {id}");
+                let entity = Entity::from_state(id, collection_id.to_owned(), &existing_state.payload.state)?;
+
+                {
+                    self.0.write().unwrap().insert(id, entity.weak());
+                }
+
+                // We need to apply the new state to check lineage
+                let changed = entity.apply_state(retriever, &state).await?;
+                return Ok((Some(changed), entity));
+            } else {
+                debug!("No existing state in storage for {id}");
+                let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+
+                {
+                    self.0.write().unwrap().insert(id, entity.weak());
+                }
+
+                return Ok((None, entity));
+            }
+        };
+
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let changed = entity.apply_state(collection, &state).await?;
+        let changed = entity.apply_state(retriever, &state).await?;
         Ok((Some(changed), entity))
     }
 }

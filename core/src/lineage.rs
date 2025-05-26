@@ -1,62 +1,11 @@
-use crate::{error::RetrievalError, storage::StorageCollectionWrapper};
-use ankurah_proto::{Attested, Clock, Event, EventId};
-use async_trait::async_trait;
+use crate::error::RetrievalError;
+use crate::retrieval::{TClock, TEvent};
+use ankurah_proto::{Clock, Event, EventId};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-/// a trait for events and eventlike things that can be descended
-pub trait TEvent {
-    type Id: Eq + PartialEq + Clone;
-    type Parent: TClock<Id = Self::Id>;
-
-    fn id(&self) -> Self::Id;
-    fn parent(&self) -> &Self::Parent;
-}
-
-pub trait TClock {
-    type Id: Eq + PartialEq + Clone;
-    fn members(&self) -> &[Self::Id];
-}
-
-#[async_trait]
-pub trait GetEvents {
-    type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
-    type Event: TEvent<Id = Self::Id>;
-
-    /// Estimate the budget cost for retrieving a batch of events
-    /// This allows different implementations to model their cost structure
-    fn estimate_cost(&self, _batch_size: usize) -> usize {
-        // Default implementation: fixed cost of 1 per batch
-        1
-    }
-
-    /// retrieve the events from the store, returning the budget consumed by this operation and the events retrieved
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
-}
-
-impl TClock for Clock {
-    type Id = EventId;
-    fn members(&self) -> &[Self::Id] { self.as_slice() }
-}
-
-impl TEvent for ankurah_proto::Event {
-    type Id = ankurah_proto::EventId;
-    type Parent = Clock;
-
-    fn id(&self) -> EventId { self.id() }
-    fn parent(&self) -> &Clock { &self.parent }
-}
-
-#[async_trait]
-impl GetEvents for StorageCollectionWrapper {
-    type Id = EventId;
-    type Event = ankurah_proto::Event;
-
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-        // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
-        Ok((1, self.0.get_events(event_ids).await?))
-    }
-}
+pub use crate::retrieval::GetEvents;
+pub use crate::retrieval::Retrieve;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ordering<Id> {
@@ -91,12 +40,8 @@ pub enum Ordering<Id> {
     },
 }
 
-pub async fn compare_event(
-    getter: &StorageCollectionWrapper,
-    subject: &Event,
-    other: &Clock,
-    budget: usize,
-) -> Result<Ordering<EventId>, RetrievalError> {
+pub async fn compare_event<G>(getter: &G, subject: &Event, other: &Clock, budget: usize) -> Result<Ordering<EventId>, RetrievalError>
+where G: GetEvents<Id = EventId, Event = Event> {
     if subject.parent().members() == other.members() {
         return Ok(Ordering::Descends);
     }
@@ -285,9 +230,7 @@ where
         // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
         // so we can pass the HashSet as a borrow and don't have to alloc this twice
         let mut result_checklist: HashSet<G::Id> = ids.iter().cloned().collect();
-        // info!("step -> get_events {:?}", ids);
-        let (cost, events) = self.getter.get_events(ids).await?;
-        // info!("step -> get_events result {:?}", events.iter().map(|e| e.payload.id()).collect::<Vec<_>>());
+        let (cost, events) = self.getter.retrieve_event(ids).await?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
         for event in events {
@@ -398,9 +341,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ankurah_proto::AttestationSet;
+    use ankurah_proto::{AttestationSet, Attested};
 
     use super::*;
+    use async_trait::async_trait;
     use std::collections::HashMap;
 
     // Simple test types
@@ -450,7 +394,7 @@ mod tests {
         type Id = TestId;
         type Event = TestEvent;
 
-        async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+        async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
             let mut result = Vec::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {
