@@ -219,10 +219,13 @@ impl StorageCollection for SledStorageCollection {
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
         let mut events = Vec::new();
 
-        for event_data in self.events.range(entity_id.to_bytes()..) {
+        // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
+        for event_data in self.events.iter() {
             let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
             let event: Attested<Event> = bincode::deserialize(&data)?;
-            events.push(event);
+            if event.payload.entity_id == entity_id {
+                events.push(event);
+            }
         }
 
         Ok(events)
