@@ -1,7 +1,7 @@
 [package]
 name          = "ankurah-core"
 description   = "Core state management functionality for Ankurah"
-version       = "0.4.4"
+version       = "0.4.5"
 edition       = "2021"
 license       = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/ankurah-core"
@@ -15,9 +15,9 @@ instrument = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive = { path = "../derive", optional = true, version = "^0.4.4" }
-ankql          = { path = "../ankql", version = "^0.4.4" }
-ankurah-proto  = { path = "../proto", version = "^0.4.4" }
+ankurah-derive = { path = "../derive", optional = true, version = "^0.4.5" }
+ankql          = { path = "../ankql", version = "^0.4.5" }
+ankurah-proto  = { path = "../proto", version = "^0.4.5" }
 
 rand                 = "0.8"
 anyhow               = "1.0"
