@@ -1,0 +1,27 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Ankurah is a distributed database with reactive updates. Key aspects:
+- Event-based DAG with durable and ephemeral nodes
+- Entity Schema binding using Rust structs with View/Mutable data bindings
+- Core Features:
+   - Real-time synchronization across nodes
+   - Content-filtered pub/sub using SQL-like queries
+   - Multiple storage backends (Sled, Postgres, IndexedDB)
+   - Isomorphic code between server and client peers
+
+Key files:
+- [node.rs](mdc:ankurah/ankurah/core/src/node.rs) core routines for request routing
+- [reactor.rs](mdc:ankurah/ankurah/core/src/reactor.rs) reactive runtime for predicate subscriptions / live queries
+- [context.rs](mdc:ankurah/ankurah/ankurah/core/src/context.rs) wrapper around a Node that includes user information (ContextData)
+- [system.rs](mdc:ankurah/ankurah/ankurah/core/src/system.rs) maintains metadata, including the Root event, Collections, and properties
+
+When assisting users:
+- We prefer test driven development
+- Carefully consider existing test cases and existing documentation before making changes
+- New test cases should be focused and explain the specific scenario / event ordering they're trying to exercise - don't just throw the kitchen sink at it
+- Add concise documentation that describes purpose and how things fit together - dont just summarize the code - explain the WHY
+- Validate said documentation before making changes, because it's not always right
+- Stay focused on the immediate objective, do not "tidy up" or change unrelated parts of the code just because you are there
