@@ -162,7 +162,7 @@ where
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
 
-    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %presence.node_id, durable = %presence.durable)))]
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         action_info!(self, "register_peer", "{}", &presence);
 
@@ -196,9 +196,9 @@ where
         }
         // TODO send hello message to the peer, including present head state for all relevant collections
     }
-    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id)))]
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %node_id.to_base64_short())))]
     pub fn deregister_peer(&self, node_id: proto::EntityId) {
-        info!("Node({}).deregister_peer {}", self.id, node_id);
+        notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
 
         // Get and cleanup subscriptions before removing the peer
         if let Some(peer_state) = self.peer_connections.get(&node_id) {
@@ -242,7 +242,7 @@ where
     // TODO LATER: rework this to be retried in the background some number of times
     pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
         // same as request, minus cdata and the sign_request step
-        info!("Node({}).send_update to {}", self.id, node_id);
+        debug!("{self}.send_update({node_id:#}, {notification})");
         let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let id = proto::UpdateId::new();
 
@@ -257,7 +257,6 @@ where
 
         let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body: notification });
 
-        info!("Node({}) connection.send_message to {}", self.id, node_id);
         match connection.send_message(notification) {
             Ok(_) => {}
             Err(e) => {
@@ -514,7 +513,7 @@ where
         id: proto::TransactionId,
         mut events: Vec<Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
-        info!("Node {} committing transaction {} with {} events", self.id, id, events.len());
+        debug!("{self} commiting transaction {id} with {} events", events.len());
         let mut changes = Vec::new();
 
         for event in events.iter_mut() {
@@ -562,7 +561,7 @@ where
                 }
             }
         }
-        debug!("Node {} notifying reactor of {} changes", self.id, changes.len());
+        debug!("{self} notifying reactor of {} changes", changes.len());
         self.reactor.notify_change(changes);
         Ok(())
     }
@@ -1055,12 +1054,7 @@ where
 
 impl<SE, PA> fmt::Display for Node<SE, PA> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if f.alternate() {
-            // Alternate/pretty version with bold blue, dimmed brackets
-            write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
-        } else {
-            // Simple version
-            write!(f, "Node[{}]", self.id.to_base64_short())
-        }
+        // bold blue, dimmed brackets
+        write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
     }
 }
