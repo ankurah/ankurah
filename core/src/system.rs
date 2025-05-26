@@ -177,8 +177,6 @@ where
                 *root = None;
             }
             self.hard_reset().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
-        } else {
-            tracing::info!("No existing root found, proceeding with join");
         }
 
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
