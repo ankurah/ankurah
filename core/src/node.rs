@@ -15,7 +15,7 @@ use crate::{
     changes::{ChangeSet, EntityChange, ItemChange},
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
-    context::Context,
+    context::{Context, NodeAndContext},
     entity::{Entity, WeakEntitySet},
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
@@ -23,6 +23,7 @@ use crate::{
     reactor::Reactor,
     storage::StorageEngine,
     subscription::SubscriptionHandle,
+    subscription_relay::SubscriptionRelay,
     system::SystemManager,
     task::spawn,
     transaction::Transaction,
@@ -73,21 +74,31 @@ impl From<ankql::error::ParseError> for RetrievalError {
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
-pub struct Node<SE, PA>(Arc<NodeInner<SE, PA>>);
-impl<SE, PA> Clone for Node<SE, PA> {
+pub struct Node<SE, PA>(Arc<NodeInner<SE, PA>>)
+where PA: PolicyAgent;
+impl<SE, PA> Clone for Node<SE, PA>
+where PA: PolicyAgent
+{
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct WeakNode<SE, PA>(Weak<NodeInner<SE, PA>>);
-impl<SE, PA> Clone for WeakNode<SE, PA> {
+pub struct WeakNode<SE, PA>(Weak<NodeInner<SE, PA>>)
+where PA: PolicyAgent;
+impl<SE, PA> Clone for WeakNode<SE, PA>
+where PA: PolicyAgent
+{
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<SE, PA> WeakNode<SE, PA> {
+impl<SE, PA> WeakNode<SE, PA>
+where PA: PolicyAgent
+{
     pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.0.upgrade().map(Node) }
 }
 
-impl<SE, PA> Deref for Node<SE, PA> {
+impl<SE, PA> Deref for Node<SE, PA>
+where PA: PolicyAgent
+{
     type Target = Arc<NodeInner<SE, PA>>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
@@ -95,9 +106,11 @@ impl<SE, PA> Deref for Node<SE, PA> {
 /// Represents the user session - or whatever other context the PolicyAgent
 /// Needs to perform it's evaluation.
 #[async_trait]
-pub trait ContextData: Send + Sync + 'static {}
+pub trait ContextData: Send + Sync + Clone + 'static {}
 
-pub struct NodeInner<SE, PA> {
+pub struct NodeInner<SE, PA>
+where PA: PolicyAgent
+{
     pub id: proto::EntityId,
     pub durable: bool,
     pub collections: CollectionSet<SE>,
@@ -106,10 +119,17 @@ pub struct NodeInner<SE, PA> {
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
+    subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
+
+    // Pending subscriptions waiting for first remote update
+    pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<()>>,
+
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
+
+    subscription_relay: Option<SubscriptionRelay<PA::ContextData>>,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -120,13 +140,16 @@ where
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         let id = proto::EntityId::new();
+        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone(), id.clone());
         notice_info!("Node {id:#} created as ephemeral");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
 
-        Node(Arc::new(NodeInner {
+        // Create subscription relay for ephemeral nodes
+        let subscription_relay = Some(SubscriptionRelay::new());
+
+        let node = Node(Arc::new(NodeInner {
             id,
             collections,
             entities: entityset,
@@ -136,15 +159,27 @@ where
             durable: false,
             policy_agent,
             system: system_manager,
-        }))
+            subscription_context: SafeMap::new(),
+            subscription_relay,
+            pending_subs: SafeMap::new(),
+        }));
+
+        // Set up the message sender for the subscription relay
+        if let Some(ref relay) = node.subscription_relay {
+            let weak_node = node.weak();
+            if let Err(_) = relay.set_message_sender(Arc::new(weak_node)) {
+                warn!("Failed to set message sender for subscription relay");
+            }
+        }
+
+        node
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
-
         let id = proto::EntityId::new();
-        info!("Node {id} created as durable");
+        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone(), id.clone());
+        notice_info!("Node {id:#} created as durable");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), true);
 
@@ -158,6 +193,9 @@ where
             durable: true,
             policy_agent,
             system: system_manager,
+            subscription_context: SafeMap::new(),
+            subscription_relay: None,
+            pending_subs: SafeMap::new(),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -178,6 +216,12 @@ where
         );
         if presence.durable {
             self.durable_peers.insert(presence.node_id);
+
+            // Notify subscription relay of new durable peer connection
+            if let Some(ref relay) = self.subscription_relay {
+                relay.notify_peer_connected(presence.node_id);
+            }
+
             if !self.durable {
                 if let Some(system_root) = presence.system_root {
                     action_info!(self, "received system root", "{}", &system_root.payload);
@@ -210,6 +254,11 @@ where
                 action_info!(self, "unsubscribing", "subscription {} for peer {}", sub_id, node_id);
                 self.reactor.unsubscribe(sub_id);
             }
+        }
+
+        // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)
+        if let Some(ref relay) = self.subscription_relay {
+            relay.notify_peer_disconnected(node_id);
         }
 
         // Remove the peer connection and durable status
@@ -424,10 +473,22 @@ where
         };
 
         match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: _, items } => {
+            proto::NodeUpdateBody::SubscriptionUpdate { subscription_id, items } => {
                 // TODO check if this is a valid subscription
                 action_debug!(self, "received subscription update for {} items", "{}", items.len());
-                self.apply_subscription_updates(&notification.from, items).await?;
+                if let Some(cdata) = self.subscription_context.get(&subscription_id) {
+                    let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
+
+                    self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
+                    // Signal any pending subscription waiting for first update
+                    if let Some(tx) = self.pending_subs.remove(&subscription_id) {
+                        let _ = tx.send(()); // Ignore if receiver was dropped
+                    }
+                } else {
+                    error!("Received subscription update for unknown subscription {}", subscription_id);
+                    return Err(anyhow!("Received subscription update for unknown subscription {}", subscription_id));
+                }
+
                 Ok(())
             }
         }
@@ -546,10 +607,11 @@ where
         &self,
         from_peer_id: &proto::EntityId,
         updates: Vec<proto::SubscriptionUpdateItem>,
+        nodeandcontext: NodeAndContext<SE, PA>,
     ) -> Result<(), MutationError> {
         let mut changes = Vec::new();
         for update in updates {
-            match self.apply_subscription_update(from_peer_id, update).await {
+            match self.apply_subscription_update(from_peer_id, update, &nodeandcontext).await {
                 Ok(Some(change)) => {
                     changes.push(change);
                 }
@@ -578,6 +640,7 @@ where
         &self,
         from_peer_id: &proto::EntityId,
         update: proto::SubscriptionUpdateItem,
+        nodeandcontext: &NodeAndContext<SE, PA>,
     ) -> Result<Option<EntityChange>, MutationError> {
         match update {
             proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
@@ -587,8 +650,9 @@ where
 
                 let payload = state.payload;
                 let collection = self.collections.get(&payload.collection).await?;
+                let getter = (payload.collection.clone(), nodeandcontext);
 
-                match self.entities.with_state(&collection, payload.entity_id, payload.collection, payload.state).await? {
+                match self.entities.with_state(&getter, payload.entity_id, payload.collection, payload.state).await? {
                     (Some(true), entity) => {
                         // We had the entity already, and this state is newer than the one we have, so save it to the collection
                         // Not sure if we should reproject the state - discuss
@@ -632,7 +696,11 @@ where
                 let state = (entity_id, collection_id.clone(), state).into();
                 self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
 
-                match self.entities.with_state(&collection, entity_id, collection_id, state.payload.state).await? {
+                match self
+                    .entities
+                    .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, state.payload.state)
+                    .await?
+                {
                     (Some(false), _entity) => {
                         // had it already, and the state is not newer than the one we have
                         Ok(None)
@@ -688,41 +756,7 @@ where
         }
     }
 
-    pub async fn request_remote_subscribe(
-        &self,
-        cdata: &PA::ContextData,
-        sub: &mut SubscriptionHandle,
-        collection_id: &CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) -> anyhow::Result<()> {
-        // First, find any durable nodes to subscribe to
-        let durable_peer_id = self.get_durable_peer_random();
-
-        // If we have a durable node, send a subscription request to it
-        if let Some(peer_id) = durable_peer_id {
-            match self
-                .request(
-                    peer_id,
-                    cdata,
-                    proto::NodeRequestBody::Subscribe { subscription_id: sub.id, collection: collection_id.clone(), predicate },
-                )
-                .await?
-            {
-                proto::NodeResponseBody::Subscribed { subscription_id: _ } => {
-                    debug!("Node {} subscribed to peer {}", self.id, peer_id);
-                }
-                proto::NodeResponseBody::Error(e) => {
-                    return Err(anyhow!("Error from peer subscription: {}", e));
-                }
-                _ => {
-                    return Err(anyhow!("Unexpected response type from peer subscription"));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg_attr(feature = "instrument", instrument(skip_all, fields(peer_id = %peer_id, sub_id = %sub_id, collection_id = %collection_id, predicate = %predicate)))]
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(peer_id = %peer_id.to_base64_short(), sub_id = %sub_id, collection_id = %collection_id, predicate = %predicate)))]
     async fn handle_subscribe_request(
         &self,
         cdata: &PA::ContextData,
@@ -742,62 +776,60 @@ where
         let node = self.clone();
         {
             let peer_id = peer_id;
-            self.reactor
-                .subscribe(sub_id, &collection_id, predicate, move |changeset| {
-                    // TODO move this into a task being fed by a channel and reorg into a function
-                    let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
+            let subscription = self.reactor.register(sub_id, &collection_id, predicate, move |changeset| {
+                // TODO move this into a task being fed by a channel and reorg into a function
+                let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
 
-                    // When changes occur, collect events and states
-                    for change in changeset.changes.into_iter() {
-                        match change {
-                            ItemChange::Initial { item } => {
-                                // For initial state, include both events and state
-                                if let Ok(es) = item.to_entity_state() {
-                                    let attestation = node.policy_agent.attest_state(&node, &es);
-
-                                    updates.push(proto::SubscriptionUpdateItem::initial(
-                                        item.id(),
-                                        item.collection.clone(),
-                                        Attested::opt(es, attestation),
-                                    ));
-                                }
-                            }
-                            ItemChange::Add { item, events } => {
-                                // For entities which were not previously matched, state AND events should be included
-                                // but it's weird because EntityState and Event redundantly include entity_id and collection
-                                // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
-                                // it has to have the entity_id
-
-                                let state = match item.to_state() {
-                                    Ok(state) => state,
-                                    Err(e) => {
-                                        warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
-                                        continue;
-                                    }
-                                };
-
-                                let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
+                // When changes occur, collect events and states
+                for change in changeset.changes.into_iter() {
+                    match change {
+                        ItemChange::Initial { item } => {
+                            // For initial state, include both events and state
+                            if let Ok(es) = item.to_entity_state() {
                                 let attestation = node.policy_agent.attest_state(&node, &es);
 
-                                updates.push(proto::SubscriptionUpdateItem::add(
-                                    item.id,
+                                updates.push(proto::SubscriptionUpdateItem::initial(
+                                    item.id(),
                                     item.collection.clone(),
                                     Attested::opt(es, attestation),
-                                    events,
                                 ));
                             }
-                            ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
-                                updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
-                            }
+                        }
+                        ItemChange::Add { item, events } => {
+                            // For entities which were not previously matched, state AND events should be included
+                            // but it's weird because EntityState and Event redundantly include entity_id and collection
+                            // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
+                            // it has to have the entity_id
+
+                            let state = match item.to_state() {
+                                Ok(state) => state,
+                                Err(e) => {
+                                    warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
+                                    continue;
+                                }
+                            };
+
+                            let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
+                            let attestation = node.policy_agent.attest_state(&node, &es);
+
+                            updates.push(proto::SubscriptionUpdateItem::add(
+                                item.id,
+                                item.collection.clone(),
+                                Attested::opt(es, attestation),
+                                events,
+                            ));
+                        }
+                        ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
+                            updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
                         }
                     }
+                }
 
-                    if !updates.is_empty() {
-                        info!("Node({}) sending update to {}", node.id, peer_id);
-                        node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates });
-                    }
-                })
-                .await?;
+                // Always send subscription update, even if empty
+                node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates });
+            });
+
+            self.reactor.initialize(subscription).await?;
         };
 
         // Store the subscription handle
@@ -912,11 +944,34 @@ where
         self.policy_agent.can_access_collection(cdata, collection_id)?;
         args.predicate = self.policy_agent.filter_predicate(cdata, collection_id, args.predicate)?;
 
-        // TODO spawn a task for these and make this fn syncrhonous - Pending error handling refinement / retry logic
-        // spawn(async move {
-        self.request_remote_subscribe(cdata, &mut handle, collection_id, args.predicate.clone()).await?;
-        self.reactor.subscribe(handle.id, collection_id, args, callback).await?;
-        // });
+        // Store subscription context for event requests
+        self.subscription_context.insert(sub_id, cdata.clone());
+
+        let predicate = args.predicate.clone();
+        let cached = args.cached;
+
+        // Register subscription with reactor (synchronous)
+        let subscription = self.reactor.register(handle.id, collection_id, args.predicate, callback);
+
+        // Handle remote subscription setup
+        if let Some(ref relay) = self.subscription_relay {
+            relay.notify_subscribe(sub_id, collection_id.clone(), predicate, cdata.clone());
+
+            if !cached {
+                // Create oneshot channel to wait for first remote update
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.pending_subs.insert(sub_id, tx);
+
+                // Wait for first remote update before initializing
+                if let Err(_) = rx.await {
+                    // Channel was dropped, proceed with local initialization anyway
+                    warn!("Failed to receive first remote update for subscription {}", sub_id);
+                }
+            }
+        }
+
+        // Always initialize the subscription
+        self.reactor.initialize(subscription).await?;
 
         Ok(handle)
     }
@@ -1022,21 +1077,31 @@ where
 
     pub fn unsubscribe(self: &Arc<Self>, handle: &SubscriptionHandle) -> anyhow::Result<()> {
         let node = Node(self.clone());
-        let peers = handle.peers.clone();
         let sub_id = handle.id;
         spawn(async move {
+            // Clean up subscription context
+            node.subscription_context.remove(&sub_id);
+
+            // Clean up any pending oneshot channel
+            node.pending_subs.remove(&sub_id);
+
+            // Unsubscribe from local reactor
             node.reactor.unsubscribe(sub_id);
-            if let Err(e) = node.request_remote_unsubscribe(sub_id, peers).await {
-                warn!("Error unsubscribing from peers: {}", e);
+
+            // Notify subscription relay for remote cleanup
+            if let Some(ref relay) = node.subscription_relay {
+                relay.notify_unsubscribe(sub_id);
             }
         });
         Ok(())
     }
 }
 
-impl<SE, PA> Drop for NodeInner<SE, PA> {
+impl<SE, PA> Drop for NodeInner<SE, PA>
+where PA: PolicyAgent
+{
     fn drop(&mut self) {
-        info!("Node({}) dropped", self.id);
+        notice_info!("Node({}) dropped", self.id);
     }
 }
 
@@ -1052,7 +1117,9 @@ where
     fn unsubscribe(&self, handle: &SubscriptionHandle) { let _ = self.0.unsubscribe(handle); }
 }
 
-impl<SE, PA> fmt::Display for Node<SE, PA> {
+impl<SE, PA> fmt::Display for Node<SE, PA>
+where PA: PolicyAgent
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets
         write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())

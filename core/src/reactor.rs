@@ -13,12 +13,14 @@ use crate::value::Value;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::info;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
+use tracing::{debug, warn};
 
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, EntityId};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 
@@ -45,6 +47,7 @@ pub struct Reactor<SE, PA> {
     // Weak reference to the node
     // node: OnceCell<WeakNode<PA>>,
     _policy_agent: PA,
+    node_id: EntityId,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -58,7 +61,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA, node_id: EntityId) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: SafeMap::new(),
             index_watchers: SafeMap::new(),
@@ -67,54 +70,68 @@ where
             collections,
             entityset,
             _policy_agent: policy_agent,
+            node_id,
             // node: OnceCell::new(),
         })
     }
 
-    // TODO - update this to take a channel rather than a callback
-    pub async fn subscribe(
-        self: &Arc<Self>,
+    /// Register a subscription without performing initial evaluation
+    /// This is synchronous and just sets up the subscription structure and watchers
+    pub fn register(
+        &self,
         sub_id: proto::SubscriptionId,
         collection_id: &proto::CollectionId,
-        args: impl Into<MatchArgs>,
+        predicate: ankql::ast::Predicate,
         callback: impl Fn(ChangeSet<Entity>) + Send + Sync + 'static,
-    ) -> anyhow::Result<()> {
-        let args = args.into();
+    ) -> Arc<Subscription<Entity>> {
         // Start watching the relevant indexes
-        Self::manage_watchers_recurse(self, collection_id, &args.predicate, sub_id, WatcherOp::Add);
+        Self::manage_watchers_recurse(self, collection_id, &predicate, sub_id, WatcherOp::Add);
 
+        // Create subscription with empty initial matching entities
+        let subscription = Arc::new(Subscription {
+            id: sub_id,
+            collection_id: collection_id.clone(),
+            predicate,
+            callback: Arc::new(Box::new(callback)),
+            matching_entities: std::sync::Mutex::new(Vec::new()),
+            initialized: AtomicBool::new(false),
+        });
+
+        // Register the subscription
+        self.subscriptions.insert(sub_id, subscription.clone());
+
+        subscription
+    }
+
+    /// Initialize a subscription by performing initial evaluation and calling the callback
+    /// This is async and does the initial fetch and evaluation
+    pub async fn initialize(&self, subscription: Arc<Subscription<Entity>>) -> anyhow::Result<()> {
         // Find initial matching entities
-        let storage_collection = self.collections.get(collection_id).await?;
-        let states = storage_collection.fetch_states(&args.predicate).await?;
+        let storage_collection = self.collections.get(&subscription.collection_id).await?;
+        let states = storage_collection.fetch_states(&subscription.predicate).await?;
         let mut matching_entities = Vec::new();
 
         // Convert states to Entity and filter by predicate
         for state in states {
-            let (_entity_changed, entity) = self
+            let (_, entity) = self
                 .entityset
-                .with_state(&storage_collection, state.payload.entity_id, collection_id.to_owned(), state.payload.state)
+                .with_state(&storage_collection, state.payload.entity_id, subscription.collection_id.to_owned(), state.payload.state)
                 .await?;
 
             // Evaluate predicate for each entity
-            if ankql::selection::filter::evaluate_predicate(&entity, &args.predicate).unwrap_or(false) {
+            if ankql::selection::filter::evaluate_predicate(&entity, &subscription.predicate).unwrap_or(false) {
                 matching_entities.push(entity.clone());
 
                 // Set up entity watchers
-                self.entity_watchers.set_insert(entity.id, sub_id);
+                self.entity_watchers.set_insert(entity.id, subscription.id);
             }
         }
 
-        // Create subscription with initial matching entities
-        let subscription = Arc::new(Subscription {
-            id: sub_id,
-            collection_id: collection_id.clone(),
-            predicate: args.predicate,
-            callback: Arc::new(Box::new(callback)),
-            matching_entities: std::sync::Mutex::new(matching_entities.clone()),
-        });
+        // Update subscription's matching entities
+        *subscription.matching_entities.lock().unwrap() = matching_entities.clone();
 
-        // TODO - is this a memory leak?
-        self.subscriptions.insert(sub_id, subscription.clone());
+        // Mark subscription as initialized
+        subscription.initialized.store(true, Ordering::SeqCst);
 
         // Call callback with initial state
         (subscription.callback)(ChangeSet {
@@ -224,7 +241,6 @@ where
     }
 
     /// Notify subscriptions about an entity change
-
     pub fn notify_change(&self, changes: Vec<EntityChange>) {
         // pretty format self
         debug!("Reactor.notify_change({:?})", changes);
@@ -265,6 +281,11 @@ where
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
+                    // Skip uninitialized subscriptions
+                    if !subscription.initialized.load(Ordering::SeqCst) {
+                        continue;
+                    }
+
                     // Use evaluate_predicate directly on the entity instead of fetch_entities
                     debug!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
                     let matches = ankql::selection::filter::evaluate_predicate::<Entity>(&entity, &subscription.predicate).unwrap_or(false);
