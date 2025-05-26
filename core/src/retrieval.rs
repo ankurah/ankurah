@@ -109,7 +109,7 @@ where
                     .request(
                         peer_id,
                         &self.1.cdata,
-                        proto::NodeRequestBody::GetEvents { collection: self.0.clone(), event_ids: missing_ids, motivation: None },
+                        proto::NodeRequestBody::GetEvents { collection: self.0.clone(), event_ids: missing_ids },
                     )
                     .await
                     .map_err(|e| RetrievalError::StorageError(format!("Request failed: {}", e).into()))?

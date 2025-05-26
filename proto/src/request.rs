@@ -84,13 +84,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::Get { collection, ids } => {
                 write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
-            NodeRequestBody::GetEvents { collection, event_ids, motivation } => {
-                write!(
-                    f,
-                    "GetEvents {collection} {} {}",
-                    event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),
-                    motivation.as_ref().map(|c| format!("motivation: {c}")).unwrap_or_default()
-                )
+            NodeRequestBody::GetEvents { collection, event_ids } => {
+                write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
             NodeRequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")

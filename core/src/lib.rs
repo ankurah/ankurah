@@ -16,6 +16,7 @@ pub mod resultset;
 pub mod retrieval;
 pub mod storage;
 pub mod subscription;
+pub mod subscription_relay;
 pub mod system;
 pub mod task;
 pub mod transaction;

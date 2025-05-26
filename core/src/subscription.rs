@@ -15,6 +15,8 @@ pub struct Subscription<R: Clone> {
     // Track which entities currently match this subscription
     // TODO make this a ResultSet so we can clone it cheaply
     pub(crate) matching_entities: Mutex<Vec<Entity>>,
+    /// Whether this subscription has been initialized with its initial state
+    pub(crate) initialized: std::sync::atomic::AtomicBool,
 }
 
 impl<R: Clone> std::fmt::Debug for Subscription<R> {
