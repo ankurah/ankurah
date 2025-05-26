@@ -77,7 +77,10 @@ where
     {
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                let _ = node.handle_message(message).await;
+                let node = node.clone();
+                tokio::spawn(async move {
+                    let _ = node.handle_message(message).await;
+                });
             }
         })
     }
