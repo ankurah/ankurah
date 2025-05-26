@@ -44,7 +44,13 @@ impl EventId {
 }
 
 impl std::fmt::Display for EventId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.to_base64()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{}", self.to_base64_short())
+        } else {
+            write!(f, "{}", self.to_base64())
+        }
+    }
 }
 
 impl TryFrom<String> for EventId {
