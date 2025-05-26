@@ -40,13 +40,26 @@ pub enum Ordering<Id> {
     },
 }
 
-pub async fn compare_event<G>(getter: &G, subject: &Event, other: &Clock, budget: usize) -> Result<Ordering<EventId>, RetrievalError>
-where G: GetEvents<Id = EventId, Event = Event> {
-    if subject.parent().members() == other.members() {
-        return Ok(Ordering::Descends);
-    }
-    let subject = subject.id().into();
-    compare(getter, &subject, other, budget).await
+/// Compares an unstored event against a stored clock by starting the comparison
+/// from the event's parent clock and checking if the other clock is reachable.
+pub async fn compare_unstored_event<G, E, C>(getter: &G, subject: &E, other: &C, budget: usize) -> Result<Ordering<G::Id>, RetrievalError>
+where
+    G: GetEvents,
+    G::Event: TEvent<Id = G::Id>,
+    E: TEvent<Id = G::Id, Parent = C>,
+    C: TClock<Id = G::Id>,
+    G::Id: std::hash::Hash + Ord + std::fmt::Display,
+{
+    let subject_parent = subject.parent();
+
+    // Compare the subject's parent clock with the other clock
+    // If parent equals other, then subject descends from other
+    // Otherwise, the relationship is the same as between parent and other
+    let result = compare(getter, subject_parent, other, budget).await?;
+    Ok(match result {
+        Ordering::Equal => Ordering::Descends,
+        other => other,
+    })
 }
 
 /// Compares two Clocks, traversing the event history to classify their
@@ -374,6 +387,10 @@ mod tests {
         fn parent(&self) -> &TestClock { &self.parent_clock }
     }
 
+    impl std::fmt::Display for TestEvent {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Event({})", self.id) }
+    }
+
     // Mock event store for testing
     struct MockEventStore {
         events: HashMap<TestId, Attested<TestEvent>>,
@@ -632,5 +649,51 @@ mod tests {
 
         // In the opposite direction, none of the heads descend from 8, but they are comparable
         assert_eq!(compare(&store, &big_other, &subject, 1_000).await.unwrap(), Ordering::NotDescends { meet: vec![1, 2, 3, 4, 5, 6] });
+    }
+
+    #[tokio::test]
+    async fn test_compare_event_unstored() {
+        let mut store = MockEventStore::new();
+
+        // Create a chain: 1 <- 2 <- 3 (stored)
+        store.add(1, &[]);
+        store.add(2, &[1]);
+        store.add(3, &[2]);
+
+        // Create an unstored event 4 that would descend from 3
+        let unstored_event = TestEvent { id: 4, parent_clock: TestClock { members: vec![3] } };
+
+        // Test cases for the unstored event
+        let clock_1 = TestClock { members: vec![1] };
+        let clock_2 = TestClock { members: vec![2] };
+        let clock_3 = TestClock { members: vec![3] };
+
+        // The unstored event should descend from all ancestors
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_1, 100).await.unwrap(), Ordering::Descends);
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_2, 100).await.unwrap(), Ordering::Descends);
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_3, 100).await.unwrap(), Ordering::Descends);
+
+        // Test with an unstored event that has multiple parents
+        let unstored_merge_event = TestEvent { id: 5, parent_clock: TestClock { members: vec![2, 3] } };
+
+        assert_eq!(compare_unstored_event(&store, &unstored_merge_event, &clock_1, 100).await.unwrap(), Ordering::Descends);
+
+        // Test with an incomparable case
+        store.add(10, &[]); // Independent root
+        let incomparable_clock = TestClock { members: vec![10] };
+
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &incomparable_clock, 100).await.unwrap(), Ordering::Incomparable);
+
+        // Test root event case
+        let root_event = TestEvent { id: 11, parent_clock: TestClock { members: vec![] } };
+
+        let empty_clock = TestClock { members: vec![] };
+        assert_eq!(compare_unstored_event(&store, &root_event, &empty_clock, 100).await.unwrap(), Ordering::Incomparable);
+
+        assert_eq!(compare_unstored_event(&store, &root_event, &clock_1, 100).await.unwrap(), Ordering::Incomparable);
+
+        // Test that a non-empty unstored event does not descend from an empty clock
+        let empty_clock = TestClock { members: vec![] };
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &empty_clock, 100).await.unwrap(), Ordering::Incomparable);
     }
 }

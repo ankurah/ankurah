@@ -127,7 +127,7 @@ impl Entity {
             return Ok(true);
         }
 
-        match crate::lineage::compare_event(getter, event, &head, 100).await? {
+        match crate::lineage::compare_unstored_event(getter, event, &head, 100).await? {
             lineage::Ordering::Equal => {
                 debug!("Equal - skip");
                 Ok(false)
