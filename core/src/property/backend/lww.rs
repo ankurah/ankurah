@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{btree_map::Entry, BTreeMap},
+    collections::BTreeMap,
     fmt::Debug,
     sync::{Arc, RwLock},
 };
