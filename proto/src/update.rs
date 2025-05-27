@@ -17,7 +17,7 @@ pub enum NodeUpdateBody {
     SubscriptionUpdate { subscription_id: SubscriptionId, items: Vec<SubscriptionUpdateItem> },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum SubscriptionUpdateItem {
     Initial { entity_id: EntityId, collection: CollectionId, state: StateFragment },
     Add { entity_id: EntityId, collection: CollectionId, state: StateFragment, events: Vec<EventFragment> },

@@ -42,6 +42,16 @@ pub enum Ordering<Id> {
 
 /// Compares an unstored event against a stored clock by starting the comparison
 /// from the event's parent clock and checking if the other clock is reachable.
+///
+/// # Assumptions
+///
+/// This function assumes that all events in the `other` clock are already stored
+/// and can be retrieved via the `getter`. This is typically true when `other`
+/// represents an entity's current head, since all events in an entity's head
+/// should be previously applied (and thus stored) events.
+///
+/// The `subject` event itself may not be stored, as it represents a new event
+/// being compared for potential application.
 pub async fn compare_unstored_event<G, E, C>(getter: &G, subject: &E, other: &C, budget: usize) -> Result<Ordering<G::Id>, RetrievalError>
 where
     G: GetEvents,
@@ -50,6 +60,14 @@ where
     C: TClock<Id = G::Id>,
     G::Id: std::hash::Hash + Ord + std::fmt::Display,
 {
+    // Handle redundant delivery: if the other clock contains exactly this event,
+    // return Equal immediately. Without this check, comparing the event's parent
+    // against a clock containing the event itself would incorrectly return
+    // NotDescends instead of the semantically correct Equal.
+    if other.members().len() == 1 && other.members()[0] == subject.id() {
+        return Ok(Ordering::Equal);
+    }
+
     let subject_parent = subject.parent();
 
     // Compare the subject's parent clock with the other clock
@@ -695,5 +713,36 @@ mod tests {
         // Test that a non-empty unstored event does not descend from an empty clock
         let empty_clock = TestClock { members: vec![] };
         assert_eq!(compare_unstored_event(&store, &unstored_event, &empty_clock, 100).await.unwrap(), Ordering::Incomparable);
+    }
+
+    #[tokio::test]
+    async fn test_compare_event_redundant_delivery() {
+        let mut store = MockEventStore::new();
+
+        // Create a chain: 1 <- 2 <- 3 (stored)
+        store.add(1, &[]);
+        store.add(2, &[1]);
+        store.add(3, &[2]);
+
+        // Create an unstored event 4 that would descend from 3
+        let unstored_event = TestEvent { id: 4, parent_clock: TestClock { members: vec![3] } };
+
+        // Test the normal case first
+        let clock_3 = TestClock { members: vec![3] };
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_3, 100).await.unwrap(), Ordering::Descends);
+
+        // Now store event 4 to simulate it being applied
+        store.add(4, &[3]);
+
+        // Test redundant delivery: the event is already in the clock (exact match)
+        let clock_with_event = TestClock { members: vec![4] };
+        // The equality check should catch this case and return Equal
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_with_event, 100).await.unwrap(), Ordering::Equal);
+
+        // Test case where the event is in the clock but with other events too - this is NOT Equal
+        let clock_with_multiple = TestClock { members: vec![3, 4] };
+        // This should be Incomparable since we're comparing the event's parent [3] against [3,4]
+        // The parent [3] doesn't contain 4, so they're incomparable
+        assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_with_multiple, 100).await.unwrap(), Ordering::Incomparable);
     }
 }

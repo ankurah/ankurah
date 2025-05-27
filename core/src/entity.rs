@@ -127,7 +127,8 @@ impl Entity {
             return Ok(true);
         }
 
-        match crate::lineage::compare_unstored_event(getter, event, &head, 100).await? {
+        let budget = 100;
+        match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
             lineage::Ordering::Equal => {
                 debug!("Equal - skip");
                 Ok(false)
@@ -185,7 +186,7 @@ impl Entity {
                 Err(LineageError::PartiallyDescends { meet }.into())
             }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
+                Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
             }
         }
     }
@@ -196,8 +197,9 @@ impl Entity {
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
+        let budget = 100;
 
-        match crate::lineage::compare(getter, &new_head, &head, 100).await? {
+        match crate::lineage::compare(getter, &new_head, &head, budget).await? {
             lineage::Ordering::Equal => {
                 debug!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
@@ -225,7 +227,7 @@ impl Entity {
             }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
                 tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
-                Err(LineageError::BudgetExceeded { subject_frontier, other_frontier }.into())
+                Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
             }
         }
     }
