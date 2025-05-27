@@ -116,9 +116,9 @@ impl Entity {
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
     where G: GetEvents<Id = EventId, Event = Event> {
         debug!("apply_event head: {event} to {self}");
-        let head = self.head();
+        let current_entity_head = self.head(); // Capture current head before any potential modifications
 
-        if head.is_empty() && event.is_entity_create() {
+        if current_entity_head.is_empty() && event.is_entity_create() {
             // this is the creation event for a new entity, so we simply accept it
             for (backend_name, operations) in event.operations.iter() {
                 self.backends.apply_operations((*backend_name).to_owned(), operations)?;
@@ -127,65 +127,86 @@ impl Entity {
             return Ok(true);
         }
 
-        let budget = 100;
-        match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
+        let budget = 100; // TODO: Make budget configurable or dynamic
+        match crate::lineage::compare_unstored_event(getter, event, &current_entity_head, budget).await? {
             lineage::Ordering::Equal => {
-                debug!("Equal - skip");
+                debug!("Event {} is Equal to current head {}, skipping.", event.id(), current_entity_head);
                 Ok(false)
             }
-            lineage::Ordering::Descends => {
-                debug!("Descends - apply");
-                let new_head = event.id().into();
-                for (backend_name, operations) in event.operations.iter() {
-                    // IMPORTANT TODO - we might descend the entity head by more than one event,
-                    // therefore we need to play forward events one by one, not just the latest
-                    // set operations, the current head and the parent of that.
-                    // We have to play forward all events from the current entity/backend state
-                    // to the latest event. At this point we know this lineage is connected,
-                    // else we would get back an Ordering::Incomparable.
-                    // So we just need to fiure out how to scan through those events here.
-                    // Probably the easiest thing would be to update Ordering::Descends to provide
-                    // the list of events to play forward, but ideally we'd do it on a streaming
-                    // basis instead. of materializing what could potentially be a large number
-                    // of events in some cases.
-
-                    // we can't do this in the lineage comparison, because its looking backwards
-                    // not forwards - and we need to replay the events in order.
-                    // Maybe the best approach is to have Descends return the list of event ids
-                    // connecting the current head to the new event, and use a modest LRU cache
-                    // on the event geter (which needs to abstract storage collection anyway,
-                    // due to the need for remote event retrieval)
-                    // ...so we get a cache hit in the most common cases, and it can paginate the rest.
-                    self.backends.apply_operations((*backend_name).to_owned(), operations)?;
+            lineage::Ordering::Descends { unapplied } => {
+                debug!(
+                    "Event {} Descends current head {}. Applying unapplied path ({} events) and event itself.",
+                    event.id(),
+                    current_entity_head,
+                    unapplied.len()
+                );
+                for item in unapplied {
+                    // Each item.event is an event in the path from current_entity_head to event.parent()
+                    // These need to be applied in order. The `compare_unstored_event` and `compare` logic
+                    // should provide them in causal order (oldest to newest).
+                    // The `item.concurrency` might be relevant for LWW if those concurrent events affect the same properties.
+                    debug!("Applying operations from unapplied event: {}", item.event.id());
+                    for (backend_name, operations) in item.event.operations.iter() {
+                        self.backends.apply_operations((*backend_name).to_owned(), operations)?;
+                    }
                 }
-                *self.head.lock().unwrap() = new_head;
+                // After applying the path, the original `event` is the new tip.
+                // Its operations were included if it was the last item in `unapplied` (or if `unapplied` only contained it for direct descent).
+                // If `compare_unstored_event` ensures the original `event` is the last in `unapplied` if it's part of the sequence,
+                // then this separate application might be redundant OR `unapplied` is only up to parent.
+                // Given `compare_unstored_event` structure, `unapplied` goes up to `event` itself.
+                // So, no need to apply `event.operations` separately here if it's already the last in `unapplied`.
+
+                *self.head.lock().unwrap() = event.id().into(); // Set head to the incoming event's ID
                 Ok(true)
             }
-            lineage::Ordering::NotDescends { meet: _ } => {
-                // TODOs:
-                // [ ] we should probably have some rules about when a non-descending (concurrent) event is allowed. In a way, this is the same question as Descends with a gap, as discussed above
-                // [ ] update LWW backend determine which value to keep based on its deterministic last write win strategy. (just lexicographic winner, I think?)
-                // [ ] differentiate NotDescends into Ascends and Concurrent. we should ignore the former, and apply the latter
-                // just doing the needful for now
-                debug!("NotDescends - applying");
-                for (backend_name, operations) in event.operations.iter() {
-                    self.backends.apply_operations((*backend_name).to_owned(), operations)?;
-                }
-                // concurrent - so augment the head
-                self.head.lock().unwrap().insert(event.id());
+            lineage::Ordering::Ascends => {
+                debug!("Event {} Ascends current head {} (event is older), skipping.", event.id(), current_entity_head);
                 Ok(false)
             }
+            lineage::Ordering::Other { unapplied } => {
+                // 'unapplied' contains events from the new event's branch that are not known to the current_entity_head.
+                // These events lead up to the incoming 'event'.
+                // The incoming 'event' itself should be the last one in this sequence or represented by it.
+                debug!(
+                    "Event {} is Other (concurrent or divergent) with current head {}. Applying its branch ({} events).",
+                    event.id(),
+                    current_entity_head,
+                    unapplied.len()
+                );
+                for item in unapplied {
+                    // item.event is on the new branch. item.concurrency are events from the current_entity_head's branch that are concurrent.
+                    // For LWW, backends need to handle this when applying operations.
+                    debug!("Applying operations from Other branch event: {}", item.event.id());
+                    for (backend_name, operations) in item.event.operations.iter() {
+                        // The backend needs to be smart enough to use LWW rules if applicable, potentially using item.concurrency for context.
+                        // For now, we just apply the operations from item.event.
+                        self.backends.apply_operations((*backend_name).to_owned(), operations)?;
+                    }
+                }
+                // After applying the operations from the incoming event's branch, augment the head.
+                // The original `event` is the tip of this new branch.
+                let mut head_guard = self.head.lock().unwrap();
+                head_guard.insert(event.id());
+                // It might be necessary to also remove elements from head_guard that are now superseded
+                // if 'unapplied' implies that 'event' makes some parts of current_entity_head obsolete.
+                // This depends on the exact semantics of Ordering::Other.
+                // For now, simple augmentation.
+                debug!("Augmented head with {} due to Other ordering. New head: {}", event.id(), *head_guard);
+                Ok(true) // Indicate change was made
+            }
             lineage::Ordering::Incomparable => {
-                // total apples and oranges - take a hike buddy
+                warn!("Event {} is Incomparable with current head {}, skipping.", event.id(), current_entity_head);
                 Err(LineageError::Incomparable.into())
             }
-            lineage::Ordering::PartiallyDescends { meet } => {
-                error!("PartiallyDescends - skipping this event, but we should probably be handling this");
-                // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                // but it requires that we update the propertybackends to support this
-                Err(LineageError::PartiallyDescends { meet }.into())
-            }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                error!(
+                    "Budget exceeded comparing event {} with current head {}. Subject frontier: {:?}, Other frontier: {:?}",
+                    event.id(),
+                    current_entity_head,
+                    subject_frontier,
+                    other_frontier
+                );
                 Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
             }
         }
@@ -204,29 +225,46 @@ impl Entity {
                 debug!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
             }
-            lineage::Ordering::Descends => {
-                debug!("{self} apply_state - new head descends from current, applying");
+            lineage::Ordering::Descends { unapplied: _ } => {
+                // TODO: Handle unapplied path for state changes if necessary.
+                // For apply_state, if new_head Descends current_head, it means the new_state
+                // is a direct successor or has a lineage of successors.
+                // The `unapplied` path might be relevant if we need to ensure intermediate states
+                // are also valid or trigger some logic, but typically apply_state just sets to the target state.
+                debug!("{self} apply_state - new head {} descends from current {}, applying state", state.head, self.head());
                 self.backends.apply_state(state)?;
-                *self.head.lock().unwrap() = new_head;
+                *self.head.lock().unwrap() = state.head.clone();
                 Ok(true)
             }
-            lineage::Ordering::NotDescends { meet } => {
-                warn!("{self} apply_state - new head {new_head} does not descend {head}, meet: {meet:?}");
+            lineage::Ordering::Ascends => {
+                warn!(
+                    "{self} apply_state - new head {} ascends current_head {} (new state is older), skipping application.",
+                    state.head,
+                    self.head()
+                );
+                Ok(false)
+            }
+            lineage::Ordering::Other { unapplied: _ } => {
+                // TODO: Define behavior for Other in apply_state.
+                // This implies the new state is concurrent or divergent.
+                // A simple 'apply_state' might not be appropriate.
+                // It might require merging backend states, which is complex.
+                // For now, treating as a non-apply.
+                warn!("{self} apply_state - new head {} is Other relative to current_head {}. State application for 'Other' is not fully defined, skipping.", state.head, self.head());
                 Ok(false)
             }
             lineage::Ordering::Incomparable => {
-                error!("{self} apply_state - heads are incomparable");
-                // total apples and oranges - take a hike buddy
+                error!("{self} apply_state - new head {} is Incomparable with current_head {}.", state.head, self.head());
                 Err(LineageError::Incomparable.into())
             }
-            lineage::Ordering::PartiallyDescends { meet } => {
-                error!("{self} apply_state - heads partially descend, meet: {meet:?}");
-                // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                // but it requires that we update the propertybackends to support this
-                Err(LineageError::PartiallyDescends { meet }.into())
-            }
             lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
+                tracing::warn!(
+                    "{self} apply_state - budget exceeded comparing new head {} with current {}. Subject: {:?}, Other: {:?}",
+                    state.head,
+                    self.head(),
+                    subject_frontier,
+                    other_frontier
+                );
                 Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
             }
         }
@@ -394,7 +432,7 @@ impl WeakEntitySet {
         let mut entities = self.0.write().unwrap();
         let id = EntityId::new();
         let entity = Entity::create(id, collection, Backends::new());
-        entities.insert(id, entity.weak());
+        entities.insert(*id, entity.weak());
         entity
     }
 

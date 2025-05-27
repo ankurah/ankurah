@@ -8,33 +8,29 @@ pub use crate::retrieval::GetEvents;
 pub use crate::retrieval::Retrieve;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Ordering<Id> {
+pub struct UnappliedItem<Evt> {
+    /// The event which has not yet been applied to the subject head (if subject is the entity's current head)
+    /// or an event on a path.
+    pub event: Evt,
+    /// Events which may or may not have been applied already, but we know they're concurrent in the DAG with `event`.
+    /// These would typically be from the 'other side' of a divergence when in the 'Other' variant,
+    /// or external concurrencies if relevant for 'Descends'.
+    pub concurrency: Vec<Evt>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ordering<Id, Evt> {
     Equal,
-
-    /// This means there exists a path in the DAG from each event in comparison to every event in subject
-    Descends,
-
-    /// subject does not descend from comparison, but there exists a path to a common ancestor
-    NotDescends {
-        /// The greatest lower bound of the two sets
-        meet: Vec<Id>,
+    Descends {
+        unapplied: Vec<UnappliedItem<Evt>>,
     },
-
-    /// subject and comparison have no common ancestor whatsoever
+    Ascends,
+    Other {
+        // Covers concurrency and other complex relationships
+        unapplied: Vec<UnappliedItem<Evt>>,
+    },
     Incomparable,
-
-    /// subject partially descends from comparison (some but not all events in comparison are in subject's history)
-    /// This means there exists a path from some events in comparison to some (but not all) events in subject
-    PartiallyDescends {
-        /// The greatest lower bound of the two sets
-        meet: Vec<Id>,
-        // LATER: The immediate descendents of the common ancestor that are in b's history but not in a's history
-        // difference: Vec<Id>,
-    },
-
-    /// Recursion budget was exceeded before a determination could be made
     BudgetExceeded {
-        // what exactly do we need to resume the comparison?
         subject_frontier: BTreeSet<Id>,
         other_frontier: BTreeSet<Id>,
     },
@@ -264,6 +260,7 @@ where
         let (cost, events) = self.getter.retrieve_event(ids).await?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
+        tracing::info!("step: {}", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "));
         for event in events {
             if result_checklist.remove(&event.payload.id()) {
                 self.process_event(event.payload.id(), event.payload.parent().members());
@@ -672,6 +669,44 @@ mod tests {
     #[tokio::test]
     async fn test_compare_event_unstored() {
         let mut store = MockEventStore::new();
+        store.add(1, &[]);
+        store.add(2, &[1]);
+        store.add(3, &[2]);
+
+        let unstored_event = TestEvent { id: 4, parent_clock: TestClock { members: vec![3] } }; // Parent is {3}
+        let clock_1 = TestClock { members: vec![1] };
+
+        // compare_unstored_event(unstored=4(p3), other=1)
+        // -> compare(parent_clock={3}, other={1}) -> Descends { unapplied: events for path 1 to 3, i.e., [2,3] (sorted) }
+        // `compare_unstored_event` takes this unapplied list, adds UnappliedItem for event 4.
+        // Result: Descends { unapplied: [items for 2,3,4] } (sorted)
+        match compare_unstored_event(&store, &unstored_event, &clock_1, 100).await.unwrap() {
+            Ordering::Descends { unapplied } => {
+                assert_eq!(unapplied.len(), 3); // Expect items for 2, 3, 4
+                assert!(unapplied.iter().any(|item| item.event.id == 2));
+                assert!(unapplied.iter().any(|item| item.event.id == 3));
+                assert!(unapplied.iter().any(|item| item.event.id == 4));
+                // Check order if sort is reliable: 2, 3, 4
+                if unapplied.len() == 3 {
+                    assert_eq!(unapplied[0].event.id, 2);
+                    assert_eq!(unapplied[1].event.id, 3);
+                    assert_eq!(unapplied[2].event.id, 4);
+                }
+            }
+            other => panic!("Expected Descends, got {:?}", other),
+        }
+        let clock_3 = TestClock { members: vec![3] };
+        // compare_unstored_event(unstored=4(p3), other=3)
+        // -> compare(parent_clock={3}, other={3}) -> Equal
+        // `compare_unstored_event` maps Equal from parent to Descends { unapplied: [item for 4] }
+        match compare_unstored_event(&store, &unstored_event, &clock_3, 100).await.unwrap() {
+            Ordering::Descends { unapplied } => {
+                assert_eq!(unapplied.len(), 1);
+                assert_eq!(unapplied[0].event.id, 4);
+            }
+            other => panic!("Expected Descends, got {:?}", other),
+        }
+    }
 
         // Create a chain: 1 <- 2 <- 3 (stored)
         store.add(1, &[]);
@@ -693,8 +728,15 @@ mod tests {
 
         // Test with an unstored event that has multiple parents
         let unstored_merge_event = TestEvent { id: 5, parent_clock: TestClock { members: vec![2, 3] } };
-
-        assert_eq!(compare_unstored_event(&store, &unstored_merge_event, &clock_1, 100).await.unwrap(), Ordering::Descends);
+ assert_eq!(compare_unstored_event(&store, &unstored_merge_event, &clock_1, 100).await.unwrap(), Ordering::Descends);
+ }
+    #[tokio::test]
+    async fn test_ordering_descends_scenarios() {
+        let mut store = MockEventStore::new();
+        // Path: R <- 1 <- 2 <- S (Subject Head)
+        // Other Head: O
+        store.add(10, &[]); // R (root for other)
+        store.add(11, &[10]); // O
 
         // Test with an incomparable case
         store.add(10, &[]); // Independent root

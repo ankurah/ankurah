@@ -611,7 +611,8 @@ where
     ) -> Result<(), MutationError> {
         let mut changes = Vec::new();
         for update in updates {
-            match self.apply_subscription_update(from_peer_id, update, &nodeandcontext).await {
+            info!("{self} applying subscription update {update}");
+            match self.apply_subscription_update(from_peer_id, update.clone(), &nodeandcontext).await {
                 Ok(Some(change)) => {
                     changes.push(change);
                 }
@@ -619,7 +620,7 @@ where
                     continue;
                 }
                 Err(e) => {
-                    action_warn!(self, "received invalid update from peer", "{}: {}", from_peer_id.to_base64_short(), e);
+                    action_warn!(self, "received invalid update from peer", "{}: {} {update}", from_peer_id.to_base64_short(), e);
                 }
             }
         }
@@ -642,6 +643,7 @@ where
         update: proto::SubscriptionUpdateItem,
         nodeandcontext: &NodeAndContext<SE, PA>,
     ) -> Result<Option<EntityChange>, MutationError> {
+        info!("{self} applying subscription update");
         match update {
             proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
                 let state = (entity_id, collection, state).into();
@@ -652,8 +654,10 @@ where
                 let collection = self.collections.get(&payload.collection).await?;
                 let getter = (payload.collection.clone(), nodeandcontext);
 
+                info!("{self} with_state");
                 match self.entities.with_state(&getter, payload.entity_id, payload.collection, payload.state).await? {
                     (Some(true), entity) => {
+                        info!("{self} with_state found entity");
                         // We had the entity already, and this state is newer than the one we have, so save it to the collection
                         // Not sure if we should reproject the state - discuss
                         // however, if we do reproject, we need to re-attest the state
@@ -665,10 +669,12 @@ where
                         Ok(Some(EntityChange::new(entity, vec![])?))
                     }
                     (Some(false), _entity) => {
+                        info!("{self} with_state found entity but it's not newer");
                         // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
                         Ok(None)
                     }
                     (None, entity) => {
+                        info!("{self} with_state found no entity");
                         // We did not have the entity yet, so we created it, so save it to the collection
                         // see notes as above regarding reprojecting and re-attesting the state
                         let state = entity.to_state()?;
@@ -681,6 +687,7 @@ where
                 }
             }
             proto::SubscriptionUpdateItem::Add { entity_id, collection: collection_id, state, events } => {
+                info!("{self} add");
                 let collection = self.collections.get(&collection_id).await?;
 
                 // validate and store the events, in case we need them for lineage comparison
@@ -693,9 +700,11 @@ where
                     attested_events.push(event);
                 }
 
+                info!("{self} add 2");
                 let state = (entity_id, collection_id.clone(), state).into();
                 self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
 
+                info!("{self} add with_state 2");
                 match self
                     .entities
                     .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, state.payload.state)
