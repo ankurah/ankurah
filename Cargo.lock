@@ -155,6 +155,7 @@ dependencies = [
  "postgres-types",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "sha2",
  "ulid",
  "wasm-bindgen",

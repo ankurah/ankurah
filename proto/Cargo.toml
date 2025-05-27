@@ -30,3 +30,6 @@ fallible-iterator  = { version = "0.2", optional = true }           # has to be 
 
 wasm-bindgen = { version = "0.2.92", features = ["serde"], optional = true }
 js-sys       = { version = "0.3.69", optional = true }
+
+[dev-dependencies]
+serde_json = "1.0"

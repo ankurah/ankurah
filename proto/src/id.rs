@@ -7,7 +7,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::error::DecodeError;
 // TODO - split out the different id types. Presently there's a lot of not-entities that are using this type for their ID
-#[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 #[wasm_bindgen]
 pub struct EntityId(pub(crate) Ulid);
 
@@ -89,4 +89,53 @@ impl From<EntityId> for Ulid {
 
 impl Default for EntityId {
     fn default() -> Self { Self::new() }
+}
+
+impl Serialize for EntityId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        if serializer.is_human_readable() {
+            // Use base64 for human-readable formats like JSON
+            serializer.serialize_str(&self.to_base64())
+        } else {
+            // Use raw bytes as a fixed-size array for binary formats like bincode
+            self.to_bytes().serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EntityId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        if deserializer.is_human_readable() {
+            // Deserialize from base64 string for human-readable formats
+            let s = String::deserialize(deserializer)?;
+            EntityId::from_base64(s).map_err(serde::de::Error::custom)
+        } else {
+            // Deserialize from raw bytes as a fixed-size array for binary formats
+            let bytes = <[u8; 16]>::deserialize(deserializer)?;
+            Ok(EntityId::from_bytes(bytes))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_entity_id_json_serialization() {
+        let id = EntityId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"AQIDBAUGBwgJCgsMDQ4PEA\"");
+        assert_eq!(id, serde_json::from_str(&json).unwrap());
+    }
+
+    #[test]
+    fn test_entity_id_bincode_serialization() {
+        let id = EntityId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let bytes = bincode::serialize(&id).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+    }
 }
