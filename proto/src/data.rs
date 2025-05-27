@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{auth::Attested, clock::Clock, collection::CollectionId, id::EntityId, AttestationSet, DecodeError};
 
-#[derive(Clone, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
 
 impl std::fmt::Debug for EventId {
@@ -70,6 +70,35 @@ impl TryFrom<Vec<u8>> for EventId {
         Ok(Self(v))
     }
 }
+
+impl Serialize for EventId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        if serializer.is_human_readable() {
+            // Use base64 for human-readable formats like JSON
+            serializer.serialize_str(&self.to_base64())
+        } else {
+            // Use raw bytes as a fixed-size array for binary formats like bincode
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EventId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        if deserializer.is_human_readable() {
+            // Deserialize from base64 string for human-readable formats
+            let s = String::deserialize(deserializer)?;
+            EventId::from_base64(s).map_err(serde::de::Error::custom)
+        } else {
+            // Deserialize from raw bytes as a fixed-size array for binary formats
+            let bytes = <[u8; 32]>::deserialize(deserializer)?;
+            Ok(EventId::from_bytes(bytes))
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
     pub collection: CollectionId,
@@ -246,5 +275,33 @@ impl Attested<EntityState> {
 impl Attested<Event> {
     pub fn from_parts(entity_id: EntityId, collection: CollectionId, frag: EventFragment) -> Self {
         Self { payload: Event { entity_id, collection, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_event_id_json_serialization() {
+        let id = EventId::from_bytes([
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ]);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA\"");
+        assert_eq!(id, serde_json::from_str(&json).unwrap());
+    }
+
+    #[test]
+    fn test_event_id_bincode_serialization() {
+        let id = EventId::from_bytes([
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ]);
+        let bytes = bincode::serialize(&id).unwrap();
+        assert_eq!(
+            bytes,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+        );
+        assert_eq!(id, bincode::deserialize(&bytes).unwrap());
     }
 }
