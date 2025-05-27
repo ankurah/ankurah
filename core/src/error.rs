@@ -126,7 +126,7 @@ pub enum LineageError {
     #[error("partially descends: {meet:?}")]
     PartiallyDescends { meet: Vec<EventId> },
     #[error("budget exceeded: {subject_frontier:?} {other_frontier:?}")]
-    BudgetExceeded { subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
+    BudgetExceeded { original_budget: usize, subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
 }
 
 impl From<LineageError> for MutationError {
