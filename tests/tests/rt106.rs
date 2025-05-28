@@ -4,7 +4,6 @@ use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
-use tracing::info;
 
 mod common;
 use common::{Album, AlbumView};

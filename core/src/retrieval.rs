@@ -55,12 +55,18 @@ pub trait GetEvents {
 
 #[async_trait]
 pub trait Retrieve: GetEvents {
-    /// get the entity state from the local store, but do not try to retrieve it from the remote peer
-    async fn get_local_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError>;
+    // Each implementation of Retrieve determines whether to use local or remote storage
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError>;
+}
+
+pub struct LocalRetriever(StorageCollectionWrapper);
+
+impl LocalRetriever {
+    pub fn new(collection: StorageCollectionWrapper) -> Self { Self(collection) }
 }
 
 #[async_trait]
-impl GetEvents for StorageCollectionWrapper {
+impl GetEvents for LocalRetriever {
     type Id = EventId;
     type Event = ankurah_proto::Event;
 
@@ -72,8 +78,8 @@ impl GetEvents for StorageCollectionWrapper {
 }
 
 #[async_trait]
-impl Retrieve for StorageCollectionWrapper {
-    async fn get_local_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
+impl Retrieve for LocalRetriever {
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
         match self.0.get_state(entity_id).await {
             Ok(state) => Ok(Some(state)),
             Err(RetrievalError::EntityNotFound(_)) => Ok(None),
@@ -141,7 +147,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    async fn get_local_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
         let collection = self.1.node.collections.get(&self.0).await?;
         match collection.get_state(entity_id).await {
             Ok(state) => Ok(Some(state)),

@@ -21,6 +21,7 @@ use crate::{
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
+    retrieval::LocalRetriever,
     storage::StorageEngine,
     subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,
@@ -74,7 +75,7 @@ impl From<ankql::error::ParseError> for RetrievalError {
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
-pub struct Node<SE, PA>(Arc<NodeInner<SE, PA>>)
+pub struct Node<SE, PA>(pub(crate) Arc<NodeInner<SE, PA>>)
 where PA: PolicyAgent;
 impl<SE, PA> Clone for Node<SE, PA>
 where PA: PolicyAgent
@@ -119,17 +120,17 @@ where PA: PolicyAgent
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
-    subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
+    pub(crate) subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
-    pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<()>>,
+    pub(crate) pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<()>>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    subscription_relay: Option<SubscriptionRelay<PA::ContextData>>,
+    pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData>>,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -141,7 +142,7 @@ where
         let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone(), id.clone());
+        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         notice_info!("Node {id:#} created as ephemeral");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
@@ -178,7 +179,7 @@ where
         let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone(), id.clone());
+        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         notice_info!("Node {id:#} created as durable");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), true);
@@ -494,7 +495,7 @@ where
         }
     }
 
-    async fn relay_to_required_peers(
+    pub(crate) async fn relay_to_required_peers(
         &self,
         cdata: &PA::ContextData,
         id: proto::TransactionId,
@@ -520,53 +521,6 @@ where
         Ok(())
     }
 
-    /// Does all the things necessary to commit a local transaction
-    /// notably, the application of events to Entities works differently versus remote transactions
-    pub async fn commit_local_trx(&self, cdata: &PA::ContextData, trx: Transaction) -> Result<(), MutationError> {
-        let (trx_id, entity_events) = trx.into_parts()?;
-        let mut attested_events = Vec::new();
-        let mut entity_attested_events = Vec::new();
-
-        // Check policy and collect attestations
-        for (entity, event) in entity_events {
-            let attestation = self.policy_agent.check_event(self, cdata, &entity, &event)?;
-            let attested = Attested::opt(event.clone(), attestation);
-            attested_events.push(attested.clone());
-            entity_attested_events.push((entity, attested));
-        }
-
-        // Relay to peers and wait for confirmation
-        self.relay_to_required_peers(cdata, trx_id, &attested_events).await?;
-
-        // All peers confirmed, now we can update local state
-        let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
-            let collection = self.collections.get(&attested_event.payload.collection).await?;
-            collection.add_event(&attested_event).await?;
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
-
-            // If this entity has an upstream, propagate the changes
-            if let Some(ref upstream) = entity.upstream {
-                upstream.apply_event(&self.collections.get(&attested_event.payload.collection).await?, &attested_event.payload).await?;
-            }
-
-            // Persist
-
-            let state = entity.to_state()?;
-
-            let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-            let attestation = self.policy_agent.attest_state(self, &entity_state);
-            let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(attested).await?;
-
-            changes.push(EntityChange::new(entity.clone(), vec![attested_event])?);
-        }
-
-        // Notify reactor of ALL changes
-        self.reactor.notify_change(changes);
-        Ok(())
-    }
-
     /// Does all the things necessary to commit a remote transaction
     pub async fn commit_remote_transaction(
         &self,
@@ -579,13 +533,17 @@ where
 
         for event in events.iter_mut() {
             let collection = self.collections.get(&event.payload.collection).await?;
-            let entity = self.entities.get_retrieve_or_create(&event.payload.collection, &collection, &event.payload.entity_id).await?;
+
+            // When applying an event, we should only look at the local storage for the lineage
+            let retriever = LocalRetriever::new(collection.clone());
+            let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
 
             // we have the entity, so we can check access, optionally atteste, and apply/save the event;
             if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
                 event.attestations.push(attestation);
             }
-            if entity.apply_event(&collection, &event.payload).await? {
+
+            if entity.apply_event(&retriever, &event.payload).await? {
                 let state = entity.to_state()?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
@@ -686,7 +644,7 @@ where
                 // validate and store the events, in case we need them for lineage comparison
                 let mut attested_events = Vec::new();
                 for event in events.iter() {
-                    let event = (entity_id, collection_id.clone(), event.clone()).into();
+                    let event: Attested<ankurah_proto::Event> = (entity_id, collection_id.clone(), event.clone()).into();
                     self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
                     // store the validated event in case we need it for lineage comparison
                     collection.add_event(&event).await?;
@@ -741,11 +699,12 @@ where
                     attested_events.push(event);
                 }
 
-                let entity = self.entities.get_retrieve_or_create(&collection_id, &collection, &entity_id).await?;
+                let entity =
+                    self.entities.get_retrieve_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
 
                 let mut changed = false;
                 for event in attested_events.iter() {
-                    changed = entity.apply_event(&collection, &event.payload).await?;
+                    changed = entity.apply_event(&(collection_id.clone(), nodeandcontext), &event.payload).await?;
                 }
                 if changed {
                     Ok(Some(EntityChange::new(entity, attested_events)?))
@@ -854,129 +813,8 @@ where
         Context::new(Node::clone(self), data)
     }
 
-    /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
-    pub(crate) async fn get_entity(
-        &self,
-        collection_id: &CollectionId,
-        id: proto::EntityId,
-        cdata: &PA::ContextData,
-        cached: bool,
-    ) -> Result<Entity, RetrievalError> {
-        debug!("Node({}).get_entity {:?}-{:?}", self.id, id, collection_id);
-
-        if !self.durable {
-            // Fetch from peers and commit first response
-            match self.get_from_peer(collection_id, vec![id], cdata).await {
-                Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if cached => (),
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
-        if let Some(local) = self.entities.get(&id) {
-            debug!("Node({}).get_entity found local entity - returning", self.id);
-            return Ok(local);
-        }
-        debug!("Node({}).get_entity fetching from storage", self.id);
-
-        let collection = self.collections.get(collection_id).await?;
-        match collection.get_state(id).await {
-            Ok(entity_state) => {
-                let (_changed, entity) =
-                    self.entities.with_state(&collection, id, collection_id.clone(), entity_state.payload.state).await?;
-                Ok(entity)
-            }
-            Err(RetrievalError::EntityNotFound(id)) => {
-                let (_, entity) = self.entities.with_state(&collection, id, collection_id.clone(), proto::State::default()).await?;
-                Ok(entity)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Fetch a list of entities based on a predicate
-    pub async fn fetch_entities(
-        &self,
-        collection_id: &CollectionId,
-        args: MatchArgs,
-        cdata: &PA::ContextData,
-    ) -> Result<Vec<Entity>, RetrievalError> {
-        // TODO implement cached: true
-        if !self.durable {
-            // Fetch from peers and commit first response
-            match self.fetch_from_peer(collection_id, args.predicate.clone(), cdata).await {
-                Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if args.cached => (),
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
-        self.policy_agent.can_access_collection(cdata, collection_id)?;
-        // Fetch raw states from storage
-        let storage_collection = self.collections.get(collection_id).await?;
-        let filtered_predicate = self.policy_agent.filter_predicate(cdata, collection_id, args.predicate)?;
-        let states = storage_collection.fetch_states(&filtered_predicate).await?;
-
-        // Convert states to entities
-        let mut entities = Vec::new();
-        for state in states {
-            let (_, entity) =
-                self.entities.with_state(&storage_collection, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
-            entities.push(entity);
-        }
-        Ok(entities)
-    }
-
-    pub async fn subscribe(
-        &self,
-        cdata: &PA::ContextData,
-        sub_id: proto::SubscriptionId,
-        collection_id: &CollectionId,
-        mut args: MatchArgs,
-        callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<SubscriptionHandle, RetrievalError> {
-        let mut handle = SubscriptionHandle::new(Box::new(Node(self.0.clone())) as Box<dyn TNodeErased>, sub_id);
-
-        self.policy_agent.can_access_collection(cdata, collection_id)?;
-        args.predicate = self.policy_agent.filter_predicate(cdata, collection_id, args.predicate)?;
-
-        // Store subscription context for event requests
-        self.subscription_context.insert(sub_id, cdata.clone());
-
-        let predicate = args.predicate.clone();
-        let cached = args.cached;
-
-        // Register subscription with reactor (synchronous)
-        let subscription = self.reactor.register(handle.id, collection_id, args.predicate, callback);
-
-        // Handle remote subscription setup
-        if let Some(ref relay) = self.subscription_relay {
-            relay.notify_subscribe(sub_id, collection_id.clone(), predicate, cdata.clone());
-
-            if !cached {
-                // Create oneshot channel to wait for first remote update
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                self.pending_subs.insert(sub_id, tx);
-
-                // Wait for first remote update before initializing
-                if let Err(_) = rx.await {
-                    // Channel was dropped, proceed with local initialization anyway
-                    warn!("Failed to receive first remote update for subscription {}", sub_id);
-                }
-            }
-        }
-
-        // Always initialize the subscription
-        self.reactor.initialize(subscription).await?;
-
-        Ok(handle)
-    }
     /// Fetch entities from the first available durable peer.
-    async fn fetch_from_peer(
+    pub(crate) async fn fetch_from_peer(
         &self,
         collection_id: &CollectionId,
         predicate: ankql::ast::Predicate,
@@ -1010,7 +848,7 @@ where
         }
     }
 
-    async fn get_from_peer(
+    pub(crate) async fn get_from_peer(
         &self,
         collection_id: &CollectionId,
         ids: Vec<proto::EntityId>,

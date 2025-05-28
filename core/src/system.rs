@@ -14,6 +14,7 @@ use crate::policy::PolicyAgent;
 use crate::property::{backend::LWWBackend, PropertyValue};
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
+use crate::retrieval::LocalRetriever;
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
@@ -248,9 +249,11 @@ where
         let mut entities = Vec::new();
         let mut root_state = None;
 
+        let retriever = LocalRetriever::new(storage.clone());
+
         for state in storage.fetch_states(&ankql::ast::Predicate::True).await? {
             let (_entity_changed, entity) =
-                self.0.entities.with_state(&storage, state.payload.entity_id, collection_id.clone(), state.payload.state.clone()).await?;
+                self.0.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state.clone()).await?;
             let lww_backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");

@@ -5,6 +5,7 @@ use crate::entity::{Entity, WeakEntitySet};
 use crate::node::MatchArgs;
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
+use crate::retrieval::LocalRetriever;
 use crate::storage::StorageEngine;
 use crate::subscription::Subscription;
 use crate::util::safemap::SafeMap;
@@ -47,7 +48,6 @@ pub struct Reactor<SE, PA> {
     // Weak reference to the node
     // node: OnceCell<WeakNode<PA>>,
     _policy_agent: PA,
-    node_id: EntityId,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -61,7 +61,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA, node_id: EntityId) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: SafeMap::new(),
             index_watchers: SafeMap::new(),
@@ -70,7 +70,6 @@ where
             collections,
             entityset,
             _policy_agent: policy_agent,
-            node_id,
             // node: OnceCell::new(),
         })
     }
@@ -111,11 +110,13 @@ where
         let states = storage_collection.fetch_states(&subscription.predicate).await?;
         let mut matching_entities = Vec::new();
 
+        // in theory, any state that is in the collection should already have its events in the storage collection as well
+        let retriever = LocalRetriever::new(storage_collection.clone());
         // Convert states to Entity and filter by predicate
         for state in states {
             let (_, entity) = self
                 .entityset
-                .with_state(&storage_collection, state.payload.entity_id, subscription.collection_id.to_owned(), state.payload.state)
+                .with_state(&retriever, state.payload.entity_id, subscription.collection_id.to_owned(), state.payload.state)
                 .await?;
 
             // Evaluate predicate for each entity
