@@ -345,35 +345,41 @@ impl WeakEntitySet {
         }
     }
 
-    pub async fn get_or_retrieve(
+    pub async fn get_or_retrieve<R>(
         &self,
+        retriever: &R,
         collection_id: &CollectionId,
-        collection: &StorageCollectionWrapper,
         id: &EntityId,
-    ) -> Result<Option<Entity>, RetrievalError> {
+    ) -> Result<Option<Entity>, RetrievalError>
+    where
+        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+    {
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get(id) {
             Some(entity) => Ok(Some(entity)),
-            None => match collection.get_state(*id).await {
-                Err(RetrievalError::EntityNotFound(_)) => Ok(None),
-                Err(e) => Err(e),
-                Ok(state) => {
+            None => match retriever.get_state(*id).await {
+                Ok(None) => Ok(None),
+                Ok(Some(state)) => {
                     // technically someone could have added the entity since we last checked, so it's better to use the
                     // with_state method to re-check
-                    let (_, entity) = self.with_state(collection, *id, collection_id.to_owned(), state.payload.state).await?;
+                    let (_, entity) = self.with_state(retriever, *id, collection_id.to_owned(), state.payload.state).await?;
                     Ok(Some(entity))
                 }
+                Err(e) => Err(e),
             },
         }
     }
     /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
-    pub async fn get_retrieve_or_create(
+    pub async fn get_retrieve_or_create<R>(
         &self,
+        retriever: &R,
         collection_id: &CollectionId,
-        collection: &StorageCollectionWrapper,
         id: &EntityId,
-    ) -> Result<Entity, RetrievalError> {
-        match self.get_or_retrieve(collection_id, collection, id).await? {
+    ) -> Result<Entity, RetrievalError>
+    where
+        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+    {
+        match self.get_or_retrieve(retriever, collection_id, id).await? {
             Some(entity) => Ok(entity),
             None => {
                 let mut entities = self.0.write().unwrap();
@@ -434,7 +440,7 @@ impl WeakEntitySet {
         // Handle the case where entity is not resident (either vacant or deallocated)
         let Some(entity) = entity else {
             // Check if there's existing state in storage before creating a new entity
-            if let Some(existing_state) = retriever.get_local_state(id).await? {
+            if let Some(existing_state) = retriever.get_state(id).await? {
                 debug!("Found existing state in storage for {id}");
                 let entity = Entity::from_state(id, collection_id.to_owned(), &existing_state.payload.state)?;
 

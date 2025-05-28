@@ -10,7 +10,7 @@ use ankql::{ast::Predicate, error::ParseError};
 use ankurah_proto::Attested;
 use async_trait::async_trait;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::debug;
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
 #[derive(Debug, Error)]
 pub enum AccessDenied {
@@ -185,7 +185,7 @@ impl PolicyAgent for PermissiveAgent {
         _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
         _entity: &Entity,
-        event: &proto::Event,
+        _event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
         Ok(None)
     }
@@ -193,13 +193,13 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        from_node: &proto::EntityId,
-        event: &proto::Attested<proto::Event>,
+        _from_node: &proto::EntityId,
+        _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation> {
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
         // This PolicyAgent does not require attestation, so we return None
         // Client/Server policy agents may also return None and defer to the server identity to validate the received state
         None
@@ -209,19 +209,19 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _node: &Node<SE, Self>,
         _from_node: &proto::EntityId,
-        state: &Attested<proto::EntityState>,
+        _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         // This PolicyAgent does not require validation, so we return Ok
         // Client/Server policy agents may use the _from_node to validate the received state rather than an attestation
         Ok(())
     }
 
-    fn can_access_collection(&self, _context: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
+    fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
 
     fn check_read(
         &self,
         _context: &Self::ContextData,
-        id: &proto::EntityId,
+        _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
     ) -> Result<(), AccessDenied> {
@@ -229,13 +229,13 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read_event(&self, _context: &Self::ContextData, event: &Attested<proto::Event>) -> Result<(), AccessDenied> {
+    fn check_read_event(&self, _context: &Self::ContextData, _event: &Attested<proto::Event>) -> Result<(), AccessDenied> {
         // TODO - think about the best way to get the entity properties for cases where we want to inspect
         // presumably this would need to be changed to async, and we'd need a way to retrieve entity state from storage, or possibly even a remote node
         Ok(())
     }
 
-    fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied> {
+    fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
         Ok(())
     }
 
