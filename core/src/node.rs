@@ -480,7 +480,7 @@ where
                 if let Some(cdata) = self.subscription_context.get(&subscription_id) {
                     let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
 
-                    self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
+                    self.apply_subscription_updates(&notification.from, subscription_id, items, nodeandcontext, initial).await?;
                     // Signal any pending subscription waiting for first update
                     if let Some(tx) = self.pending_subs.remove(&subscription_id) {
                         let _ = tx.send(()); // Ignore if receiver was dropped
@@ -488,12 +488,6 @@ where
                 } else {
                     error!("Received subscription update for unknown subscription {}", subscription_id);
                     return Err(anyhow!("Received subscription update for unknown subscription {}", subscription_id));
-                }
-
-                if initial {
-                    if let Some(relay) = self.subscription_relay.as_ref() {
-                        relay.notify_applied_initial_state(subscription_id);
-                    }
                 }
 
                 Ok(())
@@ -570,8 +564,10 @@ where
     pub async fn apply_subscription_updates(
         &self,
         from_peer_id: &proto::EntityId,
+        subscription_id: proto::SubscriptionId,
         updates: Vec<proto::SubscriptionUpdateItem>,
         nodeandcontext: NodeAndContext<SE, PA>,
+        initial: bool,
     ) -> Result<(), MutationError> {
         let mut changes = Vec::new();
         for update in updates {
@@ -589,6 +585,12 @@ where
         }
         debug!("{self} notifying reactor of {} changes", changes.len());
         self.reactor.notify_change(changes);
+
+        if initial {
+            if let Some(relay) = self.subscription_relay.as_ref() {
+                relay.notify_applied_initial_state(subscription_id);
+            }
+        }
         Ok(())
     }
 
