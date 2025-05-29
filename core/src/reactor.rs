@@ -139,6 +139,9 @@ where
         });
     }
 
+    /// Get a subscription by ID for external access (e.g., stale entity detection)
+    pub fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Arc<Subscription<Entity>>> { self.subscriptions.get(&sub_id) }
+
     fn manage_watchers_recurse(
         &self,
         collection_id: &proto::CollectionId,

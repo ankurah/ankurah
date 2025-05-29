@@ -14,6 +14,7 @@ pub struct Subscription<R: Clone> {
     pub(crate) on_change: Arc<Callback<R>>,
     // Track which entities currently match this subscription
     // TODO make this a ResultSet so we can clone it cheaply
+    // Should probab be a SafeMap<EntityId, Entity>
     pub(crate) matching_entities: Mutex<Vec<Entity>>,
     /// Whether this subscription has been initialized with its initial state
     pub(crate) initialized: std::sync::atomic::AtomicBool,

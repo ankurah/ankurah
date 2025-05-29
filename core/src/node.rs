@@ -595,7 +595,7 @@ where
 
         if initial {
             if let Some(relay) = self.subscription_relay.as_ref() {
-                relay.notify_applied_initial_state(subscription_id, initial_entity_ids);
+                relay.notify_applied_initial_state(subscription_id, initial_entity_ids).await?;
             }
         }
         Ok(())

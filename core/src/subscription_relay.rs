@@ -187,21 +187,56 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         Ok(())
     }
 
-    pub fn notify_applied_initial_state(&self, sub_id: proto::SubscriptionId, initial_entity_ids: Vec<proto::EntityId>) {
+    pub async fn notify_applied_initial_state(
+        &self,
+        sub_id: proto::SubscriptionId,
+        initial_entity_ids: Vec<proto::EntityId>,
+    ) -> Result<(), RetrievalError> {
         println!("🏁 SubscriptionRelay: Applied initial state for subscription {} with {} entities", sub_id, initial_entity_ids.len());
 
-        if let Some(info) = self.inner.subscriptions.get(&sub_id) {
-            // Signal first data arrival if this is a non-cached subscription waiting for it
-            if let Some(signal) = info.first_data_signal.lock().unwrap().take() {
-                // Try to send signal (ignore if receiver was dropped)
-                let _ = signal.send(());
-            }
+        let Some(info) = self.inner.subscriptions.get(&sub_id) else {
+            return Err(RetrievalError::Other(format!("Subscription {} not found", sub_id)));
+        };
+        // Get the subscription from reactor to access matching_entities
+        if let Some(subscription) = self.inner.reactor.get_subscription(sub_id) {
+            // Create HashSet from server's initial entities first
+            let mut entity_ids: std::collections::HashSet<proto::EntityId> = initial_entity_ids.iter().copied().collect();
 
-            // TODO: Implement stale entity detection here once we have proper reactor access methods
-            println!("🚨 TODO: Implement stale entity detection for subscription {}", sub_id);
+            // Lock matching_entities and iterate without cloning
+            {
+                for entity in subscription.matching_entities.lock().unwrap().iter() {
+                    entity_ids.remove(&entity.id);
+                }
+            }
+            // initial_set now contains entities that server has but we don't (new entities)
+            // stale_entity_ids contains entities we have but server doesn't (stale entities)
+
+            if !entity_ids.is_empty() {
+                println!("🚨 SubscriptionRelay: Found {} stale entities for subscription {}, refreshing...", entity_ids.len(), sub_id);
+
+                // Get node to refresh stale entities
+                if let Some(node) = self.inner.node.get() {
+                    node.get_from_peer(&subscription.collection_id, entity_ids.into_iter().collect(), &info.context_data).await?;
+                } else {
+                    warn!("SubscriptionRelay: No node available to refresh stale entities for subscription {}", sub_id);
+                }
+            } else {
+                println!(
+                    "✅ SubscriptionRelay: No stale entities found for subscription {} (server sent {} entities)",
+                    sub_id,
+                    initial_entity_ids.len()
+                );
+            }
         } else {
-            println!("⚠️  SubscriptionRelay: No subscription info found for {}", sub_id);
+            warn!("SubscriptionRelay: Could not find subscription {} in reactor for stale entity detection", sub_id);
         }
+
+        // Signal first data arrival if this is a non-cached subscription waiting for it
+        if let Some(signal) = info.first_data_signal.lock().unwrap().take() {
+            // Try to send signal (ignore if receiver was dropped)
+            let _ = signal.send(());
+        }
+        Ok(())
     }
 
     /// Notify the relay that a subscription has been removed locally
@@ -360,8 +395,7 @@ where
     PA: crate::policy::PolicyAgent + Send + Sync + 'static,
 {
     fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Arc<crate::subscription::Subscription<crate::entity::Entity>>> {
-        // TODO: Add public method to Reactor to access subscriptions
-        None // Temporary until we add proper accessor
+        self.get_subscription(sub_id)
     }
 }
 
