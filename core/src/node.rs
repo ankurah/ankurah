@@ -148,7 +148,7 @@ where
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
 
         // Create subscription relay for ephemeral nodes
-        let subscription_relay = Some(SubscriptionRelay::new());
+        let subscription_relay = Some(SubscriptionRelay::new(reactor.clone()));
 
         let node = Node(Arc::new(NodeInner {
             id,
@@ -168,7 +168,7 @@ where
         // Set up the message sender for the subscription relay
         if let Some(ref relay) = node.subscription_relay {
             let weak_node = node.weak();
-            if let Err(_) = relay.set_message_sender(Arc::new(weak_node)) {
+            if let Err(_) = relay.set_node(Arc::new(weak_node)) {
                 warn!("Failed to set message sender for subscription relay");
             }
         }
@@ -570,7 +570,14 @@ where
         initial: bool,
     ) -> Result<(), MutationError> {
         let mut changes = Vec::new();
+        let mut initial_entity_ids = Vec::new();
+
         for update in updates {
+            // Collect entity IDs if this is initial data
+            if initial {
+                initial_entity_ids.push(update.entity_id());
+            }
+
             match self.apply_subscription_update(from_peer_id, update, &nodeandcontext).await {
                 Ok(Some(change)) => {
                     changes.push(change);
@@ -588,7 +595,7 @@ where
 
         if initial {
             if let Some(relay) = self.subscription_relay.as_ref() {
-                relay.notify_applied_initial_state(subscription_id);
+                relay.notify_applied_initial_state(subscription_id, initial_entity_ids);
             }
         }
         Ok(())
@@ -743,63 +750,66 @@ where
         let node = self.clone();
         {
             let peer_id = peer_id;
-            let subscription = self.reactor.register(sub_id, &collection_id, predicate, move |changeset| {
-                // TODO move this into a task being fed by a channel and reorg into a function
-                let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
+            let subscription = self
+                .reactor
+                .register(sub_id, &collection_id, predicate, move |changeset| {
+                    // TODO move this into a task being fed by a channel and reorg into a function
+                    let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
 
-                // When changes occur, collect events and states
-                for change in changeset.changes.into_iter() {
-                    match change {
-                        ItemChange::Initial { item } => {
-                            // For initial state, include both events and state
-                            if let Ok(es) = item.to_entity_state() {
+                    // When changes occur, collect events and states
+                    for change in changeset.changes.into_iter() {
+                        match change {
+                            ItemChange::Initial { item } => {
+                                // For initial state, include both events and state
+                                if let Ok(es) = item.to_entity_state() {
+                                    let attestation = node.policy_agent.attest_state(&node, &es);
+
+                                    updates.push(proto::SubscriptionUpdateItem::initial(
+                                        item.id(),
+                                        item.collection.clone(),
+                                        Attested::opt(es, attestation),
+                                    ));
+                                }
+                            }
+                            ItemChange::Add { item, events } => {
+                                // For entities which were not previously matched, state AND events should be included
+                                // but it's weird because EntityState and Event redundantly include entity_id and collection
+                                // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
+                                // it has to have the entity_id
+
+                                let state = match item.to_state() {
+                                    Ok(state) => state,
+                                    Err(e) => {
+                                        warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
+                                        continue;
+                                    }
+                                };
+
+                                let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
                                 let attestation = node.policy_agent.attest_state(&node, &es);
 
-                                updates.push(proto::SubscriptionUpdateItem::initial(
-                                    item.id(),
+                                updates.push(proto::SubscriptionUpdateItem::add(
+                                    item.id,
                                     item.collection.clone(),
                                     Attested::opt(es, attestation),
+                                    events,
                                 ));
                             }
-                        }
-                        ItemChange::Add { item, events } => {
-                            // For entities which were not previously matched, state AND events should be included
-                            // but it's weird because EntityState and Event redundantly include entity_id and collection
-                            // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
-                            // it has to have the entity_id
-
-                            let state = match item.to_state() {
-                                Ok(state) => state,
-                                Err(e) => {
-                                    warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
-                                    continue;
-                                }
-                            };
-
-                            let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
-                            let attestation = node.policy_agent.attest_state(&node, &es);
-
-                            updates.push(proto::SubscriptionUpdateItem::add(
-                                item.id,
-                                item.collection.clone(),
-                                Attested::opt(es, attestation),
-                                events,
-                            ));
-                        }
-                        ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
-                            updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
+                            ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
+                                updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
+                            }
                         }
                     }
-                }
 
-                // Always send subscription update, even if empty
-                node.send_update(
-                    peer_id,
-                    proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates, initial: changeset.initial },
-                );
-            });
+                    // Always send subscription update, even if empty
+                    node.send_update(
+                        peer_id,
+                        proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates, initial: changeset.initial },
+                    );
+                })
+                .await?;
 
-            self.reactor.initialize(subscription).await?;
+            self.reactor.initialize(subscription);
         };
 
         // Store the subscription handle

@@ -37,6 +37,13 @@ impl SubscriptionUpdateItem {
     pub fn change(entity_id: EntityId, collection: CollectionId, events: Vec<Attested<Event>>) -> Self {
         Self::Change { entity_id, collection, events: events.into_iter().map(|e| e.into()).collect() }
     }
+    pub fn entity_id(&self) -> EntityId {
+        match self {
+            Self::Initial { entity_id, .. } => *entity_id,
+            Self::Add { entity_id, .. } => *entity_id,
+            Self::Change { entity_id, .. } => *entity_id,
+        }
+    }
 }
 
 /// An update from one node to another

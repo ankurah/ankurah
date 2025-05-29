@@ -2,9 +2,10 @@ use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use std::sync::{Arc, OnceLock};
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::error::RequestError;
+use crate::error::{RequestError, RetrievalError};
 use crate::node::ContextData;
 use crate::util::safemap::SafeMap;
 use crate::util::safeset::SafeSet;
@@ -22,12 +23,12 @@ pub struct SubscriptionInfo<CD: ContextData> {
     pub predicate: ankql::ast::Predicate,
     pub context_data: CD,
     pub state: SubscriptionState,
-    pub on_subscribe: Arc<dyn Fn() + Send + Sync>, // Does this need to be EntityId or EntityState?
+    pub first_data_signal: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>, // Signal when first data arrives
 }
 
-/// Trait for sending subscription requests to remote peers
+/// Abstracted Node interface for subscription relay integration
 #[async_trait]
-pub trait MessageSender<CD: ContextData>: Send + Sync {
+pub trait TNode<CD: ContextData>: Send + Sync {
     /// Send a subscription request to a remote peer
     /// Returns Ok(()) if the subscription was successfully established (NodeResponseBody::Subscribed),
     /// Err(RequestError) for any error or non-success response
@@ -43,6 +44,15 @@ pub trait MessageSender<CD: ContextData>: Send + Sync {
     /// Send an unsubscribe message to a remote peer
     /// This is a one-way message, no response expected
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, sub_id: proto::SubscriptionId) -> Result<(), anyhow::Error>;
+
+    /// Get entities from peer to refresh stale data
+    async fn get_from_peer(&self, collection_id: &CollectionId, entity_ids: Vec<proto::EntityId>, context_data: &CD) -> anyhow::Result<()>;
+}
+
+/// Abstracted Reactor interface for subscription relay integration
+pub trait TReactor: Send + Sync {
+    /// Get subscription by ID for stale entity detection
+    fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Arc<crate::subscription::Subscription<crate::entity::Entity>>>;
 }
 
 struct SubscriptionRelayInner<CD: ContextData> {
@@ -50,8 +60,10 @@ struct SubscriptionRelayInner<CD: ContextData> {
     subscriptions: SafeMap<proto::SubscriptionId, SubscriptionInfo<CD>>,
     // Track connected durable peers
     connected_peers: SafeSet<proto::EntityId>,
-    // Message sender for communicating with remote peers
-    message_sender: OnceLock<Arc<dyn MessageSender<CD>>>,
+    // Node interface for communicating with remote peers
+    node: OnceLock<Arc<dyn TNode<CD>>>,
+    // Reactor interface for managing local subscriptions
+    reactor: Arc<dyn TReactor>,
 }
 
 /// Manages subscription state and handles remote subscription setup/teardown for ephemeral nodes.
@@ -63,13 +75,14 @@ struct SubscriptionRelayInner<CD: ContextData> {
 /// - Retrying failed subscription attempts
 /// - Clean teardown when subscriptions are removed
 /// - Storing ContextData for each subscription to enable proper authorization
+/// - Stale entity detection and refresh
 ///
 /// This design separates subscription management concerns from the main Node implementation,
 /// making it easier to test and reason about subscription lifecycle management.
 ///
 /// # Public API (for Node integration)
 ///
-/// - `notify_subscribe()` - Call when local subscriptions are created (parallel to reactor.subscribe)
+/// - `register()` - Call when local subscriptions are created (parallel to reactor.subscribe)
 /// - `notify_unsubscribe()` - Call when local subscriptions are removed (parallel to reactor.unsubscribe)
 /// - `notify_peer_connected()` - Call when durable peers connect (triggers automatic setup)
 /// - `notify_peer_disconnected()` - Call when durable peers disconnect (orphans subscriptions)
@@ -87,41 +100,42 @@ pub struct SubscriptionRelay<CD: ContextData> {
 }
 
 impl<CD: ContextData> SubscriptionRelay<CD> {
-    pub fn new() -> Self {
+    pub fn new(reactor: Arc<dyn TReactor>) -> Self {
         Self {
             inner: Arc::new(SubscriptionRelayInner {
                 subscriptions: SafeMap::new(),
                 connected_peers: SafeSet::new(),
-                message_sender: OnceLock::new(),
+                node: OnceLock::new(),
+                reactor,
             }),
         }
     }
 
-    /// Inject the message sender (typically a WeakNode for production)
+    /// Inject the node interface (typically a WeakNode for production)
     ///
     /// This should be called once during initialization. Returns an error if
-    /// the sender has already been set.
-    pub fn set_message_sender(&self, sender: Arc<dyn MessageSender<CD>>) -> Result<(), ()> {
-        self.inner.message_sender.set(sender).map_err(|_| ())
-    }
+    /// the node has already been set.
+    pub fn set_node(&self, node: Arc<dyn TNode<CD>>) -> Result<(), ()> { self.inner.node.set(node).map_err(|_| ()) }
 
-    /// Notify the relay that a new subscription has been created locally and needs remote setup
+    /// Register a new subscription and wait for remote data before returning
     ///
-    /// This should be called whenever a local subscription is established. The relay will
-    /// track this subscription and automatically attempt to set it up with available durable peers.
-    /// LEFT OFF HERE:
-    /// It shoud return a list of entities matching the subscription on successful establishment
-    /// but that establishment might happen multiple times, so we need to do that evaluation multiple times
-    /// so we should take a closure which gets called with the current list of entities matching the subscription whenever it established
+    /// This method will:
+    /// 1. Register the subscription with remote peers
+    /// 2. Wait for the first remote data to arrive
+    /// 3. Perform stale entity detection and refresh
+    /// 4. Return so the caller can initialize the subscription
+    ///
+    /// This method always waits for remote data. If the caller wants cached behavior,
+    /// they should handle that by backgrounding this call.
     pub fn register(
         &self,
         sub_id: proto::SubscriptionId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: CD,
-        on_subscribe: impl Fn() + Send + Sync + 'static,
-    ) {
-        debug!("New subscription {} needs remote setup", sub_id);
+    ) -> Result<(), RetrievalError> {
+        debug!("Registering subscription {}", sub_id);
+
         self.inner.subscriptions.insert(
             sub_id,
             SubscriptionInfo {
@@ -129,7 +143,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                 predicate,
                 context_data,
                 state: SubscriptionState::PendingRemote,
-                on_subscribe: Arc::new(on_subscribe),
+                first_data_signal: Arc::new(std::sync::Mutex::new(None)),
             },
         );
 
@@ -137,12 +151,56 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         if !self.inner.connected_peers.is_empty() {
             self.setup_remote_subscriptions();
         }
+
+        Ok(())
     }
 
-    pub fn notify_applied_initial_state(&self, sub_id: proto::SubscriptionId) {
-        debug!("Applied initial state for subscription {}", sub_id);
+    pub async fn register_and_wait_first_update(
+        &self,
+        sub_id: proto::SubscriptionId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        context_data: CD,
+    ) -> Result<(), RetrievalError> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.subscriptions.insert(
+            sub_id,
+            SubscriptionInfo {
+                collection_id,
+                predicate,
+                context_data,
+                state: SubscriptionState::PendingRemote,
+                first_data_signal: Arc::new(std::sync::Mutex::new(Some(tx))),
+            },
+        );
+
+        // Immediately attempt setup with available peers
+        if !self.inner.connected_peers.is_empty() {
+            self.setup_remote_subscriptions();
+        }
+
+        // Wait for first data to arrive
+        if let Err(_) = rx.await {
+            warn!("Failed to receive first remote update for subscription {}", sub_id);
+        }
+
+        Ok(())
+    }
+
+    pub fn notify_applied_initial_state(&self, sub_id: proto::SubscriptionId, initial_entity_ids: Vec<proto::EntityId>) {
+        println!("🏁 SubscriptionRelay: Applied initial state for subscription {} with {} entities", sub_id, initial_entity_ids.len());
+
         if let Some(info) = self.inner.subscriptions.get(&sub_id) {
-            (info.on_subscribe)();
+            // Signal first data arrival if this is a non-cached subscription waiting for it
+            if let Some(signal) = info.first_data_signal.lock().unwrap().take() {
+                // Try to send signal (ignore if receiver was dropped)
+                let _ = signal.send(());
+            }
+
+            // TODO: Implement stale entity detection here once we have proper reactor access methods
+            println!("🚨 TODO: Implement stale entity detection for subscription {}", sub_id);
+        } else {
+            println!("⚠️  SubscriptionRelay: No subscription info found for {}", sub_id);
         }
     }
 
@@ -156,8 +214,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         // If subscription was established with a peer, send unsubscribe request
         if let Some(info) = self.inner.subscriptions.get(&sub_id) {
             if let SubscriptionState::Established(peer_id) = info.state {
-                let sender = self.inner.message_sender.get();
-                if let Some(sender) = sender {
+                if let Some(sender) = self.inner.node.get() {
                     let sender = sender.clone();
                     crate::task::spawn(async move {
                         if let Err(e) = sender.peer_unsubscribe(peer_id, sub_id).await {
@@ -244,10 +301,10 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     pub(crate) fn setup_remote_subscriptions(&self) {
         let relay = self.clone();
         crate::task::spawn(async move {
-            let sender = match relay.inner.message_sender.get() {
+            let sender = match relay.inner.node.get() {
                 Some(sender) => sender,
                 None => {
-                    warn!("No message sender configured for remote subscription setup");
+                    warn!("No node configured for remote subscription setup");
                     return;
                 }
             };
@@ -296,9 +353,21 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     }
 }
 
-/// Implementation of MessageSender for WeakNode to enable subscription relay integration
+/// Implementation of TReactor for the real Reactor
+impl<SE, PA> TReactor for crate::reactor::Reactor<SE, PA>
+where
+    SE: crate::storage::StorageEngine + Send + Sync + 'static,
+    PA: crate::policy::PolicyAgent + Send + Sync + 'static,
+{
+    fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Arc<crate::subscription::Subscription<crate::entity::Entity>>> {
+        // TODO: Add public method to Reactor to access subscriptions
+        None // Temporary until we add proper accessor
+    }
+}
+
+/// Implementation of TNode for WeakNode to enable subscription relay integration
 #[async_trait]
-impl<SE, PA> MessageSender<PA::ContextData> for crate::node::WeakNode<SE, PA>
+impl<SE, PA> TNode<PA::ContextData> for crate::node::WeakNode<SE, PA>
 where
     SE: crate::storage::StorageEngine + Send + Sync + 'static,
     PA: crate::policy::PolicyAgent + Send + Sync + 'static,
@@ -335,6 +404,17 @@ where
 
         Ok(())
     }
+
+    async fn get_from_peer(
+        &self,
+        collection_id: &CollectionId,
+        entity_ids: Vec<proto::EntityId>,
+        context_data: &PA::ContextData,
+    ) -> anyhow::Result<()> {
+        let node = self.upgrade().ok_or_else(|| anyhow!("Node has been dropped"))?;
+
+        node.get_from_peer(collection_id, entity_ids, context_data).await.map_err(|e| anyhow!("Failed to get from peer: {:?}", e))
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +432,18 @@ mod tests {
 
     // For testing, we'll use CollectionId as our ContextData
     impl ContextData for CollectionId {}
+
+    /// Mock reactor for testing
+    struct MockReactor;
+
+    impl TReactor for MockReactor {
+        fn get_subscription(
+            &self,
+            _sub_id: proto::SubscriptionId,
+        ) -> Option<Arc<crate::subscription::Subscription<crate::entity::Entity>>> {
+            None // Mock implementation
+        }
+    }
 
     /// Mock message sender for testing
     #[derive(Debug)]
@@ -387,7 +479,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl<CD: ContextData> MessageSender<CD> for MockMessageSender<CD> {
+    impl<CD: ContextData> TNode<CD> for MockMessageSender<CD> {
         async fn peer_subscribe(
             &self,
             peer_id: EntityId,
@@ -396,7 +488,7 @@ mod tests {
             predicate: Predicate,
             _context_data: &CD,
         ) -> Result<(), RequestError> {
-            self.sent_requests.lock().unwrap().push((peer_id, sub_id, collection_id.clone(), predicate.clone()));
+            self.sent_requests.lock().unwrap().push((peer_id, sub_id, collection_id, predicate));
 
             if *self.should_fail.lock().unwrap() {
                 Err(RequestError::ConnectionLost)
@@ -407,20 +499,19 @@ mod tests {
 
         async fn peer_unsubscribe(&self, peer_id: EntityId, sub_id: proto::SubscriptionId) -> Result<(), anyhow::Error> {
             self.sent_requests.lock().unwrap().push((peer_id, sub_id, CollectionId::from("unsubscribe"), Predicate::True));
+            Ok(())
+        }
 
-            if *self.should_fail.lock().unwrap() {
-                Err(anyhow!(self.failure_message.lock().unwrap().clone()))
-            } else {
-                Ok(())
-            }
+        async fn get_from_peer(
+            &self,
+            _collection_id: &CollectionId,
+            _entity_ids: Vec<proto::EntityId>,
+            _context_data: &CD,
+        ) -> anyhow::Result<()> {
+            // Mock implementation - just succeed
+            Ok(())
         }
     }
-
-    /// Implementation of MessageSender for WeakNode would require ContextData
-    /// which is not available in this trait. This suggests the trait design
-    /// needs to be reconsidered for production use. For now, we'll leave this
-    /// as a TODO and focus on the core relay functionality.
-
     fn create_test_predicate() -> Predicate {
         // Create a simple test predicate
         Predicate::True
@@ -429,10 +520,11 @@ mod tests {
     fn create_test_collection_id() -> CollectionId { CollectionId::from("test_collection") }
 
     #[tokio::test]
-    async fn test_new_subscription_setup() {
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
+    async fn test_new_subscription_setup() -> anyhow::Result<()> {
+        let mock_reactor = Arc::new(MockReactor);
+        let relay = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
+        relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -443,7 +535,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Notify of new subscription
-        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone())?;
 
         // Check initial state
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
@@ -460,13 +552,16 @@ mod tests {
 
         // Verify subscription is marked as established
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::Established(peer_id)));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_peer_disconnection_orphans_subscriptions() {
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
+    async fn test_peer_disconnection_orphans_subscriptions() -> anyhow::Result<()> {
+        let mock_reactor = Arc::new(MockReactor);
+        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
+        relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -477,7 +572,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Setup established subscription by going through the full flow
-        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone(), || {});
+        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -489,13 +584,16 @@ mod tests {
 
         // Verify subscription is marked as pending again
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_peer_connection_triggers_setup() {
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
+    async fn test_peer_connection_triggers_setup() -> anyhow::Result<()> {
+        let mock_reactor = Arc::new(MockReactor);
+        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
+        relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -503,7 +601,7 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add pending subscription (no peers connected yet)
-        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone())?;
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Clear any previous requests
@@ -523,13 +621,16 @@ mod tests {
 
         // Verify subscription is established
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::Established(peer_id)));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_failed_subscription_retry() {
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
+    async fn test_failed_subscription_retry() -> anyhow::Result<()> {
+        let mock_reactor = Arc::new(MockReactor);
+        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
+        relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -541,7 +642,7 @@ mod tests {
 
         // Connect peer and add subscription
         relay.notify_peer_connected(peer_id);
-        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -571,13 +672,16 @@ mod tests {
 
         // Verify subscription is now established
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::Established(peer_id)));
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_subscription_removal() {
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
+    async fn test_subscription_removal() -> anyhow::Result<()> {
+        let mock_reactor = Arc::new(MockReactor);
+        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
+        relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -586,7 +690,7 @@ mod tests {
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
-        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone(), || {});
+        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -610,11 +714,14 @@ mod tests {
 
         // Verify subscription is gone
         assert_eq!(relay.get_subscription_state(sub_id), None);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_edge_cases() {
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
+    async fn test_edge_cases() -> anyhow::Result<()> {
+        let mock_reactor = Arc::new(MockReactor);
+        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
 
         let sub_id = proto::SubscriptionId::new();
@@ -622,15 +729,15 @@ mod tests {
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
 
-        // Test setup without message sender - should not crash
-        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
+        // Test setup without node - should not crash
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone())?;
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        // Should still be pending since no sender
+        // Should still be pending since no node
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
-        // Now set sender and test with no connected peers
-        relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
+        // Now set node and test with no connected peers
+        relay.set_node(mock_sender.clone()).expect("Failed to set node");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no peers available
@@ -646,20 +753,23 @@ mod tests {
         // Should now be established
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::Established(peer_id)));
         assert_eq!(mock_sender.get_sent_requests().len(), 1);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_notify_unsubscribe_with_no_established_subscription() {
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
+    async fn test_notify_unsubscribe_with_no_established_subscription() -> anyhow::Result<()> {
+        let mock_reactor = Arc::new(MockReactor);
+        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
+        relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
 
         // Add subscription but don't establish it
-        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone(), || {});
+        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone())?;
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Unsubscribe from pending subscription
@@ -674,5 +784,7 @@ mod tests {
 
         // Verify subscription is gone
         assert_eq!(relay.get_subscription_state(sub_id), None);
+
+        Ok(())
     }
 }

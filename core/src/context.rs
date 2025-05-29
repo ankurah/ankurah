@@ -293,31 +293,19 @@ where
         let cached = args.cached;
 
         // Register subscription with reactor (synchronous)
-        let subscription = self.node.reactor.register(handle.id, collection_id, args.predicate, callback);
+        let subscription = self.node.reactor.register(handle.id, collection_id, args.predicate, callback).await?;
 
         // Handle remote subscription setup
         if let Some(ref relay) = self.node.subscription_relay {
-            relay.register(sub_id, collection_id.clone(), predicate, self.cdata.clone(), || {
-                todo!(
-                    "check initial entities against relay result - do this last, after the type system is happy with the rest of the repo"
-                );
-            });
-
-            if !cached {
-                // Create oneshot channel to wait for first remote update
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                self.node.pending_subs.insert(sub_id, tx);
-
-                // Wait for first remote update before initializing
-                if let Err(_) = rx.await {
-                    // Channel was dropped, proceed with local initialization anyway
-                    warn!("Failed to receive first remote update for subscription {}", sub_id);
-                }
+            if cached {
+                relay.register(sub_id, collection_id.clone(), predicate, self.cdata.clone())?;
+            } else {
+                relay.register_and_wait_first_update(sub_id, collection_id.clone(), predicate, self.cdata.clone()).await?;
             }
         }
 
-        // Always initialize the subscription
-        self.node.reactor.initialize(subscription).await?;
+        // Fire off the first notification for the subscription
+        self.node.reactor.initialize(subscription);
 
         Ok(handle)
     }

@@ -74,72 +74,69 @@ where
         })
     }
 
-    /// Register a subscription without performing initial evaluation
-    /// This is synchronous and just sets up the subscription structure and watchers
-    pub fn register(
+    /// Register a subscription and perform initial local data fetch
+    /// This sets up the subscription structure and populates it with local data,
+    /// but does NOT call the on_change callback yet (that happens in initialize)
+    pub async fn register(
         &self,
         sub_id: proto::SubscriptionId,
         collection_id: &proto::CollectionId,
         predicate: ankql::ast::Predicate,
         on_change: impl Fn(ChangeSet<Entity>) + Send + Sync + 'static,
-    ) -> Arc<Subscription<Entity>> {
+    ) -> anyhow::Result<Arc<Subscription<Entity>>> {
         // Start watching the relevant indexes
         Self::manage_watchers_recurse(self, collection_id, &predicate, sub_id, WatcherOp::Add);
 
-        // Create subscription with empty initial matching entities
+        // Find initial matching entities from local storage
+        let storage_collection = self.collections.get(collection_id).await?;
+        let matching_states = storage_collection.fetch_states(&predicate).await?;
+        let mut matching_entities = Vec::new();
+
+        // in theory, any state that is in the collection should already have its events in the storage collection as well
+        let retriever = LocalRetriever::new(storage_collection.clone());
+        // Convert states to Entity and set up entity watchers
+        for state in &matching_states {
+            let (_, entity) =
+                self.entityset.with_state(&retriever, state.payload.entity_id, collection_id.to_owned(), &state.payload.state).await?;
+
+            // I don't think we need to do this redundantly
+            // if ankql::selection::filter::evaluate_predicate(&entity, &subscription.predicate).unwrap_or(false) {
+            matching_entities.push(entity.clone());
+            self.entity_watchers.set_insert(entity.id, sub_id);
+            // }
+        }
+
+        // Create subscription with local matching entities, but NOT initialized yet
         let subscription = Arc::new(Subscription {
             id: sub_id,
             collection_id: collection_id.clone(),
             predicate,
             on_change: Arc::new(Box::new(on_change)),
-            matching_entities: std::sync::Mutex::new(Vec::new()),
+            matching_entities: std::sync::Mutex::new(matching_entities),
             initialized: AtomicBool::new(false),
         });
 
         // Register the subscription
         self.subscriptions.insert(sub_id, subscription.clone());
 
-        subscription
+        Ok(subscription)
     }
 
-    /// Initialize a subscription by performing initial evaluation and calling the callback
-    /// This is async and does the initial fetch and evaluation
-    pub async fn initialize(&self, subscription: Arc<Subscription<Entity>>) -> anyhow::Result<()> {
-        // Find initial matching entities
-        let storage_collection = self.collections.get(&subscription.collection_id).await?;
-        let matching_states = storage_collection.fetch_states(&subscription.predicate).await?;
-        let mut matching_entities = Vec::new();
-
-        // in theory, any state that is in the collection should already have its events in the storage collection as well
-        let retriever = LocalRetriever::new(storage_collection.clone());
-        // Convert states to Entity and filter by predicate
-        for state in &matching_states {
-            let (_, entity) = self
-                .entityset
-                .with_state(&retriever, state.payload.entity_id, subscription.collection_id.to_owned(), &state.payload.state)
-                .await?;
-
-            // I don't think we need to do this redundantly
-            // if ankql::selection::filter::evaluate_predicate(&entity, &subscription.predicate).unwrap_or(false) {
-            matching_entities.push(entity.clone());
-            self.entity_watchers.set_insert(entity.id, subscription.id);
-            // }
-        }
-
-        // Update subscription's matching entities
-        *subscription.matching_entities.lock().unwrap() = matching_entities.clone();
+    /// Initialize a subscription by calling the callback with the current data
+    /// This should only be called after any remote data has been fetched and stale entities refreshed
+    pub fn initialize(&self, subscription: Arc<Subscription<Entity>>) {
+        // Get the current matching entities (which should already include refreshed data)
+        let matching_entities = subscription.matching_entities.lock().unwrap().clone();
 
         // Mark subscription as initialized
         subscription.initialized.store(true, Ordering::SeqCst);
 
-        // Call callback with initial state
+        // Call callback with current state
         (subscription.on_change)(ChangeSet {
             changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
             resultset: ResultSet { loaded: true, items: matching_entities.clone() },
             initial: true,
         });
-
-        Ok(())
     }
 
     fn manage_watchers_recurse(
@@ -281,41 +278,37 @@ where
             // Check each possibly interested subscription with full predicate evaluation
             for sub_id in possibly_interested_subs {
                 if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                    // Skip uninitialized subscriptions
-                    if !subscription.initialized.load(Ordering::SeqCst) {
-                        continue;
-                    }
-
                     // Use evaluate_predicate directly on the entity instead of fetch_entities
                     debug!("\tnotify_change predicate: {} {:?}", sub_id, subscription.predicate);
                     let matches = ankql::selection::filter::evaluate_predicate::<Entity>(&entity, &subscription.predicate).unwrap_or(false);
 
-                    let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id() == entity.id());
-                    use ankql::selection::filter::Filterable;
-                    debug!("\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}", entity.id, entity.value("status"));
-
-                    // Update entity watchers and notify subscription if needed
+                    // Always update entity watchers, even for uninitialized subscriptions
                     self.update_entity_watchers(&entity, matches, sub_id);
 
-                    // Determine the change type
-                    let new_change: Option<ItemChange<Entity>> = if matches != did_match {
-                        // Matching status changed
-                        Some(if matches {
-                            ItemChange::Add { item: entity.clone(), events: events.clone() }
-                        } else {
-                            ItemChange::Remove { item: entity.clone(), events: events.clone() }
-                        })
-                    } else if matches {
-                        // Entity still matches but was updated
-                        Some(ItemChange::Update { item: entity.clone(), events: events.clone() })
-                    } else {
-                        // Entity didn't match before and still doesn't match
-                        None
-                    };
+                    // Only proceed with callback logic if subscription is initialized
+                    if subscription.initialized.load(Ordering::SeqCst) {
+                        let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id() == entity.id());
 
-                    // Add the change to the subscription's changes if there is one
-                    if let Some(new_change) = new_change {
-                        sub_changes.entry(sub_id).or_default().push(new_change);
+                        // Determine the change type
+                        let new_change: Option<ItemChange<Entity>> = if matches != did_match {
+                            // Matching status changed
+                            Some(if matches {
+                                ItemChange::Add { item: entity.clone(), events: events.clone() }
+                            } else {
+                                ItemChange::Remove { item: entity.clone(), events: events.clone() }
+                            })
+                        } else if matches {
+                            // Entity still matches but was updated
+                            Some(ItemChange::Update { item: entity.clone(), events: events.clone() })
+                        } else {
+                            // Entity didn't match before and still doesn't match
+                            None
+                        };
+
+                        // Add the change to the subscription's changes if there is one
+                        if let Some(new_change) = new_change {
+                            sub_changes.entry(sub_id).or_default().push(new_change);
+                        }
                     }
                 }
             }
