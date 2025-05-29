@@ -474,7 +474,7 @@ where
         };
 
         match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { subscription_id, items } => {
+            proto::NodeUpdateBody::SubscriptionUpdate { subscription_id, items, initial } => {
                 // TODO check if this is a valid subscription
                 action_debug!(self, "received subscription update for {} items", "{}", items.len());
                 if let Some(cdata) = self.subscription_context.get(&subscription_id) {
@@ -488,6 +488,12 @@ where
                 } else {
                     error!("Received subscription update for unknown subscription {}", subscription_id);
                     return Err(anyhow!("Received subscription update for unknown subscription {}", subscription_id));
+                }
+
+                if initial {
+                    if let Some(relay) = self.subscription_relay.as_ref() {
+                        relay.notify_applied_initial_state(subscription_id);
+                    }
                 }
 
                 Ok(())
@@ -610,7 +616,7 @@ where
                 let collection = self.collections.get(&payload.collection).await?;
                 let getter = (payload.collection.clone(), nodeandcontext);
 
-                match self.entities.with_state(&getter, payload.entity_id, payload.collection, payload.state).await? {
+                match self.entities.with_state(&getter, payload.entity_id, payload.collection, &payload.state).await? {
                     (Some(true), entity) => {
                         // We had the entity already, and this state is newer than the one we have, so save it to the collection
                         // Not sure if we should reproject the state - discuss
@@ -656,7 +662,7 @@ where
 
                 match self
                     .entities
-                    .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, state.payload.state)
+                    .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, &state.payload.state)
                     .await?
                 {
                     (Some(false), _entity) => {
@@ -785,7 +791,10 @@ where
                 }
 
                 // Always send subscription update, even if empty
-                node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates });
+                node.send_update(
+                    peer_id,
+                    proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates, initial: changeset.initial },
+                );
             });
 
             self.reactor.initialize(subscription).await?;

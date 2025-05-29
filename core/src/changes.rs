@@ -90,6 +90,7 @@ impl std::fmt::Display for EntityChange {
 pub struct ChangeSet<R> {
     pub resultset: crate::resultset::ResultSet<R>,
     pub changes: Vec<ItemChange<R>>,
+    pub initial: bool,
 }
 
 impl<I> std::fmt::Display for ChangeSet<I>
@@ -112,6 +113,7 @@ where I: View
                 items: val.resultset.iter().map(|item| I::from_entity(item.clone())).collect(),
             },
             changes: val.changes.into_iter().map(|change| change.into()).collect(),
+            initial: val.initial,
         }
     }
 }

@@ -21,7 +21,7 @@ use tracing::info;
 use tracing::instrument;
 use tracing::{debug, warn};
 
-use ankurah_proto::{self as proto, EntityId};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 
@@ -81,7 +81,7 @@ where
         sub_id: proto::SubscriptionId,
         collection_id: &proto::CollectionId,
         predicate: ankql::ast::Predicate,
-        callback: impl Fn(ChangeSet<Entity>) + Send + Sync + 'static,
+        on_change: impl Fn(ChangeSet<Entity>) + Send + Sync + 'static,
     ) -> Arc<Subscription<Entity>> {
         // Start watching the relevant indexes
         Self::manage_watchers_recurse(self, collection_id, &predicate, sub_id, WatcherOp::Add);
@@ -91,7 +91,7 @@ where
             id: sub_id,
             collection_id: collection_id.clone(),
             predicate,
-            callback: Arc::new(Box::new(callback)),
+            on_change: Arc::new(Box::new(on_change)),
             matching_entities: std::sync::Mutex::new(Vec::new()),
             initialized: AtomicBool::new(false),
         });
@@ -107,25 +107,23 @@ where
     pub async fn initialize(&self, subscription: Arc<Subscription<Entity>>) -> anyhow::Result<()> {
         // Find initial matching entities
         let storage_collection = self.collections.get(&subscription.collection_id).await?;
-        let states = storage_collection.fetch_states(&subscription.predicate).await?;
+        let matching_states = storage_collection.fetch_states(&subscription.predicate).await?;
         let mut matching_entities = Vec::new();
 
         // in theory, any state that is in the collection should already have its events in the storage collection as well
         let retriever = LocalRetriever::new(storage_collection.clone());
         // Convert states to Entity and filter by predicate
-        for state in states {
+        for state in &matching_states {
             let (_, entity) = self
                 .entityset
-                .with_state(&retriever, state.payload.entity_id, subscription.collection_id.to_owned(), state.payload.state)
+                .with_state(&retriever, state.payload.entity_id, subscription.collection_id.to_owned(), &state.payload.state)
                 .await?;
 
-            // Evaluate predicate for each entity
-            if ankql::selection::filter::evaluate_predicate(&entity, &subscription.predicate).unwrap_or(false) {
-                matching_entities.push(entity.clone());
-
-                // Set up entity watchers
-                self.entity_watchers.set_insert(entity.id, subscription.id);
-            }
+            // I don't think we need to do this redundantly
+            // if ankql::selection::filter::evaluate_predicate(&entity, &subscription.predicate).unwrap_or(false) {
+            matching_entities.push(entity.clone());
+            self.entity_watchers.set_insert(entity.id, subscription.id);
+            // }
         }
 
         // Update subscription's matching entities
@@ -135,9 +133,10 @@ where
         subscription.initialized.store(true, Ordering::SeqCst);
 
         // Call callback with initial state
-        (subscription.callback)(ChangeSet {
+        (subscription.on_change)(ChangeSet {
             changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
             resultset: ResultSet { loaded: true, items: matching_entities.clone() },
+            initial: true,
         });
 
         Ok(())
@@ -325,9 +324,10 @@ where
         // Send batched notifications
         for (sub_id, changes) in sub_changes {
             if let Some(subscription) = self.subscriptions.get(&sub_id) {
-                (subscription.callback)(ChangeSet {
+                (subscription.on_change)(ChangeSet {
                     resultset: ResultSet { loaded: true, items: subscription.matching_entities.lock().unwrap().clone() },
                     changes,
+                    initial: false,
                 });
             }
         }
@@ -353,12 +353,13 @@ where
                     .collect();
 
                 // Notify the subscription
-                (subscription.callback)(ChangeSet {
+                (subscription.on_change)(ChangeSet {
                     changes,
                     resultset: ResultSet {
                         loaded: true,
                         items: vec![], // Empty resultset since everything is removed
                     },
+                    initial: false,
                 });
             }
         }

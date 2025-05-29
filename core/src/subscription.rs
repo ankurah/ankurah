@@ -1,5 +1,5 @@
 use crate::{changes::ChangeSet, entity::Entity, node::TNodeErased};
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, EntityId};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 /// A callback function that receives subscription updates
@@ -11,7 +11,7 @@ pub struct Subscription<R: Clone> {
     pub(crate) id: proto::SubscriptionId,
     pub(crate) collection_id: proto::CollectionId,
     pub(crate) predicate: ankql::ast::Predicate,
-    pub(crate) callback: Arc<Callback<R>>,
+    pub(crate) on_change: Arc<Callback<R>>,
     // Track which entities currently match this subscription
     // TODO make this a ResultSet so we can clone it cheaply
     pub(crate) matching_entities: Mutex<Vec<Entity>>,

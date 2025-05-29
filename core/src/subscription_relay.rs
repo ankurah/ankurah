@@ -16,12 +16,13 @@ pub enum SubscriptionState {
     Failed(String),               // Failed to establish, needs retry
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SubscriptionInfo<CD: ContextData> {
     pub collection_id: CollectionId,
     pub predicate: ankql::ast::Predicate,
     pub context_data: CD,
     pub state: SubscriptionState,
+    pub on_subscribe: Arc<dyn Fn() + Send + Sync>, // Does this need to be EntityId or EntityState?
 }
 
 /// Trait for sending subscription requests to remote peers
@@ -108,21 +109,40 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     ///
     /// This should be called whenever a local subscription is established. The relay will
     /// track this subscription and automatically attempt to set it up with available durable peers.
-    pub fn notify_subscribe(
+    /// LEFT OFF HERE:
+    /// It shoud return a list of entities matching the subscription on successful establishment
+    /// but that establishment might happen multiple times, so we need to do that evaluation multiple times
+    /// so we should take a closure which gets called with the current list of entities matching the subscription whenever it established
+    pub fn register(
         &self,
         sub_id: proto::SubscriptionId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: CD,
+        on_subscribe: impl Fn() + Send + Sync + 'static,
     ) {
         debug!("New subscription {} needs remote setup", sub_id);
-        self.inner
-            .subscriptions
-            .insert(sub_id, SubscriptionInfo { collection_id, predicate, context_data, state: SubscriptionState::PendingRemote });
+        self.inner.subscriptions.insert(
+            sub_id,
+            SubscriptionInfo {
+                collection_id,
+                predicate,
+                context_data,
+                state: SubscriptionState::PendingRemote,
+                on_subscribe: Arc::new(on_subscribe),
+            },
+        );
 
         // Immediately attempt setup with available peers
         if !self.inner.connected_peers.is_empty() {
             self.setup_remote_subscriptions();
+        }
+    }
+
+    pub fn notify_applied_initial_state(&self, sub_id: proto::SubscriptionId) {
+        debug!("Applied initial state for subscription {}", sub_id);
+        if let Some(info) = self.inner.subscriptions.get(&sub_id) {
+            (info.on_subscribe)();
         }
     }
 
@@ -423,7 +443,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Notify of new subscription
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
 
         // Check initial state
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
@@ -457,7 +477,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Setup established subscription by going through the full flow
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone(), || {});
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -483,7 +503,7 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add pending subscription (no peers connected yet)
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Clear any previous requests
@@ -521,7 +541,7 @@ mod tests {
 
         // Connect peer and add subscription
         relay.notify_peer_connected(peer_id);
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -566,7 +586,7 @@ mod tests {
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone(), || {});
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -603,7 +623,7 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Test setup without message sender - should not crash
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.register(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone(), || {});
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
@@ -639,7 +659,7 @@ mod tests {
         let predicate = create_test_predicate();
 
         // Add subscription but don't establish it
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.register(sub_id, collection_id.clone(), predicate, collection_id.clone(), || {});
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Unsubscribe from pending subscription

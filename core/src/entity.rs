@@ -362,7 +362,7 @@ impl WeakEntitySet {
                 Ok(Some(state)) => {
                     // technically someone could have added the entity since we last checked, so it's better to use the
                     // with_state method to re-check
-                    let (_, entity) = self.with_state(retriever, *id, collection_id.to_owned(), state.payload.state).await?;
+                    let (_, entity) = self.with_state(retriever, *id, collection_id.to_owned(), &state.payload.state).await?;
                     Ok(Some(entity))
                 }
                 Err(e) => Err(e),
@@ -412,7 +412,7 @@ impl WeakEntitySet {
         retriever: &R,
         id: EntityId,
         collection_id: CollectionId,
-        state: State,
+        state: &State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where
         R: Retrieve<Id = EventId, Event = Event>,
@@ -464,7 +464,7 @@ impl WeakEntitySet {
         };
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let changed = entity.apply_state(retriever, &state).await?;
+        let changed = entity.apply_state(retriever, state).await?;
         Ok((Some(changed), entity))
     }
 }

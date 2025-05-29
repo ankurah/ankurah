@@ -226,7 +226,7 @@ where
                 let (_changed, entity) = self
                     .node
                     .entities
-                    .with_state(&(collection_id.clone(), self), id, collection_id.clone(), entity_state.payload.state)
+                    .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &entity_state.payload.state)
                     .await?;
                 Ok(entity)
             }
@@ -234,7 +234,7 @@ where
                 let (_, entity) = self
                     .node
                     .entities
-                    .with_state(&(collection_id.clone(), self), id, collection_id.clone(), proto::State::default())
+                    .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &proto::State::default())
                     .await?;
                 Ok(entity)
             }
@@ -267,7 +267,7 @@ where
             let (_, entity) = self
                 .node
                 .entities
-                .with_state(&(collection_id.clone(), self), state.payload.entity_id, collection_id.clone(), state.payload.state)
+                .with_state(&(collection_id.clone(), self), state.payload.entity_id, collection_id.clone(), &state.payload.state)
                 .await?;
             entities.push(entity);
         }
@@ -297,7 +297,11 @@ where
 
         // Handle remote subscription setup
         if let Some(ref relay) = self.node.subscription_relay {
-            relay.notify_subscribe(sub_id, collection_id.clone(), predicate, self.cdata.clone());
+            relay.register(sub_id, collection_id.clone(), predicate, self.cdata.clone(), || {
+                todo!(
+                    "check initial entities against relay result - do this last, after the type system is happy with the rest of the repo"
+                );
+            });
 
             if !cached {
                 // Create oneshot channel to wait for first remote update
