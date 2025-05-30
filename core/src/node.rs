@@ -590,6 +590,7 @@ where
                 }
             }
         }
+        // TODO - think about whether this should come after notifying the relay or not
         debug!("{self} notifying reactor of {} changes", changes.len());
         self.reactor.notify_change(changes);
 
@@ -877,12 +878,14 @@ where
     ) -> Result<(), RetrievalError> {
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
+        println!("🔍 Node::get_from_peer: collection_id = {collection_id}, ids = {ids:?}");
         match self
             .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
             .await
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
         {
             proto::NodeResponseBody::Get(states) => {
+                println!("🔍 Node::get_from_peer: states = {states:?}");
                 let collection = self.collections.get(collection_id).await?;
 
                 // do we have the ability to merge states?

@@ -46,7 +46,12 @@ pub trait TNode<CD: ContextData>: Send + Sync {
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, sub_id: proto::SubscriptionId) -> Result<(), anyhow::Error>;
 
     /// Get entities from peer to refresh stale data
-    async fn get_from_peer(&self, collection_id: &CollectionId, entity_ids: Vec<proto::EntityId>, context_data: &CD) -> anyhow::Result<()>;
+    async fn get_from_peer(
+        &self,
+        collection_id: &CollectionId,
+        entity_ids: Vec<proto::EntityId>,
+        context_data: &CD,
+    ) -> Result<(), RetrievalError>;
 }
 
 /// Abstracted Reactor interface for subscription relay integration
@@ -199,24 +204,38 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         };
         // Get the subscription from reactor to access matching_entities
         if let Some(subscription) = self.inner.reactor.get_subscription(sub_id) {
-            // Create HashSet from server's initial entities first
-            let mut entity_ids: std::collections::HashSet<proto::EntityId> = initial_entity_ids.iter().copied().collect();
+            // Create HashSet from server's initial entities for fast lookup
+            let initial_set: std::collections::HashSet<proto::EntityId> = initial_entity_ids.iter().copied().collect();
 
-            // Lock matching_entities and iterate without cloning
+            // Start with our local entities and remove the ones server has
+            let mut stale_entity_ids = Vec::new();
             {
                 for entity in subscription.matching_entities.lock().unwrap().iter() {
-                    entity_ids.remove(&entity.id);
+                    println!("💡 SubscriptionRelay: Entity {} is in local matching_entities", entity.id);
+                    if initial_set.contains(&entity.id) {
+                        println!(" ✅ SubscriptionRelay: Entity {} is also on server (not stale)", entity.id);
+                    } else {
+                        use ankql::selection::filter::Filterable;
+                        println!(
+                            " ❌ SubscriptionRelay: Entity {} is NOT on server (stale) {}",
+                            entity.id,
+                            entity.value("year").unwrap_or_default()
+                        );
+                        stale_entity_ids.push(entity.id);
+                    }
                 }
             }
-            // initial_set now contains entities that server has but we don't (new entities)
-            // stale_entity_ids contains entities we have but server doesn't (stale entities)
 
-            if !entity_ids.is_empty() {
-                println!("🚨 SubscriptionRelay: Found {} stale entities for subscription {}, refreshing...", entity_ids.len(), sub_id);
+            if !stale_entity_ids.is_empty() {
+                println!(
+                    "🚨 SubscriptionRelay: Found {} stale entities for subscription {}, refreshing...",
+                    stale_entity_ids.len(),
+                    sub_id
+                );
 
                 // Get node to refresh stale entities
                 if let Some(node) = self.inner.node.get() {
-                    node.get_from_peer(&subscription.collection_id, entity_ids.into_iter().collect(), &info.context_data).await?;
+                    node.get_from_peer(&subscription.collection_id, stale_entity_ids, &info.context_data).await?;
                 } else {
                     warn!("SubscriptionRelay: No node available to refresh stale entities for subscription {}", sub_id);
                 }
@@ -444,10 +463,10 @@ where
         collection_id: &CollectionId,
         entity_ids: Vec<proto::EntityId>,
         context_data: &PA::ContextData,
-    ) -> anyhow::Result<()> {
-        let node = self.upgrade().ok_or_else(|| anyhow!("Node has been dropped"))?;
+    ) -> Result<(), RetrievalError> {
+        let node = self.upgrade().ok_or_else(|| RetrievalError::Other("node has been dropped".to_string()))?;
 
-        node.get_from_peer(collection_id, entity_ids, context_data).await.map_err(|e| anyhow!("Failed to get from peer: {:?}", e))
+        node.get_from_peer(collection_id, entity_ids, context_data).await
     }
 }
 
@@ -541,7 +560,7 @@ mod tests {
             _collection_id: &CollectionId,
             _entity_ids: Vec<proto::EntityId>,
             _context_data: &CD,
-        ) -> anyhow::Result<()> {
+        ) -> Result<(), RetrievalError> {
             // Mock implementation - just succeed
             Ok(())
         }

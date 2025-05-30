@@ -26,7 +26,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let trx = server_ctx.begin();
         let album1 = trx.create(&Album { name: "Test Album 1".into(), year: "2020".into() }).await?;
         let album1: AlbumView = album1.read();
-        let album2 = trx.create(&Album { name: "Test Album 2".into(), year: "2020".into() }).await?;
+        let album2 = trx.create(&Album { name: "Test Album 2".into(), year: "2091".into() }).await?;
         let album2: AlbumView = album2.read();
         trx.commit().await?;
         (album1, album2)
@@ -44,7 +44,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Should get both albums initially
-    assert_eq!(vec![vec!["2020", "2020"]], check());
+    assert_eq!(vec![vec!["2020", "2091"]], check());
 
     // actually zero events because we receive a state from ItemChange::Initial
     assert_eq!(0, client_collection.dump_entity_events(album1_id.clone()).await?.len()); // after subscribe
