@@ -534,7 +534,8 @@ where
         for event in events.iter_mut() {
             let collection = self.collections.get(&event.payload.collection).await?;
 
-            // When applying an event, we should only look at the local storage for the lineage
+            // When applying events for a remote transaction, we should only look at the local storage for the lineage
+            // If we are missing events necessary to connect the lineage, that's their responsibility to include in the transaction.
             let retriever = LocalRetriever::new(collection.clone());
             let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
 
@@ -627,24 +628,13 @@ where
                 let getter = (payload.collection.clone(), nodeandcontext);
 
                 match self.entities.with_state(&getter, payload.entity_id, payload.collection, &payload.state).await? {
-                    (Some(true), entity) => {
-                        // We had the entity already, and this state is newer than the one we have, so save it to the collection
-                        // Not sure if we should reproject the state - discuss
-                        // however, if we do reproject, we need to re-attest the state
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
-                        Ok(Some(EntityChange::new(entity, vec![])?))
-                    }
-                    (Some(false), _entity) => {
+                    (Some(false), _) => {
                         // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
                         Ok(None)
                     }
-                    (None, entity) => {
-                        // We did not have the entity yet, so we created it, so save it to the collection
-                        // see notes as above regarding reprojecting and re-attesting the state
+                    (Some(true) | None, entity) => {
+                        // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
+                        // so save it to the collection
                         let state = entity.to_state()?;
                         let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                         let attestation = self.policy_agent.attest_state(self, &entity_state);
@@ -679,21 +669,9 @@ where
                         // had it already, and the state is not newer than the one we have
                         Ok(None)
                     }
-                    (Some(true), entity) => {
-                        // had it already, and the state is newer than the one we have, and was applied successfully, so save it and return the change
-                        // reduce the probability of error by reprojecting the state - is this necessary if we've validated the attestation?
-                        // See notes above regarding reprojecting and re-attesting the state
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
-                        Ok(Some(EntityChange::new(entity, attested_events)?))
-                    }
-
-                    (None, entity) => {
-                        // did not have it, so we created it, so save it and return the change
-                        // See notes above regarding attestation/reprojection
+                    (Some(true) | None, entity) => {
+                        // we had it already, or we did not have it yet and the state is newer than the one we have and was applied successfully
+                        // so save it and return the change
                         let state = entity.to_state()?;
                         let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                         let attestation = self.policy_agent.attest_state(self, &entity_state);
@@ -715,7 +693,7 @@ where
                     attested_events.push(event);
                 }
 
-                let entity =
+                let entity: Entity =
                     self.entities.get_retrieve_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
 
                 let mut changed = false;
