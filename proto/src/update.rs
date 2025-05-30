@@ -44,6 +44,13 @@ impl SubscriptionUpdateItem {
             Self::Change { entity_id, .. } => *entity_id,
         }
     }
+    pub fn into_parts(self) -> (EntityId, CollectionId, Option<StateFragment>, Option<Vec<EventFragment>>) {
+        match self {
+            Self::Initial { entity_id, collection, state } => (entity_id, collection, Some(state), None),
+            Self::Add { entity_id, collection, state, events } => (entity_id, collection, Some(state), Some(events)),
+            Self::Change { entity_id, collection, events } => (entity_id, collection, None, Some(events)),
+        }
+    }
 }
 
 /// An update from one node to another

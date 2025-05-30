@@ -481,10 +481,6 @@ where
                     let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
 
                     self.apply_subscription_updates(&notification.from, subscription_id, items, nodeandcontext, initial).await?;
-                    // Signal any pending subscription waiting for first update
-                    if let Some(tx) = self.pending_subs.remove(&subscription_id) {
-                        let _ = tx.send(()); // Ignore if receiver was dropped
-                    }
                 } else {
                     error!("Received subscription update for unknown subscription {}", subscription_id);
                     return Err(anyhow!("Received subscription update for unknown subscription {}", subscription_id));
@@ -600,6 +596,11 @@ where
                 relay.notify_applied_initial_state(subscription_id, initial_entity_ids).await?;
             }
         }
+        // Signal any pending subscription waiting for first update
+        if let Some(tx) = self.pending_subs.remove(&subscription_id) {
+            let _ = tx.send(()); // Ignore if receiver was dropped
+        }
+
         Ok(())
     }
 
@@ -617,61 +618,42 @@ where
         update: proto::SubscriptionUpdateItem,
         nodeandcontext: &NodeAndContext<SE, PA>,
     ) -> Result<Option<EntityChange>, MutationError> {
-        match update {
-            proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
-                let state = (entity_id, collection, state).into();
-                // validate that we trust the state given to us
-                self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
+        let (entity_id, collection_id, state, events) = update.into_parts();
+        let collection = self.collections.get(&collection_id).await?;
+        let getter = (collection_id.clone(), nodeandcontext);
 
-                let payload = state.payload;
-                let collection = self.collections.get(&payload.collection).await?;
-                let getter = (payload.collection.clone(), nodeandcontext);
-
-                match self.entities.with_state(&getter, payload.entity_id, payload.collection, &payload.state).await? {
-                    (Some(false), _) => {
-                        // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
-                        Ok(None)
-                    }
-                    (Some(true) | None, entity) => {
-                        // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
-                        // so save it to the collection
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
-                        Ok(Some(EntityChange::new(entity, vec![])?))
-                    }
-                }
-            }
-            proto::SubscriptionUpdateItem::Add { entity_id, collection: collection_id, state, events } => {
-                let collection = self.collections.get(&collection_id).await?;
-
+        let attested_events = match events {
+            Some(events) => {
                 // validate and store the events, in case we need them for lineage comparison
                 let mut attested_events = Vec::new();
                 for event in events.iter() {
-                    let event: Attested<ankurah_proto::Event> = (entity_id, collection_id.clone(), event.clone()).into();
+                    // : Attested<ankurah_proto::Event>
+                    let event = (entity_id, collection_id.clone(), event.clone()).into();
                     self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
                     // store the validated event in case we need it for lineage comparison
                     collection.add_event(&event).await?;
                     attested_events.push(event);
                 }
+                attested_events
+            }
+            None => vec![],
+        };
 
+        match state {
+            Some(state) => {
                 let state = (entity_id, collection_id.clone(), state).into();
+                // validate that we trust the state given to us
                 self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
 
-                match self
-                    .entities
-                    .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, &state.payload.state)
-                    .await?
-                {
-                    (Some(false), _entity) => {
-                        // had it already, and the state is not newer than the one we have
-                        Ok(None)
-                    }
+                let payload = state.payload;
+
+                match self.entities.with_state(&getter, payload.entity_id, payload.collection, &payload.state).await? {
+                    // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
+                    (Some(false), _) => Ok(None),
+                    // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
                     (Some(true) | None, entity) => {
-                        // we had it already, or we did not have it yet and the state is newer than the one we have and was applied successfully
-                        // so save it and return the change
+                        // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
+                        // so save it to the collection
                         let state = entity.to_state()?;
                         let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                         let attestation = self.policy_agent.attest_state(self, &entity_state);
@@ -681,22 +663,12 @@ where
                     }
                 }
             }
-            proto::SubscriptionUpdateItem::Change { entity_id, collection: collection_id, events } => {
-                let collection = self.collections.get(&collection_id).await?;
-                let mut attested_events = Vec::new();
-                for event in events.iter() {
-                    let event = (entity_id, collection_id.clone(), event.clone()).into();
-
-                    self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
-                    // store the validated event in case we need it for lineage comparison
-                    collection.add_event(&event).await?;
-                    attested_events.push(event);
-                }
-
+            None => {
                 let entity: Entity =
                     self.entities.get_retrieve_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
 
                 let mut changed = false;
+                // TODO - figure out how to apply the events in the correct order
                 for event in attested_events.iter() {
                     changed = entity.apply_event(&(collection_id.clone(), nodeandcontext), &event.payload).await?;
                 }
