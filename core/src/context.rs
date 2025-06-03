@@ -300,11 +300,12 @@ where
                 self.node.reactor.register(subscription.clone(), retriever)?;
             }
             Some(relay) => {
-                let first_update_received = if args.cached {
-                    relay.register(subscription.clone(), self.cdata.clone())?;
+                let first_update_received = relay.register(subscription.clone(), self.cdata.clone())?;
+
+                let remote_ready_rx = if args.cached {
                     None // For cached mode, don't wait for remote data
                 } else {
-                    Some(relay.register(subscription.clone(), self.cdata.clone())?)
+                    Some(first_update_received)
                 };
 
                 let retriever = RemoteFetcher::new(
@@ -312,7 +313,7 @@ where
                     self.node.entities.clone(),
                     Arc::new(relay.clone()),
                     self.cdata.clone(),
-                    first_update_received,
+                    remote_ready_rx,
                     args.cached,
                 );
                 self.node.reactor.register(subscription.clone(), retriever)?;
