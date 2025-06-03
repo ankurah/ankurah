@@ -2,10 +2,9 @@ use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::collectionset::CollectionSet;
 use crate::entity::{Entity, WeakEntitySet};
-use crate::node::MatchArgs;
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
-use crate::retrieval::LocalRetriever;
+use crate::retrieve::Fetch;
 use crate::storage::StorageEngine;
 use crate::subscription::Subscription;
 use crate::util::safemap::SafeMap;
@@ -14,14 +13,13 @@ use crate::value::Value;
 use ankql::ast;
 use ankql::selection::filter::Filterable;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::info;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 use tracing::{debug, warn};
 
-use ankurah_proto::{self as proto, Attested, EntityId, EntityState};
+use ankurah_proto::{self as proto};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 
@@ -32,7 +30,7 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<SE, PA> {
     /// Current subscriptions
-    subscriptions: SafeMap<proto::SubscriptionId, Arc<Subscription<Entity>>>,
+    subscriptions: SafeMap<proto::SubscriptionId, Subscription<Entity>>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as changes)
     index_watchers: SafeMap<(proto::CollectionId, FieldId), Arc<std::sync::RwLock<ComparisonIndex>>>,
     /// The set of watchers who want to be notified of any changes to a given collection
@@ -45,9 +43,7 @@ pub struct Reactor<SE, PA> {
     collections: CollectionSet<SE>,
 
     entityset: WeakEntitySet,
-    // Weak reference to the node
-    // node: OnceCell<WeakNode<PA>>,
-    _policy_agent: PA,
+    policy_agent: PA,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -69,78 +65,34 @@ where
             entity_watchers: SafeMap::new(),
             collections,
             entityset,
-            _policy_agent: policy_agent,
-            // node: OnceCell::new(),
+            policy_agent,
         })
     }
 
-    /// Register a subscription and perform initial local data fetch
-    /// This sets up the subscription structure and populates it with local data,
-    /// but does NOT call the on_change callback yet (that happens in initialize)
-    pub async fn register(
-        &self,
-        sub_id: proto::SubscriptionId,
-        collection_id: &proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-        on_change: impl Fn(ChangeSet<Entity>) + Send + Sync + 'static,
-    ) -> anyhow::Result<Arc<Subscription<Entity>>> {
+    /// Register a subscription
+    /// This sets up the subscription structure and spawns a task to initialize it
+    pub fn register<F: Fetch<Entity>>(&self, subscription: Subscription<Entity>, fetcher: F) -> anyhow::Result<()> {
+        let sub_id = subscription.id;
+        let collection_id = &subscription.collection_id;
+
         // Start watching the relevant indexes
-        Self::manage_watchers_recurse(self, collection_id, &predicate, sub_id, WatcherOp::Add);
+        self.manage_watchers_recurse(collection_id, &subscription.predicate, sub_id, WatcherOp::Add);
 
-        // Find initial matching entities from local storage
-        let storage_collection = self.collections.get(collection_id).await?;
-        let matching_states = storage_collection.fetch_states(&predicate).await?;
-        let mut matching_entities = Vec::new();
-
-        // in theory, any state that is in the collection should already have its events in the storage collection as well
-        let retriever = LocalRetriever::new(storage_collection.clone());
-        // Convert states to Entity and set up entity watchers
-        for state in &matching_states {
-            let (_, entity) =
-                self.entityset.with_state(&retriever, state.payload.entity_id, collection_id.to_owned(), &state.payload.state).await?;
-
-            // I don't think we need to do this redundantly
-            // if ankql::selection::filter::evaluate_predicate(&entity, &subscription.predicate).unwrap_or(false) {
-            matching_entities.push(entity.clone());
-            self.entity_watchers.set_insert(entity.id, sub_id);
-            // }
-        }
-
-        // Create subscription with local matching entities, but NOT initialized yet
-        let subscription = Arc::new(Subscription {
-            id: sub_id,
-            collection_id: collection_id.clone(),
-            predicate,
-            on_change: Arc::new(Box::new(on_change)),
-            matching_entities: std::sync::Mutex::new(matching_entities),
-            initialized: AtomicBool::new(false),
-        });
-
-        // Register the subscription
+        // Register the subscription first
         self.subscriptions.insert(sub_id, subscription.clone());
 
-        Ok(subscription)
-    }
-
-    /// Initialize a subscription by calling the callback with the current data
-    /// This should only be called after any remote data has been fetched and stale entities refreshed
-    pub fn initialize(&self, subscription: Arc<Subscription<Entity>>) {
-        // Get the current matching entities (which should already include refreshed data)
-        let matching_entities = subscription.matching_entities.lock().unwrap().clone();
-
-        // Mark subscription as initialized
-        subscription.initialized.store(true, Ordering::SeqCst);
-
-        // Call callback with current state
-        (subscription.on_change)(ChangeSet {
-            changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
-            resultset: ResultSet { loaded: true, items: matching_entities.clone() },
-            initial: true,
+        // Spawn a task to load the subscription
+        crate::task::spawn(async move {
+            if let Err(e) = subscription.load(fetcher).await {
+                warn!("Failed to load subscription {}: {}", sub_id, e);
+            }
         });
+
+        Ok(())
     }
 
     /// Get a subscription by ID for external access (e.g., stale entity detection)
-    pub fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Arc<Subscription<Entity>>> { self.subscriptions.get(&sub_id) }
+    pub fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Subscription<Entity>> { self.subscriptions.get(&sub_id) }
 
     fn manage_watchers_recurse(
         &self,
@@ -289,7 +241,7 @@ where
                     self.update_entity_watchers(&entity, matches, sub_id);
 
                     // Only proceed with callback logic if subscription is initialized
-                    if subscription.initialized.load(Ordering::SeqCst) {
+                    if subscription.initial_data_sent.load(Ordering::SeqCst) {
                         let did_match = subscription.matching_entities.lock().unwrap().iter().any(|r| r.id() == entity.id());
 
                         // Determine the change type

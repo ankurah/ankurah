@@ -18,16 +18,16 @@ use crate::{
     context::{Context, NodeAndContext},
     entity::{Entity, WeakEntitySet},
     error::{MutationError, RequestError, RetrievalError},
+    getdata::LocalGetter,
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
-    retrieval::LocalRetriever,
+    retrieve::{remote::RemoteFetcher, Fetch},
     storage::StorageEngine,
     subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,
     system::SystemManager,
     task::spawn,
-    transaction::Transaction,
     util::{safemap::SafeMap, safeset::SafeSet},
 };
 #[cfg(feature = "instrument")]
@@ -130,7 +130,7 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData>>,
+    pub(crate) subscription_relay: Option<SubscriptionRelay<Entity, PA::ContextData>>,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -532,8 +532,8 @@ where
 
             // When applying events for a remote transaction, we should only look at the local storage for the lineage
             // If we are missing events necessary to connect the lineage, that's their responsibility to include in the transaction.
-            let retriever = LocalRetriever::new(collection.clone());
-            let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
+            let retriever = LocalGetter::new(collection.clone());
+            let entity = self.entities.get_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
 
             // we have the entity, so we can check access, optionally atteste, and apply/save the event;
             if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
@@ -665,7 +665,7 @@ where
             }
             None => {
                 let entity: Entity =
-                    self.entities.get_retrieve_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
+                    self.entities.get_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
 
                 let mut changed = false;
                 // TODO - figure out how to apply the events in the correct order
@@ -690,10 +690,6 @@ where
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
-        // First fetch initial state
-        // let storage_collection = self.collections.get(&collection_id).await?;
-        // let states = storage_collection.fetch_states(&predicate).await?;
-
         self.policy_agent.can_access_collection(cdata, &collection_id)?;
         let predicate = self.policy_agent.filter_predicate(cdata, &collection_id, predicate)?;
 
@@ -701,9 +697,13 @@ where
         let node = self.clone();
         {
             let peer_id = peer_id;
-            let subscription = self
-                .reactor
-                .register(sub_id, &collection_id, predicate, move |changeset| {
+
+            // Create the subscription with callback (synchronous)
+            let subscription = crate::subscription::Subscription::new(
+                sub_id,
+                collection_id.clone(),
+                predicate,
+                Arc::new(Box::new(move |changeset: ChangeSet<Entity>| {
                     // TODO move this into a task being fed by a channel and reorg into a function
                     let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
 
@@ -757,10 +757,33 @@ where
                         peer_id,
                         proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates, initial: changeset.initial },
                     );
-                })
-                .await?;
+                })),
+            );
 
-            self.reactor.initialize(subscription);
+            match &self.subscription_relay {
+                None => {
+                    let fetcher = LocalFetcher::new(self.collections.clone(), self.entities.clone());
+                    self.reactor.register(subscription, fetcher)?;
+                }
+                Some(_relay) => {
+                    warn!("subscribe requests with relay are not supported");
+                    return Err(anyhow!("subscribe requests with relay are not supported"));
+                    // DO WE ACTUALLY WANT TO HANDLE THIS CASE?
+                    // Register with subscription relay and get the oneshot receiver
+                    // let remote_ready_rx = relay.register(subscription.clone(), cdata.clone())?;
+
+                    // let retriever = RemoteEntityFetcher::new(
+                    //     self.collections.clone(),
+                    //     self.entities.clone(),
+                    //     Arc::new(relay),
+                    //     cdata.clone(),
+                    //     Some(remote_ready_rx),
+                    //     false, // For subscriptions, we don't use cache mode - we wait for remote data
+                    // );
+
+                    // self.reactor.register(subscription, retriever)?;
+                }
+            }
         };
 
         // Store the subscription handle
@@ -935,5 +958,36 @@ where PA: PolicyAgent
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets
         write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
+    }
+}
+
+/// Local entity retriever that only fetches from local storage (for durable nodes)
+pub struct LocalFetcher<SE: StorageEngine + Send + Sync + 'static> {
+    collections: CollectionSet<SE>,
+    entityset: WeakEntitySet,
+}
+
+impl<SE: StorageEngine + Send + Sync + 'static> LocalFetcher<SE> {
+    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet) -> Self { Self { collections, entityset } }
+}
+
+#[async_trait::async_trait]
+impl<SE: StorageEngine + Send + Sync + 'static> Fetch<Entity> for LocalFetcher<SE> {
+    async fn fetch(self: Self, collection_id: &CollectionId, predicate: &ankql::ast::Predicate) -> Result<Vec<Entity>, RetrievalError> {
+        let storage_collection = self.collections.get(collection_id).await?;
+        let matching_states = storage_collection.fetch_states(predicate).await?;
+        let retriever = LocalGetter::new(storage_collection.clone());
+
+        let mut entities = Vec::new();
+        for state in matching_states {
+            let (_, entity) = self
+                .entityset
+                .with_state(&retriever, state.payload.entity_id, collection_id.clone(), &state.payload.state)
+                .await
+                .map_err(|e| RetrievalError::Other(format!("Failed to process entity state: {}", e)))?;
+            entities.push(entity);
+        }
+
+        Ok(entities)
     }
 }

@@ -1,11 +1,11 @@
 use crate::error::RetrievalError;
-use crate::retrieval::{TClock, TEvent};
+use crate::getdata::{TClock, TEvent};
 use ankurah_proto::{Clock, Event, EventId};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-pub use crate::retrieval::GetEvents;
-pub use crate::retrieval::Retrieve;
+pub use crate::getdata::GetEvents;
+pub use crate::getdata::GetState;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ordering<Id> {
@@ -261,7 +261,7 @@ where
         // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
         // so we can pass the HashSet as a borrow and don't have to alloc this twice
         let mut result_checklist: HashSet<G::Id> = ids.iter().cloned().collect();
-        let (cost, events) = self.getter.retrieve_event(ids).await?;
+        let (cost, events) = self.getter.get_events(ids).await?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
         for event in events {
@@ -429,7 +429,7 @@ mod tests {
         type Id = TestId;
         type Event = TestEvent;
 
-        async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+        async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
             let mut result = Vec::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {

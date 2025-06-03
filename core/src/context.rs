@@ -64,7 +64,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
         self.get_entity(collection, id, cached).await
     }
-    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity> { self.node.entities.get(&id) }
+    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity> { self.node.entities.get_resident(&id) }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.fetch_entities(collection, args).await
     }
@@ -214,7 +214,7 @@ where
             }
         }
 
-        if let Some(local) = self.node.entities.get(&id) {
+        if let Some(local) = self.node.entities.get_resident(&id) {
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
             return Ok(local);
         }
@@ -281,7 +281,7 @@ where
         mut args: MatchArgs,
         callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<SubscriptionHandle, RetrievalError> {
-        let mut handle = SubscriptionHandle::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, sub_id);
+        let handle = SubscriptionHandle::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, sub_id);
 
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         args.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
@@ -289,23 +289,32 @@ where
         // Store subscription context for event requests
         self.node.subscription_context.insert(sub_id, self.cdata.clone());
 
-        let predicate = args.predicate.clone();
-        let cached = args.cached;
+        // Create the subscription (synchronous)
+        let subscription =
+            crate::subscription::Subscription::new(handle.id, collection_id.clone(), args.predicate.clone(), Arc::new(callback));
 
-        // Register subscription with reactor (synchronous)
-        let subscription = self.node.reactor.register(handle.id, collection_id, args.predicate, callback).await?;
-
-        // Handle remote subscription setup
-        if let Some(ref relay) = self.node.subscription_relay {
-            if cached {
-                relay.register(sub_id, collection_id.clone(), predicate, self.cdata.clone())?;
+        // Create the appropriate retriever based on node type
+        if self.node.durable || self.node.subscription_relay.is_none() {
+            let retriever = crate::node::LocalFetcher::new(self.node.collections.clone(), self.node.entities.clone());
+            self.node.reactor.register(subscription.clone(), retriever)?;
+        } else {
+            let subscription_relay = self.node.subscription_relay.as_ref().unwrap();
+            let remote_ready_rx = if args.cached {
+                None // For cached mode, don't wait for remote data
             } else {
-                relay.register_and_wait_first_update(sub_id, collection_id.clone(), predicate, self.cdata.clone()).await?;
-            }
-        }
+                Some(subscription_relay.register(subscription.clone(), self.cdata.clone())?)
+            };
 
-        // Fire off the first notification for the subscription
-        self.node.reactor.initialize(subscription);
+            let retriever = crate::retrieve::remote::RemoteFetcher::new(
+                self.node.collections.clone(),
+                self.node.entities.clone(),
+                Arc::new(subscription_relay.clone()),
+                self.cdata.clone(),
+                remote_ready_rx,
+                args.cached,
+            );
+            self.node.reactor.register(subscription.clone(), retriever)?;
+        };
 
         Ok(handle)
     }

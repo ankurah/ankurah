@@ -1,5 +1,5 @@
-//! Implements GetEvents for NodeAndContext, allowing event retrieval from local and remote sources.
-//! This lives in lineage because event retrieval is a lineage concern, not a context/session concern.
+//! Traits and impls for getting state and event data for specific IDs
+//! It's generic so we can use it for unit tests as well as the real implementation
 
 use crate::{
     context::NodeAndContext,
@@ -9,6 +9,36 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event, EventId};
 use async_trait::async_trait;
+
+#[async_trait]
+pub trait GetEvents {
+    type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
+    type Event: TEvent<Id = Self::Id> + std::fmt::Display;
+
+    /// Estimate the budget cost for retrieving a batch of events
+    /// This allows different implementations to model their cost structure
+    fn estimate_cost(&self, _batch_size: usize) -> usize {
+        // Default implementation: fixed cost of 1 per batch
+        1
+    }
+
+    /// retrieve the events from the store OR the remote peer
+    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
+}
+
+// TODO: make this generic
+#[async_trait]
+pub trait GetState {
+    // Each implementation of Retrieve determines whether to use local or remote storage
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError>;
+
+    /// Estimate the budget cost for retrieving a batch of events
+    /// This allows different implementations to model their cost structure
+    fn estimate_cost(&self, _batch_size: usize) -> usize {
+        // Default implementation: fixed cost of 1 per batch
+        1
+    }
+}
 
 /// a trait for events and eventlike things that can be descended
 pub trait TEvent: std::fmt::Display {
@@ -37,40 +67,18 @@ impl TEvent for ankurah_proto::Event {
     fn parent(&self) -> &Clock { &self.parent }
 }
 
-#[async_trait]
-pub trait GetEvents {
-    type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
-    type Event: TEvent<Id = Self::Id> + std::fmt::Display;
+pub struct LocalGetter(StorageCollectionWrapper);
 
-    /// Estimate the budget cost for retrieving a batch of events
-    /// This allows different implementations to model their cost structure
-    fn estimate_cost(&self, _batch_size: usize) -> usize {
-        // Default implementation: fixed cost of 1 per batch
-        1
-    }
-
-    /// retrieve the events from the store OR the remote peer
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
-}
-
-#[async_trait]
-pub trait Retrieve: GetEvents {
-    // Each implementation of Retrieve determines whether to use local or remote storage
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError>;
-}
-
-pub struct LocalRetriever(StorageCollectionWrapper);
-
-impl LocalRetriever {
+impl LocalGetter {
     pub fn new(collection: StorageCollectionWrapper) -> Self { Self(collection) }
 }
 
 #[async_trait]
-impl GetEvents for LocalRetriever {
+impl GetEvents for LocalGetter {
     type Id = EventId;
     type Event = ankurah_proto::Event;
 
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
         println!("StorageCollectionWrapper.GetEvents {:?}", event_ids);
         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
         Ok((1, self.0.get_events(event_ids).await?))
@@ -78,7 +86,7 @@ impl GetEvents for LocalRetriever {
 }
 
 #[async_trait]
-impl Retrieve for LocalRetriever {
+impl GetState for LocalGetter {
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
         match self.0.get_state(entity_id).await {
             Ok(state) => Ok(Some(state)),
@@ -97,7 +105,7 @@ where
     type Id = EventId;
     type Event = Event;
 
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
         // First try to get events from local storage
         let collection = self.1.node.system.collection(&self.0).await?;
         let mut events = collection.get_events(event_ids.clone()).await?;
@@ -142,7 +150,7 @@ where
 }
 
 #[async_trait]
-impl<SE, PA> Retrieve for (proto::CollectionId, &NodeAndContext<SE, PA>)
+impl<SE, PA> GetState for (proto::CollectionId, &NodeAndContext<SE, PA>)
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,

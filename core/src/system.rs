@@ -9,12 +9,12 @@ use crate::collectionset::CollectionSet;
 use crate::entity::{Entity, WeakEntitySet};
 use crate::error::MutationError;
 use crate::error::RetrievalError;
+use crate::getdata::LocalGetter;
 use crate::notice_info;
 use crate::policy::PolicyAgent;
 use crate::property::{backend::LWWBackend, PropertyValue};
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
-use crate::retrieval::LocalRetriever;
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
@@ -249,7 +249,7 @@ where
         let mut entities = Vec::new();
         let mut root_state = None;
 
-        let retriever = LocalRetriever::new(storage.clone());
+        let retriever = LocalGetter::new(storage.clone());
 
         for state in storage.fetch_states(&ankql::ast::Predicate::True).await? {
             let (_entity_changed, entity) =
