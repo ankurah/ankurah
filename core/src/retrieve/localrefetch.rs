@@ -1,4 +1,5 @@
 use crate::collectionset::CollectionSet;
+use crate::consistency::diff_resolver::DiffResolver;
 use crate::getdata::LocalGetter;
 use crate::{entity::Entity, error::RetrievalError};
 use crate::{entity::WeakEntitySet, node::ContextData, storage::StorageEngine};
@@ -13,25 +14,15 @@ use super::Fetch;
 // it feels weird to roll that into a fetcher, because it's not really a fetch operation, it's more of a maintenance operation
 
 /// Remote entity retriever that fetches locally, optionally waits for remote data, then detects and refreshes stale entities
-pub struct RemoteFetcher<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> {
+pub struct LocalRefetcher<SE: StorageEngine + Send + Sync + 'static> {
     collections: CollectionSet<SE>,
     entityset: WeakEntitySet,
-    subscription_relay: Arc<crate::subscription_relay::SubscriptionRelay<Entity, CD>>,
-    context_data: CD,
-    first_resulset_rs: Option<tokio::sync::oneshot::Receiver<Vec<EntityId>>>,
-    use_cache: bool,
+    resolver: DiffResolver,
 }
 
-impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> RemoteFetcher<SE, CD> {
-    pub fn new(
-        collections: CollectionSet<SE>,
-        entityset: WeakEntitySet,
-        subscription_relay: Arc<crate::subscription_relay::SubscriptionRelay<Entity, CD>>,
-        context_data: CD,
-        remote_ready_rx: Option<tokio::sync::oneshot::Receiver<Vec<EntityId>>>,
-        use_cache: bool,
-    ) -> Self {
-        Self { collections, entityset, subscription_relay, context_data, first_resulset_rs: remote_ready_rx, use_cache }
+impl<SE: StorageEngine + Send + Sync + 'static> LocalRefetcher<SE> {
+    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, resolver: DiffResolver) -> Self {
+        Self { collections, entityset, resolver }
     }
 
     /// Perform stale entity detection by comparing local entities with server entity IDs
@@ -75,7 +66,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> RemoteFetcher<S
 }
 
 #[async_trait::async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> Fetch<Entity> for RemoteFetcher<SE, CD> {
+impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> Fetch<Entity> for LocalRefetcher<SE, CD> {
     async fn fetch(mut self: Self, collection_id: &CollectionId, predicate: &ankql::ast::Predicate) -> Result<Vec<Entity>, RetrievalError> {
         // First, do the local fetch just like LocalEntityRetriever
         let storage_collection = self.collections.get(collection_id).await?;

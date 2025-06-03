@@ -22,7 +22,7 @@ use crate::{
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
-    retrieve::{local::LocalFetcher, remote::RemoteFetcher, Fetch},
+    retrieve::{local::LocalFetcher, localrefetch::LocalRefetcher, Fetch},
     storage::StorageEngine,
     subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,

@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use crate::{
     changes::{ChangeSet, EntityChange},
+    consistency::diff_resolver::DiffResolver,
     entity::Entity,
     error::{MutationError, RetrievalError},
     model::View,
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
     resultset::ResultSet,
-    retrieve::local::LocalFetcher,
-    retrieve::remote::RemoteFetcher,
+    retrieve::{local::LocalFetcher, localrefetch::LocalRefetcher},
     storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
     transaction::Transaction,
@@ -301,22 +301,11 @@ where
                 self.node.reactor.register(subscription.clone(), retriever)?;
             }
             Some(relay) => {
-                let first_update_received = relay.register(subscription.clone(), self.cdata.clone())?;
+                let resolver = DiffResolver::new(&self.node, args.cached);
 
-                let remote_ready_rx = if args.cached {
-                    None // For cached mode, don't wait for remote data
-                } else {
-                    Some(first_update_received)
-                };
+                relay.register(subscription.clone(), self.cdata.clone(), resolver)?;
 
-                let retriever = RemoteFetcher::new(
-                    self.node.collections.clone(),
-                    self.node.entities.clone(),
-                    Arc::new(relay.clone()),
-                    self.cdata.clone(),
-                    remote_ready_rx,
-                    args.cached,
-                );
+                let refetcher = LocalRefetcher::new(self.node.collections.clone(), self.node.entities.clone(), resolver);
                 self.node.reactor.register(subscription.clone(), retriever)?;
             }
         }

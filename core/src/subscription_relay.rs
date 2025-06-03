@@ -26,7 +26,8 @@ pub struct SubscriptionInfo<CD: ContextData> {
     pub context_data: CD,
     pub state: SubscriptionState,
     /// Signal when first Resultset is received from remote peer
-    pub first_resultset_signal: Arc<std::sync::Mutex<Option<oneshot::Sender<Vec<proto::EntityId>>>>>,
+    // pub first_resultset_signal: Arc<std::sync::Mutex<Option<oneshot::Sender<Vec<proto::EntityId>>>>>,
+    pub on_first_update: Arc<dyn crate::consistency::OnFirstSubscriptionUpdate>,
 }
 
 /// Abstracted Node interface for subscription relay integration
@@ -139,6 +140,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
         &self,
         subscription: Subscription<R>,
         context_data: CD,
+        on_first_update: impl crate::consistency::OnFirstSubscriptionUpdate + 'static,
     ) -> Result<tokio::sync::oneshot::Receiver<Vec<proto::EntityId>>, RetrievalError> {
         let sub_id = subscription.id;
         let collection_id = subscription.collection_id.clone();
@@ -154,7 +156,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
                 predicate,
                 context_data,
                 state: SubscriptionState::PendingRemote,
-                first_resultset_signal: Arc::new(std::sync::Mutex::new(Some(tx))),
+                on_first_update: Arc::new(on_first_update),
             },
         );
 
@@ -164,37 +166,6 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
         }
 
         Ok(rx)
-    }
-
-    // TODO move this to subscription handle.loaded().await
-    pub async fn register_and_wait_first_update(&self, subscription: Subscription<R>, context_data: CD) -> Result<(), RetrievalError> {
-        let sub_id = subscription.id;
-        let collection_id = subscription.collection_id.clone();
-        let predicate = subscription.predicate.clone();
-
-        let (tx, rx) = oneshot::channel();
-        self.inner.subscriptions.insert(
-            sub_id,
-            SubscriptionInfo {
-                collection_id,
-                predicate,
-                context_data,
-                state: SubscriptionState::PendingRemote,
-                first_resultset_signal: Arc::new(std::sync::Mutex::new(Some(tx))),
-            },
-        );
-
-        // Immediately attempt setup with available peers
-        if !self.inner.connected_peers.is_empty() {
-            self.setup_remote_subscriptions();
-        }
-
-        // Wait for first data to arrive
-        if let Err(_) = rx.await {
-            warn!("Failed to receive first remote update for subscription {}", sub_id);
-        }
-
-        Ok(())
     }
 
     /// Signal that first remote data has been applied for a subscription

@@ -1,5 +1,5 @@
 pub mod local;
-pub mod remote;
+pub mod localrefetch;
 
 use ankurah_proto::CollectionId;
 
