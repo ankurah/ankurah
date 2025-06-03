@@ -8,6 +8,7 @@ use crate::{
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
     resultset::ResultSet,
+    retrieve::local::LocalFetcher,
     retrieve::remote::RemoteFetcher,
     storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
@@ -296,7 +297,7 @@ where
 
         match &self.node.subscription_relay {
             None => {
-                let retriever = crate::node::LocalFetcher::new(self.node.collections.clone(), self.node.entities.clone());
+                let retriever = LocalFetcher::new(self.node.collections.clone(), self.node.entities.clone());
                 self.node.reactor.register(subscription.clone(), retriever)?;
             }
             Some(relay) => {

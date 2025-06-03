@@ -22,7 +22,7 @@ use crate::{
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
-    retrieve::{remote::RemoteFetcher, Fetch},
+    retrieve::{local::LocalFetcher, remote::RemoteFetcher, Fetch},
     storage::StorageEngine,
     subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,
@@ -769,6 +769,8 @@ where
                     warn!("subscribe requests with relay are not supported");
                     return Err(anyhow!("subscribe requests with relay are not supported"));
                     // DO WE ACTUALLY WANT TO HANDLE THIS CASE?
+                    // I'm not certain we do.
+
                     // Register with subscription relay and get the oneshot receiver
                     // let remote_ready_rx = relay.register(subscription.clone(), cdata.clone())?;
 
@@ -958,36 +960,5 @@ where PA: PolicyAgent
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets
         write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
-    }
-}
-
-/// Local entity retriever that only fetches from local storage (for durable nodes)
-pub struct LocalFetcher<SE: StorageEngine + Send + Sync + 'static> {
-    collections: CollectionSet<SE>,
-    entityset: WeakEntitySet,
-}
-
-impl<SE: StorageEngine + Send + Sync + 'static> LocalFetcher<SE> {
-    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet) -> Self { Self { collections, entityset } }
-}
-
-#[async_trait::async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static> Fetch<Entity> for LocalFetcher<SE> {
-    async fn fetch(self: Self, collection_id: &CollectionId, predicate: &ankql::ast::Predicate) -> Result<Vec<Entity>, RetrievalError> {
-        let storage_collection = self.collections.get(collection_id).await?;
-        let matching_states = storage_collection.fetch_states(predicate).await?;
-        let retriever = LocalGetter::new(storage_collection.clone());
-
-        let mut entities = Vec::new();
-        for state in matching_states {
-            let (_, entity) = self
-                .entityset
-                .with_state(&retriever, state.payload.entity_id, collection_id.clone(), &state.payload.state)
-                .await
-                .map_err(|e| RetrievalError::Other(format!("Failed to process entity state: {}", e)))?;
-            entities.push(entity);
-        }
-
-        Ok(entities)
     }
 }
