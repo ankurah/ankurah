@@ -301,12 +301,21 @@ where
                 self.node.reactor.register(subscription.clone(), retriever)?;
             }
             Some(relay) => {
+                // DiffResolver is used to detect and refresh entities which are present in or initial local fetch but not in the remote fetch
                 let resolver = DiffResolver::new(&self.node, args.cached);
 
+                // injecting the OnFirstSubscriptionUpdate into the relay
                 relay.register(subscription.clone(), self.cdata.clone(), resolver)?;
 
+                // LocalRefetcher fetches from local storage, then calls resolver.local_entity_ids()
+                // then, if cached is false, it yields that initial set of entities to fetcher.fetch inside reactor.register
+                // then if cached is true, it will call resolver.wait_resolution() which resolves the differences and returns true if differences were detected
+                // or returns false if no differences were detected
+                // the LocalRefetcher will redo the fetch in the case that the resolver returns true
+                // or it will return the initial set of entities if the resolver returns false
+
                 let refetcher = LocalRefetcher::new(self.node.collections.clone(), self.node.entities.clone(), resolver);
-                self.node.reactor.register(subscription.clone(), retriever)?;
+                self.node.reactor.register(subscription.clone(), refetcher)?;
             }
         }
 
