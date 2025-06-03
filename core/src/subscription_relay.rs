@@ -2,7 +2,6 @@ use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::entity::Entity;
@@ -48,14 +47,6 @@ pub trait TNode<CD: ContextData>: Send + Sync {
     /// Send an unsubscribe message to a remote peer
     /// This is a one-way message, no response expected
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, sub_id: proto::SubscriptionId) -> Result<(), anyhow::Error>;
-
-    /// Get entities from peer to refresh stale data
-    async fn get_from_peer(
-        &self,
-        collection_id: &CollectionId,
-        entity_ids: Vec<proto::EntityId>,
-        context_data: &CD,
-    ) -> Result<(), RetrievalError>;
 }
 
 /// Abstracted Reactor interface for subscription relay integration
@@ -129,26 +120,25 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
     /// the node has already been set.
     pub fn set_node(&self, node: Arc<dyn TNode<CD>>) -> Result<(), ()> { self.inner.node.set(node).map_err(|_| ()) }
 
-    /// Register a new subscription and return a channel to wait for first remote data
+    /// Register a new subscription
     ///
     /// This method will:
     /// 1. Register the subscription with remote peers
-    /// 2. Returns a oneshot receiver that will be signaled when first update is received from remote peer
+    /// 2. Call the on_first_update callback when the first update is received from remote peer
     ///
-    /// The caller can use this receiver to wait for remote data before proceeding (or optionally just ignore it).
-    pub fn register(
+    /// The on_first_update callback will be invoked when remote data arrives.
+    pub fn register<T: crate::consistency::OnFirstSubscriptionUpdate + 'static>(
         &self,
         subscription: Subscription<R>,
         context_data: CD,
-        on_first_update: impl crate::consistency::OnFirstSubscriptionUpdate + 'static,
-    ) -> Result<tokio::sync::oneshot::Receiver<Vec<proto::EntityId>>, RetrievalError> {
+        on_first_update: T,
+    ) -> Result<(), RetrievalError> {
         let sub_id = subscription.id;
         let collection_id = subscription.collection_id.clone();
         let predicate = subscription.predicate.clone();
 
         debug!("Registering subscription {}", sub_id);
 
-        let (tx, rx) = oneshot::channel();
         self.inner.subscriptions.insert(
             sub_id,
             SubscriptionInfo {
@@ -165,7 +155,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
             self.setup_remote_subscriptions();
         }
 
-        Ok(rx)
+        Ok(())
     }
 
     /// Signal that first remote data has been applied for a subscription
@@ -181,11 +171,8 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
             return Err(RetrievalError::Other(format!("Subscription {} not found", sub_id)));
         };
 
-        // Signal first data arrival with the entity IDs
-        if let Some(signal) = info.first_resultset_signal.lock().unwrap().take() {
-            // Send the initial entity IDs to whoever is waiting
-            let _ = signal.send(initial_entity_ids);
-        }
+        // Notify the consistency resolver about the first update
+        info.on_first_update.on_first_update(initial_entity_ids);
         Ok(())
     }
 
@@ -389,17 +376,6 @@ where
 
         Ok(())
     }
-
-    async fn get_from_peer(
-        &self,
-        collection_id: &CollectionId,
-        entity_ids: Vec<proto::EntityId>,
-        context_data: &PA::ContextData,
-    ) -> Result<(), RetrievalError> {
-        let node = self.upgrade().ok_or_else(|| RetrievalError::Other("node has been dropped".to_string()))?;
-
-        node.get_from_peer(collection_id, entity_ids, context_data).await
-    }
 }
 
 #[cfg(test)]
@@ -493,16 +469,6 @@ mod tests {
             self.sent_requests.lock().unwrap().push((peer_id, sub_id, CollectionId::from("unsubscribe"), Predicate::True));
             Ok(())
         }
-
-        async fn get_from_peer(
-            &self,
-            _collection_id: &CollectionId,
-            _entity_ids: Vec<proto::EntityId>,
-            _context_data: &CD,
-        ) -> Result<(), RetrievalError> {
-            // Mock implementation - just succeed
-            Ok(())
-        }
     }
     fn create_test_predicate() -> Predicate {
         // Create a simple test predicate
@@ -528,7 +494,7 @@ mod tests {
 
         // Create mock subscription and register it
         let sub = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(sub, collection_id.clone())?;
+        let _rx = relay.register(sub, collection_id.clone(), ())?;
 
         // Check initial state
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
@@ -567,7 +533,7 @@ mod tests {
         // Setup established subscription by going through the full flow
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone())?;
+        let _rx = relay.register(subscription, collection_id.clone(), ())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -598,7 +564,7 @@ mod tests {
         // Add pending subscription (no peers connected yet)
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone())?;
+        let _rx = relay.register(subscription, collection_id.clone(), ())?;
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Clear any previous requests
@@ -640,7 +606,7 @@ mod tests {
         // Connect peer and add subscription
         relay.notify_peer_connected(peer_id);
         let sub = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(sub, collection_id.clone())?;
+        let _rx = relay.register(sub, collection_id.clone(), ())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -690,7 +656,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone())?;
+        let _rx = relay.register(subscription, collection_id.clone(), ())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -731,7 +697,7 @@ mod tests {
 
         // Test setup without node - should not crash
         let subscription = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone())?;
+        let _rx = relay.register(subscription, collection_id.clone(), ())?;
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no node
@@ -772,7 +738,7 @@ mod tests {
         // Add subscription but don't establish it
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone())?;
+        let _rx = relay.register(subscription, collection_id.clone(), ())?;
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Unsubscribe from pending subscription

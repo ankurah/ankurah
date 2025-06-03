@@ -5,6 +5,7 @@ use crate::{
     consistency::diff_resolver::DiffResolver,
     entity::Entity,
     error::{MutationError, RetrievalError},
+    getdata::{GetEntities, LocalGetter, RemoteGetter},
     model::View,
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
@@ -16,7 +17,7 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::debug;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -34,6 +35,14 @@ where
 {
     pub node: Node<SE, PA>,
     pub cdata: PA::ContextData,
+}
+
+impl<SE, PA> Clone for NodeAndContext<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self { Self { node: self.node.clone(), cdata: self.cdata.clone() } }
 }
 
 #[async_trait]
@@ -205,42 +214,52 @@ where
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
 
-        if !self.node.durable {
+        // LEFT OFF HERE - this is the crux of the issue.
+        // get_from_peer needs to go away, because it's just storing the state without checking descendency
+
+        let getter : Box<dyn GetEntities> = if self.node.durable {
+            Box::new(LocalGetter::new(self.node.collections.get(collection_id).await?))
+        } else {
+            Box::new(RemoteGetter::new(collection_id.clone(), self.clone(), cached))
+
             // Fetch from peers and commit first response
-            match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
-                Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if cached => (),
-                Err(e) => {
-                    return Err(e);
-                }
-            }
+            // match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
+            //     Ok(_) => (),
+            //     Err(RetrievalError::NoDurablePeers) if cached => (),
+            //     Err(e) => {
+            //         return Err(e);
+            //     }
+            // }
         }
 
-        if let Some(local) = self.node.entities.get_resident(&id) {
-            debug!("Node({}).get_entity found local entity - returning", self.node.id);
-            return Ok(local);
-        }
-        debug!("{}.get_entity fetching from storage", self.node);
+        // TODO update this to use entities.with_state and then commit to the collection if that applies and also call reactor.notify_change,
+        // just like apply_subscription_updates/apply_subscription_update
 
-        let collection = self.node.collections.get(collection_id).await?;
-        match collection.get_state(id).await {
-            Ok(entity_state) => {
-                let (_changed, entity) = self
-                    .node
-                    .entities
-                    .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &entity_state.payload.state)
-                    .await?;
-                Ok(entity)
-            }
-            Err(RetrievalError::EntityNotFound(id)) => {
-                let (_, entity) = self
-                    .node
-                    .entities
-                    .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &proto::State::default())
-                    .await?;
-                Ok(entity)
-            }
-            Err(e) => Err(e),
+        // if let Some(local) = self.node.entities.get_resident(&id) {
+        //     debug!("Node({}).get_entity found local entity - returning", self.node.id);
+        //     return Ok(local);
+        // }
+        // debug!("{}.get_entity fetching from storage", self.node);
+
+        // let collection = self.node.collections.get(collection_id).await?;
+        // match collection.get_state(id).await {
+        //     Ok(entity_state) => {
+        //         let (_changed, entity) = self
+        //             .node
+        //             .entities
+        //             .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &entity_state.payload.state)
+        //             .await?;
+        //         Ok(entity)
+        //     }
+        //     Err(RetrievalError::EntityNotFound(id)) => {
+        //         let (_, entity) = self
+        //             .node
+        //             .entities
+        //             .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &proto::State::default())
+        //             .await?;
+        //         Ok(entity)
+        //     }
+        //     Err(e) => Err(e),
         }
     }
     /// Fetch a list of entities based on a predicate
@@ -301,20 +320,19 @@ where
                 self.node.reactor.register(subscription.clone(), retriever)?;
             }
             Some(relay) => {
-                // DiffResolver is used to detect and refresh entities which are present in or initial local fetch but not in the remote fetch
-                let resolver = DiffResolver::new(&self.node, args.cached);
+                // DiffResolver is used to detect and refresh entities which are present in our initial local fetch but not in the remote fetch
+                let resolver = DiffResolver::new(self, collection_id.clone());
 
-                // injecting the OnFirstSubscriptionUpdate into the relay
-                relay.register(subscription.clone(), self.cdata.clone(), resolver)?;
+                relay.register(subscription.clone(), self.cdata.clone(), resolver.clone())?;
 
                 // LocalRefetcher fetches from local storage, then calls resolver.local_entity_ids()
-                // then, if cached is false, it yields that initial set of entities to fetcher.fetch inside reactor.register
-                // then if cached is true, it will call resolver.wait_resolution() which resolves the differences and returns true if differences were detected
+                // then, if use_cache is true, it yields that initial set of entities to fetcher.fetch inside reactor.register
+                // then if use_cache is false, it will call resolver.wait_resolution() which resolves the differences and returns true if differences were detected
                 // or returns false if no differences were detected
                 // the LocalRefetcher will redo the fetch in the case that the resolver returns true
                 // or it will return the initial set of entities if the resolver returns false
 
-                let refetcher = LocalRefetcher::new(self.node.collections.clone(), self.node.entities.clone(), resolver);
+                let refetcher = LocalRefetcher::new(self.node.collections.clone(), self.node.entities.clone(), resolver, args.cached);
                 self.node.reactor.register(subscription.clone(), refetcher)?;
             }
         }

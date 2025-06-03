@@ -3,11 +3,12 @@
 
 use crate::{
     context::NodeAndContext,
+    entity::Entity,
     error::RetrievalError,
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
 };
-use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -38,6 +39,11 @@ pub trait GetState {
         // Default implementation: fixed cost of 1 per batch
         1
     }
+}
+
+#[async_trait]
+pub trait GetEntities {
+    async fn get_entities(&self, entity_ids: Vec<EntityId>) -> Result<Vec<Entity>, RetrievalError>;
 }
 
 /// a trait for events and eventlike things that can be descended
@@ -96,8 +102,20 @@ impl GetState for LocalGetter {
     }
 }
 
+pub struct RemoteGetter<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> {
+    collection_id: CollectionId,
+    nodeandcontext: NodeAndContext<SE, PA>,
+    allow_cache: bool,
+}
+
+impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> RemoteGetter<SE, PA> {
+    pub fn new(collection_id: CollectionId, nodeandcontext: NodeAndContext<SE, PA>, allow_cache: bool) -> Self {
+        Self { collection_id, nodeandcontext, allow_cache }
+    }
+}
+
 #[async_trait]
-impl<SE, PA> GetEvents for (proto::CollectionId, &NodeAndContext<SE, PA>)
+impl<SE, PA> GetEvents for RemoteGetter<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -155,6 +173,9 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    // this used to be called get_local_state
+    // and for some reason we have a use case that wants local or remote event fetching, but not the same for state
+
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
         let collection = self.1.node.collections.get(&self.0).await?;
         match collection.get_state(entity_id).await {

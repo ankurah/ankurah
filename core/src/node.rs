@@ -845,42 +845,42 @@ where
         }
     }
 
-    pub(crate) async fn get_from_peer(
-        &self,
-        collection_id: &CollectionId,
-        ids: Vec<proto::EntityId>,
-        cdata: &PA::ContextData,
-    ) -> Result<(), RetrievalError> {
-        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+    // pub(crate) async fn get_from_peer(
+    //     &self,
+    //     collection_id: &CollectionId,
+    //     ids: Vec<proto::EntityId>,
+    //     cdata: &PA::ContextData,
+    // ) -> Result<(), RetrievalError> {
+    //     let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-        println!("🔍 Node::get_from_peer: collection_id = {collection_id}, ids = {ids:?}");
-        match self
-            .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
-            .await
-            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
-        {
-            proto::NodeResponseBody::Get(states) => {
-                println!("🔍 Node::get_from_peer: states = {states:?}");
-                let collection = self.collections.get(collection_id).await?;
+    //     println!("🔍 Node::get_from_peer: collection_id = {collection_id}, ids = {ids:?}");
+    //     match self
+    //         .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
+    //         .await
+    //         .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+    //     {
+    //         proto::NodeResponseBody::Get(states) => {
+    //             println!("🔍 Node::get_from_peer: states = {states:?}");
+    //             let collection = self.collections.get(collection_id).await?;
 
-                // do we have the ability to merge states?
-                // because that's what we have to do I think
-                for state in states {
-                    self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
-                }
-                Ok(())
-            }
-            proto::NodeResponseBody::Error(e) => {
-                debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
-            }
-            _ => {
-                debug!("Unexpected response type from peer get");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
-            }
-        }
-    }
+    //             // do we have the ability to merge states?
+    //             // because that's what we have to do I think
+    //             for state in states {
+    //                 self.policy_agent.validate_received_state(self, &peer_id, &state)?;
+    //                 collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+    //             }
+    //             Ok(())
+    //         }
+    //         proto::NodeResponseBody::Error(e) => {
+    //             debug!("Error from peer fetch: {}", e);
+    //             Err(RetrievalError::Other(format!("{:?}", e)))
+    //         }
+    //         _ => {
+    //             debug!("Unexpected response type from peer get");
+    //             Err(RetrievalError::Other("Unexpected response type".to_string()))
+    //         }
+    //     }
+    // }
 
     /// Get a random durable peer node ID
     pub fn get_durable_peer_random(&self) -> Option<proto::EntityId> {
