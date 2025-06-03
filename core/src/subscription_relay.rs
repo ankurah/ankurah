@@ -109,7 +109,7 @@ impl<R, CD: ContextData> Clone for SubscriptionRelay<R, CD> {
     fn clone(&self) -> Self { Self { inner: self.inner.clone() } }
 }
 
-impl<R, CD: ContextData> SubscriptionRelay<R, CD> {
+impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
     pub fn new(reactor: Arc<dyn TReactor<R>>) -> Self {
         Self {
             inner: Arc::new(SubscriptionRelayInner {
@@ -451,7 +451,7 @@ mod tests {
     struct MockReactor;
 
     impl TReactor<()> for MockReactor {
-        fn get_subscription(&self, _sub_id: proto::SubscriptionId) -> Option<crate::subscription::Subscription> { None }
+        fn get_subscription(&self, _sub_id: proto::SubscriptionId) -> Option<Subscription<()>> { None }
     }
 
     #[async_trait::async_trait]
@@ -580,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_disconnection_orphans_subscriptions() -> anyhow::Result<()> {
         let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
+        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
@@ -614,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_connection_triggers_setup() -> anyhow::Result<()> {
         let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
+        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
@@ -653,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn test_failed_subscription_retry() -> anyhow::Result<()> {
         let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
+        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
@@ -667,8 +667,8 @@ mod tests {
 
         // Connect peer and add subscription
         relay.notify_peer_connected(peer_id);
-        let subscription = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone())?;
+        let sub = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
+        let _rx = relay.register(sub, collection_id.clone())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -705,7 +705,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_removal() -> anyhow::Result<()> {
         let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
+        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set node");
 
@@ -749,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn test_edge_cases() -> anyhow::Result<()> {
         let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
+        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
 
         let sub_id = proto::SubscriptionId::new();
@@ -789,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn test_notify_unsubscribe_with_no_established_subscription() -> anyhow::Result<()> {
         let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new(mock_reactor);
+        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set node");
 

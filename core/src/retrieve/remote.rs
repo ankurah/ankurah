@@ -16,7 +16,7 @@ use super::Fetch;
 pub struct RemoteFetcher<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> {
     collections: CollectionSet<SE>,
     entityset: WeakEntitySet,
-    subscription_relay: Arc<crate::subscription_relay::SubscriptionRelay<CD>>,
+    subscription_relay: Arc<crate::subscription_relay::SubscriptionRelay<Entity, CD>>,
     context_data: CD,
     remote_ready_rx: Option<tokio::sync::oneshot::Receiver<Vec<EntityId>>>,
     use_cache: bool,
@@ -26,7 +26,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> RemoteFetcher<S
     pub fn new(
         collections: CollectionSet<SE>,
         entityset: WeakEntitySet,
-        subscription_relay: Arc<crate::subscription_relay::SubscriptionRelay<CD>>,
+        subscription_relay: Arc<crate::subscription_relay::SubscriptionRelay<Entity, CD>>,
         context_data: CD,
         remote_ready_rx: Option<tokio::sync::oneshot::Receiver<Vec<EntityId>>>,
         use_cache: bool,
