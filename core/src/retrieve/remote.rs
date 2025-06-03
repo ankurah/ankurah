@@ -18,7 +18,7 @@ pub struct RemoteFetcher<SE: StorageEngine + Send + Sync + 'static, CD: ContextD
     entityset: WeakEntitySet,
     subscription_relay: Arc<crate::subscription_relay::SubscriptionRelay<Entity, CD>>,
     context_data: CD,
-    remote_ready_rx: Option<tokio::sync::oneshot::Receiver<Vec<EntityId>>>,
+    first_resulset_rs: Option<tokio::sync::oneshot::Receiver<Vec<EntityId>>>,
     use_cache: bool,
 }
 
@@ -31,7 +31,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> RemoteFetcher<S
         remote_ready_rx: Option<tokio::sync::oneshot::Receiver<Vec<EntityId>>>,
         use_cache: bool,
     ) -> Self {
-        Self { collections, entityset, subscription_relay, context_data, remote_ready_rx, use_cache }
+        Self { collections, entityset, subscription_relay, context_data, first_resulset_rs: remote_ready_rx, use_cache }
     }
 
     /// Perform stale entity detection by comparing local entities with server entity IDs
@@ -92,7 +92,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> Fetch<Entity> f
             local_entities.push(entity);
         }
 
-        if let Some(rx) = self.remote_ready_rx.take() {
+        if let Some(first_resultset_rx) = self.first_resulset_rs.take() {
             if self.use_cache {
                 // For cached requests, spawn background task for stale detection
                 debug!("RemoteEntityRetriever: Cached mode - spawning background stale detection task");
@@ -102,7 +102,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> Fetch<Entity> f
                 let local_entity_ids: Vec<EntityId> = local_entities.iter().map(|e| e.id).collect();
 
                 crate::task::spawn(async move {
-                    match rx.await {
+                    match first_resultset_rx.await {
                         Ok(server_entity_ids) => {
                             debug!("RemoteEntityRetriever: Background task received {} entity IDs from server", server_entity_ids.len());
 
@@ -135,7 +135,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> Fetch<Entity> f
                 });
             } else {
                 // For non-cached requests, wait for remote data before returning
-                match rx.await {
+                match first_resultset_rx.await {
                     Ok(server_entity_ids) => {
                         debug!("RemoteEntityRetriever: Non-cached mode - received {} entity IDs from server", server_entity_ids.len());
                         // Perform stale entity detection and refresh synchronously

@@ -25,7 +25,8 @@ pub struct SubscriptionInfo<CD: ContextData> {
     pub predicate: ankql::ast::Predicate,
     pub context_data: CD,
     pub state: SubscriptionState,
-    pub first_data_signal: Arc<std::sync::Mutex<Option<oneshot::Sender<Vec<proto::EntityId>>>>>, // Signal when first data arrives with entity IDs
+    /// Signal when first Resultset is received from remote peer
+    pub first_resultset_signal: Arc<std::sync::Mutex<Option<oneshot::Sender<Vec<proto::EntityId>>>>>,
 }
 
 /// Abstracted Node interface for subscription relay integration
@@ -131,9 +132,9 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
     ///
     /// This method will:
     /// 1. Register the subscription with remote peers
-    /// 2. Return a receiver that will be signaled when first remote data arrives with the initial entity IDs
+    /// 2. Returns a oneshot receiver that will be signaled when first update is received from remote peer
     ///
-    /// The caller can use this receiver to wait for remote data before proceeding.
+    /// The caller can use this receiver to wait for remote data before proceeding (or optionally just ignore it).
     pub fn register(
         &self,
         subscription: Subscription<R>,
@@ -153,7 +154,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
                 predicate,
                 context_data,
                 state: SubscriptionState::PendingRemote,
-                first_data_signal: Arc::new(std::sync::Mutex::new(Some(tx))),
+                first_resultset_signal: Arc::new(std::sync::Mutex::new(Some(tx))),
             },
         );
 
@@ -179,7 +180,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
                 predicate,
                 context_data,
                 state: SubscriptionState::PendingRemote,
-                first_data_signal: Arc::new(std::sync::Mutex::new(Some(tx))),
+                first_resultset_signal: Arc::new(std::sync::Mutex::new(Some(tx))),
             },
         );
 
@@ -210,7 +211,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
         };
 
         // Signal first data arrival with the entity IDs
-        if let Some(signal) = info.first_data_signal.lock().unwrap().take() {
+        if let Some(signal) = info.first_resultset_signal.lock().unwrap().take() {
             // Send the initial entity IDs to whoever is waiting
             let _ = signal.send(initial_entity_ids);
         }

@@ -8,6 +8,7 @@ use crate::{
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
     resultset::ResultSet,
+    retrieve::remote::RemoteFetcher,
     storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
     transaction::Transaction,
@@ -293,28 +294,30 @@ where
         let subscription =
             crate::subscription::Subscription::new(handle.id, collection_id.clone(), args.predicate.clone(), Arc::new(callback));
 
-        // Create the appropriate retriever based on node type
-        if self.node.durable || self.node.subscription_relay.is_none() {
-            let retriever = crate::node::LocalFetcher::new(self.node.collections.clone(), self.node.entities.clone());
-            self.node.reactor.register(subscription.clone(), retriever)?;
-        } else {
-            let subscription_relay = self.node.subscription_relay.as_ref().unwrap();
-            let remote_ready_rx = if args.cached {
-                None // For cached mode, don't wait for remote data
-            } else {
-                Some(subscription_relay.register(subscription.clone(), self.cdata.clone())?)
-            };
+        match &self.node.subscription_relay {
+            None => {
+                let retriever = crate::node::LocalFetcher::new(self.node.collections.clone(), self.node.entities.clone());
+                self.node.reactor.register(subscription.clone(), retriever)?;
+            }
+            Some(relay) => {
+                let first_update_received = if args.cached {
+                    relay.register(subscription.clone(), self.cdata.clone())?;
+                    None // For cached mode, don't wait for remote data
+                } else {
+                    Some(relay.register(subscription.clone(), self.cdata.clone())?)
+                };
 
-            let retriever = crate::retrieve::remote::RemoteFetcher::new(
-                self.node.collections.clone(),
-                self.node.entities.clone(),
-                Arc::new(subscription_relay.clone()),
-                self.cdata.clone(),
-                remote_ready_rx,
-                args.cached,
-            );
-            self.node.reactor.register(subscription.clone(), retriever)?;
-        };
+                let retriever = RemoteFetcher::new(
+                    self.node.collections.clone(),
+                    self.node.entities.clone(),
+                    Arc::new(relay.clone()),
+                    self.cdata.clone(),
+                    first_update_received,
+                    args.cached,
+                );
+                self.node.reactor.register(subscription.clone(), retriever)?;
+            }
+        }
 
         Ok(handle)
     }
