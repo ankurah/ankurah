@@ -24,7 +24,11 @@ pub trait GetEvents {
     }
 
     /// retrieve the events from the store OR the remote peer
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
+    async fn get_events(
+        &self,
+        collection_id: CollectionId,
+        event_ids: Vec<Self::Id>,
+    ) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
 }
 
 // TODO: make this generic
@@ -73,49 +77,46 @@ impl TEvent for ankurah_proto::Event {
     fn parent(&self) -> &Clock { &self.parent }
 }
 
-pub struct LocalGetter(StorageCollectionWrapper);
+// LocalGetter either goes away, or becomes a stub. Interfaces using Option<GetEvents + GetState> would be better I think?
+// pub struct LocalGetter(StorageCollectionWrapper);
 
-impl LocalGetter {
-    pub fn new(collection: StorageCollectionWrapper) -> Self { Self(collection) }
-}
+// impl LocalGetter {
+//     pub fn new(collection: StorageCollectionWrapper) -> Self { Self(collection) }
+// }
 
-#[async_trait]
-impl GetEvents for LocalGetter {
-    type Id = EventId;
-    type Event = ankurah_proto::Event;
+// #[async_trait]
+// impl GetEvents for LocalGetter {
+//     type Id = EventId;
+//     type Event = ankurah_proto::Event;
 
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-        println!("StorageCollectionWrapper.GetEvents {:?}", event_ids);
-        // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
-        Ok((1, self.0.get_events(event_ids).await?))
-    }
-}
+//     async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+//         println!("StorageCollectionWrapper.GetEvents {:?}", event_ids);
+//         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
+//         Ok((1, self.0.get_events(event_ids).await?))
+//     }
+// }
 
-#[async_trait]
-impl GetState for LocalGetter {
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
-        match self.0.get_state(entity_id).await {
-            Ok(state) => Ok(Some(state)),
-            Err(RetrievalError::EntityNotFound(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-}
+// #[async_trait]
+// impl GetState for LocalGetter {
+//     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
+//         match self.0.get_state(entity_id).await {
+//             Ok(state) => Ok(Some(state)),
+//             Err(RetrievalError::EntityNotFound(_)) => Ok(None),
+//             Err(e) => Err(e),
+//         }
+//     }
+// }
 
-pub struct RemoteGetter<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> {
-    collection_id: CollectionId,
+pub struct DurablePeerGetter<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> {
     nodeandcontext: NodeAndContext<SE, PA>,
-    allow_cache: bool,
 }
 
-impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> RemoteGetter<SE, PA> {
-    pub fn new(collection_id: CollectionId, nodeandcontext: NodeAndContext<SE, PA>, allow_cache: bool) -> Self {
-        Self { collection_id, nodeandcontext, allow_cache }
-    }
+impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> DurablePeerGetter<SE, PA> {
+    pub fn new(nodeandcontext: NodeAndContext<SE, PA>) -> Self { Self { nodeandcontext } }
 }
 
 #[async_trait]
-impl<SE, PA> GetEvents for RemoteGetter<SE, PA>
+impl<SE, PA> GetEvents for DurablePeerGetter<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -123,47 +124,30 @@ where
     type Id = EventId;
     type Event = Event;
 
-    async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-        // First try to get events from local storage
-        let collection = self.1.node.system.collection(&self.0).await?;
-        let mut events = collection.get_events(event_ids.clone()).await?;
-        let mut cost = 1; // Cost for local retrieval
+    async fn get_events(
+        &self,
+        collection_id: CollectionId,
+        event_ids: Vec<Self::Id>,
+    ) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+        let cost = 1; // Cost for local retrieval
 
-        // Check which IDs are missing from the returned events
-        let missing_ids: Vec<_> = event_ids.into_iter().filter(|id| !events.iter().any(|e| e.payload.id() == *id)).collect();
+        let peer_id =
+            self.nodeandcontext.node.get_durable_peer_random().ok_or(RetrievalError::StorageError("No durable peer found".into()))?;
 
-        // If we have missing events and a durable peer, try to fetch them
-        if !missing_ids.is_empty() {
-            if let Some(peer_id) = self.1.node.get_durable_peer_random() {
-                match self
-                    .1
-                    .node
-                    .request(
-                        peer_id,
-                        &self.1.cdata,
-                        proto::NodeRequestBody::GetEvents { collection: self.0.clone(), event_ids: missing_ids },
-                    )
-                    .await
-                    .map_err(|e| RetrievalError::StorageError(format!("Request failed: {}", e).into()))?
-                {
-                    proto::NodeResponseBody::GetEvents(peer_events) => {
-                        for event in peer_events.iter() {
-                            collection.add_event(event).await?;
-                        }
-                        events.extend(peer_events);
-                        cost += 1; // Additional cost for remote retrieval
-                    }
-                    proto::NodeResponseBody::Error(e) => {
-                        return Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into()));
-                    }
-                    _ => {
-                        return Err(RetrievalError::StorageError("Unexpected response type from peer".into()));
-                    }
-                }
+        match self
+            .nodeandcontext
+            .node
+            .request(peer_id, &self.nodeandcontext.cdata, proto::NodeRequestBody::GetEvents { collection: collection_id, event_ids })
+            .await?
+        {
+            proto::NodeResponseBody::GetEvents(peer_events) => Ok((cost, peer_events)),
+            proto::NodeResponseBody::Error(e) => {
+                return Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into()));
+            }
+            _ => {
+                return Err(RetrievalError::StorageError("Unexpected response type from peer".into()));
             }
         }
-
-        Ok((cost, events))
     }
 }
 

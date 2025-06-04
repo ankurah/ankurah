@@ -6,7 +6,7 @@ use tokio::sync::Notify;
 use tracing::{error, warn};
 
 use crate::collectionset::CollectionSet;
-use crate::entity::{Entity, WeakEntitySet};
+use crate::entity::{Entity, EntityManager};
 use crate::error::MutationError;
 use crate::error::RetrievalError;
 use crate::getdata::LocalGetter;
@@ -32,7 +32,7 @@ impl<SE, PA> Clone for SystemManager<SE, PA> {
 struct Inner<SE, PA> {
     collectionset: CollectionSet<SE>,
     collection_map: RwLock<BTreeMap<CollectionId, Entity>>,
-    entities: WeakEntitySet,
+    entities: EntityManager<SE>,
     durable: bool,
     root: RwLock<Option<Attested<EntityState>>>,
     items: RwLock<Vec<Entity>>,
@@ -48,7 +48,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Arc<Reactor<SE, PA>>, durable: bool) -> Self {
+    pub(crate) fn new(collections: CollectionSet<SE>, entities: EntityManager<SE>, reactor: Arc<Reactor<SE, PA>>, durable: bool) -> Self {
         let me = Self(Arc::new(Inner {
             collectionset: collections,
             entities,

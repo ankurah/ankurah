@@ -16,7 +16,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::{Context, NodeAndContext},
-    entity::{Entity, WeakEntitySet},
+    entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
     getdata::LocalGetter,
     notice_info,
@@ -116,7 +116,7 @@ where PA: PolicyAgent
     pub durable: bool,
     pub collections: CollectionSet<SE>,
 
-    pub(crate) entities: WeakEntitySet,
+    pub(crate) entities: EntityManager<SE>,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -140,7 +140,7 @@ where
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine.clone());
-        let entityset: WeakEntitySet = Default::default();
+        let entityset = EntityManager::new(collections.clone());
         let id = proto::EntityId::new();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         notice_info!("Node {id:#} created as ephemeral");
@@ -177,7 +177,7 @@ where
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine);
-        let entityset: WeakEntitySet = Default::default();
+        let entityset = EntityManager::new(collections.clone());
         let id = proto::EntityId::new();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         notice_info!("Node {id:#} created as durable");
@@ -652,13 +652,14 @@ where
                     (Some(false), _) => Ok(None),
                     // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
                     (Some(true) | None, entity) => {
-                        // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
-                        // so save it to the collection
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
+                        // // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
+                        // // so save it to the collection
+                        // let state = entity.to_state()?;
+                        // let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                        // let attestation = self.policy_agent.attest_state(self, &entity_state);
+                        // let attested = Attested::opt(entity_state, attestation);
+                        // collection.set_state(attested).await?;
+                        todo!("LEFT OFF HERE: Move this into with_state")
                         Ok(Some(EntityChange::new(entity, attested_events)?))
                     }
                 }

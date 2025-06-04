@@ -1,7 +1,7 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::collectionset::CollectionSet;
-use crate::entity::{Entity, WeakEntitySet};
+use crate::entity::{Entity, EntityManager};
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
 use crate::retrieve::Fetch;
@@ -42,7 +42,7 @@ pub struct Reactor<SE, PA> {
     /// Reference to the storage engine
     collections: CollectionSet<SE>,
 
-    entityset: WeakEntitySet,
+    entityset: EntityManager<SE>,
     policy_agent: PA,
 }
 
@@ -57,7 +57,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, policy_agent: PA) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, entityset: EntityManager<SE>, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: SafeMap::new(),
             index_watchers: SafeMap::new(),

@@ -5,7 +5,7 @@ use crate::{
     consistency::diff_resolver::DiffResolver,
     entity::Entity,
     error::{MutationError, RetrievalError},
-    getdata::{GetEntities, LocalGetter, RemoteGetter},
+    getdata::{DurablePeerGetter, GetEntities, LocalGetter},
     model::View,
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
@@ -217,23 +217,23 @@ where
         // LEFT OFF HERE - this is the crux of the issue.
         // get_from_peer needs to go away, because it's just storing the state without checking descendency
 
-        let getter : Box<dyn GetEntities> = if self.node.durable {
-            Box::new(LocalGetter::new(self.node.collections.get(collection_id).await?))
-        } else {
-            Box::new(RemoteGetter::new(collection_id.clone(), self.clone(), cached))
+        // let getter : Box<dyn GetEntities> = if self.node.durable {
+        //     Box::new(LocalGetter::new(self.node.collections.get(collection_id).await?))
+        // } else {
+        //     Box::new(RemoteGetter::new(collection_id.clone(), self.clone(), cached))
 
-            // Fetch from peers and commit first response
-            // match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
-            //     Ok(_) => (),
-            //     Err(RetrievalError::NoDurablePeers) if cached => (),
-            //     Err(e) => {
-            //         return Err(e);
-            //     }
-            // }
-        }
+        //     // Fetch from peers and commit first response
+        //     // match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
+        //     //     Ok(_) => (),
+        //     //     Err(RetrievalError::NoDurablePeers) if cached => (),
+        //     //     Err(e) => {
+        //     //         return Err(e);
+        //     //     }
+        //     // }
+        // }
 
         // TODO update this to use entities.with_state and then commit to the collection if that applies and also call reactor.notify_change,
-        // just like apply_subscription_updates/apply_subscription_update
+        //just like apply_subscription_updates/apply_subscription_update
 
         // if let Some(local) = self.node.entities.get_resident(&id) {
         //     debug!("Node({}).get_entity found local entity - returning", self.node.id);
@@ -260,7 +260,8 @@ where
         //         Ok(entity)
         //     }
         //     Err(e) => Err(e),
-        }
+        // }
+        unimplemented!()
     }
     /// Fetch a list of entities based on a predicate
     pub async fn fetch_entities(&self, collection_id: &CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
@@ -282,14 +283,13 @@ where
         let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
         let states = storage_collection.fetch_states(&filtered_predicate).await?;
 
+        let getter = DurablePeerGetter::new(self.clone());
+
         // Convert states to entities
         let mut entities = Vec::new();
         for state in states {
-            let (_, entity) = self
-                .node
-                .entities
-                .with_state(&(collection_id.clone(), self), state.payload.entity_id, collection_id.clone(), &state.payload.state)
-                .await?;
+            let (_, entity) =
+                self.node.entities.with_state(&getter, state.payload.entity_id, collection_id.clone(), &state.payload.state).await?;
             entities.push(entity);
         }
         Ok(entities)
@@ -368,7 +368,8 @@ where
             let collection_id = &attested_event.payload.collection;
             // If this entity has an upstream, propagate the changes
             if let Some(ref upstream) = entity.upstream {
-                upstream.apply_event(&(collection_id.clone(), self), &attested_event.payload).await?;
+                unimplemented!()
+                // upstream.apply_event(&(collection_id.clone(), self), &attested_event.payload).await?;
             }
 
             // Persist

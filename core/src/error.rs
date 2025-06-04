@@ -41,6 +41,8 @@ pub enum RetrievalError {
     StateError(StateError),
     #[error("Mutation error: {0}")]
     MutationError(Box<MutationError>),
+    #[error("Request error: {0}")]
+    RequestError(RequestError),
 }
 
 impl From<MutationError> for RetrievalError {
@@ -87,6 +89,9 @@ impl From<SendError> for RequestError {
 
 impl From<DecodeError> for RetrievalError {
     fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(err) }
+}
+impl From<RequestError> for RetrievalError {
+    fn from(err: RequestError) -> Self { RetrievalError::RequestError(err) }
 }
 
 #[derive(Error, Debug)]

@@ -2,7 +2,7 @@ use crate::collectionset::CollectionSet;
 use crate::consistency::diff_resolver::DiffResolver;
 use crate::getdata::LocalGetter;
 use crate::{entity::Entity, error::RetrievalError};
-use crate::{entity::WeakEntitySet, storage::StorageEngine};
+use crate::{entity::EntityManager, storage::StorageEngine};
 use ankurah_proto::{CollectionId, EntityId};
 use tracing::debug;
 
@@ -15,13 +15,13 @@ use super::Fetch;
 /// 4. If use_cache=false, waits for consistency resolution and conditionally refetches if differences were detected
 pub struct LocalRefetcher<SE: StorageEngine + Send + Sync + 'static> {
     collections: CollectionSet<SE>,
-    entityset: WeakEntitySet,
+    entityset: EntityManager,
     resolver: DiffResolver,
     use_cache: bool,
 }
 
 impl<SE: StorageEngine + Send + Sync + 'static> LocalRefetcher<SE> {
-    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet, resolver: DiffResolver, use_cache: bool) -> Self {
+    pub fn new(collections: CollectionSet<SE>, entityset: EntityManager, resolver: DiffResolver, use_cache: bool) -> Self {
         Self { collections, entityset, resolver, use_cache }
     }
 

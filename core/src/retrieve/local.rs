@@ -2,7 +2,7 @@ use ankurah_proto::CollectionId;
 
 use crate::{
     collectionset::CollectionSet,
-    entity::{Entity, WeakEntitySet},
+    entity::{Entity, EntityManager},
     error::RetrievalError,
     getdata::LocalGetter,
     storage::StorageEngine,
@@ -13,11 +13,11 @@ use super::Fetch;
 /// Local entity retriever that only fetches from local storage (for durable nodes)
 pub struct LocalFetcher<SE: StorageEngine + Send + Sync + 'static> {
     collections: CollectionSet<SE>,
-    entityset: WeakEntitySet,
+    entityset: EntityManager<SE>,
 }
 
 impl<SE: StorageEngine + Send + Sync + 'static> LocalFetcher<SE> {
-    pub fn new(collections: CollectionSet<SE>, entityset: WeakEntitySet) -> Self { Self { collections, entityset } }
+    pub fn new(collections: CollectionSet<SE>, entityset: EntityManager<SE>) -> Self { Self { collections, entityset } }
 }
 
 #[async_trait::async_trait]
