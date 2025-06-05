@@ -11,7 +11,7 @@ pub fn state_name(name: &str) -> String { format!("{}_state", name) }
 pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 
 #[async_trait]
-pub trait StorageEngine: Send + Sync {
+pub trait StorageEngine: Send + Sync + Clone {
     type Value;
     // Opens and/or creates a storage collection.
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;

@@ -1,6 +1,5 @@
 use crate::collectionset::CollectionSet;
 use crate::consistency::diff_resolver::DiffResolver;
-use crate::getdata::LocalGetter;
 use crate::{entity::Entity, error::RetrievalError};
 use crate::{entity::EntityManager, storage::StorageEngine};
 use ankurah_proto::{CollectionId, EntityId};

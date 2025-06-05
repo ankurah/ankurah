@@ -1,4 +1,5 @@
 use crate::collectionset::CollectionSet;
+use crate::databroker::DataBroker;
 use crate::lineage::{self, GetEvents};
 use crate::storage::StorageEngine;
 use crate::{
@@ -338,19 +339,20 @@ impl std::fmt::Display for TemporaryEntity {
 }
 
 /// The abiter of all entities in the system (except those which are forked during a transaction)
-pub struct EntityManager<SE>(Arc<Inner<SE>>);
-impl<SE> Clone for EntityManager<SE> {
+pub struct EntityManager<SE, C>(Arc<Inner<SE, C>>);
+impl<SE, C> Clone for EntityManager<SE, C> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct Inner<SE> {
+pub struct Inner<SE, C> {
     resident: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
+    data_broker: Arc<dyn DataBroker<C>>,
     collections: CollectionSet<SE>,
 }
 
-impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
-    pub fn new(collections: CollectionSet<SE>) -> Self {
-        Self(Arc::new(Inner { resident: std::sync::RwLock::new(BTreeMap::new()), collections }))
+impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> EntityManager<SE, C> {
+    pub fn new(data_broker: Arc<dyn DataBroker<C>>, collections: CollectionSet<SE>) -> Self {
+        Self(Arc::new(Inner { resident: std::sync::RwLock::new(BTreeMap::new()), data_broker, collections }))
     }
     /// Returns a resident entity, or None if it's not resident
     pub fn get_resident(&self, id: &EntityId) -> Option<Entity> {
@@ -364,23 +366,14 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
     }
 
     /// Returns a resident entity, or uses the getter
-    pub async fn get<G>(&self, getter: &G, collection_id: &CollectionId, id: &EntityId) -> Result<Option<Entity>, RetrievalError>
-    where G: GetState + GetEvents<Id = EventId, Event = Event> + Send + Sync {
-        // LEFT OFF HERE - how should we handle GetState?
-        // I think we do need a getter, if for no other reason than to apply the context.
-        // We could optionally have that getter impl GetEvents in order to make entity.can_apply_state work, or construct that ourselves.
-        // the weird part is that a GetState is not the same as a GetEvents, because it would first have to check the local storage ( kind of the point fusing state read/write and entity management)
-        // but EntityManager is already doing the first half of that. So maybe taking Context could be the way to go
-
+    pub async fn get(&self, collection_id: &CollectionId, id: &EntityId, cdata: &C) -> Result<Option<Entity>, RetrievalError> {
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get_resident(id) {
             Some(entity) => Ok(Some(entity)),
-            None => match getter.get_state(*id).await {
+            None => match self.0.data_broker.get_state(collection_id, *id, cdata).await {
                 Ok(None) => Ok(None),
                 Ok(Some(state)) => {
-                    // technically someone could have added the entity since we last checked, so it's better to use the
-                    // apply_state method to re-check
-                    let (_, entity) = self.apply_state(getter, state).await?;
+                    let (_, entity) = self.apply_state(state, cdata).await?;
                     Ok(Some(entity))
                 }
                 Err(e) => Err(e),
@@ -388,9 +381,8 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
         }
     }
     /// Returns a resident entity, or gets it from the provided getter, or finally creates if neither of the two are found
-    pub async fn get_or_create<G>(&self, getter: &G, collection_id: &CollectionId, id: &EntityId) -> Result<Entity, RetrievalError>
-    where G: GetState + GetEvents<Id = EventId, Event = Event> + Send + Sync {
-        match self.get(getter, collection_id, id).await? {
+    pub async fn get_or_create(&self, collection_id: &CollectionId, id: &EntityId, cdata: &C) -> Result<Entity, RetrievalError> {
+        match self.get(collection_id, id, cdata).await? {
             Some(entity) => Ok(entity),
             None => {
                 let mut entities = self.0.resident.write().unwrap();
@@ -411,8 +403,29 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
         let mut entities = self.0.resident.write().unwrap();
         let id = EntityId::new();
         let entity = Entity::create(id, collection, Backends::new());
-        entities.insert(id, entity.weak());
+        entities.insert(*id, entity.weak());
         entity
+    }
+
+    /// Fetch multiple entities matching a predicate, hydrating them through apply_state
+    pub async fn fetch_entities(
+        &self,
+        collection_id: &CollectionId,
+        predicate: &ankql::ast::Predicate,
+        cdata: &C,
+    ) -> Result<Vec<Entity>, RetrievalError> {
+        let matching_states = self.0.data_broker.fetch_states(collection_id, predicate, cdata).await?;
+
+        let mut entities = Vec::new();
+        for state in matching_states {
+            let (_, entity) = self
+                .apply_state(state, cdata)
+                .await
+                .map_err(|e| RetrievalError::Other(format!("Failed to process entity state: {}", e)))?;
+            entities.push(entity);
+        }
+
+        Ok(entities)
     }
 
     /// Attempts to apply an EntityState to the locally resident Entity (if any) and to the collection.
@@ -426,8 +439,8 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
     /// - changed is None if the entity was not previously on the local node
     pub async fn apply_state(
         &self,
-        event_getter: &impl GetEvents<Id = EventId, Event = Event>,
         attested_entity_state: Attested<EntityState>,
+        cdata: &C,
     ) -> Result<(Option<bool>, Entity), MutationError> {
         let id = attested_entity_state.payload.entity_id;
         let collection_id = &attested_entity_state.payload.collection;
@@ -442,8 +455,8 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
 
             debug!("Entity {id} was resident");
 
-            // Apply the state if lineage allows
-            if entity.can_apply_state(event_getter, state).await? {
+            // Apply the state if lineage allows - use data_broker for event retrieval
+            if entity.can_apply_state(&*self.0.data_broker.event_getter(cdata, collection_id), state).await? {
                 // we can only apply the state if it descends from the current head, which means it changed
                 entity.apply_state(state)?;
                 let collection = self.0.collections.get(collection_id).await?;
@@ -465,8 +478,8 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
             // Register the entity as resident
             self.0.resident.write().unwrap().insert(id, entity.weak());
 
-            // Check lineage and apply if needed
-            let changed = entity.can_apply_state(event_getter, state).await?;
+            // Check lineage and apply if needed - use data_broker for event retrieval
+            let changed = entity.can_apply_state(&*self.0.data_broker.event_getter(cdata, collection_id), state).await?;
             if changed {
                 entity.apply_state(state)?;
                 collection.set_state(attested_entity_state).await?;
@@ -530,7 +543,7 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
     //             }
 
     //             // We need to apply the new state to check lineage
-    //             let changed = entity.can_apply_state(getter, &state).await?;
+    //             let changed = entity.can_apply_state(getter, state).await?;
     //             return Ok((Some(changed), entity));
     //         } else {
     //             debug!("No existing state in storage for {id}");

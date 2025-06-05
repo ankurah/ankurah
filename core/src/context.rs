@@ -9,7 +9,7 @@ use crate::{
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
     resultset::ResultSet,
-    retrieve::{local::LocalFetcher, localrefetch::LocalRefetcher},
+    retrieve::localrefetch::LocalRefetcher,
     storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
     transaction::Transaction,
@@ -213,54 +213,19 @@ where
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
 
-        // LEFT OFF HERE - this is the crux of the issue.
-        // get_from_peer needs to go away, because it's just storing the state without checking descendency
+        // Use EntityManager's get method directly
+        match self.node.entities.get(collection_id, &id).await? {
+            Some(entity) => Ok(entity),
+            None => {
+                // If not found and not cached, try to fetch from peer first for ephemeral nodes
+                if !self.node.durable && !cached {
+                    // TODO: Fetch from peers if needed
+                }
 
-        // let getter : Box<dyn GetEntities> = if self.node.durable {
-        //     Box::new(LocalEventGetter::new(self.node.collections.get(collection_id).await?))
-        // } else {
-        //     Box::new(RemoteGetter::new(collection_id.clone(), self.clone(), cached))
-
-        //     // Fetch from peers and commit first response
-        //     // match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
-        //     //     Ok(_) => (),
-        //     //     Err(RetrievalError::NoDurablePeers) if cached => (),
-        //     //     Err(e) => {
-        //     //         return Err(e);
-        //     //     }
-        //     // }
-        // }
-
-        // TODO update this to use entities.with_state and then commit to the collection if that applies and also call reactor.notify_change,
-        //just like apply_subscription_updates/apply_subscription_update
-
-        // if let Some(local) = self.node.entities.get_resident(&id) {
-        //     debug!("Node({}).get_entity found local entity - returning", self.node.id);
-        //     return Ok(local);
-        // }
-        // debug!("{}.get_entity fetching from storage", self.node);
-
-        // let collection = self.node.collections.get(collection_id).await?;
-        // match collection.get_state(id).await {
-        //     Ok(entity_state) => {
-        //         let (_changed, entity) = self
-        //             .node
-        //             .entities
-        //             .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &entity_state.payload.state)
-        //             .await?;
-        //         Ok(entity)
-        //     }
-        //     Err(RetrievalError::EntityNotFound(id)) => {
-        //         let (_, entity) = self
-        //             .node
-        //             .entities
-        //             .with_state(&(collection_id.clone(), self), id, collection_id.clone(), &proto::State::default())
-        //             .await?;
-        //         Ok(entity)
-        //     }
-        //     Err(e) => Err(e),
-        // }
-        unimplemented!()
+                // Create new entity if not found anywhere
+                self.node.entities.get_or_create(collection_id, &id).await
+            }
+        }
     }
     /// Fetch a list of entities based on a predicate
     pub async fn fetch_entities(&self, collection_id: &CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
@@ -277,20 +242,9 @@ where
         }
 
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
-        // Fetch raw states from storage
-        let storage_collection = self.node.collections.get(collection_id).await?;
+        // Use EntityManager's fetch_entities method directly
         let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
-        let states = storage_collection.fetch_states(&filtered_predicate).await?;
-
-        let getter = DurableGetter::new(self.clone());
-
-        // Convert states to entities
-        let mut entities = Vec::new();
-        for state in states {
-            let (_, entity) = self.node.entities.apply_state(&getter, state).await?;
-            entities.push(entity);
-        }
-        Ok(entities)
+        self.node.entities.fetch_entities(collection_id, &filtered_predicate).await
     }
 
     pub async fn subscribe(
@@ -314,8 +268,16 @@ where
 
         match &self.node.subscription_relay {
             None => {
-                let retriever = LocalFetcher::new(self.node.collections.clone(), self.node.entities.clone());
-                self.node.reactor.register(subscription.clone(), retriever)?;
+                // For durable nodes, create a simple fetcher that uses EntityManager directly
+                let entities = self.node.entities.clone();
+                let fetch_fn = move |collection_id: &CollectionId, predicate: &ankql::ast::Predicate| {
+                    let entities = entities.clone();
+                    let collection_id = collection_id.clone();
+                    let predicate = predicate.clone();
+                    async move { entities.fetch_entities(&collection_id, &predicate).await }
+                };
+                // TODO: Update reactor.register to accept the fetch function instead of a Fetch trait object
+                todo!("Update reactor to use EntityManager directly")
             }
             Some(relay) => {
                 // DiffResolver is used to detect and refresh entities which are present in our initial local fetch but not in the remote fetch

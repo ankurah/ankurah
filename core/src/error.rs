@@ -7,6 +7,8 @@ use crate::{connector::SendError, policy::AccessDenied};
 
 #[derive(Error, Debug)]
 pub enum RetrievalError {
+    #[error("Sanity error: {0}")]
+    SanityError(&'static str),
     #[error("access denied")]
     AccessDenied(AccessDenied),
     #[error("Parse error: {0}")]

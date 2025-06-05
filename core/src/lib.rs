@@ -4,6 +4,7 @@ pub mod comparison_index;
 pub mod connector;
 pub mod consistency;
 pub mod context;
+pub mod databroker;
 pub mod entity;
 pub mod error;
 // pub mod event;

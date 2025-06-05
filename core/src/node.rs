@@ -16,6 +16,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::{Context, NodeAndContext},
+    databroker,
     entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
     lineage::{LocalEventGetter, LocalOrRemoteEventGetter},
@@ -116,7 +117,7 @@ where PA: PolicyAgent
     pub durable: bool,
     pub collections: CollectionSet<SE>,
 
-    pub(crate) entities: EntityManager<SE>,
+    pub(crate) entities: EntityManager<SE, PA::ContextData>,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -140,7 +141,10 @@ where
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine.clone());
-        let entityset = EntityManager::new(collections.clone());
+
+        // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
+        let network_broker = Arc::new(crate::databroker::NetworkDataBroker::new(collections.clone()));
+        let entityset = EntityManager::new(network_broker.clone(), collections.clone());
         let id = proto::EntityId::new();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         notice_info!("Node {id:#} created as ephemeral");
@@ -165,6 +169,9 @@ where
             pending_subs: SafeMap::new(),
         }));
 
+        // Set up the node reference in the NetworkDataBroker
+        network_broker.set_node(&node).unwrap();
+
         // Set up the message sender for the subscription relay
         if let Some(ref relay) = node.subscription_relay {
             let weak_node = node.weak();
@@ -177,7 +184,9 @@ where
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
         let collections = CollectionSet::new(engine);
-        let entityset = EntityManager::new(collections.clone());
+
+        let data_broker = Arc::new(crate::databroker::LocalDataBroker::new(collections.clone()));
+        let entityset = EntityManager::new(data_broker, collections.clone());
         let id = proto::EntityId::new();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
         notice_info!("Node {id:#} created as durable");
@@ -653,7 +662,7 @@ where
                 }
             }
             None => {
-                // LEFT OFF HERE - fetch the state from a peer if we don't have it
+                // LEFT OFF HERE - Move this into self.entities.apply_event
 
                 let entity: Entity = self.entities.get_or_create(&getter, &collection_id, &entity_id).await?;
 
