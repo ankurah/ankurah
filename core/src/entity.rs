@@ -1,5 +1,5 @@
 use crate::collectionset::CollectionSet;
-use crate::lineage::{self, GetEvents, GetState};
+use crate::lineage::{self, GetEvents};
 use crate::storage::StorageEngine;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
@@ -7,7 +7,7 @@ use crate::{
     property::{Backends, PropertyValue},
 };
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
+use ankurah_proto::{Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
@@ -366,6 +366,12 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
     /// Returns a resident entity, or uses the getter
     pub async fn get<G>(&self, getter: &G, collection_id: &CollectionId, id: &EntityId) -> Result<Option<Entity>, RetrievalError>
     where G: GetState + GetEvents<Id = EventId, Event = Event> + Send + Sync {
+        // LEFT OFF HERE - how should we handle GetState?
+        // I think we do need a getter, if for no other reason than to apply the context.
+        // We could optionally have that getter impl GetEvents in order to make entity.can_apply_state work, or construct that ourselves.
+        // the weird part is that a GetState is not the same as a GetEvents, because it would first have to check the local storage ( kind of the point fusing state read/write and entity management)
+        // but EntityManager is already doing the first half of that. So maybe taking Context could be the way to go
+
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get_resident(id) {
             Some(entity) => Ok(Some(entity)),
@@ -373,8 +379,8 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
                 Ok(None) => Ok(None),
                 Ok(Some(state)) => {
                     // technically someone could have added the entity since we last checked, so it's better to use the
-                    // with_state method to re-check
-                    let (_, entity) = self.with_state(getter, *id, collection_id.to_owned(), &state.payload.state).await?;
+                    // apply_state method to re-check
+                    let (_, entity) = self.apply_state(getter, state).await?;
                     Ok(Some(entity))
                 }
                 Err(e) => Err(e),
@@ -409,28 +415,76 @@ impl<SE: StorageEngine + Send + Sync + 'static> EntityManager<SE> {
         entity
     }
 
-    /// Attempts to apply an EntityState to the locally resident Entity (if any) and to the collection
-    pub async fn with_state(
+    /// Attempts to apply an EntityState to the locally resident Entity (if any) and to the collection.
+    ///
+    /// This method ensures that entity state is only written to StorageCollection if it descends
+    /// the current state for that entity. It centralizes reading and writing of local state.
+    ///
+    /// Returns (changed, entity) where:
+    /// - changed is Some(true) if the entity was changed
+    /// - changed is Some(false) if it already exists and the state was not applied
+    /// - changed is None if the entity was not previously on the local node
+    pub async fn apply_state(
         &self,
         event_getter: &impl GetEvents<Id = EventId, Event = Event>,
-        id: EntityId,
-        collection_id: CollectionId,
-        state: &State,
+        attested_entity_state: Attested<EntityState>,
     ) -> Result<(Option<bool>, Entity), MutationError> {
-        // First we have to check if we have the entity resident at all. If so, we can assume that it
-        // matches the collection. If not, we have to fetch it from storage.
+        let id = attested_entity_state.payload.entity_id;
+        let collection_id = &attested_entity_state.payload.collection;
+        let state = &attested_entity_state.payload.state;
 
-        // Then, we need to call can_apply_state to see if the state applies to the entity
+        // Check if the entity is already resident
+        if let Some(entity) = self.get_resident(&id) {
+            // Validate that the resident entity belongs to the correct collection
+            if entity.collection() != collection_id {
+                return Err(MutationError::General(format!("collection mismatch {} {collection_id}", entity.collection()).into()));
+            }
 
-        // Then store it in the collection
+            debug!("Entity {id} was resident");
 
-        // and if that succeeds, then call apply_state on the entity
+            // Apply the state if lineage allows
+            if entity.can_apply_state(event_getter, state).await? {
+                // we can only apply the state if it descends from the current head, which means it changed
+                entity.apply_state(state)?;
+                let collection = self.0.collections.get(collection_id).await?;
+                collection.set_state(attested_entity_state).await?;
 
-        // Finally return the entity
-        unimplemented!()
+                return Ok((Some(true), entity));
+            } else {
+                return Ok((Some(false), entity));
+            }
+        }
+
+        // Entity is not resident - check if there's existing state in storage
+        let collection = self.0.collections.get(collection_id).await?;
+
+        if let Some(existing_state) = collection.get_state(id).await.ok() {
+            debug!("Found existing state in storage for {id}");
+            let entity = Entity::from_state(id, collection_id.clone(), &existing_state.payload.state)?;
+
+            // Register the entity as resident
+            self.0.resident.write().unwrap().insert(id, entity.weak());
+
+            // Check lineage and apply if needed
+            let changed = entity.can_apply_state(event_getter, state).await?;
+            if changed {
+                entity.apply_state(state)?;
+                collection.set_state(attested_entity_state).await?;
+            }
+            Ok((Some(changed), entity))
+        } else {
+            debug!("No existing state in storage for {id}");
+            let entity = Entity::from_state(id, collection_id.clone(), state)?;
+
+            // Register the entity as resident and store the new state
+            self.0.resident.write().unwrap().insert(id, entity.weak());
+            collection.set_state(attested_entity_state).await?;
+
+            Ok((None, entity))
+        }
     }
 
-    // DEPRECATED - use apply_state instead
+    // DEPRECATED - use apply_state instead. DO NOT DELETE THIS COMMENTED FUNCTION. WE WANT TO LEAVE IT FOR REFERENCE.
     // Returns a tuple of (changed, entity)
     // changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
     // None if the entity was not previously on the local node (either in the WeakEntitySet or in storage)

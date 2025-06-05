@@ -4,7 +4,7 @@ use crate::{
     collectionset::CollectionSet,
     entity::{Entity, EntityManager},
     error::RetrievalError,
-    getdata::LocalGetter,
+    lineage::LocalEventGetter,
     storage::StorageEngine,
 };
 
@@ -25,13 +25,13 @@ impl<SE: StorageEngine + Send + Sync + 'static> Fetch<Entity> for LocalFetcher<S
     async fn fetch(self: Self, collection_id: &CollectionId, predicate: &ankql::ast::Predicate) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
         let matching_states = storage_collection.fetch_states(predicate).await?;
-        let retriever = LocalGetter::new(storage_collection.clone());
+        let retriever = LocalEventGetter::new(storage_collection.clone());
 
         let mut entities = Vec::new();
         for state in matching_states {
             let (_, entity) = self
                 .entityset
-                .with_state(&retriever, state.payload.entity_id, collection_id.clone(), &state.payload.state)
+                .apply_state(&retriever, state.payload.entity_id, collection_id.clone(), &state.payload.state)
                 .await
                 .map_err(|e| RetrievalError::Other(format!("Failed to process entity state: {}", e)))?;
             entities.push(entity);

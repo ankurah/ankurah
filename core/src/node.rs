@@ -18,7 +18,7 @@ use crate::{
     context::{Context, NodeAndContext},
     entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
-    getdata::LocalGetter,
+    lineage::{LocalEventGetter, LocalOrRemoteEventGetter},
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
@@ -532,15 +532,15 @@ where
 
             // When applying events for a remote transaction, we should only look at the local storage for the lineage
             // If we are missing events necessary to connect the lineage, that's their responsibility to include in the transaction.
-            let retriever = LocalGetter::new(collection.clone());
-            let entity = self.entities.get_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
+            let getter = LocalEventGetter::new(collection.clone());
+            let entity = self.entities.get_or_create(&getter, &event.payload.collection, &event.payload.entity_id).await?;
 
             // we have the entity, so we can check access, optionally atteste, and apply/save the event;
             if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
                 event.attestations.push(attestation);
             }
 
-            if entity.apply_event(&retriever, &event.payload).await? {
+            if entity.apply_event(&getter, &event.payload).await? {
                 let state = entity.to_state()?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
@@ -620,7 +620,6 @@ where
     ) -> Result<Option<EntityChange>, MutationError> {
         let (entity_id, collection_id, state, events) = update.into_parts();
         let collection = self.collections.get(&collection_id).await?;
-        let getter = (collection_id.clone(), nodeandcontext);
 
         let attested_events = match events {
             Some(events) => {
@@ -639,34 +638,24 @@ where
             None => vec![],
         };
 
+        let getter = LocalOrRemoteEventGetter::new(nodeandcontext.clone());
         match state {
             Some(state) => {
                 let state = (entity_id, collection_id.clone(), state).into();
                 // validate that we trust the state given to us
                 self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
 
-                let payload = state.payload;
-
-                match self.entities.with_state(&getter, payload.entity_id, payload.collection, &payload.state).await? {
+                match self.entities.apply_state(&getter, state).await? {
                     // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
                     (Some(false), _) => Ok(None),
                     // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
-                    (Some(true) | None, entity) => {
-                        // // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
-                        // // so save it to the collection
-                        // let state = entity.to_state()?;
-                        // let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        // let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        // let attested = Attested::opt(entity_state, attestation);
-                        // collection.set_state(attested).await?;
-                        todo!("LEFT OFF HERE: Move this into with_state")
-                        Ok(Some(EntityChange::new(entity, attested_events)?))
-                    }
+                    (Some(true) | None, entity) => Ok(Some(EntityChange::new(entity, attested_events)?)),
                 }
             }
             None => {
-                let entity: Entity =
-                    self.entities.get_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
+                // LEFT OFF HERE - fetch the state from a peer if we don't have it
+
+                let entity: Entity = self.entities.get_or_create(&getter, &collection_id, &entity_id).await?;
 
                 let mut changed = false;
                 // TODO - figure out how to apply the events in the correct order

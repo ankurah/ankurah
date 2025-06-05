@@ -249,11 +249,11 @@ where
         let mut entities = Vec::new();
         let mut root_state = None;
 
-        let retriever = LocalGetter::new(storage.clone());
+        // let retriever = LocalGetter::new(storage.clone());
 
         for state in storage.fetch_states(&ankql::ast::Predicate::True).await? {
             let (_entity_changed, entity) =
-                self.0.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), &state.payload.state).await?;
+                self.0.entities.apply_state(&retriever, state.payload.entity_id, collection_id.clone(), &state.payload.state).await?;
             let lww_backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");

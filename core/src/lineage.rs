@@ -1,11 +1,10 @@
+mod getevents;
+pub use getevents::*;
+
 use crate::error::RetrievalError;
-use crate::getdata::{TClock, TEvent};
-use ankurah_proto::{Clock, Event, EventId};
+use ankurah_proto::CollectionId;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
-
-pub use crate::getdata::GetEvents;
-pub use crate::getdata::GetState;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ordering<Id> {
@@ -196,6 +195,8 @@ where
     G::Event: TEvent<Id = G::Id>,
     G::Id: std::hash::Hash + Ord + std::fmt::Debug,
 {
+    collection_id: CollectionId,
+
     /// The event store to fetch events from
     getter: &'a G,
 
@@ -237,6 +238,7 @@ where
 
         Self {
             getter,
+            collection_id: subject.collection().clone(),
 
             unseen_other_heads: other.len(),
 
@@ -261,7 +263,7 @@ where
         // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
         // so we can pass the HashSet as a borrow and don't have to alloc this twice
         let mut result_checklist: HashSet<G::Id> = ids.iter().cloned().collect();
-        let (cost, events) = self.getter.get_events(ids).await?;
+        let (cost, events) = self.getter.get_events(&self.collection_id, ids).await?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
         for event in events {
@@ -372,7 +374,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ankurah_proto::{AttestationSet, Attested};
+    use ankurah_proto::{AttestationSet, Attested, CollectionId};
 
     use super::*;
     use async_trait::async_trait;
@@ -429,7 +431,11 @@ mod tests {
         type Id = TestId;
         type Event = TestEvent;
 
-        async fn get_events(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+        async fn get_events(
+            &self,
+            collection_id: &CollectionId,
+            event_ids: Vec<Self::Id>,
+        ) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
             let mut result = Vec::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {

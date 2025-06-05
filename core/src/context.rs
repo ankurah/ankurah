@@ -5,7 +5,6 @@ use crate::{
     consistency::diff_resolver::DiffResolver,
     entity::Entity,
     error::{MutationError, RetrievalError},
-    getdata::{DurablePeerGetter, GetEntities, LocalGetter},
     model::View,
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
@@ -28,7 +27,7 @@ impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct NodeAndContext<SE, PA: PolicyAgent>
+pub struct NodeAndContext<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -218,7 +217,7 @@ where
         // get_from_peer needs to go away, because it's just storing the state without checking descendency
 
         // let getter : Box<dyn GetEntities> = if self.node.durable {
-        //     Box::new(LocalGetter::new(self.node.collections.get(collection_id).await?))
+        //     Box::new(LocalEventGetter::new(self.node.collections.get(collection_id).await?))
         // } else {
         //     Box::new(RemoteGetter::new(collection_id.clone(), self.clone(), cached))
 
@@ -283,13 +282,12 @@ where
         let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
         let states = storage_collection.fetch_states(&filtered_predicate).await?;
 
-        let getter = DurablePeerGetter::new(self.clone());
+        let getter = DurableGetter::new(self.clone());
 
         // Convert states to entities
         let mut entities = Vec::new();
         for state in states {
-            let (_, entity) =
-                self.node.entities.with_state(&getter, state.payload.entity_id, collection_id.clone(), &state.payload.state).await?;
+            let (_, entity) = self.node.entities.apply_state(&getter, state).await?;
             entities.push(entity);
         }
         Ok(entities)
