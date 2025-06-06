@@ -16,7 +16,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::{Context, NodeAndContext},
-    databroker::{self, DataBroker},
+    databroker::{self, DataBroker, LocalDataBroker},
     entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
@@ -156,6 +156,8 @@ where
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
         let collections = CollectionSet::new(engine.clone());
 
+        // TODO think about how Reactor and EntityManager should reference each other
+
         // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
         let network_broker = crate::databroker::NetworkDataBroker::new(collections.clone());
 
@@ -200,7 +202,7 @@ where
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
         let collections = CollectionSet::new(engine);
 
-        let data_broker = Arc::new(crate::databroker::LocalDataBroker::new(collections.clone()));
+        let data_broker = Arc::new(LocalDataBroker::new(collections.clone()));
         let entityset = EntityManager::new(data_broker, collections.clone());
         let id = proto::EntityId::new();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
@@ -549,33 +551,9 @@ where
         mut events: Vec<Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
         debug!("{self} commiting transaction {id} with {} events", events.len());
-        let mut changes = Vec::new();
 
-        for event in events.iter_mut() {
-            let collection = self.collections.get(&event.payload.collection).await?;
-
-            // When applying events for a remote transaction, we should only look at the local storage for the lineage
-            // If we are missing events necessary to connect the lineage, that's their responsibility to include in the transaction.
-            let getter = LocalEventGetter::new(collection.clone());
-            let entity = self.entities.get_or_create(&getter, &event.payload.collection, &event.payload.entity_id).await?;
-
-            // we have the entity, so we can check access, optionally atteste, and apply/save the event;
-            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
-                event.attestations.push(attestation);
-            }
-            // LEFT OFF HERE - call self.entities.apply_event - but we have to make sure we get it right
-            if entity.apply_event(&getter, &event.payload).await? {
-                let state = entity.to_state()?;
-                let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                let attestation = self.policy_agent.attest_state(self, &entity_state);
-                let attested = Attested::opt(entity_state, attestation);
-                collection.add_event(event).await?;
-                collection.set_state(attested).await?;
-                changes.push(EntityChange::new(entity.clone(), event.clone())?);
-            }
-        }
-
-        self.reactor.notify_change(changes);
+        let getter = LocalDataBroker::new(self.collections.clone());
+        self.entities.apply_events_with_getter(cdata, events.into_iter(), getter).await?;
 
         Ok(())
     }

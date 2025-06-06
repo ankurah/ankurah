@@ -1,6 +1,8 @@
+use crate::changes::EntityChange;
 use crate::collectionset::CollectionSet;
 use crate::databroker::DataBroker;
 use crate::lineage::{self, GetEvents};
+use crate::reactor::Reactor;
 use crate::storage::StorageEngine;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
@@ -346,9 +348,10 @@ impl<SE, PA, D> Clone for EntityManager<SE, PA, D> {
 
 pub struct Inner<SE, PA, D> {
     resident: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
+    reactor: Reactor<SE, PA>,
+    policy_agent: PA,
     data_broker: D,
     collections: CollectionSet<SE>,
-    _marker: std::marker::PhantomData<PA>,
 }
 
 impl<
@@ -357,13 +360,8 @@ impl<
         D: DataBroker<PA::ContextData> + Send + Sync + 'static,
     > EntityManager<SE, PA, D>
 {
-    pub fn new(data_broker: D, collections: CollectionSet<SE>) -> Self {
-        Self(Arc::new(Inner {
-            resident: std::sync::RwLock::new(BTreeMap::new()),
-            data_broker,
-            collections,
-            _marker: std::marker::PhantomData,
-        }))
+    pub fn new(data_broker: D, collections: CollectionSet<SE>, reactor: Reactor<SE, PA>, policy_agent: PA) -> Self {
+        Self(Arc::new(Inner { resident: std::sync::RwLock::new(BTreeMap::new()), data_broker, collections, reactor, policy_agent }))
     }
     /// Returns a resident entity, or None if it's not resident
     pub fn get_resident(&self, id: &EntityId) -> Option<Entity> {
@@ -429,8 +427,52 @@ impl<
         entity
     }
 
-    pub async fn apply_event(&self, collection_id: &CollectionId, entity_id: &EntityId, event: &Event) -> Result<bool, MutationError> {
-        todo!()
+    /// use the data broker's default getter
+    pub async fn apply_events(
+        &self,
+        cdata: &PA::ContextData,
+        events: impl Iterator<Item = Attested<Event>>,
+    ) -> Result<bool, MutationError> {
+        let getter = self.0.data_broker.event_getter(cdata.clone());
+        self.apply_events_with_getter(cdata, events, getter).await
+    }
+
+    /// Use the provided getter to apply the events which may or may not differ from the data broker's default getter
+    pub async fn apply_events_with_getter<G: GetEvents<Id = EventId, Event = Event>>(
+        &self,
+        cdata: &PA::ContextData,
+        events: impl Iterator<Item = Attested<Event>>,
+        getter: G,
+    ) -> Result<bool, MutationError> {
+        let mut changed = false;
+
+        let mut changes = Vec::new();
+
+        for event in events.iter_mut() {
+            let collection = self.collections.get(&event.payload.collection).await?;
+
+            // When applying events for a remote transaction, we should only look at the local storage for the lineage
+            // If we are missing events necessary to connect the lineage, that's their responsibility to include in the transaction.
+            let entity = self.entities.get_or_create(&getter, &event.payload.collection, &event.payload.entity_id).await?;
+
+            // we have the entity, so we can check access, optionally atteste, and apply/save the event;
+            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
+                event.attestations.push(attestation);
+            }
+            if entity.apply_event(&getter, &event.payload).await? {
+                let state = entity.to_state()?;
+                let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                let attestation = self.policy_agent.attest_state(self, &entity_state);
+                let attested = Attested::opt(entity_state, attestation);
+                collection.add_event(event).await?;
+                collection.set_state(attested).await?;
+                changes.push(EntityChange::new(entity.clone(), event.clone())?);
+            }
+        }
+
+        self.reactor.notify_change(changes);
+
+        Ok(changed)
     }
 
     /// Fetch multiple entities matching a predicate, hydrating them through apply_state
@@ -489,6 +531,7 @@ impl<
                 collection.set_state(attested_entity_state).await?;
 
                 // LEFT OFF HERE - determine if we should be notifying the reactor here
+                // yes, we should be notifying the reactor here
 
                 return Ok((Some(true), entity));
             } else {

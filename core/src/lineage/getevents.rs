@@ -22,7 +22,7 @@ pub trait GetEvents {
     async fn get_events(
         &self,
         collection_id: &CollectionId,
-        event_ids: impl Iterator<Item = Self::Id> + Send,
+        event_ids: Vec<Self::Id>,
     ) -> Result<(usize, HashMap<Self::Id, Attested<Self::Event>>), RetrievalError>;
 }
 

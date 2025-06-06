@@ -435,11 +435,11 @@ mod tests {
             &self,
             collection_id: &CollectionId,
             event_ids: Vec<Self::Id>,
-        ) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-            let mut result = Vec::new();
+        ) -> Result<(usize, HashMap<Self::Id, Attested<Self::Event>>), RetrievalError> {
+            let mut result = HashMap::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {
-                    result.push(event.clone());
+                    result.insert(id, event.clone());
                 }
             }
             Ok((1, result))

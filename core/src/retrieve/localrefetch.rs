@@ -34,7 +34,7 @@ impl<SE: StorageEngine + Send + Sync + 'static> LocalRefetcher<SE> {
 
         todo!("move fetch_local_entities to EntityManager");
         let matching_states = storage_collection.fetch_states(predicate).await?;
-        let localgetter = LocalGetter::new(storage_collection.clone());
+        let localgetter = LocalDataBroker::new(storage_collection.clone());
 
         let mut local_entities = Vec::new();
         for state in matching_states {

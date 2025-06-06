@@ -69,7 +69,7 @@ impl<SE: StorageEngine> LocalDataBroker<SE> {
 impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataBroker<C> for LocalDataBroker<SE> {
     type EventGetter = Self;
 
-    fn event_getter(&self, _cdata: C) -> Result<Self::EventGetter, RetrievalError> { Ok(self.clone()) }
+    fn event_getter(&self, _cdata: C) -> Self::EventGetter { self.clone() }
 
     async fn get_events(
         &self,
@@ -112,7 +112,7 @@ impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalDataBroker<SE
     async fn get_events(
         &self,
         collection_id: &CollectionId,
-        event_ids: impl Iterator<Item = Self::Id> + Send,
+        event_ids: Vec<Self::Id>,
     ) -> Result<(usize, HashMap<EventId, Attested<Self::Event>>), RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
         let events = collection.get_events(event_ids.collect()).await?;
@@ -306,7 +306,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn get_events(
         &self,
         collection_id: &CollectionId,
-        event_ids: impl Iterator<Item = Self::Id> + Send,
+        event_ids: Vec<Self::Id>,
     ) -> Result<(usize, HashMap<EventId, Attested<Self::Event>>), RetrievalError> {
         // Just delegate to the broker
         self.broker.get_events(collection_id, event_ids.collect(), &self.cdata).await
