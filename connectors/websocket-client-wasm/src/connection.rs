@@ -96,8 +96,6 @@ impl Connection {
         }
     }
 
-    // fn get_state(&self) -> ConnectionState { self.state.read().map(|state| state.clone()).unwrap_or(ConnectionState::None) }
-
     fn handle_open(&self, e: Event) {
         action_info!(self, "connection open", "{}", &e.type_());
     }

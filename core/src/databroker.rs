@@ -1,14 +1,14 @@
-use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
+use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId, NodeRequestBody, NodeResponseBody};
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
 };
+use tracing::debug;
 
 /// LEFT OFF HERE : Audit this stem to stern
 use crate::{
     collectionset::CollectionSet,
-    context::NodeAndContext,
     error::RetrievalError,
     lineage::GetEvents,
     node::{ContextData, Node, WeakNode},
@@ -24,7 +24,7 @@ pub trait DataBroker<C: ContextData>: Send + Sync {
     type EventGetter: GetEvents<Id = EventId, Event = Event> + Send + Sync;
 
     /// Create an event getter with the provided context data and collection
-    fn event_getter(&self, cdata: &C, collection_id: &CollectionId) -> Result<Self::EventGetter, RetrievalError>;
+    fn event_getter(&self, cdata: C) -> Result<Self::EventGetter, RetrievalError>;
 
     async fn get_events(
         &self,
@@ -34,12 +34,13 @@ pub trait DataBroker<C: ContextData>: Send + Sync {
     ) -> Result<(usize, HashMap<EventId, Attested<Event>>), RetrievalError>;
 
     /// Retrieve entity state
-    async fn get_state(
+    async fn get_states(
         &self,
         collection_id: &CollectionId,
-        entity_id: EntityId,
+        entity_ids: Vec<EntityId>,
         cdata: &C,
-    ) -> Result<Attested<EntityState>, RetrievalError>;
+        // allow_cache: bool,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
     /// Fetch multiple entity states matching a predicate (used by subscriptions)
     async fn fetch_states(
@@ -65,37 +66,38 @@ impl<SE: StorageEngine> LocalDataBroker<SE> {
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, CD: ContextData> DataBroker<CD> for LocalDataBroker<SE> {
+impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataBroker<C> for LocalDataBroker<SE> {
     type EventGetter = Self;
 
-    fn event_getter(&self, _cdata: &CD, _collection_id: &CollectionId) -> Result<Self::EventGetter, RetrievalError> { Ok(self.clone()) }
+    fn event_getter(&self, _cdata: C) -> Result<Self::EventGetter, RetrievalError> { Ok(self.clone()) }
 
     async fn get_events(
         &self,
         collection_id: &CollectionId,
         event_ids: Vec<EventId>,
-        _cdata: &CD,
+        _cdata: &C,
     ) -> Result<(usize, HashMap<EventId, Attested<Event>>), RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
         let events = collection.get_events(event_ids).await?;
-        Ok((1, events.into_iter().map(|event| (event.payload.id(), event)).collect()))
+        Ok((1, events))
     }
 
-    async fn get_state(
+    async fn get_states(
         &self,
         collection_id: &CollectionId,
-        entity_id: EntityId,
-        _cdata: &CD,
-    ) -> Result<Attested<EntityState>, RetrievalError> {
+        entity_ids: Vec<EntityId>,
+        _cdata: &C,
+        // _allow_cache: bool,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
-        collection.get_state(entity_id).await
+        collection.get_states(entity_ids).await
     }
 
     async fn fetch_states(
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
-        _cdata: &CD,
+        _cdata: &C,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
         collection.fetch_states(predicate).await
@@ -114,7 +116,7 @@ impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalDataBroker<SE
     ) -> Result<(usize, HashMap<EventId, Attested<Self::Event>>), RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
         let events = collection.get_events(event_ids.collect()).await?;
-        Ok((1, events.into_iter().map(|event| (event.payload.id(), event)).collect()))
+        Ok((1, events))
     }
 }
 
@@ -143,8 +145,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 {
     type EventGetter = NetworkEventGetter<SE, PA>;
 
-    fn event_getter(&self, cdata: &PA::ContextData, _collection_id: &CollectionId) -> Result<Self::EventGetter, RetrievalError> {
-        Ok(NetworkEventGetter::new(self.clone(), cdata.clone()))
+    fn event_getter(&self, cdata: PA::ContextData) -> Result<Self::EventGetter, RetrievalError> {
+        Ok(NetworkEventGetter::new(self.clone(), cdata))
     }
 
     async fn get_events(
@@ -157,8 +159,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
         // try to get the events from the local storage first
         let collection = self.collections.get(collection_id).await?;
-        let mut events: HashMap<EventId, Attested<Event>> =
-            collection.get_events(event_ids.clone()).await?.into_iter().map(|event| (event.payload.id(), event)).collect();
+        let mut events = collection.get_events(event_ids.clone()).await?;
 
         // collect the missing event IDs
         let missing_event_ids: Vec<EventId> = event_ids.iter().filter(|id| !events.contains_key(id)).cloned().collect();
@@ -168,56 +169,87 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         } else {
             let node = self.node()?;
 
-            let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::StorageError("No durable peer found".into()))?;
+            let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
             match node
                 .request(
                     peer_id,
                     cdata,
-                    ankurah_proto::NodeRequestBody::GetEvents { collection: collection_id.clone(), event_ids: missing_event_ids.clone() },
+                    NodeRequestBody::GetEvents { collection: collection_id.clone(), event_ids: missing_event_ids.clone() },
                 )
                 .await
                 .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
             {
-                ankurah_proto::NodeResponseBody::GetEvents(peer_events) => {
+                NodeResponseBody::GetEvents(peer_events) => {
                     // merge remote events into local events
                     for event in peer_events {
                         events.insert(event.payload.id(), event);
                     }
 
-                    // build result vector in the requested order, validating each event exists
-                    let mut result_events = HashMap::with_capacity(event_ids.len());
-                    for event_id in event_ids {
-                        match events.remove(&event_id) {
-                            Some(event) => result_events.insert(event_id, event),
-                            None => return Err(RetrievalError::StorageError(format!("Failed to retrieve event: {:?}", event_id).into())),
-                        }
-                    }
-
-                    Ok((cost, result_events))
+                    Ok((cost, events))
                 }
-                ankurah_proto::NodeResponseBody::Error(e) => Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into())),
+                NodeResponseBody::Error(e) => Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into())),
                 _ => Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
             }
         }
     }
 
-    async fn get_state(
+    async fn get_states(
         &self,
         collection_id: &CollectionId,
-        entity_id: EntityId,
-        _cdata: &PA::ContextData,
-    ) -> Result<Attested<EntityState>, RetrievalError> {
-        // Try local first, then remote if available
-        let collection = self.collections.get(collection_id).await?;
+        mut entity_ids: Vec<EntityId>,
+        cdata: &PA::ContextData,
+        // allow_cache: bool,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        // let mut statemap: HashMap<EntityId, Attested<EntityState>> = HashMap::new();
+        // if allow_cache {
+        //     let collection = self.collections.get(collection_id).await?;
 
-        match collection.get_state(entity_id).await {
-            Ok(state) => Ok(Some(state)),
-            Err(RetrievalError::EntityNotFound(_)) => {
-                // TODO: Try to fetch from remote peers via the WeakNode
-                Ok(None)
+        //     for state in collection.get_states(entity_ids).await? {
+        //         statemap.insert(state.payload.entity_id, state);
+        //     }
+
+        //     let missing_entity_ids: Vec<EntityId> = entity_ids.iter().filter(|id| !statemap.contains_key(id)).cloned().collect();
+
+        //     if missing_entity_ids.is_empty() {
+        //         return Ok(statemap.values().cloned().collect());
+        //     }
+        //     entity_ids = missing_entity_ids;
+
+        //     // QUESTION: should we return it immediately and background the peer fetch?
+        //     // If so, then we are doing a bit more than just retrieving, we're alsos applying that state to the collection
+        //     // which might be a separation of concerns issue vs Node/EntityManager
+        // }
+        let node = self.node()?;
+        let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+
+        println!("🔍 NetworkDataBroker::get_state: collection_id = {collection_id}, entity_ids = {entity_ids:?}");
+        match node
+            .request(peer_id, cdata, NodeRequestBody::Get { collection: collection_id.clone(), ids: entity_ids })
+            .await
+            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+        {
+            NodeResponseBody::Get(states) => {
+                println!("🔍 Node::get_from_peer: states = {states:?}");
+                let collection = self.collections.get(collection_id).await?;
+
+                // do we have the ability to merge states?
+                // because that's what we have to do I think
+                for state in states {
+                    node.policy_agent.validate_received_state(&node, &peer_id, &state)?;
+                    // collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    // statemap.insert(state.payload.entity_id, state);
+                }
+                Ok(states)
             }
-            Err(e) => Err(e),
+            NodeResponseBody::Error(e) => {
+                debug!("Error from peer fetch: {}", e);
+                Err(RetrievalError::Other(format!("{:?}", e)))
+            }
+            _ => {
+                debug!("Unexpected response type from peer get");
+                Err(RetrievalError::Other("Unexpected response type".to_string()))
+            }
         }
     }
 
@@ -225,9 +257,36 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
-        _cdata: &PA::ContextData,
+        cdata: &PA::ContextData,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        todo!()
+        let node = self.node()?;
+        let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+
+        match node
+            .request(peer_id, cdata, NodeRequestBody::Fetch { collection: collection_id.clone(), predicate: predicate.clone() })
+            .await
+            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+        {
+            NodeResponseBody::Fetch(states) => {
+                let collection = self.collections.get(collection_id).await?;
+                // do we have the ability to merge states?
+                // because that's what we have to do I think
+                for state in states {
+                    node.policy_agent.validate_received_state(&node, &peer_id, &state)?;
+                    // collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                }
+                let states = collection.fetch_states(predicate).await?;
+                Ok(states)
+            }
+            NodeResponseBody::Error(e) => {
+                debug!("Error from peer fetch: {}", e);
+                Err(RetrievalError::Other(format!("{:?}", e)))
+            }
+            _ => {
+                debug!("Unexpected response type from peer fetch");
+                Err(RetrievalError::Other("Unexpected response type".to_string()))
+            }
+        }
     }
 }
 

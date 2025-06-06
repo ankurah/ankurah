@@ -205,34 +205,58 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
-    pub(crate) async fn get_entity(
-        &self,
-        collection_id: &CollectionId,
-        id: proto::EntityId,
-        cached: bool,
-    ) -> Result<Entity, RetrievalError> {
-        debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
+    // pub(crate) async fn get_entity(
+    //     &self,
+    //     collection_id: &CollectionId,
+    //     id: proto::EntityId,
+    //     cached: bool,
+    // ) -> Result<Entity, RetrievalError> {
+    //     debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
 
-        // Use EntityManager's get method directly
-        match self.node.entities.get(collection_id, &id).await? {
-            Some(entity) => Ok(entity),
-            None => {
-                // If not found and not cached, try to fetch from peer first for ephemeral nodes
-                if !self.node.durable && !cached {
-                    // TODO: Fetch from peers if needed
-                }
+    //     if !self.node.durable {
+    //         // Fetch from peers and commit first response
+    //         match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
+    //             Ok(_) => (),
+    //             Err(RetrievalError::NoDurablePeers) if cached => (),
+    //             Err(e) => {
+    //                 return Err(e);
+    //             }
+    //         }
+    //     }
 
-                // Create new entity if not found anywhere
-                self.node.entities.get_or_create(collection_id, &id).await
-            }
-        }
-    }
+    //     if let Some(local) = self.node.entities.get(&id) {
+    //         debug!("Node({}).get_entity found local entity - returning", self.node.id);
+    //         return Ok(local);
+    //     }
+    //     debug!("{}.get_entity fetching from storage", self.node);
+
+    //     let collection = self.node.collections.get(collection_id).await?;
+    //     match collection.get_state(id).await {
+    //         Ok(entity_state) => {
+    //             let (_changed, entity) = self
+    //                 .node
+    //                 .entities
+    //                 .with_state(&(collection_id.clone(), self), id, collection_id.clone(), entity_state.payload.state)
+    //                 .await?;
+    //             Ok(entity)
+    //         }
+    //         Err(RetrievalError::EntityNotFound(id)) => {
+    //             let (_, entity) = self
+    //                 .node
+    //                 .entities
+    //                 .with_state(&(collection_id.clone(), self), id, collection_id.clone(), proto::State::default())
+    //                 .await?;
+    //             Ok(entity)
+    //         }
+    //         Err(e) => Err(e),
+    //     }
+    // }
     /// Fetch a list of entities based on a predicate
     pub async fn fetch_entities(&self, collection_id: &CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         // TODO implement cached: true
         if !self.node.durable {
             // Fetch from peers and commit first response
-            match self.node.fetch_from_peer(collection_id, args.predicate.clone(), &self.cdata).await {
+            match self.node.entities.fetch(collection_id, &args.predicate, &self.cdata).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if args.cached => (),
                 Err(e) => {
@@ -244,7 +268,7 @@ where
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         // Use EntityManager's fetch_entities method directly
         let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
-        self.node.entities.fetch_entities(collection_id, &filtered_predicate).await
+        self.node.entities.fetch(collection_id, &filtered_predicate, &self.cdata).await
     }
 
     pub async fn subscribe(
@@ -274,7 +298,7 @@ where
                     let entities = entities.clone();
                     let collection_id = collection_id.clone();
                     let predicate = predicate.clone();
-                    async move { entities.fetch_entities(&collection_id, &predicate).await }
+                    async move { entities.fetch(&collection_id, &predicate, &self.cdata).await }
                 };
                 // TODO: Update reactor.register to accept the fetch function instead of a Fetch trait object
                 todo!("Update reactor to use EntityManager directly")

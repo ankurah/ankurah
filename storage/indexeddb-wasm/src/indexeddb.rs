@@ -379,9 +379,9 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<HashMap<EventId, Attested<ankurah_proto::Event>>, RetrievalError> {
         if event_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(HashMap::new());
         }
 
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
@@ -393,7 +393,7 @@ impl StorageCollection for IndexedDBBucket {
             let store = step(transaction.object_store("events"), "get object store")?;
 
             // TODO - do we want to use a cursor? The id space is pretty sparse, so we would probably need benchmarks to see if it's worth it
-            let mut events = Vec::new();
+            let mut events = HashMap::with_capacity(event_ids.len());
             for event_id in event_ids {
                 let request = step(store.get(&event_id.to_base64().into()), "get event")?;
                 step(CBFuture::new(&request, "success", "error").await, "await event request")?;
@@ -415,7 +415,7 @@ impl StorageCollection for IndexedDBBucket {
                     },
                     attestations: get_property(&event_obj, &ATTESTATIONS_KEY)?.try_into()?,
                 };
-                events.push(event);
+                events.insert(event_id, event);
             }
 
             Ok(events)

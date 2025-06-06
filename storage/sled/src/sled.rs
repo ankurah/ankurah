@@ -202,13 +202,13 @@ impl StorageCollection for SledStorageCollection {
         }
     }
 
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
-        let mut events = Vec::new();
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<HashMap<EventId, Attested<Event>>, RetrievalError> {
+        let mut events = HashMap::with_capacity(event_ids.len());
         for event_id in event_ids {
             match self.events.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
                 Some(event) => {
                     let event: Attested<Event> = bincode::deserialize(&event)?;
-                    events.push(event);
+                    events.insert(event_id, event);
                 }
                 None => continue,
             }

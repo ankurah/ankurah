@@ -513,7 +513,7 @@ impl StorageCollection for PostgresBucket {
         Ok(affected > 0)
     }
 
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<HashMap<EventId, Attested<Event>>, RetrievalError> {
         if event_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -547,7 +547,7 @@ impl StorageCollection for PostgresBucket {
                 payload: Event { collection: self.collection_id.clone(), entity_id, operations, parent },
                 attestations: AttestationSet(attestations),
             };
-            events.push(event);
+            events.insert(event_id, event);
         }
         Ok(events)
     }

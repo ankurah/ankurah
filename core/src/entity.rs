@@ -370,7 +370,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get_resident(id) {
             Some(entity) => Ok(Some(entity)),
-            None => match self.0.data_broker.get_state(collection_id, *id, cdata).await {
+            None => match self.0.data_broker.get_states(collection_id, *id, cdata).await {
                 Ok(None) => Ok(None),
                 Ok(Some(state)) => {
                     let (_, entity) = self.apply_state(state, cdata).await?;
@@ -408,7 +408,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
     }
 
     /// Fetch multiple entities matching a predicate, hydrating them through apply_state
-    pub async fn fetch_entities(
+    pub async fn fetch(
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
@@ -471,7 +471,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
         // Entity is not resident - check if there's existing state in storage
         let collection = self.0.collections.get(collection_id).await?;
 
-        if let Some(existing_state) = collection.get_state(id).await.ok() {
+        if let Some(existing_state) = collection.get_state_useeeee_dataaa_broker(id, &*self.0.data_broker, cdata).await.ok() {
             debug!("Found existing state in storage for {id}");
             let entity = Entity::from_state(id, collection_id.clone(), &existing_state.payload.state)?;
 
