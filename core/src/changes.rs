@@ -4,15 +4,15 @@ use ankurah_proto::{Attested, Event};
 #[derive(Debug, Clone)]
 pub struct EntityChange {
     entity: Entity,
-    events: Vec<Attested<Event>>,
+    event: Option<Attested<Event>>,
 }
 
 // TODO consider a flattened version of EntityChange that includes the entity and Vec<(operations, parent, attestations)> rather than a Vec<Attested<Event>>
 impl EntityChange {
-    pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationError> {
+    pub fn new(entity: Entity, event: Option<Attested<Event>>) -> Result<Self, MutationError> {
         // validate that all events have the same entity id as the entity
         // and that the event ids are present in the entity's head clock
-        for event in &events {
+        if let Some(event) = &event {
             let head = entity.head();
             if event.payload.entity_id != entity.id {
                 return Err(MutationError::InvalidEvent);
@@ -21,11 +21,11 @@ impl EntityChange {
                 return Err(MutationError::InvalidEvent);
             }
         }
-        Ok(Self { entity, events })
+        Ok(Self { entity, event })
     }
     pub fn entity(&self) -> &Entity { &self.entity }
-    pub fn events(&self) -> &[Attested<Event>] { &self.events }
-    pub fn into_parts(self) -> (Entity, Vec<Attested<Event>>) { (self.entity, self.events) }
+    pub fn event(&self) -> Option<&Attested<Event>> { self.event.as_ref() }
+    pub fn into_parts(self) -> (Entity, Option<Attested<Event>>) { (self.entity, self.event) }
 }
 
 #[derive(Debug, Clone)]
@@ -33,11 +33,11 @@ pub enum ItemChange<I> {
     /// Initial retrieval of an item upon subscription
     Initial { item: I },
     /// A new item was added OR changed such that it now matches the subscription
-    Add { item: I, events: Vec<Attested<Event>> },
+    Add { item: I, event: Attested<Event> },
     /// A item that previously matched the subscription has changed in a way that has not changed the matching condition
-    Update { item: I, events: Vec<Attested<Event>> },
+    Update { item: I, event: Attested<Event> },
     /// A item that previously matched the subscription has changed in a way that no longer matches the subscription
-    Remove { item: I, events: Vec<Attested<Event>> },
+    Remove { item: I, event: Attested<Event> },
 }
 
 impl<I> ItemChange<I> {
@@ -50,10 +50,10 @@ impl<I> ItemChange<I> {
         }
     }
 
-    pub fn events(&self) -> &[Attested<Event>] {
+    pub fn event(&self) -> Option<&Attested<Event>> {
         match self {
-            ItemChange::Add { events, .. } | ItemChange::Update { events, .. } | ItemChange::Remove { events, .. } => events,
-            _ => &[],
+            ItemChange::Add { event, .. } | ItemChange::Update { event, .. } | ItemChange::Remove { event, .. } => Some(event),
+            _ => None,
         }
     }
     pub fn kind(&self) -> ChangeKind { ChangeKind::from(self) }
@@ -124,9 +124,9 @@ where I: View
     fn from(change: ItemChange<Entity>) -> Self {
         match change {
             ItemChange::Initial { item } => ItemChange::Initial { item: I::from_entity(item) },
-            ItemChange::Add { item, events } => ItemChange::Add { item: I::from_entity(item), events },
-            ItemChange::Update { item, events } => ItemChange::Update { item: I::from_entity(item), events },
-            ItemChange::Remove { item, events } => ItemChange::Remove { item: I::from_entity(item), events },
+            ItemChange::Add { item, event } => ItemChange::Add { item: I::from_entity(item), event },
+            ItemChange::Update { item, event } => ItemChange::Update { item: I::from_entity(item), event },
+            ItemChange::Remove { item, event } => ItemChange::Remove { item: I::from_entity(item), event },
         }
     }
 }

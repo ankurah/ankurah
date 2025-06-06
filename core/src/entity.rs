@@ -5,11 +5,11 @@ use crate::storage::StorageEngine;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
+    policy::PolicyAgent,
     property::{Backends, PropertyValue},
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{Attested, Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
-use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::{Arc, Weak};
 use tracing::{debug, error, warn};
@@ -118,7 +118,7 @@ impl Entity {
 
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
-    pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
+    async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
     where G: GetEvents<Id = EventId, Event = Event> {
         debug!("apply_event head: {event} to {self}");
         let head = self.head();
@@ -196,7 +196,7 @@ impl Entity {
         }
     }
 
-    async fn can_apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
+    async fn can_apply_state<G>(&self, getter: G, state: &State) -> Result<bool, MutationError>
     where G: GetEvents<Id = EventId, Event = Event> {
         let head = self.head();
         let new_head = state.head.clone();
@@ -204,7 +204,7 @@ impl Entity {
         debug!("{self} apply_state - new head: {new_head}");
         let budget = 100;
 
-        match crate::lineage::compare(getter, &new_head, &head, budget).await? {
+        match crate::lineage::compare(&getter, &new_head, &head, budget).await? {
             lineage::Ordering::Equal => {
                 debug!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
@@ -339,20 +339,31 @@ impl std::fmt::Display for TemporaryEntity {
 }
 
 /// The abiter of all entities in the system (except those which are forked during a transaction)
-pub struct EntityManager<SE, C>(Arc<Inner<SE, C>>);
-impl<SE, C> Clone for EntityManager<SE, C> {
+pub struct EntityManager<SE, PA, D>(Arc<Inner<SE, PA, D>>);
+impl<SE, PA, D> Clone for EntityManager<SE, PA, D> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct Inner<SE, C> {
+pub struct Inner<SE, PA, D> {
     resident: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
-    data_broker: Arc<dyn DataBroker<C>>,
+    data_broker: D,
     collections: CollectionSet<SE>,
+    _marker: std::marker::PhantomData<PA>,
 }
 
-impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> EntityManager<SE, C> {
-    pub fn new(data_broker: Arc<dyn DataBroker<C>>, collections: CollectionSet<SE>) -> Self {
-        Self(Arc::new(Inner { resident: std::sync::RwLock::new(BTreeMap::new()), data_broker, collections }))
+impl<
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    > EntityManager<SE, PA, D>
+{
+    pub fn new(data_broker: D, collections: CollectionSet<SE>) -> Self {
+        Self(Arc::new(Inner {
+            resident: std::sync::RwLock::new(BTreeMap::new()),
+            data_broker,
+            collections,
+            _marker: std::marker::PhantomData,
+        }))
     }
     /// Returns a resident entity, or None if it's not resident
     pub fn get_resident(&self, id: &EntityId) -> Option<Entity> {
@@ -366,22 +377,33 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
     }
 
     /// Returns a resident entity, or uses the getter
-    pub async fn get(&self, collection_id: &CollectionId, id: &EntityId, cdata: &C) -> Result<Option<Entity>, RetrievalError> {
+    pub async fn get(
+        &self,
+        collection_id: &CollectionId,
+        id: &EntityId,
+        cdata: &PA::ContextData,
+    ) -> Result<Option<Entity>, RetrievalError> {
         // do it in two phases to avoid holding the lock while waiting for the collection
-        match self.get_resident(id) {
-            Some(entity) => Ok(Some(entity)),
-            None => match self.0.data_broker.get_states(collection_id, *id, cdata).await {
-                Ok(None) => Ok(None),
-                Ok(Some(state)) => {
-                    let (_, entity) = self.apply_state(state, cdata).await?;
-                    Ok(Some(entity))
-                }
-                Err(e) => Err(e),
-            },
-        }
+        // match self.get_resident(id) {
+        //     Some(entity) => Ok(Some(entity)),
+        //     None => match self.0.data_broker.get_states(collection_id, *id, cdata).await {
+        //         Ok(None) => Ok(None),
+        //         Ok(Some(state)) => {
+        //             let (_, entity) = self.apply_state(state, cdata).await?;
+        //             Ok(Some(entity))
+        //         }
+        //         Err(e) => Err(e),
+        //     },
+        // }
+        todo!()
     }
     /// Returns a resident entity, or gets it from the provided getter, or finally creates if neither of the two are found
-    pub async fn get_or_create(&self, collection_id: &CollectionId, id: &EntityId, cdata: &C) -> Result<Entity, RetrievalError> {
+    pub async fn get_or_create(
+        &self,
+        collection_id: &CollectionId,
+        id: &EntityId,
+        cdata: &PA::ContextData,
+    ) -> Result<Entity, RetrievalError> {
         match self.get(collection_id, id, cdata).await? {
             Some(entity) => Ok(entity),
             None => {
@@ -403,8 +425,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
         let mut entities = self.0.resident.write().unwrap();
         let id = EntityId::new();
         let entity = Entity::create(id, collection, Backends::new());
-        entities.insert(*id, entity.weak());
+        entities.insert(id, entity.weak());
         entity
+    }
+
+    pub async fn apply_event(&self, collection_id: &CollectionId, entity_id: &EntityId, event: &Event) -> Result<bool, MutationError> {
+        todo!()
     }
 
     /// Fetch multiple entities matching a predicate, hydrating them through apply_state
@@ -412,7 +438,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
-        cdata: &C,
+        cdata: &PA::ContextData,
     ) -> Result<Vec<Entity>, RetrievalError> {
         let matching_states = self.0.data_broker.fetch_states(collection_id, predicate, cdata).await?;
 
@@ -440,7 +466,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
     pub async fn apply_state(
         &self,
         attested_entity_state: Attested<EntityState>,
-        cdata: &C,
+        cdata: &PA::ContextData,
     ) -> Result<(Option<bool>, Entity), MutationError> {
         let id = attested_entity_state.payload.entity_id;
         let collection_id = &attested_entity_state.payload.collection;
@@ -456,11 +482,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
             debug!("Entity {id} was resident");
 
             // Apply the state if lineage allows - use data_broker for event retrieval
-            if entity.can_apply_state(&*self.0.data_broker.event_getter(cdata, collection_id), state).await? {
+            if entity.can_apply_state(self.0.data_broker.event_getter(cdata.clone()), state).await? {
                 // we can only apply the state if it descends from the current head, which means it changed
                 entity.apply_state(state)?;
                 let collection = self.0.collections.get(collection_id).await?;
                 collection.set_state(attested_entity_state).await?;
+
+                // LEFT OFF HERE - determine if we should be notifying the reactor here
 
                 return Ok((Some(true), entity));
             } else {
@@ -479,7 +507,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: crate::node::ContextData> Ent
             self.0.resident.write().unwrap().insert(id, entity.weak());
 
             // Check lineage and apply if needed - use data_broker for event retrieval
-            let changed = entity.can_apply_state(&*self.0.data_broker.event_getter(cdata, collection_id), state).await?;
+            let getter = self.0.data_broker.event_getter(cdata.clone());
+            let changed = entity.can_apply_state(getter, state).await?;
             if changed {
                 entity.apply_state(state)?;
                 collection.set_state(attested_entity_state).await?;

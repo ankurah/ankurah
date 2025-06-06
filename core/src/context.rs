@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::{
     changes::{ChangeSet, EntityChange},
     consistency::diff_resolver::DiffResolver,
+    databroker::DataBroker,
     entity::Entity,
     error::{MutationError, RetrievalError},
     model::View,
@@ -27,19 +28,21 @@ impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct NodeAndContext<SE, PA>
+pub struct NodeAndContext<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
-    pub node: Node<SE, PA>,
+    pub node: Node<SE, PA, D>,
     pub cdata: PA::ContextData,
 }
 
-impl<SE, PA> Clone for NodeAndContext<SE, PA>
+impl<SE, PA, D> Clone for NodeAndContext<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self { node: self.node.clone(), cdata: self.cdata.clone() } }
 }
@@ -67,7 +70,12 @@ pub trait TContext {
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
+impl<
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    > TContext for NodeAndContext<SE, PA, D>
+{
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId) -> Entity { self.node.entities.create(collection) }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
@@ -109,8 +117,8 @@ impl Context {
 }
 
 impl Context {
-    pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
-        node: Node<SE, PA>,
+    pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static, D>(
+        node: Node<SE, PA, D>,
         data: PA::ContextData,
     ) -> Self {
         Self(Arc::new(NodeAndContext { node, cdata: data }))
@@ -199,10 +207,11 @@ impl Context {
     }
 }
 
-impl<SE, PA> NodeAndContext<SE, PA>
+impl<SE, PA, D> NodeAndContext<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
     // pub(crate) async fn get_entity(
@@ -365,7 +374,7 @@ where
             let attested = Attested::opt(entity_state, attestation);
             collection.set_state(attested).await?;
 
-            changes.push(EntityChange::new(entity.clone(), vec![attested_event])?);
+            changes.push(EntityChange::new(entity.clone(), Some(attested_event))?);
         }
 
         // Notify reactor of ALL changes

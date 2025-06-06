@@ -16,10 +16,9 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::{Context, NodeAndContext},
-    databroker,
+    databroker::{self, DataBroker},
     entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
-    lineage::{LocalEventGetter, LocalOrRemoteEventGetter},
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
@@ -76,32 +75,44 @@ impl From<ankql::error::ParseError> for RetrievalError {
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
-pub struct Node<SE, PA>(pub(crate) Arc<NodeInner<SE, PA>>)
-where PA: PolicyAgent;
-impl<SE, PA> Clone for Node<SE, PA>
-where PA: PolicyAgent
+pub struct Node<SE, PA, D>(pub(crate) Arc<NodeInner<SE, PA, D>>)
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static;
+impl<SE, PA, D> Clone for Node<SE, PA, D>
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct WeakNode<SE, PA>(Weak<NodeInner<SE, PA>>)
-where PA: PolicyAgent;
-impl<SE, PA> Clone for WeakNode<SE, PA>
-where PA: PolicyAgent
+pub struct WeakNode<SE, PA, D>(Weak<NodeInner<SE, PA, D>>)
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static;
+impl<SE, PA, D> Clone for WeakNode<SE, PA, D>
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<SE, PA> WeakNode<SE, PA>
-where PA: PolicyAgent
+impl<SE, PA, D> WeakNode<SE, PA, D>
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
-    pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.0.upgrade().map(Node) }
+    pub fn upgrade(&self) -> Option<Node<SE, PA, D>> { self.0.upgrade().map(Node) }
 }
 
-impl<SE, PA> Deref for Node<SE, PA>
-where PA: PolicyAgent
+impl<SE, PA, D> Deref for Node<SE, PA, D>
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
-    type Target = Arc<NodeInner<SE, PA>>;
+    type Target = Arc<NodeInner<SE, PA, D>>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
@@ -110,14 +121,16 @@ where PA: PolicyAgent
 #[async_trait]
 pub trait ContextData: Send + Sync + Clone + 'static {}
 
-pub struct NodeInner<SE, PA>
-where PA: PolicyAgent
+pub struct NodeInner<SE, PA, D>
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     pub id: proto::EntityId,
     pub durable: bool,
     pub collections: CollectionSet<SE>,
 
-    pub(crate) entities: EntityManager<SE, PA::ContextData>,
+    pub(crate) entities: EntityManager<SE, PA, D>,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -134,16 +147,18 @@ where PA: PolicyAgent
     pub(crate) subscription_relay: Option<SubscriptionRelay<Entity, PA::ContextData>>,
 }
 
-impl<SE, PA> Node<SE, PA>
+impl<SE, PA, D> Node<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
-    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
         let collections = CollectionSet::new(engine.clone());
 
         // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
-        let network_broker = Arc::new(crate::databroker::NetworkDataBroker::new(collections.clone()));
+        let network_broker = crate::databroker::NetworkDataBroker::new(collections.clone());
+
         let entityset = EntityManager::new(network_broker.clone(), collections.clone());
         let id = proto::EntityId::new();
         let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
@@ -182,7 +197,7 @@ where
 
         node
     }
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
         let collections = CollectionSet::new(engine);
 
         let data_broker = Arc::new(crate::databroker::LocalDataBroker::new(collections.clone()));
@@ -208,7 +223,7 @@ where
             pending_subs: SafeMap::new(),
         }))
     }
-    pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
+    pub fn weak(&self) -> WeakNode<SE, PA, D> { WeakNode(Arc::downgrade(&self.0)) }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
@@ -548,7 +563,7 @@ where
             if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
                 event.attestations.push(attestation);
             }
-
+            // LEFT OFF HERE - call self.entities.apply_event - but we have to make sure we get it right
             if entity.apply_event(&getter, &event.payload).await? {
                 let state = entity.to_state()?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
@@ -556,7 +571,7 @@ where
                 let attested = Attested::opt(entity_state, attestation);
                 collection.add_event(event).await?;
                 collection.set_state(attested).await?;
-                changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
+                changes.push(EntityChange::new(entity.clone(), event.clone())?);
             }
         }
 
@@ -627,24 +642,19 @@ where
         update: proto::SubscriptionUpdateItem,
         nodeandcontext: &NodeAndContext<SE, PA>,
     ) -> Result<Option<EntityChange>, MutationError> {
-        let (entity_id, collection_id, state, events) = update.into_parts();
+        let (entity_id, collection_id, state, event) = update.into_parts();
         let collection = self.collections.get(&collection_id).await?;
 
-        let attested_events = match events {
-            Some(events) => {
+        let attested_event = match event {
+            Some(event) => {
                 // validate and store the events, in case we need them for lineage comparison
-                let mut attested_events = Vec::new();
-                for event in events.iter() {
-                    // : Attested<ankurah_proto::Event>
-                    let event = (entity_id, collection_id.clone(), event.clone()).into();
-                    self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
-                    // store the validated event in case we need it for lineage comparison
-                    collection.add_event(&event).await?;
-                    attested_events.push(event);
-                }
-                attested_events
+                let event = (entity_id, collection_id.clone(), event.clone()).into();
+                self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
+                // store the validated event in case we need it for lineage comparison
+                collection.add_event(&event).await?;
+                Some(event)
             }
-            None => vec![],
+            None => None,
         };
 
         let getter = LocalOrRemoteEventGetter::new(nodeandcontext.clone());
@@ -668,11 +678,11 @@ where
 
                 let mut changed = false;
                 // TODO - figure out how to apply the events in the correct order
-                for event in attested_events.iter() {
-                    changed = entity.apply_event(&(collection_id.clone(), nodeandcontext), &event.payload).await?;
+                for event in attested_event.iter() {
+                    changed = self.entities.apply_event(&collection_id, &entity_id, &event.payload).await?;
                 }
                 if changed {
-                    Ok(Some(EntityChange::new(entity, attested_events)?))
+                    Ok(Some(EntityChange::new(entity, attested_event)?))
                 } else {
                     Ok(None)
                 }
@@ -723,7 +733,7 @@ where
                             }
                             ItemChange::Add { item, events } => {
                                 // For entities which were not previously matched, state AND events should be included
-                                // but it's weird because EntityState and Event redundantly include entity_id and collection
+                                // but it's weird because EntityState and Event redundantly hinclude entity_id and collection
                                 // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
                                 // it has to have the entity_id
 
@@ -821,10 +831,11 @@ where
     pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.durable_peers.to_vec() }
 }
 
-impl<SE, PA> NodeInner<SE, PA>
+impl<SE, PA, D> NodeInner<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
@@ -861,8 +872,10 @@ where
     }
 }
 
-impl<SE, PA> Drop for NodeInner<SE, PA>
-where PA: PolicyAgent
+impl<SE, PA, D> Drop for NodeInner<SE, PA, D>
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         notice_info!("Node({}) dropped", self.id);
@@ -873,16 +886,19 @@ pub trait TNodeErased: Send + Sync + 'static {
     fn unsubscribe(&self, handle: &SubscriptionHandle);
 }
 
-impl<SE, PA> TNodeErased for Node<SE, PA>
+impl<SE, PA, D> TNodeErased for Node<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     fn unsubscribe(&self, handle: &SubscriptionHandle) { let _ = self.0.unsubscribe(handle); }
 }
 
-impl<SE, PA> fmt::Display for Node<SE, PA>
-where PA: PolicyAgent
+impl<SE, PA, D> fmt::Display for Node<SE, PA, D>
+where
+    PA: PolicyAgent,
+    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets

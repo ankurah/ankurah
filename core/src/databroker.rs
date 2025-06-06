@@ -24,7 +24,7 @@ pub trait DataBroker<C: ContextData>: Send + Sync {
     type EventGetter: GetEvents<Id = EventId, Event = Event> + Send + Sync;
 
     /// Create an event getter with the provided context data and collection
-    fn event_getter(&self, cdata: C) -> Result<Self::EventGetter, RetrievalError>;
+    fn event_getter(&self, cdata: C) -> Self::EventGetter;
 
     async fn get_events(
         &self,
@@ -124,15 +124,15 @@ impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalDataBroker<SE
 #[derive(Clone)]
 pub struct NetworkDataBroker<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> {
     collections: CollectionSet<SE>,
-    node: OnceLock<WeakNode<SE, PA>>,
+    node: OnceLock<WeakNode<SE, PA, Self>>,
 }
 
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NetworkDataBroker<SE, PA> {
     pub fn new(collections: CollectionSet<SE>) -> Self { Self { collections, node: OnceLock::new() } }
 
-    pub fn set_node(&self, node: &Node<SE, PA>) -> Result<(), ()> { self.node.set(node.weak()).map_err(|_| ()) }
+    pub fn set_node(&self, node: &Node<SE, PA, Self>) -> Result<(), ()> { self.node.set(node.weak()).map_err(|_| ()) }
 
-    pub fn node(&self) -> Result<Node<SE, PA>, RetrievalError> {
+    pub fn node(&self) -> Result<Node<SE, PA, Self>, RetrievalError> {
         let weak_node = self.node.get().ok_or(RetrievalError::SanityError("Node not set in NetworkDataBroker"))?;
         let node = weak_node.upgrade().ok_or(RetrievalError::SanityError("Node has been dropped"))?;
         Ok(node)
@@ -145,9 +145,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 {
     type EventGetter = NetworkEventGetter<SE, PA>;
 
-    fn event_getter(&self, cdata: PA::ContextData) -> Result<Self::EventGetter, RetrievalError> {
-        Ok(NetworkEventGetter::new(self.clone(), cdata))
-    }
+    fn event_getter(&self, cdata: PA::ContextData) -> Self::EventGetter { NetworkEventGetter::new(self.clone(), cdata) }
 
     async fn get_events(
         &self,
