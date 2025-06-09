@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
 
+use crate::databroker::DataBroker;
 use crate::{context::NodeAndContext, policy::PolicyAgent, storage::StorageEngine, util::onetimevalue::OneTimeValue};
 use ankurah_proto::{CollectionId, EntityId};
 
@@ -34,8 +35,12 @@ struct DiffResolverInner {
 }
 
 impl DiffResolver {
-    pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
-        node_and_context: &NodeAndContext<SE, PA>,
+    pub fn new<
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    >(
+        node_and_context: &NodeAndContext<SE, PA, D>,
         collection_id: CollectionId,
     ) -> Self {
         Self(Arc::new(DiffResolverInner {

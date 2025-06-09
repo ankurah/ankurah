@@ -22,7 +22,7 @@ use crate::{
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
-    retrieve::{local::LocalFetcher, localrefetch::LocalRefetcher, Fetch},
+    retrieve::{localrefetch::LocalRefetcher, Fetch},
     storage::StorageEngine,
     subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,
@@ -136,9 +136,6 @@ where
 
     pub(crate) subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
 
-    // Pending subscriptions waiting for first remote update
-    pub(crate) pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<()>>,
-
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
     pub(crate) policy_agent: PA,
@@ -154,22 +151,39 @@ where
     D: DataBroker<PA::ContextData> + Send + Sync + 'static,
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
-        let collections = CollectionSet::new(engine.clone());
-
-        // TODO think about how Reactor and EntityManager should reference each other
-
+        let collections = CollectionSet::new(engine);
         // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
         let network_broker = crate::databroker::NetworkDataBroker::new(collections.clone());
 
-        let entityset = EntityManager::new(network_broker.clone(), collections.clone());
+        Self::new_internal(collections, network_broker, policy_agent, false, true)
+    }
+
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
+        let collections = CollectionSet::new(engine);
+        // Create LocalDataBroker for durable nodes (local storage only)
+        let local_broker = Arc::new(LocalDataBroker::new(collections.clone()));
+
+        Self::new_internal(collections, local_broker, policy_agent, true, false)
+    }
+
+    fn new_internal<DB>(
+        collections: CollectionSet<SE>,
+        data_broker: DB,
+        policy_agent: PA,
+        durable: bool,
+        needs_subscription_relay: bool,
+    ) -> Node<SE, PA, DB>
+    where
+        DB: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    {
+        let reactor = Reactor::new(collections.clone(), data_broker.clone(), policy_agent.clone());
+        let entityset = EntityManager::new(data_broker.clone(), collections.clone(), reactor.clone(), policy_agent.clone());
         let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
-        notice_info!("Node {id:#} created as ephemeral");
 
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
+        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
 
-        // Create subscription relay for ephemeral nodes
-        let subscription_relay = Some(SubscriptionRelay::new(reactor.clone()));
+        // Create subscription relay for ephemeral nodes only
+        let subscription_relay = if needs_subscription_relay { Some(SubscriptionRelay::new(reactor.clone())) } else { None };
 
         let node = Node(Arc::new(NodeInner {
             id,
@@ -178,16 +192,16 @@ where
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
             reactor,
-            durable: false,
-            policy_agent,
+            durable,
+            policy_agent: policy_agent.clone(),
             system: system_manager,
             subscription_context: SafeMap::new(),
             subscription_relay,
-            pending_subs: SafeMap::new(),
         }));
 
-        // Set up the node reference in the NetworkDataBroker
-        network_broker.set_node(&node).unwrap();
+        // Bind the node to both policy agent and data broker
+        policy_agent.bind_node(&node);
+        data_broker.bind_node(&node);
 
         // Set up the message sender for the subscription relay
         if let Some(ref relay) = node.subscription_relay {
@@ -197,33 +211,10 @@ where
             }
         }
 
+        let node_type = if durable { "durable" } else { "ephemeral" };
+        notice_info!("Node {id:#} created as {node_type}");
+
         node
-    }
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
-        let collections = CollectionSet::new(engine);
-
-        let data_broker = Arc::new(LocalDataBroker::new(collections.clone()));
-        let entityset = EntityManager::new(data_broker, collections.clone());
-        let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
-        notice_info!("Node {id:#} created as durable");
-
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), true);
-
-        Node(Arc::new(NodeInner {
-            id,
-            collections,
-            entities: entityset,
-            peer_connections: SafeMap::new(),
-            durable_peers: SafeSet::new(),
-            reactor,
-            durable: true,
-            policy_agent,
-            system: system_manager,
-            subscription_context: SafeMap::new(),
-            subscription_relay: None,
-            pending_subs: SafeMap::new(),
-        }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA, D> { WeakNode(Arc::downgrade(&self.0)) }
 
@@ -303,7 +294,7 @@ where
         let request_id = proto::RequestId::new();
 
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
-        let auth = self.policy_agent.sign_request(self, cdata, &request);
+        let auth = self.policy_agent.sign_request(cdata, &request);
 
         // Get the peer connection
         let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
@@ -388,7 +379,7 @@ where
                 // I think we want timeouts to be handled by the node, not the connector,
                 // which would lend itself to spawning a task here and making this function synchronous.
 
-                let cdata = self.policy_agent.check_request(self, &auth, &request).await?;
+                let cdata = self.policy_agent.check_request(&auth, &request).await?;
 
                 // double check to make sure we have a connection to the peer based on the node id
                 if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
@@ -552,6 +543,7 @@ where
     ) -> Result<(), MutationError> {
         debug!("{self} commiting transaction {id} with {} events", events.len());
 
+        // Use LocalDataBroker to ensure we only consider already-local state when applying
         let getter = LocalDataBroker::new(self.collections.clone());
         self.entities.apply_events_with_getter(cdata, events.into_iter(), getter).await?;
 
@@ -568,104 +560,56 @@ where
         nodeandcontext: NodeAndContext<SE, PA>,
         initial: bool,
     ) -> Result<(), MutationError> {
-        let mut changes = Vec::new();
         let mut initial_entity_ids = Vec::new();
+        let mut processed_updates = Vec::new();
 
+        // Process each update, validate, and prepare for batch application
         for update in updates {
             // Collect entity IDs if this is initial data
             if initial {
                 initial_entity_ids.push(update.entity_id());
             }
 
-            match self.apply_subscription_update(from_peer_id, update, &nodeandcontext).await {
-                Ok(Some(change)) => {
-                    changes.push(change);
-                }
-                Ok(None) => {
-                    continue;
-                }
-                Err(e) => {
-                    action_warn!(self, "received invalid update from peer", "{}: {}", from_peer_id.to_base64_short(), e);
-                }
-            }
-        }
-        // TODO - think about whether this should come after notifying the relay or not
-        debug!("{self} notifying reactor of {} changes", changes.len());
-        self.reactor.notify_change(changes);
+            let (entity_id, collection_id, state, event) = update.into_parts();
 
+            // Validate and prepare event if present
+            let attested_event = match event {
+                Some(event) => {
+                    // validate and store the events, in case we need them for lineage comparison
+                    let event = (entity_id, collection_id.clone(), event.clone()).into();
+                    self.policy_agent.validate_received_event(from_peer_id, &event)?;
+                    // Note: We don't store the event here as apply_events_and_states will handle it
+                    Some(event)
+                }
+                None => None,
+            };
+
+            // Validate and prepare state if present
+            let attested_state = match state {
+                Some(state) => {
+                    let state = (entity_id, collection_id.clone(), state).into();
+                    // validate that we trust the state given to us
+                    self.policy_agent.validate_received_state(from_peer_id, &state)?;
+                    Some(state)
+                }
+                None => None,
+            };
+
+            // Add to batch for processing
+            processed_updates.push((attested_event, attested_state));
+        }
+
+        // Apply all updates in a single batch with unified reactor notification
+        self.entities.apply_events_and_states(processed_updates, &nodeandcontext.cdata).await?;
+
+        // Handle subscription relay notifications
         if initial {
             if let Some(relay) = self.subscription_relay.as_ref() {
                 relay.notify_applied_initial_state(subscription_id, initial_entity_ids).await?;
             }
         }
-        // Signal any pending subscription waiting for first update
-        if let Some(tx) = self.pending_subs.remove(&subscription_id) {
-            let _ = tx.send(()); // Ignore if receiver was dropped
-        }
 
         Ok(())
-    }
-
-    // TODO:
-    // in the Initial and Add cases, if this is the first time we're hearing about this entity
-    // it's fine that we only have the state, and no events.
-    // But if we already have the state and its clock is not identical, we
-    // may need to fetch the events that connect the two. If those events are in the
-    // collection, the collection, then lineage compare inside with_state -> apply_state
-    // will find them. But if there's a gap, it doesn't currently have the ability to request
-    // those events from the peer.
-    pub async fn apply_subscription_update(
-        &self,
-        from_peer_id: &proto::EntityId,
-        update: proto::SubscriptionUpdateItem,
-        nodeandcontext: &NodeAndContext<SE, PA>,
-    ) -> Result<Option<EntityChange>, MutationError> {
-        let (entity_id, collection_id, state, event) = update.into_parts();
-        let collection = self.collections.get(&collection_id).await?;
-
-        let attested_event = match event {
-            Some(event) => {
-                // validate and store the events, in case we need them for lineage comparison
-                let event = (entity_id, collection_id.clone(), event.clone()).into();
-                self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
-                // store the validated event in case we need it for lineage comparison
-                collection.add_event(&event).await?;
-                Some(event)
-            }
-            None => None,
-        };
-
-        let getter = LocalOrRemoteEventGetter::new(nodeandcontext.clone());
-        match state {
-            Some(state) => {
-                let state = (entity_id, collection_id.clone(), state).into();
-                // validate that we trust the state given to us
-                self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
-
-                match self.entities.apply_state(&getter, state).await? {
-                    // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
-                    (Some(false), _) => Ok(None),
-                    // We did not have the entity yet, or we had the entity already and this state is newer than the one we have
-                    (Some(true) | None, entity) => Ok(Some(EntityChange::new(entity, attested_events)?)),
-                }
-            }
-            None => {
-                // LEFT OFF HERE - Move this into self.entities.apply_event
-
-                let entity: Entity = self.entities.get_or_create(&getter, &collection_id, &entity_id).await?;
-
-                let mut changed = false;
-                // TODO - figure out how to apply the events in the correct order
-                for event in attested_event.iter() {
-                    changed = self.entities.apply_event(&collection_id, &entity_id, &event.payload).await?;
-                }
-                if changed {
-                    Ok(Some(EntityChange::new(entity, attested_event)?))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
     }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(peer_id = %peer_id.to_base64_short(), sub_id = %sub_id, collection_id = %collection_id, predicate = %predicate)))]
@@ -700,7 +644,7 @@ where
                             ItemChange::Initial { item } => {
                                 // For initial state, include both events and state
                                 if let Ok(es) = item.to_entity_state() {
-                                    let attestation = node.policy_agent.attest_state(&node, &es);
+                                    let attestation = node.policy_agent.attest_state(&es);
 
                                     updates.push(proto::SubscriptionUpdateItem::initial(
                                         item.id(),
@@ -709,7 +653,7 @@ where
                                     ));
                                 }
                             }
-                            ItemChange::Add { item, events } => {
+                            ItemChange::Add { item, event } => {
                                 // For entities which were not previously matched, state AND events should be included
                                 // but it's weird because EntityState and Event redundantly hinclude entity_id and collection
                                 // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
@@ -724,17 +668,17 @@ where
                                 };
 
                                 let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
-                                let attestation = node.policy_agent.attest_state(&node, &es);
+                                let attestation = node.policy_agent.attest_state(&es);
 
                                 updates.push(proto::SubscriptionUpdateItem::add(
                                     item.id,
                                     item.collection.clone(),
                                     Attested::opt(es, attestation),
-                                    events,
+                                    event,
                                 ));
                             }
-                            ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
-                                updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
+                            ItemChange::Update { item, event } | ItemChange::Remove { item, event } => {
+                                updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), event));
                             }
                         }
                     }
@@ -834,9 +778,6 @@ where
         spawn(async move {
             // Clean up subscription context
             node.subscription_context.remove(&sub_id);
-
-            // Clean up any pending oneshot channel
-            node.pending_subs.remove(&sub_id);
 
             // Unsubscribe from local reactor
             node.reactor.unsubscribe(sub_id);

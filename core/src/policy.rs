@@ -1,4 +1,5 @@
 use crate::{
+    databroker::DataBroker,
     entity::Entity,
     error::ValidationError,
     node::{ContextData, Node, NodeInner},
@@ -51,34 +52,28 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
 
+    /// Gives the PolicyAgent a reference to the Node, which it can use to access the EntityManager and other resources
+    /// This can be stored by your implementation of the PolicyAgent, or just ignore it if you don't need it
+    fn bind_node<SE: StorageEngine, D: DataBroker<Self::ContextData> + Send + Sync + 'static>(&self, _node: &Node<SE, Self, D>) {
+        // Default implementation does nothing
+    }
+
     /// Create relevant auth data for a given request
     /// This could be a JWT or a cryptographic signature, or some other arbitrary method of authentication as defined by the PolicyAgent
-    fn sign_request<SE: StorageEngine>(
-        &self,
-        node: &NodeInner<SE, Self>,
-        cdata: &Self::ContextData,
-        request: &proto::NodeRequest,
-    ) -> proto::AuthData;
+    fn sign_request(&self, cdata: &Self::ContextData, request: &proto::NodeRequest) -> proto::AuthData;
 
     /// Reverse of sign_request. This will typically parse + validate the auth data and return a ContextData if valid
     /// optionally, the PolicyAgent may introspect the request directly for signature validation, or other policy checks
     /// Note that check_read and check_write will be called with the ContextData as well if the request is approved
     /// Meaning that the PolicyAgent need not necessarily introspect the request directly here if it doesn't want to.
-    async fn check_request<SE: StorageEngine>(
-        &self,
-        node: &Node<SE, Self>,
-        auth: &proto::AuthData,
-        request: &proto::NodeRequest,
-    ) -> Result<Self::ContextData, ValidationError>
-    where
-        Self: Sized;
+    async fn check_request(&self, auth: &proto::AuthData, request: &proto::NodeRequest) -> Result<Self::ContextData, ValidationError>
+    where Self: Sized;
 
     /// Check the event and optionally return an attestation
     /// This could be used to attest that the event has passed the policy check for a given context
     /// or you could just return None if you don't want to attest to the event
-    fn check_event<SE: StorageEngine>(
+    fn check_event(
         &self,
-        node: &Node<SE, Self>,
         cdata: &Self::ContextData,
         entity: &Entity,
         event: &proto::Event,
@@ -86,19 +81,13 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
 
     /// Validate an event attestation
     /// This could be used to validate that the event has sufficient attestation as to be trusted
-    fn validate_received_event<SE: StorageEngine>(
-        &self,
-        node: &Node<SE, Self>,
-        received_from_node: &proto::EntityId,
-        event: &Attested<proto::Event>,
-    ) -> Result<(), AccessDenied>;
+    fn validate_received_event(&self, received_from_node: &proto::EntityId, event: &Attested<proto::Event>) -> Result<(), AccessDenied>;
 
     /// Attest a state which the caller asserts is valid. Implementation may return None if no attestation is required
-    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation>;
+    fn attest_state(&self, state: &proto::EntityState) -> Option<proto::Attestation>;
 
-    fn validate_received_state<SE: StorageEngine>(
+    fn validate_received_state(
         &self,
-        node: &Node<SE, Self>,
         received_from_node: &proto::EntityId,
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
@@ -159,30 +148,19 @@ impl PolicyAgent for PermissiveAgent {
     type ContextData = &'static DefaultContext;
 
     /// Create relevant auth data for a given request
-    fn sign_request<SE: StorageEngine>(
-        &self,
-        _node: &NodeInner<SE, Self>,
-        _cdata: &Self::ContextData,
-        _request: &proto::NodeRequest,
-    ) -> proto::AuthData {
+    fn sign_request(&self, _cdata: &Self::ContextData, _request: &proto::NodeRequest) -> proto::AuthData {
         debug!("PermissiveAgent sign_request: {:?}", _request);
         proto::AuthData(vec![])
     }
 
     /// Validate auth data and yield the context data if valid
-    async fn check_request<SE: StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _auth: &proto::AuthData,
-        _request: &proto::NodeRequest,
-    ) -> Result<Self::ContextData, ValidationError> {
+    async fn check_request(&self, _auth: &proto::AuthData, _request: &proto::NodeRequest) -> Result<Self::ContextData, ValidationError> {
         Ok(DEFAULT_CONTEXT)
     }
 
     /// Create an attestation for an event
-    fn check_event<SE: StorageEngine>(
+    fn check_event(
         &self,
-        _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
         _entity: &Entity,
         _event: &proto::Event,
@@ -190,25 +168,23 @@ impl PolicyAgent for PermissiveAgent {
         Ok(None)
     }
 
-    fn validate_received_event<SE: StorageEngine>(
+    fn validate_received_event(
         &self,
-        _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _received_from_node: &proto::EntityId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
+    fn attest_state(&self, _state: &proto::EntityState) -> Option<proto::Attestation> {
         // This PolicyAgent does not require attestation, so we return None
         // Client/Server policy agents may also return None and defer to the server identity to validate the received state
         None
     }
 
-    fn validate_received_state<SE: StorageEngine>(
+    fn validate_received_state(
         &self,
-        _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _received_from_node: &proto::EntityId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         // This PolicyAgent does not require validation, so we return Ok

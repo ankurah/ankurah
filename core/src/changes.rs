@@ -37,7 +37,7 @@ pub enum ItemChange<I> {
     /// A item that previously matched the subscription has changed in a way that has not changed the matching condition
     Update { item: I, event: Attested<Event> },
     /// A item that previously matched the subscription has changed in a way that no longer matches the subscription
-    Remove { item: I, event: Attested<Event> },
+    Remove { item: I, event: Option<Attested<Event>> },
 }
 
 impl<I> ItemChange<I> {

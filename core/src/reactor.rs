@@ -42,7 +42,6 @@ pub struct Reactor<SE, PA> {
     /// Reference to the storage engine
     collections: CollectionSet<SE>,
 
-    entityset: EntityManager<SE>,
     policy_agent: PA,
 }
 
@@ -64,7 +63,6 @@ where
             wildcard_watchers: SafeMap::new(),
             entity_watchers: SafeMap::new(),
             collections,
-            entityset,
             policy_agent,
         })
     }
@@ -200,7 +198,7 @@ where
         let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Entity>>> = std::collections::HashMap::new();
 
         for change in changes {
-            let (entity, events) = change.into_parts();
+            let (entity, event) = change.into_parts();
 
             let mut possibly_interested_subs = HashSet::new();
 
@@ -248,13 +246,13 @@ where
                         let new_change: Option<ItemChange<Entity>> = if matches != did_match {
                             // Matching status changed
                             Some(if matches {
-                                ItemChange::Add { item: entity.clone(), events: events.clone() }
+                                ItemChange::Add { item: entity.clone(), event }
                             } else {
-                                ItemChange::Remove { item: entity.clone(), events: events.clone() }
+                                ItemChange::Remove { item: entity.clone(), event }
                             })
                         } else if matches {
                             // Entity still matches but was updated
-                            Some(ItemChange::Update { item: entity.clone(), events: events.clone() })
+                            Some(ItemChange::Update { item: entity.clone(), event })
                         } else {
                             // Entity didn't match before and still doesn't match
                             None
@@ -296,7 +294,7 @@ where
                     .iter()
                     .map(|entity| ItemChange::Remove {
                         item: entity.clone(),
-                        events: vec![], // No events for system reset
+                        event: None, // No event for system reset
                     })
                     .collect();
 

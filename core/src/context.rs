@@ -342,7 +342,7 @@ where
 
         // Check policy and collect attestations
         for (entity, event) in entity_events {
-            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity, &event)?;
+            let attestation = self.node.policy_agent.check_event(&self.cdata, &entity, &event)?;
             let attested = Attested::opt(event.clone(), attestation);
             attested_events.push(attested.clone());
             entity_attested_events.push((entity, attested));
@@ -350,35 +350,8 @@ where
 
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
+        self.entities.commit_events(entity_attested_events)?;
 
-        // All peers confirmed, now we can update local state
-        let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
-            let collection = self.node.collections.get(&attested_event.payload.collection).await?;
-            collection.add_event(&attested_event).await?;
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
-
-            let collection_id = &attested_event.payload.collection;
-            // If this entity has an upstream, propagate the changes
-            if let Some(ref upstream) = entity.upstream {
-                unimplemented!()
-                // upstream.apply_event(&(collection_id.clone(), self), &attested_event.payload).await?;
-            }
-
-            // Persist
-
-            let state = entity.to_state()?;
-
-            let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-            let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
-            let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(attested).await?;
-
-            changes.push(EntityChange::new(entity.clone(), Some(attested_event))?);
-        }
-
-        // Notify reactor of ALL changes
-        self.node.reactor.notify_change(changes);
         Ok(())
     }
 }

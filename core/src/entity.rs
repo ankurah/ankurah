@@ -340,11 +340,11 @@ impl std::fmt::Display for TemporaryEntity {
     }
 }
 
+// LEFT OFF HERE - audit this stem to stern
+
 /// The abiter of all entities in the system (except those which are forked during a transaction)
 pub struct EntityManager<SE, PA, D>(Arc<Inner<SE, PA, D>>);
-impl<SE, PA, D> Clone for EntityManager<SE, PA, D> {
-    fn clone(&self) -> Self { Self(self.0.clone()) }
-}
+// pub struct WeakEntityManager<SE, PA, D>(Weak<Inner<SE, PA, D>>);
 
 pub struct Inner<SE, PA, D> {
     resident: std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>,
@@ -353,6 +353,18 @@ pub struct Inner<SE, PA, D> {
     data_broker: D,
     collections: CollectionSet<SE>,
 }
+
+impl<SE, PA, D> Clone for EntityManager<SE, PA, D> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
+
+// impl<SE, PA, D> Clone for WeakEntityManager<SE, PA, D> {
+//     fn clone(&self) -> Self { Self(self.0.clone()) }
+// }
+
+// impl<SE, PA, D> WeakEntityManager<SE, PA, D> {
+//     pub fn upgrade(&self) -> Option<EntityManager<SE, PA, D>> { self.0.upgrade().map(EntityManager) }
+// }
 
 impl<
         SE: StorageEngine + Send + Sync + 'static,
@@ -363,6 +375,7 @@ impl<
     pub fn new(data_broker: D, collections: CollectionSet<SE>, reactor: Reactor<SE, PA>, policy_agent: PA) -> Self {
         Self(Arc::new(Inner { resident: std::sync::RwLock::new(BTreeMap::new()), data_broker, collections, reactor, policy_agent }))
     }
+    // pub fn weak(&self) -> WeakEntityManager<SE, PA, D> { WeakEntityManager(Arc::downgrade(&self.0)) }
     /// Returns a resident entity, or None if it's not resident
     pub fn get_resident(&self, id: &EntityId) -> Option<Entity> {
         let entities = self.0.resident.read().unwrap();
@@ -441,19 +454,19 @@ impl<
     pub async fn apply_events_with_getter<G: GetEvents<Id = EventId, Event = Event>>(
         &self,
         cdata: &PA::ContextData,
-        events: impl Iterator<Item = Attested<Event>>,
+        events: impl IntoIterator<Item = Attested<Event>>,
         getter: G,
     ) -> Result<bool, MutationError> {
         let mut changed = false;
 
         let mut changes = Vec::new();
 
-        for event in events.iter_mut() {
-            let collection = self.collections.get(&event.payload.collection).await?;
+        for event in events {
+            let collection = self.0.collections.get(&event.payload.collection).await?;
 
             // When applying events for a remote transaction, we should only look at the local storage for the lineage
             // If we are missing events necessary to connect the lineage, that's their responsibility to include in the transaction.
-            let entity = self.entities.get_or_create(&getter, &event.payload.collection, &event.payload.entity_id).await?;
+            let entity = self.get_or_create(&event.payload.collection, &event.payload.entity_id, cdata).await?;
 
             // we have the entity, so we can check access, optionally atteste, and apply/save the event;
             if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
@@ -464,13 +477,13 @@ impl<
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
                 let attested = Attested::opt(entity_state, attestation);
-                collection.add_event(event).await?;
+                collection.add_event(&event).await?;
                 collection.set_state(attested).await?;
-                changes.push(EntityChange::new(entity.clone(), event.clone())?);
+                changes.push(EntityChange::new(entity, Some(event))?);
             }
         }
 
-        self.reactor.notify_change(changes);
+        self.0.reactor.notify_change(changes);
 
         Ok(changed)
     }
@@ -510,6 +523,50 @@ impl<
         attested_entity_state: Attested<EntityState>,
         cdata: &PA::ContextData,
     ) -> Result<(Option<bool>, Entity), MutationError> {
+        match self.apply_state_inner(attested_entity_state, cdata).await {
+            Ok((Some(true), entity)) => {
+                self.0.reactor.notify_change(vec![EntityChange::new(entity.clone(), None)?]);
+                Ok((Some(true), entity))
+            }
+            Ok((Some(false), entity)) => Ok((Some(false), entity)),
+            Ok((None, entity)) => Ok((None, entity)),
+            Err(e) => Err(e),
+        }
+    }
+    pub async fn apply_states(
+        &self,
+        attested_entity_states: Vec<Attested<EntityState>>,
+        cdata: &PA::ContextData,
+    ) -> Result<Vec<Entity>, MutationError> {
+        let mut results = Vec::new();
+        let mut changes = Vec::new();
+
+        for attested_entity_state in attested_entity_states {
+            let (changed, entity) = self.apply_state_inner(attested_entity_state, cdata).await?;
+
+            // Only create EntityChange for entities that actually changed
+            if changed == Some(true) {
+                changes.push(EntityChange::new(entity.clone(), None)?);
+            }
+
+            results.push(entity);
+        }
+
+        // Notify reactor of all changes at once
+        if !changes.is_empty() {
+            self.0.reactor.notify_change(changes);
+        }
+
+        Ok(results)
+    }
+
+    async fn apply_state_inner(
+        &self,
+        attested_entity_state: Attested<EntityState>,
+        cdata: &PA::ContextData,
+    ) -> Result<(Option<bool>, Entity), MutationError> {
+        let mut changes = Vec::new();
+
         let id = attested_entity_state.payload.entity_id;
         let collection_id = &attested_entity_state.payload.collection;
         let state = &attested_entity_state.payload.state;
@@ -529,9 +586,6 @@ impl<
                 entity.apply_state(state)?;
                 let collection = self.0.collections.get(collection_id).await?;
                 collection.set_state(attested_entity_state).await?;
-
-                // LEFT OFF HERE - determine if we should be notifying the reactor here
-                // yes, we should be notifying the reactor here
 
                 return Ok((Some(true), entity));
             } else {
@@ -569,68 +623,98 @@ impl<
         }
     }
 
-    // DEPRECATED - use apply_state instead. DO NOT DELETE THIS COMMENTED FUNCTION. WE WANT TO LEAVE IT FOR REFERENCE.
-    // Returns a tuple of (changed, entity)
-    // changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
-    // None if the entity was not previously on the local node (either in the WeakEntitySet or in storage)
-    // pub async fn with_state<G>(
-    //     &self,
-    //     getter: &G,
-    //     id: EntityId,
-    //     collection_id: CollectionId,
-    //     state: &State,
-    // ) -> Result<(Option<bool>, Entity), RetrievalError>
-    // where
-    //     G: GetState + GetEvents<Id = EventId, Event = Event>,
-    // {
-    //     let entity = {
-    //         let mut entities = self.0.resident.write().unwrap();
-    //         match entities.entry(id) {
-    //             Entry::Vacant(_) => None,
-    //             Entry::Occupied(o) => match o.get().upgrade() {
-    //                 Some(entity) => {
-    //                     debug!("Entity {id} was resident");
-    //                     if entity.collection != collection_id {
-    //                         return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
-    //                     }
-    //                     Some(entity)
-    //                 }
-    //                 None => {
-    //                     debug!("Entity {id} was deallocated");
-    //                     None
-    //                 }
-    //             },
-    //         }
-    //     };
+    pub async fn commit_events(&self, entity_attested_events: Vec<(Entity, Attested<Event>)>) -> Result<(), MutationError> {
+        // All peers confirmed, now we can update local state
+        let mut changes: Vec<EntityChange> = Vec::new();
+        for (entity, attested_event) in entity_attested_events {
+            let collection = self.node.collections.get(&attested_event.payload.collection).await?;
+            collection.add_event(&attested_event).await?;
+            entity.commit_head(Clock::new([attested_event.payload.id()]));
 
-    //     // Handle the case where entity is not resident (either vacant or deallocated)
-    //     let Some(entity) = entity else {
-    //         // Check if there's existing state in storage before creating a new entity
-    //         if let Some(existing_state) = getter.get_state(id).await? {
-    //             debug!("Found existing state in storage for {id}");
-    //             let entity = Entity::from_state(id, collection_id.to_owned(), &existing_state.payload.state)?;
+            let collection_id = &attested_event.payload.collection;
+            // If this entity has an upstream, propagate the changes
+            if let Some(ref upstream) = entity.upstream {
+                upstream.apply_event(&(collection_id.clone(), self), &attested_event.payload).await?;
+            }
 
-    //             {
-    //                 self.0.resident.write().unwrap().insert(id, entity.weak());
-    //             }
+            // Persist
 
-    //             // We need to apply the new state to check lineage
-    //             let changed = entity.can_apply_state(getter, state).await?;
-    //             return Ok((Some(changed), entity));
-    //         } else {
-    //             debug!("No existing state in storage for {id}");
-    //             let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
+            let state = entity.to_state()?;
 
-    //             {
-    //                 self.0.resident.write().unwrap().insert(id, entity.weak());
-    //             }
+            let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+            let attestation = self.node.policy_agent.attest_state(&entity_state);
+            let attested = Attested::opt(entity_state, attestation);
+            collection.set_state(attested).await?;
 
-    //             return Ok((None, entity));
-    //         }
-    //     };
+            changes.push(EntityChange::new(entity.clone(), Some(attested_event))?);
+        }
 
-    //     // if we're here, we've retrieved the entity from the set and need to apply the state
-    //     let changed = entity.can_apply_state(getter, state).await?;
-    //     Ok((Some(changed), entity))
-    // }
+        // Notify reactor of ALL changes
+        self.0.reactor.notify_change(changes);
+
+        Ok(())
+    }
+
+    /// Apply a mix of events and states without duplicate reactor notifications
+    /// This is used by subscription updates where each item may have events, state, or both
+    pub async fn apply_events_and_states(
+        &self,
+        updates: Vec<(Option<Attested<Event>>, Option<Attested<EntityState>>)>,
+        cdata: &PA::ContextData,
+    ) -> Result<Vec<(bool, Entity)>, MutationError> {
+        let mut results = Vec::new();
+        let mut changes = Vec::new();
+
+        for (event, state) in updates {
+            let mut entity_changed = false;
+            let mut change_event = None;
+
+            // Handle state first if present
+            let entity = if let Some(attested_state) = state {
+                let (changed, entity) = self.apply_state_inner(attested_state, cdata).await?;
+                if changed == Some(true) {
+                    entity_changed = true;
+                }
+                entity
+            } else if let Some(ref attested_event) = event {
+                // If no state but we have an event, get or create the entity
+                self.get_or_create(&attested_event.payload.collection, &attested_event.payload.entity_id, cdata).await?
+            } else {
+                // Neither state nor event - skip this update
+                continue;
+            };
+
+            // Handle event if present
+            if let Some(attested_event) = event {
+                let getter = self.0.data_broker.event_getter(cdata.clone());
+                if entity.apply_event(&getter, &attested_event.payload).await? {
+                    entity_changed = true;
+                    change_event = Some(attested_event.clone());
+
+                    // Only store the event in collection if it applied successfully
+                    let collection = self.0.collections.get(&attested_event.payload.collection).await?;
+                    collection.add_event(&attested_event).await?;
+
+                    // Update entity state in storage
+                    let state = entity.to_state()?;
+                    let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+                    collection.set_state(Attested::new(entity_state)).await?;
+                }
+            }
+
+            // Collect change for reactor notification
+            if entity_changed {
+                changes.push(EntityChange::new(entity.clone(), change_event)?);
+            }
+
+            results.push((entity_changed, entity));
+        }
+
+        // Single reactor notification for all changes
+        if !changes.is_empty() {
+            self.0.reactor.notify_change(changes);
+        }
+
+        Ok(results)
+    }
 }

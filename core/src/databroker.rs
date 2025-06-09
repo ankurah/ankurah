@@ -12,7 +12,7 @@ use crate::{
     error::RetrievalError,
     lineage::GetEvents,
     node::{ContextData, Node, WeakNode},
-    policy::PolicyAgent,
+    policy::{AccessDenied, PolicyAgent},
     storage::StorageEngine,
 };
 
@@ -22,6 +22,13 @@ use crate::{
 #[async_trait]
 pub trait DataBroker<C: ContextData>: Send + Sync {
     type EventGetter: GetEvents<Id = EventId, Event = Event> + Send + Sync;
+
+    /// Gives the DataBroker a reference to the Node, which it can use to access the EntityManager and other resources
+    /// This can be stored by your implementation of the DataBroker, or just ignore it if you don't need it
+    fn bind_node<SE: StorageEngine, PA: PolicyAgent<ContextData = C> + Send + Sync + 'static>(&self, _node: &Node<SE, PA, Self>)
+    where Self: Sized {
+        // Default implementation does nothing
+    }
 
     /// Create an event getter with the provided context data and collection
     fn event_getter(&self, cdata: C) -> Self::EventGetter;
@@ -130,8 +137,6 @@ pub struct NetworkDataBroker<SE: StorageEngine + Send + Sync + 'static, PA: Poli
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NetworkDataBroker<SE, PA> {
     pub fn new(collections: CollectionSet<SE>) -> Self { Self { collections, node: OnceLock::new() } }
 
-    pub fn set_node(&self, node: &Node<SE, PA, Self>) -> Result<(), ()> { self.node.set(node.weak()).map_err(|_| ()) }
-
     pub fn node(&self) -> Result<Node<SE, PA, Self>, RetrievalError> {
         let weak_node = self.node.get().ok_or(RetrievalError::SanityError("Node not set in NetworkDataBroker"))?;
         let node = weak_node.upgrade().ok_or(RetrievalError::SanityError("Node has been dropped"))?;
@@ -144,6 +149,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     for NetworkDataBroker<SE, PA>
 {
     type EventGetter = NetworkEventGetter<SE, PA>;
+
+    fn bind_node<SE2: StorageEngine, PA2: PolicyAgent<ContextData = PA::ContextData> + Send + Sync + 'static>(
+        &self,
+        node: &Node<SE2, PA2, Self>,
+    ) where
+        Self: Sized,
+    {
+        self.node.set(node.weak()).expect("Failed to set node reference in NetworkDataBroker - already set");
+    }
 
     fn event_getter(&self, cdata: PA::ContextData) -> Self::EventGetter { NetworkEventGetter::new(self.clone(), cdata) }
 
@@ -234,7 +248,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for state in states {
-                    node.policy_agent.validate_received_state(&node, &peer_id, &state)?;
+                    node.policy_agent.validate_received_state(&peer_id, &state)?;
                     // collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                     // statemap.insert(state.payload.entity_id, state);
                 }
@@ -258,6 +272,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         cdata: &PA::ContextData,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let node = self.node()?;
+
         let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match node
@@ -270,7 +285,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for state in states {
-                    node.policy_agent.validate_received_state(&node, &peer_id, &state)?;
+                    node.policy_agent.validate_received_state(&peer_id, &state)?;
                     // collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
                 let states = collection.fetch_states(predicate).await?;
