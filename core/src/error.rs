@@ -124,6 +124,8 @@ pub enum MutationError {
     PeerRejected,
     #[error("invalid event")]
     InvalidEvent,
+    #[error("event does not match this entity")]
+    DifferentEntity,
 }
 
 #[derive(Error, Debug)]

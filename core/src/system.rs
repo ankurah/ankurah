@@ -130,7 +130,7 @@ where
         storage.add_event(&event.into()).await?;
 
         // Update the entity's head clock
-        system_entity.commit_head(root.clone());
+        self.0.entities.commit_events(vec![(system_entity.clone(), event)]).await?;
         // Now get the entity state after the head is updated
         let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
         storage.set_state(attested_state.clone()).await?;
@@ -249,17 +249,13 @@ where
         let mut entities = Vec::new();
         let mut root_state = None;
 
-        // let retriever = LocalGetter::new(storage.clone());
-
-        for state in storage.fetch_states(&ankql::ast::Predicate::True).await? {
-            let (_entity_changed, entity) =
-                self.0.entities.apply_state(&retriever, state.payload.entity_id, collection_id.clone(), &state.payload.state).await?;
+        for entity in self.entities.fetch_local(&collection_id, &ankql::ast::Predicate::True).await? {
             let lww_backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");
 
                 if let proto::sys::Item::SysRoot = &item {
-                    root_state = Some(state);
+                    root_state = Some(entity.to_entity_state()?.into());
                 }
                 entities.push(entity);
             }

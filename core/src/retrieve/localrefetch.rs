@@ -32,21 +32,22 @@ impl<SE: StorageEngine + Send + Sync + 'static> LocalRefetcher<SE> {
     ) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
 
-        todo!("move fetch_local_entities to EntityManager");
-        let matching_states = storage_collection.fetch_states(predicate).await?;
-        let localgetter = LocalDataBroker::new(storage_collection.clone());
+        // todo!("move fetch_local_entities to EntityManager");
+        // let matching_states = storage_collection.fetch_states(predicate).await?;
+        // let localgetter = LocalDataBroker::new(storage_collection.clone());
 
-        let mut local_entities = Vec::new();
-        for state in matching_states {
-            let (_, entity) = self
-                .entityset
-                .apply_state(&localgetter, state.payload.entity_id, collection_id.clone(), &state.payload.state)
-                .await
-                .map_err(|e| RetrievalError::Other(format!("Failed to process entity state: {}", e)))?;
-            local_entities.push(entity);
-        }
+        // let mut local_entities = Vec::new();
+        // for state in matching_states {
+        //     let (_, entity) = self
+        //         .entityset
+        //         .apply_state(&localgetter, state.payload.entity_id, collection_id.clone(), &state.payload.state)
+        //         .await
+        //         .map_err(|e| RetrievalError::Other(format!("Failed to process entity state: {}", e)))?;
+        //     local_entities.push(entity);
+        // }
 
-        Ok(local_entities)
+        // Ok(local_entities)
+        unimplemented!()
     }
 }
 

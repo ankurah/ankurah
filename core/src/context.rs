@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     changes::{ChangeSet, EntityChange},
     consistency::diff_resolver::DiffResolver,
-    databroker::DataBroker,
+    databroker::DataGetter,
     entity::Entity,
     error::{MutationError, RetrievalError},
     model::View,
@@ -32,7 +32,7 @@ pub struct NodeAndContext<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     pub node: Node<SE, PA, D>,
     pub cdata: PA::ContextData,
@@ -42,7 +42,7 @@ impl<SE, PA, D> Clone for NodeAndContext<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self { node: self.node.clone(), cdata: self.cdata.clone() } }
 }
@@ -56,7 +56,6 @@ pub trait TContext {
     fn create_entity(&self, collection: proto::CollectionId) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
-    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
     async fn subscribe(
@@ -73,7 +72,7 @@ pub trait TContext {
 impl<
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+        D: DataGetter<PA::ContextData> + Send + Sync + 'static,
     > TContext for NodeAndContext<SE, PA, D>
 {
     fn node_id(&self) -> proto::EntityId { self.node.id }
@@ -82,7 +81,6 @@ impl<
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
         self.get_entity(collection, id, cached).await
     }
-    fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity> { self.node.entities.get_resident(&id) }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.fetch_entities(collection, args).await
     }
@@ -211,7 +209,7 @@ impl<SE, PA, D> NodeAndContext<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
     // pub(crate) async fn get_entity(

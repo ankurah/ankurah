@@ -16,7 +16,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::{Context, NodeAndContext},
-    databroker::{self, DataBroker, LocalDataBroker},
+    databroker::{self, DataGetter, LocalGetter},
     entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
@@ -78,11 +78,11 @@ impl From<ankql::error::ParseError> for RetrievalError {
 pub struct Node<SE, PA, D>(pub(crate) Arc<NodeInner<SE, PA, D>>)
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static;
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static;
 impl<SE, PA, D> Clone for Node<SE, PA, D>
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
@@ -90,11 +90,11 @@ where
 pub struct WeakNode<SE, PA, D>(Weak<NodeInner<SE, PA, D>>)
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static;
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static;
 impl<SE, PA, D> Clone for WeakNode<SE, PA, D>
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
@@ -102,7 +102,7 @@ where
 impl<SE, PA, D> WeakNode<SE, PA, D>
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     pub fn upgrade(&self) -> Option<Node<SE, PA, D>> { self.0.upgrade().map(Node) }
 }
@@ -110,7 +110,7 @@ where
 impl<SE, PA, D> Deref for Node<SE, PA, D>
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     type Target = Arc<NodeInner<SE, PA, D>>;
     fn deref(&self) -> &Self::Target { &self.0 }
@@ -124,7 +124,7 @@ pub trait ContextData: Send + Sync + Clone + 'static {}
 pub struct NodeInner<SE, PA, D>
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     pub id: proto::EntityId,
     pub durable: bool,
@@ -148,12 +148,12 @@ impl<SE, PA, D> Node<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
         let collections = CollectionSet::new(engine);
         // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
-        let network_broker = crate::databroker::NetworkDataBroker::new(collections.clone());
+        let network_broker = crate::databroker::NetworkGetter::new(collections.clone());
 
         Self::new_internal(collections, network_broker, policy_agent, false, true)
     }
@@ -161,7 +161,7 @@ where
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
         let collections = CollectionSet::new(engine);
         // Create LocalDataBroker for durable nodes (local storage only)
-        let local_broker = Arc::new(LocalDataBroker::new(collections.clone()));
+        let local_broker = Arc::new(LocalGetter::new(collections.clone()));
 
         Self::new_internal(collections, local_broker, policy_agent, true, false)
     }
@@ -174,7 +174,7 @@ where
         needs_subscription_relay: bool,
     ) -> Node<SE, PA, DB>
     where
-        DB: DataBroker<PA::ContextData> + Send + Sync + 'static,
+        DB: DataGetter<PA::ContextData> + Send + Sync + 'static,
     {
         let reactor = Reactor::new(collections.clone(), data_broker.clone(), policy_agent.clone());
         let entityset = EntityManager::new(data_broker.clone(), collections.clone(), reactor.clone(), policy_agent.clone());
@@ -544,7 +544,7 @@ where
         debug!("{self} commiting transaction {id} with {} events", events.len());
 
         // Use LocalDataBroker to ensure we only consider already-local state when applying
-        let getter = LocalDataBroker::new(self.collections.clone());
+        let getter = LocalGetter::new(self.collections.clone());
         self.entities.apply_events_with_getter(cdata, events.into_iter(), getter).await?;
 
         Ok(())
@@ -757,7 +757,7 @@ impl<SE, PA, D> NodeInner<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
@@ -794,7 +794,7 @@ where
 impl<SE, PA, D> Drop for NodeInner<SE, PA, D>
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         notice_info!("Node({}) dropped", self.id);
@@ -809,7 +809,7 @@ impl<SE, PA, D> TNodeErased for Node<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     fn unsubscribe(&self, handle: &SubscriptionHandle) { let _ = self.0.unsubscribe(handle); }
 }
@@ -817,7 +817,7 @@ where
 impl<SE, PA, D> fmt::Display for Node<SE, PA, D>
 where
     PA: PolicyAgent,
-    D: DataBroker<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets

@@ -20,7 +20,7 @@ use crate::{
 /// remote peers, or a combination. Handles the complexity of local vs remote
 /// data retrieval while keeping EntityManager agnostic.
 #[async_trait]
-pub trait DataBroker<C: ContextData>: Send + Sync {
+pub trait DataGetter<C: ContextData>: Send + Sync {
     type EventGetter: GetEvents<Id = EventId, Event = Event> + Send + Sync;
 
     /// Gives the DataBroker a reference to the Node, which it can use to access the EntityManager and other resources
@@ -39,6 +39,13 @@ pub trait DataBroker<C: ContextData>: Send + Sync {
         event_ids: Vec<EventId>,
         cdata: &C,
     ) -> Result<(usize, HashMap<EventId, Attested<Event>>), RetrievalError>;
+
+    async fn get_state(
+        &self,
+        collection_id: &CollectionId,
+        entity_id: &EntityId,
+        cdata: &C,
+    ) -> Result<Attested<EntityState>, RetrievalError>;
 
     /// Retrieve entity state
     async fn get_states(
@@ -59,21 +66,21 @@ pub trait DataBroker<C: ContextData>: Send + Sync {
 }
 
 /// DataBroker implementation for durable nodes that only access local storage
-pub struct LocalDataBroker<SE> {
+pub struct LocalGetter<SE> {
     collections: CollectionSet<SE>,
 }
-impl<SE> Clone for LocalDataBroker<SE>
+impl<SE> Clone for LocalGetter<SE>
 where SE: StorageEngine
 {
     fn clone(&self) -> Self { Self { collections: self.collections.clone() } }
 }
 
-impl<SE: StorageEngine> LocalDataBroker<SE> {
+impl<SE: StorageEngine> LocalGetter<SE> {
     pub fn new(collections: CollectionSet<SE>) -> Self { Self { collections } }
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataBroker<C> for LocalDataBroker<SE> {
+impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataGetter<C> for LocalGetter<SE> {
     type EventGetter = Self;
 
     fn event_getter(&self, _cdata: C) -> Self::EventGetter { self.clone() }
@@ -99,6 +106,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataBroker<C> fo
         let collection = self.collections.get(collection_id).await?;
         collection.get_states(entity_ids).await
     }
+    async fn get_state(
+        &self,
+        collection_id: &CollectionId,
+        entity_id: &EntityId,
+        cdata: &C,
+    ) -> Result<Attested<EntityState>, RetrievalError> {
+        let collection = self.collections.get(collection_id).await?;
+        collection.get_state(entity_id).await
+    }
 
     async fn fetch_states(
         &self,
@@ -112,7 +128,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataBroker<C> fo
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalDataBroker<SE> {
+impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalGetter<SE> {
     type Id = EventId;
     type Event = Event;
 
@@ -129,12 +145,12 @@ impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalDataBroker<SE
 
 /// DataBroker implementation for ephemeral nodes that access both local and remote storage
 #[derive(Clone)]
-pub struct NetworkDataBroker<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> {
+pub struct NetworkGetter<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> {
     collections: CollectionSet<SE>,
     node: OnceLock<WeakNode<SE, PA, Self>>,
 }
 
-impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NetworkDataBroker<SE, PA> {
+impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NetworkGetter<SE, PA> {
     pub fn new(collections: CollectionSet<SE>) -> Self { Self { collections, node: OnceLock::new() } }
 
     pub fn node(&self) -> Result<Node<SE, PA, Self>, RetrievalError> {
@@ -145,8 +161,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> DataBroker<PA::ContextData>
-    for NetworkDataBroker<SE, PA>
+impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> DataGetter<PA::ContextData>
+    for NetworkGetter<SE, PA>
 {
     type EventGetter = NetworkEventGetter<SE, PA>;
 
@@ -206,32 +222,26 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
     }
 
+    async fn get_state(
+        &self,
+        collection_id: &CollectionId,
+        entity_id: &EntityId,
+        cdata: &PA::ContextData,
+    ) -> Result<Attested<EntityState>, RetrievalError> {
+        let states = self.get_states(collection_id, vec![entity_id.clone()], cdata).await?;
+        if states.is_empty() {
+            Err(RetrievalError::EntityNotFound(entity_id.clone()))
+        } else {
+            Ok(states[0].clone())
+        }
+    }
+
     async fn get_states(
         &self,
         collection_id: &CollectionId,
         mut entity_ids: Vec<EntityId>,
         cdata: &PA::ContextData,
-        // allow_cache: bool,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        // let mut statemap: HashMap<EntityId, Attested<EntityState>> = HashMap::new();
-        // if allow_cache {
-        //     let collection = self.collections.get(collection_id).await?;
-
-        //     for state in collection.get_states(entity_ids).await? {
-        //         statemap.insert(state.payload.entity_id, state);
-        //     }
-
-        //     let missing_entity_ids: Vec<EntityId> = entity_ids.iter().filter(|id| !statemap.contains_key(id)).cloned().collect();
-
-        //     if missing_entity_ids.is_empty() {
-        //         return Ok(statemap.values().cloned().collect());
-        //     }
-        //     entity_ids = missing_entity_ids;
-
-        //     // QUESTION: should we return it immediately and background the peer fetch?
-        //     // If so, then we are doing a bit more than just retrieving, we're alsos applying that state to the collection
-        //     // which might be a separation of concerns issue vs Node/EntityManager
-        // }
         let node = self.node()?;
         let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
@@ -305,12 +315,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
 /// Event getter for network access - thin wrapper that delegates to NetworkDataBroker
 pub struct NetworkEventGetter<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> {
-    broker: NetworkDataBroker<SE, PA>,
+    broker: NetworkGetter<SE, PA>,
     cdata: PA::ContextData,
 }
 
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NetworkEventGetter<SE, PA> {
-    pub fn new(broker: NetworkDataBroker<SE, PA>, cdata: PA::ContextData) -> Self { Self { broker, cdata } }
+    pub fn new(broker: NetworkGetter<SE, PA>, cdata: PA::ContextData) -> Self { Self { broker, cdata } }
 }
 
 #[async_trait]
