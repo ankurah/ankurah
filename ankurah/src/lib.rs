@@ -86,9 +86,9 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create server and client nodes
-//!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
+//!     let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable()?), ankurah::policy::PermissiveAgent::new());
 //!     server.system.create().await?;
-//!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
+//!     let client = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral()?), ankurah::policy::PermissiveAgent::new());
 //!
 //!     // Connect nodes using local process connection
 //!     let _conn = LocalProcessConnection::new(&server, &client).await?;
@@ -166,7 +166,9 @@ where
     T: reactive_graph::traits::Get + Clone + 'static,
     T::Value: 'static,
 {
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> { Box::new(self.clone()) }
+    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> {
+        Box::new(self.clone())
+    }
 }
 
 // Re-export the derive macro

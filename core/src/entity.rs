@@ -361,7 +361,7 @@ impl<SE, PA, D> Clone for EntityManager<SE, PA, D> {
 impl<
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
+        DG: DataGetter<SE, PA> + Send + Sync + 'static,
     > EntityManager<SE, PA, DG>
 {
     pub fn new(data_getter: DG, collections: CollectionSet<SE>, reactor: Reactor<SE, PA>, policy_agent: PA) -> Self {
@@ -375,7 +375,9 @@ impl<
         //     Some(entity) => Ok(Some(entity)),
         //     None =>
 
+        self.0.policy_agent.can_access_collection(cdata, collection_id)?;
         let state = self.0.data_getter.get_state(collection_id, id, cdata).await?;
+        self.0.policy_agent.check_read(cdata, id, collection_id, &state.payload.state)?;
         let entity = self.apply_state(state, cdata).await?;
         Ok(entity)
 
@@ -480,7 +482,10 @@ impl<
         predicate: &ankql::ast::Predicate,
         cdata: &PA::ContextData,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        let matching_states = self.0.data_getter.fetch_states(collection_id, predicate, cdata).await?;
+        self.0.policy_agent.can_access_collection(cdata, collection_id)?;
+        // Use EntityManager's fetch_entities method directly
+        let filtered_predicate = self.0.policy_agent.filter_predicate(cdata, collection_id, predicate)?;
+        let matching_states = self.0.data_getter.fetch_states(collection_id, &filtered_predicate, cdata).await?;
 
         let mut entities = Vec::new();
         for state in matching_states {
@@ -498,7 +503,7 @@ impl<
         predicate: &ankql::ast::Predicate,
     ) -> Result<Vec<Entity>, RetrievalError> {
         let collection = self.0.collections.get(collection_id).await?;
-        let local_getter = LocalGetter::new(self.0.collections.clone());
+        let local_getter = LocalGetter::<SE, PA>::new(self.0.collections.clone());
         let mut changes = Vec::new();
 
         let entities = Vec::new();
@@ -640,7 +645,7 @@ impl<
     pub async fn commit_events(&self, entity_attested_events: Vec<(Entity, Attested<Event>)>) -> Result<(), MutationError> {
         // All peers confirmed, now we can update local state
         let mut changes: Vec<EntityChange> = Vec::new();
-        let local_getter = LocalGetter::new(self.0.collections.clone());
+        let local_getter = LocalGetter::<SE, PA>::new(self.0.collections.clone());
         for (entity, attested_event) in entity_attested_events {
             let collection = self.0.collections.get(&attested_event.payload.collection).await?;
             collection.add_event(&attested_event).await?;
@@ -677,7 +682,7 @@ impl<
         &self,
         updates: Vec<(Option<Attested<Event>>, Option<Attested<EntityState>>)>,
         cdata: &PA::ContextData,
-    ) -> Result<Vec<(bool, Entity)>, MutationError> {
+    ) -> Result<Vec<Entity>, MutationError> {
         let mut results = Vec::new();
         let mut changes = Vec::new();
 

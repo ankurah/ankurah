@@ -10,7 +10,7 @@ use std::sync::Arc;
 async fn test_system() -> Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test().unwrap());
     {
-        let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+        let node = NodeBuilder::new(engine.clone().build_durable(), PermissiveAgent::new());
 
         node.system.create().await?;
 
@@ -22,7 +22,7 @@ async fn test_system() -> Result<()> {
     }
 
     {
-        let node = Node::new_durable(engine, PermissiveAgent::new());
+        let node = NodeBuilder::new(engine, PermissiveAgent::new().build_durable());
 
         // assert that this fails because the system already exists
         assert!(node.system.create().await.is_err());
@@ -42,7 +42,7 @@ async fn test_system_ready_behavior() -> Result<()> {
 
     // First create and initialize with a durable node
     {
-        let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+        let node = NodeBuilder::new(engine.clone().build_durable(), PermissiveAgent::new());
         assert!(!node.system.is_system_ready()); // Not ready before initialize
 
         node.system.create().await?;
@@ -54,7 +54,7 @@ async fn test_system_ready_behavior() -> Result<()> {
 
     // Create another durable node - should be ready after loading since system exists
     {
-        let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+        let node = NodeBuilder::new(engine.clone().build_durable(), PermissiveAgent::new());
         assert!(!node.system.is_system_ready()); // Not ready immediately
 
         // Wait for load
@@ -67,7 +67,7 @@ async fn test_system_ready_behavior() -> Result<()> {
 
     // Create an ephemeral node - should NOT be ready even after loading
     {
-        let node = Node::new(engine.clone(), PermissiveAgent::new());
+        let node = NodeBuilder::new(engine.clone().build_ephemeral(), PermissiveAgent::new());
         assert!(!node.system.is_system_ready()); // Not ready immediately
 
         // Wait for load
@@ -90,7 +90,7 @@ async fn test_system_persistence_across_reconstruction() -> Result<()> {
     // First setup: Create both durable and ephemeral nodes
     let root_state = {
         // Create and initialize durable node
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
+        let durable_node = NodeBuilder::new(durable_engine.clone().build_durable(), PermissiveAgent::new());
         durable_node.system.create().await?;
         assert!(durable_node.system.is_system_ready());
 
@@ -99,7 +99,7 @@ async fn test_system_persistence_across_reconstruction() -> Result<()> {
         assert_eq!(root_state.payload.state.head.len(), 1);
 
         // Create ephemeral node
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        let ephemeral_node = NodeBuilder::new(ephemeral_engine.clone().build_ephemeral(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
         assert!(!ephemeral_node.system.is_system_ready());
 
@@ -121,7 +121,7 @@ async fn test_system_persistence_across_reconstruction() -> Result<()> {
     // Second setup: Reconstruct both nodes with their respective storage engines
     {
         // Create new durable node - should automatically load existing system
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
+        let durable_node = NodeBuilder::new(durable_engine.clone().build_durable(), PermissiveAgent::new());
         durable_node.system.wait_loaded().await;
         assert!(durable_node.system.is_system_ready(), "Durable node should be ready after loading existing system");
 
@@ -133,7 +133,7 @@ async fn test_system_persistence_across_reconstruction() -> Result<()> {
         );
 
         // Create new ephemeral node
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        let ephemeral_node = NodeBuilder::new(ephemeral_engine.clone().build_ephemeral(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
         assert!(!ephemeral_node.system.is_system_ready(), "Ephemeral node should not be ready before connection");
 
@@ -169,12 +169,12 @@ async fn test_system_root_change_behavior() -> Result<()> {
     // Get initial root state
     let initial_root = {
         // Create and initialize durable node
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
+        let durable_node = NodeBuilder::new(durable_engine.clone().build_durable(), PermissiveAgent::new());
         durable_node.system.create().await?;
         assert!(durable_node.system.is_system_ready());
 
         // Create ephemeral node
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        let ephemeral_node = NodeBuilder::new(ephemeral_engine.clone().build_ephemeral(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
 
         // Not ready because we haven't joined the system
@@ -215,7 +215,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
     // Reset durable node's system (creating new root) but NOT ephemeral node
     let second_root = {
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
+        let durable_node = NodeBuilder::new(durable_engine.clone().build_durable(), PermissiveAgent::new());
         durable_node.system.wait_loaded().await;
 
         // should be ready because we previously initialized a system
@@ -254,7 +254,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
 
     // Ephemeral node joins the new system and resets everything
     {
-        let durable_node = Node::new_durable(durable_engine.clone(), PermissiveAgent::new());
+        let durable_node = NodeBuilder::new(durable_engine.clone().build_durable(), PermissiveAgent::new());
         durable_node.system.wait_loaded().await;
         assert!(durable_node.system.is_system_ready()); // should be ready when loaded
         assert_eq!(durable_node.system.root(), Some(second_root.clone()));
@@ -263,7 +263,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
             vec![CollectionId::fixed_name("_ankurah_system"), CollectionId::fixed_name("album")]
         );
 
-        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        let ephemeral_node = NodeBuilder::new(ephemeral_engine.clone().build_ephemeral(), PermissiveAgent::new());
         ephemeral_node.system.wait_loaded().await;
         assert!(!ephemeral_node.system.is_system_ready()); // should not be ready before joining
         assert_eq!(ephemeral_node.system.root(), Some(initial_root), "Ephemeral node should have old root prior to joining");

@@ -1,6 +1,7 @@
 use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
@@ -26,7 +27,7 @@ pub struct SubscriptionInfo<CD: ContextData> {
     pub state: SubscriptionState,
     /// Signal when first Resultset is received from remote peer
     // pub first_resultset_signal: Arc<std::sync::Mutex<Option<oneshot::Sender<Vec<proto::EntityId>>>>>,
-    pub on_first_update: Arc<dyn crate::consistency::OnFirstSubscriptionUpdate>,
+    // pub on_first_update: Arc<dyn crate::consistency::OnFirstSubscriptionUpdate>,
 }
 
 /// Abstracted Node interface for subscription relay integration
@@ -127,12 +128,11 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
     /// 2. Call the on_first_update callback when the first update is received from remote peer
     ///
     /// The on_first_update callback will be invoked when remote data arrives.
-    pub fn register<T: crate::consistency::OnFirstSubscriptionUpdate + 'static>(
+    pub fn register(
         &self,
         subscription: Subscription<R>,
         context_data: CD,
-        on_first_update: T,
-    ) -> Result<(), RetrievalError> {
+    ) -> Result<impl Future<Output = Result<Vec<R>, RetrievalError>> + Send + 'static, RetrievalError> {
         let sub_id = subscription.id;
         let collection_id = subscription.collection_id.clone();
         let predicate = subscription.predicate.clone();
@@ -155,15 +155,17 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
             self.setup_remote_subscriptions();
         }
 
-        Ok(())
+        // TODO: update this to return a future that will be used to initialize the subscription
+        // triggered by the first update from the remote peer
+        unimplemented!();
     }
 
     /// Signal that first remote data has been applied for a subscription
     /// This is called by the node when initial subscription updates are processed
-    pub async fn notify_applied_initial_state(
+    pub async fn notify_initial_set(
         &self,
         sub_id: proto::SubscriptionId,
-        initial_entity_ids: Vec<proto::EntityId>,
+        entities: Vec<Entity>,
     ) -> Result<(), RetrievalError> {
         println!("🏁 SubscriptionRelay: Applied initial state for subscription {} with {} entities", sub_id, initial_entity_ids.len());
 

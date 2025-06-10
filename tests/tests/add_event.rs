@@ -12,7 +12,7 @@ async fn add_event_postgres() -> Result<()> {
 
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
 
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(storage_engine).build_durable(), PermissiveAgent::new());
     node.system.create().await?;
     let context = node.context(c)?;
 

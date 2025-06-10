@@ -1,18 +1,14 @@
 use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId, NodeRequestBody, NodeResponseBody};
 use async_trait::async_trait;
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, marker::PhantomData, sync::OnceLock};
 use tracing::debug;
 
-/// LEFT OFF HERE : Audit this stem to stern
 use crate::{
     collectionset::CollectionSet,
     error::RetrievalError,
     lineage::GetEvents,
-    node::{ContextData, Node, WeakNode},
-    policy::{AccessDenied, PolicyAgent},
+    node::{Node, WeakNode},
+    policy::PolicyAgent,
     storage::StorageEngine,
 };
 
@@ -20,31 +16,35 @@ use crate::{
 /// remote peers, or a combination. Handles the complexity of local vs remote
 /// data retrieval while keeping EntityManager agnostic.
 #[async_trait]
-pub trait DataGetter<C: ContextData>: Send + Sync {
+pub trait DataGetter<SE, PA>: Send + Sync + Clone
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     type EventGetter: GetEvents<Id = EventId, Event = Event> + Send + Sync;
 
     /// Gives the DataBroker a reference to the Node, which it can use to access the EntityManager and other resources
     /// This can be stored by your implementation of the DataBroker, or just ignore it if you don't need it
-    fn bind_node<SE: StorageEngine, PA: PolicyAgent<ContextData = C> + Send + Sync + 'static>(&self, _node: &Node<SE, PA, Self>)
+    fn bind_node(&self, _node: &Node<SE, PA, Self>)
     where Self: Sized {
         // Default implementation does nothing
     }
 
     /// Create an event getter with the provided context data and collection
-    fn event_getter(&self, cdata: C) -> Self::EventGetter;
+    fn event_getter(&self, cdata: PA::ContextData) -> Self::EventGetter;
 
     async fn get_events(
         &self,
         collection_id: &CollectionId,
         event_ids: Vec<EventId>,
-        cdata: &C,
+        cdata: &PA::ContextData,
     ) -> Result<(usize, HashMap<EventId, Attested<Event>>), RetrievalError>;
 
     async fn get_state(
         &self,
         collection_id: &CollectionId,
         entity_id: &EntityId,
-        cdata: &C,
+        cdata: &PA::ContextData,
     ) -> Result<Attested<EntityState>, RetrievalError>;
 
     /// Retrieve entity state
@@ -52,7 +52,7 @@ pub trait DataGetter<C: ContextData>: Send + Sync {
         &self,
         collection_id: &CollectionId,
         entity_ids: Vec<EntityId>,
-        cdata: &C,
+        cdata: &PA::ContextData,
         // allow_cache: bool,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
@@ -61,35 +61,41 @@ pub trait DataGetter<C: ContextData>: Send + Sync {
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
-        cdata: &C,
+        cdata: &PA::ContextData,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 }
 
 /// DataBroker implementation for durable nodes that only access local storage
-pub struct LocalGetter<SE> {
+pub struct LocalGetter<SE, PA> {
     collections: CollectionSet<SE>,
-}
-impl<SE> Clone for LocalGetter<SE>
-where SE: StorageEngine
-{
-    fn clone(&self) -> Self { Self { collections: self.collections.clone() } }
+    _phantom: PhantomData<PA>,
 }
 
-impl<SE: StorageEngine> LocalGetter<SE> {
-    pub fn new(collections: CollectionSet<SE>) -> Self { Self { collections } }
+impl<SE, PA> Clone for LocalGetter<SE, PA>
+where SE: StorageEngine
+{
+    fn clone(&self) -> Self { Self { collections: self.collections.clone(), _phantom: PhantomData } }
+}
+
+impl<SE: StorageEngine, PA> LocalGetter<SE, PA> {
+    pub fn new(collections: CollectionSet<SE>) -> Self { Self { collections, _phantom: PhantomData } }
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataGetter<C> for LocalGetter<SE> {
+impl<SE, PA> DataGetter<SE, PA> for LocalGetter<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     type EventGetter = Self;
 
-    fn event_getter(&self, _cdata: C) -> Self::EventGetter { self.clone() }
+    fn event_getter(&self, _cdata: PA::ContextData) -> Self::EventGetter { self.clone() }
 
     async fn get_events(
         &self,
         collection_id: &CollectionId,
         event_ids: Vec<EventId>,
-        _cdata: &C,
+        _cdata: &PA::ContextData,
     ) -> Result<(usize, HashMap<EventId, Attested<Event>>), RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
         let events = collection.get_events(event_ids).await?;
@@ -100,7 +106,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataGetter<C> fo
         &self,
         collection_id: &CollectionId,
         entity_ids: Vec<EntityId>,
-        _cdata: &C,
+        _cdata: &PA::ContextData,
         // _allow_cache: bool,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
@@ -110,17 +116,17 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataGetter<C> fo
         &self,
         collection_id: &CollectionId,
         entity_id: &EntityId,
-        cdata: &C,
+        cdata: &PA::ContextData,
     ) -> Result<Attested<EntityState>, RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
-        collection.get_state(entity_id).await
+        collection.get_state(entity_id.clone()).await
     }
 
     async fn fetch_states(
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
-        _cdata: &C,
+        _cdata: &PA::ContextData,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
         collection.fetch_states(predicate).await
@@ -128,7 +134,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, C: ContextData> DataGetter<C> fo
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalGetter<SE> {
+impl<SE, PA> GetEvents for LocalGetter<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     type Id = EventId;
     type Event = Event;
 
@@ -138,7 +148,7 @@ impl<SE: StorageEngine + Send + Sync + 'static> GetEvents for LocalGetter<SE> {
         event_ids: Vec<Self::Id>,
     ) -> Result<(usize, HashMap<EventId, Attested<Self::Event>>), RetrievalError> {
         let collection = self.collections.get(collection_id).await?;
-        let events = collection.get_events(event_ids.collect()).await?;
+        let events = collection.get_events(event_ids).await?;
         Ok((1, events))
     }
 }
@@ -161,17 +171,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> DataGetter<PA::ContextData>
-    for NetworkGetter<SE, PA>
-{
+impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> DataGetter<SE, PA> for NetworkGetter<SE, PA> {
     type EventGetter = NetworkEventGetter<SE, PA>;
 
-    fn bind_node<SE2: StorageEngine, PA2: PolicyAgent<ContextData = PA::ContextData> + Send + Sync + 'static>(
-        &self,
-        node: &Node<SE2, PA2, Self>,
-    ) where
-        Self: Sized,
-    {
+    fn bind_node(&self, node: &Node<SE, PA, Self>)
+    where Self: Sized {
         self.node.set(node.weak()).expect("Failed to set node reference in NetworkDataBroker - already set");
     }
 
@@ -257,8 +261,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
 
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
-                for state in states {
-                    node.policy_agent.validate_received_state(&peer_id, &state)?;
+                for state in states.iter() {
+                    node.policy_agent.validate_received_state(&peer_id, state)?;
                     // collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                     // statemap.insert(state.payload.entity_id, state);
                 }
@@ -334,6 +338,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         event_ids: Vec<Self::Id>,
     ) -> Result<(usize, HashMap<EventId, Attested<Self::Event>>), RetrievalError> {
         // Just delegate to the broker
-        self.broker.get_events(collection_id, event_ids.collect(), &self.cdata).await
+        self.broker.get_events(collection_id, event_ids, &self.cdata).await
     }
 }

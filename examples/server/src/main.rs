@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
 
     // Initialize storage engine
     let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
-    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(storage).build_durable(), PermissiveAgent::new());
 
     node.system.wait_loaded().await;
     if node.system.root().is_none() {

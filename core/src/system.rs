@@ -40,19 +40,19 @@ struct Inner<SE, PA, DG> {
     loading: Notify,
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
-    reactor: Arc<Reactor<SE, PA>>,
+    reactor: Reactor<SE, PA>,
 }
 
 impl<SE, PA, DG> SystemManager<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     pub(crate) fn new(
         collections: CollectionSet<SE>,
         entities: EntityManager<SE, PA, DG>,
-        reactor: Arc<Reactor<SE, PA>>,
+        reactor: Reactor<SE, PA>,
         durable: bool,
     ) -> Self {
         let me = Self(Arc::new(Inner {

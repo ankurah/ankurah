@@ -76,40 +76,56 @@ impl From<ankql::error::ParseError> for RetrievalError {
 
 pub struct Node<SE, PA, D>(pub(crate) Arc<NodeInner<SE, PA, D>>)
 where
+    SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static;
+    D: DataGetter<SE, PA> + Send + Sync + 'static;
 impl<SE, PA, D> Clone for Node<SE, PA, D>
 where
+    SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
 pub struct WeakNode<SE, PA, D>(Weak<NodeInner<SE, PA, D>>)
 where
+    SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static;
+    D: DataGetter<SE, PA> + Send + Sync + 'static;
+
 impl<SE, PA, D> Clone for WeakNode<SE, PA, D>
 where
+    SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
 impl<SE, PA, D> WeakNode<SE, PA, D>
 where
+    SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     pub fn upgrade(&self) -> Option<Node<SE, PA, D>> { self.0.upgrade().map(Node) }
 }
 
+impl<SE, PA, D> std::fmt::Debug for WeakNode<SE, PA, D>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent,
+    D: DataGetter<SE, PA> + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "WeakNode") }
+}
+
 impl<SE, PA, D> Deref for Node<SE, PA, D>
 where
+    SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     type Target = Arc<NodeInner<SE, PA, D>>;
     fn deref(&self) -> &Self::Target { &self.0 }
@@ -122,8 +138,9 @@ pub trait ContextData: Send + Sync + Clone + 'static {}
 
 pub struct NodeInner<SE, PA, DG>
 where
+    SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent,
-    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     pub id: proto::EntityId,
     pub durable: bool,
@@ -136,45 +153,99 @@ where
     pub(crate) subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
 
     /// The reactor for handling subscriptions
-    pub(crate) reactor: Arc<Reactor<SE, PA>>,
+    pub(crate) reactor: Reactor<SE, PA>,
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA, DG>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<Entity, PA::ContextData>>,
 }
 
+pub fn ephemeral_node<SE, PA>(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, NetworkGetter<SE, PA>>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let collections = CollectionSet::new(engine);
+    // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
+    let network_broker = crate::datagetter::NetworkGetter::new(collections.clone());
+
+    Node::new_internal(collections, network_broker, policy_agent, false, true)
+}
+
+pub fn durable_node<SE, PA>(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, LocalGetter<SE, PA>>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let collections = CollectionSet::new(engine);
+    // Create LocalDataBroker for durable nodes (local storage only)
+    let getter = LocalGetter::new(collections.clone());
+
+    Node::new_internal(collections, getter, policy_agent, true, false)
+}
+
+/// Builder pattern for creating nodes with more flexible configuration
+pub struct NodeBuilder<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    engine: Arc<SE>,
+    policy_agent: PA,
+    // Future extensibility: could add optional configurations here
+    // custom_id: Option<proto::EntityId>,
+    // custom_subscription_relay_config: Option<SubscriptionRelayConfig>,
+}
+
+impl<SE, PA> NodeBuilder<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    /// Create a new node builder with required components
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self { engine, policy_agent } }
+
+    /// Build an ephemeral node that can access both local and remote data
+    /// Ephemeral nodes have subscription relays and use NetworkGetter
+    pub fn build_ephemeral(self) -> Node<SE, PA, NetworkGetter<SE, PA>> {
+        let collections = CollectionSet::new(self.engine);
+        let network_getter = NetworkGetter::new(collections.clone());
+        Node::new_internal(collections, network_getter, self.policy_agent, false, true)
+    }
+
+    /// Build a durable node that only accesses local storage
+    /// Durable nodes do not have subscription relays and use LocalGetter
+    pub fn build_durable(self) -> Node<SE, PA, LocalGetter<SE, PA>> {
+        let collections = CollectionSet::new(self.engine);
+        let local_getter = LocalGetter::new(collections.clone());
+        Node::new_internal(collections, local_getter, self.policy_agent, true, false)
+    }
+
+    // Future methods for configuration could be added here:
+    // pub fn with_custom_id(mut self, id: proto::EntityId) -> Self {
+    //     self.custom_id = Some(id);
+    //     self
+    // }
+    //
+    // pub fn with_subscription_relay_config(mut self, config: SubscriptionRelayConfig) -> Self {
+    //     self.custom_subscription_relay_config = Some(config);
+    //     self
+    // }
+}
+
 impl<SE, PA, DG> Node<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
-    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, NetworkGetter<SE, PA>> {
-        let collections = CollectionSet::new(engine);
-        // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
-        let network_broker = crate::datagetter::NetworkGetter::new(collections.clone());
-
-        Self::new_internal(collections, network_broker, policy_agent, false, true)
-    }
-
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, LocalGetter<SE>> {
-        let collections = CollectionSet::new(engine);
-        // Create LocalDataBroker for durable nodes (local storage only)
-        let local_broker = Arc::new(LocalGetter::new(collections.clone()));
-
-        Self::new_internal(collections, local_broker, policy_agent, true, false)
-    }
-
-    fn new_internal<DB>(
+    fn new_internal(
         collections: CollectionSet<SE>,
-        data_getter: DB,
+        data_getter: DG,
         policy_agent: PA,
         durable: bool,
         needs_subscription_relay: bool,
-    ) -> Node<SE, PA, DB>
-    where
-        DB: DataGetter<PA::ContextData> + Send + Sync + 'static,
-    {
+    ) -> Node<SE, PA, DG> {
         let reactor = Reactor::new(collections.clone(), policy_agent.clone());
         let entityset = EntityManager::new(data_getter.clone(), collections.clone(), reactor.clone(), policy_agent.clone());
         let id = proto::EntityId::new();
@@ -201,7 +272,7 @@ where
         // Bind the node to both policy agent and data broker
         data_getter.bind_node(&node);
         node.policy_agent.bind_node(&node);
-        node.subscription_relay.as_ref().map(|relay| relay.bind_node(&node));
+        node.subscription_relay.as_ref().map(|relay| relay.bind_node(&node.0));
 
         let node_type = if durable { "durable" } else { "ephemeral" };
         notice_info!("Node {id:#} created as {node_type}");
@@ -592,12 +663,12 @@ where
         }
 
         // Apply all updates in a single batch with unified reactor notification
-        self.entities.apply_events_and_states(processed_updates, &nodeandcontext.cdata).await?;
+        let entities = self.entities.apply_events_and_states(processed_updates, &nodeandcontext.cdata).await?;
 
         // Handle subscription relay notifications
         if initial {
             if let Some(relay) = self.subscription_relay.as_ref() {
-                relay.notify_applied_initial_state(subscription_id, initial_entity_ids).await?;
+                relay.notify_initial_set(subscription_id, entities).await?;
             }
         }
 
@@ -686,7 +757,7 @@ where
             match &self.subscription_relay {
                 None => {
                     let fetcher = LocalGetter::new(self.collections.clone());
-                    self.reactor.register(subscription, fetcher)?;
+                    self.reactor.register(subscription, fetcher);
                 }
                 Some(_relay) => {
                     warn!("subscribe requests with relay are not supported");
@@ -745,11 +816,11 @@ where
     pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.durable_peers.to_vec() }
 }
 
-impl<SE, PA, D> NodeInner<SE, PA, D>
+impl<SE, PA, DG> NodeInner<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
@@ -783,10 +854,11 @@ where
     }
 }
 
-impl<SE, PA, D> Drop for NodeInner<SE, PA, D>
+impl<SE, PA, DG> Drop for NodeInner<SE, PA, DG>
 where
-    PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         notice_info!("Node({}) dropped", self.id);
@@ -801,15 +873,16 @@ impl<SE, PA, D> TNodeErased for Node<SE, PA, D>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    D: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     fn unsubscribe(&self, handle: &SubscriptionHandle) { let _ = self.0.unsubscribe(handle); }
 }
 
-impl<SE, PA, D> fmt::Display for Node<SE, PA, D>
+impl<SE, PA, DG> fmt::Display for Node<SE, PA, DG>
 where
-    PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets

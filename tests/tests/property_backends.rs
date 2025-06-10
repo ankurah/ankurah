@@ -35,7 +35,7 @@ pub struct Video {
 
 #[tokio::test]
 async fn property_backends() -> Result<()> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 
@@ -73,7 +73,7 @@ async fn pg_property_backends() -> Result<()> {
     use ankurah::PermissiveAgent;
 
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(storage_engine).build_durable(), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 

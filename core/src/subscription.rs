@@ -1,6 +1,7 @@
 use crate::util::onetimeflag::OneTimeFlag;
 use crate::{changes::ChangeSet, entity::Entity, error::RetrievalError, node::TNodeErased};
 use ankurah_proto as proto;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::debug;
@@ -55,13 +56,26 @@ impl<T: Clone> Subscription<T> {
         }))
     }
 
+    /// Used by the reactor to avoid sending updates until the initial data has been sent
+    pub fn initial_data_sent(&self) -> bool { self.initial_data_sent.load(Ordering::SeqCst) }
+
+    pub fn initialize(&self, fut: impl Future<Output = Result<Vec<T>, crate::error::RetrievalError>> + Send + 'static)
+    where T: Send + Sync + 'static {
+        let me = self.clone();
+        crate::task::spawn(async move {
+            let entities = match fut.await {
+                Ok(entities) => entities,
+                Err(e) => {
+                    *me.load_error.lock().unwrap() = Some(e);
+                    return;
+                }
+            };
+            me.load(entities);
+        });
+    }
+
     /// Load initial data for the subscription using the provided retriever
-    pub async fn load(&self, retriever: impl crate::retrieve::Fetch<T>) -> Result<(), crate::error::RetrievalError> {
-        debug!("Loading subscription {} for collection {}", self.id, self.collection_id);
-
-        // Retrieve initial entities using the retriever
-        let entities = retriever.fetch(&self.collection_id, &self.predicate).await?;
-
+    pub fn load(&self, entities: Vec<T>) {
         debug!("Subscription {} loaded {} initial entities", self.id, entities.len());
 
         // Convert to ItemChange::Initial for each entity
@@ -89,36 +103,10 @@ impl<T: Clone> Subscription<T> {
         // Mark that initial data has been sent
         self.initial_data_sent.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        debug!("Subscription {} initial load complete", self.id);
-        Ok(())
-    }
-
-    /// Mark initialization as completed
-    pub fn initialization_completed(&self) {
+        // Loaded and initial data are tracked separately, because we might emit cached initial data later
         self.loaded.set();
-        self.check_and_send_initial();
-    }
 
-    /// Check if we should send initial data and do so if conditions are met
-    fn check_and_send_initial(&self) {
-        let should_send = self.loaded.is_set();
-
-        if should_send && !self.initial_data_sent.load(Ordering::SeqCst) {
-            // Mark as sent first to prevent duplicate sends
-            if self.initial_data_sent.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                self.send_initial_data();
-            }
-        }
-    }
-
-    fn send_initial_data(&self) {
-        let matching_entities = self.matching_entities.lock().unwrap().clone();
-
-        (self.on_change)(ChangeSet {
-            changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
-            resultset: ResultSet { loaded: true, items: matching_entities },
-            initial: true,
-        });
+        debug!("Subscription {} initial load complete", self.id);
     }
 }
 

@@ -12,7 +12,7 @@ fn main() {
 #[allow(unused)]
 async fn create_client() -> WebsocketClient {
     let storage = IndexedDBStorageEngine::open("test_db").await.unwrap();
-    let node = Node::new(Arc::new(storage), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(storage).build_ephemeral(), PermissiveAgent::new());
     WebsocketClient::new(node, "localhost:9797").unwrap()
 }
 

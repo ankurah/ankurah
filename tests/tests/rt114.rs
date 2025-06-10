@@ -11,10 +11,10 @@ use common::{Album, AlbumView};
 #[tokio::test]
 async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set up server (durable) and client (ephemeral)
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
     let client_storage = Arc::new(SledStorageEngine::new_test().unwrap());
-    let client = Node::new(client_storage.clone(), PermissiveAgent::new());
+    let client = NodeBuilder::new(client_storage.clone().build_ephemeral(), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
@@ -90,10 +90,10 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[tokio::test]
 async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set up server (durable) and client (ephemeral)
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
     let client_storage = Arc::new(SledStorageEngine::new_test().unwrap());
-    let client = Node::new(client_storage.clone(), PermissiveAgent::new());
+    let client = NodeBuilder::new(client_storage.clone().build_ephemeral(), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 

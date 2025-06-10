@@ -11,7 +11,7 @@ async fn test_postgres() -> Result<()> {
     use common::*;
 
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(storage_engine).build_durable(), PermissiveAgent::new());
 
     // Initialize the node's system catalog
     node.system.create().await?;

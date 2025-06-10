@@ -11,7 +11,7 @@ use common::{Album, AlbumView, Pet, PetView};
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 
@@ -70,7 +70,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 #[tokio::test]
 async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create a new node
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 

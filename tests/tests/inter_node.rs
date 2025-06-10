@@ -13,8 +13,8 @@ pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.i
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
-    let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    let node2 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node1 = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
+    let node2 = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral().unwrap()), PermissiveAgent::new());
 
     info!("Node1 root: {:?}", node1.system.root());
     info!("Node2 root: {:?}", node2.system.root());
@@ -71,9 +71,9 @@ async fn inter_node_fetch() -> Result<()> {
 #[tokio::test]
 async fn server_edits_subscription() -> Result<()> {
     // Create two nodes
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
-    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes
     let _conn = LocalProcessConnection::new(&server, &client).await?;
@@ -145,11 +145,11 @@ async fn server_edits_subscription() -> Result<()> {
 #[tokio::test]
 async fn test_client_server_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
 
-    let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client_a = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral().unwrap()), PermissiveAgent::new());
+    let client_b = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral().unwrap()), PermissiveAgent::new());
 
     // Connect both clients to the server
     let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;
@@ -190,10 +190,10 @@ async fn test_client_server_propagation() -> Result<()> {
 #[tokio::test]
 async fn test_client_server_subscription_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
-    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
-    let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let client_a = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral().unwrap()), PermissiveAgent::new());
+    let client_b = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral().unwrap()), PermissiveAgent::new());
 
     // Connect both clients to the server
     let _conn_a = LocalProcessConnection::new(&client_a, &server).await?;

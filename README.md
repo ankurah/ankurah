@@ -66,12 +66,12 @@ all data. The demo server currently uses the sled backend, but postgres is also 
 
 ```rust
 // Create server and client nodes
-let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable()?), PermissiveAgent::new());
 server.system.create()it?; // Initialize a new "system" - something you only do once on the first startup.
 
 let server = server.context(c)?;
 
-let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+let client = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral()_test().build_ephemeral()?), PermissiveAgent::new());
 
 // Connect nodes using local process connection
 let _conn = LocalProcessConnection::new(&server, &client).await?;

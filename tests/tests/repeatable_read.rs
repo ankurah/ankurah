@@ -22,7 +22,7 @@ pub struct Album {
 
 #[tokio::test]
 async fn repeatable_read() -> Result<()> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 
@@ -78,7 +78,7 @@ mod pg_common;
 #[tokio::test]
 async fn pg_repeatable_read() -> Result<()> {
     let (_container, postgres) = pg_common::create_postgres_container().await?;
-    let node = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(postgres).build_durable(), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 
@@ -130,7 +130,7 @@ async fn pg_repeatable_read() -> Result<()> {
 #[tokio::test]
 async fn pg_events() -> Result<()> {
     let (_container, postgres) = pg_common::create_postgres_container().await?;
-    let node = Node::new_durable(Arc::new(postgres), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(postgres).build_durable(), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 

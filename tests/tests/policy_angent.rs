@@ -89,7 +89,7 @@
 
 // #[tokio::test]
 // async fn local_access_control() -> Result<(), Box<dyn std::error::Error>> {
-//     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), TestAgent {});
+//     let node = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), TestAgent {});
 //     let root_context = node.context(MyContextData::Root);
 //     create_test_dataset(root_context.clone()).await?;
 
@@ -144,8 +144,8 @@
 // #[tokio::test]
 // async fn keeping_peers_honest() -> Result<(), Box<dyn std::error::Error>> {
 //     // Create a server with TestAgent (enforcing policies) and a "dishonest" client with PermissiveAgent (no restrictions)
-//     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), TestAgent {});
-//     let dishonest_client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), DishonestTestAgent {});
+//     let server = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), TestAgent {});
+//     let dishonest_client = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_ephemeral().unwrap()), DishonestTestAgent {});
 
 //     // Connect the client to the server
 //     let _conn = LocalProcessConnection::new(&dishonest_client, &server).await?;

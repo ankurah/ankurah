@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     changes::{ChangeSet, EntityChange},
     consistency::diff_resolver::DiffResolver,
-    datagetter::DataGetter,
+    datagetter::{DataGetter, LocalGetter},
     entity::Entity,
     error::{MutationError, RetrievalError},
     model::View,
@@ -11,7 +11,7 @@ use crate::{
     policy::{AccessDenied, PolicyAgent},
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
-    subscription::SubscriptionHandle,
+    subscription::{Subscription, SubscriptionHandle},
     transaction::Transaction,
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
@@ -27,21 +27,21 @@ impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-pub struct NodeAndContext<SE, PA, D>
+pub struct NodeAndContext<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
-    pub node: Node<SE, PA, D>,
+    pub node: Node<SE, PA, DG>,
     pub cdata: PA::ContextData,
 }
 
-impl<SE, PA, D> Clone for NodeAndContext<SE, PA, D>
+impl<SE, PA, DG> Clone for NodeAndContext<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
     fn clone(&self) -> Self { Self { node: self.node.clone(), cdata: self.cdata.clone() } }
 }
@@ -71,17 +71,17 @@ pub trait TContext {
 impl<
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        D: DataGetter<PA::ContextData> + Send + Sync + 'static,
-    > TContext for NodeAndContext<SE, PA, D>
+        DG: DataGetter<SE, PA> + Send + Sync + 'static,
+    > TContext for NodeAndContext<SE, PA, DG>
 {
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId) -> Entity { self.node.entities.create(collection) }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
-        self.get_entity(collection, id, cached).await
+        self.node.entities.get(collection, &id, &self.cdata).await
     }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        self.fetch_entities(collection, args).await
+        self.node.entities.fetch(collection, &args.predicate, &self.cdata).await
     }
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
     async fn subscribe(
@@ -117,7 +117,7 @@ impl Context {
     pub fn new<
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
+        DG: DataGetter<SE, PA> + Send + Sync + 'static,
     >(
         node: Node<SE, PA, DG>,
         data: PA::ContextData,
@@ -208,79 +208,12 @@ impl Context {
     }
 }
 
-impl<SE, PA, D> NodeAndContext<SE, PA, D>
+impl<SE, PA, DG> NodeAndContext<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<SE, PA> + Send + Sync + 'static,
 {
-    /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
-    // pub(crate) async fn get_entity(
-    //     &self,
-    //     collection_id: &CollectionId,
-    //     id: proto::EntityId,
-    //     cached: bool,
-    // ) -> Result<Entity, RetrievalError> {
-    //     debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
-
-    //     if !self.node.durable {
-    //         // Fetch from peers and commit first response
-    //         match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
-    //             Ok(_) => (),
-    //             Err(RetrievalError::NoDurablePeers) if cached => (),
-    //             Err(e) => {
-    //                 return Err(e);
-    //             }
-    //         }
-    //     }
-
-    //     if let Some(local) = self.node.entities.get(&id) {
-    //         debug!("Node({}).get_entity found local entity - returning", self.node.id);
-    //         return Ok(local);
-    //     }
-    //     debug!("{}.get_entity fetching from storage", self.node);
-
-    //     let collection = self.node.collections.get(collection_id).await?;
-    //     match collection.get_state(id).await {
-    //         Ok(entity_state) => {
-    //             let (_changed, entity) = self
-    //                 .node
-    //                 .entities
-    //                 .with_state(&(collection_id.clone(), self), id, collection_id.clone(), entity_state.payload.state)
-    //                 .await?;
-    //             Ok(entity)
-    //         }
-    //         Err(RetrievalError::EntityNotFound(id)) => {
-    //             let (_, entity) = self
-    //                 .node
-    //                 .entities
-    //                 .with_state(&(collection_id.clone(), self), id, collection_id.clone(), proto::State::default())
-    //                 .await?;
-    //             Ok(entity)
-    //         }
-    //         Err(e) => Err(e),
-    //     }
-    // }
-    /// Fetch a list of entities based on a predicate
-    pub async fn fetch_entities(&self, collection_id: &CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        // TODO implement cached: true
-        if !self.node.durable {
-            // Fetch from peers and commit first response
-            match self.node.entities.fetch(collection_id, &args.predicate, &self.cdata).await {
-                Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if args.cached => (),
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
-        self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
-        // Use EntityManager's fetch_entities method directly
-        let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
-        self.node.entities.fetch(collection_id, &filtered_predicate, &self.cdata).await
-    }
-
     pub async fn subscribe(
         &self,
         sub_id: proto::SubscriptionId,
@@ -297,40 +230,19 @@ where
         self.node.subscription_context.insert(sub_id, self.cdata.clone());
 
         // Create the subscription (synchronous)
-        let subscription =
-            crate::subscription::Subscription::new(handle.id, collection_id.clone(), args.predicate.clone(), Arc::new(callback));
+        let subscription = Subscription::new(handle.id, collection_id.clone(), args.predicate.clone(), Arc::new(callback));
+        self.node.reactor.register(subscription.clone());
 
         match &self.node.subscription_relay {
             None => {
-                // For durable nodes, create a simple fetcher that uses EntityManager directly
-                let entities = self.node.entities.clone();
-                let fetch_fn = move |collection_id: &CollectionId, predicate: &ankql::ast::Predicate| {
-                    let entities = entities.clone();
-                    let collection_id = collection_id.clone();
-                    let predicate = predicate.clone();
-                    async move { entities.fetch(&collection_id, &predicate, &self.cdata).await }
-                };
-                // TODO: Update reactor.register to accept the fetch function instead of a Fetch trait object
-                todo!("Update reactor to use EntityManager directly")
+                let fut = self.node.entities.fetch(&collection_id, &args.predicate, &self.cdata);
+                subscription.initialize(fut);
             }
             Some(relay) => {
-                // DiffResolver is used to detect and refresh entities which are present in our initial local fetch but not in the remote fetch
-                let resolver = DiffResolver::new(self, collection_id.clone());
-
-                relay.register(subscription.clone(), self.cdata.clone(), resolver.clone())?;
-
-                // LocalRefetcher fetches from local storage, then calls resolver.local_entity_ids()
-                // then, if use_cache is true, it yields that initial set of entities to fetcher.fetch inside reactor.register
-                // then if use_cache is false, it will call resolver.wait_resolution() which resolves the differences and returns true if differences were detected
-                // or returns false if no differences were detected
-                // the LocalRefetcher will redo the fetch in the case that the resolver returns true
-                // or it will return the initial set of entities if the resolver returns false
-
-                // let refetcher = LocalRefetcher::new(self.node.collections.clone(), self.node.entities.clone(), resolver, args.cached);
-                // self.node.reactor.register(subscription.clone(), refetcher)?;
-                unimplemented!("LocalRefetcher is not implemented yet");
+                let fut = relay.register(subscription.clone(), self.cdata.clone())?;
+                subscription.initialize(fut);
             }
-        }
+        };
 
         Ok(handle)
     }

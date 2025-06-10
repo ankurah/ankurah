@@ -597,7 +597,7 @@ mod tests {
         tracing::info!("Starting test_basic_workflow");
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
         tracing::info!("Storage engine opened");
-        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+        let node = NodeBuilder::new(Arc::new(storage_engine).build_ephemeral(), PermissiveAgent::new());
         node.system.create().await?;
         let ctx = node.context(c)?;
 
@@ -636,7 +636,7 @@ mod tests {
 
         let db_name = format!("test_db_{}", ulid::Ulid::new());
         let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
-        let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+        let node = NodeBuilder::new(Arc::new(storage_engine).build_ephemeral(), PermissiveAgent::new());
         node.system.create().await?;
         let ctx = node.context(c)?;
 

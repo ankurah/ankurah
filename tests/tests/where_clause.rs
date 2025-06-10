@@ -7,7 +7,7 @@ use common::{Album, AlbumView};
 use std::sync::Arc;
 #[tokio::test]
 async fn basic_where_clause() -> Result<()> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let client = node.context(c)?;
 
@@ -46,7 +46,7 @@ async fn basic_where_clause() -> Result<()> {
 
 #[tokio::test]
 async fn test_where_clause_with_id() -> Result<()> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(SledStorageEngine::new_test().build_durable().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 
@@ -75,7 +75,7 @@ mod pg_common;
 #[tokio::test]
 async fn pg_basic_where_clause() -> Result<()> {
     let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    let node = NodeBuilder::new(Arc::new(storage_engine).build_durable(), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 

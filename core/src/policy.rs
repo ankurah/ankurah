@@ -54,7 +54,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
 
     /// Gives the PolicyAgent a reference to the Node, which it can use to access the EntityManager and other resources
     /// This can be stored by your implementation of the PolicyAgent, or just ignore it if you don't need it
-    fn bind_node<SE: StorageEngine, D: DataGetter<Self::ContextData> + Send + Sync + 'static>(&self, _node: &Node<SE, Self, D>) {
+    fn bind_node<SE: StorageEngine, D: DataGetter<SE, Self> + Send + Sync + 'static>(&self, _node: &Node<SE, Self, D>) {
         // Default implementation does nothing
     }
 
