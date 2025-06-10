@@ -118,7 +118,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
     ///
     /// This should be called once during initialization. Returns an error if
     /// the node has already been set.
-    pub fn set_node(&self, node: Arc<dyn TNode<CD>>) -> Result<(), ()> { self.inner.node.set(node).map_err(|_| ()) }
+    pub fn bind_node(&self, node: Arc<dyn TNode<CD>>) -> Result<(), ()> { self.inner.node.set(node).map_err(|_| ()) }
 
     /// Register a new subscription
     ///
@@ -339,10 +339,11 @@ where
 
 /// Implementation of TNode for WeakNode to enable subscription relay integration
 #[async_trait]
-impl<SE, PA> TNode<PA::ContextData> for crate::node::WeakNode<SE, PA>
+impl<SE, PA, DG> TNode<PA::ContextData> for crate::node::WeakNode<SE, PA, DG>
 where
     SE: crate::storage::StorageEngine + Send + Sync + 'static,
     PA: crate::policy::PolicyAgent + Send + Sync + 'static,
+    DG: crate::datagetter::DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     async fn peer_subscribe(
         &self,
@@ -403,7 +404,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::retrieve::Fetch<()> for MockReactor {
+    impl crate::datagetter::DataGetter<()> for MockReactor {
         async fn fetch(
             self: Self,
             _collection_id: &CollectionId,
@@ -482,7 +483,7 @@ mod tests {
         let mock_reactor = Arc::new(MockReactor);
         let relay = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_node(mock_sender.clone()).expect("Failed to set node");
+        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -520,7 +521,7 @@ mod tests {
         let mock_reactor = Arc::new(MockReactor);
         let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_node(mock_sender.clone()).expect("Failed to set node");
+        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -554,7 +555,7 @@ mod tests {
         let mock_reactor = Arc::new(MockReactor);
         let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_node(mock_sender.clone()).expect("Failed to set node");
+        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -593,7 +594,7 @@ mod tests {
         let mock_reactor = Arc::new(MockReactor);
         let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_node(mock_sender.clone()).expect("Failed to set node");
+        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -645,7 +646,7 @@ mod tests {
         let mock_reactor = Arc::new(MockReactor);
         let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_node(mock_sender.clone()).expect("Failed to set node");
+        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -704,7 +705,7 @@ mod tests {
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Now set node and test with no connected peers
-        relay.set_node(mock_sender.clone()).expect("Failed to set node");
+        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no peers available
@@ -729,7 +730,7 @@ mod tests {
         let mock_reactor = Arc::new(MockReactor);
         let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.set_node(mock_sender.clone()).expect("Failed to set node");
+        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();

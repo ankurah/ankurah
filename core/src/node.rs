@@ -120,16 +120,16 @@ where
 #[async_trait]
 pub trait ContextData: Send + Sync + Clone + 'static {}
 
-pub struct NodeInner<SE, PA, D>
+pub struct NodeInner<SE, PA, DG>
 where
     PA: PolicyAgent,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
     pub id: proto::EntityId,
     pub durable: bool,
     pub collections: CollectionSet<SE>,
 
-    pub(crate) entities: EntityManager<SE, PA, D>,
+    pub(crate) entities: EntityManager<SE, PA, DG>,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -138,7 +138,7 @@ where
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
     pub(crate) policy_agent: PA,
-    pub system: SystemManager<SE, PA>,
+    pub system: SystemManager<SE, PA, DG>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<Entity, PA::ContextData>>,
 }
@@ -167,7 +167,7 @@ where
 
     fn new_internal<DB>(
         collections: CollectionSet<SE>,
-        data_broker: DB,
+        data_getter: DB,
         policy_agent: PA,
         durable: bool,
         needs_subscription_relay: bool,
@@ -176,7 +176,7 @@ where
         DB: DataGetter<PA::ContextData> + Send + Sync + 'static,
     {
         let reactor = Reactor::new(collections.clone(), policy_agent.clone());
-        let entityset = EntityManager::new(data_broker.clone(), collections.clone(), reactor.clone(), policy_agent.clone());
+        let entityset = EntityManager::new(data_getter.clone(), collections.clone(), reactor.clone(), policy_agent.clone());
         let id = proto::EntityId::new();
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
@@ -192,23 +192,16 @@ where
             durable_peers: SafeSet::new(),
             reactor,
             durable,
-            policy_agent: policy_agent.clone(),
+            policy_agent,
             system: system_manager,
             subscription_context: SafeMap::new(),
             subscription_relay,
         }));
 
         // Bind the node to both policy agent and data broker
-        policy_agent.bind_node(&node);
-        data_broker.bind_node(&node);
-
-        // Set up the message sender for the subscription relay
-        if let Some(ref relay) = node.subscription_relay {
-            let weak_node = node.weak();
-            if let Err(_) = relay.set_node(Arc::new(weak_node)) {
-                warn!("Failed to set message sender for subscription relay");
-            }
-        }
+        data_getter.bind_node(&node);
+        node.policy_agent.bind_node(&node);
+        node.subscription_relay.as_ref().map(|relay| relay.bind_node(&node));
 
         let node_type = if durable { "durable" } else { "ephemeral" };
         notice_info!("Node {id:#} created as {node_type}");
