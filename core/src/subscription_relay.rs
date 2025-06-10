@@ -5,12 +5,16 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
-use crate::entity::Entity;
-use crate::error::{RequestError, RetrievalError};
-use crate::node::ContextData;
 use crate::subscription::Subscription;
 use crate::util::safemap::SafeMap;
 use crate::util::safeset::SafeSet;
+use crate::{
+    entity::Entity,
+    error::{RequestError, RetrievalError},
+    node::ContextData,
+    policy::PolicyAgent,
+    storage::StorageEngine,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubscriptionState {
@@ -20,14 +24,15 @@ pub enum SubscriptionState {
 }
 
 #[derive(Clone)]
-pub struct SubscriptionInfo<CD: ContextData> {
+pub struct SubscriptionInfo<R, CD: ContextData> {
     pub collection_id: CollectionId,
     pub predicate: ankql::ast::Predicate,
     pub context_data: CD,
     pub state: SubscriptionState,
-    /// Signal when first Resultset is received from remote peer
+    // Signal when first Resultset is received from remote peer
     // pub first_resultset_signal: Arc<std::sync::Mutex<Option<oneshot::Sender<Vec<proto::EntityId>>>>>,
     // pub on_first_update: Arc<dyn crate::consistency::OnFirstSubscriptionUpdate>,
+    pub on_first_update: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<R>>>>>,
 }
 
 /// Abstracted Node interface for subscription relay integration
@@ -54,6 +59,15 @@ pub trait TNode<CD: ContextData>: Send + Sync {
 pub trait TReactor<R>: Send + Sync {
     /// Get subscription by ID for stale entity detection
     fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Subscription<R>>;
+}
+
+/// Implementation of TReactor for the real Reactor
+impl<SE, PA> TReactor<Entity> for crate::reactor::Reactor<SE, PA>
+where
+    SE: crate::storage::StorageEngine + Send + Sync + 'static,
+    PA: crate::policy::PolicyAgent + Send + Sync + 'static,
+{
+    fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Subscription<Entity>> { self.get_subscription(sub_id) }
 }
 
 struct SubscriptionRelayInner<R, CD: ContextData> {
@@ -139,6 +153,8 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
 
         debug!("Registering subscription {}", sub_id);
 
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
         self.inner.subscriptions.insert(
             sub_id,
             SubscriptionInfo {
@@ -146,7 +162,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
                 predicate,
                 context_data,
                 state: SubscriptionState::PendingRemote,
-                on_first_update: Arc::new(on_first_update),
+                on_first_update: Arc::new(std::sync::Mutex::new(Some(tx))),
             },
         );
 
@@ -155,26 +171,23 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
             self.setup_remote_subscriptions();
         }
 
-        // TODO: update this to return a future that will be used to initialize the subscription
-        // triggered by the first update from the remote peer
-        unimplemented!();
+        Ok(rx.map_err(|_| RetrievalError::Other("Failed to retrieve initial set".to_string())))
     }
 
     /// Signal that first remote data has been applied for a subscription
     /// This is called by the node when initial subscription updates are processed
-    pub async fn notify_initial_set(
-        &self,
-        sub_id: proto::SubscriptionId,
-        entities: Vec<Entity>,
-    ) -> Result<(), RetrievalError> {
-        println!("🏁 SubscriptionRelay: Applied initial state for subscription {} with {} entities", sub_id, initial_entity_ids.len());
+    pub async fn notify_initial_set(&self, sub_id: proto::SubscriptionId, entities: Vec<Entity>) -> Result<(), RetrievalError> {
+        println!("🏁 SubscriptionRelay: Applied initial state for subscription {} with {} entities", sub_id, entities.len());
 
         let Some(info) = self.inner.subscriptions.get(&sub_id) else {
             return Err(RetrievalError::Other(format!("Subscription {} not found", sub_id)));
         };
 
         // Notify the consistency resolver about the first update
-        info.on_first_update.on_first_update(initial_entity_ids);
+        if let Some(on_first_update) = info.on_first_update.lock().unwrap().take() {
+            on_first_update.send(entities).map_err(|_| RetrievalError::Other("Failed to send initial set".to_string()))?;
+        }
+
         Ok(())
     }
 
@@ -328,15 +341,6 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
 
     /// Get the node interface for making remote calls (used by RemoteEntityRetriever)
     pub(crate) fn get_node(&self) -> Option<Arc<dyn TNode<CD>>> { self.inner.node.get().cloned() }
-}
-
-/// Implementation of TReactor for the real Reactor
-impl<SE, PA> TReactor<Entity> for crate::reactor::Reactor<SE, PA>
-where
-    SE: crate::storage::StorageEngine + Send + Sync + 'static,
-    PA: crate::policy::PolicyAgent + Send + Sync + 'static,
-{
-    fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Subscription<Entity>> { self.get_subscription(sub_id) }
 }
 
 /// Implementation of TNode for WeakNode to enable subscription relay integration
