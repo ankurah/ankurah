@@ -1,5 +1,5 @@
 use crate::{
-    databroker::DataGetter,
+    datagetter::DataGetter,
     entity::Entity,
     error::ValidationError,
     node::{ContextData, Node, NodeInner},

@@ -1,7 +1,7 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::collectionset::CollectionSet;
-use crate::databroker::DataGetter;
+use crate::datagetter::DataGetter;
 use crate::entity::{Entity, EntityManager};
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;

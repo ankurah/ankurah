@@ -1,6 +1,6 @@
 use crate::changes::EntityChange;
 use crate::collectionset::CollectionSet;
-use crate::databroker::{DataGetter, LocalGetter};
+use crate::datagetter::{DataGetter, LocalGetter};
 use crate::lineage::{self, GetEvents};
 use crate::reactor::Reactor;
 use crate::storage::StorageEngine;

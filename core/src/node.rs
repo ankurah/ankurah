@@ -16,7 +16,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::{Context, NodeAndContext},
-    databroker::{self, DataGetter, LocalGetter, NetworkGetter},
+    datagetter::{self, DataGetter, LocalGetter, NetworkGetter},
     entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
@@ -152,7 +152,7 @@ where
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, NetworkGetter<SE, PA>> {
         let collections = CollectionSet::new(engine);
         // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
-        let network_broker = crate::databroker::NetworkGetter::new(collections.clone());
+        let network_broker = crate::datagetter::NetworkGetter::new(collections.clone());
 
         Self::new_internal(collections, network_broker, policy_agent, false, true)
     }

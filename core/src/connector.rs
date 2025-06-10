@@ -1,7 +1,7 @@
 use ankurah_proto::{self as proto, Attested, EntityState};
 use async_trait::async_trait;
 
-use crate::{databroker::DataGetter, policy::PolicyAgent, storage::StorageEngine, Node};
+use crate::{datagetter::DataGetter, policy::PolicyAgent, storage::StorageEngine, Node};
 
 // TODO redesign this such that:
 // - the sender and receiver are disconnected at the same time

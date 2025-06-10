@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     changes::{ChangeSet, EntityChange},
     consistency::diff_resolver::DiffResolver,
-    databroker::DataGetter,
+    datagetter::DataGetter,
     entity::Entity,
     error::{MutationError, RetrievalError},
     model::View,
