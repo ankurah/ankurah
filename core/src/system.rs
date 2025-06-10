@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -6,10 +6,10 @@ use tokio::sync::Notify;
 use tracing::{error, warn};
 
 use crate::collectionset::CollectionSet;
+use crate::datagetter::DataGetter;
 use crate::entity::{Entity, EntityManager};
 use crate::error::MutationError;
 use crate::error::RetrievalError;
-use crate::getdata::LocalGetter;
 use crate::notice_info;
 use crate::policy::PolicyAgent;
 use crate::property::{backend::LWWBackend, PropertyValue};
@@ -24,15 +24,15 @@ pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
 /// * valid collections (TODO)
 /// * property definitions (TODO)
 
-pub struct SystemManager<SE, PA>(Arc<Inner<SE, PA>>);
-impl<SE, PA> Clone for SystemManager<SE, PA> {
+pub struct SystemManager<SE, PA, DG>(Arc<Inner<SE, PA, DG>>);
+impl<SE, PA, DG> Clone for SystemManager<SE, PA, DG> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-struct Inner<SE, PA> {
+struct Inner<SE, PA, DG> {
     collectionset: CollectionSet<SE>,
     collection_map: RwLock<BTreeMap<CollectionId, Entity>>,
-    entities: EntityManager<SE>,
+    entities: EntityManager<SE, PA, DG>,
     durable: bool,
     root: RwLock<Option<Attested<EntityState>>>,
     items: RwLock<Vec<Entity>>,
@@ -43,12 +43,18 @@ struct Inner<SE, PA> {
     reactor: Arc<Reactor<SE, PA>>,
 }
 
-impl<SE, PA> SystemManager<SE, PA>
+impl<SE, PA, DG> SystemManager<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
-    pub(crate) fn new(collections: CollectionSet<SE>, entities: EntityManager<SE>, reactor: Arc<Reactor<SE, PA>>, durable: bool) -> Self {
+    pub(crate) fn new(
+        collections: CollectionSet<SE>,
+        entities: EntityManager<SE, PA, DG>,
+        reactor: Arc<Reactor<SE, PA>>,
+        durable: bool,
+    ) -> Self {
         let me = Self(Arc::new(Inner {
             collectionset: collections,
             entities,
@@ -123,14 +129,14 @@ where
         let lww_backend = system_entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
 
-        let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
-        let root: Clock = event.id().into();
+        let event: Attested<Event> = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?.into();
+        // let root: Clock = event.payload.id().into();
 
         // Add the event to storage first
-        storage.add_event(&event.into()).await?;
+        storage.add_event(&event).await?;
 
         // Update the entity's head clock
-        self.0.entities.commit_events(vec![(system_entity.clone(), event)]).await?;
+        self.0.entities.commit_events(vec![(system_entity.clone(), event.into())]).await?;
         // Now get the entity state after the head is updated
         let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
         storage.set_state(attested_state.clone()).await?;
@@ -249,7 +255,7 @@ where
         let mut entities = Vec::new();
         let mut root_state = None;
 
-        for entity in self.entities.fetch_local(&collection_id, &ankql::ast::Predicate::True).await? {
+        for entity in self.0.entities.fetch_local(&collection_id, &ankql::ast::Predicate::True).await? {
             let lww_backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");

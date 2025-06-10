@@ -55,9 +55,8 @@ impl<SE, PA> Reactor<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
-    pub fn new(collections: CollectionSet<SE>, entityset: EntityManager<SE, PA, DG>, policy_agent: PA) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: SafeMap::new(),
             index_watchers: SafeMap::new(),
@@ -70,7 +69,8 @@ where
 
     /// Register a subscription
     /// This sets up the subscription structure and spawns a task to initialize it
-    pub fn register<F: Fetch<Entity>>(&self, subscription: Subscription<Entity>, fetcher: F) -> anyhow::Result<()> {
+    pub fn register<DG>(&self, subscription: Subscription<Entity>, getter: DG) -> anyhow::Result<()>
+    where DG: DataGetter<PA::ContextData> + Send + Sync + 'static {
         let sub_id = subscription.id;
         let collection_id = &subscription.collection_id;
 
@@ -82,7 +82,7 @@ where
 
         // Spawn a task to load the subscription
         crate::task::spawn(async move {
-            if let Err(e) = subscription.load(fetcher).await {
+            if let Err(e) = subscription.load(getter).await {
                 warn!("Failed to load subscription {}: {}", sub_id, e);
             }
         });

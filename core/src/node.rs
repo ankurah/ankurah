@@ -175,7 +175,7 @@ where
     where
         DB: DataGetter<PA::ContextData> + Send + Sync + 'static,
     {
-        let reactor = Reactor::new(collections.clone(), data_broker.clone(), policy_agent.clone());
+        let reactor = Reactor::new(collections.clone(), policy_agent.clone());
         let entityset = EntityManager::new(data_broker.clone(), collections.clone(), reactor.clone(), policy_agent.clone());
         let id = proto::EntityId::new();
 
