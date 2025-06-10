@@ -24,7 +24,7 @@ pub enum SubscriptionState {
 }
 
 #[derive(Clone)]
-pub struct SubscriptionInfo<R, CD: ContextData> {
+pub struct SubscriptionInfo<R, CD> {
     pub collection_id: CollectionId,
     pub predicate: ankql::ast::Predicate,
     pub context_data: CD,
@@ -70,9 +70,9 @@ where
     fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Subscription<Entity>> { self.get_subscription(sub_id) }
 }
 
-struct SubscriptionRelayInner<R, CD: ContextData> {
+struct SubscriptionRelayInner<R, CD> {
     // All subscription information in one place
-    subscriptions: SafeMap<proto::SubscriptionId, SubscriptionInfo<CD>>,
+    subscriptions: SafeMap<proto::SubscriptionId, SubscriptionInfo<R, CD>>,
     // Track connected durable peers
     connected_peers: SafeSet<proto::EntityId>,
     // Node interface for communicating with remote peers
@@ -110,14 +110,14 @@ struct SubscriptionRelayInner<R, CD: ContextData> {
 ///
 /// The relay will automatically handle remote setup/teardown asynchronously.
 
-pub struct SubscriptionRelay<R, CD: ContextData> {
+pub struct SubscriptionRelay<R, CD> {
     inner: Arc<SubscriptionRelayInner<R, CD>>,
 }
-impl<R, CD: ContextData> Clone for SubscriptionRelay<R, CD> {
+impl<R: Clone + Send + Sync + 'static, CD: ContextData> Clone for SubscriptionRelay<R, CD> {
     fn clone(&self) -> Self { Self { inner: self.inner.clone() } }
 }
 
-impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
+impl<R: Clone + Send + Sync + 'static, CD: ContextData> SubscriptionRelay<R, CD> {
     pub fn new(reactor: Arc<dyn TReactor<R>>) -> Self {
         Self {
             inner: Arc::new(SubscriptionRelayInner {
@@ -171,12 +171,13 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
             self.setup_remote_subscriptions();
         }
 
+        use futures::TryFutureExt;
         Ok(rx.map_err(|_| RetrievalError::Other("Failed to retrieve initial set".to_string())))
     }
 
     /// Signal that first remote data has been applied for a subscription
     /// This is called by the node when initial subscription updates are processed
-    pub async fn notify_initial_set(&self, sub_id: proto::SubscriptionId, entities: Vec<Entity>) -> Result<(), RetrievalError> {
+    pub async fn notify_initial_set(&self, sub_id: proto::SubscriptionId, entities: Vec<R>) -> Result<(), RetrievalError> {
         println!("🏁 SubscriptionRelay: Applied initial state for subscription {} with {} entities", sub_id, entities.len());
 
         let Some(info) = self.inner.subscriptions.get(&sub_id) else {
@@ -220,7 +221,7 @@ impl<R: 'static, CD: ContextData> SubscriptionRelay<R, CD> {
     }
 
     /// Get all subscriptions that need remote setup
-    pub fn get_pending_subscriptions(&self) -> Vec<(proto::SubscriptionId, SubscriptionInfo<CD>)> {
+    pub fn get_pending_subscriptions(&self) -> Vec<(proto::SubscriptionId, SubscriptionInfo<R, CD>)> {
         self.inner
             .subscriptions
             .to_vec()
@@ -349,7 +350,7 @@ impl<SE, PA, DG> TNode<PA::ContextData> for crate::node::WeakNode<SE, PA, DG>
 where
     SE: crate::storage::StorageEngine + Send + Sync + 'static,
     PA: crate::policy::PolicyAgent + Send + Sync + 'static,
-    DG: crate::datagetter::DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: crate::datagetter::DataGetter<SE, PA> + Send + Sync + 'static,
 {
     async fn peer_subscribe(
         &self,
@@ -410,13 +411,61 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::datagetter::DataGetter<()> for MockReactor {
-        async fn fetch(
+    impl crate::datagetter::DataGetter<(), ()> for MockReactor {
+        async fn fetch_states(
             self: Self,
             _collection_id: &CollectionId,
             _predicate: &ankql::ast::Predicate,
         ) -> Result<Vec<()>, crate::error::RetrievalError> {
             Ok(vec![])
+        }
+        /// Gives the DataBroker a reference to the Node, which it can use to access the EntityManager and other resources
+        /// This can be stored by your implementation of the DataBroker, or just ignore it if you don't need it
+        fn bind_node(&self, _node: &TNode<SE, PA, Self>)
+        where Self: Sized {
+            // Default implementation does nothing
+        }
+
+        /// Create an event getter with the provided context data and collection
+        fn event_getter(&self, cdata: PA::ContextData) -> Self::EventGetter { unimplemented!() }
+
+        async fn get_events(
+            &self,
+            collection_id: &CollectionId,
+            event_ids: Vec<EventId>,
+            cdata: &PA::ContextData,
+        ) -> Result<(usize, HashMap<EventId, Attested<Event>>), RetrievalError> {
+            unimplemented!()
+        }
+
+        async fn get_state(
+            &self,
+            collection_id: &CollectionId,
+            entity_id: &EntityId,
+            cdata: &PA::ContextData,
+        ) -> Result<Attested<EntityState>, RetrievalError> {
+            unimplemented!()
+        }
+
+        /// Retrieve entity state
+        async fn get_states(
+            &self,
+            collection_id: &CollectionId,
+            entity_ids: Vec<EntityId>,
+            cdata: &PA::ContextData,
+            // allow_cache: bool,
+        ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+            unimplemented!()
+        }
+
+        /// Fetch multiple entity states matching a predicate (used by subscriptions)
+        async fn fetch_states(
+            &self,
+            collection_id: &CollectionId,
+            predicate: &ankql::ast::Predicate,
+            cdata: &PA::ContextData,
+        ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+            unimplemented!()
         }
     }
 
