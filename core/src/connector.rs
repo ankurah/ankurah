@@ -1,7 +1,7 @@
 use ankurah_proto::{self as proto, Attested, EntityState};
 use async_trait::async_trait;
 
-use crate::{policy::PolicyAgent, storage::StorageEngine, Node};
+use crate::{databroker::DataGetter, policy::PolicyAgent, storage::StorageEngine, Node};
 
 // TODO redesign this such that:
 // - the sender and receiver are disconnected at the same time
@@ -40,7 +40,12 @@ pub trait NodeComms: Send + Sync {
 }
 
 #[async_trait]
-impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
+impl<
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    > NodeComms for Node<SE, PA, DG>
+{
     fn id(&self) -> proto::EntityId { self.id }
     fn durable(&self) -> bool { self.durable }
     fn system_root(&self) -> Option<Attested<EntityState>> { self.system.root() }

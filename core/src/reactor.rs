@@ -1,10 +1,10 @@
 use super::comparison_index::ComparisonIndex;
 use crate::changes::{ChangeSet, EntityChange, ItemChange};
 use crate::collectionset::CollectionSet;
+use crate::databroker::DataGetter;
 use crate::entity::{Entity, EntityManager};
 use crate::policy::PolicyAgent;
 use crate::resultset::ResultSet;
-use crate::retrieve::Fetch;
 use crate::storage::StorageEngine;
 use crate::subscription::Subscription;
 use crate::util::safemap::SafeMap;
@@ -55,8 +55,9 @@ impl<SE, PA> Reactor<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
-    pub fn new(collections: CollectionSet<SE>, entityset: EntityManager<SE>, policy_agent: PA) -> Arc<Self> {
+    pub fn new(collections: CollectionSet<SE>, entityset: EntityManager<SE, PA, DG>, policy_agent: PA) -> Arc<Self> {
         Arc::new(Self {
             subscriptions: SafeMap::new(),
             index_watchers: SafeMap::new(),

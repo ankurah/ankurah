@@ -10,7 +10,6 @@ use crate::{
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
     resultset::ResultSet,
-    retrieve::localrefetch::LocalRefetcher,
     storage::{StorageCollectionWrapper, StorageEngine},
     subscription::SubscriptionHandle,
     transaction::Transaction,
@@ -115,8 +114,12 @@ impl Context {
 }
 
 impl Context {
-    pub fn new<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static, D>(
-        node: Node<SE, PA, D>,
+    pub fn new<
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    >(
+        node: Node<SE, PA, DG>,
         data: PA::ContextData,
     ) -> Self {
         Self(Arc::new(NodeAndContext { node, cdata: data }))
@@ -323,8 +326,9 @@ where
                 // the LocalRefetcher will redo the fetch in the case that the resolver returns true
                 // or it will return the initial set of entities if the resolver returns false
 
-                let refetcher = LocalRefetcher::new(self.node.collections.clone(), self.node.entities.clone(), resolver, args.cached);
-                self.node.reactor.register(subscription.clone(), refetcher)?;
+                // let refetcher = LocalRefetcher::new(self.node.collections.clone(), self.node.entities.clone(), resolver, args.cached);
+                // self.node.reactor.register(subscription.clone(), refetcher)?;
+                unimplemented!("LocalRefetcher is not implemented yet");
             }
         }
 
@@ -348,7 +352,7 @@ where
 
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
-        self.entities.commit_events(entity_attested_events)?;
+        self.node.entities.commit_events(entity_attested_events);
 
         Ok(())
     }

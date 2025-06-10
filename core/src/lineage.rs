@@ -266,9 +266,9 @@ where
         let (cost, events) = self.getter.get_events(&self.collection_id, ids).await?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
-        for event in events {
-            if result_checklist.remove(&event.payload.id()) {
-                self.process_event(event.payload.id(), event.payload.parent().members());
+        for (event_id, event) in events {
+            if result_checklist.remove(&event_id) {
+                self.process_event(event_id, event.payload.parent().members());
             }
         }
         if !result_checklist.is_empty() {

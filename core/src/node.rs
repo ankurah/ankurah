@@ -16,13 +16,12 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::{Context, NodeAndContext},
-    databroker::{self, DataGetter, LocalGetter},
+    databroker::{self, DataGetter, LocalGetter, NetworkGetter},
     entity::{Entity, EntityManager},
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
-    retrieve::{localrefetch::LocalRefetcher, Fetch},
     storage::StorageEngine,
     subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,
@@ -144,13 +143,13 @@ where
     pub(crate) subscription_relay: Option<SubscriptionRelay<Entity, PA::ContextData>>,
 }
 
-impl<SE, PA, D> Node<SE, PA, D>
+impl<SE, PA, DG> Node<SE, PA, DG>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
-    D: DataGetter<PA::ContextData> + Send + Sync + 'static,
+    DG: DataGetter<PA::ContextData> + Send + Sync + 'static,
 {
-    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, NetworkGetter<SE, PA>> {
         let collections = CollectionSet::new(engine);
         // Create NetworkDataBroker for ephemeral nodes (can access both local and remote)
         let network_broker = crate::databroker::NetworkGetter::new(collections.clone());
@@ -158,7 +157,7 @@ where
         Self::new_internal(collections, network_broker, policy_agent, false, true)
     }
 
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, _> {
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Node<SE, PA, LocalGetter<SE>> {
         let collections = CollectionSet::new(engine);
         // Create LocalDataBroker for durable nodes (local storage only)
         let local_broker = Arc::new(LocalGetter::new(collections.clone()));
@@ -216,7 +215,7 @@ where
 
         node
     }
-    pub fn weak(&self) -> WeakNode<SE, PA, D> { WeakNode(Arc::downgrade(&self.0)) }
+    pub fn weak(&self) -> WeakNode<SE, PA, DG> { WeakNode(Arc::downgrade(&self.0)) }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
@@ -469,7 +468,7 @@ where
                 // filter out any that the policy agent says we don't have access to
                 let mut events = Vec::new();
                 for event in storage_collection.get_events(event_ids).await? {
-                    match self.policy_agent.check_read_event(cdata, &event) {
+                    match self.policy_agent.check_read_event(cdata, &event.1) {
                         Ok(_) => events.push(event),
                         Err(AccessDenied::ByPolicy(_)) => {}
                         // TODO: we need to have a cleaner delineation between actual access denied versus processing errors
@@ -477,7 +476,7 @@ where
                     }
                 }
 
-                Ok(proto::NodeResponseBody::GetEvents(events))
+                Ok(proto::NodeResponseBody::GetEvents(events.into_iter().map(|(_, event)| event).collect()))
             }
             proto::NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
                 self.handle_subscribe_request(cdata, request.from, subscription_id, collection, predicate).await
@@ -557,7 +556,7 @@ where
         from_peer_id: &proto::EntityId,
         subscription_id: proto::SubscriptionId,
         updates: Vec<proto::SubscriptionUpdateItem>,
-        nodeandcontext: NodeAndContext<SE, PA>,
+        nodeandcontext: NodeAndContext<SE, PA, DG>,
         initial: bool,
     ) -> Result<(), MutationError> {
         let mut initial_entity_ids = Vec::new();
@@ -693,7 +692,7 @@ where
 
             match &self.subscription_relay {
                 None => {
-                    let fetcher = LocalFetcher::new(self.collections.clone(), self.entities.clone());
+                    let fetcher = LocalGetter::new(self.collections.clone());
                     self.reactor.register(subscription, fetcher)?;
                 }
                 Some(_relay) => {
