@@ -243,23 +243,19 @@ where
     }
     /// Fetch a list of entities based on a predicate
     pub async fn fetch_entities(&self, collection_id: &CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        // TODO implement cached: true
-        if !self.node.durable {
-            // Fetch from peers and commit first response
-            match self.node.fetch_from_peer(collection_id, args.predicate.clone(), &self.cdata).await {
-                Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if args.cached => (),
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         // Fetch raw states from storage
-        let storage_collection = self.node.collections.get(collection_id).await?;
+
         let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
-        let states = storage_collection.fetch_states(&filtered_predicate).await?;
+
+        // TODO implement cached: true
+        let states = if !self.node.durable {
+            // Fetch from peers and commit first response
+            self.node.fetch_from_peer(collection_id, filtered_predicate, &self.cdata).await?
+        } else {
+            let storage_collection = self.node.collections.get(collection_id).await?;
+            storage_collection.fetch_states(&filtered_predicate).await?
+        };
 
         // Convert states to entities
         let mut entities = Vec::new();
@@ -294,10 +290,12 @@ where
 
         // Register subscription with reactor (synchronous)
         let subscription = self.node.reactor.register(handle.id, collection_id, args.predicate, callback);
+        let storage_collection = self.node.collections.get(&subscription.collection_id).await?;
 
+        let initial_states: Vec<Attested<EntityState>>;
         // Handle remote subscription setup
         if let Some(ref relay) = self.node.subscription_relay {
-            relay.notify_subscribe(sub_id, collection_id.clone(), predicate, self.cdata.clone());
+            relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), self.cdata.clone());
 
             if !cached {
                 // Create oneshot channel to wait for first remote update
@@ -305,15 +303,23 @@ where
                 self.node.pending_subs.insert(sub_id, tx);
 
                 // Wait for first remote update before initializing
-                if let Err(_) = rx.await {
-                    // Channel was dropped, proceed with local initialization anyway
-                    warn!("Failed to receive first remote update for subscription {}", sub_id);
+                match rx.await {
+                    Err(_) => {
+                        // Channel was dropped, proceed with local initialization anyway
+                        warn!("Failed to receive first remote update for subscription {}", sub_id);
+                        initial_states = storage_collection.fetch_states(&predicate).await?;
+                    }
+                    Ok(states) => initial_states = states,
                 }
+            } else {
+                initial_states = storage_collection.fetch_states(&predicate).await?;
             }
+        } else {
+            initial_states = storage_collection.fetch_states(&predicate).await?;
         }
 
         // Always initialize the subscription
-        self.node.reactor.initialize(subscription).await?;
+        self.node.reactor.initialize(subscription, initial_states).await?;
 
         Ok(handle)
     }

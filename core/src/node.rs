@@ -123,7 +123,7 @@ where PA: PolicyAgent
     pub(crate) subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
-    pub(crate) pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<()>>,
+    pub(crate) pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<Vec<Attested<EntityState>>>>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
@@ -480,10 +480,13 @@ where
                 if let Some(cdata) = self.subscription_context.get(&subscription_id) {
                     let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
 
-                    self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
                     // Signal any pending subscription waiting for first update
                     if let Some(tx) = self.pending_subs.remove(&subscription_id) {
-                        let _ = tx.send(()); // Ignore if receiver was dropped
+                        let initial_states = items.iter().cloned().filter_map(|item| item.try_into().ok()).collect();
+                        self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
+                        let _ = tx.send(initial_states); // Ignore if receiver was dropped
+                    } else {
+                        self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
                     }
                 } else {
                     error!("Received subscription update for unknown subscription {}", subscription_id);
@@ -735,7 +738,7 @@ where
         let node = self.clone();
         {
             let peer_id = peer_id;
-            let subscription = self.reactor.register(sub_id, &collection_id, predicate, move |changeset| {
+            let subscription = self.reactor.register(sub_id, &collection_id, predicate.clone(), move |changeset| {
                 // TODO move this into a task being fed by a channel and reorg into a function
                 let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
 
@@ -788,7 +791,9 @@ where
                 node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates });
             });
 
-            self.reactor.initialize(subscription).await?;
+            let storage_collection = self.collections.get(&collection_id).await?;
+            let initial_states = storage_collection.fetch_states(&predicate).await?;
+            self.reactor.initialize(subscription, initial_states).await?;
         };
 
         // Store the subscription handle
@@ -819,7 +824,7 @@ where
         collection_id: &CollectionId,
         predicate: ankql::ast::Predicate,
         cdata: &PA::ContextData,
-    ) -> anyhow::Result<(), RetrievalError> {
+    ) -> anyhow::Result<Vec<Attested<EntityState>>, RetrievalError> {
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self
@@ -831,11 +836,11 @@ where
                 let collection = self.collections.get(collection_id).await?;
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
-                for state in states {
-                    self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                for state in states.iter() {
+                    self.policy_agent.validate_received_state(self, &peer_id, state)?;
+                    collection.set_state(state.clone()).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
                 }
-                Ok(())
+                Ok(states)
             }
             proto::NodeResponseBody::Error(e) => {
                 debug!("Error from peer fetch: {}", e);

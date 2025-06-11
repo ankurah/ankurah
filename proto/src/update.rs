@@ -39,6 +39,17 @@ impl SubscriptionUpdateItem {
     }
 }
 
+impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
+    type Error = anyhow::Error;
+    fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {
+        match value {
+            SubscriptionUpdateItem::Initial { entity_id, collection, state } => Ok((entity_id, collection, state).into()),
+            SubscriptionUpdateItem::Add { entity_id, collection, state, events: _ } => Ok((entity_id, collection, state).into()),
+            SubscriptionUpdateItem::Change { .. } => Err(anyhow::anyhow!("Cannot convert change to entity state")),
+        }
+    }
+}
+
 /// An update from one node to another
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdate {
