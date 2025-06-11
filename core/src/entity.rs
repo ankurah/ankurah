@@ -479,7 +479,7 @@ impl<
     pub async fn fetch(
         &self,
         collection_id: &CollectionId,
-        predicate: &ankql::ast::Predicate,
+        predicate: ankql::ast::Predicate,
         cdata: &PA::ContextData,
     ) -> Result<Vec<Entity>, RetrievalError> {
         self.0.policy_agent.can_access_collection(cdata, collection_id)?;
@@ -732,7 +732,7 @@ impl<
                 changes.push(EntityChange::new(entity.clone(), change_event)?);
             }
 
-            results.push((entity_changed, entity));
+            results.push(entity);
         }
 
         // Single reactor notification for all changes

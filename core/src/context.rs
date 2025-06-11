@@ -81,7 +81,7 @@ impl<
         self.node.entities.get(collection, &id, &self.cdata).await
     }
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        self.node.entities.fetch(collection, &args.predicate, &self.cdata).await
+        self.node.entities.fetch(collection, args.predicate, &self.cdata).await
     }
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
     async fn subscribe(
@@ -235,12 +235,13 @@ where
 
         match &self.node.subscription_relay {
             None => {
-                let fut = self.node.entities.fetch(&collection_id, &args.predicate, &self.cdata);
+                let fut = self.node.entities.fetch(&collection_id, args.predicate, &self.cdata);
                 subscription.initialize(fut);
             }
             Some(relay) => {
-                let fut = relay.register(subscription.clone(), self.cdata.clone())?;
-                subscription.initialize(fut);
+                let rx = relay.register(subscription.clone(), self.cdata.clone())?;
+
+                subscription.initialize(rx.try_recv().map_err(|_| RetrievalError::Other("Failed to retrieve initial set".to_string())));
             }
         };
 

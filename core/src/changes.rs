@@ -38,6 +38,8 @@ pub enum ItemChange<I> {
     Update { item: I, event: Attested<Event> },
     /// A item that previously matched the subscription has changed in a way that no longer matches the subscription
     Remove { item: I, event: Attested<Event> },
+    /// A item that previously matched the subscription has been removed because the system was reset
+    SystemReset { item: I },
 }
 
 impl<I> ItemChange<I> {

@@ -287,13 +287,8 @@ where
             let entities: Vec<Entity> = subscription.matching_entities.lock().unwrap().drain(..).collect();
             if !entities.is_empty() {
                 // Create removal changes for all entities
-                let changes: Vec<ItemChange<Entity>> = entities
-                    .iter()
-                    .map(|entity| ItemChange::Remove {
-                        item: entity.clone(),
-                        event: None, // No event for system reset
-                    })
-                    .collect();
+                let changes: Vec<ItemChange<Entity>> =
+                    entities.iter().map(|entity| ItemChange::SystemReset { item: entity.clone() }).collect();
 
                 // Notify the subscription
                 (subscription.on_change)(ChangeSet {

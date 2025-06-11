@@ -37,7 +37,7 @@ pub struct SubscriptionInfo<R, CD> {
 
 /// Abstracted Node interface for subscription relay integration
 #[async_trait]
-pub trait TNode<CD: ContextData>: Send + Sync {
+pub trait PeerSubscribe<CD: ContextData>: Send + Sync {
     /// Send a subscription request to a remote peer
     /// Returns Ok(()) if the subscription was successfully established (NodeResponseBody::Subscribed),
     /// Err(RequestError) for any error or non-success response
@@ -56,13 +56,13 @@ pub trait TNode<CD: ContextData>: Send + Sync {
 }
 
 /// Abstracted Reactor interface for subscription relay integration
-pub trait TReactor<R>: Send + Sync {
+pub trait GetSubscription<R>: Send + Sync {
     /// Get subscription by ID for stale entity detection
     fn get_subscription(&self, sub_id: proto::SubscriptionId) -> Option<Subscription<R>>;
 }
 
-/// Implementation of TReactor for the real Reactor
-impl<SE, PA> TReactor<Entity> for crate::reactor::Reactor<SE, PA>
+/// Implementation of GetSubscription for the real Reactor
+impl<SE, PA> GetSubscription<Entity> for crate::reactor::Reactor<SE, PA>
 where
     SE: crate::storage::StorageEngine + Send + Sync + 'static,
     PA: crate::policy::PolicyAgent + Send + Sync + 'static,
@@ -76,9 +76,7 @@ struct SubscriptionRelayInner<R, CD> {
     // Track connected durable peers
     connected_peers: SafeSet<proto::EntityId>,
     // Node interface for communicating with remote peers
-    node: OnceLock<Arc<dyn TNode<CD>>>,
-    // Reactor interface for managing local subscriptions
-    reactor: Arc<dyn TReactor<R>>,
+    node: OnceLock<Arc<dyn PeerSubscribe<CD>>>,
 }
 
 /// Manages subscription state and handles remote subscription setup/teardown for ephemeral nodes.
@@ -118,13 +116,12 @@ impl<R: Clone + Send + Sync + 'static, CD: ContextData> Clone for SubscriptionRe
 }
 
 impl<R: Clone + Send + Sync + 'static, CD: ContextData> SubscriptionRelay<R, CD> {
-    pub fn new(reactor: Arc<dyn TReactor<R>>) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(SubscriptionRelayInner {
                 subscriptions: SafeMap::new(),
                 connected_peers: SafeSet::new(),
                 node: OnceLock::new(),
-                reactor,
             }),
         }
     }
@@ -133,20 +130,20 @@ impl<R: Clone + Send + Sync + 'static, CD: ContextData> SubscriptionRelay<R, CD>
     ///
     /// This should be called once during initialization. Returns an error if
     /// the node has already been set.
-    pub fn bind_node(&self, node: Arc<dyn TNode<CD>>) -> Result<(), ()> { self.inner.node.set(node).map_err(|_| ()) }
+    pub fn bind_node(&self, node: Arc<dyn PeerSubscribe<CD>>) -> Result<(), ()> { self.inner.node.set(node).map_err(|_| ()) }
 
     /// Register a new subscription
     ///
     /// This method will:
     /// 1. Register the subscription with remote peers
-    /// 2. Call the on_first_update callback when the first update is received from remote peer
+    /// 2. Return a receiver that will receive the initial data when the first update arrives from remote peer
     ///
-    /// The on_first_update callback will be invoked when remote data arrives.
+    /// The receiver will be sent the initial data when remote data arrives.
     pub fn register(
         &self,
         subscription: Subscription<R>,
         context_data: CD,
-    ) -> Result<impl Future<Output = Result<Vec<R>, RetrievalError>> + Send + 'static, RetrievalError> {
+    ) -> Result<tokio::sync::oneshot::Receiver<Vec<R>>, RetrievalError> {
         let sub_id = subscription.id;
         let collection_id = subscription.collection_id.clone();
         let predicate = subscription.predicate.clone();
@@ -171,8 +168,7 @@ impl<R: Clone + Send + Sync + 'static, CD: ContextData> SubscriptionRelay<R, CD>
             self.setup_remote_subscriptions();
         }
 
-        use futures::TryFutureExt;
-        Ok(rx.map_err(|_| RetrievalError::Other("Failed to retrieve initial set".to_string())))
+        Ok(rx)
     }
 
     /// Signal that first remote data has been applied for a subscription
@@ -341,12 +337,12 @@ impl<R: Clone + Send + Sync + 'static, CD: ContextData> SubscriptionRelay<R, CD>
     }
 
     /// Get the node interface for making remote calls (used by RemoteEntityRetriever)
-    pub(crate) fn get_node(&self) -> Option<Arc<dyn TNode<CD>>> { self.inner.node.get().cloned() }
+    pub(crate) fn get_node(&self) -> Option<Arc<dyn PeerSubscribe<CD>>> { self.inner.node.get().cloned() }
 }
 
 /// Implementation of TNode for WeakNode to enable subscription relay integration
 #[async_trait]
-impl<SE, PA, DG> TNode<PA::ContextData> for crate::node::WeakNode<SE, PA, DG>
+impl<SE, PA, DG> PeerSubscribe<PA::ContextData> for crate::node::WeakNode<SE, PA, DG>
 where
     SE: crate::storage::StorageEngine + Send + Sync + 'static,
     PA: crate::policy::PolicyAgent + Send + Sync + 'static,
@@ -400,85 +396,18 @@ mod tests {
     // - Direct calls test the setup mechanism itself (error handling, state transitions)
     // - Event-driven calls test the integration and user-facing API
 
-    // For testing, we'll use CollectionId as our ContextData
-    impl ContextData for CollectionId {}
-
-    /// Mock reactor for testing
-    struct MockReactor;
-
-    impl TReactor<()> for MockReactor {
-        fn get_subscription(&self, _sub_id: proto::SubscriptionId) -> Option<Subscription<()>> { None }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::datagetter::DataGetter<(), ()> for MockReactor {
-        async fn fetch_states(
-            self: Self,
-            _collection_id: &CollectionId,
-            _predicate: &ankql::ast::Predicate,
-        ) -> Result<Vec<()>, crate::error::RetrievalError> {
-            Ok(vec![])
-        }
-        /// Gives the DataBroker a reference to the Node, which it can use to access the EntityManager and other resources
-        /// This can be stored by your implementation of the DataBroker, or just ignore it if you don't need it
-        fn bind_node(&self, _node: &TNode<SE, PA, Self>)
-        where Self: Sized {
-            // Default implementation does nothing
-        }
-
-        /// Create an event getter with the provided context data and collection
-        fn event_getter(&self, cdata: PA::ContextData) -> Self::EventGetter { unimplemented!() }
-
-        async fn get_events(
-            &self,
-            collection_id: &CollectionId,
-            event_ids: Vec<EventId>,
-            cdata: &PA::ContextData,
-        ) -> Result<(usize, HashMap<EventId, Attested<Event>>), RetrievalError> {
-            unimplemented!()
-        }
-
-        async fn get_state(
-            &self,
-            collection_id: &CollectionId,
-            entity_id: &EntityId,
-            cdata: &PA::ContextData,
-        ) -> Result<Attested<EntityState>, RetrievalError> {
-            unimplemented!()
-        }
-
-        /// Retrieve entity state
-        async fn get_states(
-            &self,
-            collection_id: &CollectionId,
-            entity_ids: Vec<EntityId>,
-            cdata: &PA::ContextData,
-            // allow_cache: bool,
-        ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-            unimplemented!()
-        }
-
-        /// Fetch multiple entity states matching a predicate (used by subscriptions)
-        async fn fetch_states(
-            &self,
-            collection_id: &CollectionId,
-            predicate: &ankql::ast::Predicate,
-            cdata: &PA::ContextData,
-        ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-            unimplemented!()
-        }
-    }
+    impl ContextData for () {}
 
     /// Mock message sender for testing
     #[derive(Debug)]
-    struct MockMessageSender<CD: ContextData> {
+    struct MockNode<CD: ContextData> {
         sent_requests: Arc<Mutex<Vec<(EntityId, proto::SubscriptionId, CollectionId, Predicate)>>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
         _phantom: std::marker::PhantomData<CD>,
     }
 
-    impl<CD: ContextData> MockMessageSender<CD> {
+    impl<CD: ContextData> MockNode<CD> {
         fn new() -> Self {
             Self {
                 sent_requests: Arc::new(Mutex::new(Vec::new())),
@@ -503,7 +432,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl<CD: ContextData> TNode<CD> for MockMessageSender<CD> {
+    impl<CD: ContextData> PeerSubscribe<CD> for MockNode<CD> {
         async fn peer_subscribe(
             &self,
             peer_id: EntityId,
@@ -535,9 +464,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_subscription_setup() -> anyhow::Result<()> {
-        let mock_reactor = Arc::new(MockReactor);
-        let relay = SubscriptionRelay::new(mock_reactor);
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let relay: SubscriptionRelay<(), ()> = SubscriptionRelay::new();
+        let mock_sender = Arc::new(MockNode::<()>::new());
         relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
@@ -550,7 +478,7 @@ mod tests {
 
         // Create mock subscription and register it
         let sub = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(sub, collection_id.clone(), ())?;
+        let _rx = relay.register(sub, ())?;
 
         // Check initial state
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
@@ -573,9 +501,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_disconnection_orphans_subscriptions() -> anyhow::Result<()> {
-        let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        // The record type is () and the context data is () because we don't actually need them for this test
+        let relay: SubscriptionRelay<(), ()> = SubscriptionRelay::new();
+        let mock_sender = Arc::new(MockNode::<()>::new());
         relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
@@ -589,7 +517,7 @@ mod tests {
         // Setup established subscription by going through the full flow
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone(), ())?;
+        let _rx = relay.register(subscription, ())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -607,9 +535,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_connection_triggers_setup() -> anyhow::Result<()> {
-        let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let relay: SubscriptionRelay<(), ()> = SubscriptionRelay::new();
+        let mock_sender = Arc::new(MockNode::<()>::new());
         relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
@@ -620,7 +547,7 @@ mod tests {
         // Add pending subscription (no peers connected yet)
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone(), ())?;
+        let _rx = relay.register(subscription, ())?;
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Clear any previous requests
@@ -646,9 +573,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_subscription_retry() -> anyhow::Result<()> {
-        let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let relay: SubscriptionRelay<(), ()> = SubscriptionRelay::new();
+        let mock_sender = Arc::new(MockNode::<()>::new());
         relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
@@ -662,7 +588,7 @@ mod tests {
         // Connect peer and add subscription
         relay.notify_peer_connected(peer_id);
         let sub = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(sub, collection_id.clone(), ())?;
+        let _rx = relay.register(sub, ())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -698,10 +624,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscription_removal() -> anyhow::Result<()> {
-        let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
-        relay.bind_node(mock_sender.clone()).expect("Failed to set node");
+        let relay: SubscriptionRelay<(), ()> = SubscriptionRelay::new();
+        let node = Arc::new(MockNode::<()>::new());
+        relay.bind_node(node.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -712,7 +637,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone(), ())?;
+        let _rx = relay.register(subscription, ())?;
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -720,7 +645,7 @@ mod tests {
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::Established(peer_id)));
 
         // Clear previous requests to focus on unsubscribe
-        mock_sender.clear_sent_requests();
+        node.clear_sent_requests();
 
         // Remove subscription
         relay.notify_unsubscribe(sub_id);
@@ -729,7 +654,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Verify unsubscribe message was sent
-        let sent_requests = mock_sender.get_sent_requests();
+        let sent_requests = node.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
         assert_eq!(sent_requests[0].0, peer_id);
         assert_eq!(sent_requests[0].1, sub_id);
@@ -742,9 +667,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edge_cases() -> anyhow::Result<()> {
-        let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let relay: SubscriptionRelay<(), ()> = SubscriptionRelay::new();
+        let mock_sender = Arc::new(MockNode::<()>::new());
 
         let sub_id = proto::SubscriptionId::new();
         let collection_id = create_test_collection_id();
@@ -753,7 +677,7 @@ mod tests {
 
         // Test setup without node - should not crash
         let subscription = Subscription::new(sub_id, collection_id.clone(), predicate, Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone(), ())?;
+        let _rx = relay.register(subscription, ())?;
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no node
@@ -782,9 +706,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_unsubscribe_with_no_established_subscription() -> anyhow::Result<()> {
-        let mock_reactor = Arc::new(MockReactor);
-        let relay: SubscriptionRelay<(), CollectionId> = SubscriptionRelay::new(mock_reactor);
-        let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
+        let relay: SubscriptionRelay<(), ()> = SubscriptionRelay::new();
+        let mock_sender = Arc::new(MockNode::<()>::new());
         relay.bind_node(mock_sender.clone()).expect("Failed to set node");
 
         let sub_id = proto::SubscriptionId::new();
@@ -794,7 +717,7 @@ mod tests {
         // Add subscription but don't establish it
         let subscription =
             crate::subscription::Subscription::new(sub_id, collection_id.clone(), predicate.clone(), Arc::new(Box::new(|_| {})));
-        let _rx = relay.register(subscription, collection_id.clone(), ())?;
+        let _rx = relay.register(subscription, ())?;
         assert_eq!(relay.get_subscription_state(sub_id), Some(SubscriptionState::PendingRemote));
 
         // Unsubscribe from pending subscription
