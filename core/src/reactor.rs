@@ -21,7 +21,7 @@ use tracing::info;
 use tracing::instrument;
 use tracing::{debug, warn};
 
-use ankurah_proto::{self as proto, EntityId};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldId(String);
 
@@ -104,10 +104,9 @@ where
 
     /// Initialize a subscription by performing initial evaluation and calling the callback
     /// This is async and does the initial fetch and evaluation
-    pub async fn initialize(&self, subscription: Arc<Subscription<Entity>>) -> anyhow::Result<()> {
+    pub async fn initialize(&self, subscription: Arc<Subscription<Entity>>, states: Vec<Attested<EntityState>>) -> anyhow::Result<()> {
         // Find initial matching entities
         let storage_collection = self.collections.get(&subscription.collection_id).await?;
-        let states = storage_collection.fetch_states(&subscription.predicate).await?;
         let mut matching_entities = Vec::new();
 
         // in theory, any state that is in the collection should already have its events in the storage collection as well
