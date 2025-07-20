@@ -45,6 +45,7 @@ dependencies = [
 name = "ankql"
 version = "0.5.1"
 dependencies = [
+ "anyhow",
  "env_logger",
  "log",
  "pest",
@@ -226,6 +227,7 @@ dependencies = [
  "bincode",
  "bytes",
  "futures-util",
+ "thiserror 2.0.12",
  "tokio",
  "tokio-postgres",
  "tracing",
