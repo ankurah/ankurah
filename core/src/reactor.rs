@@ -199,6 +199,12 @@ where
             Predicate::False => {
                 unimplemented!("Not sure how to implement this")
             }
+            // Placeholder should be transformed before reaching this point
+            Predicate::Placeholder => {
+                // This should not happen in normal operation as Placeholder should be transformed
+                // before being used in subscriptions
+                unimplemented!("Placeholder should be transformed before reactor processing")
+            }
         }
     }
 

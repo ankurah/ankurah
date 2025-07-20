@@ -401,7 +401,7 @@ impl StorageCollection for PostgresBucket {
         let mut results = Vec::new();
 
         let mut ankql_sql = predicate::Sql::new();
-        ankql_sql.predicate(predicate);
+        ankql_sql.predicate(predicate).map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
 
         let (sql, args) = ankql_sql.collapse();
 

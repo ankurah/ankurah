@@ -21,6 +21,9 @@ impl TryFrom<ast::Expr> for Predicate {
     fn try_from(value: ast::Expr) -> Result<Self, Self::Error> {
         match value {
             ast::Expr::Predicate(p) => Ok(p),
+            ast::Expr::Placeholder => Ok(Predicate::Placeholder),
+            ast::Expr::Literal(ast::Literal::Boolean(true)) => Ok(Predicate::True),
+            ast::Expr::Literal(ast::Literal::Boolean(false)) => Ok(Predicate::False),
             _ => Err(ParseError::InvalidPredicate("Expression is not a predicate".into())),
         }
     }
