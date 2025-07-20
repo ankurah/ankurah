@@ -26,3 +26,5 @@ syn = { version = "2.0", default-features = false, features = [
     "extra-traits",
 ] }
 serde_derive_internals = "0.29"
+ankql = { path = "../ankql" }
+regex = "1.0"
