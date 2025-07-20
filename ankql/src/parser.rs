@@ -32,9 +32,6 @@ pub fn parse_selection(input: &str) -> Result<ast::Predicate, ParseError> {
     if input.trim().is_empty() {
         return Ok(ast::Predicate::True);
     }
-    if input.trim().to_lowercase() == "true" {
-        return Ok(ast::Predicate::True);
-    }
 
     let pairs = grammar::AnkqlParser::parse(grammar::Rule::Selection, input).map_err(|e| ParseError::SyntaxError(format!("{}", e)))?;
 
@@ -193,6 +190,7 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
         grammar::Rule::True => Ok(ast::Expr::Literal(ast::Literal::Boolean(true))),
         grammar::Rule::False => Ok(ast::Expr::Literal(ast::Literal::Boolean(false))),
         grammar::Rule::Unsigned => parse_number(pair),
+        grammar::Rule::QuestionParameter => Ok(ast::Expr::Placeholder),
         grammar::Rule::ExpressionInParentheses => {
             let inner = pair.into_inner().next().ok_or(ParseError::EmptyExpression)?;
             let pred = parse_expr(inner)?;
@@ -473,5 +471,86 @@ mod tests {
                 right: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string())))
             }
         );
+    }
+
+    #[test]
+    fn test_placeholders() -> anyhow::Result<()> {
+        // Single literal placeholder in comparison
+        assert_eq!(
+            parse_selection("user_id = ?")?,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Placeholder)
+            }
+        );
+
+        // Multiple literal placeholders in AND expression
+        assert_eq!(
+            parse_selection("user_id = ? AND status = ?")?,
+            ast::Predicate::And(
+                Box::new(ast::Predicate::Comparison {
+                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                    operator: ast::ComparisonOperator::Equal,
+                    right: Box::new(ast::Expr::Placeholder)
+                }),
+                Box::new(ast::Predicate::Comparison {
+                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                    operator: ast::ComparisonOperator::Equal,
+                    right: Box::new(ast::Expr::Placeholder)
+                })
+            )
+        );
+
+        // Literal placeholders in IN clause
+        assert_eq!(
+            parse_selection("status IN (?, ?, ?)")?,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                operator: ast::ComparisonOperator::In,
+                right: Box::new(ast::Expr::ExprList(vec![ast::Expr::Placeholder, ast::Expr::Placeholder, ast::Expr::Placeholder,]))
+            }
+        );
+
+        // predicate placeholders connected by AND
+        assert_eq!(
+            parse_selection("? AND ?")?,
+            ast::Predicate::And(Box::new(ast::Predicate::Placeholder), Box::new(ast::Predicate::Placeholder))
+        );
+
+        // predicate placeholders connected by OR
+        assert_eq!(
+            parse_selection("? OR ?")?,
+            ast::Predicate::Or(Box::new(ast::Predicate::Placeholder), Box::new(ast::Predicate::Placeholder))
+        );
+
+        // Test a single predicate placeholder
+        assert_eq!(parse_selection("?")?, ast::Predicate::Placeholder);
+
+        // test a mix of predicate and literal placeholders
+        assert_eq!(
+            parse_selection("? AND foo = ?")?,
+            ast::Predicate::And(
+                Box::new(ast::Predicate::Placeholder),
+                Box::new(ast::Predicate::Comparison {
+                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("foo".to_string()))),
+                    operator: ast::ComparisonOperator::Equal,
+                    right: Box::new(ast::Expr::Placeholder),
+                })
+            )
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_boolean_literals() -> anyhow::Result<()> {
+        // Test that "true" parses correctly through the TryFrom path
+        assert_eq!(parse_selection("true")?, ast::Predicate::True);
+
+        // Test that "false" parses correctly through the TryFrom path
+        assert_eq!(parse_selection("false")?, ast::Predicate::False);
+
+        Ok(())
     }
 }

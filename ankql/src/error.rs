@@ -1,27 +1,28 @@
 use crate::grammar;
+use thiserror::Error;
 
 /// Custom error type for parsing errors
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ParseError {
+    #[error("Syntax error: {0}")]
     SyntaxError(String),
+    #[error("Empty expression")]
     EmptyExpression,
+    #[error("Expected {expected}, got {got:?}")]
     UnexpectedRule { expected: &'static str, got: grammar::Rule },
+    #[error("Invalid predicate: {0}")]
     InvalidPredicate(String),
+    #[error("Missing {0} operand")]
     MissingOperand(&'static str),
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SyntaxError(msg) => write!(f, "Syntax error: {}", msg),
-            Self::EmptyExpression => write!(f, "Empty expression"),
-            Self::UnexpectedRule { expected, got } => {
-                write!(f, "Expected {}, got {:?}", expected, got)
-            }
-            Self::InvalidPredicate(msg) => write!(f, "Invalid predicate: {}", msg),
-            Self::MissingOperand(side) => write!(f, "Missing {} operand", side),
-        }
-    }
+/// Custom error type for SQL generation errors
+#[derive(Debug, Error)]
+pub enum SqlGenerationError {
+    #[error("Placeholder count mismatch: expected {expected}, found {found}")]
+    PlaceholderCountMismatch { expected: usize, found: usize },
+    #[error("Invalid expression: {0}")]
+    InvalidExpression(String),
+    #[error("Unsupported operator: {0}")]
+    UnsupportedOperator(&'static str),
 }
-
-impl std::error::Error for ParseError {}

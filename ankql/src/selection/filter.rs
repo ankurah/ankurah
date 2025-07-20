@@ -10,6 +10,10 @@ pub enum Error {
     CollectionMismatch { expected: String, actual: String },
     #[error("property not found: {0}")]
     PropertyNotFound(String),
+    #[error("Unsupported expression: {0}")]
+    UnsupportedExpression(&'static str),
+    #[error("Unsupported operator: {0}")]
+    UnsupportedOperator(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +58,7 @@ pub trait Filterable {
 
 fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<String>, Error> {
     match expr {
+        Expr::Placeholder => return Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(match lit {
             Literal::String(s) => s.clone(),
             Literal::Integer(i) => i.to_string(),
@@ -76,7 +81,7 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Stri
             }
             Ok(ExprOutput::List(result))
         }
-        _ => unimplemented!("Only literal, identifier, and list expressions are supported"),
+        _ => return Err(Error::UnsupportedExpression("Only literal, identifier, and list expressions are supported")),
     }
 }
 
@@ -101,7 +106,7 @@ pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Res
                     let list = right_val.as_list().ok_or_else(|| Error::PropertyNotFound("Expected list for IN right operand".into()))?;
                     list.iter().any(|item| item.as_value().map(|v| v == value).unwrap_or(false))
                 }
-                ComparisonOperator::Between => unimplemented!("BETWEEN operator not yet supported"),
+                ComparisonOperator::Between => return Err(Error::UnsupportedOperator("BETWEEN operator not yet supported")),
             })
         }
         Predicate::And(left, right) => Ok(evaluate_predicate(item, left)? && evaluate_predicate(item, right)?),
@@ -110,6 +115,8 @@ pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Res
         Predicate::IsNull(expr) => Ok(evaluate_expr(item, expr)?.is_none()),
         Predicate::True => Ok(true),
         Predicate::False => Ok(false),
+        // Placeholder should be transformed to a comparison before filtering
+        Predicate::Placeholder => Err(Error::PropertyNotFound("Placeholder must be transformed before filtering".to_string())),
     }
 }
 

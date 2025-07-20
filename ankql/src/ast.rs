@@ -1,3 +1,4 @@
+use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,7 @@ pub enum Expr {
     Predicate(Predicate),
     InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
     ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
+    Placeholder,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,10 +36,16 @@ pub enum Predicate {
     Not(Box<Predicate>),
     True,
     False,
+    Placeholder,
 }
 
 impl std::fmt::Display for Predicate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", generate_selection_sql(self)) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match generate_selection_sql(self, None) {
+            Ok(sql) => write!(f, "{}", sql),
+            Err(e) => write!(f, "SQL Error: {}", e),
+        }
+    }
 }
 
 impl Predicate {
@@ -138,6 +146,80 @@ impl Predicate {
             // These are constants, just clone them
             Predicate::True => Predicate::True,
             Predicate::False => Predicate::False,
+            Predicate::Placeholder => Predicate::Placeholder,
+        }
+    }
+
+    /// Populate placeholders in the predicate with actual values
+    pub fn populate<I, V>(self, values: I) -> Result<Predicate, ParseError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<Expr>,
+    {
+        let mut values_iter = values.into_iter();
+        let result = self.populate_recursive(&mut values_iter)?;
+
+        // Check if there are any unused values
+        if values_iter.next().is_some() {
+            return Err(ParseError::InvalidPredicate("Too many values provided for placeholders".to_string()));
+        }
+
+        Ok(result)
+    }
+
+    fn populate_recursive<I, V>(self, values: &mut I) -> Result<Predicate, ParseError>
+    where
+        I: Iterator<Item = V>,
+        V: Into<Expr>,
+    {
+        match self {
+            Predicate::Comparison { left, operator, right } => Ok(Predicate::Comparison {
+                left: Box::new(left.populate_recursive(values)?),
+                operator,
+                right: Box::new(right.populate_recursive(values)?),
+            }),
+            Predicate::And(left, right) => {
+                Ok(Predicate::And(Box::new(left.populate_recursive(values)?), Box::new(right.populate_recursive(values)?)))
+            }
+            Predicate::Or(left, right) => {
+                Ok(Predicate::Or(Box::new(left.populate_recursive(values)?), Box::new(right.populate_recursive(values)?)))
+            }
+            Predicate::Not(pred) => Ok(Predicate::Not(Box::new(pred.populate_recursive(values)?))),
+            Predicate::IsNull(expr) => Ok(Predicate::IsNull(Box::new(expr.populate_recursive(values)?))),
+            Predicate::True => Ok(Predicate::True),
+            Predicate::False => Ok(Predicate::False),
+            // Placeholder should be transformed to a comparison before population
+            Predicate::Placeholder => Err(ParseError::InvalidPredicate("Placeholder must be transformed before population".to_string())),
+        }
+    }
+}
+
+impl Expr {
+    fn populate_recursive<I, V>(self, values: &mut I) -> Result<Expr, ParseError>
+    where
+        I: Iterator<Item = V>,
+        V: Into<Expr>,
+    {
+        match self {
+            Expr::Placeholder => match values.next() {
+                Some(value) => Ok(value.into()),
+                None => Err(ParseError::InvalidPredicate("Not enough values provided for placeholders".to_string())),
+            },
+            Expr::Literal(lit) => Ok(Expr::Literal(lit)),
+            Expr::Identifier(id) => Ok(Expr::Identifier(id)),
+            Expr::Predicate(pred) => Ok(Expr::Predicate(pred.populate_recursive(values)?)),
+            Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
+                left: Box::new(left.populate_recursive(values)?),
+                operator,
+                right: Box::new(right.populate_recursive(values)?),
+            }),
+            Expr::ExprList(exprs) => {
+                let mut populated_exprs = Vec::new();
+                for expr in exprs {
+                    populated_exprs.push(expr.populate_recursive(values)?);
+                }
+                Ok(Expr::ExprList(populated_exprs))
+            }
         }
     }
 }
@@ -165,13 +247,12 @@ pub enum InfixOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ParseError;
     use crate::parser::parse_selection;
 
     fn nullify_columns(input: &str, null_columns: &[&str]) -> Result<String, ParseError> {
         let pred = parse_selection(input)?;
         let result = pred.assume_null(&null_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        Ok(generate_selection_sql(&result))
+        generate_selection_sql(&result, None).map_err(|_| ParseError::InvalidPredicate("SQL generation failed".to_string()))
     }
 
     #[test]
@@ -193,4 +274,160 @@ mod tests {
         assert_eq!(nullify_columns(input, &["alpha"]).unwrap(), r#"FALSE"#);
         assert_eq!(nullify_columns(input, &["other"]).unwrap(), r#""alpha" = 1 AND ("beta" = 2 OR "charlie" = 3)"#);
     }
+
+    #[test]
+    fn test_populate_single_placeholder() {
+        let predicate = parse_selection("name = ?").unwrap();
+        let populated = predicate.populate(vec!["Alice"]).unwrap();
+
+        let expected = Predicate::Comparison {
+            left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("Alice".to_string()))),
+        };
+
+        assert_eq!(populated, expected);
+    }
+
+    #[test]
+    fn test_populate_multiple_placeholders() {
+        let predicate = parse_selection("age > ? AND name = ?").unwrap();
+        let values: Vec<Expr> = vec![25i64.into(), "Bob".into()];
+        let populated = predicate.populate(values).unwrap();
+
+        let expected = Predicate::And(
+            Box::new(Predicate::Comparison {
+                left: Box::new(Expr::Identifier(Identifier::Property("age".to_string()))),
+                operator: ComparisonOperator::GreaterThan,
+                right: Box::new(Expr::Literal(Literal::Integer(25))),
+            }),
+            Box::new(Predicate::Comparison {
+                left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String("Bob".to_string()))),
+            }),
+        );
+
+        assert_eq!(populated, expected);
+    }
+
+    #[test]
+    fn test_populate_in_clause() {
+        let predicate = parse_selection("status IN (?, ?, ?)").unwrap();
+        let populated = predicate.populate(vec!["active", "pending", "review"]).unwrap();
+
+        let expected = Predicate::Comparison {
+            left: Box::new(Expr::Identifier(Identifier::Property("status".to_string()))),
+            operator: ComparisonOperator::In,
+            right: Box::new(Expr::ExprList(vec![
+                Expr::Literal(Literal::String("active".to_string())),
+                Expr::Literal(Literal::String("pending".to_string())),
+                Expr::Literal(Literal::String("review".to_string())),
+            ])),
+        };
+
+        assert_eq!(populated, expected);
+    }
+
+    #[test]
+    fn test_populate_mixed_types() {
+        let predicate = parse_selection("active = ? AND score > ? AND name = ?").unwrap();
+        let values: Vec<Expr> = vec![true.into(), 95.5f64.into(), "Charlie".into()];
+        let populated = predicate.populate(values).unwrap();
+
+        // Verify the structure is correct
+        if let Predicate::And(left, right) = populated {
+            if let Predicate::And(inner_left, inner_right) = *left {
+                // Check boolean value
+                if let Predicate::Comparison { right: val, .. } = *inner_left {
+                    assert_eq!(*val, Expr::Literal(Literal::Boolean(true)));
+                }
+                // Check float value
+                if let Predicate::Comparison { right: val, .. } = *inner_right {
+                    assert_eq!(*val, Expr::Literal(Literal::Float(95.5)));
+                }
+            }
+            // Check string value
+            if let Predicate::Comparison { right: val, .. } = *right {
+                assert_eq!(*val, Expr::Literal(Literal::String("Charlie".to_string())));
+            }
+        }
+    }
+
+    #[test]
+    fn test_populate_too_few_values() {
+        let predicate = parse_selection("name = ? AND age = ?").unwrap();
+        let result = predicate.populate(vec!["Alice"]);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not enough values"));
+    }
+
+    #[test]
+    fn test_populate_too_many_values() {
+        let predicate = parse_selection("name = ?").unwrap();
+        let result = predicate.populate(vec!["Alice", "Bob"]);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Too many values"));
+    }
+
+    #[test]
+    fn test_populate_no_placeholders() {
+        let predicate = parse_selection("name = 'Alice'").unwrap();
+        let populated = predicate.clone().populate(Vec::<String>::new()).unwrap();
+
+        // Should be unchanged
+        assert_eq!(populated, predicate);
+    }
+}
+
+// From implementations for single values that wrap them in Expr::Literal
+impl From<String> for Expr {
+    fn from(s: String) -> Expr { Expr::Literal(Literal::String(s)) }
+}
+
+impl From<&str> for Expr {
+    fn from(s: &str) -> Expr { Expr::Literal(Literal::String(s.to_string())) }
+}
+
+impl From<i64> for Expr {
+    fn from(i: i64) -> Expr { Expr::Literal(Literal::Integer(i)) }
+}
+
+impl From<f64> for Expr {
+    fn from(f: f64) -> Expr { Expr::Literal(Literal::Float(f)) }
+}
+
+impl From<bool> for Expr {
+    fn from(b: bool) -> Expr { Expr::Literal(Literal::Boolean(b)) }
+}
+
+impl From<Literal> for Expr {
+    fn from(lit: Literal) -> Expr { Expr::Literal(lit) }
+}
+
+// These create Expr::ExprList for use in IN clauses
+impl<T> From<Vec<T>> for Expr
+where T: Into<Expr>
+{
+    fn from(vec: Vec<T>) -> Self { Expr::ExprList(vec.into_iter().map(|item| item.into()).collect()) }
+}
+
+impl<T, const N: usize> From<[T; N]> for Expr
+where T: Into<Expr>
+{
+    fn from(arr: [T; N]) -> Self { Expr::ExprList(arr.into_iter().map(|item| item.into()).collect()) }
+}
+
+impl<T> From<&[T]> for Expr
+where T: Into<Expr> + Clone
+{
+    fn from(slice: &[T]) -> Self { Expr::ExprList(slice.iter().map(|item| item.clone().into()).collect()) }
+}
+
+impl<T, const N: usize> From<&[T; N]> for Expr
+where T: Into<Expr> + Clone
+{
+    fn from(arr: &[T; N]) -> Self { Expr::ExprList(arr.iter().map(|item| item.clone().into()).collect()) }
 }
