@@ -139,3 +139,13 @@ mod tests {
         assert_eq!(id, bincode::deserialize(&bytes).unwrap());
     }
 }
+
+// EntityId support for predicates
+
+impl From<EntityId> for ankql::ast::Expr {
+    fn from(id: EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::String(id.to_base64())) }
+}
+
+impl From<&EntityId> for ankql::ast::Expr {
+    fn from(id: &EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::String(id.to_base64())) }
+}

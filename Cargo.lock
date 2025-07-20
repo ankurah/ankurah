@@ -121,8 +121,10 @@ dependencies = [
 name = "ankurah-derive"
 version = "0.5.1"
 dependencies = [
+ "ankql",
  "proc-macro2",
  "quote",
+ "regex",
  "serde_derive_internals 0.29.1",
  "syn",
 ]
