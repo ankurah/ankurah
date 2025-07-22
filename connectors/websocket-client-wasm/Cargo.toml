@@ -14,17 +14,16 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-react   = ["ankurah-react-signals"]
 
 [dependencies]
-ankurah            = { path = "../../ankurah", features = ["derive", "wasm", "react"], version = "^0.5.1" }
+ankurah            = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.5.1" }
 ankurah-core       = { path = "../../core", version = "^0.5.1" }
 ankurah-proto      = { path = "../../proto", version = "^0.5.1" }
 ankurah-derive     = { path = "../../derive", version = "^0.5.1" }
 serde              = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 
-ankurah-react-signals = { path = "../../react-signals", optional = true, version = "^0.5.1" }
+ankurah-react-signals = { path = "../../react-signals", version = "^0.5.1" }
 wasm-bindgen = "0.2.84"
 futures = "0.3.30"
 js-sys = "0.3.69"

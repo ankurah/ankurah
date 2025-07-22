@@ -10,7 +10,6 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-react = ["dep:ankurah-react-signals", "wasm"]
 wasm = [
     "derive",
     "ankurah-derive?/wasm",
