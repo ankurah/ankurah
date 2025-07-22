@@ -202,7 +202,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
- "strum",
+ "strum 0.26.3",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
@@ -263,6 +263,8 @@ dependencies = [
  "ankurah-react-signals",
  "ankurah-storage-postgres",
  "ankurah-storage-sled",
+ "ankurah-websocket-client",
+ "ankurah-websocket-server",
  "anyhow",
  "async-trait",
  "bb8",
@@ -270,6 +272,7 @@ dependencies = [
  "ctor",
  "itertools",
  "js-sys",
+ "rand 0.8.5",
  "reactive_graph",
  "serde",
  "serde_json",
@@ -281,6 +284,27 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "ankurah-websocket-client"
+version = "0.5.1"
+dependencies = [
+ "ankurah",
+ "ankurah-core",
+ "ankurah-proto",
+ "ankurah-storage-sled",
+ "ankurah-websocket-server",
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "futures-util",
+ "strum 0.27.2",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-tungstenite 0.27.0",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -305,7 +329,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
- "strum",
+ "strum 0.26.3",
  "thiserror 2.0.12",
  "tracing",
  "tracing-wasm",
@@ -474,7 +498,7 @@ dependencies = [
  "sha1",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.26.2",
  "tower",
  "tower-layer",
  "tower-service",
@@ -2796,7 +2820,16 @@ version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
 dependencies = [
- "strum_macros",
+ "strum_macros 0.26.4",
+]
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros 0.27.2",
 ]
 
 [[package]]
@@ -2809,6 +2842,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
+ "syn",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
  "syn",
 ]
 
@@ -3091,7 +3136,23 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite",
+ "tungstenite 0.26.2",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite 0.27.0",
 ]
 
 [[package]]
@@ -3263,6 +3324,25 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.0",
+ "sha1",
+ "thiserror 2.0.12",
+ "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.0",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.12",
  "utf-8",
