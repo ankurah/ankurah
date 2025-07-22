@@ -10,7 +10,7 @@ use std::sync::Weak;
 
 use wasm_bindgen::prelude::*;
 
-#[wasm_bindgen(module = "react")]
+#[wasm_bindgen(module = "wasm")]
 extern "C" {
     fn useRef() -> JsValue;
     fn useSyncExternalStore(

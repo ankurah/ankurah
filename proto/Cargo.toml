@@ -9,7 +9,7 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-default  = ["wasm"]
+default  = []
 postgres = ["dep:postgres-types", "dep:postgres-protocol", "dep:fallible-iterator"]
 wasm     = ["dep:wasm-bindgen", "dep:js-sys"]
 
