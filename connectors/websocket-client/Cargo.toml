@@ -1,0 +1,36 @@
+[package]
+name          = "ankurah-websocket-client"
+version       = "0.5.1"
+edition       = "2021"
+description   = "Ankurah WebSocket Client - Native WebSocket client for Ankurah"
+license       = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-websocket-client"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
+
+[dependencies]
+ankurah-core  = { path = "../../core", version = "^0.5.1" }
+ankurah-proto = { path = "../../proto", version = "^0.5.1" }
+
+# WebSocket implementation
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+tokio             = { version = "1.40", features = ["full"] }
+
+# Async utilities
+futures-util = "0.3"
+async-trait  = "0.1"
+
+# Serialization 
+bincode = "1.3"
+
+# Error handling and utilities
+anyhow    = "1.0"
+thiserror = "2.0"
+tracing   = "0.1"
+url       = "2.0"
+strum     = { version = "0.27", features = ["derive"] }
+
+[dev-dependencies]
+ankurah-storage-sled     = { path = "../../storage/sled", version = "^0.5.1" }
+ankurah-websocket-server = { path = "../websocket-server", version = "^0.5.1" }
+ankurah                  = { path = "../../ankurah", version = "^0.5.1", features = ["derive"] }
