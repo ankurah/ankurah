@@ -29,7 +29,7 @@
 //!     // Create WebSocket client to connect to remote server (automatically starts connecting)
 //!     let client = WebsocketClient::new(my_node.clone(), "ws://localhost:8080").await?;
 //!
-//!     println!("State: {}", client.connection_state()); // State: Connected
+//!     println!("State: {}", client.state().value()); // State: Connected
 //!
 //!     // See [ankurah] for usage details
 //!
