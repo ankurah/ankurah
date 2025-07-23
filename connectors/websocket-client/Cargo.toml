@@ -9,8 +9,9 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
-ankurah-core  = { path = "../../core", version = "^0.5.1" }
-ankurah-proto = { path = "../../proto", version = "^0.5.1" }
+ankurah-core    = { path = "../../core", version = "^0.5.1" }
+ankurah-proto   = { path = "../../proto", version = "^0.5.1" }
+ankurah-signals = { path = "../../signals", version = "^0.5.1" }
 
 # WebSocket implementation
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }

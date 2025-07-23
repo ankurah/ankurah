@@ -1,6 +1,7 @@
 use crate::sender::WebsocketPeerSender;
 use ankurah_core::{connector::PeerSender, policy::PolicyAgent, storage::StorageEngine, Node};
 use ankurah_proto as proto;
+use ankurah_signals::{Get, Mut, Read};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -8,9 +9,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use strum::Display;
+use thiserror::Error;
 use tokio::{select, sync::Notify, task::JoinHandle, time::sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -29,13 +31,15 @@ pub enum ConnectionState {
         server_presence: proto::Presence,
     },
     #[strum(serialize = "Error")]
-    Error {
-        message: String,
-    },
+    Error(ConnectionError),
 }
 
-const MAX_CONNECTION_WAIT: Duration = Duration::from_secs(30);
-const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum ConnectionError {
+    #[error("General connection error: {0}")]
+    General(String),
+}
+
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -46,7 +50,7 @@ where
 {
     node: Node<SE, PA>,
     server_url: String,
-    state: std::sync::RwLock<ConnectionState>,
+    connection_state: Mut<ConnectionState>,
     connected: AtomicBool,
     shutdown: Notify,
     shutdown_requested: AtomicBool,
@@ -75,7 +79,7 @@ where
         let inner = Arc::new(Inner {
             node,
             server_url: ws_url,
-            state: std::sync::RwLock::new(ConnectionState::Disconnected),
+            connection_state: Mut::new(ConnectionState::Disconnected),
             connected: AtomicBool::new(false),
             shutdown: Notify::new(),
             shutdown_requested: AtomicBool::new(false),
@@ -94,21 +98,8 @@ where
         }
     }
 
-    /// Wait for the client to establish a connection to the server
-    pub async fn wait_connected(&self) -> anyhow::Result<()> {
-        let start = Instant::now();
-        while start.elapsed() < MAX_CONNECTION_WAIT {
-            match self.connection_state() {
-                ConnectionState::Connected { .. } => return Ok(()),
-                ConnectionState::Error { message } => return Err(anyhow::anyhow!("Connection failed: {}", message)),
-                _ => tokio::time::sleep(CONNECTION_POLL_INTERVAL).await,
-            }
-        }
-        Err(anyhow::anyhow!("Timeout waiting for connection"))
-    }
-
-    /// Get the current connection state
-    pub fn connection_state(&self) -> ConnectionState { self.inner.state.read().unwrap().clone() }
+    /// Get the connection state as a reactive signal
+    pub fn state(&self) -> Read<ConnectionState> { self.inner.connection_state.read() }
 
     /// Check if currently connected to the server
     pub fn is_connected(&self) -> bool { self.inner.connected.load(Ordering::Acquire) }
@@ -131,9 +122,21 @@ where
         Ok(())
     }
 
+    /// Wait for the client to establish a connection to the server (signal-based)
+    pub async fn wait_connected(&self) -> Result<(), ConnectionError> {
+        // Wait for either Connected or Error state, returning appropriate Result
+        self.state()
+            .wait_for(|state| match state {
+                ConnectionState::Connected { .. } => Some(Ok(())),
+                ConnectionState::Error(e) => Some(Err(e.clone())),
+                _ => None, // Continue waiting for Connecting/Disconnected states
+            })
+            .await
+    }
+
     /// Get the node ID of the connected server (if connected)
     pub fn server_node_id(&self) -> Option<proto::EntityId> {
-        match self.connection_state() {
+        match self.state().get() {
             ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id),
             _ => None,
         }
@@ -162,7 +165,7 @@ where
                         }
                         Err(e) => {
                             error!("Connection to {} failed: {}", inner.server_url, e);
-                            Self::update_state(&inner.state, ConnectionState::Error { message: e.to_string() });
+                            inner.connection_state.set(ConnectionState::Error(ConnectionError::General(e.to_string())));
                             inner.connected.store(false, Ordering::Release);
 
                             info!("Retrying connection in {:?}", backoff);
@@ -177,14 +180,14 @@ where
             }
         }
 
-        Self::update_state(&inner.state, ConnectionState::Disconnected);
+        inner.connection_state.set(ConnectionState::Disconnected);
         inner.connected.store(false, Ordering::Release);
     }
 
     /// Attempt a single connection
     async fn connect_once(inner: &Arc<Inner<SE, PA>>) -> Result<()> {
         info!("Attempting to connect to {}", inner.server_url);
-        Self::update_state(&inner.state, ConnectionState::Connecting { url: inner.server_url.clone() });
+        inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
 
         let (ws_stream, _) = connect_async(inner.server_url.as_str()).await?;
         info!("WebSocket handshake completed with {}", inner.server_url);
@@ -332,7 +335,7 @@ where
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
 
-        Self::update_state(&inner.state, ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
+        inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
         inner.connected.store(true, Ordering::Release);
         info!("Successfully connected to server {}", inner.server_url);
     }
@@ -345,14 +348,6 @@ where
                 warn!("Error handling peer message: {}", e);
             }
         });
-    }
-
-    fn update_state(state: &std::sync::RwLock<ConnectionState>, new_state: ConnectionState) {
-        let mut current = state.write().unwrap();
-        if *current != new_state {
-            debug!("Connection state changed: {:?} -> {:?}", *current, new_state);
-            *current = new_state;
-        }
     }
 }
 
