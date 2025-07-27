@@ -12,12 +12,14 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(module = "react")]
 extern "C" {
-    fn useRef() -> JsValue;
+    #[wasm_bindgen(catch)]
+    fn useRef() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch)]
     fn useSyncExternalStore(
         subscribe: &Closure<dyn Fn(js_sys::Function) -> JsValue>,
         get_snapshot: &Closure<dyn Fn() -> JsValue>,
         get_server_snapshot: &Closure<dyn Fn() -> JsValue>,
-    ) -> JsValue;
+    ) -> Result<JsValue, JsValue>;
 }
 
 // Substantially an homage to https://github.com/preactjs/signals/blob/main/packages/react/runtime/src/auto.ts
@@ -57,17 +59,18 @@ extern "C" {
 /// This implementation follows the pattern used by Preact Signals, adapted for
 /// WebAssembly-based signal integration with React
 #[wasm_bindgen(js_name = withSignals)]
-pub fn with_signals(f: &js_sys::Function) -> JsValue {
-    let ref_value = useRef();
+pub fn with_signals(f: &js_sys::Function) -> Result<JsValue, JsValue> {
+    let ref_value = useRef()?;
 
     let mut store = js_sys::Reflect::get(&ref_value, &"current".into()).unwrap();
     if store.is_undefined() {
         let new_store = EffectStore::new();
-        useSyncExternalStore(&new_store.0.subscribe_fn, &new_store.0.get_snapshot, &new_store.0.get_snapshot);
+        useSyncExternalStore(&new_store.0.subscribe_fn, &new_store.0.get_snapshot, &new_store.0.get_snapshot)?;
+
         // TODO: Check to see if this sets up the finalizer in JS land
         store = JsValue::from(new_store.clone());
         js_sys::Reflect::set(&ref_value, &"current".into(), &store).unwrap();
-        new_store.with_observer(f)
+        Ok(new_store.with_observer(f))
     } else {
         let ptr = js_sys::Reflect::get(&store, &JsValue::from_str("__wbg_ptr")).unwrap();
         let store = {
@@ -77,8 +80,9 @@ pub fn with_signals(f: &js_sys::Function) -> JsValue {
             use wasm_bindgen::convert::RefFromWasmAbi;
             unsafe { EffectStore::ref_from_abi(ptr_u32) }
         };
-        useSyncExternalStore(&store.0.subscribe_fn, &store.0.get_snapshot, &store.0.get_snapshot);
-        store.with_observer(f)
+
+        useSyncExternalStore(&store.0.subscribe_fn, &store.0.get_snapshot, &store.0.get_snapshot)?;
+        Ok(store.with_observer(f))
     }
 }
 
