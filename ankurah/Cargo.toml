@@ -16,10 +16,10 @@ wasm = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
-    "dep:ankurah-react-signals",
     "dep:reactive_graph",
     "ankurah-core/wasm",
 ]
+react = ["dep:ankurah-react-signals"]
 derive = ["dep:ankurah-derive"]
 instrument = ["ankurah-core/instrument"]
 
