@@ -179,7 +179,7 @@ pub use ankurah_derive::*;
 pub mod derive_deps {
     #[cfg(feature = "wasm")]
     pub use crate::GetSignalValue;
-    #[cfg(feature = "wasm")]
+    #[cfg(feature = "react")]
     pub use ::ankurah_react_signals;
     #[cfg(feature = "wasm")]
     pub use ::js_sys;
