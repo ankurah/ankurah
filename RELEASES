@@ -1,3 +1,4 @@
+0.5.2  Handle exceptions from react hooks, restore react feature flag differentiation vs wasm flag, revert erroneous edit to react extern binding
 0.5.1  Fix subscription caching bug where stale locally-cached records were included in re-subscriptions
 0.5.0  Event retrieval bugfixes, improved ID serialization, NodeAndContext reorganization
 0.4.7  
