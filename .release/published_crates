@@ -1,1 +1,21 @@
-ankql ankurah-derive ankurah-proto ankurah-core ankurah-react-signals ankurah ankurah-storage-indexeddb-wasm ankurah-websocket-client-wasm ankurah-connector-local-process ankurah-storage-sled ankurah-websocket-server ankurah-storage-postgres 
+# Tier 1: Foundation crate (no internal dependencies)
+ankql
+
+# Tier 2: Core infrastructure (depends only on ankql)
+ankurah-proto
+ankurah-derive
+
+# Tier 3: Core functionality (depends on tier 1 & 2)
+ankurah-core
+ankurah-react-signals
+
+# Tier 4: Main API crate (depends on all above)
+ankurah
+
+# Tier 5: Storage and connector crates (depends on core tiers)
+ankurah-connector-local-process
+ankurah-websocket-server
+ankurah-storage-sled
+ankurah-storage-postgres
+ankurah-storage-indexeddb-wasm
+ankurah-websocket-client-wasm
