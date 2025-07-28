@@ -18,6 +18,7 @@ wasm = [
     "dep:js-sys",
     "dep:reactive_graph",
     "ankurah-core/wasm",
+    "ankurah-proto/wasm",
 ]
 react = ["dep:ankurah-react-signals"]
 derive = ["dep:ankurah-derive"]
