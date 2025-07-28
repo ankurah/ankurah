@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah"
-version       = "0.5.1"
+version       = "0.5.2"
 edition       = "2021"
 description   = "Observable, event-driven state management for native and web"
 license       = "MIT OR Apache-2.0"
@@ -25,10 +25,10 @@ derive = ["dep:ankurah-derive"]
 instrument = ["ankurah-core/instrument"]
 
 [dependencies]
-ankurah-core   = { path = "../core", version = "^0.5.1" }
-ankurah-proto  = { path = "../proto", version = "^0.5.1" }
-ankurah-derive = { path = "../derive", version = "^0.5.1", optional = true }
-ankql          = { path = "../ankql", version = "^0.5.1" }
+ankurah-core   = { path = "../core", version = "^0.5.2" }
+ankurah-proto  = { path = "../proto", version = "^0.5.2" }
+ankurah-derive = { path = "../derive", version = "^0.5.2", optional = true }
+ankql          = { path = "../ankql", version = "^0.5.2" }
 serde_json     = { version = "1.0" }
 serde          = { version = "1.0" }
 tracing        = { version = "0.1.40" }
@@ -36,7 +36,7 @@ tracing        = { version = "0.1.40" }
 wasm-bindgen          = { version = "0.2", optional = true }
 wasm-bindgen-futures  = { version = "0.4", optional = true }
 js-sys                = { version = "0.3", optional = true }
-ankurah-react-signals = { path = "../react-signals", optional = true, version = "^0.5.1" }
+ankurah-react-signals = { path = "../react-signals", optional = true, version = "^0.5.2" }
 reactive_graph        = { version = "0.1.4", features = ["effects"], optional = true }
 
 [dev-dependencies]
