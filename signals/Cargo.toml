@@ -2,6 +2,11 @@
 name    = "ankurah-signals"
 version = "0.5.2"
 edition = "2024"
+description = "Ankurah Signals"
+license       = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-storage-indexeddb-wasm"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
 tokio = { version = "1.40", features = ["sync"] }
