@@ -3,7 +3,7 @@ name: Publish Crates
 on:
   push:
     branches: [main]
-    paths: ["RELEASES"]
+    paths: ["**/Cargo.toml"]
 
 permissions:
   contents: write # Need to create and push tags
