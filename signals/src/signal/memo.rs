@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-/// Similar to a Map Signal, but it is stateful.
+/// Similar to a Map Signal, but it is stateful. Unfinished
 pub struct Memo<I, O: 'static, F: Fn(&I) -> O> {
     function: F,
     upstream: Value<I>,

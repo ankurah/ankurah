@@ -7,6 +7,9 @@ use reactive_graph::{effect::Effect, owner::LocalStorage, traits::Dispose};
 
 use wasm_bindgen::prelude::wasm_bindgen;
 
+// IMPORTANT! THIS CRATE (ankurah-react-signals) IS DEPRECATED - Do not use or edit this crate. Use ankurah-signals INSTEAD
+// See signals/tasks.md for more details
+
 #[wasm_bindgen]
 pub struct Subscription {
     effect: Option<Effect<LocalStorage>>,

@@ -8,6 +8,9 @@ use or_poisoned::OrPoisoned;
 use reactive_graph::graph::{AnySource, AnySubscriber, ReactiveNode, Subscriber};
 use std::sync::Weak;
 
+// IMPORTANT! THIS CRATE (ankurah-react-signals) IS DEPRECATED - Do not use or edit this crate. Use ankurah-signals INSTEAD
+// See signals/tasks.md for more details
+
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(module = "react")]

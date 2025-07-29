@@ -8,6 +8,9 @@ documentation = "https://docs.rs/ankurah-react-signals"
 homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
+# IMPORTANT! THIS CRATE (ankurah-react-signals) IS DEPRECATED - Do not use or edit this crate. Use ankurah-signals INSTEAD
+# See signals/tasks.md for more details
+
 [dependencies]
 futures              = "0.3"
 futures-signals      = "0.3"

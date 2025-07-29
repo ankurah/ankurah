@@ -4,7 +4,7 @@ use crate::traits::Get;
 use std::sync::Arc;
 
 /// A signal that is a map of another signal
-/// Stateless.
+/// Stateless. (Unfinished)
 pub struct Map<I, O: 'static, F: Fn(&I) -> O> {
     upstream: Value<I>,
     map_function: Arc<F>,
