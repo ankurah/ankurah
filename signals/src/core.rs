@@ -1,6 +1,6 @@
-use crate::{Renderer, Subscriber, observer::Observer, traits::Signal};
+use crate::{Renderer, Subscriber, SubscriptionHandle, observer::Observer, traits::Signal};
 use std::{
-    ops::Deref,
+    cell::RefCell,
     sync::{Arc, RwLock, RwLockReadGuard},
 };
 
@@ -39,31 +39,59 @@ impl<T: Clone> Value<T> {
 //     fn into(self) -> T { self.0.read().unwrap().clone() }
 // }
 
-static CURRENT_CONTEXT: RwLock<Option<ObserverContext>> = RwLock::new(None);
+// Thread-local stack for nested observer contexts (e.g., React component trees)
+thread_local! {
+    static OBSERVER_STACK: RefCell<Vec<ObserverContext>> = RefCell::new(Vec::new());
+}
+
 pub struct CurrentContext {}
 
 impl CurrentContext {
     /// Subscribes the current context to a signal
     pub fn track<S: Signal<T>, T>(signal: &S) {
-        if let Some(observer) = CURRENT_CONTEXT.read().unwrap().as_ref() {
-            signal.subscribe(observer.subscriber());
-        }
+        OBSERVER_STACK.with(|stack| {
+            if let Some(observer) = stack.borrow().last() {
+                let subscriber = observer.subscriber();
+                let _handle = signal.subscribe(subscriber);
+                // TODO: Properly manage subscription handle lifecycle
+                // For now, let it drop - this means subscriptions are temporary
+                // This is a known limitation that needs to be addressed
+            }
+        });
     }
 
-    /// Sets an observer as the current context
+    /// Sets an observer as the current context, pushing it onto the stack
     pub fn set(current: impl Into<ObserverContext>) {
         let current: ObserverContext = current.into();
         current.clear();
-        *CURRENT_CONTEXT.write().unwrap() = Some(current);
+        OBSERVER_STACK.with(|stack| {
+            stack.borrow_mut().push(current);
+        });
     }
 
-    /// Resets the current context to no observer
-    pub fn unset() { *CURRENT_CONTEXT.write().unwrap() = None; }
+    /// Removes the current observer from the stack, restoring the previous one
+    pub fn unset() {
+        OBSERVER_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+
+    /// Get a copy of the current observer context (for testing/debugging)
+    pub fn current() -> Option<ObserverContext> { OBSERVER_STACK.with(|stack| stack.borrow().last().cloned()) }
 }
 
 pub enum ObserverContext {
     Renderer(Renderer),
     Observer(Observer),
+}
+
+impl Clone for ObserverContext {
+    fn clone(&self) -> Self {
+        match self {
+            ObserverContext::Renderer(renderer) => ObserverContext::Renderer(renderer.clone()),
+            ObserverContext::Observer(observer) => ObserverContext::Observer(observer.clone()),
+        }
+    }
 }
 
 impl ObserverContext {
@@ -77,6 +105,12 @@ impl ObserverContext {
         match self {
             ObserverContext::Renderer(renderer) => renderer.subscriber(),
             ObserverContext::Observer(observer) => observer.subscriber(),
+        }
+    }
+    pub fn store_handle(&self, handle: SubscriptionHandle<'static>) {
+        match self {
+            ObserverContext::Renderer(renderer) => renderer.store_handle(handle),
+            ObserverContext::Observer(observer) => observer.store_handle(handle),
         }
     }
 }

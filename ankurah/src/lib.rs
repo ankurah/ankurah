@@ -133,6 +133,7 @@ pub use ankurah_core as core;
 #[cfg(feature = "derive")]
 pub use ankurah_derive as derive;
 pub use ankurah_proto as proto;
+pub use ankurah_signals as signals;
 
 pub use proto::EntityId;
 // Re-export commonly used types
@@ -151,23 +152,7 @@ pub use ankurah_core::{
     transaction,
 };
 
-// TODO move this somewhere else - it's a dependency of the signal derive macro
-#[doc(hidden)]
-#[cfg(feature = "wasm")]
-pub trait GetSignalValue: reactive_graph::traits::Get {
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = Self::Value>>;
-}
-
-// Add a blanket implementation for any type that implements Get + Clone
-#[doc(hidden)]
-#[cfg(feature = "wasm")]
-impl<T> GetSignalValue for T
-where
-    T: reactive_graph::traits::Get + Clone + 'static,
-    T::Value: 'static,
-{
-    fn cloned(&self) -> Box<dyn GetSignalValue<Value = T::Value>> { Box::new(self.clone()) }
-}
+// Note: GetSignalValue trait removed - now using ankurah-signals instead of reactive_graph
 
 // Re-export the derive macro
 #[cfg(feature = "derive")]
@@ -178,16 +163,11 @@ pub use ankurah_derive::*;
 #[doc(hidden)]
 pub mod derive_deps {
     #[cfg(feature = "wasm")]
-    pub use crate::GetSignalValue;
-    #[cfg(feature = "react")]
-    pub use ::ankurah_react_signals;
-    #[cfg(feature = "wasm")]
     pub use ::js_sys;
-    #[cfg(feature = "wasm")]
-    pub use ::reactive_graph;
-    pub use ::tracing; // Why does this fail with a Sized error: `the trait `GetSignalValue` cannot be made into an object the trait cannot be made into an object because it requires `Self: Sized``
-                       // pub use reactive_graph::traits::Get as GetSignalValue; // and this one works fine?
+    // Now using ankurah-signals instead of reactive_graph and ankurah_react_signals
     pub use ::ankurah_proto;
+    pub use ::ankurah_signals;
+    pub use ::tracing;
     #[cfg(feature = "wasm")]
     pub use ::wasm_bindgen;
     #[cfg(feature = "wasm")]

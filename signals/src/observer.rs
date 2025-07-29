@@ -29,6 +29,10 @@ impl std::ops::Deref for Renderer {
     type Target = Arc<RendererInner>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
+
+impl Clone for Renderer {
+    fn clone(&self) -> Self { Renderer(Arc::clone(&self.0)) }
+}
 impl RendererInner {
     /// Render the callback using this context
     pub fn render(self: &Arc<Self>) { self.with_context(&self.renderer); }
@@ -39,6 +43,7 @@ impl RendererInner {
     }
     pub fn subscriber<T>(self: &Arc<Self>) -> Subscriber<T> { Subscriber::Notify(Box::new(Arc::downgrade(self))) }
     pub fn clear(self: &Arc<Self>) { self.subscription_handles.write().unwrap().clear() }
+    pub fn store_handle(self: &Arc<Self>, handle: SubscriptionHandle<'static>) { self.subscription_handles.write().unwrap().push(handle) }
     pub fn clone(self: &Arc<Self>) -> Renderer { Renderer(Arc::clone(&self)) }
 }
 
@@ -53,9 +58,14 @@ impl std::ops::Deref for Observer {
     type Target = Arc<ObserverInner>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
+
+impl Clone for Observer {
+    fn clone(&self) -> Self { Observer(Arc::clone(&self.0)) }
+}
 impl ObserverInner {
     pub fn subscriber<T>(self: &Arc<Self>) -> Subscriber<T> { Subscriber::Notify(Box::new(Arc::downgrade(self))) }
     pub fn clear(self: &Arc<Self>) { self.subscription_handles.write().unwrap().clear(); }
+    pub fn store_handle(self: &Arc<Self>, handle: SubscriptionHandle<'static>) { self.subscription_handles.write().unwrap().push(handle) }
 
     /// Execute a function with this observer as the current context
     pub fn with_context<F: Fn()>(self: &Arc<Self>, f: &F) {

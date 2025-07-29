@@ -1,5 +1,5 @@
 import styled from "styled-components";
-import { withSignals, Entry, ctx, ws_client } from "example-wasm-bindings";
+import { useObserve, Entry, ctx, ws_client } from "example-wasm-bindings";
 import { useMemo } from "react";
 
 const Table = styled.table`
@@ -54,20 +54,27 @@ const Card = styled.div`
 `;
 
 function App() {
-  // Temporary hack - see https://github.com/ankurah/ankurah/issues/33
-  return withSignals(() => {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
+  const observer = useObserve();
+  console.log("MARK 🔵 App component rendering, observer:", observer);
 
-    // const [connectionState, setConnectionState] = useState<string | null>(null);
+  try {
     const connectionState = ws_client().connection_state.value?.value();
-    // eslint-disable-next-line react-hooks/rules-of-hooks
+    console.log("MARK 🌐 Connection state:", connectionState);
+
     const test_items_signal = useMemo(() => {
-      console.log("initializing usememo");
-      return Entry.subscribe(ctx(), "added = '2024-01-01'");
+      console.log("MARK 🔄 Initializing test_items_signal useMemo");
+      const signal = Entry.subscribe(ctx(), "added = '2024-01-01'");
+      console.log("📡 Created signal:", signal);
+      return signal;
     }, []);
+
+    console.log("MARK 📊 Current signal value:", test_items_signal.value);
+    console.log("MARK 📝 Items in signal:", test_items_signal.value.items);
+    console.log("MARK 📏 Items count:", test_items_signal.value.items.length);
 
     const handleButtonPress = () => {
       (async () => {
+        console.log("🚀 Creating new entry...");
         const transaction = ctx().begin();
         await Entry.create(transaction, {
           added: "2024-01-01",
@@ -84,8 +91,17 @@ function App() {
             },
           },
         });
-        console.log("Entry created", ctx().node_id());
+        console.log("MARK ✅ Entry created", ctx().node_id());
         transaction.commit();
+        console.log("MARK 💾 Transaction committed");
+
+        // Check signal after creation
+        setTimeout(() => {
+          console.log("MARK 🔍 Post-creation signal check:");
+          console.log("MARK 📊 Signal value after create:", test_items_signal.value);
+          console.log("MARK 📝 Items after create:", test_items_signal.value.items);
+          console.log("MARK 📏 Items count after create:", test_items_signal.value.items.length);
+        }, 100);
       })();
     };
 
@@ -113,21 +129,28 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {test_items_signal.value.items.map((item) => (
-                <Tr key={item.id().as_string()}>
-                  <Td>{item.id().as_string()}</Td>
-                  <Td>{item.added()}</Td>
-                  <Td>{item.ip_address()}</Td>
-                  <Td>{item.node_id()}</Td>
-                  <Td>{JSON.stringify(item.complex())}</Td>
-                </Tr>
-              ))}
+              {(() => {
+                const items = test_items_signal.value.items;
+                console.log("🎨 Rendering items:", items, "count:", items.length);
+                return items.map((item: any) => (
+                  <Tr key={item.id().as_string()}>
+                    <Td>{item.id().as_string()}</Td>
+                    <Td>{item.added()}</Td>
+                    <Td>{item.ip_address()}</Td>
+                    <Td>{item.node_id()}</Td>
+                    <Td>{JSON.stringify(item.complex())}</Td>
+                  </Tr>
+                ));
+              })()}
             </tbody>
           </Table>
         </Card>
       </Container>
     );
-  }) as JSX.Element;
+  } finally {
+    console.log("🏁 Finishing observer");
+    observer.finish();
+  }
 }
 
 export default App;

@@ -58,10 +58,16 @@ mod core;
 mod observer;
 mod signal;
 mod subscription;
-mod traits;
+pub mod traits;
+
+#[cfg(feature = "react")]
+pub mod react;
 
 pub use core::*;
 pub use observer::*;
 pub use signal::*;
 pub use subscription::*;
 pub use traits::*;
+
+#[cfg(feature = "react")]
+pub use react::*;

@@ -7,7 +7,7 @@ members = [
     "examples/model",
     # "examples/leptos-app",
     "examples/server",
-    "react-signals",
+    "deprecated-react-signals",
     "ankql",
     "connectors/*",
     "storage/*",

@@ -12,6 +12,9 @@ use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
 pub use example_model::*;
 
+// Re-export the new useObserve hook from ankurah-signals
+pub use ankurah_signals::react::*;
+
 lazy_static! {
     static ref NODE: OnceCell<Node<IndexedDBStorageEngine, PermissiveAgent>> = OnceCell::new();
     static ref CLIENT: OnceCell<SendWrapper<WebsocketClient>> = OnceCell::new();
@@ -22,7 +25,7 @@ lazy_static! {
 pub async fn start() -> Result<(), JsValue> {
     tracing_wasm::set_as_global_default();
     panic::set_hook(Box::new(console_error_panic_hook::hook));
-    let _ = any_spawner::Executor::init_wasm_bindgen();
+    // Removed any_spawner initialization - no longer needed with new signal system
 
     let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
     let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
