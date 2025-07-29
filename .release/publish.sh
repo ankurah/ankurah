@@ -26,23 +26,6 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Safety check: ensure only RELEASES file was changed in the last commit
-check_commit_safety() {
-    log_info "Checking commit safety..."
-    
-    local changed_files
-    changed_files=$(git diff --name-only HEAD~1 HEAD)
-    
-    if [ "$changed_files" != "$RELEASES_FILE" ]; then
-        log_error "Commit contains changes to files other than $RELEASES_FILE:"
-        echo "$changed_files"
-        log_error "Publishing can only be triggered by commits that change only the $RELEASES_FILE"
-        exit 1
-    fi
-    
-    log_info "✓ Commit safety check passed"
-}
-
 # Read the top line of RELEASES file and extract version
 get_version_from_releases() {
     if [ ! -f "$RELEASES_FILE" ]; then
@@ -78,74 +61,17 @@ get_version_from_releases() {
 
 # Check if version has already been published (tag exists)
 check_already_published() {
-    local version=$1
-    local tag="v$version"
-    
-    log_info "Checking if version $version has already been published..."
-    
+    local tag="v$1"
     if git tag -l | grep -q "^$tag$"; then
-        log_warn "Tag $tag already exists. This version has already been published."
-        return 1  # Return non-zero to indicate already published
+        log_info "Tag $tag already exists. Nothing to do."
+        return 1  # Already published
     fi
-    
-    log_info "✓ Version $version has not been published yet"
-    return 0  # Return zero to indicate ready to publish
+    return 0  # Ready to publish
 }
 
-# Validate that we can parse the version from RELEASES file
-validate_releases_format() {
-    log_info "Validating RELEASES file format..."
-    
-    if [ ! -f "$RELEASES_FILE" ]; then
-        log_error "$RELEASES_FILE not found"
-        exit 1
-    fi
-    
-    local top_line
-    top_line=$(head -n 1 "$RELEASES_FILE")
-    
-    if [ -z "$top_line" ]; then
-        log_error "$RELEASES_FILE is empty"
-        exit 1
-    fi
-    
-    # Try to extract version to validate format
-    local version
-    version=$(echo "$top_line" | cut -d' ' -f1)
-    
-    if [ -z "$version" ]; then
-        log_error "Could not extract version from top line: $top_line"
-        exit 1
-    fi
-    
-    log_info "✓ RELEASES file format validation passed"
-}
 
-# Run cargo release to bump versions
-bump_versions() {
-    local version=$1
-    
-    log_info "Bumping versions to $version..."
-    
-    if ! cargo release version "$version" --execute --no-confirm --workspace; then
-        log_error "Failed to bump versions"
-        exit 1
-    fi
-    
-    log_info "✓ Version bump completed"
-}
 
-# Commit the version changes
-commit_version_bump() {
-    local version=$1
-    
-    log_info "Committing version bump..."
-    
-    git add .
-    git commit -m "Bump version to $version"
-    
-    log_info "✓ Version bump committed"
-}
+
 
 # Publish crates using cargo publish
 publish_crates() {
@@ -217,23 +143,34 @@ create_and_push_tag() {
 main() {
     log_info "Starting Ankurah publishing process..."
     
-    # Safety checks
-    check_commit_safety
-    validate_releases_format
+    # Get version (validates RELEASES format)
     
-    # Get version and validate
     local version
     version=$(get_version_from_releases)
     log_info "Target version: $version"
     
     if ! check_already_published "$version"; then
-        log_info "Version $version has already been published. Nothing to do."
         return 0
     fi
     
-    # Publishing workflow
-    bump_versions "$version"
-    commit_version_bump "$version"
+    # Show what we would publish
+    local crates
+    if [ -f "$PUBLISHED_CRATES_FILE" ]; then
+        crates=$(grep -v '^#' "$PUBLISHED_CRATES_FILE" | grep -v '^$' | tr '\n' ' ')
+        log_info "Target crates: $crates"
+    else
+        log_error "$PUBLISHED_CRATES_FILE not found"
+        exit 1
+    fi
+    
+    # DRY_RUN gates the actual publishing actions
+    if [ "$DRY_RUN" = true ]; then
+        log_warn "DRY RUN MODE - No actual publishing will occur"
+        log_info "✓ Dry run completed - everything looks good!"
+        return 0
+    fi
+    
+    # Actually publish and tag
     publish_crates "$version"
     create_and_push_tag "$version"
     
@@ -269,29 +206,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# Handle dry-run mode
-if [ "$DRY_RUN" = true ]; then
-    log_warn "DRY RUN MODE - No actual publishing will occur"
-    
-    # Just validate and show what would happen
-    check_commit_safety
-    validate_releases_format
-    
-    version=$(get_version_from_releases)
-    log_info "Would publish version: $version"
-    
-    if ! check_already_published "$version"; then
-        log_info "Version $version has already been published. Nothing would be done."
-        exit 0
-    fi
-    
-    crates=$(grep -v '^#' "$PUBLISHED_CRATES_FILE" 2>/dev/null | grep -v '^$' | tr '\n' ' ' || echo "ERROR: $PUBLISHED_CRATES_FILE not found")
-    log_info "Would publish crates: $crates"
-    
-    log_info "✓ Dry run completed - everything looks good!"
-    exit 0
-fi
 
 # Run main workflow
 main "$@" 
