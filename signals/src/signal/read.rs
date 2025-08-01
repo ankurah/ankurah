@@ -2,8 +2,8 @@ use std::sync::{Arc, RwLock};
 
 use crate::{
     core::{CurrentContext, Value},
-    subscription::{Subscriber, SubscriberSet, SubscriptionHandle},
-    traits::{Get, Signal, WaitResult},
+    subscription::{Subscriber, SubscriberSet, SubscriptionGuard},
+    traits::{Get, Notify, Observable, Signal, WaitResult},
 };
 
 /// Read-only signal
@@ -12,7 +12,7 @@ pub struct Read<T> {
     pub(crate) subscribers: SubscriberSet<T>,
 }
 
-impl<T> Read<T> {
+impl<T: 'static> Read<T> {
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         CurrentContext::track(self);
         self.value.with(f)
@@ -43,7 +43,7 @@ impl<T> Read<T> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Subscribe to notifications
-        let _handle = self.subscribe(Subscriber::Notify(Box::new(tx)));
+        let _handle = Signal::subscribe(self, Subscriber::Notify(Box::new(tx)));
 
         // Loop over notifications until we find a match
         while rx.recv().await.is_some() {
@@ -98,7 +98,7 @@ impl<T> Read<T> {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
         // Keep the subscription handle alive for the duration of waiting
-        let _handle = self.subscribe(Subscriber::Notify(Box::new(sender)));
+        let _handle = Signal::subscribe(self, Subscriber::Notify(Box::new(sender)));
 
         // Wait for notifications
         while let Some(()) = receiver.recv().await {
@@ -122,17 +122,22 @@ impl<T> Clone for Read<T> {
     fn clone(&self) -> Self { Self { value: self.value.clone(), subscribers: self.subscribers.clone() } }
 }
 
-impl<T: Clone> Get<T> for Read<T> {
+impl<T: Clone + 'static> Get<T> for Read<T> {
     fn get(&self) -> T {
+        tracing::info!("LOOK: Getting value from Read signal");
         CurrentContext::track(self);
         self.value.value()
     }
 }
 
-impl<T> Signal<T> for Read<T> {
-    fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionHandle { self.subscribers.subscribe(subscriber) }
+impl<T: 'static> Signal<T> for Read<T> {
+    fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionGuard { self.subscribers.subscribe(subscriber) }
 }
 
-impl<T: std::fmt::Display> std::fmt::Display for Read<T> {
+// impl<T: 'static> Observable for Read<T> {
+//     fn subscribe(&self, subscriber: Box<dyn Notify>) -> SubscriptionGuard { self.subscribers.subscribe(Subscriber::Notify(subscriber)) }
+// }
+
+impl<T: std::fmt::Display + Send + Sync + 'static> std::fmt::Display for Read<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.with(|v| write!(f, "{}", v)) }
 }

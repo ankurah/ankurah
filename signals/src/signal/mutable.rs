@@ -7,10 +7,16 @@ pub struct Mut<T> {
     subscribers: SubscriberSet<T>,
 }
 
-impl<T> Mut<T> {
+impl<T: 'static> Mut<T> {
     pub fn new(value: T) -> Self { Self { value: Value::new(value), subscribers: SubscriberSet::new() } }
 
-    pub fn set(&self, value: T) { self.value.set_with(value, |value| self.subscribers.notify(value)) }
+    pub fn set(&self, value: T) {
+        println!("Mut::set, pre set_with");
+        self.value.set_with(value, |value| {
+            println!("Mut::set, inside set_with closure");
+            self.subscribers.notify(value)
+        })
+    }
 
     /// Calls a closure with a borrow of the current value
     /// not tracked by the current context

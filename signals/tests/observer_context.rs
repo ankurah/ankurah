@@ -1,5 +1,5 @@
 mod common;
-use ankurah_signals::*;
+use ankurah_signals::{*, observer::CallbackObserver};
 use common::watcher;
 use std::sync::{Arc, Mutex};
 
@@ -36,7 +36,7 @@ fn test_basic_observer_subscription() {
 
     let observer = {
         let results_clone = results.clone();
-        Observer::new(Arc::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             results_clone.lock().unwrap().push("observer callback triggered".to_string());
         }))
     };
@@ -83,7 +83,7 @@ fn test_multiple_signals_single_observer() {
         let name_read_clone = name_read.clone();
         let age_read_clone = age_read.clone();
         let results_clone = results.clone();
-        Observer::new(Arc::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             let name_val = name_read_clone.get();
             let age_val = age_read_clone.get();
             results_clone.lock().unwrap().push(format!("{}: {}", name_val, age_val));
@@ -125,7 +125,7 @@ fn test_nested_observer_contexts() {
     let outer_observer = {
         let tracking_log = tracking_log.clone();
         let outer_read = outer_read.clone();
-        Observer::new(Arc::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             tracking_log.lock().unwrap().push("outer callback".to_string());
         }))
     };
@@ -133,14 +133,14 @@ fn test_nested_observer_contexts() {
     let inner_observer = {
         let tracking_log = tracking_log.clone();
         let inner_read = inner_read.clone();
-        Observer::new(Arc::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             tracking_log.lock().unwrap().push("inner callback".to_string());
         }))
     };
 
     // Test nested context setup and restoration
     CurrentContext::set(outer_observer.clone());
-    assert!(matches!(CurrentContext::current(), Some(ObserverContext::Observer(_))));
+    assert!(CurrentContext::current().is_some());
 
     // Access outer signal - should subscribe to outer observer
     outer_read.get();
@@ -155,7 +155,7 @@ fn test_nested_observer_contexts() {
     CurrentContext::unset();
 
     // Context should be restored to outer observer
-    assert!(matches!(CurrentContext::current(), Some(ObserverContext::Observer(_))));
+    assert!(CurrentContext::current().is_some());
 
     // Clean up
     CurrentContext::unset();
@@ -179,10 +179,10 @@ fn test_deep_nested_context_restoration() {
     let signals: Vec<Mut<i32>> = (0..5).map(|i| Mut::new(i)).collect();
     let reads: Vec<Read<i32>> = signals.iter().map(|s| s.read()).collect();
 
-    let observers: Vec<Observer> = (0..5)
+    let observers: Vec<CallbackObserver> = (0..5)
         .map(|i| {
             let read = reads[i].clone();
-            Observer::new(Arc::new(move || {
+            CallbackObserver::new(Arc::new(move || {
                 read.get(); // Subscribe this observer to this signal
             }))
         })
@@ -222,7 +222,7 @@ fn test_observer_cleanup() {
     let observer = {
         let notification_count = notification_count.clone();
         let read_signal = read_signal.clone();
-        Observer::new(Arc::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             read_signal.get(); // Re-subscribe on each notification
             *notification_count.lock().unwrap() += 1;
         }))
@@ -259,7 +259,7 @@ fn test_context_subscription_clearing() {
 
     let observer = {
         let notification_count = notification_count.clone();
-        Observer::new(Arc::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             *notification_count.lock().unwrap() += 1;
         }))
     };
@@ -301,7 +301,7 @@ fn test_react_style_try_finally_pattern() {
     let observer = {
         let read_signal_clone = read_signal.clone();
         let results_clone = results.clone();
-        Observer::new(Arc::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             let value = read_signal_clone.get();
             results_clone.lock().unwrap().push(format!("react: {}", value));
         }))

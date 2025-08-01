@@ -1,18 +1,35 @@
-use std::sync::{Arc, RwLock};
+use crate::subscription::{Subscriber, SubscriptionGuard};
 
-use crate::subscription::{Subscriber, SubscriptionHandle};
-pub trait Signal<T> {
-    fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionHandle;
+/// Signal is Generic over T because some Subscribers want a borrow or clone of T
+pub trait Signal<T: 'static> {
+    fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionGuard;
 }
-pub trait Get<T> {
+
+/// Trait for things that can be observed (signals), but minus the type parameter
+/// We need this to be dyn, because CONTEXT_STACK is a thread_local and we could have
+/// different types of observers.
+pub trait Observable {
+    /// Subscribe to this observable with a notification callback
+    fn subscribe(&self, subscriber: Box<dyn Notify>) -> SubscriptionGuard;
+}
+
+/// Core trait for signal observers
+pub trait Observer {
+    /// Get a subscriber that will be notified when signals change
+    fn get_notifier(&self) -> Box<dyn Notify + Send + Sync>;
+
+    /// Store a subscription handle to keep the subscription alive
+    fn store_handle(&self, handle: SubscriptionGuard);
+}
+pub trait Get<T: 'static> {
     fn get(&self) -> T;
 }
 
-pub trait Notify: Send + Sync {
+pub trait Notify {
     fn notify(&self);
 }
 
-pub trait NotifyValue<T>: Send + Sync {
+pub trait NotifyValue<T: 'static> {
     fn notify(&self, value: &T);
 }
 

@@ -184,8 +184,10 @@ name = "ankurah-signals"
 version = "0.5.2"
 dependencies = [
  "js-sys",
+ "send_wrapper",
  "tokio",
  "tokio-test",
+ "tracing",
  "wasm-bindgen",
 ]
 

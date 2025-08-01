@@ -30,6 +30,23 @@ fn test_basic_signal() {
     assert!(receiver.try_recv().is_ok(), "Should have received notification");
 }
 
+#[test]
+fn test_basic_subscriber() {
+    let mutable = Mut::new(42);
+    let read = mutable.read();
+
+    // does T: 'static cause problems for subscriber?
+    let subscriber = Box::new(|value: &i32| {
+        println!("Signal value changed to: {}", value);
+    });
+
+    let handle = read.subscribe(subscriber);
+
+    mutable.set(43);
+
+    drop(handle); // unsubscribe
+}
+
 #[tokio::test]
 async fn test_wait_value() {
     let mutable = Mut::new(1);

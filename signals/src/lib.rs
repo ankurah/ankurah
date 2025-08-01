@@ -55,7 +55,7 @@ age.set(70); // So render gets called (but only ONCE, not twice)
 */
 
 mod core;
-mod observer;
+pub mod observer;
 mod signal;
 mod subscription;
 pub mod traits;

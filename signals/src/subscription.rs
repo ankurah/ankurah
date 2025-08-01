@@ -1,41 +1,25 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 
 use crate::traits::{Notify, NotifyValue};
 
-trait Unsubscriber<'a>: Send + Sync {
-    fn unsubscribe(&self);
+pub struct SubscriptionGuard {
+    unsubscribe_fn: Box<dyn Fn() + Send + Sync>,
 }
 
-struct SetUnsubscriber<T> {
-    set: Weak<SubscriberSetInner<T>>,
-    id: SubscriptionId,
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) { (self.unsubscribe_fn)(); }
 }
 
-impl<'a, T> Unsubscriber<'a> for SetUnsubscriber<T> {
-    fn unsubscribe(&self) {
-        if let Some(set) = self.set.upgrade() {
-            set.unsubscribe(self.id);
-        }
-    }
-}
-
-pub struct SubscriptionHandle<'a> {
-    unsubscriber: Box<dyn Unsubscriber<'a> + 'a>,
-}
-
-impl<'a> Drop for SubscriptionHandle<'a> {
-    fn drop(&mut self) { self.unsubscriber.unsubscribe(); }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubscriptionId(usize);
 
 pub struct SubscriberSet<T>(Arc<SubscriberSetInner<T>>);
 
 pub struct SubscriberSetInner<T> {
-    active: Mutex<Vec<(SubscriptionId, Subscriber<T>)>>,
-    pending: Mutex<Vec<(SubscriptionId, Subscriber<T>)>>,
+    active: std::sync::Mutex<HashMap<SubscriptionId, Subscriber<T>>>,
+    pending: std::sync::Mutex<Vec<(SubscriptionId, Subscriber<T>)>>,
     next_id: AtomicUsize,
 }
 
@@ -44,19 +28,22 @@ impl<T> Clone for SubscriberSet<T> {
 }
 
 /// A value observer is an observer that wants to be notified of changes to a value with a borrow of the value
+/// TODO - can we think of a way to remove the Send + Sync bounds?
 pub enum Subscriber<T> {
     Callback(Box<dyn Fn(&T) + Send + Sync>),
-    Notify(Box<dyn Notify>),
-    Value(Box<dyn NotifyValue<T>>),
+    Notify(Box<dyn Notify + Send + Sync>),
+    Value(Box<dyn NotifyValue<T> + Send + Sync>),
 }
 
 impl<T, F> From<F> for Subscriber<T>
-where F: Fn(&T) + Send + Sync + 'static
+where
+    F: Fn(&T) + Send + Sync + 'static,
+    T: 'static,
 {
     fn from(f: F) -> Self { Subscriber::Callback(Box::new(f)) }
 }
 
-impl<T> Into<Subscriber<T>> for Box<dyn Notify> {
+impl<T> Into<Subscriber<T>> for Box<dyn Notify + Send + Sync> {
     fn into(self) -> Subscriber<T> { Subscriber::Notify(self) }
 }
 
@@ -64,9 +51,13 @@ impl<T> From<tokio::sync::mpsc::UnboundedSender<()>> for Subscriber<T> {
     fn from(sender: tokio::sync::mpsc::UnboundedSender<()>) -> Self { Subscriber::Notify(Box::new(sender)) }
 }
 
-impl<T> SubscriberSet<T> {
+impl<T: 'static> SubscriberSet<T> {
     pub fn new() -> Self {
-        Self(Arc::new(SubscriberSetInner { active: Mutex::new(Vec::new()), pending: Mutex::new(Vec::new()), next_id: AtomicUsize::new(0) }))
+        Self(Arc::new(SubscriberSetInner {
+            active: std::sync::Mutex::new(HashMap::new()),
+            pending: std::sync::Mutex::new(Vec::new()),
+            next_id: AtomicUsize::new(0),
+        }))
     }
 }
 
@@ -75,12 +66,12 @@ impl<T> std::ops::Deref for SubscriberSet<T> {
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl<T> SubscriberSetInner<T> {
-    pub fn subscribe<'a, S: Into<Subscriber<T>>>(self: &'a Arc<Self>, subscriber: S) -> SubscriptionHandle<'a> {
+impl<T: 'static> SubscriberSetInner<T> {
+    pub fn subscribe<S: Into<Subscriber<T>>>(self: &Arc<Self>, subscriber: S) -> SubscriptionGuard {
         let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         match self.active.try_lock() {
             Ok(mut active) => {
-                active.push((id, subscriber.into()));
+                active.insert(id, subscriber.into());
             }
             Err(_) => {
                 // TODO - document why the pending set is needed. I faintly recall that
@@ -89,18 +80,23 @@ impl<T> SubscriberSetInner<T> {
                 self.pending.lock().unwrap().push((id, subscriber.into()));
             }
         }
-        SubscriptionHandle { unsubscriber: Box::new(SetUnsubscriber { set: Arc::downgrade(self), id }) }
-    }
-    pub fn unsubscribe(self: &Arc<Self>, id: SubscriptionId) {
-        let mut active = self.active.lock().unwrap();
-        active.retain(|(id, _)| id != id);
+
+        // Create closure that captures weak reference and ID
+        let weak_set = Arc::downgrade(self);
+        let unsubscribe_closure = move || {
+            if let Some(set) = weak_set.upgrade() {
+                set.active.lock().unwrap().remove(&id);
+            }
+        };
+
+        SubscriptionGuard { unsubscribe_fn: Box::new(unsubscribe_closure) }
     }
 
     pub fn notify(self: &Arc<Self>, value: &T) {
         let mut active = self.active.lock().unwrap();
 
         // Notify all current subscribers
-        for (id, subscriber) in active.iter() {
+        for (_id, subscriber) in active.iter() {
             match subscriber {
                 Subscriber::Callback(callback) => callback(value),
                 Subscriber::Notify(notify) => notify.notify(),
