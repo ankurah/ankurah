@@ -39,6 +39,10 @@ impl CallbackObserverInner {
     /// Execute a function with this observer as the current context
     pub fn with_context<F: Fn()>(self: &Arc<Self>, f: &F) {
         let observer = CallbackObserver(Arc::clone(&self));
+
+        // Clear previous subscriptions before establishing new ones
+        self.clear();
+
         CurrentContext::set(observer.clone());
         f();
         CurrentContext::remove(&observer);
@@ -46,7 +50,11 @@ impl CallbackObserverInner {
 
     pub fn clear(self: &Arc<Self>) {
         // Abort all tasks - they'll be dropped automatically
-        self.task_handles.write().unwrap().clear();
+        let mut handles = self.task_handles.write().unwrap();
+        for handle in handles.iter() {
+            handle.abort();
+        }
+        handles.clear();
     }
 
     pub fn clone(self: &Arc<Self>) -> CallbackObserver { CallbackObserver(Arc::clone(&self)) }

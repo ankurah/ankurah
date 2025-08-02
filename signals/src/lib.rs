@@ -17,23 +17,26 @@ A reactive signals library for ankurah
 # Basic usage
 
 ```rust
+# tokio_test::block_on(async {
 use ankurah_signals::*;
 
 let signal = Mut::new(42);
 // cant subscribe to a mutable signal
-signal.read().subscribe(|value: &i32| println!("Read value: {}", value));
-// signal.map(|value| *value * 2).subscribe(|value| println!("Mapped value: {value}"));
+let _handle = signal.read().subscribe(|value: i32| println!("Read value: {}", value));
 signal.set(43);
+
+// Sleep to allow async notification propagation
+# tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 // Should print:
-// Read value: 42
-// Mapped value: 84
 // Read value: 43
-// Mapped value: 86
+# });
 ```
 # Observer usage
 
 ```rust
+# tokio_test::block_on(async {
 use ankurah_signals::*;
+use ankurah_signals::observer::CallbackObserver;
 
 let name = Mut::new("Buffy".to_string());
 let age = Mut::new(29);
@@ -41,15 +44,18 @@ let age = Mut::new(29);
 let renderer = {
     let name = name.read();
     let age = age.read();
-    Renderer::new(move || println!("name: {name}, age: {age}"))
+    CallbackObserver::new(std::sync::Arc::new(move || {
+        println!("name: {name}, age: {age}");
+    }))
 };
 
-renderer.render();
-// name: Buffy, age: 29, retired: false
+renderer.trigger();
+// name: Buffy, age: 29
 
-// observer is still listening to all three signals
-age.set(70); // So render gets called (but only ONCE, not twice)
-// name: Buffy, age: 70, retired: true
+age.set(70);
+
+// name: Buffy, age: 70
+# });
 ```
 
 */
