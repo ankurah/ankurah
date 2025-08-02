@@ -59,6 +59,7 @@ pub mod observer;
 mod signal;
 mod subscription;
 pub mod traits;
+mod util;
 
 #[cfg(feature = "react")]
 pub mod react;

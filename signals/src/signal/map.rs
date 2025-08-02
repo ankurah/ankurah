@@ -1,5 +1,4 @@
 use crate::core::Value;
-use crate::subscription::{Subscriber, SubscriberSet};
 use crate::traits::Get;
 use std::sync::Arc;
 
@@ -8,7 +7,6 @@ use std::sync::Arc;
 pub struct Map<I, O: 'static, F: Fn(&I) -> O> {
     upstream: Value<I>,
     map_function: Arc<F>,
-    subscribers: SubscriberSet<O>,
 }
 
 impl<I, O: 'static, F> Map<I, O, F>

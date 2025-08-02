@@ -1,15 +1,16 @@
-use std::sync::{Arc, RwLock};
-
 use crate::{
     core::{CurrentContext, Value},
-    subscription::{Subscriber, SubscriberSet, SubscriptionGuard},
-    traits::{Get, Notify, Observable, Signal, WaitResult},
+    subscription::SubscriptionGuard,
+    traits::{Get, Signal, WaitResult},
 };
 
 /// Read-only signal
 pub struct Read<T> {
     pub(crate) value: Value<T>,
-    pub(crate) subscribers: SubscriberSet<T>,
+    // NOTE! If we ever decide to stop using tokio::sync::broadcast because we decide we need syncrhonous notification
+    // we should not try to store Notifiers/Observers in the signal because of lifetime issues
+    // And instead create a new Broadcast struct that uses an arena or something to store the observers
+    pub(crate) broadcast: tokio::sync::broadcast::Sender<()>,
 }
 
 impl<T: 'static> Read<T> {
@@ -39,16 +40,22 @@ impl<T: 'static> Read<T> {
             return;
         }
 
-        // Create a notification channel
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Subscribe to change notifications
+        let mut receiver = self.observe();
 
-        // Subscribe to notifications
-        let _handle = Signal::subscribe(self, Subscriber::Notify(Box::new(tx)));
-
+        use tokio::sync::broadcast::error::RecvError;
         // Loop over notifications until we find a match
-        while rx.recv().await.is_some() {
-            if self.value.with(|v| *v == target_value) {
-                break;
+        loop {
+            match receiver.recv().await {
+                Ok(_) | Err(RecvError::Lagged(_)) => {
+                    if self.value.with(|v| *v == target_value) {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => {
+                    // Signal was dropped, stop waiting
+                    break;
+                }
             }
         }
 
@@ -95,15 +102,21 @@ impl<T: 'static> Read<T> {
         }
 
         // Need to subscribe and wait
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = self.observe();
 
-        // Keep the subscription handle alive for the duration of waiting
-        let _handle = Signal::subscribe(self, Subscriber::Notify(Box::new(sender)));
-
+        use tokio::sync::broadcast::error::RecvError;
         // Wait for notifications
-        while let Some(()) = receiver.recv().await {
-            if let Some(result) = self.with(|value| predicate(value).result()) {
-                return result;
+        loop {
+            match receiver.recv().await {
+                Ok(_) | Err(RecvError::Lagged(_)) => {
+                    if let Some(result) = self.with(|value| predicate(value).result()) {
+                        return result;
+                    }
+                }
+                Err(RecvError::Closed) => {
+                    // Signal was dropped, this should not happen since we hold &self
+                    break;
+                }
             }
         }
 
@@ -119,7 +132,7 @@ where T: Clone
 }
 
 impl<T> Clone for Read<T> {
-    fn clone(&self) -> Self { Self { value: self.value.clone(), subscribers: self.subscribers.clone() } }
+    fn clone(&self) -> Self { Self { value: self.value.clone(), broadcast: self.broadcast.clone() } }
 }
 
 impl<T: Clone + 'static> Get<T> for Read<T> {
@@ -131,12 +144,8 @@ impl<T: Clone + 'static> Get<T> for Read<T> {
 }
 
 impl<T: 'static> Signal<T> for Read<T> {
-    fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionGuard { self.subscribers.subscribe(subscriber) }
+    fn observe(&self) -> tokio::sync::broadcast::Receiver<()> { self.broadcast.subscribe() }
 }
-
-// impl<T: 'static> Observable for Read<T> {
-//     fn subscribe(&self, subscriber: Box<dyn Notify>) -> SubscriptionGuard { self.subscribers.subscribe(Subscriber::Notify(subscriber)) }
-// }
 
 impl<T: std::fmt::Display + Send + Sync + 'static> std::fmt::Display for Read<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.with(|v| write!(f, "{}", v)) }

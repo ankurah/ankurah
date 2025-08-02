@@ -1,7 +1,4 @@
-use crate::{
-    Signal,
-    traits::{Observable, Observer},
-};
+use crate::{Signal, traits::Observer};
 use std::{
     cell::RefCell,
     sync::{Arc, RwLock},
@@ -53,9 +50,7 @@ impl CurrentContext {
     {
         OBSERVER_STACK.with(|stack| {
             if let Some(observer) = stack.borrow().last() {
-                // observer.observe(signal);
-                let handle = signal.subscribe(observer.get_notifier());
-                observer.store_handle(handle);
+                observer.observe_signal_receiver(signal.observe());
             }
         });
     }
@@ -69,8 +64,25 @@ impl CurrentContext {
 
     /// Removes the current observer from the stack, restoring the previous one
     pub fn unset() {
+        unimplemented!("not sure if this is safe to use")
+        // OBSERVER_STACK.with(|stack| {
+        //     stack.borrow_mut().pop();
+        // });
+    }
+
+    /// Removes a specific observer from the stack
+    pub fn remove(observer: &dyn Observer) {
         OBSERVER_STACK.with(|stack| {
-            stack.borrow_mut().pop();
+            let mut stack = stack.borrow_mut();
+            // Check if the observer we want to remove is the last one
+            if let Some(last) = stack.last() {
+                if std::ptr::eq(last.as_ref() as *const dyn Observer, observer as *const dyn Observer) {
+                    stack.pop();
+                    return;
+                }
+            }
+            // If not the last one, search and remove it
+            stack.retain(|o| !std::ptr::eq(o.as_ref() as *const dyn Observer, observer as *const dyn Observer));
         });
     }
 

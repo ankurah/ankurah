@@ -1,21 +1,21 @@
-use crate::{Read, core::Value, subscription::SubscriberSet};
+use crate::{Read, Signal, core::Value};
 
-/// Mutable (stateful) signal. We intentionally do not implement Subscribe for this signal type
 #[derive(Clone)]
 pub struct Mut<T> {
     value: Value<T>,
-    subscribers: SubscriberSet<T>,
+    broadcast: tokio::sync::broadcast::Sender<()>,
 }
 
 impl<T: 'static> Mut<T> {
-    pub fn new(value: T) -> Self { Self { value: Value::new(value), subscribers: SubscriberSet::new() } }
+    pub fn new(value: T) -> Self {
+        let (broadcast, _) = tokio::sync::broadcast::channel(1);
+        Self { value: Value::new(value), broadcast }
+    }
 
     pub fn set(&self, value: T) {
-        println!("Mut::set, pre set_with");
-        self.value.set_with(value, |value| {
-            println!("Mut::set, inside set_with closure");
-            self.subscribers.notify(value)
-        })
+        self.value.set(value);
+        // Ignore send errors - just means no receivers, which is fine
+        let _ = self.broadcast.send(());
     }
 
     /// Calls a closure with a borrow of the current value
@@ -23,8 +23,12 @@ impl<T: 'static> Mut<T> {
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R { self.value.with(f) }
 
     /// Returns a read-only version of this signal  
-    pub fn read(&self) -> Read<T> { Read { value: self.value.clone(), subscribers: self.subscribers.clone() } }
+    pub fn read(&self) -> Read<T> { Read { value: self.value.clone(), broadcast: self.broadcast.clone() } }
 }
+
+// impl<T: 'static> Signal<T> for Mut<T> {
+//     fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionGuard { self.subscribers.subscribe(subscriber) }
+// }
 
 impl<T> Mut<T>
 where T: Clone

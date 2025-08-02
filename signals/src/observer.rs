@@ -1,9 +1,9 @@
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, RwLock};
 
 use crate::{
-    CurrentContext, SubscriptionGuard,
-    subscription::Subscriber,
-    traits::{Notify, Observer},
+    CurrentContext,
+    traits::Observer,
+    util::task::{self, TaskHandle},
 };
 
 /// A CallbackObserver is an observer that wraps a callback which is called
@@ -12,14 +12,14 @@ pub struct CallbackObserver(Arc<CallbackObserverInner>);
 pub struct CallbackObserverInner {
     // The callback to call when the observed signals notify the observer of a change
     callback: Box<dyn Fn() + Send + Sync>,
-    // The subscription handles to keep the subscriptions alive
-    subscription_handles: RwLock<Vec<SubscriptionGuard>>,
+    // Task handles for managing signal observation tasks
+    task_handles: RwLock<Vec<TaskHandle>>,
 }
 
 impl CallbackObserver {
     /// Create a new callback observer
     pub fn new<F: Fn() + Send + Sync + 'static>(callback: Arc<F>) -> Self {
-        Self(Arc::new(CallbackObserverInner { callback: Box::new(move || callback()), subscription_handles: RwLock::new(vec![]) }))
+        Self(Arc::new(CallbackObserverInner { callback: Box::new(move || callback()), task_handles: RwLock::new(vec![]) }))
     }
 }
 
@@ -43,23 +43,38 @@ impl CallbackObserverInner {
         CurrentContext::unset();
     }
 
-    pub fn subscriber<T>(self: &Arc<Self>) -> Subscriber<T> { Subscriber::Notify(Box::new(Arc::downgrade(self))) }
-    pub fn clear(self: &Arc<Self>) { self.subscription_handles.write().unwrap().clear(); }
-    pub fn store_handle(self: &Arc<Self>, handle: SubscriptionGuard) { self.subscription_handles.write().unwrap().push(handle); }
+    pub fn clear(self: &Arc<Self>) {
+        // Abort all tasks - they'll be dropped automatically
+        self.task_handles.write().unwrap().clear();
+    }
+
     pub fn clone(self: &Arc<Self>) -> CallbackObserver { CallbackObserver(Arc::clone(&self)) }
 }
 
-impl Notify for Weak<CallbackObserverInner> {
-    fn notify(&self) {
-        if let Some(inner) = self.upgrade() {
-            inner.trigger();
-        }
-    }
-}
-
-// SignalObserver implementation
+// Observer trait implementation - dyn safe
 impl Observer for CallbackObserver {
-    fn get_notifier(&self) -> Box<dyn Notify + Send + Sync> { Box::new(Arc::downgrade(&self.0)) }
+    fn observe_signal_receiver(&self, mut receiver: tokio::sync::broadcast::Receiver<()>) {
+        let observer_weak = Arc::downgrade(self);
 
-    fn store_handle(&self, handle: SubscriptionGuard) { self.0.store_handle(handle); }
+        let handle = task::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match receiver.recv().await {
+                    Ok(_) | Err(RecvError::Lagged(_)) => {
+                        if let Some(observer) = observer_weak.upgrade() {
+                            observer.trigger();
+                        } else {
+                            break; // Observer dropped
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        // Signal dropped, end task
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.task_handles.write().unwrap().push(handle);
+    }
 }

@@ -15,9 +15,10 @@ fn test_observer() {
         let age = age.read();
 
         CallbackObserver::new(Arc::new(move || {
+            println!("Render - pre-get calls");
             let body = format!("name: {}, age: {}", name.get(), age.get());
             println!("Render: {body}");
-            accumulate(&body)
+            accumulate(body)
         }))
     };
 
@@ -30,7 +31,7 @@ fn test_observer() {
     println!("Age set to 70, checking results...");
 
     // Give a moment for async notifications (if any)
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    // std::thread::sleep(std::time::Duration::from_millis(10));
 
     let results = check();
     println!("Results after age.set(70): {:?}", results);

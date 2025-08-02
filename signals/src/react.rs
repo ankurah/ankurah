@@ -3,7 +3,6 @@
 //! This module provides the `useObserve` hook that allows React components to
 //! automatically re-render when signals they access are updated.
 
-use send_wrapper::SendWrapper;
 use wasm_bindgen::prelude::*;
 
 use std::cell::OnceCell;
@@ -12,10 +11,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use crate::{
-    CurrentContext, SubscriptionGuard,
-    traits::{Notify, Observer},
-};
+use crate::{CurrentContext, traits::Observer, util::task::TaskHandle};
+
+#[cfg(target_arch = "wasm32")]
+use crate::util::task;
 
 #[wasm_bindgen(module = "react")]
 extern "C" {
@@ -33,7 +32,7 @@ extern "C" {
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct ReactObserver {
-    subscription_handles: Arc<std::sync::RwLock<Vec<SubscriptionGuard>>>,
+    task_handles: Arc<std::sync::RwLock<Vec<TaskHandle>>>,
     /// This function gets called when a change is observed
     notify_fn: Arc<OnceCell<js_sys::Function>>,
     /// This function gets called by react on the initial render with the notify_fn as an argument
@@ -80,15 +79,15 @@ impl ReactObserver {
 
         Self {
             version,
-            subscription_handles: Arc::new(std::sync::RwLock::new(vec![])),
+            task_handles: Arc::new(std::sync::RwLock::new(vec![])),
             notify_fn: trigger_render,
             subscribe_fn: Arc::new(subscribe_fn),
             get_snapshot: Arc::new(get_snapshot),
         }
     }
 
-    /// Clear all subscription handles
-    pub fn clear(&self) { self.subscription_handles.write().unwrap().clear(); }
+    /// Clear all task handles
+    pub fn clear(&self) { self.task_handles.write().unwrap().clear(); }
 }
 
 #[wasm_bindgen]
@@ -96,7 +95,7 @@ impl ReactObserver {
     /// Finish using this observer and restore the previous context
     /// This should be called in a finally block after component rendering
     #[wasm_bindgen]
-    pub fn finish(&self) { CurrentContext::unset(); }
+    pub fn finish(&self) { CurrentContext::remove(self as &dyn Observer); }
 }
 
 /// React hook for observing signals within a component
@@ -153,31 +152,39 @@ pub fn use_observe() -> Result<ReactObserver, JsValue> {
     }
 }
 
-// SignalObserver implementation for ReactObserver
+// Observer implementation for ReactObserver
 impl Observer for ReactObserver {
-    fn get_notifier(&self) -> Box<dyn Notify + Send + Sync> {
-        Box::new(SendWrapper::new(ReactNotifier { version: self.version.clone(), notify_fn: self.notify_fn.clone() }))
+    #[cfg(not(target_arch = "wasm32"))]
+    fn observe_signal_receiver(&self, _receiver: tokio::sync::broadcast::Receiver<()>) {
+        unreachable!("ReactObserver is only supported on WASM targets");
     }
 
-    fn store_handle(&self, handle: SubscriptionGuard) { self.subscription_handles.write().unwrap().push(handle); }
-}
+    #[cfg(target_arch = "wasm32")]
+    fn observe_signal_receiver(&self, mut receiver: tokio::sync::broadcast::Receiver<()>) {
+        let version = self.version.clone();
+        let notify_fn = self.notify_fn.clone();
 
-// Helper struct to implement Notify for React updates
-struct ReactNotifier {
-    version: Arc<AtomicU64>,
-    notify_fn: Arc<OnceCell<js_sys::Function>>,
-}
+        let handle = task::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match receiver.recv().await {
+                    Ok(_) | Err(RecvError::Lagged(_)) => {
+                        // Increment version to trigger React re-render
+                        version.fetch_add(1, Ordering::Relaxed);
 
-// Implementation for SendWrapper<ReactNotifier> to satisfy Send + Sync requirements
-// while keeping ReactNotifier single-threaded for WASM
-impl Notify for SendWrapper<ReactNotifier> {
-    fn notify(&self) {
-        tracing::info!("LOOK: Notifying React");
-        self.version.fetch_add(1, Ordering::Relaxed);
+                        // Call React's callback if it's been set
+                        if let Some(callback) = notify_fn.get() {
+                            let _ = callback.call0(&JsValue::NULL);
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        // Signal dropped, end task
+                        break;
+                    }
+                }
+            }
+        });
 
-        // Call React's callback if it's been set
-        if let Some(notify_fn) = self.notify_fn.get() {
-            notify_fn.call0(&JsValue::NULL).unwrap_or(JsValue::UNDEFINED);
-        }
+        self.task_handles.write().unwrap().push(handle);
     }
 }

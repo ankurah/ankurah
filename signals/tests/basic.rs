@@ -17,6 +17,10 @@ fn test_basic_signal() {
 
     mutable.set(43);
     mutable.set(44);
+
+    // Sleep to allow async notification propagation
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
     assert_eq!(check(), vec![43, 44]); // Signals are only notified on updates, not initial value
 
     // channel subscription
@@ -35,12 +39,9 @@ fn test_basic_subscriber() {
     let mutable = Mut::new(42);
     let read = mutable.read();
 
-    // does T: 'static cause problems for subscriber?
-    let subscriber = Box::new(|value: &i32| {
+    let handle = read.subscribe(|value: i32| {
         println!("Signal value changed to: {}", value);
     });
-
-    let handle = read.subscribe(subscriber);
 
     mutable.set(43);
 

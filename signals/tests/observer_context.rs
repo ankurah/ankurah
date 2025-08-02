@@ -1,5 +1,5 @@
 mod common;
-use ankurah_signals::{*, observer::CallbackObserver};
+use ankurah_signals::{observer::CallbackObserver, *};
 use common::watcher;
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +13,7 @@ fn test_manual_subscription_works() {
 
     // Manual subscription like in basic.rs test
     let results_clone = results.clone();
-    let subscription_handle = read_signal.subscribe(move |value: &i32| {
+    let subscription_handle = read_signal.subscribe(move |value: i32| {
         results_clone.lock().unwrap().push(format!("notified: {}", value));
     });
 

@@ -1,6 +1,5 @@
 use crate::{
     core::{CurrentContext, Value},
-    subscription::SubscriberSet,
     traits::{Get, Signal},
 };
 use std::{
@@ -13,7 +12,7 @@ pub struct Memo<I, O: 'static, F: Fn(&I) -> O> {
     function: F,
     upstream: Value<I>,
     value: Value<O>,
-    subscribers: SubscriberSet<O>,
+    pub(crate) broadcast: tokio::sync::broadcast::Sender<()>,
 }
 
 // impl<I, O: 'static, F: Fn(&I) -> O> Signal<O> for Memo<I, O, F> {}
