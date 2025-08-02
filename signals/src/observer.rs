@@ -38,9 +38,10 @@ impl CallbackObserverInner {
 
     /// Execute a function with this observer as the current context
     pub fn with_context<F: Fn()>(self: &Arc<Self>, f: &F) {
-        CurrentContext::set(CallbackObserver(Arc::clone(&self)));
+        let observer = CallbackObserver(Arc::clone(&self));
+        CurrentContext::set(observer.clone());
         f();
-        CurrentContext::unset();
+        CurrentContext::remove(&observer);
     }
 
     pub fn clear(self: &Arc<Self>) {
@@ -77,4 +78,6 @@ impl Observer for CallbackObserver {
 
         self.task_handles.write().unwrap().push(handle);
     }
+
+    fn observer_id(&self) -> usize { Arc::as_ptr(&self.0) as *const _ as usize }
 }

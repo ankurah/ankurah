@@ -3,8 +3,8 @@ use ankurah_signals::{observer::CallbackObserver, *};
 use common::watcher;
 use std::sync::Arc;
 
-#[test]
-fn test_observer() {
+#[tokio::test]
+async fn test_observer() {
     let name: Mut<&str> = Mut::new("Buffy");
     let age: Mut<u32> = Mut::new(29);
     // let retired: Map<u32, bool> = age.map(|age| *age > 65);

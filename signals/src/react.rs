@@ -187,4 +187,9 @@ impl Observer for ReactObserver {
 
         self.task_handles.write().unwrap().push(handle);
     }
+
+    fn observer_id(&self) -> usize {
+        // Use the pointer address of one of the Arc fields as a unique identifier
+        Arc::as_ptr(&self.version) as *const _ as usize
+    }
 }

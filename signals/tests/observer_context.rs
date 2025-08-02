@@ -4,8 +4,8 @@ use common::watcher;
 use std::sync::{Arc, Mutex};
 
 /// Test manual subscription to verify notification mechanism works
-#[test]
-fn test_manual_subscription_works() {
+#[tokio::test]
+async fn test_manual_subscription_works() {
     let signal = Mut::new(42);
     let read_signal = signal.read();
 
@@ -18,7 +18,7 @@ fn test_manual_subscription_works() {
     });
 
     signal.set(100);
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     println!("Manual subscription results: {:?}", *results.lock().unwrap());
     assert_eq!(*results.lock().unwrap(), vec!["notified: 100"]);
@@ -27,8 +27,8 @@ fn test_manual_subscription_works() {
 }
 
 /// Test basic Observer subscription and notification - simplified for debugging
-#[test]
-fn test_basic_observer_subscription() {
+#[tokio::test]
+async fn test_basic_observer_subscription() {
     let signal = Mut::new(42);
     let read_signal = signal.read();
 
@@ -64,15 +64,15 @@ fn test_basic_observer_subscription() {
     signal.set(100);
 
     // Give some time for async notification
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     println!("Results after signal change: {:?}", *results.lock().unwrap());
     assert_eq!(*results.lock().unwrap(), vec!["observer callback triggered"]);
 }
 
 /// Test multiple signals with single observer
-#[test]
-fn test_multiple_signals_single_observer() {
+#[tokio::test]
+async fn test_multiple_signals_single_observer() {
     let name = Mut::new("Alice");
     let age = Mut::new(25);
     let name_read = name.read();
@@ -102,19 +102,19 @@ fn test_multiple_signals_single_observer() {
 
     // Change name - should trigger observer
     name.set("Bob");
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*results.lock().unwrap(), vec!["Bob: 25"]);
     results.lock().unwrap().clear();
 
     // Change age - should also trigger observer
     age.set(30);
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*results.lock().unwrap(), vec!["Bob: 30"]);
 }
 
 /// Test nested observer contexts (critical for React component trees)
-#[test]
-fn test_nested_observer_contexts() {
+#[tokio::test]
+async fn test_nested_observer_contexts() {
     let outer_signal = Mut::new("outer");
     let inner_signal = Mut::new("inner");
     let outer_read = outer_signal.read();
@@ -152,13 +152,13 @@ fn test_nested_observer_contexts() {
     inner_read.get();
 
     // Restore outer context
-    CurrentContext::unset();
+    CurrentContext::pop();
 
     // Context should be restored to outer observer
     assert!(CurrentContext::current().is_some());
 
     // Clean up
-    CurrentContext::unset();
+    CurrentContext::pop();
     assert!(CurrentContext::current().is_none());
 
     // Test that signal changes trigger correct observers
@@ -166,7 +166,7 @@ fn test_nested_observer_contexts() {
     inner_signal.set("inner_changed");
 
     // Give callbacks time to execute
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     let log = tracking_log.lock().unwrap();
     assert!(log.contains(&"outer callback".to_string()));
@@ -174,8 +174,8 @@ fn test_nested_observer_contexts() {
 }
 
 /// Test context restoration with multiple nesting levels (React tree scenario)
-#[test]
-fn test_deep_nested_context_restoration() {
+#[tokio::test]
+async fn test_deep_nested_context_restoration() {
     let signals: Vec<Mut<i32>> = (0..5).map(|i| Mut::new(i)).collect();
     let reads: Vec<Read<i32>> = signals.iter().map(|s| s.read()).collect();
 
@@ -199,7 +199,7 @@ fn test_deep_nested_context_restoration() {
 
     // Now unwind the stack - each unset should restore previous context
     for i in (0..5).rev() {
-        CurrentContext::unset();
+        CurrentContext::pop();
 
         if i > 0 {
             // Should still have a context (the previous one)
@@ -212,8 +212,8 @@ fn test_deep_nested_context_restoration() {
 }
 
 /// Test observer cleanup and subscription handle management
-#[test]
-fn test_observer_cleanup() {
+#[tokio::test]
+async fn test_observer_cleanup() {
     let signal = Mut::new("test");
     let read_signal = signal.read();
 
@@ -235,7 +235,7 @@ fn test_observer_cleanup() {
 
     // Change signal - should trigger notification
     signal.set("changed1");
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*notification_count.lock().unwrap(), 1);
 
     // Clear observer subscriptions
@@ -243,13 +243,13 @@ fn test_observer_cleanup() {
 
     // Change signal again - should NOT trigger notification
     signal.set("changed2");
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*notification_count.lock().unwrap(), 1); // Should still be 1
 }
 
 /// Test that with_context properly clears previous subscriptions
-#[test]
-fn test_context_subscription_clearing() {
+#[tokio::test]
+async fn test_context_subscription_clearing() {
     let signal1 = Mut::new(1);
     let signal2 = Mut::new(2);
     let read1 = signal1.read();
@@ -271,7 +271,7 @@ fn test_context_subscription_clearing() {
 
     // Change signal1 - should trigger
     signal1.set(10);
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*notification_count.lock().unwrap(), 1);
 
     // Second context - should clear previous subscriptions and subscribe to signal2
@@ -281,18 +281,18 @@ fn test_context_subscription_clearing() {
 
     // Change signal1 - should NOT trigger (subscription was cleared)
     signal1.set(20);
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*notification_count.lock().unwrap(), 1); // Still 1
 
     // Change signal2 - should trigger
     signal2.set(30);
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*notification_count.lock().unwrap(), 2);
 }
 
 /// Test try/finally pattern that React will use  
-#[test]
-fn test_react_style_try_finally_pattern() {
+#[tokio::test]
+async fn test_react_style_try_finally_pattern() {
     let signal = Mut::new("react_test");
     let read_signal = signal.read();
 
@@ -318,7 +318,7 @@ fn test_react_style_try_finally_pattern() {
         };
 
         // This must happen even if the component throws
-        CurrentContext::unset();
+        CurrentContext::pop();
 
         result
     };
@@ -330,6 +330,71 @@ fn test_react_style_try_finally_pattern() {
 
     // Change signal - should trigger observer
     signal.set("updated");
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     assert_eq!(*results.lock().unwrap(), vec!["react: updated"]);
+}
+
+/// Test CurrentContext::remove() observer identification logic
+#[tokio::test]
+async fn test_context_remove_pointer_equality() {
+    let observer1 = CallbackObserver::new(Arc::new(|| {}));
+    let observer2 = CallbackObserver::new(Arc::new(|| {}));
+    let observer3 = CallbackObserver::new(Arc::new(|| {}));
+
+    // Initially no context
+    assert!(CurrentContext::current().is_none());
+
+    // Build a stack: observer1 -> observer2 -> observer3
+    CurrentContext::set(observer1.clone());
+    CurrentContext::set(observer2.clone());
+    CurrentContext::set(observer3.clone());
+
+    // Should have 3 observers in stack, current should be observer3
+    assert!(CurrentContext::current().is_some());
+
+    // Test 1: Remove the top observer (observer3) - should work like pop()
+    CurrentContext::remove(&observer3);
+    assert!(CurrentContext::current().is_some()); // Should still have observer2
+
+    // Test 2: Remove middle observer (observer1) from stack [observer1, observer2]
+    CurrentContext::remove(&observer1);
+    assert!(CurrentContext::current().is_some()); // Should still have observer2
+
+    // Test 3: Remove the last observer (observer2)
+    CurrentContext::remove(&observer2);
+    assert!(CurrentContext::current().is_none()); // Stack should be empty
+
+    // Test 4: Try to remove an observer that's not in the stack (should not crash)
+    let observer4 = CallbackObserver::new(Arc::new(|| {}));
+    CurrentContext::remove(&observer4); // Should be safe no-op
+    assert!(CurrentContext::current().is_none()); // Still empty
+
+    // Test 5: Verify that cloning doesn't break observer identification
+    CurrentContext::set(observer1.clone());
+    let observer1_clone = observer1.clone();
+
+    // Both the original and clone should refer to the same observer
+    assert!(CurrentContext::current().is_some());
+    CurrentContext::remove(&observer1_clone); // Remove using clone
+    assert!(CurrentContext::current().is_none()); // Should work
+
+    // Test 6: Test removing from middle of larger stack
+    CurrentContext::set(observer1.clone());
+    CurrentContext::set(observer2.clone());
+    CurrentContext::set(observer3.clone());
+    CurrentContext::set(observer4.clone());
+
+    // Stack is now: [observer1, observer2, observer3, observer4]
+    // Remove observer2 from the middle
+    CurrentContext::remove(&observer2);
+
+    // Stack should now be: [observer1, observer3, observer4]
+    // Current should still be observer4
+    assert!(CurrentContext::current().is_some());
+
+    // Clean up remaining observers
+    CurrentContext::remove(&observer4);
+    CurrentContext::remove(&observer3);
+    CurrentContext::remove(&observer1);
+    assert!(CurrentContext::current().is_none());
 }

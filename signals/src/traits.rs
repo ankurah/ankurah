@@ -17,6 +17,9 @@ pub trait Signal<T: 'static> {
 pub trait Observer {
     /// Observe a signal - takes a type-erased receiver
     fn observe_signal_receiver(&self, receiver: tokio::sync::broadcast::Receiver<()>);
+
+    /// Get a unique identifier for this observer (for equality comparison)
+    fn observer_id(&self) -> usize;
 }
 
 /// Trait for types that can subscribe to signal changes

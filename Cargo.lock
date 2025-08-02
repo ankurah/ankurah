@@ -189,6 +189,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

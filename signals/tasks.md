@@ -92,7 +92,7 @@ function MyReactComponent(current_time: StringRead<number>) {
 ### Observer Context Management
 
 - **OBSERVER_STACK**: Thread-local `RefCell<Vec<ObserverContext>>` manages nested observer contexts
-- **Push/Pop Behavior**: `CurrentContext::set()` pushes, `CurrentContext::unset()` pops (restores previous)
+- **Push/Pop Behavior**: `CurrentContext::set()` pushes, `CurrentContext::pop()` pops (restores previous)
 - **React Integration**: `useObserve()` hook properly sets/unsets context around component renders
 
 ### React Hook Implementation
