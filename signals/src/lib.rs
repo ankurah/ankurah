@@ -1,67 +1,65 @@
 /*!
-A reactive signals library for ankurah
+A signals library designed to support Ankurah's needs - but can be used independently as well.
+Supports both native Rust and WebAssembly/React use cases.
 
-# Design requirements:
-- Must be dyn object safe - Not sure if we want traits, but if we do, they must be dyn object safe.
-- Writers and readers must be different types
-- writers should not implement subscription methods
-- should be able to derive directly from either writer or reader via .map()
-- reader should keep a reference to the present value
-- Should offer closure subscriptions for T ?Clone (not sure what other bounds are needed)
-- Should offer stream subscriptions for T: Clone (not sure what other bounds are needed)
-
-# Nomenclature (not sure if applicable to different types or traits - we will have to see):
-- fn subscribe_now - immediately calls the given closure with the current value, and also with future values. Only applicable to stateful types
-- fn subscribe - does not immediately call the given closure - only when the value changes. could be stateless or stateful
-
-# Basic usage
+# Basic Usage in Rust
 
 ```rust
-use ankurah_signals::*;
+# use ankurah_signals::{Mut, Subscribe, CallbackObserver};
+# use std::sync::Arc;
 
-let signal = Mut::new(42);
-// cant subscribe to a mutable signal
-signal.read().subscribe(|value: &i32| println!("Read value: {}", value));
-// signal.map(|value| *value * 2).subscribe(|value| println!("Mapped value: {value}"));
-signal.set(43);
-// Should print:
-// Read value: 42
-// Mapped value: 84
-// Read value: 43
-// Mapped value: 86
-```
-# Observer usage
+let day = Mut::new("Friday");
+let vibe = Mut::new("grindcore");
 
-```rust
-use ankurah_signals::*;
+// Sometimes directly subscribing to the signal can be useful
+// your listener will not be called immediately, only when the signal changes
+// the subscription will be removed when the SubscriptionGuard is dropped
+let _guard1 = day.subscribe(|v| println!("The day is: {}", v));
+let _guard2 = vibe.subscribe(|v| println!("Vibe: {}", v));
 
-let name = Mut::new("Buffy".to_string());
-let age = Mut::new(29);
-// let retired = age.map(|age| *age > 65);
+// For things that need to track signal dependencies, we can use an Observer
 let renderer = {
-    let name = name.read();
-    let age = age.read();
-    Renderer::new(move || println!("name: {name}, age: {age}"))
+    let day = day.read(); // Read<T> signals can be constructed from a Mut<T> signal
+    let vibe = vibe.read();
+    CallbackObserver::new(Arc::new(move ||{
+        // Your "render" function that uses signals
+        // The Observer will automatically subscribe to the signals used
+        // during this dispatch using the thread-local CurrentObserver
+        println!("It's {day} and I'm {vibe}") // the Observer will automatically subscribe to the signals
+    }))
 };
 
-renderer.render();
-// name: Buffy, age: 29, retired: false
+renderer.trigger(); // trigger the initial "render". Signals used will be tracked by the observer.
+// Should print:
+// It's Friday and I'm grindcore
 
-// observer is still listening to all three signals
-age.set(70); // So render gets called (but only ONCE, not twice)
-// name: Buffy, age: 70, retired: true
+vibe.set("chillmaxing"); // triggers the direct signal subscription AND the observer
+// Should print:
+// Vibe: chillmaxing
+// It's Friday and I'm chillmaxing
+
+day.set("Saturday");
+// Should print:
+// The day is: Saturday
+// It's Saturday and I'm chillmaxing
 ```
 
 */
 
-mod core;
-mod observer;
+mod broadcast;
+mod context;
+pub mod observer;
+pub mod porcelain;
 mod signal;
-mod subscription;
-mod traits;
+mod value;
 
-pub use core::*;
+#[cfg(feature = "react")]
+pub mod react;
+
+pub use context::*;
 pub use observer::*;
+pub use porcelain::*;
 pub use signal::*;
-pub use subscription::*;
-pub use traits::*;
+
+#[cfg(feature = "react")]
+pub use react::*;

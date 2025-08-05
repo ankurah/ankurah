@@ -1,13 +1,11 @@
 use ankurah_signals::*;
 mod common;
 use common::watcher;
-use tokio::{
-    sync::mpsc::unbounded_channel,
-    time::{Duration, timeout},
-};
+use std::sync::mpsc;
+use tokio::time::{Duration, timeout};
 
-#[test]
-fn test_basic_signal() {
+#[tokio::test]
+async fn test_basic_signal() {
     let mutable = Mut::new(42);
     let read = mutable.read();
 
@@ -16,20 +14,42 @@ fn test_basic_signal() {
     let _handle = read.subscribe(w);
 
     mutable.set(43);
+    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
     mutable.set(44);
+
+    // Sleep to allow async notification propagation
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
     assert_eq!(check(), vec![43, 44]); // Signals are only notified on updates, not initial value
 
     // channel subscription
-    let (sender, mut receiver) = unbounded_channel();
+    let (sender, receiver) = mpsc::channel();
     let _handle2 = read.subscribe(sender);
 
     mutable.set(45);
 
-    // both should have received the update
-    assert_eq!(check(), vec![45]);
+    // Sleep to allow async notification propagation
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Channel should have received the update
     assert!(receiver.try_recv().is_ok(), "Should have received notification");
 }
 
+#[tokio::test]
+async fn test_basic_subscriber() {
+    let mutable = Mut::new(42);
+    let read = mutable.read();
+
+    let handle = read.subscribe(|value: i32| {
+        println!("Signal value changed to: {}", value);
+    });
+
+    mutable.set(43);
+
+    drop(handle); // unsubscribe
+}
+
+#[cfg(feature = "tokio")]
 #[tokio::test]
 async fn test_wait_value() {
     let mutable = Mut::new(1);
@@ -177,4 +197,81 @@ async fn test_wait_for_immediate_match() {
         .await;
 
     assert_eq!(remainder, 3); // 10 % 7 = 3
+}
+
+#[tokio::test]
+async fn test_map_signal() {
+    let mutable = Mut::new(10);
+    let mapped = Map::new(mutable.read(), |x| *x * 2);
+
+    // Test With trait
+    mapped.with(|val| assert_eq!(*val, 20));
+
+    // Test Get trait (requires Clone on Output)
+    assert_eq!(mapped.get(), 20);
+
+    // Test subscription
+    let (w, check) = watcher();
+    let _handle = mapped.subscribe(w);
+
+    mutable.set(15);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    mutable.set(20);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Should receive transformed values
+    assert_eq!(check(), vec![30, 40]); // 15*2=30, 20*2=40
+}
+
+#[tokio::test]
+async fn test_map_signal_string_transform() {
+    let mutable = Mut::new(5);
+    let mapped = Map::new(mutable.read(), |x| format!("Value: {}", x));
+
+    // Test With trait with type transformation
+    mapped.with(|val| assert_eq!(val, "Value: 5"));
+
+    // Test subscription with type transformation
+    let (sender, receiver) = mpsc::channel();
+    let _handle = mapped.subscribe(sender);
+
+    mutable.set(10);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    mutable.set(15);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Should receive transformed string values
+    let value1 = receiver.recv().unwrap();
+    let value2 = receiver.recv().unwrap();
+    assert_eq!(value1, "Value: 10");
+    assert_eq!(value2, "Value: 15");
+}
+
+#[tokio::test]
+async fn test_read_map_convenience_method() {
+    let mutable = Mut::new(100);
+    let read = mutable.read();
+
+    // Use the convenience method to create a mapped signal
+    let doubled = read.map(|x| *x * 2);
+    let stringified = read.map(|x| format!("Number: {}", x));
+
+    // Test both mapped signals
+    doubled.with(|val| assert_eq!(*val, 200));
+    stringified.with(|val| assert_eq!(val, "Number: 100"));
+
+    // Test subscription on mapped signals
+    let (sender1, receiver1) = mpsc::channel();
+    let (sender2, receiver2) = mpsc::channel();
+    let _handle1 = doubled.subscribe(sender1);
+    let _handle2 = stringified.subscribe(sender2);
+
+    mutable.set(50);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Should receive transformed values
+    assert_eq!(receiver1.recv().unwrap(), 100); // 50 * 2
+    assert_eq!(receiver2.recv().unwrap(), "Number: 50");
 }

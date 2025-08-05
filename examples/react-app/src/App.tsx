@@ -1,5 +1,11 @@
 import styled from "styled-components";
-import { withSignals, Entry, ctx, ws_client } from "example-wasm-bindings";
+import {
+  useObserve,
+  Entry,
+  ctx,
+  ws_client,
+  EntryView,
+} from "example-wasm-bindings";
 import { useMemo } from "react";
 
 const Table = styled.table`
@@ -53,67 +59,87 @@ const Card = styled.div`
   box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 `;
 
-function App() {
-  // Temporary hack - see https://github.com/ankurah/ankurah/issues/33
-  return withSignals(() => {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
+function signalObserver<T>(fc: React.FC<T>): React.FC<T> {
+  return (props: T) => {
+    const observer = useObserve();
+    try {
+      return fc(props);
+    } finally {
+      observer.finish();
+    }
+  };
+}
+const App: React.FC = signalObserver(() => {
+  const connectionState = ws_client().connection_state.value?.value();
 
-    // const [connectionState, setConnectionState] = useState<string | null>(null);
-    const connectionState = ws_client().connection_state.value?.value();
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    const test_items_signal = useMemo(() => {
-      console.log("initializing usememo");
-      return Entry.subscribe(ctx(), "added = '2024-01-01'");
-    }, []);
+  // ignore unused _h warning
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [test_items_signal, _h] = useMemo(() => {
+    // subscribe to the ankurah query - returns a signal
+    const signal = Entry.subscribe(ctx(), "added = '2024-01-01'");
 
-    const handleButtonPress = () => {
-      (async () => {
-        const transaction = ctx().begin();
-        await Entry.create(transaction, {
-          added: "2024-01-01",
-          ip_address: "127.0.0.1",
-          node_id: ctx().node_id().to_base64(),
-          complex: {
-            name: "wesh",
-            value: 123,
-            thing: {
-              Bravo: {
-                b: "ça dit quoi",
-                c: 123,
-              },
+    // subscribe to the signal - not necessary for this page - just illustrating how to do it
+    // the call to test_items_signal.value below is what is doing the real work here,
+    // because it automatically subscribes the current observer to the signal
+    const h = signal.subscribe((value) => {
+      console.log(
+        "Subcription to EntryResultSetSignal called the callback with value: ",
+        value,
+      );
+    });
+    // h is a SubscriptionGuard. We just keep it resident so the finalization registry doesn't free it and cancel the subscription
+    return [signal, h];
+  }, []);
+
+  const handleButtonPress = () => {
+    (async () => {
+      const transaction = ctx().begin();
+      await Entry.create(transaction, {
+        added: "2024-01-01",
+        ip_address: "127.0.0.1",
+        node_id: ctx().node_id().to_base64(),
+        complex: {
+          name: "wesh",
+          value: 123,
+          thing: {
+            Bravo: {
+              b: "ça dit quoi",
+              c: 123,
             },
           },
-        });
-        console.log("Entry created", ctx().node_id());
-        transaction.commit();
-      })();
-    };
+        },
+      });
+      transaction.commit();
+    })();
+  };
 
-    return (
-      <Container>
-        <h1>Ankurah Example App</h1>
-        <Card>
-          <div className="connection-status" style={{ textAlign: "center" }}>
-            Connection State: {connectionState}
-          </div>
-          <div style={{ textAlign: "center", margin: "20px 0" }}>
-            <button onClick={handleButtonPress}>Create</button>
-          </div>
-          <div style={{ textAlign: "center", marginBottom: "10px" }}>
-            Sessions:
-          </div>
-          <Table>
-            <thead>
-              <tr>
-                <Th>ID</Th>
-                <Th>Date Connected</Th>
-                <Th>IP Address</Th>
-                <Th>Node ID</Th>
-                <Th>Complex</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {test_items_signal.value.items.map((item) => (
+  return (
+    <Container>
+      <h1>Ankurah Example App</h1>
+      <Card>
+        <div className="connection-status" style={{ textAlign: "center" }}>
+          Connection State: {connectionState}
+        </div>
+        <div style={{ textAlign: "center", margin: "20px 0" }}>
+          <button onClick={handleButtonPress}>Create</button>
+        </div>
+        <div style={{ textAlign: "center", marginBottom: "10px" }}>
+          Sessions:
+        </div>
+        <Table>
+          <thead>
+            <tr>
+              <Th>ID</Th>
+              <Th>Date Connected</Th>
+              <Th>IP Address</Th>
+              <Th>Node ID</Th>
+              <Th>Complex</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {(() => {
+              // calling .value automatically subscribes the current observer to the signal
+              return test_items_signal.value.items.map((item: EntryView) => (
                 <Tr key={item.id().as_string()}>
                   <Td>{item.id().as_string()}</Td>
                   <Td>{item.added()}</Td>
@@ -121,13 +147,13 @@ function App() {
                   <Td>{item.node_id()}</Td>
                   <Td>{JSON.stringify(item.complex())}</Td>
                 </Tr>
-              ))}
-            </tbody>
-          </Table>
-        </Card>
-      </Container>
-    );
-  }) as JSX.Element;
-}
+              ));
+            })()}
+          </tbody>
+        </Table>
+      </Card>
+    </Container>
+  );
+});
 
 export default App;

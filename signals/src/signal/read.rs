@@ -1,115 +1,15 @@
-use std::sync::{Arc, RwLock};
-
 use crate::{
-    core::{CurrentContext, Value},
-    subscription::{Subscriber, SubscriberSet, SubscriptionHandle},
-    traits::{Get, Signal, WaitResult},
+    broadcast::Broadcast,
+    context::CurrentObserver,
+    porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
+    signal::{Get, GetReadCell, Signal, With, map::Map},
+    value::{ReadValueCell, ValueCell},
 };
 
 /// Read-only signal
 pub struct Read<T> {
-    pub(crate) value: Value<T>,
-    pub(crate) subscribers: SubscriberSet<T>,
-}
-
-impl<T> Read<T> {
-    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        CurrentContext::track(self);
-        self.value.with(f)
-    }
-
-    /// Wait for the signal to match a specific value
-    ///
-    /// This method waits until the signal's value equals the given target value using `PartialEq`.
-    ///
-    /// # Example
-    /// ```rust
-    /// # use ankurah_signals::*;
-    /// # tokio_test::block_on(async {
-    /// let signal = Mut::new(42); // Already at target value
-    ///
-    /// // Wait for the signal to reach the value 42 (already there)
-    /// signal.read().wait_value(42).await;
-    /// # });
-    /// ```
-    pub async fn wait_value(&self, target_value: T) -> ()
-    where T: PartialEq + Clone + Send + Sync + 'static {
-        // Check if current value already matches
-        if self.value.with(|v| *v == target_value) {
-            return;
-        }
-
-        // Create a notification channel
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // Subscribe to notifications
-        let _handle = self.subscribe(Subscriber::Notify(Box::new(tx)));
-
-        // Loop over notifications until we find a match
-        while rx.recv().await.is_some() {
-            if self.value.with(|v| *v == target_value) {
-                break;
-            }
-        }
-
-        // Subscription handle drops here, automatically unsubscribing
-    }
-
-    /// Wait for the signal to reach a value matching the given predicate
-    ///
-    /// This method supports flexible return types through the [`WaitResult`] trait.
-    ///
-    /// # Example
-    /// ```rust
-    /// # use ankurah_signals::*;
-    /// # tokio_test::block_on(async {
-    /// let signal = Mut::new(11);
-    ///
-    /// // Wait for a boolean predicate - returns ()
-    /// signal.read().wait_for(|&v| v > 5).await;
-    ///
-    /// // Wait for a the predicate and include a value in the response
-    /// assert_eq!(1, signal.read().wait_for(|&v| {
-    ///     let rem = v % 5;
-    ///     if rem == 0 { None } else { Some(rem) }
-    /// }).await);
-    /// # });
-    /// ```
-    ///
-    /// ## Behavior
-    /// - The predicate is called with the current value immediately
-    /// - If it returns a "ready" result (true, Some(value)), that result is returned
-    /// - Otherwise, the method subscribes to signal updates and calls the predicate on each change
-    /// - Returns when the predicate indicates readiness by returning true or Some(value)
-    ///
-    /// [`WaitResult`]: crate::traits::WaitResult
-    pub async fn wait_for<F, R>(&self, predicate: F) -> R::Output
-    where
-        F: Fn(&T) -> R,
-        R: WaitResult,
-        T: Send + Sync,
-    {
-        // Check current value first
-        if let Some(result) = self.with(|value| predicate(value).result()) {
-            return result;
-        }
-
-        // Need to subscribe and wait
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-
-        // Keep the subscription handle alive for the duration of waiting
-        let _handle = self.subscribe(Subscriber::Notify(Box::new(sender)));
-
-        // Wait for notifications
-        while let Some(()) = receiver.recv().await {
-            if let Some(result) = self.with(|value| predicate(value).result()) {
-                return result;
-            }
-        }
-
-        // This should never happen since Read<T> cannot be dropped while we hold &self
-        unreachable!("Subscription channel closed unexpectedly - this should not be possible");
-    }
+    pub(crate) value: ValueCell<T>,
+    pub(crate) broadcast: Broadcast,
 }
 
 impl<T> Read<T>
@@ -118,21 +18,77 @@ where T: Clone
     pub fn value(&self) -> T { self.value.value() }
 }
 
-impl<T> Clone for Read<T> {
-    fn clone(&self) -> Self { Self { value: self.value.clone(), subscribers: self.subscribers.clone() } }
+impl<T> Read<T> {
+    /// Create a mapped signal that transforms this signal's values on-demand
+    ///
+    /// Note: The Send + Sync bounds on Transform are only required if you want to subscribe
+    /// to the mapped signal. For just using .with(), they're not needed.
+    pub fn map<Output, Transform>(&self, transform: Transform) -> Map<Self, T, Output, Transform>
+    where
+        T: 'static,
+        Transform: Fn(&T) -> Output,
+        Output: 'static,
+    {
+        Map::new(self.clone(), transform)
+    }
 }
 
-impl<T: Clone> Get<T> for Read<T> {
+impl<T> Clone for Read<T> {
+    fn clone(&self) -> Self { Self { value: self.value.clone(), broadcast: self.broadcast.clone() } }
+}
+
+impl<T: Clone + 'static> Get<T> for Read<T> {
     fn get(&self) -> T {
-        CurrentContext::track(self);
+        CurrentObserver::track(self);
         self.value.value()
     }
 }
 
-impl<T> Signal<T> for Read<T> {
-    fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionHandle { self.subscribers.subscribe(subscriber) }
+impl<T: 'static> With<T> for Read<T> {
+    fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        CurrentObserver::track(self);
+        self.value.with(f)
+    }
 }
 
-impl<T: std::fmt::Display> std::fmt::Display for Read<T> {
+impl<T: 'static> GetReadCell<T> for Read<T> {
+    fn get_readcell(&self) -> ReadValueCell<T> { self.value.readvalue() }
+}
+
+impl<T> Signal for Read<T> {
+    fn broadcast(&self) -> crate::broadcast::Ref { self.broadcast.reference() }
+}
+
+/// foo == bar will automatically track the signals used in the comparison against the current observer
+impl<T: PartialEq + 'static> PartialEq for Read<T> {
+    fn eq(&self, other: &Self) -> bool {
+        // Short-circuit if comparing to self to avoid deadlock from nested with calls
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        self.with(|self_val| other.with(|other_val| self_val == other_val))
+    }
+}
+
+impl<T: Eq + 'static> Eq for Read<T> {}
+
+impl<T: std::fmt::Display + Send + Sync + 'static> std::fmt::Display for Read<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.with(|v| write!(f, "{}", v)) }
+}
+
+impl<T> Subscribe<T> for Read<T>
+where T: Clone + Send + Sync + 'static
+{
+    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
+    where F: IntoSubscribeListener<T> {
+        let listener = listener.into_subscribe_listener();
+        let ro_value = self.get_readcell(); // Get read-only value handle
+        let reader = self.broadcast();
+        let subscription = reader.listen(move || {
+            // Get current value when the broadcast fires
+            let current_value = ro_value.value();
+            listener(current_value);
+        });
+        SubscriptionGuard::new(subscription)
+    }
 }

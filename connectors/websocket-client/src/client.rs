@@ -1,7 +1,7 @@
 use crate::sender::WebsocketPeerSender;
 use ankurah_core::{connector::PeerSender, policy::PolicyAgent, storage::StorageEngine, Node};
 use ankurah_proto as proto;
-use ankurah_signals::{Get, Mut, Read};
+use ankurah_signals::{Mut, Read, Wait};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -136,6 +136,7 @@ where
 
     /// Get the node ID of the connected server (if connected)
     pub fn server_node_id(&self) -> Option<proto::EntityId> {
+        use ankurah_signals::Get;
         match self.state().get() {
             ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id),
             _ => None,

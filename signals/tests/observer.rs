@@ -1,9 +1,11 @@
 mod common;
 use ankurah_signals::*;
 use common::watcher;
+use std::sync::Arc;
 
-#[test]
-fn test_observer() {
+#[tokio::test]
+async fn test_observer() {
+    tracing_subscriber::fmt::init();
     let name: Mut<&str> = Mut::new("Buffy");
     let age: Mut<u32> = Mut::new(29);
     // let retired: Map<u32, bool> = age.map(|age| *age > 65);
@@ -13,34 +15,30 @@ fn test_observer() {
         let name = name.read();
         let age = age.read();
 
-        Renderer::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             let body = format!("name: {}, age: {}", name.get(), age.get());
-            println!("Render: {body}");
-            accumulate(&body)
-        })
+            accumulate(body)
+        }))
     };
 
-    renderer.render();
+    renderer.trigger();
     assert_eq!(check(), ["name: Buffy, age: 29"]); // got initial render
     assert_eq!(check(), [] as [&str; 0]); // no changes
 
+    println!("About to set age to 70...");
     age.set(70);
+    println!("Age set to 70, checking results...");
 
-    // LEFT OFF HERE for observer - audit internals
-    // this .render() should not be necessary - so something is wrong with the tracking logic (probably just never finished it)
-    // be sure to validate that signals are un-tracked at the start of each render, and re-tracked based on usage
-    // so that we are only observing signals relevant to the current conditional state
-    // eg:
-    // Renderer::new(move || {
-    //     let doc = if(age.get() < 18) {
-    //       // render function is not called subsequently if name changes
-    //       "Jane Doe (minor)".to_string();
-    //     }else{
-    //        // name and age are observed
-    //        format!("name: {}, age: {}", name.get(), age.get())
-    //     }
-    //    accumulate(doc);
-    // });
-    renderer.render();
-    assert_eq!(check(), ["name: Buffy, age: 70"]);
+    // Give a moment for async notifications (if any)
+    // std::thread::sleep(std::time::Duration::from_millis(10));
+
+    let results = check();
+    println!("Results after age.set(70): {:?}", results);
+
+    // For now, manually trigger to see what happens
+    println!("Manually triggering renderer...");
+    renderer.trigger();
+    let results_after_manual = check();
+
+    assert_eq!(results_after_manual, ["name: Buffy, age: 70"]);
 }
