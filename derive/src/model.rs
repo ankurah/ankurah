@@ -109,15 +109,16 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                     pub fn subscribe (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
                         let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
-                        let (signal, rwsignal) = ::ankurah::derive_deps::reactive_graph::signal::RwSignal::new(#resultset_name::default()).split();
+                        let signal = ::ankurah::derive_deps::ankurah_signals::Mut::new(#resultset_name::default());
+                        let signal_clone = signal.clone();
 
                         let context2 = (*context).clone();
                         let handle2 = handle.clone();
                         let future = Box::pin(async move {
-                            use ::ankurah::derive_deps::reactive_graph::traits::Set;
+                            // Direct method call on Mut - no trait needed
                             let handle = context2
                                 .subscribe(predicate.as_str(), move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                                    rwsignal.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
+                                    signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
                                 })
                                 .await;
                             match handle {
@@ -132,7 +133,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         wasm_bindgen_futures::spawn_local(future);
 
                         Ok(#resultset_signal_name{
-                            sig: Box::new(signal),
+                            sig: Box::new(signal.read()),
                             handle: Box::new(handle)
                         })
                     }

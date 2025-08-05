@@ -8,9 +8,24 @@ documentation = "https://docs.rs/ankurah-storage-indexeddb-wasm"
 homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
+[features]
+default = ["tokio"]
+tokio   = ["dep:tokio"]
+wasm    = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures"]
+react   = ["wasm", "dep:send_wrapper"]
+
 [dependencies]
-tokio = { version = "1.40", features = ["sync"] }
+tokio = { version = "1.40", features = ["sync"], optional = true }
+
+# WASM and React integration (optional)
+wasm-bindgen         = { version = "0.2", optional = true }
+js-sys               = { version = "0.3", optional = true }
+send_wrapper         = { version = "0.6", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+tracing = "0.1"
 
 [dev-dependencies]
-tokio      = { version = "1.40", features = ["sync", "macros", "rt", "time"] }
-tokio-test = "0.4"
+tokio              = { version = "1.40", features = ["sync", "macros", "rt", "time"] }
+tokio-test         = "0.4"
+tracing-subscriber = "0.3"

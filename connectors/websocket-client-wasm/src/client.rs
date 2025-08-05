@@ -4,8 +4,8 @@ use ankurah_core::connector::NodeComms;
 use ankurah_core::{action_info, notice_info, Node};
 
 use crate::connection_state::*;
+use ankurah::signals::{Mut, Read};
 use gloo_timers::future::sleep;
-use reactive_graph::prelude::*;
 use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
@@ -31,7 +31,7 @@ pub struct WebsocketClient {
 pub(crate) struct ClientInner {
     server_url: String,
     connection: RefCell<Option<Connection>>,
-    state: reactive_graph::signal::RwSignal<ConnectionState>,
+    state: Mut<ConnectionState>,
     node: Box<dyn NodeComms>,
     reconnect_delay: RefCell<u64>,
     pending_ready_wakers: RefCell<Vec<Waker>>,
@@ -49,7 +49,7 @@ impl WebsocketClient {
             server_url: server_url.to_string(),
             node: Box::new(node),
             connection: RefCell::new(None),
-            state: reactive_graph::signal::RwSignal::new(ConnectionState::None),
+            state: Mut::new(ConnectionState::None),
             reconnect_delay: RefCell::new(0),
             pending_ready_wakers: RefCell::new(Vec::new()),
         });
@@ -59,7 +59,7 @@ impl WebsocketClient {
         Ok(WebsocketClient { inner })
     }
 
-    pub fn connection_state(&self) -> reactive_graph::signal::ReadSignal<ConnectionState> { self.inner.state.read_only() }
+    pub fn connection_state(&self) -> Read<ConnectionState> { self.inner.state.read() }
 }
 
 #[wasm_bindgen]
@@ -72,9 +72,9 @@ impl WebsocketClient {
 
     #[wasm_bindgen(getter, js_name = "connection_state")]
     pub fn js_connection_state(&self) -> ConnectionStateEnumSignal {
-        let state = self.inner.state.read_only();
-        let signal = reactive_graph::computed::Memo::new(move |_| state.get().into());
-        ConnectionStateEnumSignal { sig: Box::new(signal), handle: Box::new(()) }
+        let sig = Box::new(self.inner.state.read().map(|state| state.into()));
+
+        ConnectionStateEnumSignal { sig, handle: Box::new(()) }
     }
 }
 
@@ -164,7 +164,7 @@ impl Future for ReadyFuture {
     type Output = Result<(), ()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let ConnectionState::Connected { .. } = self.client.state.get() {
+        if let ConnectionState::Connected { .. } = self.client.state.value() {
             Poll::Ready(Ok(()))
         } else {
             self.client.pending_ready_wakers.borrow_mut().push(cx.waker().clone());

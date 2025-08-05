@@ -6,14 +6,14 @@ publish = false
 
 [features]
 default = []
-wasm    = ["dep:wasm-bindgen", "ankurah/wasm", "ankurah/wasm", "ankurah/react"]
+wasm    = ["dep:wasm-bindgen", "ankurah/wasm", "ankurah/react"]
 
 [dependencies]
-ankurah        = { path = "../../ankurah", features = ["derive"], version = "^0.5.2" }
-serde          = { version = "1.0", features = ["derive"] }
-wasm-bindgen   = { version = "0.2", optional = true }
-reactive_graph = { version = "0.1.4", features = ["effects"], optional = true }
-tsify          = { version = "0.4" }
+ankurah      = { path = "../../ankurah", features = ["derive"], version = "^0.5.2" }
+serde        = { version = "1.0", features = ["derive"] }
+wasm-bindgen = { version = "0.2", optional = true }
+
+tsify = { version = "0.4" }
 
 ##### patch - something is wrong with the uuid crate for wasm
 getrandom = { version = "0.3", features = ["wasm_js"] }

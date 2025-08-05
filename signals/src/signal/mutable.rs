@@ -1,31 +1,80 @@
-use crate::{Read, core::Value, subscription::SubscriberSet};
+use crate::{
+    broadcast::Broadcast,
+    context::CurrentObserver,
+    porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
+    signal::{Get, GetReadCell, Signal, With, read::Read},
+    value::{ReadValueCell, ValueCell},
+};
 
-/// Mutable (stateful) signal. We intentionally do not implement Subscribe for this signal type
+#[derive(Clone)]
 pub struct Mut<T> {
-    value: Value<T>,
-    subscribers: SubscriberSet<T>,
+    value: ValueCell<T>,
+    broadcast: Broadcast,
 }
 
-impl<T> Mut<T> {
-    pub fn new(value: T) -> Self { Self { value: Value::new(value), subscribers: SubscriberSet::new() } }
+impl<T: 'static> Mut<T> {
+    pub fn new(value: T) -> Self {
+        let broadcast = Broadcast::new();
+        Self { value: ValueCell::new(value), broadcast }
+    }
 
-    pub fn set(&self, value: T) { self.value.set_with(value, |value| self.subscribers.notify(value)) }
+    pub fn set(&self, value: T) {
+        self.value.set(value);
+        // Notify all listeners
+        self.broadcast.send();
+    }
 
     /// Calls a closure with a borrow of the current value
     /// not tracked by the current context
-    fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R { self.value.with(f) }
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R { self.value.with(f) }
 
-    /// Readonly signal downstream of this mutable signal
-    pub fn read(&self) -> Read<T> {
-        let value = self.value.clone();
-        let subscribers = self.subscribers.clone();
-        Read { value, subscribers }
-    }
+    /// Returns a read-only version of this signal  
+    pub fn read(&self) -> Read<T> { Read { value: self.value.clone(), broadcast: self.broadcast.clone() } }
 }
+
+// impl<T: 'static> Signal<T> for Mut<T> {
+//     fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionGuard { self.subscribers.subscribe(subscriber) }
+// }
 
 impl<T> Mut<T>
 where T: Clone
 {
     /// Returns a clone of the current value - not tracked by the current context
-    fn value(&self) -> T { self.value.value() }
+    pub fn value(&self) -> T { self.value.value() }
+}
+
+impl<T: Clone + 'static> Get<T> for Mut<T> {
+    fn get(&self) -> T { self.value.value() }
+}
+
+impl<T: 'static> With<T> for Mut<T> {
+    fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        CurrentObserver::track(self);
+        self.value.with(f)
+    }
+}
+
+impl<T: 'static> GetReadCell<T> for Mut<T> {
+    fn get_readcell(&self) -> ReadValueCell<T> { self.value.readvalue() }
+}
+
+impl<T> Signal for Mut<T> {
+    fn broadcast(&self) -> crate::broadcast::Ref { self.broadcast.reference() }
+}
+
+impl<T> Subscribe<T> for Mut<T>
+where T: Clone + Send + Sync + 'static
+{
+    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
+    where F: IntoSubscribeListener<T> {
+        let listener = listener.into_subscribe_listener();
+        let ro_value = self.get_readcell(); // Get read-only value handle
+        let reader = self.broadcast();
+        let subscription = reader.listen(move || {
+            // Get current value when the broadcast fires
+            let current_value = ro_value.value();
+            listener(current_value);
+        });
+        SubscriptionGuard::new(subscription)
+    }
 }
