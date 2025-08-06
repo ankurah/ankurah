@@ -13,10 +13,10 @@ ankurah-signals
 ankurah
 
 # Tier 5: Storage and connector crates (depends on core tiers)
+ankurah-storage-sled
 ankurah-connector-local-process
 ankurah-websocket-server
 ankurah-websocket-client
-ankurah-storage-sled
 ankurah-storage-postgres
 ankurah-storage-indexeddb-wasm
 ankurah-websocket-client-wasm
