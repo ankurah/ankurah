@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-websocket-client"
-version       = "0.5.2"
+version       = "0.5.4"
 edition       = "2021"
 description   = "Ankurah WebSocket Client - Native WebSocket client for Ankurah"
 license       = "MIT OR Apache-2.0"
@@ -9,9 +9,9 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
-ankurah-core    = { path = "../../core", version = "^0.5.2" }
-ankurah-proto   = { path = "../../proto", version = "^0.5.2" }
-ankurah-signals = { path = "../../signals", version = "^0.5.2" }
+ankurah-core    = { path = "../../core", version = "^0.5.4" }
+ankurah-proto   = { path = "../../proto", version = "^0.5.4" }
+ankurah-signals = { path = "../../signals", version = "^0.5.4" }
 
 # WebSocket implementation
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
@@ -32,6 +32,6 @@ url       = "2.0"
 strum     = { version = "0.27", features = ["derive"] }
 
 [dev-dependencies]
-ankurah-storage-sled     = { path = "../../storage/sled", version = "^0.5.2" }
-ankurah-websocket-server = { path = "../websocket-server", version = "^0.5.2" }
-ankurah                  = { path = "../../ankurah", version = "^0.5.2", features = ["derive"] }
+ankurah-storage-sled     = { path = "../../storage/sled", version = "^0.5.4" }
+ankurah-websocket-server = { path = "../websocket-server", version = "^0.5.4" }
+ankurah                  = { path = "../../ankurah", version = "^0.5.4", features = ["derive"] }

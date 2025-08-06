@@ -8,7 +8,6 @@ ankurah-derive
 # Tier 3: Core functionality (depends on tier 1 & 2)
 ankurah-core
 ankurah-signals
-ankurah-react-signals
 
 # Tier 4: Main API crate (depends on all above)
 ankurah
