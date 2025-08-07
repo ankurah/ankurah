@@ -55,12 +55,14 @@ async fn test_sled() -> Result<()> {
     // (remote updates are another story)
     let album = context.get::<AlbumView>(album_id).await?;
 
-    let (w, check) = generic_watcher::<AlbumView>();
-    let (w2, check2) = generic_watcher::<String>();
+    let (w, check_view) = generic_watcher::<AlbumView>();
+    let (w2, check_name) = generic_watcher::<String>();
+    let (w3, check_year) = generic_watcher::<String>();
 
     // store the handles to keep the subscriptions alive
     let _h1 = album.subscribe(w);
-    let _h2 = album.name().subscribe(w2); // TODO: YrsString<String> implement Subscribe<String>
+    let _h2 = album.name().subscribe(w2);
+    let _h3 = album.year().subscribe(w3);
 
     let trx2 = context.begin();
     let album_mut2 = album.edit(&trx2)?;
@@ -68,16 +70,26 @@ async fn test_sled() -> Result<()> {
     album_mut2.name().delete(16, 1)?; // remove the "typo" b from bowl
 
     // we haven't committed the transaction yet - neither watcher should have received any changes
-    assert_eq!(check(), vec![]);
-    assert_eq!(check2(), Vec::<String>::new());
+    assert_eq!(check_view(), vec![]);
+    assert_eq!(check_name(), vec![] as Vec<String>);
+    assert_eq!(check_year(), vec![] as Vec<String>);
 
     // commit the transaction
     trx2.commit().await?;
 
     // now we should have one change since we performed a delete operation
     // TODO - implement PartialEq for Views
-    assert_eq!(check(), vec![album]);
-    assert_eq!(check2(), vec!["The rest of the owl".to_owned()]);
+    assert_eq!(check_view(), vec![album.clone()]);
+    assert_eq!(check_name(), vec!["The rest of the owl".to_owned()]);
+
+    let trx3 = context.begin();
+    let album_mut3 = album.edit(&trx3)?;
+    album_mut3.year().replace("2025")?;
+    trx3.commit().await?;
+
+    assert_eq!(check_view(), vec![album]); // AlbumView changed
+    assert_eq!(check_name(), vec![] as Vec<String>); // name didn't change
+    assert_eq!(check_year(), vec!["2025".to_owned()]); // year changed
 
     Ok(())
 }
