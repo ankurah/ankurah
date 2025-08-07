@@ -98,7 +98,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                 #[wasm_bindgen(js_class = #name)]
                 impl #namespace_struct {
-                    pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+                    pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::EntityId) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                         context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
                     }
 
@@ -109,7 +109,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                     pub fn subscribe (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
                         let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
-                        let signal = ::ankurah::derive_deps::ankurah_signals::Mut::new(#resultset_name::default());
+                        let signal = ::ankurah::signals::Mut::new(#resultset_name::default());
                         let signal_clone = signal.clone();
 
                         let context2 = (*context).clone();
@@ -167,7 +167,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     pub fn items(&self) -> Vec<#view_name> {
                         self.0.items.to_vec()
                     }
-                    pub fn by_id(&self, id: ::ankurah::derive_deps::ankurah_proto::EntityId) -> Option<#view_name> {
+                    pub fn by_id(&self, id: ::ankurah::proto::EntityId) -> Option<#view_name> {
                         self.0.items.iter().find(|item| item.id() == id).map(|item| item.clone())
                         // todo generate a map on demand if there are more than a certain number of items (benchmark this)
                     }
@@ -187,6 +187,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         #wasm_attributes
         #clone_derive
+        #[derive(Debug, PartialEq)]
         pub struct #view_name {
             entity: ::ankurah::entity::Entity,
             #(
@@ -204,7 +205,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         impl ::ankurah::model::Model for #name {
             type View = #view_name;
             type Mutable<'rec> = #mutable_name<'rec>;
-            fn collection() -> ankurah::derive_deps::ankurah_proto::CollectionId {
+            fn collection() -> ankurah::proto::CollectionId {
                 #collection_str.into()
             }
             fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
@@ -245,6 +246,25 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
         }
 
+        impl ::ankurah::signals::Signal for #view_name {
+            fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
+                self.entity.broadcast().reference().listen(listener)
+            }
+            
+            fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
+                self.entity.broadcast().id()
+            }
+        }
+
+        impl ::ankurah::signals::Subscribe<#view_name> for #view_name {
+            fn subscribe<F>(&self, listener: F) -> ::ankurah::signals::SubscriptionGuard
+            where
+                F: ::ankurah::signals::subscribe::IntoSubscribeListener<#view_name>,
+            {
+                ::ankurah::core::model::vsub_helper(self, listener)
+            }
+        }
+
         // TODO wasm-bindgen this
         impl #view_name {
             pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::policy::AccessDenied> {
@@ -256,7 +276,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         #wasm_attributes
         impl #view_name {
-            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
+            pub fn id(&self) -> ankurah::proto::EntityId {
                 self.entity.id().clone()
             }
             #(
@@ -295,7 +315,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
         }
         impl<'rec> #mutable_name<'rec> {
-            pub fn id(&self) -> ankurah::derive_deps::ankurah_proto::EntityId {
+            pub fn id(&self) -> ankurah::proto::EntityId {
                 self.entity.id().clone()
             }
             #(
@@ -305,14 +325,14 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             )*
         }
 
-        impl<'a> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #view_name {
-            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityId {
+        impl<'a> Into<ankurah::proto::EntityId> for &'a #view_name {
+            fn into(self) -> ankurah::proto::EntityId {
                 ankurah::View::id(self)
             }
         }
 
-        impl<'a, 'rec> Into<ankurah::derive_deps::ankurah_proto::EntityId> for &'a #mutable_name<'rec> {
-            fn into(self) -> ankurah::derive_deps::ankurah_proto::EntityId {
+        impl<'a, 'rec> Into<ankurah::proto::EntityId> for &'a #mutable_name<'rec> {
+            fn into(self) -> ankurah::proto::EntityId {
                 ::ankurah::model::Mutable::id(self)
             }
         }

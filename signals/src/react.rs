@@ -14,7 +14,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{CurrentObserver, Signal, broadcast::ListenerGuard, observer::Observer};
+use crate::{
+    CurrentObserver, Signal,
+    broadcast::{BroadcastId, ListenerGuard},
+    observer::Observer,
+};
 
 #[wasm_bindgen(module = "react")]
 extern "C" {
@@ -28,7 +32,7 @@ extern "C" {
     ) -> Result<JsValue, JsValue>;
 }
 
-struct SubscriptionEntry {
+struct ListenerEntry {
     guard: ListenerGuard,
     marked_for_removal: bool,
 }
@@ -43,7 +47,7 @@ struct ReactObserverWeak(Weak<Inner>);
 
 pub struct Inner {
     _human_readable_id: usize,
-    subscriptions: std::sync::RwLock<HashMap<usize, SubscriptionEntry>>,
+    entries: std::sync::RwLock<HashMap<BroadcastId, ListenerEntry>>,
     /// This function gets called when a change is observed
     trigger_render: Arc<SendWrapper<OnceCell<js_sys::Function>>>,
 
@@ -97,7 +101,7 @@ impl ReactObserver {
         Self(Arc::new(Inner {
             _human_readable_id: react_observer_id,
             version,
-            subscriptions: std::sync::RwLock::new(HashMap::new()),
+            entries: std::sync::RwLock::new(HashMap::new()),
             trigger_render,
             subscribe_fn: subscribe_fn,
             get_snapshot: get_snapshot,
@@ -106,23 +110,18 @@ impl ReactObserver {
     #[allow(unused)]
     fn weak(&self) -> ReactObserverWeak { ReactObserverWeak(Arc::downgrade(&self.0)) }
 
-    /// Clear all subscriptions
-    // pub fn clear(&self) { self.subscriptions.write().unwrap().clear(); }
-
-    /// Mark all existing subscriptions for removal (mark phase of mark-and-sweep)
+    /// Mark all existing listeners for removal (mark phase of mark-and-sweep)
     fn mark_all_for_removal(&self) {
-        if let Ok(mut subscriptions) = self.0.subscriptions.write() {
-            for entry in subscriptions.values_mut() {
-                entry.marked_for_removal = true;
-            }
+        let mut entries = self.0.entries.write().expect("entries lock is poisoned");
+        for entry in entries.values_mut() {
+            entry.marked_for_removal = true;
         }
     }
 
-    /// Remove all subscriptions that are still marked for removal (sweep phase)
-    fn sweep_marked_subscriptions(&self) {
-        if let Ok(mut subscriptions) = self.0.subscriptions.write() {
-            subscriptions.retain(|_, entry| !entry.marked_for_removal);
-        }
+    /// Remove all listeners that are still marked for removal (sweep phase)
+    fn sweep_marked_listeners(&self) {
+        let mut entries = self.0.entries.write().expect("entries lock is poisoned");
+        entries.retain(|_, entry| !entry.marked_for_removal);
     }
 }
 
@@ -133,8 +132,8 @@ impl ReactObserver {
     /// This should be called in a finally block after component rendering
     #[wasm_bindgen]
     pub fn finish(&self) {
-        // Sweep away any subscriptions that weren't preserved during render
-        self.sweep_marked_subscriptions();
+        // Sweep away any listeners that weren't preserved during render
+        self.sweep_marked_listeners();
         CurrentObserver::remove(self as &dyn Observer);
     }
 }
@@ -192,34 +191,34 @@ pub fn use_observe() -> Result<ReactObserver, JsValue> {
 // Observer implementation for ReactObserver
 impl Observer for ReactObserver {
     fn observe(&self, signal: &dyn Signal) {
-        let broadcast_ref = signal.broadcast();
-        let signal_id = broadcast_ref.unique_id();
+        let broadcast_id = signal.broadcast_id();
 
-        // Check if we already have a subscription to this signal
-        if let Ok(mut subscriptions) = self.0.subscriptions.write() {
-            if let Some(entry) = subscriptions.get_mut(&signal_id) {
-                // We already have a subscription, just unmark it for removal
-                entry.marked_for_removal = false;
-                return;
-            }
-
-            // Create new subscription
-            let version = self.0.version.clone();
-            let trigger_render = self.0.trigger_render.clone();
-            let subscription = broadcast_ref.listen(move || {
-                // Increment version to trigger React re-render
-                version.fetch_add(1, Ordering::Relaxed);
-
-                // Call React's callback if it's been set
-                if let Some(callback) = trigger_render.get() {
-                    let _ = callback.call0(&JsValue::NULL);
-                }
-            });
-
-            let entry = SubscriptionEntry { guard: subscription, marked_for_removal: false };
-
-            subscriptions.insert(signal_id, entry);
+        // Check if we already have a listener for this broadcast
+        let mut entries = self.0.entries.write().expect("entries lock is poisoned");
+        if let Some(entry) = entries.get_mut(&broadcast_id) {
+            // We already have a listener for this broadcast, just unmark it for removal
+            entry.marked_for_removal = false;
+            return;
         }
+
+        // Create new listener
+        let version = self.0.version.clone();
+        let trigger_render = self.0.trigger_render.clone();
+        entries.insert(
+            broadcast_id,
+            ListenerEntry {
+                guard: signal.listen(Arc::new(move || {
+                    // Increment version to trigger React re-render
+                    version.fetch_add(1, Ordering::Relaxed);
+
+                    // Call React's callback if it's been set
+                    if let Some(callback) = trigger_render.get() {
+                        let _ = callback.call0(&JsValue::NULL);
+                    }
+                })),
+                marked_for_removal: false,
+            },
+        );
     }
 
     fn observer_id(&self) -> usize {

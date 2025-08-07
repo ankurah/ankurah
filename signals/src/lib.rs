@@ -46,7 +46,7 @@ day.set("Saturday");
 
 */
 
-mod broadcast;
+pub mod broadcast;
 mod context;
 pub mod observer;
 pub mod porcelain;
@@ -56,6 +56,7 @@ mod value;
 #[cfg(feature = "react")]
 pub mod react;
 
+pub use broadcast::BroadcastId;
 pub use context::*;
 pub use observer::*;
 pub use porcelain::*;

@@ -120,7 +120,7 @@ where
 
         let system_entity = self.0.entities.create(collection_id.clone());
 
-        let lww_backend = system_entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
+        let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
 
         let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
@@ -254,7 +254,7 @@ where
         for state in storage.fetch_states(&ankql::ast::Predicate::True).await? {
             let (_entity_changed, entity) =
                 self.0.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state.clone()).await?;
-            let lww_backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
+            let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");
 

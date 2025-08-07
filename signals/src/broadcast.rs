@@ -2,6 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 
+/// A unique identifier for a broadcast that cannot be forged or extracted.
+/// Can only be created by a Broadcast and used for deduplication/comparison.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BroadcastId(usize);
+
 /// A listener that can be called when broadcast notifications are sent.
 pub type Listener = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -15,9 +20,16 @@ pub trait IntoListener {
 /// Uses synchronous function callbacks for immediate notification.
 #[derive(Clone)]
 pub struct Broadcast(Arc<Inner>);
+
 struct Inner {
     listeners: std::sync::RwLock<HashMap<usize, Listener>>,
     next_id: AtomicUsize,
+}
+
+impl std::fmt::Debug for Broadcast {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Broadcast").field("listeners", &self.0.listeners.read().unwrap().len()).finish()
+    }
 }
 
 /// A listen-only reference to a broadcast
@@ -29,9 +41,26 @@ pub struct ListenerGuard {
     id: usize,
 }
 
+impl ListenerGuard {
+    /// Get the broadcast ID that this guard is subscribed to
+    pub fn broadcast_id(&self) -> BroadcastId {
+        // Use the same logic as Broadcast::id() - the Arc pointer address
+        if let Some(inner) = self.inner.upgrade() {
+            BroadcastId(Arc::as_ptr(&inner) as usize)
+        } else {
+            // If the broadcast is gone, we still need to return a consistent ID
+            // This should be rare since the guard keeps the broadcast alive
+            BroadcastId(self.inner.as_ptr() as usize)
+        }
+    }
+}
+
 impl Broadcast {
     /// Creates a new Broadcast struct
     pub fn new() -> Self { Self(Arc::new(Inner { listeners: std::sync::RwLock::new(HashMap::new()), next_id: AtomicUsize::new(0) })) }
+
+    /// Get the unique identifier for this broadcast
+    pub fn id(&self) -> BroadcastId { BroadcastId(Arc::as_ptr(&self.0) as usize) }
 
     /// Sends a notification to all active listeners
     pub fn send(&self) {
@@ -63,7 +92,7 @@ impl<'a> Ref<'a> {
     }
 
     /// Get a unique identifier for this broadcast (for deduplication purposes)
-    pub fn unique_id(&self) -> usize { Arc::as_ptr(&self.0.0) as usize }
+    pub fn broadcast_id(&self) -> BroadcastId { BroadcastId(Arc::as_ptr(&self.0.0) as usize) }
 }
 
 impl Drop for ListenerGuard {
@@ -82,6 +111,11 @@ impl<F> IntoListener for F
 where F: Fn() + Send + Sync + 'static
 {
     fn into_listener(self) -> Listener { Arc::new(self) }
+}
+
+// Implementation for Listener itself (Arc<dyn Fn() + Send + Sync + 'static>)
+impl IntoListener for Listener {
+    fn into_listener(self) -> Listener { self }
 }
 
 #[cfg(feature = "tokio")]

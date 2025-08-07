@@ -5,7 +5,7 @@ use std::{
 
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
-    property::Backends,
+    property::backend::backend_from_string,
     storage::{StorageCollection, StorageEngine},
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
@@ -244,7 +244,6 @@ impl StorageCollection for PostgresBucket {
 
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
 
-        let backends = Backends::from_state_buffers(&state.payload.state.state_buffers)?;
         let mut columns: Vec<String> = vec!["id".to_owned(), "state_buffer".to_owned(), "head".to_owned(), "attestations".to_owned()];
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
         params.push(&id);
@@ -253,21 +252,35 @@ impl StorageCollection for PostgresBucket {
         params.push(&attestations);
 
         let mut materialized: Vec<(String, Option<PGValue>)> = Vec::new();
-        for (column, value) in backends.property_values() {
-            let pg_value: Option<PGValue> = value.map(|value| value.into());
-            if !self.has_column(&column) {
-                // We don't have the column yet and we know the type.
-                if let Some(ref pg_value) = pg_value {
-                    self.add_missing_columns(&mut client, vec![(column.clone(), pg_value.postgres_type())]).await?;
-                } else {
-                    // The column doesn't exist yet and we don't have a value.
-                    // This means the entire column is already null/none so we
-                    // don't need to set anything.
+        let mut seen_properties = std::collections::HashSet::new();
+
+        // Process property values directly from state buffers
+        for (name, state_buffer) in state.payload.state.state_buffers.iter() {
+            let backend = backend_from_string(name, Some(state_buffer))?;
+            for (column, value) in backend.property_values() {
+                if !seen_properties.insert(column.clone()) {
+                    // Skip if property already seen in another backend
+                    // TODO: this should cause all (or subsequent?) fields with the same name
+                    // to be suffixed with the property id when we have property ids
+                    // requires some thought (and field metadata) on how to do this right
                     continue;
                 }
-            }
 
-            materialized.push((column.clone(), pg_value));
+                let pg_value: Option<PGValue> = value.map(|value| value.into());
+                if !self.has_column(&column) {
+                    // We don't have the column yet and we know the type.
+                    if let Some(ref pg_value) = pg_value {
+                        self.add_missing_columns(&mut client, vec![(column.clone(), pg_value.postgres_type())]).await?;
+                    } else {
+                        // The column doesn't exist yet and we don't have a value.
+                        // This means the entire column is already null/none so we
+                        // don't need to set anything.
+                        continue;
+                    }
+                }
+
+                materialized.push((column.clone(), pg_value));
+            }
         }
 
         for (name, parameter) in &materialized {

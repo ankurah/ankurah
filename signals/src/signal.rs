@@ -9,9 +9,17 @@ pub use read::*;
 
 /// Core trait for signals - provides observation capability without regard to a payload value
 /// The sole purpose of this trait is to provide a way to listen to changes to a signal.
+///
+/// Note: Multiple signals may share the same broadcast (and thus the same broadcast_id).
+/// This is intentional and allows observers to deduplicate subscriptions efficiently.
 pub trait Signal {
-    /// Get a reference to this signal's broadcast
-    fn broadcast(&self) -> crate::broadcast::Ref;
+    /// Listen to changes to this signal with a listener function
+    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard;
+
+    /// Get the broadcast identifier for this signal.
+    /// Multiple signals may return the same broadcast_id if they share a broadcast.
+    /// The broadcast_id remains valid as a deduplication key as long as any ListenerGuard for that broadcast exists.
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId;
 }
 
 /// Trait for getting the current value of a signal in a way that will be tracked by the current context

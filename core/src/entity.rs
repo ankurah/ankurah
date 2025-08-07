@@ -2,14 +2,16 @@ use crate::lineage::{self, GetEvents, Retrieve};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
-    property::{Backends, PropertyValue},
-    storage::StorageCollectionWrapper,
+    property::{
+        backend::{backend_from_string, PropertyBackend},
+        PropertyValue,
+    },
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use tracing::{debug, error, warn};
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
@@ -25,13 +27,15 @@ pub struct TemporaryEntity(Arc<EntityInner>);
 pub struct EntityInner {
     pub id: EntityId,
     pub collection: CollectionId,
-    pub(crate) backends: Backends,
+    pub(crate) backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
     head: std::sync::Mutex<Clock>,
     // TODO when a transaction creates a downstream entity, we needf to provide a weak reference back to the transaction
     // so we can error in the case that the transaction has been committed/rolled back (dropped)
     // This is necessary for JsMutables (to be created) which cannot have a borrow of the transaction
     // Standard Mutables will have a borrow of the transaction so it should not be possible for them to outlive the transaction
     pub(crate) upstream: Option<Entity>,
+    /// Broadcast for notifying Signal subscribers about entity changes
+    pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
 }
 
 impl std::ops::Deref for Entity {
@@ -44,6 +48,13 @@ impl std::ops::Deref for TemporaryEntity {
     type Target = EntityInner;
 
     fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl PartialEq for Entity {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare entities by their ID - two entities are equal if they have the same ID
+        self.id == other.id
+    }
 }
 
 /// A weak reference to an entity
@@ -61,12 +72,16 @@ impl Entity {
 
     pub fn collection(&self) -> &CollectionId { &self.collection }
 
-    pub fn backends(&self) -> &Backends { &self.backends }
-
     pub fn head(&self) -> Clock { self.head.lock().unwrap().clone() }
 
     pub fn to_state(&self) -> Result<State, StateError> {
-        let state_buffers = self.backends.to_state_buffers()?;
+        let backends = self.backends.lock().expect("other thread panicked, panic here too");
+        let mut state_buffers = BTreeMap::default();
+        for (name, backend) in &*backends {
+            let state_buffer = backend.to_state_buffer()?;
+            state_buffers.insert(name.clone(), state_buffer);
+        }
+        let state_buffers = ankurah_proto::StateBuffers(state_buffers);
         Ok(State { state_buffers, head: self.head() })
     }
 
@@ -76,21 +91,47 @@ impl Entity {
     }
 
     // used by the Model macro
-    pub fn create(id: EntityId, collection: CollectionId, backends: Backends) -> Self {
-        Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(Clock::default()), upstream: None }))
+    pub fn create(id: EntityId, collection: CollectionId) -> Self {
+        Self(Arc::new(EntityInner {
+            id,
+            collection,
+            backends: Arc::new(Mutex::new(BTreeMap::default())),
+            head: std::sync::Mutex::new(Clock::default()),
+            upstream: None,
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        }))
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
     fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(&state.state_buffers)?;
-        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
+        let mut backends = BTreeMap::new();
+        for (name, state_buffer) in state.state_buffers.iter() {
+            let backend = backend_from_string(name, Some(state_buffer))?;
+            backends.insert(name.to_owned(), backend);
+        }
+
+        Ok(Self(Arc::new(EntityInner {
+            id,
+            collection,
+            backends: Arc::new(Mutex::new(backends)),
+            head: std::sync::Mutex::new(state.head.clone()),
+            upstream: None,
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        })))
     }
 
     /// Generate an event which contains all operations for all backends since the last time they were collected
     /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
     /// using commit_head
     pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
-        let operations = self.backends.take_accumulated_operations()?;
+        let backends = self.backends.lock().expect("other thread panicked, panic here too");
+        let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
+        for (name, backend) in &*backends {
+            if let Some(ops) = backend.to_operations()? {
+                operations.insert(name.clone(), ops);
+            }
+        }
+
         if operations.is_empty() {
             Ok(None)
         } else {
@@ -121,9 +162,11 @@ impl Entity {
         if head.is_empty() && event.is_entity_create() {
             // this is the creation event for a new entity, so we simply accept it
             for (backend_name, operations) in event.operations.iter() {
-                self.backends.apply_operations((*backend_name).to_owned(), operations)?;
+                self.apply_operations((*backend_name).to_owned(), operations)?;
             }
             *self.head.lock().unwrap() = event.id().into();
+            // Notify Signal subscribers about the change
+            self.broadcast.send();
             return Ok(true);
         }
 
@@ -156,9 +199,11 @@ impl Entity {
                     // on the event geter (which needs to abstract storage collection anyway,
                     // due to the need for remote event retrieval)
                     // ...so we get a cache hit in the most common cases, and it can paginate the rest.
-                    self.backends.apply_operations((*backend_name).to_owned(), operations)?;
+                    self.apply_operations((*backend_name).to_owned(), operations)?;
                 }
                 *self.head.lock().unwrap() = new_head;
+                // Notify Signal subscribers about the change
+                self.broadcast.send();
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet: _ } => {
@@ -169,7 +214,7 @@ impl Entity {
                 // just doing the needful for now
                 debug!("NotDescends - applying");
                 for (backend_name, operations) in event.operations.iter() {
-                    self.backends.apply_operations((*backend_name).to_owned(), operations)?;
+                    self.apply_operations((*backend_name).to_owned(), operations)?;
                 }
                 // concurrent - so augment the head
                 self.head.lock().unwrap().insert(event.id());
@@ -206,8 +251,10 @@ impl Entity {
             }
             lineage::Ordering::Descends => {
                 debug!("{self} apply_state - new head descends from current, applying");
-                self.backends.apply_state(state)?;
+                self.overwrite_backends(state)?;
                 *self.head.lock().unwrap() = new_head;
+                // Notify Signal subscribers about the change
+                self.broadcast.send();
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
@@ -234,17 +281,68 @@ impl Entity {
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
     pub fn snapshot(&self) -> Self {
+        // Inline fork logic
+        let backends = self.backends.lock().expect("other thread panicked, panic here too");
+        let mut forked = BTreeMap::new();
+        for (name, backend) in &*backends {
+            forked.insert(name.clone(), backend.fork());
+        }
+
         Self(Arc::new(EntityInner {
             id: self.id,
             collection: self.collection.clone(),
-            backends: self.backends.fork(),
+            backends: Arc::new(Mutex::new(forked)),
             head: std::sync::Mutex::new(self.head.lock().unwrap().clone()),
             upstream: Some(self.clone()),
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
     }
 
+    /// Get a reference to the entity's broadcast for Signal implementations
+    pub fn broadcast(&self) -> &ankurah_signals::broadcast::Broadcast { &self.broadcast }
+
+    /// Get a specific backend, creating it if it doesn't exist
+    pub fn get_backend<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
+        let backend_name = P::property_backend_name();
+        let mut backends = self.backends.lock().expect("other thread panicked, panic here too");
+        if let Some(backend) = backends.get(&backend_name) {
+            let upcasted = backend.clone().as_arc_dyn_any();
+            Ok(upcasted.downcast::<P>().unwrap()) // TODO: handle downcast error
+        } else {
+            let backend = backend_from_string(&backend_name, None)?;
+            let upcasted = backend.clone().as_arc_dyn_any();
+            let typed_backend = upcasted.downcast::<P>().unwrap(); // TODO handle downcast error
+            backends.insert(backend_name, backend);
+            Ok(typed_backend)
+        }
+    }
+
+    /// Apply operations to a specific backend
+    pub fn apply_operations(&self, backend_name: String, operations: &Vec<ankurah_proto::Operation>) -> Result<(), MutationError> {
+        let mut backends = self.backends.lock().expect("other thread panicked, panic here too");
+        if let Some(backend) = backends.get(&backend_name) {
+            backend.apply_operations(operations)?;
+        } else {
+            let backend = backend_from_string(&backend_name, None)?;
+            backend.apply_operations(operations)?;
+            backends.insert(backend_name, backend);
+        }
+        Ok(())
+    }
+
+    /// Apply state by replacing backends with new ones from state buffers
+    /// TODO: Ideally this would be based on a play-forward of events
+    fn overwrite_backends(&self, state: &ankurah_proto::State) -> Result<(), MutationError> {
+        let mut backends = self.backends.lock().expect("other thread panicked, panic here too");
+        for (name, state_buffer) in state.state_buffers.iter() {
+            let backend = backend_from_string(name, Some(state_buffer))?;
+            backends.insert(name.to_owned(), backend);
+        }
+        Ok(())
+    }
+
     pub fn values(&self) -> Vec<(String, Option<PropertyValue>)> {
-        let backends = self.backends.backends.lock().unwrap();
+        let backends = self.backends.lock().expect("other thread panicked, panic here too");
         backends
             .values()
             .flat_map(|backend| {
@@ -275,7 +373,7 @@ impl Filterable for Entity {
             Some(self.id.to_base64())
         } else {
             // Iterate through backends to find one that has this property
-            let backends = self.backends.backends.lock().unwrap();
+            let backends = self.backends.lock().expect("other thread panicked, panic here too");
             backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
                 Some(value) => match value {
                     PropertyValue::String(s) => Some(s),
@@ -294,8 +392,22 @@ impl Filterable for Entity {
 
 impl TemporaryEntity {
     pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
-        let backends = Backends::from_state_buffers(&state.state_buffers)?;
-        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
+        // Inline from_state_buffers logic
+        let mut backends = BTreeMap::new();
+        for (name, state_buffer) in state.state_buffers.iter() {
+            let backend = backend_from_string(name, Some(state_buffer))?;
+            backends.insert(name.to_owned(), backend);
+        }
+
+        Ok(Self(Arc::new(EntityInner {
+            id,
+            collection,
+            backends: Arc::new(Mutex::new(backends)),
+            head: std::sync::Mutex::new(state.head.clone()),
+            upstream: None,
+            // slightly annoying that we need to populate this, given that it won't be used
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        })))
     }
 }
 
@@ -308,7 +420,7 @@ impl Filterable for TemporaryEntity {
             Some(self.0.id.to_base64())
         } else {
             // Iterate through backends to find one that has this property
-            let backends = self.0.backends.backends.lock().unwrap();
+            let backends = self.0.backends.lock().expect("other thread panicked, panic here too");
             backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
                 Some(value) => match value {
                     PropertyValue::String(s) => Some(s),
@@ -389,7 +501,7 @@ impl WeakEntitySet {
                         return Ok(entity);
                     }
                 }
-                let entity = Entity::create(*id, collection_id.to_owned(), Backends::new());
+                let entity = Entity::create(*id, collection_id.to_owned());
                 entities.insert(*id, entity.weak());
                 Ok(entity)
             }
@@ -399,7 +511,7 @@ impl WeakEntitySet {
     pub fn create(&self, collection: CollectionId) -> Entity {
         let mut entities = self.0.write().unwrap();
         let id = EntityId::new();
-        let entity = Entity::create(id, collection, Backends::new());
+        let entity = Entity::create(id, collection);
         entities.insert(id, entity.weak());
         entity
     }
