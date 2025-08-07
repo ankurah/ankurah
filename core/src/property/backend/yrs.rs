@@ -5,8 +5,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use yrs::Update;
-use yrs::{updates::decoder::Decode, GetString, ReadTxn, StateVector, Text, Transact};
+use yrs::{updates::decoder::Decode, GetString, Observable, ReadTxn, StateVector, Text, Transact};
+use yrs::{Update, WriteTxn};
 
 use crate::{
     error::{MutationError, StateError},
@@ -55,10 +55,32 @@ impl YrsBackend {
         Ok(())
     }
 
-    fn apply_update(&self, update: &[u8]) -> Result<(), MutationError> {
+    fn apply_update(&self, update: &[u8], changed_fields: &Arc<Mutex<std::collections::HashSet<String>>>) -> Result<(), MutationError> {
+        tracing::info!("apply_update: {:?}", update);
+
         let mut txn = self.doc.transact_mut();
+
+        // TODO: There's gotta be a better way to do this - but I don't see it at the time of this writing
+        let _subs: Vec<yrs::Subscription> = self
+            .field_broadcasts
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|b| {
+                let changed_fields = changed_fields.clone();
+                let b = b.to_string();
+                txn.get_or_insert_text(b.as_str()).observe(move |_, _| {
+                    let mut changed_fields = changed_fields.lock().unwrap();
+                    changed_fields.insert(b.clone());
+                })
+            })
+            .collect();
+
         let update = Update::decode_v2(update).map_err(|e| StateError::SerializationError(Box::new(e)))?;
-        txn.apply_update(update).map_err(|e| MutationError::UpdateFailed(Box::new(e)))
+        txn.apply_update(update).map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
+        txn.commit();
+
+        Ok(())
     }
 
     fn get_property_string(&self, trx: &yrs::Transaction, property_name: &PropertyName) -> Option<PropertyValue> {
@@ -148,15 +170,16 @@ impl PropertyBackend for YrsBackend {
     }
 
     fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
+        let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));
         for operation in operations {
-            self.apply_update(&operation.diff)?;
+            self.apply_update(&operation.diff, &changed_fields)?;
         }
-
-        // Notify all field subscribers that changes occurred
-        // TODO1: fix this to check which fields actually changed
-        let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        for broadcast in field_broadcasts.values() {
-            broadcast.send();
+        //Only notify field subscribers for fields that actually changed
+        let field_broadcasts = self.field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
+        for field_name in changed_fields.lock().unwrap().iter() {
+            if let Some(broadcast) = field_broadcasts.get(field_name) {
+                broadcast.send();
+            }
         }
 
         Ok(())
