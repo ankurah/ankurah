@@ -59,3 +59,21 @@ pub trait Mutable<'rec> {
         Self::View::from_entity(new_inner)
     }
 }
+
+// Helper function for Subscribe implementations in generated Views
+// don't document this
+#[doc(hidden)]
+pub fn vsub_helper<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
+where
+    V: ankurah_signals::Signal + View + Clone + Send + Sync + 'static,
+    F: ankurah_signals::subscribe::IntoSubscribeListener<V>,
+{
+    let listener = listener.into_subscribe_listener();
+    let view_clone = view.clone();
+    let reader = view.broadcast();
+    let subscription = reader.listen(move || {
+        // Call the listener with the current view when the broadcast fires
+        listener(view_clone.clone());
+    });
+    ankurah_signals::SubscriptionGuard::new(subscription)
+}

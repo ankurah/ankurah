@@ -160,8 +160,6 @@ pub use ankurah_derive::*;
 #[cfg(feature = "derive")]
 #[doc(hidden)]
 pub mod derive_deps {
-    pub use ::ankurah_proto;
-    pub use ::ankurah_signals;
     #[cfg(feature = "wasm")]
     pub use ::js_sys;
     #[cfg(feature = "wasm")]

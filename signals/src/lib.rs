@@ -46,7 +46,7 @@ day.set("Saturday");
 
 */
 
-mod broadcast;
+pub mod broadcast;
 mod context;
 pub mod observer;
 pub mod porcelain;

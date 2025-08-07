@@ -151,9 +151,11 @@ impl Backends {
         let backends = self.backends_lock();
         let mut operations = BTreeMap::<String, Vec<Operation>>::new();
         for (name, backend) in &*backends {
-            operations.insert(name.clone(), backend.to_operations()?);
+            let backend_ops = backend.to_operations()?;
+            if !backend_ops.is_empty() {
+                operations.insert(name.clone(), backend_ops);
+            }
         }
-
         Ok(operations)
     }
 

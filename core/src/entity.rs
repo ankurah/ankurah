@@ -3,7 +3,6 @@ use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
     property::{Backends, PropertyValue},
-    storage::StorageCollectionWrapper,
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
@@ -32,6 +31,8 @@ pub struct EntityInner {
     // This is necessary for JsMutables (to be created) which cannot have a borrow of the transaction
     // Standard Mutables will have a borrow of the transaction so it should not be possible for them to outlive the transaction
     pub(crate) upstream: Option<Entity>,
+    /// Broadcast for notifying Signal subscribers about entity changes
+    pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
 }
 
 impl std::ops::Deref for Entity {
@@ -44,6 +45,13 @@ impl std::ops::Deref for TemporaryEntity {
     type Target = EntityInner;
 
     fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl PartialEq for Entity {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare entities by their ID - two entities are equal if they have the same ID
+        self.id == other.id
+    }
 }
 
 /// A weak reference to an entity
@@ -77,13 +85,27 @@ impl Entity {
 
     // used by the Model macro
     pub fn create(id: EntityId, collection: CollectionId, backends: Backends) -> Self {
-        Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(Clock::default()), upstream: None }))
+        Self(Arc::new(EntityInner {
+            id,
+            collection,
+            backends,
+            head: std::sync::Mutex::new(Clock::default()),
+            upstream: None,
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        }))
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
     fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(&state.state_buffers)?;
-        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
+        Ok(Self(Arc::new(EntityInner {
+            id,
+            collection,
+            backends,
+            head: std::sync::Mutex::new(state.head.clone()),
+            upstream: None,
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        })))
     }
 
     /// Generate an event which contains all operations for all backends since the last time they were collected
@@ -124,6 +146,8 @@ impl Entity {
                 self.backends.apply_operations((*backend_name).to_owned(), operations)?;
             }
             *self.head.lock().unwrap() = event.id().into();
+            // Notify Signal subscribers about the change
+            self.broadcast.send();
             return Ok(true);
         }
 
@@ -159,6 +183,8 @@ impl Entity {
                     self.backends.apply_operations((*backend_name).to_owned(), operations)?;
                 }
                 *self.head.lock().unwrap() = new_head;
+                // Notify Signal subscribers about the change
+                self.broadcast.send();
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet: _ } => {
@@ -208,6 +234,8 @@ impl Entity {
                 debug!("{self} apply_state - new head descends from current, applying");
                 self.backends.apply_state(state)?;
                 *self.head.lock().unwrap() = new_head;
+                // Notify Signal subscribers about the change
+                self.broadcast.send();
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {
@@ -240,8 +268,12 @@ impl Entity {
             backends: self.backends.fork(),
             head: std::sync::Mutex::new(self.head.lock().unwrap().clone()),
             upstream: Some(self.clone()),
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
     }
+
+    /// Get a reference to the entity's broadcast for Signal implementations
+    pub fn broadcast(&self) -> &ankurah_signals::broadcast::Broadcast { &self.broadcast }
 
     pub fn values(&self) -> Vec<(String, Option<PropertyValue>)> {
         let backends = self.backends.backends.lock().unwrap();
@@ -295,7 +327,15 @@ impl Filterable for Entity {
 impl TemporaryEntity {
     pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
         let backends = Backends::from_state_buffers(&state.state_buffers)?;
-        Ok(Self(Arc::new(EntityInner { id, collection, backends, head: std::sync::Mutex::new(state.head.clone()), upstream: None })))
+        Ok(Self(Arc::new(EntityInner {
+            id,
+            collection,
+            backends,
+            head: std::sync::Mutex::new(state.head.clone()),
+            upstream: None,
+            // slightly annoying that we need to populate this, given that it won't be used
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        })))
     }
 }
 
