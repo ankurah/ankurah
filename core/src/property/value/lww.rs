@@ -9,6 +9,7 @@ use crate::{
     },
 };
 
+#[derive(Clone)]
 pub struct LWW<T: Property> {
     pub property_name: PropertyName,
     pub backend: Arc<LWWBackend>,
