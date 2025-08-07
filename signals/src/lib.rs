@@ -56,6 +56,7 @@ mod value;
 #[cfg(feature = "react")]
 pub mod react;
 
+pub use broadcast::BroadcastId;
 pub use context::*;
 pub use observer::*;
 pub use porcelain::*;

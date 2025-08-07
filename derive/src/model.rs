@@ -252,8 +252,8 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 self.entity.broadcast().reference().listen(listener)
             }
             
-            fn unique_id(&self) -> usize {
-                self.entity.broadcast().reference().unique_id()
+            fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
+                self.entity.broadcast().id()
             }
         }
 

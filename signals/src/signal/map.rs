@@ -36,7 +36,7 @@ where Upstream: Signal
 {
     fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard { self.source.listen(listener) }
 
-    fn unique_id(&self) -> usize { self.source.unique_id() }
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.source.broadcast_id() }
 }
 
 // Not clear whether we should actually impl With<Output> for Map because each output value is owned

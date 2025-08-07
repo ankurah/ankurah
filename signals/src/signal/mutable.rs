@@ -65,7 +65,7 @@ impl<T> Signal for Mut<T> {
         self.broadcast.reference().listen(listener)
     }
 
-    fn unique_id(&self) -> usize { self.broadcast.reference().unique_id() }
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.broadcast.id() }
 }
 
 impl<T> Subscribe<T> for Mut<T>

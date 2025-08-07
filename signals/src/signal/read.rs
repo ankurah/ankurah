@@ -62,7 +62,7 @@ impl<T> Signal for Read<T> {
         self.broadcast.reference().listen(listener)
     }
 
-    fn unique_id(&self) -> usize { self.broadcast.reference().unique_id() }
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.broadcast.id() }
 }
 
 /// foo == bar will automatically track the signals used in the comparison against the current observer

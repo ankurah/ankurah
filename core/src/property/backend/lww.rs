@@ -161,4 +161,13 @@ impl PropertyBackend for LWWBackend {
     }
 }
 
+impl LWWBackend {
+    /// Get the broadcast ID for a specific field, creating the broadcast if necessary
+    pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
+        let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(|| ankurah_signals::broadcast::Broadcast::new());
+        broadcast.id()
+    }
+}
+
 // Need ID based happens-before determination to resolve conflicts

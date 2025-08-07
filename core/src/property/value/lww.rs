@@ -9,7 +9,7 @@ use crate::{
     },
 };
 
-use ankurah_signals::{Signal, Subscribe, SubscriptionGuard};
+use ankurah_signals::Signal;
 
 #[derive(Clone)]
 pub struct LWW<T: Property> {
@@ -67,15 +67,7 @@ impl<T: Property> ankurah_signals::Signal for LWW<T> {
         self.backend.listen_field(&self.property_name, listener)
     }
 
-    fn unique_id(&self) -> usize {
-        // Use a combination of backend pointer and property name hash for uniqueness
-        let backend_ptr = Arc::as_ptr(&self.backend) as usize;
-        let prop_hash = std::collections::hash_map::DefaultHasher::new();
-        use std::hash::{Hash, Hasher};
-        let mut hasher = prop_hash;
-        self.property_name.hash(&mut hasher);
-        backend_ptr ^ hasher.finish() as usize
-    }
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
 }
 
 impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>
