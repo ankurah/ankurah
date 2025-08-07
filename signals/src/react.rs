@@ -192,8 +192,7 @@ pub fn use_observe() -> Result<ReactObserver, JsValue> {
 // Observer implementation for ReactObserver
 impl Observer for ReactObserver {
     fn observe(&self, signal: &dyn Signal) {
-        let broadcast_ref = signal.broadcast();
-        let signal_id = broadcast_ref.unique_id();
+        let signal_id = signal.unique_id();
 
         // Check if we already have a subscription to this signal
         if let Ok(mut subscriptions) = self.0.subscriptions.write() {
@@ -206,7 +205,7 @@ impl Observer for ReactObserver {
             // Create new subscription
             let version = self.0.version.clone();
             let trigger_render = self.0.trigger_render.clone();
-            let subscription = broadcast_ref.listen(move || {
+            let subscription = signal.listen(Arc::new(move || {
                 // Increment version to trigger React re-render
                 version.fetch_add(1, Ordering::Relaxed);
 
@@ -214,7 +213,7 @@ impl Observer for ReactObserver {
                 if let Some(callback) = trigger_render.get() {
                     let _ = callback.call0(&JsValue::NULL);
                 }
-            });
+            }));
 
             let entry = SubscriptionEntry { guard: subscription, marked_for_removal: false };
 

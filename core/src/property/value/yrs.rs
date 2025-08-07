@@ -7,11 +7,13 @@ use crate::{
     entity::Entity,
     error::MutationError,
     property::{
-        backend::YrsBackend,
+        backend::{PropertyBackend, YrsBackend},
         traits::{FromActiveType, FromEntity, InitializeWith, PropertyError},
         PropertyName,
     },
 };
+
+use ankurah_signals::Signal;
 
 #[derive(Debug, Clone)]
 pub struct YrsString<Projected> {
@@ -19,7 +21,7 @@ pub struct YrsString<Projected> {
     // and call encode_update_v2 on it when we're ready to commit
     // but its got a lifetime of 'doc and that requires some refactoring
     pub property_name: PropertyName,
-    pub backend: Weak<YrsBackend>,
+    pub backend: Arc<YrsBackend>,
     phantom: PhantomData<Projected>,
     // TODO: Pretty sure we need to store a clone of the Entity here so it's kept alive for the lifetime of the YrsString
     // Previously this didn't matter because the YrsString wasn't clonable. Followup question on this:
@@ -31,28 +33,25 @@ pub struct YrsString<Projected> {
 
 // Starting with basic string type operations
 impl<Projected> YrsString<Projected> {
-    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self {
-        Self { property_name, backend: Arc::downgrade(&backend), phantom: PhantomData }
-    }
-    pub fn backend(&self) -> Arc<YrsBackend> { self.backend.upgrade().expect("Expected `Yrs` property backend to exist") }
-    pub fn value(&self) -> Option<String> { self.backend().get_string(&self.property_name) }
-    pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> { self.backend().insert(&self.property_name, index, value) }
-    pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> { self.backend().delete(&self.property_name, index, length) }
+    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self { Self { property_name, backend, phantom: PhantomData } }
+    pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property_name) }
+    pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> { self.backend.insert(&self.property_name, index, value) }
+    pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> { self.backend.delete(&self.property_name, index, length) }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
-        self.backend().delete(&self.property_name, start, length)?;
-        self.backend().insert(&self.property_name, start, value)?;
+        self.backend.delete(&self.property_name, start, length)?;
+        self.backend.insert(&self.property_name, start, value)?;
         Ok(())
     }
     pub fn replace(&self, value: &str) -> Result<(), MutationError> {
-        self.backend().delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32)?;
-        self.backend().insert(&self.property_name, 0, value)?;
+        self.backend.delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32)?;
+        self.backend.insert(&self.property_name, 0, value)?;
         Ok(())
     }
 }
 
 impl<Projected> FromEntity for YrsString<Projected> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
-        let backend = entity.backends().get::<YrsBackend>().expect("YrsBackend should exist");
+        let backend = entity.get_backend::<YrsBackend>().expect("YrsBackend should exist");
         Self::new(property_name, backend)
     }
 }
@@ -100,5 +99,38 @@ impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
             new_string.insert(0, value).unwrap();
         }
         new_string
+    }
+}
+
+impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
+    fn listen(&self, listener: ankurah_signals::broadcast::Listener) -> ankurah_signals::broadcast::ListenerGuard {
+        self.backend.listen_field(&self.property_name, listener)
+    }
+
+    fn unique_id(&self) -> usize {
+        // Use a combination of backend pointer and property name hash for uniqueness
+        let backend_ptr = Arc::as_ptr(&self.backend) as usize;
+        let prop_hash = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = prop_hash;
+        self.property_name.hash(&mut hasher);
+        backend_ptr ^ hasher.finish() as usize
+    }
+}
+
+impl<Projected> ankurah_signals::Subscribe<String> for YrsString<Projected>
+where Projected: Clone + Send + Sync + 'static
+{
+    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SubscriptionGuard
+    where F: ankurah_signals::subscribe::IntoSubscribeListener<String> {
+        let listener = listener.into_subscribe_listener();
+        let yrs_string = self.clone();
+        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move || {
+            // Get current value when the broadcast fires
+            if let Some(current_value) = yrs_string.value() {
+                listener(current_value);
+            }
+        }));
+        ankurah_signals::SubscriptionGuard::new(subscription)
     }
 }

@@ -91,6 +91,11 @@ where F: Fn() + Send + Sync + 'static
     fn into_listener(self) -> Listener { Arc::new(self) }
 }
 
+// Implementation for Listener itself (Arc<dyn Fn() + Send + Sync + 'static>)
+impl IntoListener for Listener {
+    fn into_listener(self) -> Listener { self }
+}
+
 #[cfg(feature = "tokio")]
 impl IntoListener for tokio::sync::mpsc::UnboundedSender<()> {
     fn into_listener(self) -> Listener {

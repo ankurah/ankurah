@@ -80,9 +80,8 @@ impl CallbackObserver {
 // Observer trait implementation - dyn safe
 impl Observer for CallbackObserver {
     fn observe(&self, signal: &dyn Signal) {
-        // Use the broadcast inner pointer as a unique identifier for the signal
-        let broadcast_ref = signal.broadcast();
-        let signal_id = broadcast_ref.unique_id();
+        // Use the signal's unique ID for identification
+        let signal_id = signal.unique_id();
 
         // Check if we already have a subscription to this signal
         if let Ok(mut subscriptions) = self.0.subscriptions.write() {
@@ -95,11 +94,11 @@ impl Observer for CallbackObserver {
             // Create new subscription
             let weak = WeakCallbackObserver(Arc::downgrade(&self.0));
 
-            let subscription = broadcast_ref.listen(move || {
+            let subscription = signal.listen(Arc::new(move || {
                 if let Some(observer) = weak.upgrade() {
                     observer.trigger();
                 }
-            });
+            }));
 
             let entry = SubscriptionEntry { _guard: subscription, marked_for_removal: false };
 

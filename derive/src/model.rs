@@ -224,8 +224,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             // Even though most Models will be clonable, maybe we shouldn't force it?
             // Also: nothing seems to be using this. Maybe it could be opt in
             fn to_model(&self) -> Result<Self::Model, ankurah::property::PropertyError> {
+                use ankurah::property::FromActiveType;
                 Ok(#name {
-                    #( #active_field_names: self.#active_field_names()?, )*
+                    #( #active_field_names: #projected_field_types_turbofish::from_active(self.#active_field_names())?, )*
                     #( #ephemeral_field_names: self.#ephemeral_field_names.clone(), )*
                 })
             }
@@ -247,8 +248,12 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         }
 
         impl ::ankurah::signals::Signal for #view_name {
-            fn broadcast(&self) -> ::ankurah::signals::broadcast::Ref {
-                self.entity.broadcast().reference()
+            fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
+                self.entity.broadcast().reference().listen(listener)
+            }
+            
+            fn unique_id(&self) -> usize {
+                self.entity.broadcast().reference().unique_id()
             }
         }
 
@@ -276,10 +281,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 self.entity.id().clone()
             }
             #(
-                #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
-                    use ankurah::property::{FromActiveType, FromEntity};
-                    let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity);
-                    #projected_field_types_turbofish::from_active(active_result)
+                #active_field_visibility fn #active_field_names(&self) -> #active_field_types {
+                    use ankurah::property::FromEntity;
+                    #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity)
                 }
             )*
             // #(

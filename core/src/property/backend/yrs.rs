@@ -17,10 +17,11 @@ use crate::{
 };
 
 /// Stores one or more properties of an entity
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct YrsBackend {
     pub(crate) doc: yrs::Doc,
-    previous_state: Arc<Mutex<StateVector>>,
+    previous_state: Mutex<StateVector>,
+    field_broadcasts: Mutex<BTreeMap<PropertyName, ankurah_signals::broadcast::Broadcast>>,
 }
 
 impl Default for YrsBackend {
@@ -31,7 +32,7 @@ impl YrsBackend {
     pub fn new() -> Self {
         let doc = yrs::Doc::new();
         let starting_state = doc.transact().state_vector();
-        Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) }
+        Self { doc, previous_state: Mutex::new(starting_state), field_broadcasts: Mutex::new(BTreeMap::new()) }
     }
 
     pub fn get_string(&self, property_name: impl AsRef<str>) -> Option<String> {
@@ -78,11 +79,11 @@ impl PropertyBackend for YrsBackend {
 
     fn as_debug(&self) -> &dyn Debug { self as &dyn Debug }
 
-    fn fork(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Arc<dyn PropertyBackend> {
         // TODO: Don't do all this just to sever the internal Yrs Arcs
         let state_buffer = self.to_state_buffer().unwrap();
         let backend = Self::from_state_buffer(&state_buffer).unwrap();
-        Box::new(backend)
+        Arc::new(backend)
     }
 
     fn properties(&self) -> Vec<String> {
@@ -128,10 +129,10 @@ impl PropertyBackend for YrsBackend {
         drop(txn);
         let starting_state = doc.transact().state_vector();
 
-        Ok(Self { doc, previous_state: Arc::new(Mutex::new(starting_state)) })
+        Ok(Self { doc, previous_state: Mutex::new(starting_state), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
-    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
+    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError> {
         let mut previous_state = self.previous_state.lock().unwrap();
 
         let txn = self.doc.transact_mut();
@@ -140,9 +141,9 @@ impl PropertyBackend for YrsBackend {
 
         // Check if this is actually an empty update by comparing to the known empty pattern
         if diff == Update::EMPTY_V2 {
-            Ok(vec![])
+            Ok(None)
         } else {
-            Ok(vec![Operation { diff }])
+            Ok(Some(vec![Operation { diff }]))
         }
     }
 
@@ -150,6 +151,27 @@ impl PropertyBackend for YrsBackend {
         for operation in operations {
             self.apply_update(&operation.diff)?;
         }
+
+        // Notify all field subscribers that changes occurred
+        // TODO1: fix this to check which fields actually changed
+        let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        for broadcast in field_broadcasts.values() {
+            broadcast.send();
+        }
+
         Ok(())
+    }
+
+    fn listen_field(
+        &self,
+        field_name: &PropertyName,
+        listener: ankurah_signals::broadcast::Listener,
+    ) -> ankurah_signals::broadcast::ListenerGuard {
+        // Get or create the broadcast for this field
+        let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(|| ankurah_signals::broadcast::Broadcast::new());
+
+        // Subscribe to the broadcast and return the guard
+        broadcast.reference().listen(listener)
     }
 }

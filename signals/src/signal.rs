@@ -10,8 +10,11 @@ pub use read::*;
 /// Core trait for signals - provides observation capability without regard to a payload value
 /// The sole purpose of this trait is to provide a way to listen to changes to a signal.
 pub trait Signal {
-    /// Get a reference to this signal's broadcast
-    fn broadcast(&self) -> crate::broadcast::Ref;
+    /// Listen to changes to this signal with a listener function
+    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard;
+
+    /// Get a unique identifier for this signal (for deduplication purposes)
+    fn unique_id(&self) -> usize;
 }
 
 /// Trait for getting the current value of a signal in a way that will be tracked by the current context
