@@ -2,7 +2,7 @@ use std::{
     any::Any,
     collections::BTreeMap,
     fmt::Debug,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use ankurah_proto::Operation;
@@ -21,9 +21,11 @@ struct ValueEntry {
     committed: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LWWBackend {
-    values: Arc<RwLock<BTreeMap<PropertyName, ValueEntry>>>,
+    // TODO - can this be safely combined with the values map?
+    values: RwLock<BTreeMap<PropertyName, ValueEntry>>,
+    field_broadcasts: Mutex<BTreeMap<PropertyName, ankurah_signals::broadcast::Broadcast>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,7 +39,7 @@ impl Default for LWWBackend {
 }
 
 impl LWWBackend {
-    pub fn new() -> LWWBackend { Self { values: Arc::new(RwLock::new(BTreeMap::default())) } }
+    pub fn new() -> LWWBackend { Self { values: RwLock::new(BTreeMap::default()), field_broadcasts: Mutex::new(BTreeMap::new()) } }
 
     pub fn set(&self, property_name: PropertyName, value: Option<PropertyValue>) {
         let mut values = self.values.write().unwrap();
@@ -55,12 +57,16 @@ impl PropertyBackend for LWWBackend {
 
     fn as_debug(&self) -> &dyn Debug { self as &dyn Debug }
 
-    fn fork(&self) -> Box<dyn PropertyBackend> {
+    fn fork(&self) -> Arc<dyn PropertyBackend> {
         let values = self.values.read().unwrap();
         let cloned = (*values).clone();
         drop(values);
 
-        Box::new(Self { values: Arc::new(RwLock::new(cloned)) })
+        Arc::new(Self {
+            values: RwLock::new(cloned),
+            // Create fresh broadcasts (don't clone the existing ones for transaction isolation)
+            field_broadcasts: Mutex::new(BTreeMap::new()),
+        })
     }
 
     fn properties(&self) -> Vec<PropertyName> {
@@ -87,10 +93,10 @@ impl PropertyBackend for LWWBackend {
     where Self: Sized {
         let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<PropertyValue>>>(state_buffer)?;
         let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true })).collect();
-        Ok(Self { values: Arc::new(RwLock::new(map)) })
+        Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
-    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
+    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError> {
         let mut values = self.values.write().unwrap();
         let mut changed_values = BTreeMap::new();
 
@@ -102,15 +108,17 @@ impl PropertyBackend for LWWBackend {
         }
 
         if changed_values.is_empty() {
-            return Ok(vec![]);
+            return Ok(None);
         }
 
-        Ok(vec![Operation {
+        Ok(Some(vec![Operation {
             diff: bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&changed_values)? })?,
-        }])
+        }]))
     }
 
     fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
+        let mut changed_fields = Vec::new();
+
         for operation in operations {
             let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
             match version {
@@ -120,13 +128,45 @@ impl PropertyBackend for LWWBackend {
                     let mut values = self.values.write().unwrap();
                     for (property_name, new_value) in changes {
                         // Insert as committed entry since this came from an operation
-                        values.insert(property_name, ValueEntry { value: new_value, committed: true });
+                        values.insert(property_name.clone(), ValueEntry { value: new_value, committed: true });
+                        changed_fields.push(property_name);
                     }
                 }
                 version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
             }
         }
+
+        // Notify field subscribers for changed fields only
+        let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        for field_name in changed_fields {
+            if let Some(broadcast) = field_broadcasts.get(&field_name) {
+                broadcast.send();
+            }
+        }
+
         Ok(())
+    }
+
+    fn listen_field(
+        &self,
+        field_name: &PropertyName,
+        listener: ankurah_signals::broadcast::Listener,
+    ) -> ankurah_signals::broadcast::ListenerGuard {
+        // Get or create the broadcast for this field
+        let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(|| ankurah_signals::broadcast::Broadcast::new());
+
+        // Subscribe to the broadcast and return the guard
+        broadcast.reference().listen(listener)
+    }
+}
+
+impl LWWBackend {
+    /// Get the broadcast ID for a specific field, creating the broadcast if necessary
+    pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
+        let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(|| ankurah_signals::broadcast::Broadcast::new());
+        broadcast.id()
     }
 }
 

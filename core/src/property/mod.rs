@@ -5,7 +5,7 @@ pub mod value;
 use std::fmt::Display;
 
 use ankurah_proto::EntityId;
-pub use backend::Backends;
+
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
 pub use value::YrsString;
 

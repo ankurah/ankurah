@@ -17,7 +17,7 @@ use crate::{
     Node,
 };
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub struct PNBackend {
@@ -92,7 +92,7 @@ impl PropertyBackend for PNBackend {
         let diffs = values.iter().map(|(key, value)| (key, value.diff())).collect::<BTreeMap<_, _>>();
 
         let serialized_diffs = bincode::serialize(&diffs)?;
-        Ok(vec![Operation { diff: serialized_diffs }])
+        Ok(Some(vec![Operation { diff: serialized_diffs }]))
     }
 
     fn apply_operations(
@@ -114,7 +114,6 @@ impl PropertyBackend for PNBackend {
         Ok(())
     }
 }
-
 
 macro_rules! pn_value {
     ($($integer:ty => $variant:ident),*) => {

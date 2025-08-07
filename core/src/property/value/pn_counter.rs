@@ -45,7 +45,7 @@ impl<I> FromEntity for PNCounter<I>
 where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
-        let backend = entity.backends().get::<PNBackend>().expect("PNBackend should exist");
+        let backend = entity.get_backend::<PNBackend>().expect("PNBackend should exist");
         Self::new(property_name, backend)
     }
 }

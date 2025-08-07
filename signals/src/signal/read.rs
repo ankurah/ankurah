@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     broadcast::Broadcast,
     context::CurrentObserver,
@@ -56,7 +58,11 @@ impl<T: 'static> GetReadCell<T> for Read<T> {
 }
 
 impl<T> Signal for Read<T> {
-    fn broadcast(&self) -> crate::broadcast::Ref { self.broadcast.reference() }
+    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard {
+        self.broadcast.reference().listen(listener)
+    }
+
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.broadcast.id() }
 }
 
 /// foo == bar will automatically track the signals used in the comparison against the current observer
@@ -83,12 +89,11 @@ where T: Clone + Send + Sync + 'static
     where F: IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let ro_value = self.get_readcell(); // Get read-only value handle
-        let reader = self.broadcast();
-        let subscription = reader.listen(move || {
+        let subscription = self.listen(Arc::new(move || {
             // Get current value when the broadcast fires
             let current_value = ro_value.value();
             listener(current_value);
-        });
+        }));
         SubscriptionGuard::new(subscription)
     }
 }

@@ -56,11 +56,11 @@ async fn test_sled() -> Result<()> {
     let album = context.get::<AlbumView>(album_id).await?;
 
     let (w, check) = generic_watcher::<AlbumView>();
-    // let (w2, check2) = generic_watcher::<String>();
+    let (w2, check2) = generic_watcher::<String>();
 
     // store the handles to keep the subscriptions alive
     let _h1 = album.subscribe(w);
-    // let h2 = album.name().subscribe(w2); // TODO: YrsString<String> implement Subscribe<String>
+    let _h2 = album.name().subscribe(w2); // TODO: YrsString<String> implement Subscribe<String>
 
     let trx2 = context.begin();
     let album_mut2 = album.edit(&trx2)?;
@@ -69,7 +69,7 @@ async fn test_sled() -> Result<()> {
 
     // we haven't committed the transaction yet - neither watcher should have received any changes
     assert_eq!(check(), vec![]);
-    //assert_eq!(check2(), vec![]);
+    assert_eq!(check2(), Vec::<String>::new());
 
     // commit the transaction
     trx2.commit().await?;
@@ -77,7 +77,7 @@ async fn test_sled() -> Result<()> {
     // now we should have one change since we performed a delete operation
     // TODO - implement PartialEq for Views
     assert_eq!(check(), vec![album]);
-    //assert_eq!(check2(), vec!["The rest of the owl".to_owned()]);
+    assert_eq!(check2(), vec!["The rest of the owl".to_owned()]);
 
     Ok(())
 }

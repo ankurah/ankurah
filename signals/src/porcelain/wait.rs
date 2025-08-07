@@ -46,6 +46,8 @@ where
     async fn wait_value(&self, target_value: T) -> ()
     where T: PartialEq + Clone + Send + Sync {
         // Check if current value already matches
+
+        use std::sync::Arc;
         if self.get_readcell().with(|v| *v == target_value) {
             return;
         }
@@ -54,9 +56,9 @@ where
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Subscribe to change notifications
-        let _subscription = self.broadcast().listen(move || {
+        let _subscription = self.listen(Arc::new(move || {
             let _ = tx.send(());
-        });
+        }));
 
         // Loop over notifications until we find a match
         loop {
@@ -81,6 +83,8 @@ where
         T: Send + Sync,
     {
         // Check current value first
+
+        use std::sync::Arc;
         if let Some(result) = self.get_readcell().with(|value| predicate(value).result()) {
             return result;
         }
@@ -89,9 +93,9 @@ where
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Subscribe to change notifications
-        let _subscription = self.broadcast().listen(move || {
+        let _subscription = self.listen(Arc::new(move || {
             let _ = tx.send(());
-        });
+        }));
 
         // Wait for notifications
         loop {
