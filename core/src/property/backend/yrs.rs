@@ -138,11 +138,12 @@ impl PropertyBackend for YrsBackend {
         let diff = txn.encode_diff_v2(&previous_state);
         *previous_state = txn.state_vector();
 
-        if !diff.is_empty() {
-            return Ok(vec![Operation { diff }]);
+        // Check if this is actually an empty update by comparing to the known empty pattern
+        if diff == Update::EMPTY_V2 {
+            Ok(vec![])
+        } else {
+            Ok(vec![Operation { diff }])
         }
-
-        Ok(vec![])
     }
 
     fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {

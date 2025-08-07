@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct YrsString<Projected> {
     // ideally we'd store the yrs::TransactionMut in the Transaction as an ExtendableOp or something like that
     // and call encode_update_v2 on it when we're ready to commit
@@ -21,6 +21,12 @@ pub struct YrsString<Projected> {
     pub property_name: PropertyName,
     pub backend: Weak<YrsBackend>,
     phantom: PhantomData<Projected>,
+    // TODO: Pretty sure we need to store a clone of the Entity here so it's kept alive for the lifetime of the YrsString
+    // Previously this didn't matter because the YrsString wasn't clonable. Followup question on this:
+    // Will we need to update ListenerGuard to hold a dyn Any to achieve this?
+    // I ask because the ListenerGuard/SubscriptionGuard will be the only thing directly held by the user, not the YrsString/LWW
+    // OR - will the closure be enough to hold the Entity or the YrsString/LWW alive? Ideally we wouldn't overthink this and just
+    // use TDD to determine it imperically.
 }
 
 // Starting with basic string type operations

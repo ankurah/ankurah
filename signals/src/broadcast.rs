@@ -15,9 +15,16 @@ pub trait IntoListener {
 /// Uses synchronous function callbacks for immediate notification.
 #[derive(Clone)]
 pub struct Broadcast(Arc<Inner>);
+
 struct Inner {
     listeners: std::sync::RwLock<HashMap<usize, Listener>>,
     next_id: AtomicUsize,
+}
+
+impl std::fmt::Debug for Broadcast {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Broadcast").field("listeners", &self.0.listeners.read().unwrap().len()).finish()
+    }
 }
 
 /// A listen-only reference to a broadcast
