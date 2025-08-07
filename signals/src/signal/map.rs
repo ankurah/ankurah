@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     context::CurrentObserver,
     porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
@@ -32,7 +34,9 @@ where
 impl<Upstream, Input, Output, Transform> Signal for Map<Upstream, Input, Output, Transform>
 where Upstream: Signal
 {
-    fn broadcast(&self) -> crate::broadcast::Ref { self.source.broadcast() }
+    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard { self.source.listen(listener) }
+
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.source.broadcast_id() }
 }
 
 // Not clear whether we should actually impl With<Output> for Map because each output value is owned
@@ -82,11 +86,11 @@ where
         let source = self.source.clone();
         let transform = self.transform.clone();
 
-        let subscription = self.source.broadcast().listen(move || {
+        let subscription = self.source.listen(Arc::new(move || {
             source.with(|input| {
                 listener(transform(input));
             });
-        });
+        }));
 
         SubscriptionGuard::new(subscription)
     }

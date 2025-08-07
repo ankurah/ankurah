@@ -1,10 +1,12 @@
 pub mod tsify;
 
+use std::sync::Arc;
+
 use ankurah_proto::{CollectionId, EntityId, State};
 
 use crate::entity::Entity;
 use crate::error::StateError;
-use crate::property::Backends;
+
 use crate::property::PropertyError;
 
 use anyhow::Result;
@@ -25,7 +27,7 @@ pub trait View {
     type Model: Model;
     type Mutable<'trx>: Mutable<'trx>;
     fn id(&self) -> EntityId { self.entity().id() }
-    fn backends(&self) -> &Backends { self.entity().backends() }
+
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
     fn entity(&self) -> &Entity;
     fn from_entity(inner: Entity) -> Self;
@@ -39,7 +41,7 @@ pub trait Mutable<'rec> {
     type View: View;
     fn id(&self) -> EntityId { self.entity().id() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
-    fn backends(&self) -> &Backends { &self.entity().backends }
+
     fn entity(&self) -> &Entity;
     fn new(inner: &'rec Entity) -> Self
     where Self: Sized;
@@ -58,4 +60,21 @@ pub trait Mutable<'rec> {
 
         Self::View::from_entity(new_inner)
     }
+}
+
+// Helper function for Subscribe implementations in generated Views
+// don't document this
+#[doc(hidden)]
+pub fn vsub_helper<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
+where
+    V: ankurah_signals::Signal + View + Clone + Send + Sync + 'static,
+    F: ankurah_signals::subscribe::IntoSubscribeListener<V>,
+{
+    let listener = listener.into_subscribe_listener();
+    let view_clone = view.clone();
+    let subscription = view.listen(Arc::new(move || {
+        // Call the listener with the current view when the broadcast fires
+        listener(view_clone.clone());
+    }));
+    ankurah_signals::SubscriptionGuard::new(subscription)
 }

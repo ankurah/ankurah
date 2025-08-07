@@ -3,12 +3,15 @@ use std::{marker::PhantomData, sync::Arc};
 use crate::{
     entity::Entity,
     property::{
-        backend::LWWBackend,
+        backend::{LWWBackend, PropertyBackend},
         traits::{FromActiveType, FromEntity, PropertyError},
         InitializeWith, Property, PropertyName, PropertyValue,
     },
 };
 
+use ankurah_signals::Signal;
+
+#[derive(Clone)]
 pub struct LWW<T: Property> {
     pub property_name: PropertyName,
     pub backend: Arc<LWWBackend>,
@@ -39,7 +42,7 @@ impl<T: Property> LWW<T> {
 
 impl<T: Property> FromEntity for LWW<T> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
-        let backend = entity.backends().get::<LWWBackend>().expect("LWW Backend should exist");
+        let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         Self { property_name, backend, phantom: PhantomData }
     }
 }
@@ -56,5 +59,30 @@ impl<T: Property> InitializeWith<T> for LWW<T> {
         let new = Self::from_entity(property_name, entity);
         new.set(value).unwrap();
         new
+    }
+}
+
+impl<T: Property> ankurah_signals::Signal for LWW<T> {
+    fn listen(&self, listener: ankurah_signals::broadcast::Listener) -> ankurah_signals::broadcast::ListenerGuard {
+        self.backend.listen_field(&self.property_name, listener)
+    }
+
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
+}
+
+impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>
+where T: Clone + Send + Sync + 'static
+{
+    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SubscriptionGuard
+    where F: ankurah_signals::subscribe::IntoSubscribeListener<T> {
+        let listener = listener.into_subscribe_listener();
+        let lww = self.clone();
+        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move || {
+            // Get current value when the broadcast fires
+            if let Ok(current_value) = lww.get() {
+                listener(current_value);
+            }
+        }));
+        ankurah_signals::SubscriptionGuard::new(subscription)
     }
 }

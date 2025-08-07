@@ -24,7 +24,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
         #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         pub struct #wrapper_name{
-            pub (crate) sig: Box<dyn ::ankurah::derive_deps::ankurah_signals::GetAndDynSubscribe<#name>>,
+            pub (crate) sig: Box<dyn ::ankurah::signals::GetAndDynSubscribe<#name>>,
             pub (crate) handle: ::std::boxed::Box<dyn ::std::any::Any>
         }
 
@@ -36,8 +36,8 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
         impl #wrapper_name {
 
             #[wasm_bindgen(js_name = "subscribe", skip_typescript)]
-            pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::derive_deps::ankurah_signals::SubscriptionGuard {
-                use ::ankurah::derive_deps::ankurah_signals::DynSubscribe;
+            pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
+                use ::ankurah::signals::DynSubscribe;
                 let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
 
                 self.sig.dyn_subscribe(Box::new(move |value: #name| {
@@ -51,7 +51,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
             #[wasm_bindgen(getter)]
             pub fn value(&self) -> #name {
-                use ::ankurah::derive_deps::ankurah_signals::Get;
+                use ::ankurah::signals::Get;
                 self.sig.get()
             }
         }
