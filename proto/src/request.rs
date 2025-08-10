@@ -39,7 +39,7 @@ pub enum NodeRequestBody {
     Get { collection: CollectionId, ids: Vec<EntityId> },
     GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
     Fetch { collection: CollectionId, predicate: ast::Predicate },
-    Subscribe { subscription_id: SubscriptionId, collection: CollectionId, predicate: ast::Predicate },
+    SubscribePredicate { predicate_id: SubscriptionId, collection: CollectionId, predicate: ast::Predicate },
 }
 
 /// A response from one node to another
@@ -58,7 +58,7 @@ pub enum NodeResponseBody {
     Fetch(Vec<Attested<EntityState>>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    Subscribed { subscription_id: SubscriptionId },
+    Subscribed { predicate_id: SubscriptionId },
     Success,
     Error(String),
 }

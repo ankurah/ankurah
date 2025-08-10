@@ -2,6 +2,7 @@ use ankurah_proto::{self as proto};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::collation::Collatable;
+use crate::reactor::SubscriptionPredicateId;
 use ankql::ast;
 
 /// An index for a specific field and comparison operator
@@ -12,10 +13,10 @@ use ankql::ast;
 /// registrations on intermediate nodes for range comparisons.
 #[derive(Debug, Default)]
 pub(crate) struct ComparisonIndex {
-    pub(crate) eq: HashMap<Vec<u8>, Vec<proto::SubscriptionId>>,
-    pub(crate) ne: HashMap<Vec<u8>, Vec<proto::SubscriptionId>>,
-    pub(crate) gt: BTreeMap<Vec<u8>, Vec<proto::SubscriptionId>>,
-    pub(crate) lt: BTreeMap<Vec<u8>, Vec<proto::SubscriptionId>>,
+    pub(crate) eq: HashMap<Vec<u8>, Vec<SubscriptionPredicateId>>,
+    pub(crate) ne: HashMap<Vec<u8>, Vec<SubscriptionPredicateId>>,
+    pub(crate) gt: BTreeMap<Vec<u8>, Vec<SubscriptionPredicateId>>,
+    pub(crate) lt: BTreeMap<Vec<u8>, Vec<SubscriptionPredicateId>>,
 }
 
 impl ComparisonIndex {
@@ -24,7 +25,7 @@ impl ComparisonIndex {
 
     fn for_entry<F, V>(&mut self, value: V, op: ast::ComparisonOperator, f: F)
     where
-        F: FnOnce(&mut Vec<proto::SubscriptionId>),
+        F: FnOnce(&mut Vec<SubscriptionPredicateId>),
         V: Collatable,
     {
         match op {
@@ -66,19 +67,19 @@ impl ComparisonIndex {
         }
     }
 
-    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_id: proto::SubscriptionId) {
-        self.for_entry(value, op, |entries| entries.push(sub_id));
+    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_pred_id: SubscriptionPredicateId) {
+        self.for_entry(value, op, |entries| entries.push(sub_pred_id));
     }
 
-    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_id: proto::SubscriptionId) {
+    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_pred_id: SubscriptionPredicateId) {
         self.for_entry(value, op, |entries| {
-            if let Some(pos) = entries.iter().position(|id| *id == sub_id) {
+            if let Some(pos) = entries.iter().position(|id| *id == sub_pred_id) {
                 entries.remove(pos);
             }
         });
     }
 
-    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<proto::SubscriptionId> {
+    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<SubscriptionPredicateId> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 

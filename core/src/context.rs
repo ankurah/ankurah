@@ -7,9 +7,9 @@ use crate::{
     model::View,
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
+    reactor::SubscriptionHandle,
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
-    subscription::SubscriptionHandle,
     transaction::Transaction,
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
@@ -18,7 +18,9 @@ use tracing::{debug, warn};
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// Type-erased context wrapper
+/// Context is used to provide a local interface to fetch and subscribe to entities
+/// with a specific ContextData. Generally this means your auth token for a specific user,
+/// but ContextData is abstracted so you can use what you want.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
 impl Clone for Context {
@@ -52,7 +54,7 @@ pub trait TContext {
         collection: &proto::CollectionId,
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>;
+    ) -> Result<crate::reactor::SubscriptionHandle, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
@@ -75,7 +77,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         collection: &proto::CollectionId,
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
+    ) -> Result<crate::reactor::SubscriptionHandle, RetrievalError> {
         self.subscribe(sub_id, collection, args, callback).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
@@ -158,7 +160,7 @@ impl Context {
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
         callback: F,
-    ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>
+    ) -> Result<crate::reactor::SubscriptionHandle, RetrievalError>
     where
         F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
         R: View,
@@ -272,41 +274,57 @@ where
 
     pub async fn subscribe(
         &self,
-        sub_id: proto::SubscriptionId,
+        predicate_id: proto::PredicateId,
         collection_id: &CollectionId,
         mut args: MatchArgs,
         callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<SubscriptionHandle, RetrievalError> {
-        let mut handle = SubscriptionHandle::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, sub_id);
+        let mut handle = SubscriptionHandle::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, predicate_id);
 
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         args.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
 
         // Store subscription context for event requests
-        self.node.subscription_context.insert(sub_id, self.cdata.clone());
+        self.node.subscription_context.insert(predicate_id, self.cdata.clone());
 
         let predicate = args.predicate.clone();
         let cached = args.cached;
 
-        // Register subscription with reactor (synchronous)
-        let subscription = self.node.reactor.register(handle.id, collection_id, args.predicate, callback);
-        let storage_collection = self.node.collections.get(&subscription.collection_id).await?;
+        // Create subscription container
+        let subscription = self.node.reactor.subscribe();
+
+        // Add the predicate to the subscription
+        subscription.add_predicate(&self.node.reactor, handle.id, collection_id, args.predicate);
+
+        // Set up callback bridge to signal system
+        // TODO: This should be replaced with proper signal usage when context.rs is updated
+        {
+            use ankurah_signals::Subscribe;
+            let callback = callback;
+            subscription.subscribe(move |reactor_update: ReactorUpdate| {
+                // Convert ReactorUpdate to ChangeSet for backward compatibility
+                let changeset = ChangeSet::from(reactor_update);
+                callback(changeset);
+            });
+        }
+
+        let storage_collection = self.node.collections.get(collection_id).await?;
 
         let initial_states: Vec<Attested<EntityState>>;
         // Handle remote subscription setup
         if let Some(ref relay) = self.node.subscription_relay {
-            relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), self.cdata.clone());
+            relay.notify_subscribe(predicate_id, collection_id.clone(), predicate.clone(), self.cdata.clone());
 
             if !cached {
                 // Create oneshot channel to wait for first remote update
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                self.node.pending_subs.insert(sub_id, tx);
+                self.node.pending_subs.insert(predicate_id, tx);
 
                 // Wait for first remote update before initializing
                 match rx.await {
                     Err(_) => {
                         // Channel was dropped, proceed with local initialization anyway
-                        warn!("Failed to receive first remote update for subscription {}", sub_id);
+                        warn!("Failed to receive first remote update for subscription {}", predicate_id);
                         initial_states = storage_collection.fetch_states(&predicate).await?;
                     }
                     Ok(states) => initial_states = states,
@@ -319,7 +337,7 @@ where
         }
 
         // Always initialize the subscription
-        self.node.reactor.initialize(subscription, initial_states).await?;
+        subscription.initialize(&self.node.reactor, handle.id, collection_id, initial_states).await?;
 
         Ok(handle)
     }
