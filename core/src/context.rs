@@ -7,6 +7,7 @@ use crate::{
     model::View,
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
+    reactor::ReactorUpdate,
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
@@ -47,7 +48,7 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
-    async fn subscribe(
+    async fn query(
         &self,
         sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
@@ -70,14 +71,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.fetch_entities(collection, args).await
     }
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
-    async fn subscribe(
+    async fn query(
         &self,
         sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<LiveQuery, RetrievalError> {
-        self.subscribe(sub_id, collection, args, callback).await
+        self.query(sub_id, collection, args, callback).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
@@ -155,11 +156,11 @@ impl Context {
         Ok(result_set.items.into_iter().next())
     }
     /// Subscribe to changes in entities matching a predicate
-    pub async fn subscribe<F, R>(
+    pub async fn query<F, R>(
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
         callback: F,
-    ) -> Result<crate::subscription::QueryGuard, RetrievalError>
+    ) -> Result<LiveQuery, RetrievalError>
     where
         F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
         R: View,
@@ -174,7 +175,7 @@ impl Context {
         // Now set up our local subscription
         let handle = self
             .0
-            .subscribe(
+            .query(
                 sub_id,
                 &collection_id,
                 args,
@@ -271,7 +272,7 @@ where
         Ok(entities)
     }
 
-    pub async fn subscribe(
+    pub async fn query(
         &self,
         predicate_id: proto::PredicateId,
         collection_id: &CollectionId,

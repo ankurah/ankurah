@@ -86,7 +86,7 @@ async fn server_edits_subscription() -> Result<()> {
     let client = client.context(c)?;
 
     let (server_watcher, check_server) = common::changeset_watcher::<PetView>();
-    let _server_handle = server.subscribe("name = 'Rex' OR (age > 2 and age < 5)", server_watcher).await?;
+    let _server_handle = server.query("name = 'Rex' OR (age > 2 and age < 5)", server_watcher).await?;
 
     assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
 
@@ -108,7 +108,7 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Set up subscription on node2
     let (client_watcher, check_client) = common::changeset_watcher::<PetView>();
-    let _client_handle = client.subscribe("name = 'Rex' OR (age > 2 and age < 5)", client_watcher).await?;
+    let _client_handle = client.query("name = 'Rex' OR (age > 2 and age < 5)", client_watcher).await?;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -214,8 +214,8 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     let (client_b_watcher, check_client_b) = common::changeset_watcher::<AlbumView>();
 
     // Set up subscriptions
-    let _server_sub = server.subscribe("name = 'Origin of Symmetry'", server_watcher).await?;
-    let _client_b_sub = client_b.subscribe("name = 'Origin of Symmetry'", client_b_watcher).await?;
+    let _server_sub = server.query("name = 'Origin of Symmetry'", server_watcher).await?;
+    let _client_b_sub = client_b.query("name = 'Origin of Symmetry'", client_b_watcher).await?;
 
     // Create an entity on client_a
     let album_id = {
@@ -270,7 +270,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Set up query subscription on client that matches our pet
     let (query_watcher, check_query_changes) = common::changeset_watcher::<PetView>();
-    let query_handle = client.subscribe("name = 'Buddy'", query_watcher).await?;
+    let query_handle = client.query("name = 'Buddy'", query_watcher).await?;
 
     // Wait for initial sync
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

@@ -133,8 +133,8 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
     let (client_watcher, check_client) = changeset_watcher::<AlbumView>();
 
     // Subscribe on both ends
-    let _server_sub = server_ctx.subscribe("name = 'Abbey Road'", server_watcher).await?;
-    let _client_sub = client_ctx.subscribe("name = 'Abbey Road'", client_watcher).await?;
+    let _server_sub = server_ctx.query("name = 'Abbey Road'", server_watcher).await?;
+    let _client_sub = client_ctx.query("name = 'Abbey Road'", client_watcher).await?;
 
     // Initial state should be empty
     assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
@@ -204,8 +204,8 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     let (client_watcher, check_client) = changeset_watcher::<PetView>();
 
     // Subscribe to pets with age > 5
-    let _server_sub = server_ctx.subscribe("age > 5", server_watcher).await?;
-    let _client_sub = client_ctx.subscribe("age > 5", client_watcher).await?;
+    let _server_sub = server_ctx.query("age > 5", server_watcher).await?;
+    let _client_sub = client_ctx.query("age > 5", client_watcher).await?;
 
     // Create pet on server
     let server_pet_id = {
