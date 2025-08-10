@@ -13,7 +13,7 @@ let vibe = Mut::new("grindcore");
 
 // Sometimes directly subscribing to the signal can be useful
 // your listener will not be called immediately, only when the signal changes
-// the subscription will be removed when the SubscriptionGuard is dropped
+// the subscription will be removed when the SignalGuard is dropped
 let _guard1 = day.subscribe(|v| println!("The day is: {}", v));
 let _guard2 = vibe.subscribe(|v| println!("Vibe: {}", v));
 

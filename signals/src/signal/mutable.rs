@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     broadcast::Broadcast,
     context::CurrentObserver,
-    porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
+    porcelain::{SignalGuard, Subscribe, subscribe::IntoSubscribeListener},
     signal::{Get, GetReadCell, Signal, With, read::Read},
     value::{ReadValueCell, ValueCell},
 };
@@ -33,10 +33,6 @@ impl<T: 'static> Mut<T> {
     /// Returns a read-only version of this signal  
     pub fn read(&self) -> Read<T> { Read { value: self.value.clone(), broadcast: self.broadcast.clone() } }
 }
-
-// impl<T: 'static> Signal<T> for Mut<T> {
-//     fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionGuard { self.subscribers.subscribe(subscriber) }
-// }
 
 impl<T> Mut<T>
 where T: Clone
@@ -71,7 +67,7 @@ impl<T> Signal for Mut<T> {
 impl<T> Subscribe<T> for Mut<T>
 where T: Clone + Send + Sync + 'static
 {
-    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
+    fn subscribe<F>(&self, listener: F) -> SignalGuard
     where F: IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let ro_value = self.get_readcell(); // Get read-only value handle
@@ -80,6 +76,6 @@ where T: Clone + Send + Sync + 'static
             let current_value = ro_value.value();
             listener(current_value);
         }));
-        SubscriptionGuard::new(subscription)
+        SignalGuard::new(subscription)
     }
 }

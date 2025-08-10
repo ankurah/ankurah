@@ -122,7 +122,7 @@ mod tests {
         let mut index = ComparisonIndex::new();
 
         // Less than 8 ------------------------------------------------------------
-        let sub0 = proto::SubscriptionId::test(0);
+        let sub0 = proto::PredicateId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::LessThan, sub0);
 
         // 8 should match nothing
@@ -131,7 +131,7 @@ mod tests {
         // 7 should match sub0
         assert_eq!(index.find_matching(Value::Integer(7)), vec![sub0]);
 
-        let sub1 = proto::SubscriptionId::test(1);
+        let sub1 = proto::PredicateId::test(1);
 
         // Greater than 20 ------------------------------------------------------------
         index.add(ast::Literal::Integer(20), ast::ComparisonOperator::GreaterThan, sub1);
@@ -165,7 +165,7 @@ mod tests {
     fn test_field_index_not_equal() {
         let mut index = ComparisonIndex::new();
 
-        let sub0 = proto::SubscriptionId::test(0);
+        let sub0 = proto::PredicateId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::NotEqual, sub0);
 
         assert_eq!(index.find_matching(Value::Integer(8)), vec![sub0]);

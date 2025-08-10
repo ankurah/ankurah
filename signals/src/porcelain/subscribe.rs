@@ -14,29 +14,30 @@ pub trait IntoSubscribeListener<T> {
 /// Trait for subscribing to changes - provides the subscribe method
 pub trait Subscribe<T: 'static> {
     /// Subscribe to changes with a listener that receives the new value
-    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
+    fn subscribe<F>(&self, listener: F) -> SignalGuard
     where F: IntoSubscribeListener<T>;
 }
 
 pub trait DynSubscribe<T: 'static> {
-    fn dyn_subscribe(&self, listener: Box<dyn Fn(T) + Send + Sync + 'static>) -> SubscriptionGuard;
+    fn dyn_subscribe(&self, listener: Box<dyn Fn(T) + Send + Sync + 'static>) -> SignalGuard;
 }
 
 impl<S, T: 'static> DynSubscribe<T> for S
 where S: Subscribe<T>
 {
-    fn dyn_subscribe(&self, listener: Box<dyn Fn(T) + Send + Sync + 'static>) -> SubscriptionGuard { Subscribe::subscribe(self, listener) }
+    fn dyn_subscribe(&self, listener: Box<dyn Fn(T) + Send + Sync + 'static>) -> SignalGuard { Subscribe::subscribe(self, listener) }
 }
 
 pub trait GetAndDynSubscribe<T: 'static>: Get<T> + DynSubscribe<T> {}
 impl<T: 'static, S> GetAndDynSubscribe<T> for S where S: Get<T> + DynSubscribe<T> {}
 
+/// A guard for a subscription to a signal
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-pub struct SubscriptionGuard {
+pub struct SignalGuard {
     _listenerguard: ListenerGuard,
 }
 
-impl SubscriptionGuard {
+impl SignalGuard {
     pub fn new(subscription: ListenerGuard) -> Self { Self { _listenerguard: subscription } }
 }
 

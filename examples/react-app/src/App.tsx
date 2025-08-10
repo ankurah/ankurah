@@ -87,7 +87,7 @@ const App: React.FC = signalObserver(() => {
         value,
       );
     });
-    // h is a SubscriptionGuard. We just keep it resident so the finalization registry doesn't free it and cancel the subscription
+    // h is a SignalGuard. We just keep it resident so the finalization registry doesn't free it and cancel the subscription
     return [signal, h];
   }, []);
 

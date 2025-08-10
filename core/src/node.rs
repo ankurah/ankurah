@@ -12,22 +12,20 @@ use tokio::sync::oneshot;
 
 use crate::{
     action_debug, action_error, action_info, action_warn,
-    changes::{ChangeSet, EntityChange, ItemChange},
+    changes::{EntityChange, ItemChange},
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
-    context::{Context, NodeAndContext},
-    entity::{Entity, WeakEntitySet},
+    context::{Context, LiveQuery, NodeAndContext},
+    entity::WeakEntitySet,
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
     policy::{AccessDenied, PolicyAgent},
     reactor::Reactor,
     retrieval::LocalRetriever,
     storage::StorageEngine,
-    subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,
     system::SystemManager,
     task::spawn,
-    transaction::Transaction,
     util::{safemap::SafeMap, safeset::SafeSet},
 };
 #[cfg(feature = "instrument")]
@@ -38,7 +36,7 @@ use tracing::{debug, error, info, warn};
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
-    subscriptions: SafeSet<proto::SubscriptionId>,
+    subscriptions: SafeSet<proto::PredicateId>,
     pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 }
@@ -120,10 +118,10 @@ where PA: PolicyAgent
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
-    pub(crate) subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
+    pub(crate) predicate_context: SafeMap<proto::PredicateId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
-    pub(crate) pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<Vec<Attested<EntityState>>>>,
+    pub(crate) pending_subs: SafeMap<proto::PredicateId, tokio::sync::oneshot::Sender<Vec<Attested<EntityState>>>>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Arc<Reactor<SE, PA>>,
@@ -160,7 +158,7 @@ where
             durable: false,
             policy_agent,
             system: system_manager,
-            subscription_context: SafeMap::new(),
+            predicate_context: SafeMap::new(),
             subscription_relay,
             pending_subs: SafeMap::new(),
         }));
@@ -194,7 +192,7 @@ where
             durable: true,
             policy_agent,
             system: system_manager,
-            subscription_context: SafeMap::new(),
+            predicate_context: SafeMap::new(),
             subscription_relay: None,
             pending_subs: SafeMap::new(),
         }))
@@ -392,11 +390,11 @@ where
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
-            proto::NodeMessage::Unsubscribe { from, subscription_id } => {
-                self.reactor.unsubscribe(subscription_id);
+            proto::NodeMessage::Unsubscribe { from, predicate_id } => {
+                self.reactor.unsubscribe(predicate_id);
                 // Remove and drop the subscription handle
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscriptions.remove(&subscription_id);
+                    peer_state.subscriptions.remove(&predicate_id);
                 }
             }
         }
@@ -462,8 +460,8 @@ where
 
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
-            proto::NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
-                self.handle_subscribe_request(cdata, request.from, subscription_id, collection, predicate).await
+            proto::NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
+                self.handle_subscribe_request(cdata, request.from, predicate_id, collection, predicate).await
             }
         }
     }
@@ -474,10 +472,10 @@ where
         };
 
         match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { subscription_id, items } => {
+            proto::NodeUpdateBody::SubscriptionUpdate { predicate_id, items } => {
                 // TODO check if this is a valid subscription
                 action_debug!(self, "received subscription update for {} items", "{}", items.len());
-                if let Some(cdata) = self.subscription_context.get(&subscription_id) {
+                if let Some(cdata) = self.predicate_context.get(&subscription_id) {
                     let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
 
                     // Signal any pending subscription waiting for first update
@@ -723,7 +721,7 @@ where
         &self,
         cdata: &PA::ContextData,
         peer_id: proto::EntityId,
-        sub_id: proto::SubscriptionId,
+        sub_id: proto::PredicateId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
@@ -905,7 +903,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
+    pub async fn request_remote_unsubscribe(&self, sub_id: proto::PredicateId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
             if let Some(connection) = item {
                 let sub_id = sub_id;
@@ -915,27 +913,6 @@ where
             }
         }
 
-        Ok(())
-    }
-
-    pub fn unsubscribe(self: &Arc<Self>, handle: &SubscriptionHandle) -> anyhow::Result<()> {
-        let node = Node(self.clone());
-        let sub_id = handle.id;
-        spawn(async move {
-            // Clean up subscription context
-            node.subscription_context.remove(&sub_id);
-
-            // Clean up any pending oneshot channel
-            node.pending_subs.remove(&sub_id);
-
-            // Unsubscribe from local reactor
-            node.reactor.unsubscribe(sub_id);
-
-            // Notify subscription relay for remote cleanup
-            if let Some(ref relay) = node.subscription_relay {
-                relay.notify_unsubscribe(sub_id);
-            }
-        });
         Ok(())
     }
 }
@@ -949,7 +926,7 @@ where PA: PolicyAgent
 }
 
 pub trait TNodeErased: Send + Sync + 'static {
-    fn unsubscribe(&self, handle: &SubscriptionHandle);
+    fn unsubscribe_remote_predicate(&self, handle: &LiveQuery);
 }
 
 impl<SE, PA> TNodeErased for Node<SE, PA>
@@ -957,7 +934,25 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn unsubscribe(&self, handle: &SubscriptionHandle) { let _ = self.0.unsubscribe(handle); }
+    fn unsubscribe_remote_predicate(&self, handle: &LiveQuery) {
+        let node = Node(self.clone());
+        let predicate_id = handle.id;
+        spawn(async move {
+            // Clean up subscription context
+            node.predicate_context.remove(&predicate_id);
+
+            // Clean up any pending oneshot channel
+            node.pending_subs.remove(&predicate_id);
+
+            // Unsubscribe from local reactor
+            node.reactor.unsubscribe(predicate_id);
+
+            // Notify subscription relay for remote cleanup
+            if let Some(ref relay) = node.subscription_relay {
+                relay.notify_unsubscribe(predicate_id);
+            }
+        });
+    }
 }
 
 impl<SE, PA> fmt::Display for Node<SE, PA>

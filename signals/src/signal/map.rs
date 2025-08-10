@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     context::CurrentObserver,
-    porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
+    porcelain::{SignalGuard, Subscribe, subscribe::IntoSubscribeListener},
     signal::{Get, Signal, With},
 };
 
@@ -80,7 +80,7 @@ where
     Input: Send + Sync + 'static,
     Output: Clone + Send + Sync + 'static,
 {
-    fn subscribe<L>(&self, listener: L) -> SubscriptionGuard
+    fn subscribe<L>(&self, listener: L) -> SignalGuard
     where L: IntoSubscribeListener<Output> {
         let listener = listener.into_subscribe_listener();
         let source = self.source.clone();
@@ -92,6 +92,6 @@ where
             });
         }));
 
-        SubscriptionGuard::new(subscription)
+        SignalGuard::new(subscription)
     }
 }

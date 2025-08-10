@@ -65,7 +65,7 @@ pub trait Mutable<'rec> {
 // Helper function for Subscribe implementations in generated Views
 // don't document this
 #[doc(hidden)]
-pub fn vsub_helper<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
+pub fn vsub_helper<V, F>(view: &V, listener: F) -> ankurah_signals::SignalGuard
 where
     V: ankurah_signals::Signal + View + Clone + Send + Sync + 'static,
     F: ankurah_signals::subscribe::IntoSubscribeListener<V>,
@@ -76,5 +76,5 @@ where
         // Call the listener with the current view when the broadcast fires
         listener(view_clone.clone());
     }));
-    ankurah_signals::SubscriptionGuard::new(subscription)
+    ankurah_signals::SignalGuard::new(subscription)
 }

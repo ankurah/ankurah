@@ -257,7 +257,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         }
 
         impl ::ankurah::signals::Subscribe<#view_name> for #view_name {
-            fn subscribe<F>(&self, listener: F) -> ::ankurah::signals::SubscriptionGuard
+            fn subscribe<F>(&self, listener: F) -> ::ankurah::signals::SignalGuard
             where
                 F: ::ankurah::signals::subscribe::IntoSubscribeListener<#view_name>,
             {

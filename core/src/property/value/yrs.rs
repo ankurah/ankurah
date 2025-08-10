@@ -23,7 +23,7 @@ pub struct YrsString<Projected> {
     // TODO: Pretty sure we need to store a clone of the Entity here so it's kept alive for the lifetime of the YrsString
     // Previously this didn't matter because the YrsString wasn't clonable. Followup question on this:
     // Will we need to update ListenerGuard to hold a dyn Any to achieve this?
-    // I ask because the ListenerGuard/SubscriptionGuard will be the only thing directly held by the user, not the YrsString/LWW
+    // I ask because the ListenerGuard/SignalGuard will be the only thing directly held by the user, not the YrsString/LWW
     // OR - will the closure be enough to hold the Entity or the YrsString/LWW alive? Ideally we wouldn't overthink this and just
     // use TDD to determine it imperically.
 }
@@ -111,7 +111,7 @@ impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
 impl<Projected> ankurah_signals::Subscribe<String> for YrsString<Projected>
 where Projected: Clone + Send + Sync + 'static
 {
-    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SubscriptionGuard
+    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SignalGuard
     where F: ankurah_signals::subscribe::IntoSubscribeListener<String> {
         let listener = listener.into_subscribe_listener();
         let yrs_string = self.clone();
@@ -121,6 +121,6 @@ where Projected: Clone + Send + Sync + 'static
                 listener(current_value);
             }
         }));
-        ankurah_signals::SubscriptionGuard::new(subscription)
+        ankurah_signals::SignalGuard::new(subscription)
     }
 }

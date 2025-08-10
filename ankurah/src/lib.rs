@@ -148,7 +148,7 @@ pub use ankurah_core::{
     property::{self, Property},
     resultset::ResultSet,
     storage,
-    subscription::SubscriptionHandle,
+    subscription::QueryGuard,
     transaction,
 };
 

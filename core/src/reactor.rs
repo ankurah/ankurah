@@ -4,7 +4,7 @@ use crate::{changes::ChangeSet, entity::Entity, node::TNodeErased};
 use ankurah_proto::{self as proto, Attested, EntityState, Event};
 use ankurah_signals::{
     broadcast::{Broadcast, BroadcastId, Listener, ListenerGuard},
-    porcelain::subscribe::{SubscribeListener, SubscriptionGuard},
+    porcelain::subscribe::{SignalGuard, SubscribeListener},
     Signal, Subscribe,
 };
 use std::collections::{HashMap, HashSet};
@@ -39,8 +39,8 @@ impl From<&str> for FieldId {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<SE, PA> {
     /// Current subscriptions
-    subscriptions: SafeMap<SubscriptionId, Arc<Subscription>>,
-    predicate_subscription_map: SafeMap<proto::PredicateId, SubscriptionId>,
+    subscriptions: SafeMap<ReactorSubId, Arc<Subscription>>,
+    predicate_subscription_map: SafeMap<proto::PredicateId, ReactorSubId>,
     /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as change
     index_watchers: SafeMap<(proto::CollectionId, FieldId), Arc<std::sync::RwLock<ComparisonIndex>>>,
     /// The set of watchers who want to be notified of any changes to a given collection
@@ -98,7 +98,7 @@ where
         &self,
         collection_id: &proto::CollectionId,
         predicate: &ast::Predicate,
-        sub_id: proto::SubscriptionId,
+        sub_id: proto::PredicateId,
         predicate_id: proto::PredicateId,
         op: WatcherOp,
     ) {
@@ -165,7 +165,7 @@ where
 
     /// Remove a subscription and clean up its watchers
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(sub_id = %sub_id)))]
-    pub(crate) fn unsubscribe(&self, sub_id: proto::SubscriptionId) {
+    pub(crate) fn unsubscribe(&self, sub_id: proto::PredicateId) {
         if let Some(sub) = self.subscriptions.remove(&sub_id) {
             // Remove all predicates from watchers
             let predicates = sub.predicates.lock().unwrap();
@@ -220,7 +220,7 @@ where
         // pretty format self
         debug!("Reactor.notify_change({:?})", changes);
         // Group changes by subscription
-        let mut sub_changes: std::collections::HashMap<proto::SubscriptionId, Vec<ItemChange<Entity>>> = std::collections::HashMap::new();
+        let mut sub_changes: std::collections::HashMap<proto::PredicateId, Vec<ItemChange<Entity>>> = std::collections::HashMap::new();
 
         for change in changes {
             let (entity, events) = change.into_parts();
@@ -392,7 +392,7 @@ impl<SE, PA> std::fmt::Debug for Reactor<SE, PA> {
 /// A subscription that can be shared between indexes
 pub struct Subscription {
     /// Unique ID for this subscription (channel/connection level)
-    pub(crate) id: SubscriptionId,
+    pub(crate) id: ReactorSubId,
     /// All predicate states, keyed by PredicateId
     pub(crate) predicates: Mutex<HashMap<proto::PredicateId, PredicateState>>,
     /// Entity-level subscriptions (explicit, not predicate-based)
@@ -407,7 +407,7 @@ impl Subscription {
     /// Create a new subscription
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            id: SubscriptionId::new(),
+            id: ReactorSubId::new(),
             predicates: Mutex::new(HashMap::new()),
             entity_subscriptions: Mutex::new(HashSet::new()),
             broadcast: Broadcast::new(),
@@ -559,7 +559,7 @@ impl Signal for Subscription {
 // Implement Subscribe trait for Subscription
 // Note: We're subscribing to ReactorUpdate, not ChangeSet
 impl Subscribe<ReactorUpdate> for Subscription {
-    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
+    fn subscribe<F>(&self, listener: F) -> SignalGuard
     where F: ankurah_signals::porcelain::subscribe::IntoSubscribeListener<ReactorUpdate> {
         let listener = listener.into_subscribe_listener();
 
@@ -570,30 +570,8 @@ impl Subscribe<ReactorUpdate> for Subscription {
         let guard = self.listen(Arc::new(move || {
             // Signal notification happens in notify()
         }));
-        SubscriptionGuard::new(guard)
+        SignalGuard::new(guard)
     }
-}
-
-/// A handle to a subscription that can be used to register callbacks
-pub struct SubscriptionHandle {
-    pub(crate) id: proto::PredicateId,
-    pub(crate) node: Box<dyn TNodeErased>,
-    pub(crate) peers: Vec<proto::EntityId>,
-}
-
-impl SubscriptionHandle {
-    pub fn new(node: Box<dyn TNodeErased>, id: proto::SubscriptionId) -> Self { Self { id, node, peers: Vec::new() } }
-}
-
-impl Drop for SubscriptionHandle {
-    fn drop(&mut self) {
-        debug!("Dropping SubscriptionHandle {}", self.id);
-        self.node.unsubscribe(self);
-    }
-}
-
-impl std::fmt::Debug for SubscriptionHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "SubscriptionHandle({:?})", self.id) }
 }
 
 // ============================================================================
@@ -602,20 +580,20 @@ impl std::fmt::Debug for SubscriptionHandle {
 
 /// Unique identifier for a reactor subscription (connection/channel level)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SubscriptionId(Ulid);
+pub struct ReactorSubId(Ulid);
 
-impl SubscriptionId {
+impl ReactorSubId {
     pub fn new() -> Self { Self(Ulid::new()) }
 }
 
-impl std::fmt::Display for SubscriptionId {
+impl std::fmt::Display for ReactorSubId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "RS-{}", self.0) }
 }
 
 // TODO - see if we can optimize this by using just predicate id, or by using an Arc<PredicateState> or something like that
 // so we don't have to do two lookups. (Post refactor optimization step)
 /// A subscription-predicate pair used by watchers and indexes
-pub type SubscriptionPredicateId = (SubscriptionId, proto::PredicateId);
+pub type SubscriptionPredicateId = (ReactorSubId, proto::PredicateId);
 
 /// State for a single predicate within a subscription
 #[derive(Debug)]

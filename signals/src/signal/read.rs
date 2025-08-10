@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     broadcast::Broadcast,
     context::CurrentObserver,
-    porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
+    porcelain::{SignalGuard, Subscribe, subscribe::IntoSubscribeListener},
     signal::{Get, GetReadCell, Signal, With, map::Map},
     value::{ReadValueCell, ValueCell},
 };
@@ -85,7 +85,7 @@ impl<T: std::fmt::Display + Send + Sync + 'static> std::fmt::Display for Read<T>
 impl<T> Subscribe<T> for Read<T>
 where T: Clone + Send + Sync + 'static
 {
-    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
+    fn subscribe<F>(&self, listener: F) -> SignalGuard
     where F: IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let ro_value = self.get_readcell(); // Get read-only value handle
@@ -94,6 +94,6 @@ where T: Clone + Send + Sync + 'static
             let current_value = ro_value.value();
             listener(current_value);
         }));
-        SubscriptionGuard::new(subscription)
+        SignalGuard::new(subscription)
     }
 }

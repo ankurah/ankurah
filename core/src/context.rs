@@ -7,7 +7,6 @@ use crate::{
     model::View,
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
-    reactor::SubscriptionHandle,
     resultset::ResultSet,
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
@@ -50,11 +49,11 @@ pub trait TContext {
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
     async fn subscribe(
         &self,
-        sub_id: proto::SubscriptionId,
+        sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<crate::reactor::SubscriptionHandle, RetrievalError>;
+    ) -> Result<LiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
@@ -73,11 +72,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
     async fn subscribe(
         &self,
-        sub_id: proto::SubscriptionId,
+        sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
         callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<crate::reactor::SubscriptionHandle, RetrievalError> {
+    ) -> Result<LiveQuery, RetrievalError> {
         self.subscribe(sub_id, collection, args, callback).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
@@ -160,7 +159,7 @@ impl Context {
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
         callback: F,
-    ) -> Result<crate::reactor::SubscriptionHandle, RetrievalError>
+    ) -> Result<crate::subscription::QueryGuard, RetrievalError>
     where
         F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
         R: View,
@@ -171,7 +170,7 @@ impl Context {
         let collection_id = R::Model::collection();
 
         // Using one subscription id for local and remote subscriptions
-        let sub_id = proto::SubscriptionId::new();
+        let sub_id = proto::PredicateId::new();
         // Now set up our local subscription
         let handle = self
             .0
@@ -278,14 +277,14 @@ where
         collection_id: &CollectionId,
         mut args: MatchArgs,
         callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<SubscriptionHandle, RetrievalError> {
-        let mut handle = SubscriptionHandle::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, predicate_id);
+    ) -> Result<LiveQuery, RetrievalError> {
+        let mut handle = LiveQuery::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, predicate_id);
 
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         args.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
 
         // Store subscription context for event requests
-        self.node.subscription_context.insert(predicate_id, self.cdata.clone());
+        self.node.predicate_context.insert(predicate_id, self.cdata.clone());
 
         let predicate = args.predicate.clone();
         let cached = args.cached;
@@ -389,4 +388,26 @@ where
         self.node.reactor.notify_change(changes);
         Ok(())
     }
+}
+
+/// A handle to a live query subscription that can be used to register callbacks
+pub struct LiveQuery {
+    pub(crate) id: proto::PredicateId,
+    pub(crate) node: Box<dyn TNodeErased>,
+    pub(crate) peers: Vec<proto::EntityId>,
+}
+
+impl LiveQuery {
+    pub fn new(node: Box<dyn TNodeErased>, id: proto::PredicateId) -> Self { Self { id, node, peers: Vec::new() } }
+}
+
+impl Drop for LiveQuery {
+    fn drop(&mut self) {
+        debug!("Dropping LiveQuery {}", self.id);
+        self.node.unsubscribe_remote_predicate(self);
+    }
+}
+
+impl std::fmt::Debug for LiveQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "LiveQuery({:?})", self.id) }
 }

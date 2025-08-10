@@ -15,7 +15,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
 
     // Generate TypeScript interface to augment the class with properly typed method signature
     let ts_wrapper_interface = format!(
-        "// Augments the {} class\ninterface {} {{\n  subscribe(callback: (value: {}) => void): SubscriptionGuard;\n}}",
+        "// Augments the {} class\ninterface {} {{\n  subscribe(callback: (value: {}) => void): SignalGuard;\n}}",
         wrapper_name, wrapper_name, name
     );
 
@@ -36,7 +36,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
         impl #wrapper_name {
 
             #[wasm_bindgen(js_name = "subscribe", skip_typescript)]
-            pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
+            pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SignalGuard {
                 use ::ankurah::signals::DynSubscribe;
                 let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
 

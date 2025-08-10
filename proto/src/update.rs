@@ -46,8 +46,8 @@ pub struct SubscriptionUpdateItem {
     pub collection: CollectionId,
     pub content: UpdateContent,
     /// Which predicates this update is relevant to and how
-    /// Uses SubscriptionId as PredicateId for remote subscriptions
-    pub predicate_relevance: Vec<(SubscriptionId, MembershipChange)>,
+    /// Uses PredicateId for remote subscriptions
+    pub predicate_relevance: Vec<(PredicateId, MembershipChange)>,
     /// Whether this entity has an explicit entity-level subscription
     pub entity_subscribed: bool,
 }
@@ -62,7 +62,7 @@ pub enum LegacySubscriptionUpdateItem {
 
 impl SubscriptionUpdateItem {
     /// Create an initial state update for a single predicate
-    pub fn initial(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>, predicate_id: SubscriptionId) -> Self {
+    pub fn initial(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>, predicate_id: PredicateId) -> Self {
         Self {
             entity_id,
             collection,
@@ -78,7 +78,7 @@ impl SubscriptionUpdateItem {
         collection: CollectionId,
         state: Attested<EntityState>,
         events: Vec<Attested<Event>>,
-        predicate_id: SubscriptionId,
+        predicate_id: PredicateId,
     ) -> Self {
         Self {
             entity_id,
@@ -90,7 +90,7 @@ impl SubscriptionUpdateItem {
     }
 
     /// Create a change update for a single predicate
-    pub fn change(entity_id: EntityId, collection: CollectionId, events: Vec<Attested<Event>>, _predicate_id: SubscriptionId) -> Self {
+    pub fn change(entity_id: EntityId, collection: CollectionId, events: Vec<Attested<Event>>, _predicate_id: PredicateId) -> Self {
         Self {
             entity_id,
             collection,
@@ -164,12 +164,8 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeUpdateBody::SubscriptionUpdate { subscription_id, items } => {
-                write!(
-                    f,
-                    "SubscriptionUpdate {subscription_id} [{}]",
-                    items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", ")
-                )
+            NodeUpdateBody::SubscriptionUpdate { predicate_id, items } => {
+                write!(f, "SubscriptionUpdate {predicate_id} [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
             }
         }
     }
