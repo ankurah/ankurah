@@ -98,7 +98,7 @@ where
         &self,
         collection_id: &proto::CollectionId,
         predicate: &ast::Predicate,
-        sub_id: proto::PredicateId,
+        sub_id: ReactorSubId,
         predicate_id: proto::PredicateId,
         op: WatcherOp,
     ) {
@@ -163,15 +163,21 @@ where
         }
     }
 
-    /// Remove a subscription and clean up its watchers
+    /// Remove a subscription and all its predicates
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(sub_id = %sub_id)))]
-    pub(crate) fn unsubscribe(&self, sub_id: proto::PredicateId) {
+    pub(crate) fn unsubscribe(&self, sub_id: ReactorSubId) {
         if let Some(sub) = self.subscriptions.remove(&sub_id) {
             // Remove all predicates from watchers
             let predicates = sub.predicates.lock().unwrap();
             for (predicate_id, predicate_state) in predicates.iter() {
                 // Remove from index watchers
-                self.manage_watchers_recurse(&sub.collection_id, &predicate_state.predicate, sub_id, *predicate_id, WatcherOp::Remove);
+                self.manage_watchers_recurse(
+                    &predicate_state.collection_id,
+                    &predicate_state.predicate,
+                    sub_id,
+                    *predicate_id,
+                    WatcherOp::Remove,
+                );
 
                 // Remove from entity watchers using predicate's matching entities
                 for entity in predicate_state.matching_entities.iter() {
@@ -598,6 +604,7 @@ pub type SubscriptionPredicateId = (ReactorSubId, proto::PredicateId);
 /// State for a single predicate within a subscription
 #[derive(Debug)]
 struct PredicateState {
+    collection_id: proto::CollectionId,
     predicate: ankql::ast::Predicate,
     initialized: bool,
     matching_entities: Vec<Entity>,

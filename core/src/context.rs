@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::{
     changes::{ChangeSet, EntityChange},
     entity::Entity,
@@ -13,7 +11,13 @@ use crate::{
     transaction::Transaction,
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
+use ankurah_signals::{
+    broadcast::{BroadcastId, Listener, ListenerGuard},
+    porcelain::subscribe::{IntoSubscribeListener, SignalGuard},
+    Signal, Subscribe,
+};
 use async_trait::async_trait;
+use std::sync::Arc;
 use tracing::{debug, warn};
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -53,7 +57,6 @@ pub trait TContext {
         sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
-        callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<LiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
@@ -76,9 +79,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
-        callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<LiveQuery, RetrievalError> {
-        self.query(sub_id, collection, args, callback).await
+        self.query(sub_id, collection, args).await
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
@@ -156,15 +158,8 @@ impl Context {
         Ok(result_set.items.into_iter().next())
     }
     /// Subscribe to changes in entities matching a predicate
-    pub async fn query<F, R>(
-        &self,
-        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
-        callback: F,
-    ) -> Result<LiveQuery, RetrievalError>
-    where
-        F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
-        R: View,
-    {
+    pub async fn query<R>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<LiveQuery, RetrievalError>
+    where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
 
         use crate::model::Model;
@@ -173,17 +168,7 @@ impl Context {
         // Using one subscription id for local and remote subscriptions
         let sub_id = proto::PredicateId::new();
         // Now set up our local subscription
-        let handle = self
-            .0
-            .query(
-                sub_id,
-                &collection_id,
-                args,
-                Box::new(move |changeset| {
-                    callback(changeset.into());
-                }),
-            )
-            .await?;
+        let handle = self.0.query(sub_id, &collection_id, args).await?;
         Ok(handle)
     }
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
@@ -277,7 +262,6 @@ where
         predicate_id: proto::PredicateId,
         collection_id: &CollectionId,
         mut args: MatchArgs,
-        callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
     ) -> Result<LiveQuery, RetrievalError> {
         let mut handle = LiveQuery::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, predicate_id);
 
@@ -296,17 +280,8 @@ where
         // Add the predicate to the subscription
         subscription.add_predicate(&self.node.reactor, handle.id, collection_id, args.predicate);
 
-        // Set up callback bridge to signal system
-        // TODO: This should be replaced with proper signal usage when context.rs is updated
-        {
-            use ankurah_signals::Subscribe;
-            let callback = callback;
-            subscription.subscribe(move |reactor_update: ReactorUpdate| {
-                // Convert ReactorUpdate to ChangeSet for backward compatibility
-                let changeset = ChangeSet::from(reactor_update);
-                callback(changeset);
-            });
-        }
+        // Store the subscription reference in the LiveQuery so it can implement signal traits
+        handle.subscription = Some(subscription);
 
         let storage_collection = self.node.collections.get(collection_id).await?;
 
@@ -396,10 +371,11 @@ pub struct LiveQuery {
     pub(crate) id: proto::PredicateId,
     pub(crate) node: Box<dyn TNodeErased>,
     pub(crate) peers: Vec<proto::EntityId>,
+    pub(crate) subscription: Arc<crate::reactor::Subscription>,
 }
 
 impl LiveQuery {
-    pub fn new(node: Box<dyn TNodeErased>, id: proto::PredicateId) -> Self { Self { id, node, peers: Vec::new() } }
+    pub fn new(node: Box<dyn TNodeErased>, id: proto::PredicateId) -> Self { Self { id, node, peers: Vec::new(), subscription: None } }
 }
 
 impl Drop for LiveQuery {
