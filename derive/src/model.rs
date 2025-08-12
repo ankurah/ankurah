@@ -13,11 +13,6 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let resultset_name = format_ident!("{}ResultSet", name);
     #[cfg(feature = "wasm")]
     let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
-    let clone_derive = if !get_model_flag(&input.attrs, "no_clone") {
-        quote! { #[derive(Clone)] }
-    } else {
-        quote! {}
-    };
 
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
@@ -107,6 +102,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         Ok(#resultset_name(::std::sync::Arc::new(resultset)))
                     }
 
+                    // TODO: rename this to "query"
                     pub fn subscribe (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
                         let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
                         let signal = ::ankurah::signals::Mut::new(#resultset_name::default());
@@ -121,6 +117,14 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                                     signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
                                 })
                                 .await;
+
+                            // TODO: update this to use LiveQuery<R>. something like:
+                            // let livequery = context2.query(predicate);
+                            // livequery.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                            //     signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
+                            // });
+                            
+
                             match handle {
                                 Ok(h) => {
                                     handle2.set(h).unwrap();
@@ -186,8 +190,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     let expanded: proc_macro::TokenStream = quote! {
 
         #wasm_attributes
-        #clone_derive
-        #[derive(Debug, PartialEq)]
+        #[derive(Clone, Debug, PartialEq)]
         pub struct #view_name {
             entity: ::ankurah::entity::Entity,
             #(
