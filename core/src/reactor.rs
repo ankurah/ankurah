@@ -238,7 +238,12 @@ where
     /// Initialize a specific predicate by performing initial evaluation
     /// Initialize a subscription by performing initial evaluation and calling the callback
     /// This is async and does the initial fetch and evaluation
-    pub async fn initialize(&self, subscription: &ReactorSubscription, initial_states: Vec<Attested<EntityState>>) -> anyhow::Result<()> {
+    pub async fn initialize(
+        &self,
+        subscription: &ReactorSubscription,
+        predicate_id: proto::PredicateId,
+        initial_states: Vec<Attested<EntityState>>,
+    ) -> anyhow::Result<()> {
         // Find initial matching entities
         let storage_collection = self.0.collections.get(&subscription.collection_id()).await?;
         let mut matching_entities = Vec::new();
