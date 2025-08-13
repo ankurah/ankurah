@@ -1,5 +1,5 @@
-use ankurah_proto::{self as proto};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hash;
 
 use crate::collation::Collatable;
 use ankql::ast;
@@ -10,21 +10,25 @@ use ankql::ast;
 /// This is not efficient for large datasets. If this ends up being used in production
 /// we should consider using a more efficient index structure like a B+ tree with subscription
 /// registrations on intermediate nodes for range comparisons.
-#[derive(Debug, Default)]
-pub(crate) struct ComparisonIndex {
-    pub(crate) eq: HashMap<Vec<u8>, Vec<proto::PredicateId>>,
-    pub(crate) ne: HashMap<Vec<u8>, Vec<proto::PredicateId>>,
-    pub(crate) gt: BTreeMap<Vec<u8>, Vec<proto::PredicateId>>,
-    pub(crate) lt: BTreeMap<Vec<u8>, Vec<proto::PredicateId>>,
+#[derive(Debug)]
+pub(crate) struct ComparisonIndex<T> {
+    pub(crate) eq: HashMap<Vec<u8>, Vec<T>>,
+    pub(crate) ne: HashMap<Vec<u8>, Vec<T>>,
+    pub(crate) gt: BTreeMap<Vec<u8>, Vec<T>>,
+    pub(crate) lt: BTreeMap<Vec<u8>, Vec<T>>,
 }
 
-impl ComparisonIndex {
+impl<T> Default for ComparisonIndex<T> {
+    fn default() -> Self { Self { eq: HashMap::new(), ne: HashMap::new(), gt: BTreeMap::new(), lt: BTreeMap::new() } }
+}
+
+impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
     #[allow(unused)]
-    pub fn new() -> Self { Self { eq: HashMap::new(), ne: HashMap::new(), gt: BTreeMap::new(), lt: BTreeMap::new() } }
+    pub fn new() -> Self { Self::default() }
 
     fn for_entry<F, V>(&mut self, value: V, op: ast::ComparisonOperator, f: F)
     where
-        F: FnOnce(&mut Vec<proto::PredicateId>),
+        F: FnOnce(&mut Vec<T>),
         V: Collatable,
     {
         match op {
@@ -66,19 +70,19 @@ impl ComparisonIndex {
         }
     }
 
-    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_pred_id: proto::PredicateId) {
-        self.for_entry(value, op, |entries| entries.push(sub_pred_id));
+    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, watcher_id: T) {
+        self.for_entry(value, op, |entries| entries.push(watcher_id));
     }
 
-    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_pred_id: proto::PredicateId) {
+    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, watcher_id: T) {
         self.for_entry(value, op, |entries| {
-            if let Some(pos) = entries.iter().position(|id| *id == sub_pred_id) {
+            if let Some(pos) = entries.iter().position(|id| *id == watcher_id) {
                 entries.remove(pos);
             }
         });
     }
 
-    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<proto::PredicateId> {
+    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<T> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
@@ -118,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_field_index() {
-        let mut index = ComparisonIndex::new();
+        let mut index = ComparisonIndex::<proto::PredicateId>::new();
 
         // Less than 8 ------------------------------------------------------------
         let sub0 = proto::PredicateId::test(0);
@@ -162,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_field_index_not_equal() {
-        let mut index = ComparisonIndex::new();
+        let mut index = ComparisonIndex::<proto::PredicateId>::new();
 
         let sub0 = proto::PredicateId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::NotEqual, sub0);

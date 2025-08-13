@@ -3,7 +3,8 @@ use ankurah_proto::{self as proto, Attested};
 use std::sync::Arc;
 use ulid::Ulid;
 
-/// Unique identifier for a reactor subscription
+/// Unique identifier for a reactor subscription. This id is used only within a given reactor / node.
+/// it cannot be transported across nodes. Predicate id and Entity id are used for that instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReactorSubscriptionId(Ulid);
 
@@ -17,80 +18,61 @@ impl std::fmt::Display for ReactorSubscriptionId {
 
 /// Inner state for ReactorSubscription
 pub(crate) struct ReactorSubInner {
-    state: Arc<SubscriptionState>,
+    subscription_id: ReactorSubscriptionId,
+    collection_id: proto::CollectionId,
     reactor: Box<dyn TReactor + Send + Sync>,
 }
 
 /// Trait for type-erased reactor functionality needed by ReactorSubscription
 trait TReactor {
-    fn manage_watchers_recurse(
+    fn unsubscribe(&self, sub_id: ReactorSubscriptionId);
+    fn add_predicate(
         &self,
-        collection_id: &proto::CollectionId,
-        predicate: &ankql::ast::Predicate,
-        sub_id: ReactorSubscriptionId,
+        subscription_id: ReactorSubscriptionId,
         predicate_id: proto::PredicateId,
-        op: super::WatcherOp,
+        collection_id: &proto::CollectionId,
+        predicate: ankql::ast::Predicate,
     );
-    //     fn unsubscribe(&self, sub_id: ReactorSubscriptionId);
-    //     fn add_predicate_to_state(
-    //         &self,
-    //         state: &SubscriptionState,
-    //         predicate_id: proto::PredicateId,
-    //         collection_id: &proto::CollectionId,
-    //         predicate: ankql::ast::Predicate,
-    //     );
-    //     fn initialize_predicate(
-    //         &self,
-    //         state: &SubscriptionState,
-    //         predicate_id: proto::PredicateId,
-    //         collection_id: &proto::CollectionId,
-    //         initial_states: Vec<Attested<EntityState>>,
-    //     ) -> impl std::future::Future<Output = Result<(), RetrievalError>> + Send;
+    fn remove_predicate(&self, subscription_id: ReactorSubscriptionId, predicate_id: proto::PredicateId);
+    fn add_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>);
+    fn remove_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>);
+    // TODO: Add initialize method when it's moved to Reactor
 }
 
-impl<SE, PA> TReactor for super::Reactor<SE, PA> {
-    fn manage_watchers_recurse(
+impl<SE, PA> TReactor for super::Reactor<SE, PA>
+where
+    SE: super::StorageEngine + Send + Sync + 'static,
+    PA: super::PolicyAgent + Send + Sync + 'static,
+{
+    fn unsubscribe(&self, sub_id: ReactorSubscriptionId) { self.unsubscribe(sub_id); }
+
+    fn add_predicate(
         &self,
-        collection_id: &proto::CollectionId,
-        predicate: &ankql::ast::Predicate,
-        sub_id: ReactorSubscriptionId,
+        subscription_id: ReactorSubscriptionId,
         predicate_id: proto::PredicateId,
-        op: super::WatcherOp,
+        collection_id: &proto::CollectionId,
+        predicate: ankql::ast::Predicate,
     ) {
-        self.manage_watchers_recurse(collection_id, predicate, sub_id, predicate_id, op);
+        self.add_predicate(subscription_id, predicate_id, collection_id, predicate);
+    }
+
+    fn remove_predicate(&self, subscription_id: ReactorSubscriptionId, predicate_id: proto::PredicateId) {
+        self.remove_predicate(subscription_id, predicate_id);
+    }
+
+    fn add_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>) {
+        self.add_entity_subscriptions(subscription_id, entity_ids);
+    }
+
+    fn remove_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>) {
+        self.remove_entity_subscriptions(subscription_id, entity_ids);
     }
 }
-// where
-//     SE: StorageEngine + Send + Sync + 'static,
-//     PA: PolicyAgent + Send + Sync + 'static,
-// {
-//     fn unsubscribe(&self, sub_id: ReactorSubscriptionId) { self.unsubscribe(sub_id); }
-
-//     fn add_predicate_to_state(
-//         &self,
-//         state: &SubscriptionState,
-//         predicate_id: proto::PredicateId,
-//         collection_id: &proto::CollectionId,
-//         predicate: ast::Predicate,
-//     ) {
-//         state.add_predicate(self, predicate_id, collection_id, predicate);
-//     }
-
-//     fn initialize_predicate(
-//         &self,
-//         state: &SubscriptionState,
-//         predicate_id: proto::PredicateId,
-//         collection_id: &proto::CollectionId,
-//         initial_states: Vec<Attested<EntityState>>,
-//     ) -> impl std::future::Future<Output = Result<(), RetrievalError>> + Send {
-//         state.initialize(self, predicate_id, collection_id, initial_states)
-//     }
-// }
 
 impl Drop for ReactorSubInner {
     fn drop(&mut self) {
         // Automatically unsubscribe when the ReactorSubscription is dropped
-        self.reactor.unsubscribe(self.state.id);
+        self.reactor.unsubscribe(self.subscription_id);
     }
 }
 
@@ -98,35 +80,35 @@ impl Drop for ReactorSubInner {
 pub struct ReactorSubscription(Arc<ReactorSubInner>);
 
 impl ReactorSubscription {
-    pub fn new(state: SubscriptionState, reactor: Box<dyn TReactor + Send + Sync>) -> Self {
-        Self(Arc::new(ReactorSubInner { state, reactor }))
+    pub fn new(subscription_id: ReactorSubscriptionId, reactor: Box<dyn TReactor + Send + Sync>) -> Self {
+        Self(Arc::new(ReactorSubInner { subscription_id, reactor }))
     }
+
+    /// Get the subscription ID
+    pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
+
+    pub fn collection_id(&self) -> proto::CollectionId { self.0.collection_id }
 
     /// Add a predicate to this subscription
     pub fn add_predicate(&self, predicate_id: proto::PredicateId, collection_id: &proto::CollectionId, predicate: ankql::ast::Predicate) {
-        self.0.reactor.manage_watchers_recurse(collection_id, &predicate, self.id, predicate_id, WatcherOp::Add);
-
-        // Add predicate to subscription
-        self.predicates
-            .lock()
-            .unwrap()
-            .insert(predicate_id, PredicateState { predicate, initialized: false, matching_entities: Vec::new() });
-
-        // Update predicate mapping
-        reactor.0.predicate_subscription_map.insert(predicate_id, self.id);
+        self.0.reactor.add_predicate(self.0.subscription_id, predicate_id, collection_id, predicate);
     }
 
     /// Remove a predicate from this subscription
-    pub fn remove_predicate(&self, predicate_id: &proto::PredicateId) { self.0.state.remove_predicate(predicate_id); }
+    pub fn remove_predicate(&self, predicate_id: proto::PredicateId) {
+        self.0.reactor.remove_predicate(self.0.subscription_id, predicate_id);
+    }
 
-    /// Initialize a predicate with initial states
-    pub async fn initialize(
-        &self,
-        predicate_id: proto::PredicateId,
-        collection_id: &proto::CollectionId,
-        initial_states: Vec<Attested<EntityState>>,
-    ) -> Result<(), RetrievalError> {
-        self.0.reactor.initialize_predicate(&self.0.state, predicate_id, collection_id, initial_states).await
+    /// Add entity subscriptions
+    pub fn add_entity_subscriptions(&self, entity_ids: impl IntoIterator<Item = proto::EntityId>) {
+        let entity_ids: Vec<_> = entity_ids.into_iter().collect();
+        self.0.reactor.add_entity_subscriptions(self.0.subscription_id, entity_ids);
+    }
+
+    /// Remove entity subscriptions
+    pub fn remove_entity_subscriptions(&self, entity_ids: impl IntoIterator<Item = proto::EntityId>) {
+        let entity_ids: Vec<_> = entity_ids.into_iter().collect();
+        self.0.reactor.remove_entity_subscriptions(self.0.subscription_id, entity_ids);
     }
 }
 
@@ -134,17 +116,4 @@ impl Clone for ReactorSubscription {
     fn clone(&self) -> Self { ReactorSubscription(self.0.clone()) }
 }
 
-// Implement Signal trait for ReactorSubscription
-impl Signal for ReactorSubscription {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.0.state.listen(listener) }
-
-    fn broadcast_id(&self) -> BroadcastId { self.0.state.broadcast_id() }
-}
-
-// Implement Subscribe trait for ReactorSubscription
-impl Subscribe<ReactorUpdate> for ReactorSubscription {
-    fn subscribe<F>(&self, listener: F) -> SignalGuard
-    where F: ankurah_signals::porcelain::subscribe::IntoSubscribeListener<ReactorUpdate> {
-        self.0.state.subscribe(listener)
-    }
-}
+// TODO: Re-implement Signal traits when signals are integrated with the new architecture
