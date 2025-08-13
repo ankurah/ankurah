@@ -5,7 +5,7 @@ mod update;
 use self::{
     comparison_index::ComparisonIndex,
     subscription::{ReactorSubscription, ReactorSubscriptionId},
-    update::ReactorUpdate,
+    update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
 };
 
 use crate::{
@@ -62,7 +62,7 @@ struct ReactorState {
 }
 
 /// State for a single predicate within a subscription
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PredicateState {
     pub(crate) subscription_id: ReactorSubscriptionId,
     pub(crate) collection_id: proto::CollectionId,
@@ -233,50 +233,88 @@ where
         }
     }
 
-    // TODO: Build ReactorUpdate with MembershipChange::Initial for each matching entity
-    // TODO: Call add_entity_subscriptions for all returned entities
     /// Initialize a specific predicate by performing initial evaluation
-    /// Initialize a subscription by performing initial evaluation and calling the callback
     /// This is async and does the initial fetch and evaluation
     pub async fn initialize(
         &self,
-        subscription: &ReactorSubscription,
+        subscription_id: ReactorSubscriptionId,
         predicate_id: proto::PredicateId,
         initial_states: Vec<Attested<EntityState>>,
     ) -> anyhow::Result<()> {
+        let (collection_id, predicate) = {
+            let state = self.0.state.lock().unwrap();
+            let predicate_state =
+                state.predicates.get(&predicate_id).ok_or_else(|| anyhow::anyhow!("Predicate {:?} not found", predicate_id))?;
+            (predicate_state.collection_id.clone(), predicate_state.predicate.clone())
+        };
+
         // Find initial matching entities
-        let storage_collection = self.0.collections.get(&subscription.collection_id()).await?;
+        let storage_collection = self.0.collections.get(&collection_id).await?;
         let mut matching_entities = Vec::new();
+        let mut matching_entity_ids = Vec::new();
 
         // in theory, any state that is in the collection should already have its events in the storage collection as well
         let retriever = LocalRetriever::new(storage_collection.clone());
+
         // Convert states to Entity and filter by predicate
-        for state in states {
-            let (_, entity) = self
-                .entityset
-                .with_state(&retriever, state.payload.entity_id, subscription.collection_id.to_owned(), state.payload.state)
-                .await?;
+        for state in initial_states {
+            let (_, entity) =
+                self.0.entityset.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
 
             // Evaluate predicate for each entity
-            if ankql::selection::filter::evaluate_predicate(&entity, &subscription.predicate).unwrap_or(false) {
+            if ankql::selection::filter::evaluate_predicate(&entity, &predicate).unwrap_or(false) {
+                matching_entity_ids.push(entity.id);
                 matching_entities.push(entity.clone());
-
-                // Set up entity watchers
-                self.entity_watchers.set_insert(entity.id, subscription.id);
             }
         }
 
-        // Update subscription's matching entities
-        *subscription.matching_entities.lock().unwrap() = matching_entities.clone();
+        // Update state with matching entities and mark as initialized
+        {
+            let mut state = self.0.state.lock().unwrap();
 
-        // Mark subscription as initialized
-        subscription.initialized.store(true, Ordering::SeqCst);
+            // Update predicate state
+            if let Some(predicate_state) = state.predicates.get_mut(&predicate_id) {
+                predicate_state.matching_entities = matching_entities.clone();
+                predicate_state.initialized = true;
+            }
 
-        // Call callback with initial state
-        (subscription.callback)(ChangeSet {
-            changes: matching_entities.iter().map(|entity| ItemChange::Initial { item: entity.clone() }).collect(),
-            resultset: ResultSet { loaded: true, items: matching_entities.clone() },
-        });
+            // Update subscription's predicate state
+            if let Some(subscription) = state.subscriptions.get_mut(&subscription_id) {
+                if let Some(pred_state) = subscription.predicates.get_mut(&predicate_id) {
+                    pred_state.matching_entities = matching_entities.clone();
+                    pred_state.initialized = true;
+                }
+            }
+
+            // Set up entity watchers for matching entities
+            for entity_id in &matching_entity_ids {
+                state.entity_watchers.entry(*entity_id).or_default().insert(subscription_id);
+            }
+        }
+
+        // Call add_entity_subscriptions for all returned entities
+        self.add_entity_subscriptions(subscription_id, matching_entity_ids);
+
+        // Build ReactorUpdate with MembershipChange::Initial for each matching entity
+        let reactor_update_items: Vec<ReactorUpdateItem> = matching_entities
+            .into_iter()
+            .map(|entity| ReactorUpdateItem {
+                entity,
+                events: vec![],           // No events for initial state
+                entity_subscribed: false, // These are predicate matches, not direct entity subscriptions
+                predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
+            })
+            .collect();
+
+        let reactor_update = ReactorUpdate { items: reactor_update_items };
+
+        // Notify the subscription
+        {
+            let state = self.0.state.lock().unwrap();
+            if let Some(subscription) = state.subscriptions.get(&subscription_id) {
+                subscription.notify(reactor_update);
+            }
+        }
 
         Ok(())
     }
