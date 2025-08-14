@@ -26,7 +26,7 @@ pub struct ReactorUpdate<E = Entity, Ev = Attested<Event>> {
 }
 
 /// A single entity update with all relevance information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReactorUpdateItem<E = Entity, Ev = Attested<Event>> {
     /// The entity that changed
     pub entity: E,
@@ -39,7 +39,7 @@ pub struct ReactorUpdateItem<E = Entity, Ev = Attested<Event>> {
     pub predicate_relevance: Vec<(proto::PredicateId, MembershipChange)>,
 }
 
-impl<E, Ev> ReactorUpdateItem<E, Ev> {
+impl<E, Ev: Clone> ReactorUpdateItem<E, Ev> {
     /// Check if this item represents any membership change
     pub fn has_membership_change(&self) -> bool { !self.predicate_relevance.is_empty() }
 

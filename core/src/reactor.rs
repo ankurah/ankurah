@@ -13,6 +13,7 @@ use crate::{
     entity::{Entity, WeakEntitySet},
     error::SubscriptionError,
     policy::PolicyAgent,
+    reactor::subscription::ReactorSubInner,
     resultset::ResultSet,
     retrieval::LocalRetriever,
     storage::{StorageCollection, StorageCollectionWrapper, StorageEngine},
@@ -61,13 +62,11 @@ impl ChangeNotification for EntityChange {
     fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { self.into_parts() }
 }
 
-// LEFT OFF HERE - create an abstraction for WeakEntitySet to simplify the tests
-
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
-pub struct Reactor<E: ReactorEntity = Entity>(Arc<ReactorInner<E>>);
+pub struct Reactor<E: ReactorEntity = Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(Arc<ReactorInner<E, Ev>>);
 
-struct ReactorInner<E: ReactorEntity> {
-    subscriptions: Mutex<HashMap<ReactorSubscriptionId, SubscriptionState<E>>>,
+struct ReactorInner<E: ReactorEntity, Ev> {
+    subscriptions: Mutex<HashMap<ReactorSubscriptionId, SubscriptionState<E, Ev>>>,
     watcher_set: Mutex<WatcherSet>,
 }
 
@@ -108,11 +107,12 @@ struct PredicateState {
     pub(crate) matching_entities: HashSet<proto::EntityId>,
 }
 
-struct SubscriptionState<E: ReactorEntity> {
+struct SubscriptionState<E: ReactorEntity, Ev> {
     pub(crate) id: ReactorSubscriptionId,
     pub(crate) predicates: HashMap<proto::PredicateId, PredicateState>,
     pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
     pub(crate) entities: HashMap<proto::EntityId, E>,
+    pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -129,11 +129,11 @@ enum WatcherOp {
 }
 
 // don't require Clone SE or PA, because we have an Arc
-impl<E: ReactorEntity> Clone for Reactor<E> {
+impl<E: ReactorEntity, Ev> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: ReactorEntity> Reactor<E> {
+impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
     pub fn new() -> Self {
         Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
@@ -146,13 +146,22 @@ impl<E: ReactorEntity> Reactor<E> {
     }
 
     /// Create a new subscription container
-    pub fn subscribe(&self) -> ReactorSubscription<E> {
-        let subscription = SubscriptionState::new();
+    pub fn subscribe(&self) -> ReactorSubscription<E, Ev> {
+        let broadcast = ankurah_signals::broadcast::Broadcast::new();
+        let subscription = SubscriptionState {
+            id: ReactorSubscriptionId::new(),
+            predicates: HashMap::new(),
+            entity_subscriptions: HashSet::new(),
+            entities: HashMap::new(),
+            broadcast: broadcast.clone(),
+        };
         let subscription_id = subscription.id;
         self.0.subscriptions.lock().unwrap().insert(subscription_id, subscription);
-        ReactorSubscription::new(subscription_id, self.clone())
+        ReactorSubscription(Arc::new(ReactorSubInner { subscription_id, reactor: self.clone(), broadcast }))
     }
+}
 
+impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
     /// Remove a subscription and all its predicates
     pub(crate) fn unsubscribe(&self, sub_id: ReactorSubscriptionId) -> Result<(), SubscriptionError> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
@@ -290,6 +299,37 @@ impl<E: ReactorEntity> Reactor<E> {
         }
     }
 
+    /// Update predicate matching entities when an entity's matching status changes
+    /// We need to keep a list of matching entities for subscription / predicate in order to keep the entity resident in memory
+    /// so we don't have to re-fetch it from storage every time (later, make this an LRU cached Entity, but just hold the Entity for now)
+    fn update_predicate_matching_entities(
+        subscription: &mut SubscriptionState<E, Ev>,
+        predicate_id: proto::PredicateId,
+        entity: &E,
+        matching: bool,
+    ) {
+        if let Some(predicate_state) = subscription.predicates.get_mut(&predicate_id) {
+            let entity_id = ReactorEntity::id(entity);
+            let did_match = predicate_state.matching_entities.contains(&entity_id);
+
+            match (did_match, matching) {
+                (false, true) => {
+                    // Entity now matches - add to matching set and cache the entity
+                    predicate_state.matching_entities.insert(entity_id);
+                    subscription.entities.insert(entity_id, entity.clone());
+                }
+                (true, false) => {
+                    // Entity no longer matches - remove from matching set
+                    // (but keep in entity cache for now - it might still be needed by other predicates)
+                    predicate_state.matching_entities.remove(&entity_id);
+                }
+                _ => {} // No change needed
+            }
+        }
+    }
+}
+
+impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
     /// Initialize a specific predicate by performing initial evaluation
     /// This is async and does the initial fetch and evaluation
     pub fn initialize(
@@ -349,7 +389,7 @@ impl<E: ReactorEntity> Reactor<E> {
         self.add_entity_subscriptions(subscription_id, matching_entity_ids.clone());
 
         // Build ReactorUpdate with MembershipChange::Initial for each matching entity
-        let reactor_update_items: Vec<ReactorUpdateItem<E, ()>> = matching_entities
+        let reactor_update_items: Vec<ReactorUpdateItem<E, Ev>> = matching_entities
             .into_iter()
             .map(|entity| ReactorUpdateItem {
                 entity,
@@ -359,7 +399,7 @@ impl<E: ReactorEntity> Reactor<E> {
             })
             .collect();
 
-        let reactor_update = ReactorUpdate { items: reactor_update_items };
+        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items };
 
         // Notify the subscription
         {
@@ -372,43 +412,14 @@ impl<E: ReactorEntity> Reactor<E> {
         Ok(())
     }
 
-    /// Update predicate matching entities when an entity's matching status changes
-    /// We need to keep a list of matching entities for subscription / predicate in order to keep the entity resident in memory
-    /// so we don't have to re-fetch it from storage every time (later, make this an LRU cached Entity, but just hold the Entity for now)
-    fn update_predicate_matching_entities(
-        subscription: &mut SubscriptionState<E>,
-        predicate_id: proto::PredicateId,
-        entity: &E,
-        matching: bool,
-    ) {
-        if let Some(predicate_state) = subscription.predicates.get_mut(&predicate_id) {
-            let entity_id = ReactorEntity::id(entity);
-            let did_match = predicate_state.matching_entities.contains(&entity_id);
-
-            match (did_match, matching) {
-                (false, true) => {
-                    // Entity now matches - add to matching set and cache the entity
-                    predicate_state.matching_entities.insert(entity_id);
-                    subscription.entities.insert(entity_id, entity.clone());
-                }
-                (true, false) => {
-                    // Entity no longer matches - remove from matching set
-                    // (but keep in entity cache for now - it might still be needed by other predicates)
-                    predicate_state.matching_entities.remove(&entity_id);
-                }
-                _ => {} // No change needed
-            }
-        }
-    }
-
     // TODO: Should add (but not remove) entity subscriptions for changed entities
     // TODO: Build ReactorUpdate with ReactorUpdateItem containing predicate_relevance
     // TODO: Temporarily restore callback with ReactorUpdate (not ChangeSet)
     /// Notify subscriptions about an entity change
-    pub fn notify_change<C: ChangeNotification<Entity = E>>(&self, changes: Vec<C>) {
+    pub fn notify_change<C: ChangeNotification<Entity = E, Event = Ev>>(&self, changes: Vec<C>) {
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
 
-        let mut items: std::collections::HashMap<ReactorSubscriptionId, HashMap<proto::EntityId, ReactorUpdateItem<E, C::Event>>> =
+        let mut items: std::collections::HashMap<ReactorSubscriptionId, HashMap<proto::EntityId, ReactorUpdateItem<E, Ev>>> =
             std::collections::HashMap::new();
 
         debug!("Reactor.notify_change({:?})", changes);
@@ -538,7 +549,7 @@ impl<E: ReactorEntity> Reactor<E> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
 
         for (subscription_id, subscription_state) in subscriptions.iter_mut() {
-            let mut update_items: Vec<ReactorUpdateItem<E, ()>> = Vec::new();
+            let mut update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
             // For each predicate in this subscription
             for (predicate_id, predicate_state) in &mut subscription_state.predicates {
@@ -653,25 +664,11 @@ impl WatcherSet {
     }
 }
 
-impl<E: ReactorEntity> SubscriptionState<E> {
-    /// Create a new subscription
-    pub fn new() -> Self {
-        Self {
-            id: ReactorSubscriptionId::new(),
-            predicates: HashMap::new(),
-            entity_subscriptions: HashSet::new(),
-            entities: HashMap::new(),
-        }
-    }
-
-    fn notify<Ev>(&self, update: ReactorUpdate<E, Ev>) {
-        // TODO: For now, we need a way to get the broadcast from the subscription
-        // This will require restructuring how we store the broadcast
-        todo!("implement signals - need access to broadcast from SubscriptionState")
-    }
+impl<E: ReactorEntity, Ev: Clone> SubscriptionState<E, Ev> {
+    fn notify(&self, update: ReactorUpdate<E, Ev>) { self.broadcast.send(update); }
 }
 
-impl<E: ReactorEntity> std::fmt::Debug for SubscriptionState<E> {
+impl<E: ReactorEntity, Ev> std::fmt::Debug for SubscriptionState<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Subscription {{ id: {:?}, predicates: {} }}", self.id, self.predicates.len())
     }
@@ -680,6 +677,7 @@ impl<E: ReactorEntity> std::fmt::Debug for SubscriptionState<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ankurah_signals::Subscribe;
     use proto::{CollectionId, PredicateId};
 
     pub fn watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
@@ -741,7 +739,7 @@ mod tests {
     /// by the ReactorSubscriptionId until the user explicitly unwatches it
     #[test]
     fn test_entity_remains_watched_after_predicate_stops_matching() {
-        let reactor = Reactor::<TestEntity>::new();
+        let reactor = Reactor::<TestEntity, TestEvent>::new();
 
         // Set up a subscription with a predicate that matches status="pending"
         let rsub = reactor.subscribe();

@@ -2,9 +2,8 @@ use crate::reactor::{Reactor, ReactorEntity, ReactorUpdate};
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
-    broadcast::{Broadcast, BroadcastId, Listener, ListenerGuard},
+    broadcast::{Broadcast, IntoListener},
     porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard},
-    Signal,
 };
 use std::sync::{Arc, Mutex};
 use ulid::Ulid;
@@ -23,13 +22,13 @@ impl std::fmt::Display for ReactorSubscriptionId {
 }
 
 /// Inner state for ReactorSubscription
-pub(crate) struct ReactorSubInner<E: ReactorEntity> {
-    subscription_id: ReactorSubscriptionId,
-    reactor: Reactor<E>,
-    broadcast: Broadcast<ReactorUpdate<E, ()>>, // For now, assume no events in updates
+pub(super) struct ReactorSubInner<E: ReactorEntity, Ev> {
+    pub(super) subscription_id: ReactorSubscriptionId,
+    pub(super) reactor: Reactor<E, Ev>,
+    pub(super) broadcast: Broadcast<ReactorUpdate<E, Ev>>,
 }
 
-impl<E: ReactorEntity> Drop for ReactorSubInner<E> {
+impl<E: ReactorEntity, Ev> Drop for ReactorSubInner<E, Ev> {
     fn drop(&mut self) {
         // Automatically unsubscribe when the ReactorSubscription is dropped
         let _ = self.reactor.unsubscribe(self.subscription_id);
@@ -37,13 +36,11 @@ impl<E: ReactorEntity> Drop for ReactorSubInner<E> {
 }
 
 /// A handle to a reactor subscription that automatically cleans up on drop
-pub struct ReactorSubscription<E: ReactorEntity = crate::entity::Entity>(Arc<ReactorSubInner<E>>);
+pub struct ReactorSubscription<E: ReactorEntity = crate::entity::Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(
+    pub(super) Arc<ReactorSubInner<E, Ev>>,
+);
 
-impl<E: ReactorEntity> ReactorSubscription<E> {
-    pub fn new(subscription_id: ReactorSubscriptionId, reactor: Reactor<E>) -> Self {
-        Self(Arc::new(ReactorSubInner { subscription_id, reactor, broadcast: Broadcast::new() }))
-    }
-
+impl<E: ReactorEntity, Ev: Clone> ReactorSubscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
@@ -70,25 +67,16 @@ impl<E: ReactorEntity> ReactorSubscription<E> {
     }
 }
 
-impl<E: ReactorEntity> Clone for ReactorSubscription<E> {
+impl<E: ReactorEntity, Ev> Clone for ReactorSubscription<E, Ev> {
     fn clone(&self) -> Self { ReactorSubscription(self.0.clone()) }
 }
 
-// Implement Signal trait
-impl<E: ReactorEntity> Signal for ReactorSubscription<E> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.0.broadcast.listen(listener) }
-
-    fn broadcast_id(&self) -> BroadcastId { self.0.broadcast.broadcast_id() }
-}
-
-// Implement Subscribe trait
-impl<E: ReactorEntity> Subscribe<ReactorUpdate<E, ()>> for ReactorSubscription<E> {
+// Implement Subscribe trait for ReactorUpdate
+impl<E: ReactorEntity + 'static, Ev: Clone + 'static> Subscribe<ReactorUpdate<E, Ev>> for ReactorSubscription<E, Ev> {
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
-    where F: IntoSubscribeListener<ReactorUpdate<E, ()>> {
+    where F: IntoSubscribeListener<ReactorUpdate<E, Ev>> {
         let listener = listener.into_subscribe_listener();
-        let guard = self.0.broadcast.listen(Box::new(move |update| {
-            listener(update);
-        }));
+        let guard = self.0.broadcast.reference().listen(listener);
         SubscriptionGuard::new(guard)
     }
 }
