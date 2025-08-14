@@ -20,18 +20,18 @@ pub enum MembershipChange {
 
 /// Update from the reactor that supports both single and multi-predicate subscriptions
 #[derive(Debug, Clone)]
-pub struct ReactorUpdate {
+pub struct ReactorUpdate<E = Entity, Ev = Attested<Event>> {
     /// All entities that changed, with their relevance information
-    pub items: Vec<ReactorUpdateItem>,
+    pub items: Vec<ReactorUpdateItem<E, Ev>>,
 }
 
 /// A single entity update with all relevance information
 #[derive(Debug, Clone)]
-pub struct ReactorUpdateItem {
+pub struct ReactorUpdateItem<E = Entity, Ev = Attested<Event>> {
     /// The entity that changed
-    pub entity: Entity,
+    pub entity: E,
     /// Events that caused this update
-    pub events: Vec<Attested<Event>>,
+    pub events: Vec<Ev>,
     /// Whether this entity is explicitly subscribed (entity-level subscription)
     pub entity_subscribed: bool,
     /// Which predicates this update is relevant to and how
@@ -39,7 +39,7 @@ pub struct ReactorUpdateItem {
     pub predicate_relevance: Vec<(proto::PredicateId, MembershipChange)>,
 }
 
-impl ReactorUpdateItem {
+impl<E, Ev> ReactorUpdateItem<E, Ev> {
     /// Check if this item represents any membership change
     pub fn has_membership_change(&self) -> bool { !self.predicate_relevance.is_empty() }
 
