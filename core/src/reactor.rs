@@ -61,6 +61,8 @@ impl ChangeNotification for EntityChange {
     fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { self.into_parts() }
 }
 
+// LEFT OFF HERE - create an abstraction for WeakEntitySet to simplify the tests
+
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor(Arc<ReactorInner>);
 

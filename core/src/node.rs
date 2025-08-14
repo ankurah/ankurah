@@ -36,7 +36,8 @@ use tracing::{debug, error, info, warn};
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
-    subscriptions: SafeSet<proto::PredicateId>,
+    subscription: ReactorSubscription,
+    // subscriptions: SafeSet<proto::PredicateId>,
     pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 }
@@ -124,7 +125,7 @@ where PA: PolicyAgent
     pub(crate) pending_subs: SafeMap<proto::PredicateId, tokio::sync::oneshot::Sender<Vec<Attested<EntityState>>>>,
 
     /// The reactor for handling subscriptions
-    pub(crate) reactor: Arc<Reactor<SE, PA>>,
+    pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
@@ -140,7 +141,7 @@ where
         let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
+        let reactor = Reactor::new(entityset.clone());
         notice_info!("Node {id:#} created as ephemeral");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
@@ -177,7 +178,7 @@ where
         let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
+        let reactor = Reactor::new(entityset.clone());
         notice_info!("Node {id:#} created as durable");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), true);
@@ -203,12 +204,13 @@ where
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         action_info!(self, "register_peer", "{}", &presence);
 
+        let subscription = self.reactor.subscribe();
         self.peer_connections.insert(
             presence.node_id,
             Arc::new(PeerState {
                 sender,
                 _durable: presence.durable,
-                subscriptions: SafeSet::new(),
+                subscription,
                 pending_requests: SafeMap::new(),
                 pending_updates: SafeMap::new(),
             }),
@@ -245,14 +247,8 @@ where
 
         // Get and cleanup subscriptions before removing the peer
         if let Some(peer_state) = self.peer_connections.get(&node_id) {
-            // Get all subscription IDs
-            let subscriptions = peer_state.subscriptions.to_vec();
-
-            // Unsubscribe each one from the reactor
-            for sub_id in subscriptions {
-                action_info!(self, "unsubscribing", "subscription {} for peer {}", sub_id, node_id);
-                self.reactor.unsubscribe(sub_id);
-            }
+            action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription.id, node_id);
+            peer_state.subscription.unsubscribe();
         }
 
         // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)
@@ -391,10 +387,9 @@ where
                 }
             }
             proto::NodeMessage::Unsubscribe { from, predicate_id } => {
-                self.reactor.unsubscribe(predicate_id);
                 // Remove and drop the subscription handle
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscriptions.remove(&predicate_id);
+                    self.reactor.remove_predicate(peer_state.subscription.id, predicate_id);
                 }
             }
         }
