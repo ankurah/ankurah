@@ -76,7 +76,7 @@ impl<E: ReactorEntity + 'static, Ev: Clone + 'static> Subscribe<ReactorUpdate<E,
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<ReactorUpdate<E, Ev>> {
         let listener = listener.into_subscribe_listener();
-        let guard = self.0.broadcast.reference().listen(listener);
+        let guard: ankurah_signals::broadcast::ListenerGuard<ReactorUpdate<E, Ev>> = self.0.broadcast.reference().listen(listener);
         SubscriptionGuard::new(guard)
     }
 }

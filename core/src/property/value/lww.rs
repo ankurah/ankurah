@@ -63,7 +63,7 @@ impl<T: Property> InitializeWith<T> for LWW<T> {
 }
 
 impl<T: Property> ankurah_signals::Signal for LWW<T> {
-    fn listen(&self, listener: ankurah_signals::broadcast::Listener) -> ankurah_signals::broadcast::ListenerGuard {
+    fn listen(&self, listener: ankurah_signals::broadcast::Listener<()>) -> ankurah_signals::broadcast::ListenerGuard<()> {
         self.backend.listen_field(&self.property_name, listener)
     }
 
@@ -77,7 +77,7 @@ where T: Clone + Send + Sync + 'static
     where F: ankurah_signals::subscribe::IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let lww = self.clone();
-        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move || {
+        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move |_| {
             // Get current value when the broadcast fires
             if let Ok(current_value) = lww.get() {
                 listener(current_value);

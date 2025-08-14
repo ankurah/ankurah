@@ -166,7 +166,7 @@ impl Entity {
             }
             *self.head.lock().unwrap() = event.id().into();
             // Notify Signal subscribers about the change
-            self.broadcast.send();
+            self.broadcast.send(());
             return Ok(true);
         }
 
@@ -203,7 +203,7 @@ impl Entity {
                 }
                 *self.head.lock().unwrap() = new_head;
                 // Notify Signal subscribers about the change
-                self.broadcast.send();
+                self.broadcast.send(());
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet: _ } => {
@@ -254,7 +254,7 @@ impl Entity {
                 self.overwrite_backends(state)?;
                 *self.head.lock().unwrap() = new_head;
                 // Notify Signal subscribers about the change
-                self.broadcast.send();
+                self.broadcast.send(());
                 Ok(true)
             }
             lineage::Ordering::NotDescends { meet } => {

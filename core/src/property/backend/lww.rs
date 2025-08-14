@@ -140,7 +140,7 @@ impl PropertyBackend for LWWBackend {
         let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
         for field_name in changed_fields {
             if let Some(broadcast) = field_broadcasts.get(&field_name) {
-                broadcast.send();
+                broadcast.send(());
             }
         }
 

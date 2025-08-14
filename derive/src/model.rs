@@ -102,45 +102,46 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         Ok(#resultset_name(::std::sync::Arc::new(resultset)))
                     }
 
-                    // TODO: rename this to "query"
-                    pub fn subscribe (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
+                    pub fn query (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
                         let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
                         let signal = ::ankurah::signals::Mut::new(#resultset_name::default());
                         let signal_clone = signal.clone();
 
-                        let context2 = (*context).clone();
-                        let handle2 = handle.clone();
-                        let future = Box::pin(async move {
-                            // Direct method call on Mut - no trait needed
-                            let handle = context2
-                                .subscribe(predicate.as_str(), move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                                    // LEFT OFF HERE - ReactorUpdateItem no longer has a resultset
-                                    signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
-                                })
-                                .await;
+                        unimplemented!()
+                        // let context2 = (*context).clone();
+                        // let handle2 = handle.clone();
+                        // let future = Box::pin(async move {
+                        //     // Direct method call on Mut - no trait needed
+                        //     let livequery = context2.query(predicate.as_str());
 
-                            // TODO: update this to use LiveQuery<R>. something like:
-                            // let livequery = context2.query(predicate);
-                            // livequery.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                            //     signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
-                            // });
+                        //     livequery.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                        //             // LEFT OFF HERE - ReactorUpdateItem no longer has a resultset
+                        //             signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
+                        //         })
+                        //         .await;
+
+                        //     // TODO: update this to use LiveQuery<R>. something like:
+                        //     // let livequery = context2.query(predicate);
+                        //     // livequery.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                        //     //     signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
+                        //     // });
                             
 
-                            match handle {
-                                Ok(h) => {
-                                    handle2.set(h).unwrap();
-                                }
-                                Err(e) => {
-                                    error!("Failed to subscribe to changes: {} for predicate: {}", e, predicate);
-                                }
-                            }
-                        });
-                        wasm_bindgen_futures::spawn_local(future);
+                        //     match handle {
+                        //         Ok(h) => {
+                        //             handle2.set(h).unwrap();
+                        //         }
+                        //         Err(e) => {
+                        //             error!("Failed to subscribe to changes: {} for predicate: {}", e, predicate);
+                        //         }
+                        //     }
+                        // });
+                        // wasm_bindgen_futures::spawn_local(future);
 
-                        Ok(#resultset_signal_name{
-                            sig: Box::new(signal.read()),
-                            handle: Box::new(handle)
-                        })
+                        // Ok(#resultset_signal_name{
+                        //     sig: Box::new(signal.read()),
+                        //     handle: Box::new(handle)
+                        // })
                     }
 
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
@@ -261,7 +262,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
         }
 
         impl ::ankurah::signals::Subscribe<#view_name> for #view_name {
-            fn subscribe<F>(&self, listener: F) -> ::ankurah::signals::SignalGuard
+            fn subscribe<F>(&self, listener: F) -> ::ankurah::signals::SubscriptionGuard
             where
                 F: ::ankurah::signals::subscribe::IntoSubscribeListener<#view_name>,
             {
@@ -528,7 +529,7 @@ fn get_static_methods_ts(
         /**
          * Subscribe to the set of {name}s that match the predicate
          */
-        static subscribe(context: Context, predicate: string): {resultset_signal_name};
+        static query(context: Context, predicate: string): {resultset_signal_name};
 
         /**
          * Create a new {name}

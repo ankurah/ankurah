@@ -329,7 +329,7 @@ where
             initial_entities.push(entity);
         }
 
-        self.node.reactor.initialize(subscription.id(), predicate_id, initial_entities).await?;
+        self.node.reactor.initialize(subscription.id(), predicate_id, initial_entities)?;
 
         Ok(handle)
     }
