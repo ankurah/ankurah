@@ -1,7 +1,12 @@
-use crate::reactor::{Reactor, ReactorEntity};
+use crate::reactor::{Reactor, ReactorEntity, ReactorUpdate};
 
 use ankurah_proto::{self as proto};
-use std::sync::Arc;
+use ankurah_signals::{
+    broadcast::{Broadcast, BroadcastId, Listener, ListenerGuard},
+    porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard},
+    Signal,
+};
+use std::sync::{Arc, Mutex};
 use ulid::Ulid;
 
 /// Unique identifier for a reactor subscription. This id is used only within a given reactor / node.
@@ -21,6 +26,7 @@ impl std::fmt::Display for ReactorSubscriptionId {
 pub(crate) struct ReactorSubInner<E: ReactorEntity> {
     subscription_id: ReactorSubscriptionId,
     reactor: Reactor<E>,
+    broadcast: Broadcast<ReactorUpdate<E, ()>>, // For now, assume no events in updates
 }
 
 impl<E: ReactorEntity> Drop for ReactorSubInner<E> {
@@ -35,7 +41,7 @@ pub struct ReactorSubscription<E: ReactorEntity = crate::entity::Entity>(Arc<Rea
 
 impl<E: ReactorEntity> ReactorSubscription<E> {
     pub fn new(subscription_id: ReactorSubscriptionId, reactor: Reactor<E>) -> Self {
-        Self(Arc::new(ReactorSubInner { subscription_id, reactor }))
+        Self(Arc::new(ReactorSubInner { subscription_id, reactor, broadcast: Broadcast::new() }))
     }
 
     /// Get the subscription ID
@@ -68,4 +74,21 @@ impl<E: ReactorEntity> Clone for ReactorSubscription<E> {
     fn clone(&self) -> Self { ReactorSubscription(self.0.clone()) }
 }
 
-// TODO: Re-implement Signal traits when signals are integrated with the new architecture
+// Implement Signal trait
+impl<E: ReactorEntity> Signal for ReactorSubscription<E> {
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.0.broadcast.listen(listener) }
+
+    fn broadcast_id(&self) -> BroadcastId { self.0.broadcast.broadcast_id() }
+}
+
+// Implement Subscribe trait
+impl<E: ReactorEntity> Subscribe<ReactorUpdate<E, ()>> for ReactorSubscription<E> {
+    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
+    where F: IntoSubscribeListener<ReactorUpdate<E, ()>> {
+        let listener = listener.into_subscribe_listener();
+        let guard = self.0.broadcast.listen(Box::new(move |update| {
+            listener(update);
+        }));
+        SubscriptionGuard::new(guard)
+    }
+}

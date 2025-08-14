@@ -376,26 +376,29 @@ impl<E: ReactorEntity> Reactor<E> {
     /// We need to keep a list of matching entities for subscription / predicate in order to keep the entity resident in memory
     /// so we don't have to re-fetch it from storage every time (later, make this an LRU cached Entity, but just hold the Entity for now)
     fn update_predicate_matching_entities(
-        &self,
-        subscription: &SubscriptionState<E>,
+        subscription: &mut SubscriptionState<E>,
         predicate_id: proto::PredicateId,
         entity: &E,
         matching: bool,
     ) {
-        todo!("it's not obvious to me that this belongs on the SubscriptionState/PredicateState, or rather, it seems weird that we're mixing Subsription Config and Subscription State. Perhaps that's just in my head though");
-        // let mut predicates = subscription.predicates.lock().unwrap();
-        // if let Some(predicate_state) = predicates.get_mut(&predicate_id) {
-        //     let did_match = predicate_state.matching_entities.iter().any(|e| e.id() == entity.id());
-        //     match (did_match, matching) {
-        //         (false, true) => {
-        //             predicate_state.matching_entities.push(entity.clone());
-        //         }
-        //         (true, false) => {
-        //             predicate_state.matching_entities.retain(|r| r.id != entity.id);
-        //         }
-        //         _ => {} // No change needed
-        //     }
-        // }
+        if let Some(predicate_state) = subscription.predicates.get_mut(&predicate_id) {
+            let entity_id = ReactorEntity::id(entity);
+            let did_match = predicate_state.matching_entities.contains(&entity_id);
+
+            match (did_match, matching) {
+                (false, true) => {
+                    // Entity now matches - add to matching set and cache the entity
+                    predicate_state.matching_entities.insert(entity_id);
+                    subscription.entities.insert(entity_id, entity.clone());
+                }
+                (true, false) => {
+                    // Entity no longer matches - remove from matching set
+                    // (but keep in entity cache for now - it might still be needed by other predicates)
+                    predicate_state.matching_entities.remove(&entity_id);
+                }
+                _ => {} // No change needed
+            }
+        }
     }
 
     // TODO: Should add (but not remove) entity subscriptions for changed entities
@@ -447,10 +450,10 @@ impl<E: ReactorEntity> Reactor<E> {
             }
 
             debug!(" possibly_interested_watchers: {possibly_interested_watchers:?}");
-            let subscriptions = self.0.subscriptions.lock().unwrap();
+            let mut subscriptions = self.0.subscriptions.lock().unwrap();
             // Check each possibly interested subscription-predicate pair with full predicate evaluation
             for (subscription_id, predicate_id) in possibly_interested_watchers {
-                if let Some(subscription) = subscriptions.get(&subscription_id) {
+                if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
                     // Get the predicate state
                     let (did_match, matches) = {
                         if let Some(predicate_state) = subscription.predicates.get(&predicate_id) {
@@ -488,7 +491,7 @@ impl<E: ReactorEntity> Reactor<E> {
                         // When the predicate no longer matches, only remove the predicate watcher, not the subscription watcher
                         entity_watcher.remove(&EntityWatcherId::Predicate(subscription_id, predicate_id));
                     }
-                    self.update_predicate_matching_entities(&subscription, predicate_id, &entity, matches);
+                    Self::update_predicate_matching_entities(subscription, predicate_id, &entity, matches);
 
                     let sub_entities = items.entry(subscription_id).or_default();
 
@@ -661,7 +664,11 @@ impl<E: ReactorEntity> SubscriptionState<E> {
         }
     }
 
-    fn notify<Ev>(&self, update: ReactorUpdate<E, Ev>) { todo!("implement signals (after the Reactor is fully cleaned up)") }
+    fn notify<Ev>(&self, update: ReactorUpdate<E, Ev>) {
+        // TODO: For now, we need a way to get the broadcast from the subscription
+        // This will require restructuring how we store the broadcast
+        todo!("implement signals - need access to broadcast from SubscriptionState")
+    }
 }
 
 impl<E: ReactorEntity> std::fmt::Debug for SubscriptionState<E> {
