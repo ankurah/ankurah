@@ -82,7 +82,7 @@ impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
         });
     }
 
-    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<T> {
+    pub fn find_matching<V: Collatable>(&self, value: V) -> std::collections::btree_set::IntoIter<T> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
@@ -109,7 +109,7 @@ impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
         }
 
         // Should just return the BTreeSet but this sucks for test cases
-        result.into_iter().collect()
+        result.into_iter()
     }
 }
 
@@ -129,10 +129,10 @@ mod tests {
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::LessThan, sub0);
 
         // 8 should match nothing
-        assert!(index.find_matching(Value::Integer(8)).is_empty());
+        assert!(index.find_matching(Value::Integer(8)).next().is_none());
 
         // 7 should match sub0
-        assert_eq!(index.find_matching(Value::Integer(7)), vec![sub0]);
+        assert_eq!(index.find_matching(Value::Integer(7)).next(), Some(sub0));
 
         let sub1 = proto::PredicateId::test(1);
 
@@ -140,28 +140,30 @@ mod tests {
         index.add(ast::Literal::Integer(20), ast::ComparisonOperator::GreaterThan, sub1);
 
         // 20 should match nothing
-        assert!(index.find_matching(Value::Integer(20)).is_empty());
+        assert!(index.find_matching(Value::Integer(20)).next().is_none());
 
         // 21 should match sub1
-        assert_eq!(index.find_matching(Value::Integer(21)), vec![sub1]);
+        assert_eq!(index.find_matching(Value::Integer(21)).next(), Some(sub1));
 
         // // Add subscriptions for various numeric comparisons
         index.add(ast::Literal::Integer(5), ast::ComparisonOperator::Equal, sub0);
 
         // // Test exact match (5)
-        assert_eq!(index.find_matching(Value::Integer(5)), vec![sub0]);
+        assert_eq!(index.find_matching(Value::Integer(5)).next(), Some(sub0));
 
         // Less than 25 ------------------------------------------------------------
         index.add(ast::Literal::Integer(25), ast::ComparisonOperator::LessThan, sub0);
 
         // 22 should match sub0 and sub1 because > 20 and < 25
-        assert_eq!(index.find_matching(Value::Integer(22)), vec![sub0, sub1]);
+        assert_eq!(index.find_matching(Value::Integer(22)).next(), Some(sub0));
+        assert_eq!(index.find_matching(Value::Integer(22)).next(), Some(sub1));
 
         // 25 should match sub1 because > 20 and !< 25
-        assert_eq!(index.find_matching(Value::Integer(25)), vec![sub1]);
+        assert_eq!(index.find_matching(Value::Integer(25)).next(), Some(sub1));
 
         // 26 should match sub0 and sub1 because > 20 and !< 25
-        assert_eq!(index.find_matching(Value::Integer(26)), vec![sub1]);
+        assert_eq!(index.find_matching(Value::Integer(26)).next(), Some(sub0));
+        assert_eq!(index.find_matching(Value::Integer(26)).next(), Some(sub1));
     }
 
     #[test]
@@ -171,7 +173,7 @@ mod tests {
         let sub0 = proto::PredicateId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::NotEqual, sub0);
 
-        assert_eq!(index.find_matching(Value::Integer(8)), vec![sub0]);
-        assert_eq!(index.find_matching(Value::Integer(9)), vec![]);
+        assert_eq!(index.find_matching(Value::Integer(8)).next(), Some(sub0));
+        assert!(index.find_matching(Value::Integer(9)).next().is_none());
     }
 }
