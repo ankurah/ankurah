@@ -56,7 +56,7 @@ where
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Subscribe to change notifications
-        let _subscription = self.listen(Arc::new(move || {
+        let _subscription = self.listen(Arc::new(move |_| {
             let _ = tx.send(());
         }));
 
@@ -93,7 +93,7 @@ where
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Subscribe to change notifications
-        let _subscription = self.listen(Arc::new(move || {
+        let _subscription = self.listen(Arc::new(move |_| {
             let _ = tx.send(());
         }));
 

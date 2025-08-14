@@ -73,7 +73,7 @@ impl<T: Property> ankurah_signals::Signal for LWW<T> {
 impl<T: Property> ankurah_signals::Subscribe<T> for LWW<T>
 where T: Clone + Send + Sync + 'static
 {
-    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SignalGuard
+    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SubscriptionGuard
     where F: ankurah_signals::subscribe::IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let lww = self.clone();
@@ -83,6 +83,6 @@ where T: Clone + Send + Sync + 'static
                 listener(current_value);
             }
         }));
-        ankurah_signals::SignalGuard::new(subscription)
+        ankurah_signals::SubscriptionGuard::new(subscription)
     }
 }

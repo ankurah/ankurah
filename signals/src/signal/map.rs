@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     context::CurrentObserver,
-    porcelain::{SignalGuard, Subscribe, subscribe::IntoSubscribeListener},
+    porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
     signal::{Get, Signal, With},
 };
 
@@ -34,7 +34,7 @@ where
 impl<Upstream, Input, Output, Transform> Signal for Map<Upstream, Input, Output, Transform>
 where Upstream: Signal
 {
-    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard { self.source.listen(listener) }
+    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> { self.source.listen(listener) }
 
     fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.source.broadcast_id() }
 }
@@ -80,18 +80,18 @@ where
     Input: Send + Sync + 'static,
     Output: Clone + Send + Sync + 'static,
 {
-    fn subscribe<L>(&self, listener: L) -> SignalGuard
+    fn subscribe<L>(&self, listener: L) -> SubscriptionGuard
     where L: IntoSubscribeListener<Output> {
         let listener = listener.into_subscribe_listener();
         let source = self.source.clone();
         let transform = self.transform.clone();
 
-        let subscription = self.source.listen(Arc::new(move || {
+        let subscription = self.source.listen(Arc::new(move |_| {
             source.with(|input| {
                 listener(transform(input));
             });
         }));
 
-        SignalGuard::new(subscription)
+        SubscriptionGuard::new(subscription)
     }
 }

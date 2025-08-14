@@ -14,7 +14,7 @@ use crate::{
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use ankurah_signals::{
     broadcast::{BroadcastId, Listener, ListenerGuard},
-    porcelain::subscribe::{IntoSubscribeListener, SignalGuard},
+    porcelain::subscribe::{IntoSubscribeListener, SubscriptionGuard},
     Signal, Subscribe,
 };
 use async_trait::async_trait;
@@ -408,7 +408,7 @@ impl Drop for LocalSubscription {
 }
 
 impl Subscribe<ReactorUpdate> for LocalSubscription {
-    fn subscribe<F>(&self, listener: F) -> SignalGuard
+    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<ReactorUpdate> {
         unimplemented!()
         // self.subscription.subscribe(listener)
@@ -448,7 +448,7 @@ impl<R: View> std::fmt::Debug for LiveQuery<R> {
 impl<R: View> Subscribe<ChangeSet<R>> for LiveQuery<R>
 where R: Clone + Send + Sync + 'static
 {
-    fn subscribe<L>(&self, listener: L) -> SignalGuard
+    fn subscribe<L>(&self, listener: L) -> SubscriptionGuard
     where L: IntoSubscribeListener<ChangeSet<R>> {
         let listener = listener.into_subscribe_listener();
 

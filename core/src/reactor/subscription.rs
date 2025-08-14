@@ -1,4 +1,4 @@
-use crate::reactor::Reactor;
+use crate::reactor::{Reactor, ReactorEntity};
 
 use ankurah_proto::{self as proto};
 use std::sync::Arc;
@@ -18,23 +18,23 @@ impl std::fmt::Display for ReactorSubscriptionId {
 }
 
 /// Inner state for ReactorSubscription
-pub(crate) struct ReactorSubInner {
+pub(crate) struct ReactorSubInner<E: ReactorEntity> {
     subscription_id: ReactorSubscriptionId,
-    reactor: Reactor,
+    reactor: Reactor<E>,
 }
 
-impl Drop for ReactorSubInner {
+impl<E: ReactorEntity> Drop for ReactorSubInner<E> {
     fn drop(&mut self) {
         // Automatically unsubscribe when the ReactorSubscription is dropped
-        self.reactor.unsubscribe(self.subscription_id);
+        let _ = self.reactor.unsubscribe(self.subscription_id);
     }
 }
 
 /// A handle to a reactor subscription that automatically cleans up on drop
-pub struct ReactorSubscription(Arc<ReactorSubInner>);
+pub struct ReactorSubscription<E: ReactorEntity = crate::entity::Entity>(Arc<ReactorSubInner<E>>);
 
-impl ReactorSubscription {
-    pub fn new(subscription_id: ReactorSubscriptionId, reactor: Reactor) -> Self {
+impl<E: ReactorEntity> ReactorSubscription<E> {
+    pub fn new(subscription_id: ReactorSubscriptionId, reactor: Reactor<E>) -> Self {
         Self(Arc::new(ReactorSubInner { subscription_id, reactor }))
     }
 
@@ -64,7 +64,7 @@ impl ReactorSubscription {
     }
 }
 
-impl Clone for ReactorSubscription {
+impl<E: ReactorEntity> Clone for ReactorSubscription<E> {
     fn clone(&self) -> Self { ReactorSubscription(self.0.clone()) }
 }
 

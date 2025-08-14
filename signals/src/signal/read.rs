@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     broadcast::Broadcast,
     context::CurrentObserver,
-    porcelain::{SignalGuard, Subscribe, subscribe::IntoSubscribeListener},
+    porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
     signal::{Get, GetReadCell, Signal, With, map::Map},
     value::{ReadValueCell, ValueCell},
 };
@@ -11,7 +11,7 @@ use crate::{
 /// Read-only signal
 pub struct Read<T> {
     pub(crate) value: ValueCell<T>,
-    pub(crate) broadcast: Broadcast,
+    pub(crate) broadcast: Broadcast<()>,
 }
 
 impl<T> Read<T>
@@ -58,7 +58,7 @@ impl<T: 'static> GetReadCell<T> for Read<T> {
 }
 
 impl<T> Signal for Read<T> {
-    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard {
+    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> {
         self.broadcast.reference().listen(listener)
     }
 
@@ -85,15 +85,15 @@ impl<T: std::fmt::Display + Send + Sync + 'static> std::fmt::Display for Read<T>
 impl<T> Subscribe<T> for Read<T>
 where T: Clone + Send + Sync + 'static
 {
-    fn subscribe<F>(&self, listener: F) -> SignalGuard
+    fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let ro_value = self.get_readcell(); // Get read-only value handle
-        let subscription = self.listen(Arc::new(move || {
+        let subscription = self.listen(Arc::new(move |_| {
             // Get current value when the broadcast fires
             let current_value = ro_value.value();
             listener(current_value);
         }));
-        SignalGuard::new(subscription)
+        SubscriptionGuard::new(subscription)
     }
 }

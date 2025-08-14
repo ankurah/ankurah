@@ -111,7 +111,7 @@ impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
 impl<Projected> ankurah_signals::Subscribe<String> for YrsString<Projected>
 where Projected: Clone + Send + Sync + 'static
 {
-    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SignalGuard
+    fn subscribe<F>(&self, listener: F) -> ankurah_signals::SubscriptionGuard
     where F: ankurah_signals::subscribe::IntoSubscribeListener<String> {
         let listener = listener.into_subscribe_listener();
         let yrs_string = self.clone();
@@ -121,6 +121,6 @@ where Projected: Clone + Send + Sync + 'static
                 listener(current_value);
             }
         }));
-        ankurah_signals::SignalGuard::new(subscription)
+        ankurah_signals::SubscriptionGuard::new(subscription)
     }
 }

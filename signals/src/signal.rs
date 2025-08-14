@@ -14,7 +14,7 @@ pub use read::*;
 /// This is intentional and allows observers to deduplicate subscriptions efficiently.
 pub trait Signal {
     /// Listen to changes to this signal with a listener function
-    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard;
+    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()>;
 
     /// Get the broadcast identifier for this signal.
     /// Multiple signals may return the same broadcast_id if they share a broadcast.
