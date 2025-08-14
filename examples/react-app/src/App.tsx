@@ -152,7 +152,6 @@ const App: React.FC = signalObserver(() => {
   );
 });
 
-
 interface EntryRowProps {
   entry: EntryView;
 }
@@ -162,10 +161,7 @@ const EntryRow: React.FC<EntryRowProps> = signalObserver(({ entry }) => {
   entry.track();
   console.log("RENDER EntryRow");
   return (
-    <Tr
-      onClick={() => edit_entry(entry)}
-      style={{ cursor: 'pointer' }}
-    >
+    <Tr onClick={() => edit_entry(entry)} style={{ cursor: "pointer" }}>
       {/* These are not currently calling signal::Get, because they are using FromActiveType */}
       <Td>{entry.id().as_string()}</Td>
       <Td>{entry.added()}</Td>
@@ -175,6 +171,5 @@ const EntryRow: React.FC<EntryRowProps> = signalObserver(({ entry }) => {
     </Tr>
   );
 });
-
 
 export default App;
