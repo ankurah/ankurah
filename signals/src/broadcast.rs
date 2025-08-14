@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 pub struct BroadcastId(usize);
 
 /// A listener that can be called when broadcast notifications are sent.
-pub type Listener<T> = Arc<dyn Fn(T) + Send + Sync + 'static>;
+pub type Listener<T = ()> = Arc<dyn Fn(T) + Send + Sync + 'static>;
 
 /// Trait for types that can be converted into broadcast listeners.
 pub trait IntoListener<T> {
@@ -19,7 +19,7 @@ pub trait IntoListener<T> {
 /// A broadcast sender that notifies multiple subscribers without payload data.
 /// Uses synchronous function callbacks for immediate notification.
 #[derive(Clone)]
-pub struct Broadcast<T>(Arc<Inner<T>>);
+pub struct Broadcast<T = ()>(Arc<Inner<T>>);
 
 struct Inner<T> {
     listeners: std::sync::RwLock<HashMap<usize, Listener<T>>>,
@@ -36,7 +36,7 @@ impl<T> std::fmt::Debug for Broadcast<T> {
 pub struct Ref<'a, T>(&'a Broadcast<T>);
 
 /// A subscription handle that can be used to unsubscribe from notifications.
-pub struct ListenerGuard<T> {
+pub struct ListenerGuard<T = ()> {
     inner: Weak<Inner<T>>,
     id: usize,
 }
