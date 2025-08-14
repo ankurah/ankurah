@@ -279,6 +279,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             pub fn id(&self) -> ankurah::proto::EntityId {
                 self.entity.id().clone()
             }
+            /// Manually track this View in the current observer
+            pub fn track(&self) {
+                use ::ankurah::signals::CurrentObserver;
+                CurrentObserver::track(self);
+            }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                     use ankurah::property::{FromActiveType, FromEntity};

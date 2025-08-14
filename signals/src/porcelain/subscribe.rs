@@ -1,7 +1,7 @@
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::{Get, broadcast::ListenerGuard};
+use crate::{Get, Peek, broadcast::ListenerGuard};
 
 /// Type alias for subscribe listeners with conditional thread safety bounds
 pub type SubscribeListener<T> = Box<dyn Fn(T) + Send + Sync + 'static>;
@@ -28,8 +28,8 @@ where S: Subscribe<T>
     fn dyn_subscribe(&self, listener: Box<dyn Fn(T) + Send + Sync + 'static>) -> SubscriptionGuard { Subscribe::subscribe(self, listener) }
 }
 
-pub trait GetAndDynSubscribe<T: 'static>: Get<T> + DynSubscribe<T> {}
-impl<T: 'static, S> GetAndDynSubscribe<T> for S where S: Get<T> + DynSubscribe<T> {}
+pub trait GetAndDynSubscribe<T: 'static>: Get<T> + Peek<T> + DynSubscribe<T> {}
+impl<T: 'static, S> GetAndDynSubscribe<T> for S where S: Get<T> + Peek<T> + DynSubscribe<T> {}
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct SubscriptionGuard {

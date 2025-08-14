@@ -54,6 +54,12 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
                 use ::ankurah::signals::Get;
                 self.sig.get()
             }
+
+            #[wasm_bindgen(getter)]
+            pub fn peek(&self) -> #name {
+                use ::ankurah::signals::Peek;
+                self.sig.peek()
+            }
         }
     };
 

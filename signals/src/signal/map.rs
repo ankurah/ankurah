@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    Peek,
     context::CurrentObserver,
     porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
     signal::{Get, Signal, With},
@@ -68,6 +69,19 @@ where
     fn get(&self) -> Output {
         // Track the source signal with the current observer
         CurrentObserver::track(&self.source);
+        // Get the source value and transform it on-demand, returning owned value
+        self.source.with(|input| (self.transform)(input))
+    }
+}
+
+impl<Upstream, Input, Output, Transform> Peek<Output> for Map<Upstream, Input, Output, Transform>
+where
+    Upstream: Signal + With<Input>,
+    Transform: Fn(&Input) -> Output,
+    Input: 'static,
+    Output: 'static,
+{
+    fn peek(&self) -> Output {
         // Get the source value and transform it on-demand, returning owned value
         self.source.with(|input| (self.transform)(input))
     }
