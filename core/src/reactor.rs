@@ -667,13 +667,40 @@ impl std::fmt::Debug for SubscriptionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::PredicateId;
+    use proto::{CollectionId, PredicateId};
+
+    pub fn watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let accumulate = {
+            let values = values.clone();
+            Box::new(move |value: T| {
+                values.lock().unwrap().push(value);
+            })
+        };
+
+        let check = Box::new(move || values.lock().unwrap().drain(..).collect());
+
+        (accumulate, check)
+    }
 
     #[derive(Debug, Clone)]
     struct TestEntity {
         id: proto::EntityId,
         collection: proto::CollectionId,
         state: Arc<Mutex<HashMap<String, String>>>,
+    }
+    impl Eq for TestEntity {}
+    impl PartialEq for TestEntity {
+        fn eq(&self, other: &Self) -> bool { self.id == other.id }
+    }
+    impl PartialOrd for TestEntity {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.id.cmp(&other.id)) }
+    }
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestEvent {
+        id: proto::EventId,
+        collection: proto::CollectionId,
+        changes: HashMap<String, String>,
     }
     impl TestEntity {
         fn new(name: &str, status: &str) -> Self {
@@ -705,13 +732,27 @@ mod tests {
 
         // Set up a subscription with a predicate that matches status="pending"
         let rsub = reactor.subscribe();
-        let collection_id = proto::CollectionId::fixed_name("album");
+        let (w, check) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        rsub.subscribe(w); // ReactorSubscription needs to implement ankurah_signals::Subscribe
 
         let predicate_id = PredicateId::new();
-        rsub.add_predicate(predicate_id, &collection_id, "status = 'pending'".try_into().unwrap());
+        rsub.add_predicate(predicate_id, &CollectionId::fixed_name("album"), "status = 'pending'".try_into().unwrap());
         let entity1 = TestEntity::new("Test Album", "pending");
 
         reactor.initialize(rsub.id(), predicate_id, vec![entity1]).unwrap();
+
+        // something like this
+        assert_eq!(
+            check(),
+            vec![ReactorUpdate {
+                items: vec![ReactorUpdateItem {
+                    entity: entity1.clone(),
+                    events: vec![],
+                    entity_subscribed: true,
+                    predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
+                }]
+            }]
+        );
 
         // TODO: For now, this test validates the setup. The actual notify_change test
         // will require fixing the remaining compilation issues with Entity creation

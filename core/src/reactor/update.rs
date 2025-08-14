@@ -19,7 +19,7 @@ pub enum MembershipChange {
 }
 
 /// Update from the reactor that supports both single and multi-predicate subscriptions
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReactorUpdate<E = Entity, Ev = Attested<Event>> {
     /// All entities that changed, with their relevance information
     pub items: Vec<ReactorUpdateItem<E, Ev>>,
