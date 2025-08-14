@@ -15,9 +15,9 @@ instrument = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive = { path = "../derive", optional = true, version = "^0.5.4" }
-ankql          = { path = "../ankql", version = "^0.5.4" }
-ankurah-proto  = { path = "../proto", version = "^0.5.4" }
+ankurah-derive  = { path = "../derive", optional = true, version = "^0.5.4" }
+ankql           = { path = "../ankql", version = "^0.5.4" }
+ankurah-proto   = { path = "../proto", version = "^0.5.4" }
 ankurah-signals = { path = "../signals", version = "^0.5.4" }
 
 rand                 = "0.8"

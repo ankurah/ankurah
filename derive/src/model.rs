@@ -250,7 +250,6 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
                 self.entity.broadcast().reference().listen(listener)
             }
-            
             fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
                 self.entity.broadcast().id()
             }
