@@ -5,6 +5,7 @@ import {
   ctx,
   ws_client,
   EntryView,
+  edit_entry,
 } from "example-wasm-bindings";
 import { useMemo } from "react";
 
@@ -70,6 +71,7 @@ function signalObserver<T>(fc: React.FC<T>): React.FC<T> {
   };
 }
 const App: React.FC = signalObserver(() => {
+  console.log("RENDER App");
   const connectionState = ws_client().connection_state.value?.value();
 
   // ignore unused _h warning
@@ -140,13 +142,7 @@ const App: React.FC = signalObserver(() => {
             {(() => {
               // calling .value automatically subscribes the current observer to the signal
               return test_items_signal.value.items.map((item: EntryView) => (
-                <Tr key={item.id().as_string()}>
-                  <Td>{item.id().as_string()}</Td>
-                  <Td>{item.added()}</Td>
-                  <Td>{item.ip_address()}</Td>
-                  <Td>{item.node_id()}</Td>
-                  <Td>{JSON.stringify(item.complex())}</Td>
-                </Tr>
+                <EntryRow key={item.id().as_string()} entry={item} />
               ));
             })()}
           </tbody>
@@ -155,5 +151,30 @@ const App: React.FC = signalObserver(() => {
     </Container>
   );
 });
+
+
+interface EntryRowProps {
+  entry: EntryView;
+}
+
+const EntryRow: React.FC<EntryRowProps> = signalObserver(({ entry }) => {
+  // manually track the entry in the current observer until the field accessors track
+  entry.track();
+  console.log("RENDER EntryRow");
+  return (
+    <Tr
+      onClick={() => edit_entry(entry)}
+      style={{ cursor: 'pointer' }}
+    >
+      {/* These are not currently calling signal::Get, because they are using FromActiveType */}
+      <Td>{entry.id().as_string()}</Td>
+      <Td>{entry.added()}</Td>
+      <Td>{entry.ip_address()}</Td>
+      <Td>{entry.node_id()}</Td>
+      <Td>{JSON.stringify(entry.complex())}</Td>
+    </Tr>
+  );
+});
+
 
 export default App;
