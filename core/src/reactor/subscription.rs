@@ -1,5 +1,6 @@
-use super::SubscriptionState;
-use ankurah_proto::{self as proto, Attested};
+use crate::reactor::Reactor;
+
+use ankurah_proto::{self as proto};
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -19,54 +20,7 @@ impl std::fmt::Display for ReactorSubscriptionId {
 /// Inner state for ReactorSubscription
 pub(crate) struct ReactorSubInner {
     subscription_id: ReactorSubscriptionId,
-    collection_id: proto::CollectionId,
-    reactor: Box<dyn TReactor + Send + Sync>,
-}
-
-/// Trait for type-erased reactor functionality needed by ReactorSubscription
-trait TReactor {
-    fn unsubscribe(&self, sub_id: ReactorSubscriptionId);
-    fn add_predicate(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        predicate_id: proto::PredicateId,
-        collection_id: &proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-    );
-    fn remove_predicate(&self, subscription_id: ReactorSubscriptionId, predicate_id: proto::PredicateId);
-    fn add_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>);
-    fn remove_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>);
-    // TODO: Add initialize method when it's moved to Reactor
-}
-
-impl<SE, PA> TReactor for super::Reactor<SE, PA>
-where
-    SE: super::StorageEngine + Send + Sync + 'static,
-    PA: super::PolicyAgent + Send + Sync + 'static,
-{
-    fn unsubscribe(&self, sub_id: ReactorSubscriptionId) { self.unsubscribe(sub_id); }
-
-    fn add_predicate(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        predicate_id: proto::PredicateId,
-        collection_id: &proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) {
-        self.add_predicate(subscription_id, predicate_id, collection_id, predicate);
-    }
-
-    fn remove_predicate(&self, subscription_id: ReactorSubscriptionId, predicate_id: proto::PredicateId) {
-        self.remove_predicate(subscription_id, predicate_id);
-    }
-
-    fn add_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>) {
-        self.add_entity_subscriptions(subscription_id, entity_ids);
-    }
-
-    fn remove_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: Vec<proto::EntityId>) {
-        self.remove_entity_subscriptions(subscription_id, entity_ids);
-    }
+    reactor: Reactor,
 }
 
 impl Drop for ReactorSubInner {
@@ -80,14 +34,12 @@ impl Drop for ReactorSubInner {
 pub struct ReactorSubscription(Arc<ReactorSubInner>);
 
 impl ReactorSubscription {
-    pub fn new(subscription_id: ReactorSubscriptionId, reactor: Box<dyn TReactor + Send + Sync>) -> Self {
+    pub fn new(subscription_id: ReactorSubscriptionId, reactor: Reactor) -> Self {
         Self(Arc::new(ReactorSubInner { subscription_id, reactor }))
     }
 
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
-
-    pub fn collection_id(&self) -> proto::CollectionId { self.0.collection_id }
 
     /// Add a predicate to this subscription
     pub fn add_predicate(&self, predicate_id: proto::PredicateId, collection_id: &proto::CollectionId, predicate: ankql::ast::Predicate) {

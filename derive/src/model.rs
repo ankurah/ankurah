@@ -114,6 +114,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                             // Direct method call on Mut - no trait needed
                             let handle = context2
                                 .subscribe(predicate.as_str(), move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                                    // LEFT OFF HERE - ReactorUpdateItem no longer has a resultset
                                     signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
                                 })
                                 .await;

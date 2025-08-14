@@ -58,7 +58,7 @@ pub enum NodeResponseBody {
     Fetch(Vec<Attested<EntityState>>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    Subscribed { predicate_id: PredicateId },
+    PredicateSubscribed { predicate_id: PredicateId },
     Success,
     Error(String),
 }
@@ -109,7 +109,7 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::Subscribed { predicate_id } => write!(f, "Subscribed {predicate_id}"),
+            NodeResponseBody::PredicateSubscribed { predicate_id } => write!(f, "Subscribed {predicate_id}"),
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
         }

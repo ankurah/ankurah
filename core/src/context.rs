@@ -7,6 +7,7 @@ use crate::{
     policy::{AccessDenied, PolicyAgent},
     reactor::{ReactorSubscription, ReactorUpdate},
     resultset::ResultSet,
+    retrieval::LocalRetriever,
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
@@ -79,7 +80,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
-    ) -> Result<Subscription, RetrievalError> {
+    ) -> Result<LocalSubscription, RetrievalError> {
         // Create the ReactorSubscription
         let reactor_subscription = self.node.reactor.subscribe();
 
@@ -87,7 +88,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         reactor_subscription.add_predicate(sub_id, collection, args.predicate.clone());
 
         // Create type-erased Subscription
-        let subscription = Subscription::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, sub_id, reactor_subscription);
+        let subscription =
+            LocalSubscription::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, sub_id, reactor_subscription);
 
         Ok(subscription)
     }
@@ -177,7 +179,7 @@ impl Context {
         // Using one subscription id for local and remote subscriptions
         let sub_id = proto::PredicateId::new();
         // Now set up our local subscription
-        let handle = self.0.query::<R>(sub_id, &collection_id, args).await?;
+        let handle = unimplemented!(); // self.0.query::<R>(sub_id, &collection_id, args).await?;
         Ok(handle)
     }
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
@@ -285,10 +287,10 @@ where
         let subscription = self.node.reactor.subscribe();
 
         // Add the predicate to the subscription
-        subscription.add_predicate(&self.node.reactor, predicate_id, collection_id, args.predicate);
+        subscription.add_predicate(predicate_id, collection_id, args.predicate);
 
         // Create LiveQuery with the subscription
-        let handle = LiveQuery::<R>::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, predicate_id, subscription.clone());
+        let handle = unimplemented!(); // LiveQuery::<R>::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, predicate_id, subscription.clone());
 
         let storage_collection = self.node.collections.get(collection_id).await?;
 
@@ -300,7 +302,7 @@ where
             if !cached {
                 // Create oneshot channel to wait for first remote update
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                self.node.pending_subs.insert(predicate_id, tx);
+                self.node.pending_predicate_subs.insert(predicate_id, tx);
 
                 // Wait for first remote update before initializing
                 match rx.await {
@@ -318,8 +320,16 @@ where
             initial_states = storage_collection.fetch_states(&predicate).await?;
         }
 
-        // Always initialize the subscription
-        subscription.initialize(&self.node.reactor, handle.id, collection_id, initial_states).await?;
+        // Convert states to entities
+        let retriever = LocalRetriever::new(storage_collection.clone());
+        let mut initial_entities = Vec::new();
+        for state in initial_states {
+            let (_, entity) =
+                self.node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+            initial_entities.push(entity);
+        }
+
+        self.node.reactor.initialize(subscription.id(), predicate_id, initial_entities).await?;
 
         Ok(handle)
     }
@@ -376,7 +386,7 @@ where
 /// A local subscription that handles both reactor subscription and remote cleanup
 /// This is a type-erased version that can be used in the TContext trait
 pub struct LocalSubscription {
-    pub(crate) id: proto::PredicateId,
+    pub(crate) predicate_id: proto::PredicateId,
     pub(crate) node: Box<dyn TNodeErased>,
     pub(crate) peers: Vec<proto::EntityId>,
     // Store the actual subscription - now non-generic!
@@ -385,7 +395,7 @@ pub struct LocalSubscription {
 
 impl LocalSubscription {
     pub fn new(node: Box<dyn TNodeErased>, id: proto::PredicateId, subscription: ReactorSubscription) -> Self {
-        Self { id, node, peers: Vec::new(), subscription }
+        Self { predicate_id: id, node, peers: Vec::new(), subscription }
     }
 }
 
@@ -400,44 +410,18 @@ impl Drop for LocalSubscription {
 impl Subscribe<ReactorUpdate> for LocalSubscription {
     fn subscribe<F>(&self, listener: F) -> SignalGuard
     where F: IntoSubscribeListener<ReactorUpdate> {
-        self.subscription.subscribe(listener)
+        unimplemented!()
+        // self.subscription.subscribe(listener)
     }
 }
-
-impl<SE, PA> LocalSubscription<SE, PA>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    pub fn new(node: Box<dyn TNodeErased>, id: proto::PredicateId, subscription: ReactorSubscription) -> Self {
-        Self { id, node, peers: Vec::new(), subscription }
-    }
-}
-
-impl<SE, PA> Drop for LocalSubscription<SE, PA> {
-    fn drop(&mut self) {
-        // Handle remote subscription cleanup
-        // TODO: Add relay.notify_unsubscribe, node.predicate_context.remove, node.pending_subs.remove
-        warn!("LocalSubscription dropped - remote cleanup not yet implemented");
-    }
-}
-
 // Implement Signal trait for LocalSubscription
-impl Signal for LocalSubscription {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.subscription.listen(listener) }
+// impl Signal for LocalSubscription {
+//     fn listen(&self, listener: Listener) -> ListenerGuard { self.subscription.listen(listener) }
 
-    fn broadcast_id(&self) -> BroadcastId { self.subscription.broadcast_id() }
-}
+//     fn broadcast_id(&self) -> BroadcastId { self.subscription.broadcast_id() }
+// }
 
-// Implement Subscribe trait for LocalSubscription
-impl Subscribe<ReactorUpdate> for LocalSubscription {
-    fn subscribe<F>(&self, listener: F) -> SignalGuard
-    where F: IntoSubscribeListener<ReactorUpdate> {
-        self.subscription.subscribe(listener)
-    }
-}
-
-/// A handle to a live query subscription that can be used to register callbacks
+/// LiveQuery is a typed handle to a LocalSubscription that automatically wraps Entities in View: R
 pub struct LiveQuery<R: View> {
     local_subscription: LocalSubscription,
     _phantom: std::marker::PhantomData<R>,
@@ -447,23 +431,18 @@ impl<R: View> LiveQuery<R> {
     pub fn new(local_subscription: LocalSubscription) -> Self { Self { local_subscription, _phantom: std::marker::PhantomData } }
 }
 
-impl<R: View> Drop for LiveQuery<R> {
-    fn drop(&mut self) {
-        debug!("Dropping LiveQuery {}", self.local_subscription.id);
-        self.local_subscription.node.unsubscribe_remote_predicate(self);
+impl<R: View> std::fmt::Debug for LiveQuery<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LiveQuery({:?})", self.local_subscription.predicate_id)
     }
 }
 
-impl<R: View> std::fmt::Debug for LiveQuery<R> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "LiveQuery({:?})", self.local_subscription.id) }
-}
-
 // Implement Signal trait - delegate to the underlying subscription
-impl<R: View> Signal for LiveQuery<R> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.local_subscription.listen(listener) }
+// impl<R: View> Signal for LiveQuery<R> {
+//     fn listen(&self, listener: Listener) -> ListenerGuard { self.local_subscription.listen(listener) }
 
-    fn broadcast_id(&self) -> BroadcastId { self.local_subscription.broadcast_id() }
-}
+//     fn broadcast_id(&self) -> BroadcastId { self.local_subscription.broadcast_id() }
+// }
 
 // Implement Subscribe trait - convert ReactorUpdate to ChangeSet<R>
 impl<R: View> Subscribe<ChangeSet<R>> for LiveQuery<R>

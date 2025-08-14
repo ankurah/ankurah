@@ -286,7 +286,7 @@ where
     async fn peer_subscribe(
         &self,
         peer_id: proto::EntityId,
-        sub_id: proto::PredicateId,
+        predicate_id: proto::PredicateId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: &PA::ContextData,
@@ -297,11 +297,11 @@ where
             .request(
                 peer_id,
                 context_data,
-                ankurah_proto::NodeRequestBody::Subscribe { subscription_id: sub_id, collection: collection_id, predicate },
+                ankurah_proto::NodeRequestBody::SubscribePredicate { predicate_id, collection: collection_id, predicate },
             )
             .await?
         {
-            ankurah_proto::NodeResponseBody::Subscribed { subscription_id: _ } => Ok(()),
+            ankurah_proto::NodeResponseBody::PredicateSubscribed { predicate_id: _ } => Ok(()),
             ankurah_proto::NodeResponseBody::Error(_) => Err(RequestError::ConnectionLost),
             _ => Err(RequestError::ConnectionLost),
         }
