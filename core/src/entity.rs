@@ -299,7 +299,7 @@ impl Entity {
     }
 
     /// Get a reference to the entity's broadcast for Signal implementations
-    pub fn broadcast(&self) -> &ankurah_signals::broadcast::Broadcast { &self.broadcast }
+    pub fn broadcast(&self) -> ankurah_signals::broadcast::Ref { self.broadcast.reference() }
 
     /// Get a specific backend, creating it if it doesn't exist
     pub fn get_backend<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
