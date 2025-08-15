@@ -157,8 +157,6 @@ interface EntryRowProps {
 }
 
 const EntryRow: React.FC<EntryRowProps> = signalObserver(({ entry }) => {
-  // manually track the entry in the current observer until the field accessors track
-  entry.track();
   console.log("RENDER EntryRow");
   return (
     <Tr onClick={() => edit_entry(entry)} style={{ cursor: "pointer" }}>
