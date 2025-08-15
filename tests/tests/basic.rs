@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
 mod pg_common;
-use ankurah::signals::Subscribe;
+use ankurah::signals::{CallbackObserver, Subscribe};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 
@@ -55,14 +55,25 @@ async fn test_sled() -> Result<()> {
     // (remote updates are another story)
     let album = context.get::<AlbumView>(album_id).await?;
 
-    let (w, check_view) = generic_watcher::<AlbumView>();
-    let (w2, check_name) = generic_watcher::<String>();
-    let (w3, check_year) = generic_watcher::<String>();
+    let (w, check_view) = generic_watcher::<(AlbumView, String, String)>();
+    let (w2, check_rendered) = generic_watcher::<String>();
 
     // store the handles to keep the subscriptions alive
-    let _h1 = album.subscribe(w);
-    let _h2 = album.name().subscribe(w2);
-    let _h3 = album.year().subscribe(w3);
+    let _h1 = album.subscribe(move |v: AlbumView| w((v.clone(), v.name().unwrap(), v.year().unwrap())));
+    let observer = {
+        let album = album.clone();
+        CallbackObserver::new(move || {
+            // Access the view fields - this should cause the View to be tracked by CurrentObserver
+            w2(format!("name: {}, year: {}", album.name().unwrap(), album.year().unwrap()));
+        })
+    };
+    observer.trigger();
+    assert_eq!(check_rendered(), vec!["name: The rest of the bowl, year: 2024"]);
+
+    // TODO LATER - figure out how to best access the Active type on the View
+    //              until then we will not support this
+    // let _h2 = album.name().subscribe(w2);
+    // let _h3 = album.year().subscribe(w3);
 
     let trx2 = context.begin();
     let album_mut2 = album.edit(&trx2)?;
@@ -71,25 +82,22 @@ async fn test_sled() -> Result<()> {
 
     // we haven't committed the transaction yet - neither watcher should have received any changes
     assert_eq!(check_view(), vec![]);
-    assert_eq!(check_name(), vec![] as Vec<String>);
-    assert_eq!(check_year(), vec![] as Vec<String>);
+    assert_eq!(check_rendered(), vec![] as Vec<String>);
 
     // commit the transaction
     trx2.commit().await?;
 
     // now we should have one change since we performed a delete operation
-    // TODO - implement PartialEq for Views
-    assert_eq!(check_view(), vec![album.clone()]);
-    assert_eq!(check_name(), vec!["The rest of the owl".to_owned()]);
+    assert_eq!(check_view(), vec![(album.clone(), "The rest of the owl".to_owned(), "2024".to_owned())]);
+    assert_eq!(check_rendered(), vec!["name: The rest of the owl, year: 2024"]);
 
     let trx3 = context.begin();
     let album_mut3 = album.edit(&trx3)?;
     album_mut3.year().replace("2025")?;
     trx3.commit().await?;
 
-    assert_eq!(check_view(), vec![album]); // AlbumView changed
-    assert_eq!(check_name(), vec![] as Vec<String>); // name didn't change
-    assert_eq!(check_year(), vec!["2025".to_owned()]); // year changed
+    assert_eq!(check_view(), vec![(album.clone(), "The rest of the owl".to_owned(), "2025".to_owned())]); // AlbumView changed
+    assert_eq!(check_rendered(), vec!["name: The rest of the owl, year: 2025"]);
 
     Ok(())
 }

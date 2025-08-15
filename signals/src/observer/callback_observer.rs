@@ -29,7 +29,7 @@ impl WeakCallbackObserver {
 
 impl CallbackObserver {
     /// Create a new callback observer
-    pub fn new<F: Fn() + Send + Sync + 'static>(callback: Arc<F>) -> Self {
+    pub fn new<F: Fn() + Send + Sync + 'static>(callback: F) -> Self {
         Self(Arc::new(Inner { callback: Box::new(move || callback()), entries: std::sync::RwLock::new(HashMap::new()) }))
     }
 

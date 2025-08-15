@@ -3,6 +3,8 @@ use ankurah_signals::{observer::CallbackObserver, *};
 use common::watcher;
 use std::sync::{Arc, Mutex};
 
+// TODO1 audit these test cases to make sure they are well formed and actually valuable
+
 /// Test manual subscription to verify notification mechanism works
 #[tokio::test]
 async fn test_manual_subscription_works() {
@@ -36,9 +38,9 @@ async fn test_basic_observer_subscription() {
 
     let observer = {
         let results_clone = results.clone();
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             results_clone.lock().unwrap().push("observer callback triggered".to_string());
-        }))
+        })
     };
 
     // Step 1: Initially, no context is set
@@ -83,11 +85,11 @@ async fn test_multiple_signals_single_observer() {
         let name_read_clone = name_read.clone();
         let age_read_clone = age_read.clone();
         let results_clone = results.clone();
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             let name_val = name_read_clone.get();
             let age_val = age_read_clone.get();
             results_clone.lock().unwrap().push(format!("{}: {}", name_val, age_val));
-        }))
+        })
     };
 
     // Trigger observer to establish subscriptions
@@ -125,17 +127,18 @@ async fn test_nested_observer_contexts() {
     let outer_observer = {
         let tracking_log = tracking_log.clone();
         let outer_read = outer_read.clone();
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             tracking_log.lock().unwrap().push("outer callback".to_string());
-        }))
+        })
     };
 
+    // TODO1 switch this over to generic_watcher instead of the kooky tracking_log
     let inner_observer = {
         let tracking_log = tracking_log.clone();
         let inner_read = inner_read.clone();
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             tracking_log.lock().unwrap().push("inner callback".to_string());
-        }))
+        })
     };
 
     // Test nested context setup and restoration
@@ -182,9 +185,9 @@ async fn test_deep_nested_context_restoration() {
     let observers: Vec<CallbackObserver> = (0..5)
         .map(|i| {
             let read = reads[i].clone();
-            CallbackObserver::new(Arc::new(move || {
+            CallbackObserver::new(move || {
                 read.get(); // Subscribe this observer to this signal
-            }))
+            })
         })
         .collect();
 
@@ -222,10 +225,10 @@ async fn test_observer_cleanup() {
     let observer = {
         let notification_count = notification_count.clone();
         let read_signal = read_signal.clone();
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             read_signal.get(); // Re-subscribe on each notification
             *notification_count.lock().unwrap() += 1;
-        }))
+        })
     };
 
     // Establish subscription
@@ -259,9 +262,9 @@ async fn test_context_subscription_clearing() {
 
     let observer = {
         let notification_count = notification_count.clone();
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             *notification_count.lock().unwrap() += 1;
-        }))
+        })
     };
 
     // First context - subscribe to signal1 only
@@ -301,10 +304,10 @@ async fn test_react_style_try_finally_pattern() {
     let observer = {
         let read_signal_clone = read_signal.clone();
         let results_clone = results.clone();
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             let value = read_signal_clone.get();
             results_clone.lock().unwrap().push(format!("react: {}", value));
-        }))
+        })
     };
 
     // Simulate React useObserve pattern
@@ -337,9 +340,9 @@ async fn test_react_style_try_finally_pattern() {
 /// Test CurrentContext::remove() observer identification logic
 #[tokio::test]
 async fn test_context_remove_pointer_equality() {
-    let observer1 = CallbackObserver::new(Arc::new(|| {}));
-    let observer2 = CallbackObserver::new(Arc::new(|| {}));
-    let observer3 = CallbackObserver::new(Arc::new(|| {}));
+    let observer1 = CallbackObserver::new(|| {});
+    let observer2 = CallbackObserver::new(|| {});
+    let observer3 = CallbackObserver::new(|| {});
 
     // Initially no context
     assert!(CurrentObserver::current().is_none());
@@ -365,7 +368,7 @@ async fn test_context_remove_pointer_equality() {
     assert!(CurrentObserver::current().is_none()); // Stack should be empty
 
     // Test 4: Try to remove an observer that's not in the stack (should not crash)
-    let observer4 = CallbackObserver::new(Arc::new(|| {}));
+    let observer4 = CallbackObserver::new(|| {});
     CurrentObserver::remove(&observer4); // Should be safe no-op
     assert!(CurrentObserver::current().is_none()); // Still empty
 

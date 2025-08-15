@@ -286,6 +286,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             #(
                 #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                     use ankurah::property::{FromActiveType, FromEntity};
+                    ::ankurah::signals::CurrentObserver::track(self);
                     let active_result = #active_field_types_turbofish::from_entity(#active_field_name_strs.into(), &self.entity);
                     #projected_field_types_turbofish::from_active(active_result)
                 }

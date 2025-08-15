@@ -15,10 +15,10 @@ async fn test_observer() {
         let name = name.read();
         let age = age.read();
 
-        CallbackObserver::new(Arc::new(move || {
+        CallbackObserver::new(move || {
             let body = format!("name: {}, age: {}", name.get(), age.get());
             accumulate(body)
-        }))
+        })
     };
 
     renderer.trigger();
