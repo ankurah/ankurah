@@ -44,14 +44,12 @@ pub struct ListenerGuard {
 impl ListenerGuard {
     /// Get the broadcast ID that this guard is subscribed to
     pub fn broadcast_id(&self) -> BroadcastId {
-        // Use the same logic as Broadcast::id() - the Arc pointer address
-        if let Some(inner) = self.inner.upgrade() {
-            BroadcastId(Arc::as_ptr(&inner) as usize)
-        } else {
-            // If the broadcast is gone, we still need to return a consistent ID
-            // This should be rare since the guard keeps the broadcast alive
-            BroadcastId(self.inner.as_ptr() as usize)
-        }
+        // A ListenerGuard does not keep the broadcast alive
+        // but the address is reserved until all Arc/Weak references are dropped
+        // Given that we are using the address as the ID, this is safe.
+        // We don't actually care if the broadcast is alive. The point is to
+        // provide a unqique id for removing the correct listener.
+        BroadcastId(self.inner.as_ptr() as usize)
     }
 }
 
