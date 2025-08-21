@@ -66,9 +66,16 @@ impl Sql {
                 Literal::Boolean(bool) => self.arg(*bool),
             },
             Expr::Identifier(id) => match id {
-                Identifier::Property(name) => self.sql(format!(r#""{}""#, name)),
+                Identifier::Property(name) => {
+                    // Escape any existing quotes in the property name by doubling them
+                    let escaped_name = name.replace('"', "\"\"");
+                    self.sql(format!(r#""{}""#, escaped_name));
+                }
                 Identifier::CollectionProperty(collection, name) => {
-                    self.sql(format!(r#""{}"."{}""#, collection, name));
+                    // Escape quotes in both collection and property names
+                    let escaped_collection = collection.replace('"', "\"\"");
+                    let escaped_name = name.replace('"', "\"\"");
+                    self.sql(format!(r#""{}"."{}""#, escaped_collection, escaped_name));
                 }
             },
             Expr::ExprList(exprs) => {
