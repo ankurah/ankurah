@@ -75,10 +75,14 @@ pub enum RequestError {
     PeerNotConnected,
     #[error("Connection lost")]
     ConnectionLost,
+    #[error("Server error: {0}")]
+    ServerError(String),
     #[error("Send error: {0}")]
     SendError(SendError),
     #[error("Internal channel closed")]
     InternalChannelClosed,
+    #[error("Unexpected response: {0:?}")]
+    UnexpectedResponse(ankurah_proto::NodeResponseBody),
 }
 
 impl From<SendError> for RequestError {
