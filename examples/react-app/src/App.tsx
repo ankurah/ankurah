@@ -83,14 +83,14 @@ const App: React.FC = signalObserver(() => {
     // subscribe to the signal - not necessary for this page - just illustrating how to do it
     // the call to test_items_signal.value below is what is doing the real work here,
     // because it automatically subscribes the current observer to the signal
-    const h = signal.subscribe((value) => {
+    const g = signal.subscribe((value) => {
       console.log(
         "Subcription to EntryResultSetSignal called the callback with value: ",
         value,
       );
     });
     // h is a SubscriptionGuard. We just keep it resident so the finalization registry doesn't free it and cancel the subscription
-    return [signal, h];
+    return [signal, g];
   }, []);
 
   const handleButtonPress = () => {

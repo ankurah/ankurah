@@ -139,7 +139,7 @@ pub use proto::EntityId;
 // Re-export commonly used types
 pub use ankurah_core::{
     changes,
-    context::Context,
+    context::{Context, LiveQuery},
     entity, error, model,
     model::View,
     model::{Model, Mutable},
@@ -147,9 +147,7 @@ pub use ankurah_core::{
     policy::{self, PermissiveAgent},
     property::{self, Property},
     resultset::ResultSet,
-    storage,
-    subscription::SubscriptionHandle,
-    transaction,
+    storage, transaction,
 };
 
 // Re-export the derive macro

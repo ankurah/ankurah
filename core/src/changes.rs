@@ -1,5 +1,6 @@
 use crate::{entity::Entity, error::MutationError, model::View, resultset::ResultSet};
-use ankurah_proto::{Attested, Event};
+use ankurah_proto::{self as proto, Attested, Event};
+use ulid::Ulid;
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
@@ -147,3 +148,6 @@ impl<R> From<&ItemChange<R>> for ChangeKind {
         }
     }
 }
+
+// Moved all the ReactorUpdate stuff into reactor.rs because it's specific to the reactor
+// and we have several types of updates, so it's essential to keep them organized

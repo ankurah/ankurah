@@ -12,22 +12,20 @@ use tokio::sync::oneshot;
 
 use crate::{
     action_debug, action_error, action_info, action_warn,
-    changes::{ChangeSet, EntityChange, ItemChange},
+    changes::{EntityChange, ItemChange},
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
-    context::{Context, NodeAndContext},
-    entity::{Entity, WeakEntitySet},
+    context::{Context, LiveQuery, NodeAndContext},
+    entity::WeakEntitySet,
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
     policy::{AccessDenied, PolicyAgent},
-    reactor::Reactor,
+    reactor::{Reactor, ReactorSubscription},
     retrieval::LocalRetriever,
     storage::StorageEngine,
-    subscription::SubscriptionHandle,
     subscription_relay::SubscriptionRelay,
     system::SystemManager,
     task::spawn,
-    transaction::Transaction,
     util::{safemap::SafeMap, safeset::SafeSet},
 };
 #[cfg(feature = "instrument")]
@@ -38,7 +36,8 @@ use tracing::{debug, error, info, warn};
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
-    subscriptions: SafeSet<proto::SubscriptionId>,
+    subscription: ReactorSubscription,
+    // subscriptions: SafeSet<proto::PredicateId>,
     pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 }
@@ -120,13 +119,13 @@ where PA: PolicyAgent
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
-    pub(crate) subscription_context: SafeMap<proto::SubscriptionId, PA::ContextData>,
+    pub(crate) predicate_context: SafeMap<proto::PredicateId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
-    pub(crate) pending_subs: SafeMap<proto::SubscriptionId, tokio::sync::oneshot::Sender<Vec<Attested<EntityState>>>>,
+    pub(crate) pending_predicate_subs: SafeMap<proto::PredicateId, tokio::sync::oneshot::Sender<Vec<Attested<EntityState>>>>,
 
     /// The reactor for handling subscriptions
-    pub(crate) reactor: Arc<Reactor<SE, PA>>,
+    pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
@@ -142,7 +141,7 @@ where
         let collections = CollectionSet::new(engine.clone());
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
+        let reactor = Reactor::new();
         notice_info!("Node {id:#} created as ephemeral");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
@@ -160,9 +159,9 @@ where
             durable: false,
             policy_agent,
             system: system_manager,
-            subscription_context: SafeMap::new(),
+            predicate_context: SafeMap::new(),
             subscription_relay,
-            pending_subs: SafeMap::new(),
+            pending_predicate_subs: SafeMap::new(),
         }));
 
         // Set up the message sender for the subscription relay
@@ -179,7 +178,7 @@ where
         let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
-        let reactor = Reactor::new(collections.clone(), entityset.clone(), policy_agent.clone());
+        let reactor = Reactor::new();
         notice_info!("Node {id:#} created as durable");
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), true);
@@ -194,9 +193,9 @@ where
             durable: true,
             policy_agent,
             system: system_manager,
-            subscription_context: SafeMap::new(),
+            predicate_context: SafeMap::new(),
             subscription_relay: None,
-            pending_subs: SafeMap::new(),
+            pending_predicate_subs: SafeMap::new(),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -205,12 +204,13 @@ where
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         action_info!(self, "register_peer", "{}", &presence);
 
+        let subscription = self.reactor.subscribe();
         self.peer_connections.insert(
             presence.node_id,
             Arc::new(PeerState {
                 sender,
                 _durable: presence.durable,
-                subscriptions: SafeSet::new(),
+                subscription,
                 pending_requests: SafeMap::new(),
                 pending_updates: SafeMap::new(),
             }),
@@ -245,26 +245,17 @@ where
     pub fn deregister_peer(&self, node_id: proto::EntityId) {
         notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
 
+        self.durable_peers.remove(&node_id);
         // Get and cleanup subscriptions before removing the peer
-        if let Some(peer_state) = self.peer_connections.get(&node_id) {
-            // Get all subscription IDs
-            let subscriptions = peer_state.subscriptions.to_vec();
-
-            // Unsubscribe each one from the reactor
-            for sub_id in subscriptions {
-                action_info!(self, "unsubscribing", "subscription {} for peer {}", sub_id, node_id);
-                self.reactor.unsubscribe(sub_id);
-            }
+        if let Some(peer_state) = self.peer_connections.remove(&node_id) {
+            action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription.id(), node_id);
+            // ReactorSubscription is automatically unsubscribed on drop
         }
 
         // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)
         if let Some(ref relay) = self.subscription_relay {
             relay.notify_peer_disconnected(node_id);
         }
-
-        // Remove the peer connection and durable status
-        self.peer_connections.remove(&node_id);
-        self.durable_peers.remove(&node_id);
     }
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
     pub async fn request(
@@ -392,11 +383,10 @@ where
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
-            proto::NodeMessage::Unsubscribe { from, subscription_id } => {
-                self.reactor.unsubscribe(subscription_id);
+            proto::NodeMessage::UnsubscribePredicate { from, predicate_id } => {
                 // Remove and drop the subscription handle
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscriptions.remove(&subscription_id);
+                    self.reactor.remove_predicate(peer_state.subscription.id(), predicate_id);
                 }
             }
         }
@@ -462,8 +452,8 @@ where
 
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
-            proto::NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
-                self.handle_subscribe_request(cdata, request.from, subscription_id, collection, predicate).await
+            proto::NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
+                self.handle_subscribe_request(cdata, request.from, predicate_id, collection, predicate).await
             }
         }
     }
@@ -474,14 +464,14 @@ where
         };
 
         match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { subscription_id, items } => {
+            proto::NodeUpdateBody::SubscriptionUpdate { predicate_id, items } => {
                 // TODO check if this is a valid subscription
                 action_debug!(self, "received subscription update for {} items", "{}", items.len());
-                if let Some(cdata) = self.subscription_context.get(&subscription_id) {
+                if let Some(cdata) = self.predicate_context.get(&predicate_id) {
                     let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
 
                     // Signal any pending subscription waiting for first update
-                    if let Some(tx) = self.pending_subs.remove(&subscription_id) {
+                    if let Some(tx) = self.pending_predicate_subs.remove(&predicate_id) {
                         let initial_states = items.iter().cloned().filter_map(|item| item.try_into().ok()).collect();
                         self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
                         let _ = tx.send(initial_states); // Ignore if receiver was dropped
@@ -489,8 +479,8 @@ where
                         self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
                     }
                 } else {
-                    error!("Received subscription update for unknown subscription {}", subscription_id);
-                    return Err(anyhow!("Received subscription update for unknown subscription {}", subscription_id));
+                    error!("Received subscription update for unknown predicate {}", predicate_id);
+                    return Err(anyhow!("Received subscription update for unknown predicate {}", predicate_id));
                 }
 
                 Ok(())
@@ -603,127 +593,127 @@ where
         update: proto::SubscriptionUpdateItem,
         nodeandcontext: &NodeAndContext<SE, PA>,
     ) -> Result<Option<EntityChange>, MutationError> {
-        match update {
-            proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
-                let state = (entity_id, collection, state).into();
-                // validate that we trust the state given to us
-                self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
+        todo!("Update this to reflect the changes to SubscriptionUpdateItem")
+        // match update {
+        //     proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
+        //         let state = (entity_id, collection, state).into();
+        //         // validate that we trust the state given to us
+        //         self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
 
-                let payload = state.payload;
-                let collection = self.collections.get(&payload.collection).await?;
-                let getter = (payload.collection.clone(), nodeandcontext);
+        //         let payload = state.payload;
+        //         let collection = self.collections.get(&payload.collection).await?;
+        //         let getter = (payload.collection.clone(), nodeandcontext);
 
-                match self.entities.with_state(&getter, payload.entity_id, payload.collection, payload.state).await? {
-                    (Some(true), entity) => {
-                        // We had the entity already, and this state is newer than the one we have, so save it to the collection
-                        // Not sure if we should reproject the state - discuss
-                        // however, if we do reproject, we need to re-attest the state
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
-                        Ok(Some(EntityChange::new(entity, vec![])?))
-                    }
-                    (Some(false), _entity) => {
-                        // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
-                        Ok(None)
-                    }
-                    (None, entity) => {
-                        // We did not have the entity yet, so we created it, so save it to the collection
-                        // see notes as above regarding reprojecting and re-attesting the state
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
-                        Ok(Some(EntityChange::new(entity, vec![])?))
-                    }
-                }
-            }
-            proto::SubscriptionUpdateItem::Add { entity_id, collection: collection_id, state, events } => {
-                let collection = self.collections.get(&collection_id).await?;
+        //         match self.entities.with_state(&getter, payload.entity_id, payload.collection, payload.state).await? {
+        //             (Some(true), entity) => {
+        //                 // We had the entity already, and this state is newer than the one we have, so save it to the collection
+        //                 // Not sure if we should reproject the state - discuss
+        //                 // however, if we do reproject, we need to re-attest the state
+        //                 let state = entity.to_state()?;
+        //                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+        //                 let attestation = self.policy_agent.attest_state(self, &entity_state);
+        //                 let attested = Attested::opt(entity_state, attestation);
+        //                 collection.set_state(attested).await?;
+        //                 Ok(Some(EntityChange::new(entity, vec![])?))
+        //             }
+        //             (Some(false), _entity) => {
+        //                 // We had the entity already, and this state is not newer than the one we have so we drop it to the floor
+        //                 Ok(None)
+        //             }
+        //             (None, entity) => {
+        //                 // We did not have the entity yet, so we created it, so save it to the collection
+        //                 // see notes as above regarding reprojecting and re-attesting the state
+        //                 let state = entity.to_state()?;
+        //                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+        //                 let attestation = self.policy_agent.attest_state(self, &entity_state);
+        //                 let attested = Attested::opt(entity_state, attestation);
+        //                 collection.set_state(attested).await?;
+        //                 Ok(Some(EntityChange::new(entity, vec![])?))
+        //             }
+        //         }
+        //     }
+        //     proto::SubscriptionUpdateItem::Add { entity_id, collection: collection_id, state, events } => {
+        //         let collection = self.collections.get(&collection_id).await?;
 
-                // validate and store the events, in case we need them for lineage comparison
-                let mut attested_events = Vec::new();
-                for event in events.iter() {
-                    let event: Attested<ankurah_proto::Event> = (entity_id, collection_id.clone(), event.clone()).into();
-                    self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
-                    // store the validated event in case we need it for lineage comparison
-                    collection.add_event(&event).await?;
-                    attested_events.push(event);
-                }
+        //         // validate and store the events, in case we need them for lineage comparison
+        //         let mut attested_events = Vec::new();
+        //         for event in events.iter() {
+        //             let event: Attested<ankurah_proto::Event> = (entity_id, collection_id.clone(), event.clone()).into();
+        //             self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
+        //             // store the validated event in case we need it for lineage comparison
+        //             collection.add_event(&event).await?;
+        //             attested_events.push(event);
+        //         }
 
-                let state = (entity_id, collection_id.clone(), state).into();
-                self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
+        //         let state = (entity_id, collection_id.clone(), state).into();
+        //         self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
 
-                match self
-                    .entities
-                    .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, state.payload.state)
-                    .await?
-                {
-                    (Some(false), _entity) => {
-                        // had it already, and the state is not newer than the one we have
-                        Ok(None)
-                    }
-                    (Some(true), entity) => {
-                        // had it already, and the state is newer than the one we have, and was applied successfully, so save it and return the change
-                        // reduce the probability of error by reprojecting the state - is this necessary if we've validated the attestation?
-                        // See notes above regarding reprojecting and re-attesting the state
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
-                        Ok(Some(EntityChange::new(entity, attested_events)?))
-                    }
+        //         match self
+        //             .entities
+        //             .with_state(&(collection_id.clone(), nodeandcontext), entity_id, collection_id, state.payload.state)
+        //             .await?
+        //         {
+        //             (Some(false), _entity) => {
+        //                 // had it already, and the state is not newer than the one we have
+        //                 Ok(None)
+        //             }
+        //             (Some(true), entity) => {
+        //                 // had it already, and the state is newer than the one we have, and was applied successfully, so save it and return the change
+        //                 // reduce the probability of error by reprojecting the state - is this necessary if we've validated the attestation?
+        //                 // See notes above regarding reprojecting and re-attesting the state
+        //                 let state = entity.to_state()?;
+        //                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+        //                 let attestation = self.policy_agent.attest_state(self, &entity_state);
+        //                 let attested = Attested::opt(entity_state, attestation);
+        //                 collection.set_state(attested).await?;
+        //                 Ok(Some(EntityChange::new(entity, attested_events)?))
+        //             }
 
-                    (None, entity) => {
-                        // did not have it, so we created it, so save it and return the change
-                        // See notes above regarding attestation/reprojection
-                        let state = entity.to_state()?;
-                        let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
-                        let attestation = self.policy_agent.attest_state(self, &entity_state);
-                        let attested = Attested::opt(entity_state, attestation);
-                        collection.set_state(attested).await?;
-                        Ok(Some(EntityChange::new(entity, attested_events)?))
-                    }
-                }
-            }
-            proto::SubscriptionUpdateItem::Change { entity_id, collection: collection_id, events } => {
-                let collection = self.collections.get(&collection_id).await?;
-                let mut attested_events = Vec::new();
-                for event in events.iter() {
-                    let event = (entity_id, collection_id.clone(), event.clone()).into();
+        //             (None, entity) => {
+        //                 // did not have it, so we created it, so save it and return the change
+        //                 // See notes above regarding attestation/reprojection
+        //                 let state = entity.to_state()?;
+        //                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+        //                 let attestation = self.policy_agent.attest_state(self, &entity_state);
+        //                 let attested = Attested::opt(entity_state, attestation);
+        //                 collection.set_state(attested).await?;
+        //                 Ok(Some(EntityChange::new(entity, attested_events)?))
+        //             }
+        //         }
+        //     }
+        //     proto::SubscriptionUpdateItem::Change { entity_id, collection: collection_id, events } => {
+        //         let collection = self.collections.get(&collection_id).await?;
+        //         let mut attested_events = Vec::new();
+        //         for event in events.iter() {
+        //             let event = (entity_id, collection_id.clone(), event.clone()).into();
 
-                    self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
-                    // store the validated event in case we need it for lineage comparison
-                    collection.add_event(&event).await?;
-                    attested_events.push(event);
-                }
+        //             self.policy_agent.validate_received_event(self, from_peer_id, &event)?;
+        //             // store the validated event in case we need it for lineage comparison
+        //             collection.add_event(&event).await?;
+        //             attested_events.push(event);
+        //         }
 
-                let entity =
-                    self.entities.get_retrieve_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
+        //         let entity =
+        //             self.entities.get_retrieve_or_create(&(collection_id.clone(), nodeandcontext), &collection_id, &entity_id).await?;
 
-                let mut changed = false;
-                for event in attested_events.iter() {
-                    changed = entity.apply_event(&(collection_id.clone(), nodeandcontext), &event.payload).await?;
-                }
-                if changed {
-                    Ok(Some(EntityChange::new(entity, attested_events)?))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
+        //         let mut changed = false;
+        //         for event in attested_events.iter() {
+        //             changed = entity.apply_event(&(collection_id.clone(), nodeandcontext), &event.payload).await?;
+        //         }
+        //         if changed {
+        //             Ok(Some(EntityChange::new(entity, attested_events)?))
+        //         } else {
+        //             Ok(None)
+        //         }
+        //     }
+        // }
     }
 
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(peer_id = %peer_id.to_base64_short(), sub_id = %sub_id, collection_id = %collection_id, predicate = %predicate)))]
     async fn handle_subscribe_request(
         &self,
         cdata: &PA::ContextData,
         peer_id: proto::EntityId,
-        sub_id: proto::SubscriptionId,
+        predicate_id: proto::PredicateId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
     ) -> anyhow::Result<proto::NodeResponseBody> {
@@ -737,71 +727,87 @@ where
         // Set up subscription that forwards changes to the peer
         let node = self.clone();
         {
-            let peer_id = peer_id;
-            let subscription = self.reactor.register(sub_id, &collection_id, predicate.clone(), move |changeset| {
-                // TODO move this into a task being fed by a channel and reorg into a function
-                let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
+            let reactor_subscription = self.peer_connections.get(&peer_id).unwrap().subscription.clone();
+            let subscription = self.reactor.add_predicate(reactor_subscription.id(), predicate_id, &collection_id, predicate.clone());
 
-                // When changes occur, collect events and states
-                for change in changeset.changes.into_iter() {
-                    match change {
-                        ItemChange::Initial { item } => {
-                            // For initial state, include both events and state
-                            if let Ok(es) = item.to_entity_state() {
-                                let attestation = node.policy_agent.attest_state(&node, &es);
+            todo!("listen to changes once per ReactorSubscription (not here) and convert the ReactorUpdate into a SubscriptionUpdateItem");
+            // let closure = move |changeset| {
+            //     // TODO move this into a task being fed by a channel and reorg into a function
+            //     let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
 
-                                updates.push(proto::SubscriptionUpdateItem::initial(
-                                    item.id(),
-                                    item.collection.clone(),
-                                    Attested::opt(es, attestation),
-                                ));
-                            }
-                        }
-                        ItemChange::Add { item, events } => {
-                            // For entities which were not previously matched, state AND events should be included
-                            // but it's weird because EntityState and Event redundantly include entity_id and collection
-                            // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
-                            // it has to have the entity_id
+            //     // When changes occur, collect events and states
+            //     for change in changeset.changes.into_iter() {
+            //         match change {
+            //             ItemChange::Initial { item } => {
+            //                 // For initial state, include both events and state
+            //                 if let Ok(es) = item.to_entity_state() {
+            //                     let attestation = node.policy_agent.attest_state(&node, &es);
 
-                            let state = match item.to_state() {
-                                Ok(state) => state,
-                                Err(e) => {
-                                    warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
-                                    continue;
-                                }
-                            };
+            //                     updates.push(proto::SubscriptionUpdateItem::initial(
+            //                         item.id(),
+            //                         item.collection.clone(),
+            //                         Attested::opt(es, attestation),
+            //                     ));
+            //                 }
+            //             }
+            //             ItemChange::Add { item, events } => {
+            //                 // For entities which were not previously matched, state AND events should be included
+            //                 // but it's weird because EntityState and Event redundantly include entity_id and collection
+            //                 // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
+            //                 // it has to have the entity_id
 
-                            let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
-                            let attestation = node.policy_agent.attest_state(&node, &es);
+            //                 let state = match item.to_state() {
+            //                     Ok(state) => state,
+            //                     Err(e) => {
+            //                         warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
+            //                         continue;
+            //                     }
+            //                 };
 
-                            updates.push(proto::SubscriptionUpdateItem::add(
-                                item.id,
-                                item.collection.clone(),
-                                Attested::opt(es, attestation),
-                                events,
-                            ));
-                        }
-                        ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
-                            updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
-                        }
-                    }
-                }
+            //                 let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
+            //                 let attestation = node.policy_agent.attest_state(&node, &es);
 
-                // Always send subscription update, even if empty
-                node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: sub_id, items: updates });
-            });
+            //                 updates.push(proto::SubscriptionUpdateItem::add(
+            //                     item.id,
+            //                     item.collection.clone(),
+            //                     Attested::opt(es, attestation),
+            //                     events,
+            //                 ));
+            //             }
+            //             ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
+            //                 updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
+            //             }
+            //         }
+            //     }
+
+            //     // Always send subscription update, even if empty
+            //     node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: predicate_id, items: updates });
+            // };
 
             let storage_collection = self.collections.get(&collection_id).await?;
             let initial_states = storage_collection.fetch_states(&predicate).await?;
-            self.reactor.initialize(subscription, initial_states).await?;
+
+            // Convert states to entities
+            let retriever = LocalRetriever::new(storage_collection.clone());
+            let mut initial_entities = Vec::new();
+            for state in initial_states {
+                let (_, entity) =
+                    self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+                initial_entities.push(entity);
+            }
+
+            // Note: Need to get subscription_id from somewhere - this seems to be missing in the current code
+            // For now, leaving a TODO as the subscription registration logic is broken
+            // self.reactor.initialize(subscription_id, sub_id, initial_entities).await?;
         };
 
         // Store the subscription handle
-        if let Some(peer_state) = self.peer_connections.get(&peer_id) {
-            peer_state.subscriptions.insert(sub_id);
-        }
+        // if let Some(peer_state) = self.peer_connections.get(&peer_id) {
+        //     peer_state.subscriptions.insert(sub_id);
+        // }
 
-        Ok(proto::NodeResponseBody::Subscribed { subscription_id: sub_id })
+        // Ok(proto::NodeResponseBody::Subscribed { subscription_id: sub_id })
+        unimplemented!()
     }
 
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }
@@ -905,37 +911,15 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub async fn request_remote_unsubscribe(&self, sub_id: proto::SubscriptionId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
+    pub async fn request_remote_unsubscribe(&self, predicate_id: proto::PredicateId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
             if let Some(connection) = item {
-                let sub_id = sub_id;
-                connection.send_message(proto::NodeMessage::Unsubscribe { from: peer_id, subscription_id: sub_id })?;
+                connection.send_message(proto::NodeMessage::UnsubscribePredicate { from: peer_id, predicate_id })?;
             } else {
                 warn!("Peer {} not connected", peer_id);
             }
         }
 
-        Ok(())
-    }
-
-    pub fn unsubscribe(self: &Arc<Self>, handle: &SubscriptionHandle) -> anyhow::Result<()> {
-        let node = Node(self.clone());
-        let sub_id = handle.id;
-        spawn(async move {
-            // Clean up subscription context
-            node.subscription_context.remove(&sub_id);
-
-            // Clean up any pending oneshot channel
-            node.pending_subs.remove(&sub_id);
-
-            // Unsubscribe from local reactor
-            node.reactor.unsubscribe(sub_id);
-
-            // Notify subscription relay for remote cleanup
-            if let Some(ref relay) = node.subscription_relay {
-                relay.notify_unsubscribe(sub_id);
-            }
-        });
         Ok(())
     }
 }
@@ -949,7 +933,7 @@ where PA: PolicyAgent
 }
 
 pub trait TNodeErased: Send + Sync + 'static {
-    fn unsubscribe(&self, handle: &SubscriptionHandle);
+    fn unsubscribe_remote_predicate(&self, predicate_id: proto::PredicateId);
 }
 
 impl<SE, PA> TNodeErased for Node<SE, PA>
@@ -957,7 +941,25 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn unsubscribe(&self, handle: &SubscriptionHandle) { let _ = self.0.unsubscribe(handle); }
+    fn unsubscribe_remote_predicate(&self, predicate_id: proto::PredicateId) {
+        let node = self.clone();
+        todo!("not sure what this needs")
+        // spawn(async move {
+        //     // Clean up subscription context
+        //     node.predicate_context.remove(&predicate_id);
+
+        //     // Clean up any pending oneshot channel
+        //     node.pending_predicate_subs.remove(&predicate_id);
+
+        //     // Unsubscribe from local reactor
+        //     node.reactor.unsubscribe(predicate_id);
+
+        //     // Notify subscription relay for remote cleanup
+        //     if let Some(ref relay) = node.subscription_relay {
+        //         relay.notify_unsubscribe(predicate_id);
+        //     }
+        // });
+    }
 }
 
 impl<SE, PA> fmt::Display for Node<SE, PA>
