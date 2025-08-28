@@ -40,9 +40,6 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         if let Entry::Vacant(entry) = collections.entry(id.clone()) {
             entry.insert(collection.clone());
         }
-        drop(collections);
-
-        Ok(collection)
     }
 
     pub async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {

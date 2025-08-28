@@ -89,6 +89,16 @@ impl From<SendError> for RequestError {
     fn from(err: SendError) -> Self { RequestError::SendError(err) }
 }
 
+#[derive(Error, Debug)]
+pub enum SubscriptionError {
+    #[error("predicate not found")]
+    PredicateNotFound,
+    #[error("already subscribed to predicate")]
+    PredicateAlreadySubscribed,
+    #[error("subscription not found")]
+    SubscriptionNotFound,
+}
+
 impl From<DecodeError> for RetrievalError {
     fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(err) }
 }

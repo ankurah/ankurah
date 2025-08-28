@@ -43,7 +43,7 @@ impl Transaction {
         Self { dyncontext: Some(dyncontext), id: proto::TransactionId::new(), entities: AppendOnlyVec::new() }
     }
 
-    fn add_entity(&self, entity: Entity) -> &Entity {
+    pub(crate) fn add_entity(&self, entity: Entity) -> &Entity {
         let index = self.entities.push(entity);
         &self.entities[index]
     }

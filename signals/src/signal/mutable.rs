@@ -34,10 +34,6 @@ impl<T: 'static> Mut<T> {
     pub fn read(&self) -> Read<T> { Read { value: self.value.clone(), broadcast: self.broadcast.clone() } }
 }
 
-// impl<T: 'static> Signal<T> for Mut<T> {
-//     fn subscribe<S: Into<Subscriber<T>>>(&self, subscriber: S) -> SubscriptionGuard { self.subscribers.subscribe(subscriber) }
-// }
-
 impl<T> Mut<T>
 where T: Clone
 {
