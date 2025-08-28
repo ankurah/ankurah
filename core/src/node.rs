@@ -728,7 +728,7 @@ where
         let node = self.clone();
         {
             let reactor_subscription = self.peer_connections.get(&peer_id).unwrap().subscription.clone();
-            let subscription = self.reactor.add_predicate(reactor_subscription.id(), predicate_id, &collection_id, predicate.clone());
+            self.reactor.add_predicate(reactor_subscription.id(), predicate_id, &collection_id, predicate.clone())?;
 
             todo!("listen to changes once per ReactorSubscription (not here) and convert the ReactorUpdate into a SubscriptionUpdateItem");
             // let closure = move |changeset| {

@@ -1,4 +1,8 @@
-use crate::reactor::{Reactor, ReactorEntity, ReactorUpdate};
+use crate::{
+    error::SubscriptionError,
+    reactor::{Reactor, ReactorEntity, ReactorUpdate},
+    util::safemap::SafeMap,
+};
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
@@ -45,8 +49,13 @@ impl<E: ReactorEntity, Ev: Clone> ReactorSubscription<E, Ev> {
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
     /// Add a predicate to this subscription
-    pub fn add_predicate(&self, predicate_id: proto::PredicateId, collection_id: &proto::CollectionId, predicate: ankql::ast::Predicate) {
-        self.0.reactor.add_predicate(self.0.subscription_id, predicate_id, collection_id, predicate);
+    pub fn add_predicate(
+        &self,
+        predicate_id: proto::PredicateId,
+        collection_id: &proto::CollectionId,
+        predicate: ankql::ast::Predicate,
+    ) -> Result<Arc<SafeMap<proto::EntityId, E>>, SubscriptionError> {
+        self.0.reactor.add_predicate(self.0.subscription_id, predicate_id, collection_id, predicate)
     }
 
     /// Remove a predicate from this subscription
