@@ -201,13 +201,14 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
         predicate_id: proto::PredicateId,
         collection_id: &proto::CollectionId,
         predicate: ankql::ast::Predicate,
-    ) -> Result<(), SubscriptionError> {
+    ) -> Result<Arc<SafeMap<proto::EntityId, E>>, SubscriptionError> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
         let mut watcher_state = self.0.watcher_set.lock().unwrap();
 
         // Add the predicate to the subscription
         if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
             use std::collections::hash_map::Entry;
+            let matching_entities = Arc::new(SafeMap::new());
             match subscription.predicates.entry(predicate_id) {
                 Entry::Vacant(v) => {
                     v.insert(PredicateState {
@@ -215,22 +216,22 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
                         collection_id: collection_id.clone(),
                         predicate: predicate.clone(),
                         initialized: false,
-                        matching_entities: Arc::new(SafeMap::new()),
+                        matching_entities: matching_entities.clone(),
                     });
                 }
                 Entry::Occupied(o) => {
                     return Err(SubscriptionError::PredicateAlreadySubscribed);
                 }
             };
+
+            // Set up watchers
+            let watcher_id = (subscription_id, predicate_id);
+            watcher_state.recurse_predicate_watchers(collection_id, &predicate, watcher_id, WatcherOp::Add);
+
+            Ok(matching_entities)
         } else {
             return Err(SubscriptionError::SubscriptionNotFound);
         }
-
-        // Set up watchers
-        let watcher_id = (subscription_id, predicate_id);
-        watcher_state.recurse_predicate_watchers(collection_id, &predicate, watcher_id, WatcherOp::Add);
-
-        Ok(())
     }
 
     /// Remove a predicate from a subscription
