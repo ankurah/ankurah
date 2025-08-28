@@ -124,11 +124,6 @@ impl<T> IntoListener<T> for Listener<T> {
     fn into_listener(self) -> Listener<T> { self }
 }
 
-// Implementation for Listener itself (Arc<dyn Fn() + Send + Sync + 'static>)
-impl IntoListener for Listener {
-    fn into_listener(self) -> Listener { self }
-}
-
 #[cfg(feature = "tokio")]
 impl<T> IntoListener<T> for tokio::sync::mpsc::UnboundedSender<T>
 where T: Send + Sync + 'static

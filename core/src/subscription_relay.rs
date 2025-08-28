@@ -20,7 +20,7 @@ pub enum Status {
 
 #[derive(Debug)]
 pub struct Content<CD: ContextData> {
-    pub sub_id: proto::SubscriptionId,
+    pub predicate_id: proto::PredicateId,
     pub collection_id: CollectionId,
     pub predicate: ankql::ast::Predicate,
     pub context_data: CD,
@@ -108,7 +108,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
                 sub_id.clone(),
                 SubscriptionState {
-                    content: Arc::new(Content { collection_id, predicate, context_data, sub_id }),
+                    content: Arc::new(Content { collection_id, predicate, context_data, predicate_id: sub_id }),
                     status: Status::PendingRemote,
                     last_error: None,
                 },
@@ -151,15 +151,15 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     }
 
     /// Get all subscriptions that need remote setup
-    pub fn get_pending_subscriptions(&self) -> Vec<(proto::PredicateId, SubscriptionInfo<CD>)> {
-        self.inner
-            .subscriptions
-            .lock()
-            .expect("poisoned lock")
-            .values()
-            .filter(|info| matches!(info.status, Status::PendingRemote | Status::Failed))
-            .collect()
-    }
+    // pub fn get_pending_subscriptions(&self) -> Vec<(proto::PredicateId, SubscriptionInfo<CD>)> {
+    //     self.inner
+    //         .subscriptions
+    //         .lock()
+    //         .expect("poisoned lock")
+    //         .values()
+    //         .filter(|info| matches!(info.status, Status::PendingRemote | Status::Failed))
+    //         .collect()
+    // }
 
     /// Handle peer disconnection - mark all subscriptions for that peer as needing setup
     ///
@@ -177,7 +177,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                 if *established_peer_id == peer_id {
                     // Update state to pending
                     info.status = Status::PendingRemote;
-                    warn!("Subscription {} orphaned due to peer {} disconnect", info.content.sub_id, peer_id);
+                    warn!("Subscription {} orphaned due to peer {} disconnect", info.content.predicate_id, peer_id);
                 }
             }
         }
@@ -256,7 +256,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     }
 
     async fn peer_subscribe(self, sender: Arc<dyn MessageSender<CD>>, target_peer: proto::EntityId, content: Arc<Content<CD>>) {
-        let sub_id = content.sub_id;
+        let sub_id = content.predicate_id;
         let collection_id = content.collection_id.clone();
         let predicate = content.predicate.clone();
         let context_data = content.context_data.clone();
