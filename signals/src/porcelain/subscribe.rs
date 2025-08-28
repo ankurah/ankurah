@@ -31,13 +31,14 @@ where S: Subscribe<T>
 pub trait GetAndDynSubscribe<T: 'static>: Get<T> + Peek<T> + DynSubscribe<T> {}
 impl<T: 'static, S> GetAndDynSubscribe<T> for S where S: Get<T> + Peek<T> + DynSubscribe<T> {}
 
+/// A guard for a subscription to a signal
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct SubscriptionGuard {
-    _listenerguard: ListenerGuard,
+    _listenerguard: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl SubscriptionGuard {
-    pub fn new(subscription: ListenerGuard) -> Self { Self { _listenerguard: subscription } }
+    pub fn new<T: 'static>(lguard: ListenerGuard<T>) -> Self { Self { _listenerguard: Box::new(lguard) } }
 }
 
 // IntoSubscribeListener implementation for std::sync::mpsc channels

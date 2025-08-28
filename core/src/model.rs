@@ -72,7 +72,7 @@ where
 {
     let listener = listener.into_subscribe_listener();
     let view_clone = view.clone();
-    let subscription = view.listen(Arc::new(move || {
+    let subscription = view.listen(Arc::new(move |_| {
         // Call the listener with the current view when the broadcast fires
         listener(view_clone.clone());
     }));
