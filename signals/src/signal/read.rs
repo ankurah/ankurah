@@ -12,7 +12,7 @@ use crate::{
 /// Read-only signal
 pub struct Read<T> {
     pub(crate) value: ValueCell<T>,
-    pub(crate) broadcast: Broadcast,
+    pub(crate) broadcast: Broadcast<()>,
 }
 
 impl<T> Read<T>
@@ -63,7 +63,7 @@ impl<T: 'static> GetReadCell<T> for Read<T> {
 }
 
 impl<T> Signal for Read<T> {
-    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard {
+    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> {
         self.broadcast.reference().listen(listener)
     }
 
@@ -94,7 +94,7 @@ where T: Clone + Send + Sync + 'static
     where F: IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let ro_value = self.get_readcell(); // Get read-only value handle
-        let subscription = self.listen(Arc::new(move || {
+        let subscription = self.listen(Arc::new(move |_| {
             // Get current value when the broadcast fires
             let current_value = ro_value.value();
             listener(current_value);

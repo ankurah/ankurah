@@ -178,7 +178,7 @@ impl PropertyBackend for YrsBackend {
         let field_broadcasts = self.field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
         for field_name in changed_fields.lock().unwrap().iter() {
             if let Some(broadcast) = field_broadcasts.get(field_name) {
-                broadcast.send();
+                broadcast.send(());
             }
         }
 

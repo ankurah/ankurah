@@ -62,10 +62,10 @@ async fn test_sled() -> Result<()> {
     let _h1 = album.subscribe(move |v: AlbumView| w((v.clone(), v.name().unwrap(), v.year().unwrap())));
     let observer = {
         let album = album.clone();
-        CallbackObserver::new(move || {
+        CallbackObserver::new(Arc::new(move || {
             // Access the view fields - this should cause the View to be tracked by CurrentObserver
             w2(format!("name: {}, year: {}", album.name().unwrap(), album.year().unwrap()));
-        })
+        }))
     };
     observer.trigger();
     assert_eq!(check_rendered(), vec!["name: The rest of the bowl, year: 2024"]);

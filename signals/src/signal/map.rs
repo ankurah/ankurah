@@ -35,7 +35,7 @@ where
 impl<Upstream, Input, Output, Transform> Signal for Map<Upstream, Input, Output, Transform>
 where Upstream: Signal
 {
-    fn listen(&self, listener: crate::broadcast::Listener) -> crate::broadcast::ListenerGuard { self.source.listen(listener) }
+    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> { self.source.listen(listener) }
 
     fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.source.broadcast_id() }
 }
@@ -100,7 +100,7 @@ where
         let source = self.source.clone();
         let transform = self.transform.clone();
 
-        let subscription = self.source.listen(Arc::new(move || {
+        let subscription = self.source.listen(Arc::new(move |_| {
             source.with(|input| {
                 listener(transform(input));
             });

@@ -33,7 +33,7 @@ extern "C" {
 }
 
 struct ListenerEntry {
-    guard: ListenerGuard,
+    guard: ListenerGuard<()>,
     marked_for_removal: bool,
 }
 
@@ -207,7 +207,7 @@ impl Observer for ReactObserver {
         entries.insert(
             broadcast_id,
             ListenerEntry {
-                guard: signal.listen(Arc::new(move || {
+                guard: signal.listen(Arc::new(move |_| {
                     // Increment version to trigger React re-render
                     version.fetch_add(1, Ordering::Relaxed);
 

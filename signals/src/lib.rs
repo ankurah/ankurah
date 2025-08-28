@@ -21,12 +21,12 @@ let _guard2 = vibe.subscribe(|v| println!("Vibe: {}", v));
 let renderer = {
     let day = day.read(); // Read<T> signals can be constructed from a Mut<T> signal
     let vibe = vibe.read();
-    CallbackObserver::new(move ||{
+    CallbackObserver::new(Arc::new(move ||{
         // Your "render" function that uses signals
         // The Observer will automatically subscribe to the signals used
         // during this dispatch using the thread-local CurrentObserver
         println!("It's {day} and I'm {vibe}") // the Observer will automatically subscribe to the signals
-    })
+    }))
 };
 
 renderer.trigger(); // trigger the initial "render". Signals used will be tracked by the observer.

@@ -100,7 +100,7 @@ impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
 }
 
 impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
-    fn listen(&self, listener: ankurah_signals::broadcast::Listener) -> ankurah_signals::broadcast::ListenerGuard {
+    fn listen(&self, listener: ankurah_signals::broadcast::Listener<()>) -> ankurah_signals::broadcast::ListenerGuard<()> {
         self.backend.listen_field(&self.property_name, listener)
     }
 
@@ -115,7 +115,7 @@ where Projected: Clone + Send + Sync + 'static
     where F: ankurah_signals::subscribe::IntoSubscribeListener<String> {
         let listener = listener.into_subscribe_listener();
         let yrs_string = self.clone();
-        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move || {
+        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move |_| {
             // Get current value when the broadcast fires
             if let Some(current_value) = yrs_string.value() {
                 listener(current_value);
