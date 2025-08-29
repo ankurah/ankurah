@@ -21,7 +21,7 @@ use crate::{
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
-    reactor::{Reactor, ReactorSubscription},
+    reactor::Reactor,
     retrieval::LocalRetriever,
     storage::StorageEngine,
     system::SystemManager,
@@ -35,8 +35,7 @@ use tracing::{debug, error, warn};
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
-    subscription: ReactorSubscription,
-    // subscriptions: SafeSet<proto::PredicateId>,
+    subscription_handler: SubscriptionHandler,
     pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 }
@@ -203,13 +202,13 @@ where
     pub fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) {
         action_info!(self, "register_peer", "{}", &presence);
 
-        let subscription = self.reactor.subscribe();
+        let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
         self.peer_connections.insert(
             presence.node_id,
             Arc::new(PeerState {
                 sender,
                 _durable: presence.durable,
-                subscription,
+                subscription_handler,
                 pending_requests: SafeMap::new(),
                 pending_updates: SafeMap::new(),
             }),
@@ -247,7 +246,7 @@ where
         self.durable_peers.remove(&node_id);
         // Get and cleanup subscriptions before removing the peer
         if let Some(peer_state) = self.peer_connections.remove(&node_id) {
-            action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription.id(), node_id);
+            action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
             // ReactorSubscription is automatically unsubscribed on drop
         }
 
@@ -383,9 +382,9 @@ where
                 }
             }
             proto::NodeMessage::UnsubscribePredicate { from, predicate_id } => {
-                // Remove and drop the subscription handle
+                // Remove predicate from the peer's subscription
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    self.reactor.remove_predicate(peer_state.subscription.id(), predicate_id);
+                    peer_state.subscription_handler.remove_predicate(predicate_id);
                 }
             }
         }
@@ -452,7 +451,8 @@ where
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
             proto::NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
-                self.handle_subscribe_request(cdata, request.from, predicate_id, collection, predicate).await
+                let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
+                peer_state.subscription_handler.add_predicate(self, predicate_id, collection, predicate, cdata).await
             }
         }
     }
@@ -713,107 +713,6 @@ where
         //         }
         //     }
         // }
-    }
-
-    async fn handle_subscribe_request(
-        &self,
-        cdata: &PA::ContextData,
-        peer_id: proto::EntityId,
-        predicate_id: proto::PredicateId,
-        collection_id: CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) -> anyhow::Result<proto::NodeResponseBody> {
-        // First fetch initial state
-        // let storage_collection = self.collections.get(&collection_id).await?;
-        // let states = storage_collection.fetch_states(&predicate).await?;
-
-        self.policy_agent.can_access_collection(cdata, &collection_id)?;
-        let predicate = self.policy_agent.filter_predicate(cdata, &collection_id, predicate)?;
-
-        // Set up subscription that forwards changes to the peer
-        let node = self.clone();
-        {
-            let reactor_subscription = self.peer_connections.get(&peer_id).unwrap().subscription.clone();
-            self.reactor.add_predicate(reactor_subscription.id(), predicate_id, &collection_id, predicate.clone())?;
-
-            todo!("listen to changes once per ReactorSubscription (not here) and convert the ReactorUpdate into a SubscriptionUpdateItem");
-            // let closure = move |changeset| {
-            //     // TODO move this into a task being fed by a channel and reorg into a function
-            //     let mut updates: Vec<proto::SubscriptionUpdateItem> = Vec::new();
-
-            //     // When changes occur, collect events and states
-            //     for change in changeset.changes.into_iter() {
-            //         match change {
-            //             ItemChange::Initial { item } => {
-            //                 // For initial state, include both events and state
-            //                 if let Ok(es) = item.to_entity_state() {
-            //                     let attestation = node.policy_agent.attest_state(&node, &es);
-
-            //                     updates.push(proto::SubscriptionUpdateItem::initial(
-            //                         item.id(),
-            //                         item.collection.clone(),
-            //                         Attested::opt(es, attestation),
-            //                     ));
-            //                 }
-            //             }
-            //             ItemChange::Add { item, events } => {
-            //                 // For entities which were not previously matched, state AND events should be included
-            //                 // but it's weird because EntityState and Event redundantly include entity_id and collection
-            //                 // But we want to Attest events independently, and we need to attest State - but we can't just attest a naked state,
-            //                 // it has to have the entity_id
-
-            //                 let state = match item.to_state() {
-            //                     Ok(state) => state,
-            //                     Err(e) => {
-            //                         warn!("Node {} entity {} state experienced an error - {}", node.id, item.id, e);
-            //                         continue;
-            //                     }
-            //                 };
-
-            //                 let es = EntityState { entity_id: item.id, collection: item.collection.clone(), state };
-            //                 let attestation = node.policy_agent.attest_state(&node, &es);
-
-            //                 updates.push(proto::SubscriptionUpdateItem::add(
-            //                     item.id,
-            //                     item.collection.clone(),
-            //                     Attested::opt(es, attestation),
-            //                     events,
-            //                 ));
-            //             }
-            //             ItemChange::Update { item, events } | ItemChange::Remove { item, events } => {
-            //                 updates.push(proto::SubscriptionUpdateItem::change(item.id, item.collection.clone(), events));
-            //             }
-            //         }
-            //     }
-
-            //     // Always send subscription update, even if empty
-            //     node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items: updates });
-            // };
-
-            let storage_collection = self.collections.get(&collection_id).await?;
-            let initial_states = storage_collection.fetch_states(&predicate).await?;
-
-            // Convert states to entities
-            let retriever = LocalRetriever::new(storage_collection.clone());
-            let mut initial_entities = Vec::new();
-            for state in initial_states {
-                let (_, entity) =
-                    self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
-                initial_entities.push(entity);
-            }
-
-            // Note: Need to get subscription_id from somewhere - this seems to be missing in the current code
-            // For now, leaving a TODO as the subscription registration logic is broken
-            // self.reactor.initialize(subscription_id, sub_id, initial_entities).await?;
-        };
-
-        // Store the subscription handle
-        // if let Some(peer_state) = self.peer_connections.get(&peer_id) {
-        //     peer_state.subscriptions.insert(sub_id);
-        // }
-
-        // Ok(proto::NodeResponseBody::Subscribed { subscription_id: sub_id })
-        unimplemented!()
     }
 
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }

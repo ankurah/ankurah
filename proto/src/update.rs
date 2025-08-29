@@ -60,46 +60,48 @@ pub enum LegacySubscriptionUpdateItem {
     Change { entity_id: EntityId, collection: CollectionId, events: Vec<EventFragment> },
 }
 
-impl SubscriptionUpdateItem {
-    /// Create an initial state update for a single predicate
-    pub fn initial(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>, predicate_id: PredicateId) -> Self {
-        Self {
-            entity_id,
-            collection,
-            content: UpdateContent::StateOnly(state.into()),
-            predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
-            entity_subscribed: false,
-        }
-    }
+// DANGER! These seem bad and actively misleading! initial/add/change are NOT a function of the whole SubscriptionUpdateItem
+// They are a function of the predicate_relevance!
+// impl SubscriptionUpdateItem {
+//     /// Create an initial state update for a single predicate
+//     pub fn initial(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>, predicate_id: PredicateId) -> Self {
+//         Self {
+//             entity_id,
+//             collection,
+//             content: UpdateContent::StateOnly(state.into()),
+//             predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
+//             entity_subscribed: false,
+//         }
+//     }
 
-    /// Create an add update for a single predicate
-    pub fn add(
-        entity_id: EntityId,
-        collection: CollectionId,
-        state: Attested<EntityState>,
-        events: Vec<Attested<Event>>,
-        predicate_id: PredicateId,
-    ) -> Self {
-        Self {
-            entity_id,
-            collection,
-            content: UpdateContent::StateAndEvent(state.into(), events.into_iter().map(|e| e.into()).collect()),
-            predicate_relevance: vec![(predicate_id, MembershipChange::Add)],
-            entity_subscribed: false,
-        }
-    }
+//     /// Create an add update for a single predicate
+//     pub fn add(
+//         entity_id: EntityId,
+//         collection: CollectionId,
+//         state: Attested<EntityState>,
+//         events: Vec<Attested<Event>>,
+//         predicate_id: PredicateId,
+//     ) -> Self {
+//         Self {
+//             entity_id,
+//             collection,
+//             content: UpdateContent::StateAndEvent(state.into(), events.into_iter().map(|e| e.into()).collect()),
+//             predicate_relevance: vec![(predicate_id, MembershipChange::Add)],
+//             entity_subscribed: false,
+//         }
+//     }
 
-    /// Create a change update for a single predicate
-    pub fn change(entity_id: EntityId, collection: CollectionId, events: Vec<Attested<Event>>, _predicate_id: PredicateId) -> Self {
-        Self {
-            entity_id,
-            collection,
-            content: UpdateContent::EventOnly(events.into_iter().map(|e| e.into()).collect()),
-            predicate_relevance: vec![], // No membership change for updates
-            entity_subscribed: false,
-        }
-    }
-}
+//     /// Create a change update for a single predicate
+//     pub fn change(entity_id: EntityId, collection: CollectionId, events: Vec<Attested<Event>>, _predicate_id: PredicateId) -> Self {
+//         Self {
+//             entity_id,
+//             collection,
+//             content: UpdateContent::EventOnly(events.into_iter().map(|e| e.into()).collect()),
+//             predicate_relevance: vec![], // No membership change for updates
+//             entity_subscribed: false,
+//         }
+//     }
+// }
 
 impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
     type Error = anyhow::Error;

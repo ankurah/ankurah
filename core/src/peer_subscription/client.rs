@@ -41,33 +41,33 @@ struct SubscriptionRelayInner<CD: ContextData> {
     message_sender: OnceLock<Arc<dyn MessageSender<CD>>>,
 }
 
-/// Manages subscription state and handles remote subscription setup/teardown for ephemeral nodes.
+/// Manages predicate registration on remote peer reactor subscriptions.
 ///
-/// The SubscriptionRelay provides a resilient, event-driven approach to managing subscriptions
-/// with remote durable peers. It automatically handles:
-/// - Setting up remote subscriptions when peers connect
-/// - Orphaning subscriptions when peers disconnect (marking them for re-setup)
-/// - Retrying failed subscription attempts
-/// - Clean teardown when subscriptions are removed
-/// - Storing ContextData for each subscription to enable proper authorization
+/// The SubscriptionRelay provides a resilient, event-driven approach to managing which predicates
+/// are registered with remote durable peers. It automatically handles:
+/// - Registering predicates on peer reactor subscriptions when peers connect
+/// - Re-registering predicates when peers disconnect and reconnect
+/// - Retrying failed predicate registration attempts
+/// - Clean teardown when predicates are removed
+/// - Storing ContextData for each predicate to enable proper authorization
 ///
-/// This design separates subscription management concerns from the main Node implementation,
-/// making it easier to test and reason about subscription lifecycle management.
+/// This design separates predicate management concerns from the main Node implementation,
+/// making it easier to test and reason about predicate lifecycle management.
 ///
 /// # Public API (for Node integration)
 ///
-/// - `notify_subscribe()` - Call when local subscriptions are created (parallel to reactor.subscribe)
-/// - `notify_unsubscribe()` - Call when local subscriptions are removed (parallel to reactor.unsubscribe)
-/// - `notify_peer_connected()` - Call when durable peers connect (triggers automatic setup)
-/// - `notify_peer_disconnected()` - Call when durable peers disconnect (orphans subscriptions)
-/// - `get_subscription_state()` - Query current state of a subscription
+/// - `subscribe_predicate()` - Call when local subscriptions are created (parallel to reactor.subscribe)
+/// - `unsubscribe_predicate()` - Call when local subscriptions are removed (parallel to reactor.unsubscribe)
+/// - `notify_peer_connected()` - Call when durable peers connect (triggers automatic predicate registration)
+/// - `notify_peer_disconnected()` - Call when durable peers disconnect (orphans predicate registrations)
+/// - `get_status()` - Query current state of a predicate registration
 ///
 /// # Internal/Testing API
 ///
-/// - `setup_remote_subscriptions()` - Internal method for triggering setup with specific peers
+/// - `setup_remote_subscriptions()` - Internal method for triggering predicate registration with specific peers
 ///   (called automatically by notify_peer_connected, but exposed for testing)
 ///
-/// The relay will automatically handle remote setup/teardown asynchronously.
+/// The relay will automatically handle predicate registration/teardown asynchronously.
 #[derive(Clone)]
 pub struct SubscriptionRelay<CD: ContextData> {
     inner: Arc<SubscriptionRelayInner<CD>>,
@@ -92,10 +92,10 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         self.inner.message_sender.set(sender).map_err(|_| ())
     }
 
-    /// Notify the relay that a new subscription has been created locally and needs remote setup
+    /// Notify the relay that a new predicate needs to be registered on remote peer subscriptions
     ///
     /// This should be called whenever a local subscription is established. The relay will
-    /// track this subscription and automatically attempt to set it up with available durable peers.
+    /// track this predicate and automatically attempt to register it with available durable peers.
     pub fn subscribe_predicate(
         &self,
         predicate_id: proto::PredicateId,
@@ -103,7 +103,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         predicate: ankql::ast::Predicate,
         context_data: CD,
     ) {
-        debug!("New subscription {} needs remote setup", predicate_id);
+        debug!("New predicate {} needs remote registration", predicate_id);
         {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
                 predicate_id.clone(),
@@ -121,12 +121,12 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         }
     }
 
-    /// Notify the relay that a subscription has been removed locally
+    /// Notify the relay that a predicate should be removed from remote peer subscriptions
     ///
     /// This will clean up all tracking state and send unsubscribe requests to any
-    /// remote peers that have this subscription established.
+    /// remote peers that have this predicate registered.
     pub fn unsubscribe_predicate(&self, predicate_id: proto::PredicateId) {
-        debug!("Unsubscribing from subscription {}", predicate_id);
+        debug!("Unregistering predicate {}", predicate_id);
 
         // If subscription was established with a peer, send unsubscribe request
         {
@@ -161,13 +161,13 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     //         .collect()
     // }
 
-    /// Handle peer disconnection - mark all subscriptions for that peer as needing setup
+    /// Handle peer disconnection - mark all predicates for that peer as needing re-registration
     ///
-    /// This should be called when a durable peer disconnects. All subscriptions established
-    /// with that peer will be marked as pending and will be automatically re-established
+    /// This should be called when a durable peer disconnects. All predicates registered
+    /// with that peer will be marked as pending and will be automatically re-registered
     /// when the peer reconnects or another suitable peer becomes available.
     pub fn notify_peer_disconnected(&self, peer_id: proto::EntityId) {
-        debug!("Peer {} disconnected, orphaning subscriptions", peer_id);
+        debug!("Peer {} disconnected, orphaning predicate registrations", peer_id);
 
         // Remove from connected peers
         self.inner.connected_peers.remove(&peer_id);
@@ -177,7 +177,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                 if *established_peer_id == peer_id {
                     // Update state to pending
                     info.status = Status::PendingRemote;
-                    warn!("Subscription {} orphaned due to peer {} disconnect", info.content.predicate_id, peer_id);
+                    warn!("Predicate {} orphaned due to peer {} disconnect", info.content.predicate_id, peer_id);
                 }
             }
         }
@@ -186,12 +186,12 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         self.setup_remote_subscriptions();
     }
 
-    /// Handle peer connection - trigger remote subscription setup
+    /// Handle peer connection - trigger predicate registration on the new peer subscription
     ///
     /// This should be called when a new durable peer connects. The relay will automatically
-    /// attempt to establish any pending subscriptions with the newly connected peer.
+    /// attempt to register any pending predicates on the newly connected peer's subscription.
     pub fn notify_peer_connected(&self, peer_id: proto::EntityId) {
-        debug!("Peer {} connected, setting up remote subscriptions", peer_id);
+        debug!("Peer {} connected, registering predicates on peer subscription", peer_id);
 
         // Add to connected peers
         self.inner.connected_peers.insert(peer_id);
@@ -200,13 +200,13 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         self.setup_remote_subscriptions();
     }
 
-    /// Get the current state of a subscription
+    /// Get the current state of a predicate registration
     pub fn get_status(&self, predicate_id: proto::PredicateId) -> Option<Status> {
         let subscriptions = self.inner.subscriptions.lock().unwrap();
         subscriptions.get(&predicate_id).map(|info| info.status.clone())
     }
 
-    /// Setup remote subscriptions with available durable peers
+    /// Register predicates on available durable peer subscriptions
     fn setup_remote_subscriptions(&self) {
         let sender = match self.inner.message_sender.get() {
             Some(sender) => sender,
@@ -244,11 +244,11 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         };
 
         if pending.is_empty() {
-            debug!("No pending subscriptions to set up remotely");
+            debug!("No pending predicates to register remotely");
             return;
         }
 
-        debug!("Setting up {} remote subscriptions with {} peers", pending.len(), self.inner.connected_peers.len());
+        debug!("Registering {} predicates on {} peer subscriptions", pending.len(), self.inner.connected_peers.len());
 
         for content in pending {
             crate::task::spawn(self.clone().peer_subscribe(sender.clone(), target_peer.clone(), content));
@@ -268,7 +268,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                     info.status = Status::Established(target_peer);
                 }
 
-                debug!("Successfully established remote subscription {} with peer {}", predicate_id, target_peer);
+                debug!("Successfully registered predicate {} on peer {} subscription", predicate_id, target_peer);
             }
             Err(e) => {
                 // Store error message for logging
@@ -292,17 +292,11 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                         if is_retryable {
                             // Retryable errors go back to pending for immediate retry
                             info.status = Status::PendingRemote;
-                            warn!(
-                                "Retryable failure for subscription {} with peer {}: {} - will retry",
-                                predicate_id, target_peer, error_msg
-                            );
+                            warn!("Retryable failure for predicate {} with peer {}: {} - will retry", predicate_id, target_peer, error_msg);
                         } else {
                             // Non-retryable errors are permanently failed
                             info.status = Status::Failed;
-                            warn!(
-                                "Permanent failure for subscription {} with peer {}: {} - no retry",
-                                predicate_id, target_peer, error_msg
-                            );
+                            warn!("Permanent failure for predicate {} with peer {}: {} - no retry", predicate_id, target_peer, error_msg);
                         }
                     }
                 }
@@ -311,11 +305,11 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     }
 }
 
-/// Trait for sending subscription requests to remote peers
+/// Trait for sending predicate registration requests to remote peers
 #[async_trait]
 pub trait MessageSender<CD: ContextData>: Send + Sync {
-    /// Send a subscription request to a remote peer
-    /// Returns Ok(()) if the subscription was successfully established (NodeResponseBody::Subscribed),
+    /// Send a predicate registration request to a remote peer
+    /// Returns Ok(()) if the predicate was successfully registered (NodeResponseBody::PredicateSubscribed),
     /// Err(RequestError) for any error or non-success response
     async fn peer_subscribe(
         &self,
@@ -326,12 +320,12 @@ pub trait MessageSender<CD: ContextData>: Send + Sync {
         context_data: &CD,
     ) -> Result<(), RequestError>;
 
-    /// Send an unsubscribe message to a remote peer
+    /// Send a predicate unregistration message to a remote peer
     /// This is a one-way message, no response expected
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, predicate_id: proto::PredicateId) -> Result<(), anyhow::Error>;
 }
 
-/// Implementation of MessageSender for WeakNode to enable subscription relay integration
+/// Implementation of MessageSender for WeakNode to enable predicate registration relay integration
 #[async_trait]
 impl<SE, PA> MessageSender<PA::ContextData> for crate::node::WeakNode<SE, PA>
 where
