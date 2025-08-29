@@ -1,5 +1,6 @@
-use crate::{entity::Entity, error::MutationError, model::View, resultset::ResultSet};
-use ankurah_proto::{Attested, Event};
+use crate::{entity::Entity, error::MutationError, model::View};
+use ankurah_proto::{self as proto, Attested, Event};
+use ulid::Ulid;
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
@@ -86,35 +87,27 @@ impl std::fmt::Display for EntityChange {
     }
 }
 
+use crate::resultset::ResultSet;
+
 #[derive(Debug)]
-pub struct ChangeSet<R> {
-    pub resultset: crate::resultset::ResultSet<R>,
+pub struct ChangeSet<R: View> {
+    pub resultset: ResultSet<R>,
     pub changes: Vec<ItemChange<R>>,
 }
 
 impl<I> std::fmt::Display for ChangeSet<I>
-where I: View
+where I: View + Clone + 'static
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // print the number of results in the resultset, and then display each change
-        let results = self.resultset.items.len();
+        use ankurah_signals::Peek;
+        let results = self.resultset.peek().len();
         write!(f, "ChangeSet({results} results): {}", self.changes.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "))
     }
 }
 
-impl<I> From<ChangeSet<Entity>> for ChangeSet<I>
-where I: View
-{
-    fn from(val: ChangeSet<Entity>) -> Self {
-        ChangeSet {
-            resultset: ResultSet {
-                loaded: val.resultset.loaded,
-                items: val.resultset.iter().map(|item| I::from_entity(item.clone())).collect(),
-            },
-            changes: val.changes.into_iter().map(|change| change.into()).collect(),
-        }
-    }
-}
+// Note: ChangeSet<Entity> conversion removed since Entity doesn't implement View
+// and ChangeSet is no longer used by Reactor
 
 impl<I> From<ItemChange<Entity>> for ItemChange<I>
 where I: View
@@ -147,3 +140,6 @@ impl<R> From<&ItemChange<R>> for ChangeKind {
         }
     }
 }
+
+// Moved all the ReactorUpdate stuff into reactor.rs because it's specific to the reactor
+// and we have several types of updates, so it's essential to keep them organized

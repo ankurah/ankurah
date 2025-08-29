@@ -140,16 +140,16 @@ pub use proto::EntityId;
 pub use ankurah_core::{
     changes,
     context::Context,
-    entity, error, model,
+    entity, error,
+    livequery::LiveQuery,
+    model,
     model::View,
     model::{Model, Mutable},
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
     property::{self, Property},
     resultset::ResultSet,
-    storage,
-    subscription::SubscriptionHandle,
-    transaction,
+    storage, transaction,
 };
 
 // Re-export the derive macro

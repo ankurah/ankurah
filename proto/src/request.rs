@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, collection::CollectionId, data::Event, id::EntityId, subscription::SubscriptionId, transaction::TransactionId,
+    auth::Attested, collection::CollectionId, data::Event, id::EntityId, subscription::PredicateId, transaction::TransactionId,
     EntityState, EventId,
 };
 
@@ -39,7 +39,7 @@ pub enum NodeRequestBody {
     Get { collection: CollectionId, ids: Vec<EntityId> },
     GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
     Fetch { collection: CollectionId, predicate: ast::Predicate },
-    Subscribe { subscription_id: SubscriptionId, collection: CollectionId, predicate: ast::Predicate },
+    SubscribePredicate { predicate_id: PredicateId, collection: CollectionId, predicate: ast::Predicate },
 }
 
 /// A response from one node to another
@@ -58,7 +58,7 @@ pub enum NodeResponseBody {
     Fetch(Vec<Attested<EntityState>>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    Subscribed { subscription_id: SubscriptionId },
+    PredicateSubscribed { predicate_id: PredicateId },
     Success,
     Error(String),
 }
@@ -90,8 +90,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")
             }
-            NodeRequestBody::Subscribe { subscription_id, collection, predicate } => {
-                write!(f, "Subscribe {subscription_id} {collection} {predicate}")
+            NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
+                write!(f, "Subscribe {predicate_id} {collection} {predicate}")
             }
         }
     }
@@ -109,7 +109,7 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::Subscribed { subscription_id } => write!(f, "Subscribed {subscription_id}"),
+            NodeResponseBody::PredicateSubscribed { predicate_id } => write!(f, "Subscribed {predicate_id}"),
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
         }

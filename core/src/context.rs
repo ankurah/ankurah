@@ -1,24 +1,25 @@
-use std::sync::Arc;
-
 use crate::{
-    changes::{ChangeSet, EntityChange},
+    changes::EntityChange,
     entity::Entity,
     error::{MutationError, RetrievalError},
+    livequery::{EntityLiveQuery, LiveQuery},
     model::View,
-    node::{MatchArgs, Node, TNodeErased},
+    node::{MatchArgs, Node},
     policy::{AccessDenied, PolicyAgent},
-    resultset::ResultSet,
+    resultset::{EntityResultSet, ResultSet},
     storage::{StorageCollectionWrapper, StorageEngine},
-    subscription::SubscriptionHandle,
     transaction::Transaction,
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use std::sync::Arc;
+use tracing::debug;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-/// Type-erased context wrapper
+/// Context is used to provide a local interface to fetch and subscribe to entities
+/// with a specific ContextData. Generally this means your auth token for a specific user,
+/// but ContextData is abstracted so you can use what you want.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
 impl Clone for Context {
@@ -46,13 +47,7 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
-    async fn subscribe(
-        &self,
-        sub_id: proto::SubscriptionId,
-        collection: &proto::CollectionId,
-        args: MatchArgs,
-        callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>;
+    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
@@ -69,14 +64,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.fetch_entities(collection, args).await
     }
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
-    async fn subscribe(
-        &self,
-        sub_id: proto::SubscriptionId,
-        collection: &proto::CollectionId,
-        args: MatchArgs,
-        callback: Box<dyn Fn(crate::changes::ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError> {
-        self.subscribe(sub_id, collection, args, callback).await
+    fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
+        EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
@@ -131,58 +120,29 @@ impl Context {
         Ok(R::from_entity(entity))
     }
 
-    pub async fn fetch<R: View>(
-        &self,
-        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
-    ) -> Result<ResultSet<R>, RetrievalError> {
+    pub async fn fetch<R: View>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
         let collection_id = R::Model::collection();
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 
-        let views = entities.into_iter().map(|entity| R::from_entity(entity)).collect();
-
-        Ok(ResultSet { items: views, loaded: true })
+        Ok(entities.into_iter().map(|e| R::from_entity(e)).collect())
     }
 
-    pub async fn fetch_one<R: View>(
+    pub async fn fetch_one<R: View + Clone + 'static>(
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
     ) -> Result<Option<R>, RetrievalError> {
-        let result_set = self.fetch::<R>(args).await?;
-        Ok(result_set.items.into_iter().next())
+        let views = self.fetch::<R>(args).await?;
+        Ok(views.into_iter().next())
     }
     /// Subscribe to changes in entities matching a predicate
-    pub async fn subscribe<F, R>(
-        &self,
-        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
-        callback: F,
-    ) -> Result<crate::subscription::SubscriptionHandle, RetrievalError>
-    where
-        F: Fn(crate::changes::ChangeSet<R>) + Send + Sync + 'static,
-        R: View,
-    {
+    pub fn query<R>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<LiveQuery<R>, RetrievalError>
+    where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
-
         use crate::model::Model;
-        let collection_id = R::Model::collection();
-
-        // Using one subscription id for local and remote subscriptions
-        let sub_id = proto::SubscriptionId::new();
-        // Now set up our local subscription
-        let handle = self
-            .0
-            .subscribe(
-                sub_id,
-                &collection_id,
-                args,
-                Box::new(move |changeset| {
-                    callback(changeset.into());
-                }),
-            )
-            .await?;
-        Ok(handle)
+        Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.0.collection(id).await
@@ -268,60 +228,6 @@ where
             entities.push(entity);
         }
         Ok(entities)
-    }
-
-    pub async fn subscribe(
-        &self,
-        sub_id: proto::SubscriptionId,
-        collection_id: &CollectionId,
-        mut args: MatchArgs,
-        callback: Box<dyn Fn(ChangeSet<Entity>) + Send + Sync + 'static>,
-    ) -> Result<SubscriptionHandle, RetrievalError> {
-        let mut handle = SubscriptionHandle::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, sub_id);
-
-        self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
-        args.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
-
-        // Store subscription context for event requests
-        self.node.subscription_context.insert(sub_id, self.cdata.clone());
-
-        let predicate = args.predicate.clone();
-        let cached = args.cached;
-
-        // Register subscription with reactor (synchronous)
-        let subscription = self.node.reactor.register(handle.id, collection_id, args.predicate, callback);
-        let storage_collection = self.node.collections.get(&subscription.collection_id).await?;
-
-        let initial_states: Vec<Attested<EntityState>>;
-        // Handle remote subscription setup
-        if let Some(ref relay) = self.node.subscription_relay {
-            relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), self.cdata.clone());
-
-            if !cached {
-                // Create oneshot channel to wait for first remote update
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                self.node.pending_subs.insert(sub_id, tx);
-
-                // Wait for first remote update before initializing
-                match rx.await {
-                    Err(_) => {
-                        // Channel was dropped, proceed with local initialization anyway
-                        warn!("Failed to receive first remote update for subscription {}", sub_id);
-                        initial_states = storage_collection.fetch_states(&predicate).await?;
-                    }
-                    Ok(states) => initial_states = states,
-                }
-            } else {
-                initial_states = storage_collection.fetch_states(&predicate).await?;
-            }
-        } else {
-            initial_states = storage_collection.fetch_states(&predicate).await?;
-        }
-
-        // Always initialize the subscription
-        self.node.reactor.initialize(subscription, initial_states).await?;
-
-        Ok(handle)
     }
 
     /// Does all the things necessary to commit a local transaction

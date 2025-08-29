@@ -31,7 +31,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
     let _handle = ctx
-        .subscribe(predicate, move |changeset: ChangeSet<AlbumView>| {
+        .query(predicate, move |changeset: ChangeSet<AlbumView>| {
             let mut received = received_changesets_clone.lock().unwrap();
             received.push(changeset);
         })
@@ -77,7 +77,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     let (watcher, check) = common::changeset_watcher::<PetView>();
 
     // Subscribe to changes
-    let _handle = ctx.subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher).await.unwrap();
+    let _handle = ctx.query("name = 'Rex' OR (age > 2 and age < 5)", watcher).await.unwrap();
 
     let (rex, snuffy, jasper);
     {

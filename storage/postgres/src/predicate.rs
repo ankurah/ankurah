@@ -113,7 +113,7 @@ impl Sql {
             Predicate::Comparison { left, operator, right } => {
                 self.expr(left)?;
                 self.sql(" ");
-                self.comparison_op(operator);
+                self.comparison_op(operator)?;
                 self.sql(" ");
                 self.expr(right)?;
             }
