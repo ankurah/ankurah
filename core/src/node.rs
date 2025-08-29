@@ -938,6 +938,30 @@ where PA: PolicyAgent
     }
 }
 
+impl<SE, PA> Node<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    pub(crate) fn subscribe_remote_predicate(
+        &self,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        cdata: PA::ContextData,
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<Attested<EntityState>>>> {
+        match self.subscription_relay {
+            Some(ref relay) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.predicate_context.insert(predicate_id, cdata.clone());
+                self.pending_predicate_subs.insert(predicate_id, tx);
+                relay.notify_subscribe(predicate_id, collection_id, predicate, cdata);
+                Some(rx)
+            }
+            None => None,
+        }
+    }
+}
 pub trait TNodeErased: Send + Sync + 'static {
     fn unsubscribe_remote_predicate(&self, predicate_id: proto::PredicateId);
 }
@@ -948,23 +972,16 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     fn unsubscribe_remote_predicate(&self, predicate_id: proto::PredicateId) {
-        let node = self.clone();
-        todo!("not sure what this needs")
-        // spawn(async move {
-        //     // Clean up subscription context
-        //     node.predicate_context.remove(&predicate_id);
+        // Clean up subscription context
+        self.predicate_context.remove(&predicate_id);
 
-        //     // Clean up any pending oneshot channel
-        //     node.pending_predicate_subs.remove(&predicate_id);
+        // Clean up any pending oneshot channel
+        self.pending_predicate_subs.remove(&predicate_id);
 
-        //     // Unsubscribe from local reactor
-        //     node.reactor.unsubscribe(predicate_id);
-
-        //     // Notify subscription relay for remote cleanup
-        //     if let Some(ref relay) = node.subscription_relay {
-        //         relay.notify_unsubscribe(predicate_id);
-        //     }
-        // });
+        // Notify subscription relay for remote cleanup
+        if let Some(ref relay) = self.subscription_relay {
+            relay.notify_unsubscribe(predicate_id);
+        }
     }
 }
 

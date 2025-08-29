@@ -54,18 +54,14 @@ impl EntityLiveQuery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let predicate_id = proto::PredicateId::new();
         node.policy_agent.can_access_collection(&cdata, &collection_id)?;
         args.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.predicate)?;
 
-        // Store subscription context for event requests
-        node.predicate_context.insert(predicate_id, cdata.clone());
-
-        // Create subscription container
         let subscription = node.reactor.subscribe();
 
-        // Add the predicate to the subscription
+        let predicate_id = proto::PredicateId::new();
         let resultset = subscription.add_predicate(predicate_id, &collection_id, args.predicate.clone())?;
+        let rx = node.subscribe_remote_predicate(predicate_id, collection_id.clone(), args.predicate.clone(), cdata);
 
         let me = Self(Arc::new(Inner {
             predicate_id,
@@ -78,9 +74,10 @@ impl EntityLiveQuery {
         }));
 
         let me2 = me.clone();
-        let node = node.clone();
+        let node = node.clone(); // initialize needs the typed node. Drop only needs the erased node.
+
         crate::task::spawn(async move {
-            if let Err(e) = me2.initialize_query(node, collection_id, predicate_id, args, cdata).await {
+            if let Err(e) = me2.initialize(node, collection_id, predicate_id, args, rx).await {
                 me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
                 *me2.0.error.lock().unwrap() = Some(e);
             }
@@ -90,51 +87,35 @@ impl EntityLiveQuery {
     }
     pub fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
 
-    async fn initialize_query<SE, PA>(
+    async fn initialize<SE, PA>(
         &self,
         node: Node<SE, PA>,
         collection_id: CollectionId,
         predicate_id: proto::PredicateId,
         args: MatchArgs,
-        cdata: PA::ContextData,
+        rx: Option<tokio::sync::oneshot::Receiver<Vec<Attested<EntityState>>>>,
     ) -> Result<(), RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let storage_collection = node.collections.get(&collection_id).await?;
-        let predicate = args.predicate;
-        let cached = args.cached;
 
-        let initial_states: Vec<Attested<EntityState>>;
-        // Handle remote subscription setup
-        if let Some(ref relay) = node.subscription_relay {
-            relay.notify_subscribe(predicate_id, collection_id.clone(), predicate.clone(), cdata);
-
-            if !cached {
-                // Create oneshot channel to wait for first remote update
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                node.pending_predicate_subs.insert(predicate_id, tx);
-
-                // Wait for first remote update before initializing
-                match rx.await {
-                    Err(_) => {
-                        // Channel was dropped, proceed with local initialization anyway
-                        warn!("Failed to receive first remote update for subscription {}", predicate_id);
-                        initial_states = storage_collection.fetch_states(&predicate).await?;
-                    }
-                    Ok(states) => initial_states = states,
+        // Get initial states from remote or local storage
+        let initial_states = match rx {
+            Some(rx) if !args.cached => match rx.await {
+                Ok(states) => states,
+                Err(_) => {
+                    warn!("Failed to receive first remote update for subscription {}", predicate_id);
+                    storage_collection.fetch_states(&args.predicate).await?
                 }
-            } else {
-                initial_states = storage_collection.fetch_states(&predicate).await?;
-            }
-        } else {
-            initial_states = storage_collection.fetch_states(&predicate).await?;
-        }
+            },
+            _ => storage_collection.fetch_states(&args.predicate).await?,
+        };
 
         // Convert states to entities
-        let retriever = LocalRetriever::new(storage_collection.clone());
-        let mut initial_entities = Vec::new();
+        let retriever = LocalRetriever::new(storage_collection);
+        let mut initial_entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
             let (_, entity) =
                 node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
@@ -142,17 +123,12 @@ impl EntityLiveQuery {
         }
 
         node.reactor.initialize(self.0.subscription.id(), predicate_id, initial_entities)?;
-
         Ok(())
     }
 }
 
 impl Drop for Inner {
-    fn drop(&mut self) {
-        // Handle remote subscription cleanup
-        // FIXME: Add relay.notify_unsubscribe, node.predicate_context.remove, node.pending_subs.remove
-        warn!("LocalSubscription dropped - remote cleanup not yet implemented");
-    }
+    fn drop(&mut self) { self.node.unsubscribe_remote_predicate(self.predicate_id); }
 }
 
 // impl Signal for EntityLiveQuery {
