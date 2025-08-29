@@ -1,10 +1,4 @@
-use crate::{
-    auth::Attested,
-    data::{EntityState, Event},
-    id::EntityId,
-    subscription::PredicateId,
-    CollectionId, EventFragment, StateFragment,
-};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::PredicateId, CollectionId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -26,6 +20,17 @@ pub enum UpdateContent {
     EventOnly(Vec<EventFragment>),
     /// Both state and events (peer needs both)
     StateAndEvent(StateFragment, Vec<EventFragment>),
+}
+
+impl UpdateContent {
+    /// Decompose into optional state and event fragments
+    pub fn into_parts(self) -> (Option<StateFragment>, Option<Vec<EventFragment>>) {
+        match self {
+            UpdateContent::StateOnly(state) => (Some(state), None),
+            UpdateContent::EventOnly(events) => (None, Some(events)),
+            UpdateContent::StateAndEvent(state, events) => (Some(state), Some(events)),
+        }
+    }
 }
 
 /// How an entity's membership changed for a specific predicate
@@ -115,7 +120,7 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeUpdateBody::SubscriptionUpdate { items } => {
+            NodeUpdateBody::SubscriptionUpdate { items, initialized_predicate: _ } => {
                 write!(f, "SubscriptionUpdate [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
             }
         }

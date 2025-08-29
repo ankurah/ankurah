@@ -408,9 +408,6 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
         Ok(())
     }
 
-    // TODO: Should add (but not remove) entity subscriptions for changed entities
-    // TODO: Build ReactorUpdate with ReactorUpdateItem containing predicate_relevance
-    // TODO: Temporarily restore callback with ReactorUpdate (not ChangeSet)
     /// Notify subscriptions about an entity change
     pub fn notify_change<C: ChangeNotification<Entity = E, Event = Ev>>(&self, changes: Vec<C>) {
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
@@ -528,7 +525,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
 
         for (sub_id, sub_items) in items {
             if let Some(subscription) = self.0.subscriptions.lock().unwrap().get(&sub_id) {
-                subscription.notify(ReactorUpdate { items: sub_items.into_values().collect() });
+                subscription.notify(ReactorUpdate { items: sub_items.into_values().collect(), initialized_predicate: None });
             }
         }
     }
@@ -573,7 +570,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
 
             // Send the notification if there were any updates
             if !update_items.is_empty() {
-                let reactor_update = ReactorUpdate { items: update_items };
+                let reactor_update = ReactorUpdate { items: update_items, initialized_predicate: None };
                 subscription_state.notify(reactor_update);
             }
         }
@@ -758,7 +755,8 @@ mod tests {
                     events: vec![],
                     entity_subscribed: true,
                     predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
-                }]
+                }],
+                initialized_predicate: Some(predicate_id),
             }]
         );
 
