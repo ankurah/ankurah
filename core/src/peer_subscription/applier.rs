@@ -73,14 +73,6 @@ impl UpdateApplier {
         Ok(())
     }
 
-    // TODO:
-    // in the Initial and Add cases, if this is the first time we're hearing about this entity
-    // it's fine that we only have the state, and no events.
-    // But if we already have the state and its clock is not identical, we
-    // may need to fetch the events that connect the two. If those events are in the
-    // collection, the collection, then lineage compare inside with_state -> apply_state
-    // will find them. But if there's a gap, it doesn't currently have the ability to request
-    // those events from the peer.
     pub async fn apply_subscription_update<SE, PA>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
@@ -92,8 +84,8 @@ impl UpdateApplier {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         todo!("Update this to reflect the changes to SubscriptionUpdateItem")
-        // match update {
-        //     proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
+        match update {
+            proto::SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
         //         let state = (entity_id, collection, state).into();
         //         // validate that we trust the state given to us
         //         self.policy_agent.validate_received_state(self, from_peer_id, &state)?;
@@ -203,7 +195,7 @@ impl UpdateApplier {
         //         } else {
         //             Ok(None)
         //         }
-        //     }
-        // }
+            }
+        }
     }
 }
