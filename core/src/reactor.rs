@@ -395,7 +395,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
             }
         }
 
-        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items };
+        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items, initialized_predicate: Some(predicate_id) };
 
         // Notify the subscription
         {

@@ -22,6 +22,8 @@ pub enum MembershipChange {
 pub struct ReactorUpdate<E = Entity, Ev = Attested<Event>> {
     /// All entities that changed, with their relevance information
     pub items: Vec<ReactorUpdateItem<E, Ev>>,
+    /// A predicate was initialized for this update
+    pub initialized_predicate: Option<proto::PredicateId>,
 }
 
 /// A single entity update with all relevance information

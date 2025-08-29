@@ -1,5 +1,7 @@
-mod client;
+mod applier;
+mod client_relay;
 mod server;
 
-pub use client::SubscriptionRelay;
+pub use applier::UpdateApplier;
+pub use client_relay::SubscriptionRelay;
 pub use server::SubscriptionHandler;

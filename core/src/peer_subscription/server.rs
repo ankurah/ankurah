@@ -37,6 +37,7 @@ impl SubscriptionHandler {
                     peer_id,
                     proto::NodeUpdateBody::SubscriptionUpdate {
                         items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
+                        initialized_predicate: update.initialized_predicate,
                     },
                 );
             }
