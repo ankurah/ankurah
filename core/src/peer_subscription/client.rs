@@ -96,19 +96,19 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     ///
     /// This should be called whenever a local subscription is established. The relay will
     /// track this subscription and automatically attempt to set it up with available durable peers.
-    pub fn notify_subscribe(
+    pub fn subscribe_predicate(
         &self,
-        sub_id: proto::PredicateId,
+        predicate_id: proto::PredicateId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: CD,
     ) {
-        debug!("New subscription {} needs remote setup", sub_id);
+        debug!("New subscription {} needs remote setup", predicate_id);
         {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
-                sub_id.clone(),
+                predicate_id.clone(),
                 SubscriptionState {
-                    content: Arc::new(Content { collection_id, predicate, context_data, predicate_id: sub_id }),
+                    content: Arc::new(Content { collection_id, predicate, context_data, predicate_id }),
                     status: Status::PendingRemote,
                     last_error: None,
                 },
@@ -125,23 +125,23 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     ///
     /// This will clean up all tracking state and send unsubscribe requests to any
     /// remote peers that have this subscription established.
-    pub fn notify_unsubscribe(&self, sub_id: proto::PredicateId) {
-        debug!("Unsubscribing from subscription {}", sub_id);
+    pub fn unsubscribe_predicate(&self, predicate_id: proto::PredicateId) {
+        debug!("Unsubscribing from subscription {}", predicate_id);
 
         // If subscription was established with a peer, send unsubscribe request
         {
             let mut subscriptions = self.inner.subscriptions.lock().unwrap();
-            if let Some(info) = subscriptions.remove(&sub_id) {
+            if let Some(info) = subscriptions.remove(&predicate_id) {
                 if let Status::Established(peer_id) = &info.status {
                     let sender = self.inner.message_sender.get();
                     if let Some(sender) = sender {
                         let sender = sender.clone();
                         let peer_id = *peer_id;
                         crate::task::spawn(async move {
-                            if let Err(e) = sender.peer_unsubscribe(peer_id, sub_id).await {
-                                warn!("Failed to send unsubscribe message for {}: {}", sub_id, e);
+                            if let Err(e) = sender.peer_unsubscribe(peer_id, predicate_id).await {
+                                warn!("Failed to send unsubscribe message for {}: {}", predicate_id, e);
                             } else {
-                                debug!("Successfully sent unsubscribe message for {}", sub_id);
+                                debug!("Successfully sent unsubscribe message for {}", predicate_id);
                             }
                         });
                     }
@@ -201,9 +201,9 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     }
 
     /// Get the current state of a subscription
-    pub fn get_status(&self, sub_id: proto::PredicateId) -> Option<Status> {
+    pub fn get_status(&self, predicate_id: proto::PredicateId) -> Option<Status> {
         let subscriptions = self.inner.subscriptions.lock().unwrap();
-        subscriptions.get(&sub_id).map(|info| info.status.clone())
+        subscriptions.get(&predicate_id).map(|info| info.status.clone())
     }
 
     /// Setup remote subscriptions with available durable peers
@@ -256,19 +256,19 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     }
 
     async fn peer_subscribe(self, sender: Arc<dyn MessageSender<CD>>, target_peer: proto::EntityId, content: Arc<Content<CD>>) {
-        let sub_id = content.predicate_id;
+        let predicate_id = content.predicate_id;
         let collection_id = content.collection_id.clone();
         let predicate = content.predicate.clone();
         let context_data = content.context_data.clone();
-        match sender.peer_subscribe(target_peer, sub_id, collection_id, predicate, &context_data).await {
+        match sender.peer_subscribe(target_peer, predicate_id, collection_id, predicate, &context_data).await {
             Ok(()) => {
                 // Mark as established - update the state while preserving existing data
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap();
-                if let Some(info) = subscriptions.get_mut(&sub_id) {
+                if let Some(info) = subscriptions.get_mut(&predicate_id) {
                     info.status = Status::Established(target_peer);
                 }
 
-                debug!("Successfully established remote subscription {} with peer {}", sub_id, target_peer);
+                debug!("Successfully established remote subscription {} with peer {}", predicate_id, target_peer);
             }
             Err(e) => {
                 // Store error message for logging
@@ -287,16 +287,22 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                 // Update state based on retriability
                 {
                     let mut subscriptions = self.inner.subscriptions.lock().unwrap();
-                    if let Some(info) = subscriptions.get_mut(&sub_id) {
+                    if let Some(info) = subscriptions.get_mut(&predicate_id) {
                         info.last_error = Some(e);
                         if is_retryable {
                             // Retryable errors go back to pending for immediate retry
                             info.status = Status::PendingRemote;
-                            warn!("Retryable failure for subscription {} with peer {}: {} - will retry", sub_id, target_peer, error_msg);
+                            warn!(
+                                "Retryable failure for subscription {} with peer {}: {} - will retry",
+                                predicate_id, target_peer, error_msg
+                            );
                         } else {
                             // Non-retryable errors are permanently failed
                             info.status = Status::Failed;
-                            warn!("Permanent failure for subscription {} with peer {}: {} - no retry", sub_id, target_peer, error_msg);
+                            warn!(
+                                "Permanent failure for subscription {} with peer {}: {} - no retry",
+                                predicate_id, target_peer, error_msg
+                            );
                         }
                     }
                 }
@@ -314,7 +320,7 @@ pub trait MessageSender<CD: ContextData>: Send + Sync {
     async fn peer_subscribe(
         &self,
         peer_id: proto::EntityId,
-        sub_id: proto::PredicateId,
+        predicate_id: proto::PredicateId,
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: &CD,
@@ -322,7 +328,7 @@ pub trait MessageSender<CD: ContextData>: Send + Sync {
 
     /// Send an unsubscribe message to a remote peer
     /// This is a one-way message, no response expected
-    async fn peer_unsubscribe(&self, peer_id: proto::EntityId, sub_id: proto::PredicateId) -> Result<(), anyhow::Error>;
+    async fn peer_unsubscribe(&self, peer_id: proto::EntityId, predicate_id: proto::PredicateId) -> Result<(), anyhow::Error>;
 }
 
 /// Implementation of MessageSender for WeakNode to enable subscription relay integration
@@ -356,11 +362,11 @@ where
         }
     }
 
-    async fn peer_unsubscribe(&self, peer_id: proto::EntityId, sub_id: proto::PredicateId) -> Result<(), anyhow::Error> {
+    async fn peer_unsubscribe(&self, peer_id: proto::EntityId, predicate_id: proto::PredicateId) -> Result<(), anyhow::Error> {
         let node = self.upgrade().ok_or_else(|| anyhow!("Node has been dropped"))?;
 
         // Use the existing request_remote_unsubscribe method
-        node.request_remote_unsubscribe(sub_id, vec![peer_id]).await?;
+        node.request_remote_unsubscribe(predicate_id, vec![peer_id]).await?;
 
         Ok(())
     }
@@ -417,12 +423,12 @@ mod tests {
         async fn peer_subscribe(
             &self,
             peer_id: EntityId,
-            sub_id: proto::PredicateId,
+            predicate_id: proto::PredicateId,
             collection_id: CollectionId,
             predicate: Predicate,
             _context_data: &CD,
         ) -> Result<(), RequestError> {
-            self.sent_requests.lock().unwrap().push((peer_id, sub_id, collection_id.clone(), predicate.clone()));
+            self.sent_requests.lock().unwrap().push((peer_id, predicate_id, collection_id.clone(), predicate.clone()));
 
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
@@ -432,8 +438,8 @@ mod tests {
             }
         }
 
-        async fn peer_unsubscribe(&self, peer_id: EntityId, sub_id: proto::PredicateId) -> Result<(), anyhow::Error> {
-            self.sent_requests.lock().unwrap().push((peer_id, sub_id, CollectionId::from("unsubscribe"), Predicate::True));
+        async fn peer_unsubscribe(&self, peer_id: EntityId, predicate_id: proto::PredicateId) -> Result<(), anyhow::Error> {
+            self.sent_requests.lock().unwrap().push((peer_id, predicate_id, CollectionId::from("unsubscribe"), Predicate::True));
 
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
@@ -462,7 +468,7 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let sub_id = proto::PredicateId::new();
+        let predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
@@ -471,10 +477,10 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Notify of new subscription
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
 
         // Check initial state - subscription should immediately go to Requested state since peer is connected
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Requested(_))));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Requested(_))));
 
         // Give async task time to complete (setup should happen automatically)
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -483,11 +489,11 @@ mod tests {
         let sent_requests = mock_sender.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
         assert_eq!(sent_requests[0].0, peer_id);
-        assert_eq!(sent_requests[0].1, sub_id);
+        assert_eq!(sent_requests[0].1, predicate_id);
         assert_eq!(sent_requests[0].2, collection_id);
 
         // Verify subscription is marked as established
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
     }
 
     #[tokio::test]
@@ -496,7 +502,7 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let sub_id = proto::PredicateId::new();
+        let predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
@@ -505,18 +511,18 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Setup established subscription by going through the full flow
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone());
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
 
         // Simulate peer disconnection
         relay.notify_peer_disconnected(peer_id);
 
         // Verify subscription is marked as pending again
-        assert!(matches!(relay.get_status(sub_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
     }
 
     #[tokio::test]
@@ -525,14 +531,14 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let sub_id = proto::PredicateId::new();
+        let predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
 
         // Add pending subscription (no peers connected yet)
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
-        assert!(matches!(relay.get_status(sub_id), Some(Status::PendingRemote)));
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
 
         // Clear any previous requests
         mock_sender.clear_sent_requests();
@@ -547,10 +553,10 @@ mod tests {
         let sent_requests = mock_sender.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
         assert_eq!(sent_requests[0].0, peer_id);
-        assert_eq!(sent_requests[0].1, sub_id);
+        assert_eq!(sent_requests[0].1, predicate_id);
 
         // Verify subscription is established
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
     }
 
     #[tokio::test]
@@ -559,27 +565,27 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let sub_id = proto::PredicateId::new();
+        let predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
 
         // Connect peer and add subscription (should succeed initially)
         relay.notify_peer_connected(peer_id);
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Verify subscription is marked as established (since no error was set)
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
 
         // Now test the retry behavior by disconnecting the peer (puts subscription back to PendingRemote)
         // then setting up the mock to fail, and reconnecting to trigger the retry
         relay.notify_peer_disconnected(peer_id);
 
         // Verify subscription is now in pending state
-        assert!(matches!(relay.get_status(sub_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
 
         // Clear requests and set up mock to fail on the next call
         mock_sender.clear_sent_requests();
@@ -596,7 +602,7 @@ mod tests {
         assert_eq!(sent_requests.len(), 1);
 
         // Verify subscription remains in failed state (non-retryable error)
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Failed)));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Failed)));
     }
 
     #[tokio::test]
@@ -605,23 +611,23 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let retryable_sub_id = proto::PredicateId::new();
-        let non_retryable_sub_id = proto::PredicateId::new();
+        let retryable_predicate_id = proto::PredicateId::new();
+        let non_retryable_predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
 
         // Add subscriptions
-        relay.notify_subscribe(retryable_sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
-        relay.notify_subscribe(non_retryable_sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(retryable_predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(non_retryable_predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
 
         // Manually set different failure types - retryable goes back to pending, non-retryable stays failed
         {
             let mut subscriptions = relay.inner.subscriptions.lock().unwrap();
-            if let Some(info) = subscriptions.get_mut(&retryable_sub_id) {
+            if let Some(info) = subscriptions.get_mut(&retryable_predicate_id) {
                 info.status = Status::PendingRemote; // Retryable errors go back to pending
             }
-            if let Some(info) = subscriptions.get_mut(&non_retryable_sub_id) {
+            if let Some(info) = subscriptions.get_mut(&non_retryable_predicate_id) {
                 info.status = Status::Failed; // Non-retryable errors stay failed
             }
         }
@@ -635,13 +641,13 @@ mod tests {
         // Verify only the retryable subscription was attempted
         let sent_requests = mock_sender.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
-        assert_eq!(sent_requests[0].1, retryable_sub_id);
+        assert_eq!(sent_requests[0].1, retryable_predicate_id);
 
         // Verify states
         assert!(
-            matches!(relay.get_status(retryable_sub_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id)
+            matches!(relay.get_status(retryable_predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id)
         );
-        assert!(matches!(relay.get_status(non_retryable_sub_id), Some(Status::Failed)));
+        assert!(matches!(relay.get_status(non_retryable_predicate_id), Some(Status::Failed)));
     }
 
     #[tokio::test]
@@ -650,25 +656,25 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let sub_id = proto::PredicateId::new();
+        let predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone());
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
 
         // Clear previous requests to focus on unsubscribe
         mock_sender.clear_sent_requests();
 
         // Remove subscription
-        relay.notify_unsubscribe(sub_id);
+        relay.unsubscribe_predicate(predicate_id);
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -677,10 +683,10 @@ mod tests {
         let sent_requests = mock_sender.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
         assert_eq!(sent_requests[0].0, peer_id);
-        assert_eq!(sent_requests[0].1, sub_id);
+        assert_eq!(sent_requests[0].1, predicate_id);
 
         // Verify subscription is gone
-        assert!(matches!(relay.get_status(sub_id), None));
+        assert!(matches!(relay.get_status(predicate_id), None));
     }
 
     #[tokio::test]
@@ -688,24 +694,24 @@ mod tests {
         let relay: SubscriptionRelay<CollectionId> = SubscriptionRelay::new();
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
 
-        let sub_id = proto::PredicateId::new();
+        let predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();
 
         // Test setup without message sender - should not crash
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
-        assert!(matches!(relay.get_status(sub_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
 
         // Now set sender and test with no connected peers
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no peers available
-        assert!(matches!(relay.get_status(sub_id), Some(Status::PendingRemote)));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
 
         // Verify no requests were sent
         assert_eq!(mock_sender.get_sent_requests().len(), 0);
@@ -715,7 +721,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should now be established
-        assert!(matches!(relay.get_status(sub_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
         assert_eq!(mock_sender.get_sent_requests().len(), 1);
     }
 
@@ -725,16 +731,16 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let sub_id = proto::PredicateId::new();
+        let predicate_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
 
         // Add subscription but don't establish it
-        relay.notify_subscribe(sub_id, collection_id.clone(), predicate, collection_id.clone());
-        assert!(matches!(relay.get_status(sub_id), Some(Status::PendingRemote)));
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone());
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
 
         // Unsubscribe from pending subscription
-        relay.notify_unsubscribe(sub_id);
+        relay.unsubscribe_predicate(predicate_id);
 
         // Give async task time to complete (though no request should be sent)
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -744,6 +750,6 @@ mod tests {
         assert_eq!(sent_requests.len(), 0);
 
         // Verify subscription is gone
-        assert!(matches!(relay.get_status(sub_id), None));
+        assert!(matches!(relay.get_status(predicate_id), None));
     }
 }

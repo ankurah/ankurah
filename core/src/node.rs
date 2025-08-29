@@ -19,11 +19,11 @@ use crate::{
     entity::WeakEntitySet,
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
+    peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
     reactor::{Reactor, ReactorSubscription},
     retrieval::LocalRetriever,
     storage::StorageEngine,
-    subscription_relay::SubscriptionRelay,
     system::SystemManager,
     util::{safemap::SafeMap, safeset::SafeSet},
 };
@@ -955,7 +955,7 @@ where
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.predicate_context.insert(predicate_id, cdata.clone());
                 self.pending_predicate_subs.insert(predicate_id, tx);
-                relay.notify_subscribe(predicate_id, collection_id, predicate, cdata);
+                relay.subscribe_predicate(predicate_id, collection_id, predicate, cdata);
                 Some(rx)
             }
             None => None,
@@ -980,7 +980,7 @@ where
 
         // Notify subscription relay for remote cleanup
         if let Some(ref relay) = self.subscription_relay {
-            relay.notify_unsubscribe(predicate_id);
+            relay.unsubscribe_predicate(predicate_id);
         }
     }
 }
