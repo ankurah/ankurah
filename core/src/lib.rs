@@ -5,6 +5,7 @@ pub mod context;
 pub mod entity;
 pub mod error;
 pub mod lineage;
+pub mod livequery;
 pub mod model;
 pub mod node;
 pub mod policy;

@@ -97,15 +97,16 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
                     }
 
-                    pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<#resultset_name, ::wasm_bindgen::JsValue> {
-                        let resultset = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        Ok(#resultset_name(::std::sync::Arc::new(resultset)))
+                    pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
+                        let items = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                        Ok(items)
                     }
 
                     pub fn query (context: &ankurah::core::context::Context, predicate: String) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
-                        let livequery = context.query::<#view_name>(predicate.as_str())
-                            .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        Ok(#livequery_name { inner: livequery })
+                        // let livequery = context.query::<#view_name>(predicate.as_str())
+                        //     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                        // Ok(#livequery_name { inner: livequery })
+                        unimplemented!()
                     }
 
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
@@ -136,11 +137,13 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     #[wasm_bindgen(getter)]
                     pub fn items(&self) -> Vec<#view_name> {
                         use ::ankurah::signals::Peek;
-                        self.0.get()
+                        // self.0.get()
+                        unimplemented!()
                     }
                     pub fn by_id(&self, id: ::ankurah::proto::EntityId) -> Option<#view_name> {
-                        CurrentObserver::track(&self);
-                        self.0.by_id(&id)
+                        // ::ankurah::signals::CurrentObserver::track(&self);
+                        // self.0.by_id(&id)
+                        unimplemented!()
                         // todo generate a map on demand if there are more than a certain number of items (benchmark this)
                     }
                     #[wasm_bindgen(getter)]
@@ -151,49 +154,56 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
                 impl ankurah::signals::Signal for #resultset_name {
                     fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
-                        self.0.reference().listen(listener)
+                        // self.0.listen(listener)
+                        unimplemented!()
                     }
                     fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
-                        self.0.id()
+                        // use ::ankurah::signals::Signal;
+                        // self.0.broadcast_id()
+                        unimplemented!()
                     }
                 }
 
                 #[wasm_bindgen]
-                pub struct #livequery_name(::ankurah::core::context::LiveQuery<#view_name>);
+                pub struct #livequery_name(::ankurah::LiveQuery<#view_name>);
 
                 #[wasm_bindgen]
                 impl #livequery_name {
                     pub fn items(&self) -> Vec<#view_name> {
-                        use ::ankurah::signals::Signal;
-                        CurrentObserver::track(&self);
-                        self.0.resultset.()
+                        // use ::ankurah::signals::Signal;
+                        // ::ankurah::signals::CurrentObserver::track(&self);
+                        // self.0.resultset.()
+                        unimplemented!()
                     }
                     #[wasm_bindgen(getter)]
                     pub fn value(&self) -> #resultset_name {
-                        use ::ankurah::signals::Signal;
-                        CurrentObserver::track(&self);
-                        #resultset_name(::std::sync::Arc::new(self.0.peek()))
+                        // use ::ankurah::signals::Signal;
+                        // ::ankurah::signals::CurrentObserver::track(&self);
+                        // #resultset_name(::std::sync::Arc::new(self.0.peek()))
+                        unimplemented!()
                     }
 
                     #[wasm_bindgen(getter)]
                     pub fn peek(&self) -> #resultset_name {
-                        use ::ankurah::signals::Peek;
-                        self.0.peek()
+                        // use ::ankurah::signals::Peek;
+                        // self.0.peek()
+                        unimplemented!()
                     }
 
                     pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
                         use ::ankurah::signals::Subscribe;
                         let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
                         
-                        self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                            // The ChangeSet already contains a ResultSet<View>, just wrap it
-                            let resultset = #resultset_name(::std::sync::Arc::new(changeset.resultset));
+                        // self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                        //     // The ChangeSet already contains a ResultSet<View>, just wrap it
+                        //     let resultset = #resultset_name(changeset.resultset.map());
                             
-                            let _ = callback.call1(
-                                &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
-                                &resultset.into()
-                            );
-                        })
+                        //     let _ = callback.call1(
+                        //         &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
+                        //         &resultset.into()
+                        //     );
+                        // })
+                        unimplemented!()
                     }
                 }
             };
@@ -267,11 +277,13 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         impl ::ankurah::signals::Signal for #view_name {
             fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
-                self.entity.broadcast().reference().listen(listener)
+                // self.entity.broadcast().reference().listen(listener)
+                unimplemented!()
             }
             
             fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
-                self.entity.broadcast().id()
+                // self.entity.broadcast().id()
+                unimplemented!()
             }
         }
 
@@ -300,8 +312,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             }
             /// Manually track this View in the current observer
             pub fn track(&self) {
-                use ::ankurah::signals::CurrentObserver;
-                CurrentObserver::track(self);
+                ::ankurah::signals::CurrentObserver::track(self);
             }
             #(
                 #active_field_visibility fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {

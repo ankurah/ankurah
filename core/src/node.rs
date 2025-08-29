@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
 
 use async_trait::async_trait;
@@ -12,10 +12,10 @@ use tokio::sync::oneshot;
 
 use crate::{
     action_debug, action_error, action_info, action_warn,
-    changes::{EntityChange, ItemChange},
+    changes::EntityChange,
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
-    context::{Context, LiveQuery, NodeAndContext},
+    context::{Context, NodeAndContext},
     entity::WeakEntitySet,
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
@@ -25,13 +25,12 @@ use crate::{
     storage::StorageEngine,
     subscription_relay::SubscriptionRelay,
     system::SystemManager,
-    task::spawn,
     util::{safemap::SafeMap, safeset::SafeSet},
 };
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 pub struct PeerState {
     sender: Box<dyn PeerSender>,
@@ -490,7 +489,7 @@ where
                 //     return Err(anyhow!("Received subscription update for unknown predicate {}", predicate_id));
                 // }
 
-                Ok(())
+                // Ok(())
             }
         }
     }

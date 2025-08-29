@@ -139,8 +139,10 @@ pub use proto::EntityId;
 // Re-export commonly used types
 pub use ankurah_core::{
     changes,
-    context::{Context, LiveQuery},
-    entity, error, model,
+    context::Context,
+    entity, error,
+    livequery::LiveQuery,
+    model,
     model::View,
     model::{Model, Mutable},
     node::{MatchArgs, Node},

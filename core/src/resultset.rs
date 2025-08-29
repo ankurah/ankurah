@@ -87,7 +87,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
             return false;
         }
         let pos = st.order.len();
-        st.order.push(entity);m
+        st.order.push(entity);
         st.index.insert(id, pos);
         drop(st);
         self.0.broadcast.send(());
@@ -173,7 +173,11 @@ impl<E: View> Default for ResultSet<E> {
     }
 }
 
-// Implement Signal trait
+impl<E: AbstractEntity> Signal for EntityResultSet<E> {
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.0.broadcast.reference().listen(listener) }
+    fn broadcast_id(&self) -> BroadcastId { self.0.broadcast.id() }
+}
+
 impl<R: View> Signal for ResultSet<R> {
     fn listen(&self, listener: Listener) -> ListenerGuard { self.0 .0.broadcast.reference().listen(listener) }
 
