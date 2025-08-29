@@ -14,7 +14,7 @@ use crate::{
     error::SubscriptionError,
     policy::PolicyAgent,
     reactor::subscription::ReactorSubInner,
-    resultset::ResultSet,
+    resultset::EntityResultSet,
     retrieval::LocalRetriever,
     storage::{StorageCollection, StorageCollectionWrapper, StorageEngine},
     util::safemap::SafeMap,
@@ -32,7 +32,7 @@ use tracing::instrument;
 use tracing::{debug, warn};
 
 /// Trait for entities that can be used in reactor notifications
-pub trait ReactorEntity: ankql::selection::filter::Filterable + Clone + std::fmt::Debug {
+pub trait AbstractEntity: ankql::selection::filter::Filterable + Clone + std::fmt::Debug {
     fn collection(&self) -> proto::CollectionId;
     fn id(&self) -> proto::EntityId;
     fn value(&self, field: &str) -> Option<String>;
@@ -40,14 +40,14 @@ pub trait ReactorEntity: ankql::selection::filter::Filterable + Clone + std::fmt
 
 /// Trait for types that can be used in notify_change
 pub trait ChangeNotification: std::fmt::Debug {
-    type Entity: ReactorEntity;
+    type Entity: AbstractEntity;
     type Event: Clone + std::fmt::Debug;
 
     fn into_parts(self) -> (Self::Entity, Vec<Self::Event>);
 }
 
 // Implement ReactorEntity for Entity
-impl ReactorEntity for Entity {
+impl AbstractEntity for Entity {
     fn collection(&self) -> proto::CollectionId { self.collection.clone() }
 
     fn id(&self) -> proto::EntityId { self.id }
@@ -64,9 +64,9 @@ impl ChangeNotification for EntityChange {
 }
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
-pub struct Reactor<E: ReactorEntity = Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(Arc<ReactorInner<E, Ev>>);
+pub struct Reactor<E: AbstractEntity = Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(Arc<ReactorInner<E, Ev>>);
 
-struct ReactorInner<E: ReactorEntity, Ev> {
+struct ReactorInner<E: AbstractEntity, Ev> {
     subscriptions: Mutex<HashMap<ReactorSubscriptionId, SubscriptionState<E, Ev>>>,
     watcher_set: Mutex<WatcherSet>,
 }
@@ -99,19 +99,21 @@ struct WatcherSet {
 
 /// State for a single predicate within a subscription
 #[derive(Debug, Clone)]
-struct PredicateState<E: ReactorEntity> {
+struct PredicateState<E: AbstractEntity> {
     pub(crate) subscription_id: ReactorSubscriptionId,
     pub(crate) collection_id: proto::CollectionId,
     pub(crate) predicate: ankql::ast::Predicate,
     // I think we need to move these out of PredicateState and into WatcherState
     pub(crate) initialized: bool,
-    pub(crate) matching_entities: Arc<SafeMap<proto::EntityId, E>>,
+    pub(crate) resultset: EntityResultSet<E>,
 }
 
-struct SubscriptionState<E: ReactorEntity, Ev> {
+struct SubscriptionState<E: AbstractEntity, Ev> {
     pub(crate) id: ReactorSubscriptionId,
     pub(crate) predicates: HashMap<proto::PredicateId, PredicateState<E>>,
+    /// The set of entities that are subscribed to by this subscription
     pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
+    // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
 }
@@ -130,11 +132,11 @@ enum WatcherOp {
 }
 
 // don't require Clone SE or PA, because we have an Arc
-impl<E: ReactorEntity, Ev> Clone for Reactor<E, Ev> {
+impl<E: AbstractEntity, Ev> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
+impl<E: AbstractEntity, Ev: Clone> Reactor<E, Ev> {
     pub fn new() -> Self {
         Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
@@ -162,7 +164,7 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
     }
 }
 
-impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
+impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
     /// Remove a subscription and all its predicates
     pub(crate) fn unsubscribe(&self, sub_id: ReactorSubscriptionId) -> Result<(), SubscriptionError> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
@@ -180,7 +182,7 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
                 );
 
                 // Remove from entity watchers using predicate's matching entities
-                for entity_id in predicate_state.matching_entities.keys() {
+                for entity_id in predicate_state.resultset.keys() {
                     if let Some(watchers) = watcher_set.entity_watchers.get_mut(&entity_id) {
                         // only remove the subscription watcher, not the entity watchers based on currently matching predicates
                         watchers.remove(&EntityWatcherId::Subscription(sub_id));
@@ -201,14 +203,14 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
         predicate_id: proto::PredicateId,
         collection_id: &proto::CollectionId,
         predicate: ankql::ast::Predicate,
-    ) -> Result<Arc<SafeMap<proto::EntityId, E>>, SubscriptionError> {
+    ) -> Result<EntityResultSet<E>, SubscriptionError> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
         let mut watcher_state = self.0.watcher_set.lock().unwrap();
 
         // Add the predicate to the subscription
         if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
             use std::collections::hash_map::Entry;
-            let matching_entities = Arc::new(SafeMap::new());
+            let resultset = EntityResultSet::empty();
             match subscription.predicates.entry(predicate_id) {
                 Entry::Vacant(v) => {
                     v.insert(PredicateState {
@@ -216,7 +218,7 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
                         collection_id: collection_id.clone(),
                         predicate: predicate.clone(),
                         initialized: false,
-                        matching_entities: matching_entities.clone(),
+                        resultset: resultset.clone(),
                     });
                 }
                 Entry::Occupied(o) => {
@@ -228,7 +230,7 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
             let watcher_id = (subscription_id, predicate_id);
             watcher_state.recurse_predicate_watchers(collection_id, &predicate, watcher_id, WatcherOp::Add);
 
-            Ok(matching_entities)
+            Ok(resultset)
         } else {
             return Err(SubscriptionError::SubscriptionNotFound);
         }
@@ -287,7 +289,7 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
 
                 // TODO: Check if any predicates match this entity before removing from entity_watchers
                 // For now, only remove if no predicates match
-                let should_remove = !subscription.predicates.values().any(|p| p.matching_entities.contains_key(&entity_id));
+                let should_remove = !subscription.predicates.values().any(|p| p.resultset.contains_key(&entity_id));
 
                 if should_remove {
                     if let Some(watchers) = watcher_state.entity_watchers.get_mut(&entity_id) {
@@ -311,19 +313,19 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
         matching: bool,
     ) {
         if let Some(predicate_state) = subscription.predicates.get_mut(&predicate_id) {
-            let entity_id = ReactorEntity::id(entity);
-            let did_match = predicate_state.matching_entities.contains_key(&entity_id);
+            let entity_id = AbstractEntity::id(entity);
+            let did_match = predicate_state.resultset.contains_key(&entity_id);
 
             match (did_match, matching) {
                 (false, true) => {
                     // Entity now matches - add to matching set and cache the entity
-                    predicate_state.matching_entities.insert(entity_id, entity.clone());
+                    predicate_state.resultset.push(entity.clone());
                     subscription.entities.insert(entity_id, entity.clone());
                 }
                 (true, false) => {
                     // Entity no longer matches - remove from matching set
                     // (but keep in entity cache for now - it might still be needed by other predicates)
-                    predicate_state.matching_entities.remove(&entity_id);
+                    predicate_state.resultset.remove(&entity_id);
                 }
                 _ => {} // No change needed
             }
@@ -331,7 +333,7 @@ impl<E: ReactorEntity, Ev> Reactor<E, Ev> {
     }
 }
 
-impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
+impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
     /// Initialize a specific predicate by performing initial evaluation
     /// This is async and does the initial fetch and evaluation
     pub fn initialize(
@@ -349,61 +351,49 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
             predicate_state.predicate.clone()
         };
 
-        // Find initial matching entities
         let mut matching_entities = Vec::new();
-        let mut matching_entity_ids = Vec::new();
+        let mut reactor_update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
-        // Filter entities by predicate
         for entity in initial_entities {
-            // TODO: is it necessary to reevaluate the predicate here?
-            //       shouldn't the caller have already done this?
             if ankql::selection::filter::evaluate_predicate(&entity, &predicate).unwrap_or(false) {
-                matching_entity_ids.push(entity.id());
-                matching_entities.push(entity.clone());
+                matching_entities.push(entity);
             }
         }
 
         // Update state with matching entities and mark as initialized
         {
-            let mut subscriptions = self.0.subscriptions.lock().unwrap();
             let mut watcher_state = self.0.watcher_set.lock().unwrap();
+            let mut subscriptions = self.0.subscriptions.lock().unwrap();
 
             // Update subscription's predicate state
             if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
+                // Set up entity watchers for matching entities
+                for entity in &matching_entities {
+                    let entity_id = AbstractEntity::id(entity);
+                    subscription.entity_subscriptions.insert(entity_id);
+                    watcher_state.entity_watchers.entry(entity_id).or_default().insert(EntityWatcherId::Subscription(subscription_id));
+
+                    let entity_watcher = watcher_state.entity_watchers.entry(entity_id).or_default();
+                    // same as in notify_change, we need to add a watcher for the subscription itself, which lingers
+                    // until the user expressly tells us they want to stop watching
+                    // and one for the predicate that gets removed when the predicate no longer matches
+                    entity_watcher.insert(EntityWatcherId::Subscription(subscription_id));
+                    entity_watcher.insert(EntityWatcherId::Predicate(subscription_id, predicate_id));
+                    reactor_update_items.push(ReactorUpdateItem {
+                        entity: entity.clone(),
+                        events: vec![],
+                        entity_subscribed: true, // TODO: decide if this is relevant given that we implicitly subscribe all predicate matched entities
+                        predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
+                    });
+                }
                 if let Some(pred_state) = subscription.predicates.get_mut(&predicate_id) {
                     // Clear existing matching entities and populate with new ones
-                    pred_state.matching_entities.clear();
-                    for (entity_id, entity) in matching_entity_ids.iter().zip(matching_entities.iter()) {
-                        pred_state.matching_entities.insert(*entity_id, entity.clone());
-                    }
+                    pred_state.resultset.replace_all(matching_entities);
                     pred_state.initialized = true;
+                    pred_state.resultset.set_loaded(true);
                 }
             }
-
-            // Set up entity watchers for matching entities
-            for entity_id in &matching_entity_ids {
-                let entity_watcher = watcher_state.entity_watchers.entry(*entity_id).or_default();
-                // same as in notify_change, we need to add a watcher for the subscription itself, which lingers
-                // until the user expressly tells us they want to stop watching
-                // and one for the predicate that gets removed when the predicate no longer matches
-                entity_watcher.insert(EntityWatcherId::Subscription(subscription_id));
-                entity_watcher.insert(EntityWatcherId::Predicate(subscription_id, predicate_id));
-            }
         }
-
-        // Call add_entity_subscriptions for all returned entities
-        self.add_entity_subscriptions(subscription_id, matching_entity_ids.clone());
-
-        // Build ReactorUpdate with MembershipChange::Initial for each matching entity
-        let reactor_update_items: Vec<ReactorUpdateItem<E, Ev>> = matching_entities
-            .into_iter()
-            .map(|entity| ReactorUpdateItem {
-                entity,
-                events: vec![],           // No events for initial state
-                entity_subscribed: false, // These are predicate matches, not direct entity subscriptions
-                predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
-            })
-            .collect();
 
         let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items };
 
@@ -439,15 +429,15 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
             // Find subscriptions that might be interested based on index watchers
             for ((collection_id, field_id), index_ref) in &watcher_set.index_watchers {
                 // Get the field value from the entity
-                if *collection_id == ReactorEntity::collection(&entity) {
-                    if let Some(field_value) = ReactorEntity::value(&entity, &field_id.0) {
+                if *collection_id == AbstractEntity::collection(&entity) {
+                    if let Some(field_value) = AbstractEntity::value(&entity, &field_id.0) {
                         possibly_interested_watchers.extend(index_ref.find_matching(Value::String(field_value)));
                     }
                 }
             }
 
             // Also check wildcard watchers for this collection
-            if let Some(watchers) = watcher_set.wildcard_watchers.get(&ReactorEntity::collection(&entity)) {
+            if let Some(watchers) = watcher_set.wildcard_watchers.get(&AbstractEntity::collection(&entity)) {
                 for watcher in watchers.iter() {
                     possibly_interested_watchers.insert(*watcher);
                 }
@@ -455,7 +445,7 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
 
             // Check entity watchers - these are subscription-level, not predicate-level
             // We'll need to expand these to all predicates for the subscription
-            if let Some(subscription_ids) = watcher_set.entity_watchers.get(&ReactorEntity::id(&entity)) {
+            if let Some(subscription_ids) = watcher_set.entity_watchers.get(&AbstractEntity::id(&entity)) {
                 for sub_id in subscription_ids.iter() {
                     // Get all predicates for this subscription
                     if let Some(sub) = self.0.subscriptions.lock().unwrap().get(&sub_id.subscription_id()) {
@@ -483,7 +473,7 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
                             debug!("\tnotify_change predicate: {} {:?}", predicate_id, predicate_state.predicate);
                             let matches =
                                 ankql::selection::filter::evaluate_predicate(&entity, &predicate_state.predicate).unwrap_or(false);
-                            let did_match = predicate_state.matching_entities.contains_key(&ReactorEntity::id(&entity));
+                            let did_match = predicate_state.resultset.contains_key(&AbstractEntity::id(&entity));
 
                             (did_match, matches)
                         } else {
@@ -493,8 +483,8 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
 
                     debug!(
                         "\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}",
-                        ReactorEntity::id(&entity),
-                        ReactorEntity::value(&entity, "status")
+                        AbstractEntity::id(&entity),
+                        AbstractEntity::value(&entity, "status")
                     );
 
                     let entity_watcher = watcher_set.entity_watchers.entry(entity.id()).or_default();
@@ -517,7 +507,7 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
                         (false, true) => Some(MembershipChange::Add),
                         _ => None,
                     };
-                    match sub_entities.entry(ReactorEntity::id(&entity)) {
+                    match sub_entities.entry(AbstractEntity::id(&entity)) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert(ReactorUpdateItem {
                                 entity: entity.clone(),
@@ -560,7 +550,7 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
             // For each predicate in this subscription
             for (predicate_id, predicate_state) in &mut subscription_state.predicates {
                 // For each entity that was matching this predicate
-                for entity_id in predicate_state.matching_entities.keys() {
+                for entity_id in predicate_state.resultset.keys() {
                     // Try to get the entity from the subscription's cache
                     if let Some(entity) = subscription_state.entities.get(&entity_id) {
                         update_items.push(ReactorUpdateItem {
@@ -573,7 +563,8 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
                 }
 
                 // Clear the matching entities for this predicate
-                predicate_state.matching_entities.clear();
+                predicate_state.resultset.clear();
+                predicate_state.resultset.set_loaded(false);
             }
 
             // Clear entity subscriptions and cached entities
@@ -589,7 +580,7 @@ impl<E: ReactorEntity, Ev: Clone> Reactor<E, Ev> {
     }
 }
 
-impl<E: ReactorEntity> std::fmt::Debug for Reactor<E> {
+impl<E: AbstractEntity> std::fmt::Debug for Reactor<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let watcher_set = self.0.watcher_set.lock().unwrap();
         let subscriptions = self.0.subscriptions.lock().unwrap();
@@ -670,11 +661,11 @@ impl WatcherSet {
     }
 }
 
-impl<E: ReactorEntity, Ev: Clone> SubscriptionState<E, Ev> {
+impl<E: AbstractEntity, Ev: Clone> SubscriptionState<E, Ev> {
     fn notify(&self, update: ReactorUpdate<E, Ev>) { self.broadcast.send(update); }
 }
 
-impl<E: ReactorEntity, Ev> std::fmt::Debug for SubscriptionState<E, Ev> {
+impl<E: AbstractEntity, Ev> std::fmt::Debug for SubscriptionState<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Subscription {{ id: {:?}, predicates: {} }}", self.id, self.predicates.len())
     }
@@ -735,7 +726,7 @@ mod tests {
         fn collection(&self) -> &str { self.collection.as_str() }
         fn value(&self, field: &str) -> Option<String> { self.state.lock().unwrap().get(field).cloned() }
     }
-    impl ReactorEntity for TestEntity {
+    impl AbstractEntity for TestEntity {
         fn collection(&self) -> proto::CollectionId { self.collection.clone() }
         fn id(&self) -> proto::EntityId { self.id }
         fn value(&self, field: &str) -> Option<String> { self.state.lock().unwrap().get(field).cloned() }

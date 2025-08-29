@@ -6,16 +6,17 @@ use crate::{
     node::{MatchArgs, Node, TNodeErased},
     policy::{AccessDenied, PolicyAgent},
     reactor::{ReactorSubscription, ReactorUpdate},
-    resultset::ResultSet,
+    resultset::{EntityResultSet, ResultSet},
     retrieval::LocalRetriever,
     storage::{StorageCollectionWrapper, StorageEngine},
+    task,
     transaction::Transaction,
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use ankurah_signals::{
     broadcast::{BroadcastId, Listener, ListenerGuard},
     porcelain::subscribe::{IntoSubscribeListener, SubscriptionGuard},
-    Signal, Subscribe,
+    Get, Peek, Signal, Subscribe,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -53,12 +54,12 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
-    async fn query(
+    fn query(
         &self,
         sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
-    ) -> Result<LocalSubscription, RetrievalError>;
+    ) -> Result<(LocalSubscription, EntityResultSet), RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
 
@@ -75,27 +76,66 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         self.fetch_entities(collection, args).await
     }
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
-    async fn query(
+    fn query(
         &self,
         sub_id: proto::PredicateId,
         collection: &proto::CollectionId,
         args: MatchArgs,
-    ) -> Result<LocalSubscription, RetrievalError> {
+    ) -> Result<(LocalSubscription, EntityResultSet), RetrievalError> {
         // Create the ReactorSubscription
         let reactor_subscription = self.node.reactor.subscribe();
 
-        // Add the predicate
-        reactor_subscription.add_predicate(sub_id, collection, args.predicate.clone());
+        // Add the predicate and get the EntityResultSet
+        let entity_resultset = reactor_subscription.add_predicate(sub_id, collection, args.predicate.clone())?;
 
         // Create type-erased Subscription
         let subscription =
             LocalSubscription::new(Box::new(Node(self.node.0.clone())) as Box<dyn TNodeErased>, sub_id, reactor_subscription);
 
-        Ok(subscription)
+        // TODO: Spawn async initialization task
+        // For now, return with empty EntityResultSet - async initialization will populate it
+        // let node_clone = self.node.clone();
+        // let cdata_clone = self.cdata.clone();
+        // let collection_clone = collection.clone();
+        // let args_clone = args.clone();
+        // task::spawn(async move {
+        //     if let Err(e) = initialize_query_async(node_clone, cdata_clone, sub_id, collection_clone, args_clone).await {
+        //         warn!("Failed to initialize query: {:?}", e);
+        //     }
+        // });
+
+        Ok((subscription, entity_resultset))
     }
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
+}
+
+/// Async initialization function for query subscriptions
+async fn initialize_query_async<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static>(
+    node: Node<SE, PA>,
+    cdata: PA::ContextData,
+    predicate_id: proto::PredicateId,
+    collection_id: CollectionId,
+    args: MatchArgs,
+) -> Result<(), RetrievalError> {
+    let context = NodeAndContext { node, cdata };
+
+    // Fetch initial states from storage/peers
+    let initial_entities = context.fetch_entities(&collection_id, args).await?;
+
+    // Initialize the reactor with the fetched entities
+    context
+        .node
+        .reactor
+        .initialize(
+            context.node.reactor.subscribe().id(), // This is wrong, need to get the actual subscription ID
+            predicate_id,
+            initial_entities,
+        )
+        .map_err(|e| RetrievalError::from(e))?;
+
+    Ok(())
 }
 
 // This whole impl is conditionalized by the wasm feature flag
@@ -156,20 +196,18 @@ impl Context {
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 
-        let views = entities.into_iter().map(|entity| R::from_entity(entity)).collect();
-
-        Ok(ResultSet { items: views, loaded: true })
+        Ok(EntityResultSet::from_vec(entities, true).map::<R>())
     }
 
-    pub async fn fetch_one<R: View>(
+    pub async fn fetch_one<R: View + Clone + 'static>(
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
     ) -> Result<Option<R>, RetrievalError> {
-        let result_set = self.fetch::<R>(args).await?;
-        Ok(result_set.items.into_iter().next())
+        let views = self.fetch::<R>(args).await?;
+        Ok(views.into_iter().next())
     }
     /// Subscribe to changes in entities matching a predicate
-    pub async fn query<R>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<LiveQuery<R>, RetrievalError>
+    pub fn query<R>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<LiveQuery<R>, RetrievalError>
     where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
 
@@ -178,9 +216,11 @@ impl Context {
 
         // Using one subscription id for local and remote subscriptions
         let sub_id = proto::PredicateId::new();
-        // Now set up our local subscription
-        let handle = unimplemented!(); // self.0.query::<R>(sub_id, &collection_id, args).await?;
-        Ok(handle)
+        // Now set up our local subscription and get the EntityResultSet
+        let (local_subscription, entity_resultset) = self.0.query(sub_id, &collection_id, args)?;
+
+        // Create LiveQuery with the typed ResultSet
+        Ok(LiveQuery::new(local_subscription, entity_resultset))
     }
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.0.collection(id).await
@@ -402,7 +442,7 @@ impl LocalSubscription {
 impl Drop for LocalSubscription {
     fn drop(&mut self) {
         // Handle remote subscription cleanup
-        // TODO: Add relay.notify_unsubscribe, node.predicate_context.remove, node.pending_subs.remove
+        // FIXME: Add relay.notify_unsubscribe, node.predicate_context.remove, node.pending_subs.remove
         warn!("LocalSubscription dropped - remote cleanup not yet implemented");
     }
 }
@@ -410,6 +450,7 @@ impl Drop for LocalSubscription {
 impl Subscribe<ReactorUpdate> for LocalSubscription {
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<ReactorUpdate> {
+        // FIXME
         unimplemented!()
         // self.subscription.subscribe(listener)
     }
@@ -421,14 +462,18 @@ impl Subscribe<ReactorUpdate> for LocalSubscription {
 //     fn broadcast_id(&self) -> BroadcastId { self.subscription.broadcast_id() }
 // }
 
+// FIXME: LiveQuery needs to impl Clone so Subscribe can close over a clone to keep it alive until the SubscriptionGuard is dropped
 /// LiveQuery is a typed handle to a LocalSubscription that automatically wraps Entities in View: R
 pub struct LiveQuery<R: View> {
     local_subscription: LocalSubscription,
-    _phantom: std::marker::PhantomData<R>,
+    resultset: ResultSet<R>,
 }
 
 impl<R: View> LiveQuery<R> {
-    pub fn new(local_subscription: LocalSubscription) -> Self { Self { local_subscription, _phantom: std::marker::PhantomData } }
+    pub fn new(local_subscription: LocalSubscription, entity_resultset: EntityResultSet) -> Self {
+        let resultset = entity_resultset.map::<R>();
+        Self { local_subscription, resultset }
+    }
 }
 
 impl<R: View> std::fmt::Debug for LiveQuery<R> {
@@ -437,14 +482,22 @@ impl<R: View> std::fmt::Debug for LiveQuery<R> {
     }
 }
 
-// Implement Signal trait - delegate to the underlying subscription
-// impl<R: View> Signal for LiveQuery<R> {
-//     fn listen(&self, listener: Listener) -> ListenerGuard {
-//         self.local_subscription.listen(listener)
-//     }
+// Implement Signal trait - delegate to the resultset
+impl<R: View> Signal for LiveQuery<R> {
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.resultset.listen(listener) }
 
-//     fn broadcast_id(&self) -> BroadcastId { self.local_subscription.broadcast_id() }
-// }
+    fn broadcast_id(&self) -> BroadcastId { self.resultset.broadcast_id() }
+}
+
+// Implement Get trait - delegate to ResultSet<R>
+impl<R: View + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
+    fn get(&self) -> Vec<R> { self.resultset.get() }
+}
+
+// Implement Peek trait - delegate to ResultSet<R>
+impl<R: View + Clone + 'static> Peek<Vec<R>> for LiveQuery<R> {
+    fn peek(&self) -> Vec<R> { self.resultset.peek() }
+}
 
 // Implement Subscribe trait - convert ReactorUpdate to ChangeSet<R>
 impl<R: View> Subscribe<ChangeSet<R>> for LiveQuery<R>
@@ -454,10 +507,11 @@ where R: Clone + Send + Sync + 'static
     where L: IntoSubscribeListener<ChangeSet<R>> {
         let listener = listener.into_subscribe_listener();
 
+        let me = *self.clone();
         // Subscribe to the underlying ReactorUpdate stream and convert to ChangeSet<R>
         let guard = self.local_subscription.subscribe(move |reactor_update: ReactorUpdate| {
             // Convert ReactorUpdate to ChangeSet<R>
-            let changeset = convert_reactor_update_to_changeset::<R>(reactor_update);
+            let changeset: ChangeSet<R> = (me.resultset.clone(), reactor_update).into();
             listener(changeset);
         });
 
@@ -465,37 +519,34 @@ where R: Clone + Send + Sync + 'static
     }
 }
 
-// Helper function to convert ReactorUpdate to ChangeSet<R>
-fn convert_reactor_update_to_changeset<R: View + Clone>(reactor_update: ReactorUpdate) -> ChangeSet<R> {
-    use crate::changes::ItemChange;
-    use crate::resultset::ResultSet;
+impl<R: View + Clone> From<(ResultSet<R>, ReactorUpdate)> for ChangeSet<R> {
+    fn from((resultset, reactor_update): (ResultSet<R>, ReactorUpdate)) -> Self {
+        use crate::changes::{ChangeSet, ItemChange};
 
-    let mut changes = Vec::new();
-    let mut result_items = Vec::new();
+        let mut changes = Vec::new();
 
-    for item in reactor_update.items {
-        let view = R::from_entity(item.entity.clone());
+        for item in reactor_update.items {
+            let view = R::from_entity(item.entity.clone());
 
-        // Determine the change type based on predicate relevance
-        if let Some((_, membership_change)) = item.predicate_relevance.first() {
-            match membership_change {
-                crate::reactor::MembershipChange::Initial => {
-                    changes.push(ItemChange::Initial { item: view.clone() });
+            // Determine the change type based on predicate relevance
+            if let Some((_, membership_change)) = item.predicate_relevance.first() {
+                match membership_change {
+                    crate::reactor::MembershipChange::Initial => {
+                        changes.push(ItemChange::Initial { item: view.clone() });
+                    }
+                    crate::reactor::MembershipChange::Add => {
+                        changes.push(ItemChange::Add { item: view.clone(), events: item.events });
+                    }
+                    crate::reactor::MembershipChange::Remove => {
+                        changes.push(ItemChange::Remove { item: view.clone(), events: item.events });
+                    }
                 }
-                crate::reactor::MembershipChange::Add => {
-                    changes.push(ItemChange::Add { item: view.clone(), events: item.events });
-                }
-                crate::reactor::MembershipChange::Remove => {
-                    changes.push(ItemChange::Remove { item: view.clone(), events: item.events });
-                }
+            } else {
+                // No membership change, just an update
+                changes.push(ItemChange::Update { item: view.clone(), events: item.events });
             }
-        } else {
-            // No membership change, just an update
-            changes.push(ItemChange::Update { item: view.clone(), events: item.events });
         }
 
-        result_items.push(view);
+        ChangeSet { changes, resultset }
     }
-
-    ChangeSet { changes, resultset: ResultSet { loaded: true, items: result_items } }
 }

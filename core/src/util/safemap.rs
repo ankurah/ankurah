@@ -63,6 +63,12 @@ where K: Clone
     pub fn keys(&self) -> Vec<K> { self.0.read().expect("Failed to lock the map").keys().cloned().collect() }
 }
 
+impl<K: Hash + Eq, V> SafeMap<K, V>
+where V: Clone + 'static
+{
+    pub fn values(&self) -> Vec<V> { self.0.read().expect("Failed to lock the map").values().cloned().collect() }
+}
+
 impl<K: Hash + Eq, H: PartialEq> SafeMap<K, Vec<H>> {
     pub fn push(&self, key: K, value: H) {
         //

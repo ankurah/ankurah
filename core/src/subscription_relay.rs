@@ -605,8 +605,8 @@ mod tests {
         let mock_sender = Arc::new(MockMessageSender::<CollectionId>::new());
         relay.set_message_sender(mock_sender.clone()).expect("Failed to set message sender");
 
-        let retryable_sub_id = proto::SubscriptionId::new();
-        let non_retryable_sub_id = proto::SubscriptionId::new();
+        let retryable_sub_id = proto::PredicateId::new();
+        let non_retryable_sub_id = proto::PredicateId::new();
         let collection_id = create_test_collection_id();
         let predicate = create_test_predicate();
         let peer_id = EntityId::new();

@@ -464,24 +464,31 @@ where
         };
 
         match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { predicate_id, items } => {
+            proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 // TODO check if this is a valid subscription
                 action_debug!(self, "received subscription update for {} items", "{}", items.len());
-                if let Some(cdata) = self.predicate_context.get(&predicate_id) {
-                    let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
 
-                    // Signal any pending subscription waiting for first update
-                    if let Some(tx) = self.pending_predicate_subs.remove(&predicate_id) {
-                        let initial_states = items.iter().cloned().filter_map(|item| item.try_into().ok()).collect();
-                        self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
-                        let _ = tx.send(initial_states); // Ignore if receiver was dropped
-                    } else {
-                        self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
-                    }
-                } else {
-                    error!("Received subscription update for unknown predicate {}", predicate_id);
-                    return Err(anyhow!("Received subscription update for unknown predicate {}", predicate_id));
-                }
+                // FIXME: This is wrong - an update may pertain to multiple predicate subscriptions
+                // each update should be applied to the node and the reactor. The reactor will figure out what to do with it beyond that
+                // maybe we need to make a list of predicates with Initial changes - or better yet include a separate list of predicates which should be initialized for this update
+                // we generally do not want to be in the business of making decisions based on aggregated values from a list of updates
+                unimplemented!("This is wrong - an update may pertain to multiple predicate subscriptions");
+
+                // if let Some(cdata) = self.predicate_context.get(&predicate_id) {
+                //     let nodeandcontext = NodeAndContext { node: self.clone(), cdata };
+
+                //     // Signal any pending subscription waiting for first update
+                //     if let Some(tx) = self.pending_predicate_subs.remove(&predicate_id) {
+                //         let initial_states = items.iter().cloned().filter_map(|item| item.try_into().ok()).collect();
+                //         self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
+                //         let _ = tx.send(initial_states); // Ignore if receiver was dropped
+                //     } else {
+                //         self.apply_subscription_updates(&notification.from, items, nodeandcontext).await?;
+                //     }
+                // } else {
+                //     error!("Received subscription update for unknown predicate {}", predicate_id);
+                //     return Err(anyhow!("Received subscription update for unknown predicate {}", predicate_id));
+                // }
 
                 Ok(())
             }
@@ -781,7 +788,7 @@ where
             //     }
 
             //     // Always send subscription update, even if empty
-            //     node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { subscription_id: predicate_id, items: updates });
+            //     node.send_update(peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items: updates });
             // };
 
             let storage_collection = self.collections.get(&collection_id).await?;

@@ -12,7 +12,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
     #[cfg(feature = "wasm")]
     let resultset_name = format_ident!("{}ResultSet", name);
     #[cfg(feature = "wasm")]
-    let resultset_signal_name = format_ident!("{}ResultSetSignal", name);
+    let livequery_name = format_ident!("{}LiveQuery", name);
 
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
@@ -78,7 +78,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         // We have to generate the typescript interface for the static methods because the name of the pojo interface is different from the name of the model class
         // Maybe there's a more elegant way to do this later, but this gets the job done.
-        let static_methods_ts = get_static_methods_ts(&name, &view_name, &resultset_signal_name, &pojo_interface);
+        let static_methods_ts = get_static_methods_ts(&name, &view_name, &livequery_name, &pojo_interface);
 
         quote! {
 
@@ -102,46 +102,10 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         Ok(#resultset_name(::std::sync::Arc::new(resultset)))
                     }
 
-                    pub fn query (context: &ankurah::core::context::Context, predicate: String) -> Result<#resultset_signal_name, ::wasm_bindgen::JsValue> {
-                        // let handle = ::std::sync::Arc::new(::std::sync::OnceLock::new());
-                        // let signal = ::ankurah::signals::Mut::new(#resultset_name::default());
-                        // let signal_clone = signal.clone();
-
-                        unimplemented!()
-                        // let context2 = (*context).clone();
-                        // let handle2 = handle.clone();
-                        // let future = Box::pin(async move {
-                        //     // Direct method call on Mut - no trait needed
-                        //     let livequery = context2.query(predicate.as_str());
-
-                        //     livequery.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                        //             // LEFT OFF HERE - ReactorUpdateItem no longer has a resultset
-                        //             signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
-                        //         })
-                        //         .await;
-
-                        //     // TODO: update this to use LiveQuery<R>. something like:
-                        //     // let livequery = context2.query(predicate);
-                        //     // livequery.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                        //     //     signal_clone.set(#resultset_name(::std::sync::Arc::new(changeset.resultset)));
-                        //     // });
-                            
-
-                        //     match handle {
-                        //         Ok(h) => {
-                        //             handle2.set(h).unwrap();
-                        //         }
-                        //         Err(e) => {
-                        //             error!("Failed to subscribe to changes: {} for predicate: {}", e, predicate);
-                        //         }
-                        //     }
-                        // });
-                        // wasm_bindgen_futures::spawn_local(future);
-
-                        // Ok(#resultset_signal_name{
-                        //     sig: Box::new(signal.read()),
-                        //     handle: Box::new(handle)
-                        // })
+                    pub fn query (context: &ankurah::core::context::Context, predicate: String) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
+                        let livequery = context.query::<#view_name>(predicate.as_str())
+                            .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                        Ok(#livequery_name { inner: livequery })
                     }
 
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
@@ -164,22 +128,72 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 const TS_APPEND_CONTENT: &'static str = #static_methods_ts;
 
                 #[wasm_bindgen]
-                #[derive(ankurah::WasmSignal, Clone, Default)]
-                pub struct #resultset_name(::std::sync::Arc<::ankurah::core::resultset::ResultSet<#view_name>>);
+                #[derive(Clone, Default)]
+                pub struct #resultset_name(::ankurah::core::resultset::ResultSet<#view_name>);
 
                 #[wasm_bindgen]
                 impl #resultset_name {
                     #[wasm_bindgen(getter)]
                     pub fn items(&self) -> Vec<#view_name> {
-                        self.0.items.to_vec()
+                        use ::ankurah::signals::Peek;
+                        self.0.get()
                     }
                     pub fn by_id(&self, id: ::ankurah::proto::EntityId) -> Option<#view_name> {
-                        self.0.items.iter().find(|item| item.id() == id).map(|item| item.clone())
+                        CurrentObserver::track(&self);
+                        self.0.by_id(&id)
                         // todo generate a map on demand if there are more than a certain number of items (benchmark this)
                     }
                     #[wasm_bindgen(getter)]
                     pub fn loaded(&self) -> bool {
-                        self.0.loaded
+                        self.0.is_loaded()
+                    }
+                }
+
+                impl ankurah::signals::Signal for #resultset_name {
+                    fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
+                        self.0.reference().listen(listener)
+                    }
+                    fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
+                        self.0.id()
+                    }
+                }
+
+                #[wasm_bindgen]
+                pub struct #livequery_name(::ankurah::core::context::LiveQuery<#view_name>);
+
+                #[wasm_bindgen]
+                impl #livequery_name {
+                    pub fn items(&self) -> Vec<#view_name> {
+                        use ::ankurah::signals::Signal;
+                        CurrentObserver::track(&self);
+                        self.0.resultset.()
+                    }
+                    #[wasm_bindgen(getter)]
+                    pub fn value(&self) -> #resultset_name {
+                        use ::ankurah::signals::Signal;
+                        CurrentObserver::track(&self);
+                        #resultset_name(::std::sync::Arc::new(self.0.peek()))
+                    }
+
+                    #[wasm_bindgen(getter)]
+                    pub fn peek(&self) -> #resultset_name {
+                        use ::ankurah::signals::Peek;
+                        self.0.peek()
+                    }
+
+                    pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
+                        use ::ankurah::signals::Subscribe;
+                        let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
+                        
+                        self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                            // The ChangeSet already contains a ResultSet<View>, just wrap it
+                            let resultset = #resultset_name(::std::sync::Arc::new(changeset.resultset));
+                            
+                            let _ = callback.call1(
+                                &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
+                                &resultset.into()
+                            );
+                        })
                     }
                 }
             };
@@ -517,7 +531,7 @@ pub fn expand_ts_model_type(input: &DeriveInput, interface_name: String) -> syn:
 fn get_static_methods_ts(
     name: &syn::Ident,
     view_name: &syn::Ident,
-    resultset_signal_name: &syn::Ident,
+    livequery_name: &syn::Ident,
     pojo_interface: &syn::Ident,
 ) -> String {
     format!(
@@ -535,7 +549,7 @@ fn get_static_methods_ts(
         /**
          * Subscribe to the set of {name}s that match the predicate
          */
-        static query(context: Context, predicate: string): {resultset_signal_name};
+        static query(context: Context, predicate: string): {livequery_name};
 
         /**
          * Create a new {name}

@@ -14,7 +14,7 @@ pub struct UpdateId(Ulid);
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeUpdateBody {
     /// New events for a subscription
-    SubscriptionUpdate { predicate_id: PredicateId, items: Vec<SubscriptionUpdateItem> },
+    SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
 }
 
 /// Content of an update - either state, events, or both
@@ -164,8 +164,8 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeUpdateBody::SubscriptionUpdate { predicate_id, items } => {
-                write!(f, "SubscriptionUpdate {predicate_id} [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
+            NodeUpdateBody::SubscriptionUpdate { items } => {
+                write!(f, "SubscriptionUpdate [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
             }
         }
     }

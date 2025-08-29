@@ -180,6 +180,10 @@ impl From<AccessDenied> for RetrievalError {
     fn from(err: AccessDenied) -> Self { RetrievalError::AccessDenied(err) }
 }
 
+impl From<SubscriptionError> for RetrievalError {
+    fn from(err: SubscriptionError) -> Self { RetrievalError::Anyhow(anyhow::anyhow!("Subscription error: {:?}", err)) }
+}
+
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error("serialization error: {0}")]

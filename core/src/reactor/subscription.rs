@@ -1,7 +1,7 @@
 use crate::{
     error::SubscriptionError,
-    reactor::{Reactor, ReactorEntity, ReactorUpdate},
-    util::safemap::SafeMap,
+    reactor::{AbstractEntity, Reactor, ReactorUpdate},
+    resultset::EntityResultSet,
 };
 
 use ankurah_proto::{self as proto};
@@ -26,13 +26,13 @@ impl std::fmt::Display for ReactorSubscriptionId {
 }
 
 /// Inner state for ReactorSubscription
-pub(super) struct ReactorSubInner<E: ReactorEntity, Ev> {
+pub(super) struct ReactorSubInner<E: AbstractEntity, Ev> {
     pub(super) subscription_id: ReactorSubscriptionId,
     pub(super) reactor: Reactor<E, Ev>,
     pub(super) broadcast: Broadcast<ReactorUpdate<E, Ev>>,
 }
 
-impl<E: ReactorEntity, Ev> Drop for ReactorSubInner<E, Ev> {
+impl<E: AbstractEntity, Ev> Drop for ReactorSubInner<E, Ev> {
     fn drop(&mut self) {
         // Automatically unsubscribe when the ReactorSubscription is dropped
         let _ = self.reactor.unsubscribe(self.subscription_id);
@@ -40,11 +40,11 @@ impl<E: ReactorEntity, Ev> Drop for ReactorSubInner<E, Ev> {
 }
 
 /// A handle to a reactor subscription that automatically cleans up on drop
-pub struct ReactorSubscription<E: ReactorEntity = crate::entity::Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(
+pub struct ReactorSubscription<E: AbstractEntity = crate::entity::Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(
     pub(super) Arc<ReactorSubInner<E, Ev>>,
 );
 
-impl<E: ReactorEntity, Ev: Clone> ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity, Ev: Clone> ReactorSubscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
@@ -54,7 +54,7 @@ impl<E: ReactorEntity, Ev: Clone> ReactorSubscription<E, Ev> {
         predicate_id: proto::PredicateId,
         collection_id: &proto::CollectionId,
         predicate: ankql::ast::Predicate,
-    ) -> Result<Arc<SafeMap<proto::EntityId, E>>, SubscriptionError> {
+    ) -> Result<EntityResultSet<E>, SubscriptionError> {
         self.0.reactor.add_predicate(self.0.subscription_id, predicate_id, collection_id, predicate)
     }
 
@@ -76,12 +76,12 @@ impl<E: ReactorEntity, Ev: Clone> ReactorSubscription<E, Ev> {
     }
 }
 
-impl<E: ReactorEntity, Ev> Clone for ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity, Ev> Clone for ReactorSubscription<E, Ev> {
     fn clone(&self) -> Self { ReactorSubscription(self.0.clone()) }
 }
 
 // Implement Subscribe trait for ReactorUpdate
-impl<E: ReactorEntity + 'static, Ev: Clone + 'static> Subscribe<ReactorUpdate<E, Ev>> for ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity + 'static, Ev: Clone + 'static> Subscribe<ReactorUpdate<E, Ev>> for ReactorSubscription<E, Ev> {
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<ReactorUpdate<E, Ev>> {
         let listener = listener.into_subscribe_listener();

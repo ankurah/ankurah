@@ -39,7 +39,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Subscribe on the client with predicate year >= 2020
     let (watcher, check) = common::watcher::<AlbumView, _, _>(|change| (change.entity().year().unwrap_or_default()));
-    let handle = client_ctx.query("year >= '2020'", watcher).await?;
+    let handle = client_ctx.query("year >= '2020'")?.subscribe(watcher);
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Should get both albums initially
@@ -72,7 +72,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Resubscribe on the client
     let (watcher2, check2) = common::watcher::<AlbumView, String, _>(|change| change.entity().year().unwrap_or_default());
     // in the repro, it's failling here rather than on the arrival of the StateFragment
-    let _handle2 = client_ctx.query("year >= '2020'", watcher2).await.expect("failed to resubscribe");
+    let _handle2 = client_ctx.query("year >= '2020'").expect("failed to resubscribe").subscribe(watcher2);
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // The client should receive only album1 with the correct state (year = "2020")
@@ -120,7 +120,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Fetch on the client with predicate year >= 2020
     let initial_fetch = client_ctx.fetch::<AlbumView>("year >= '2020'").await?;
-    let initial_years: Vec<String> = initial_fetch.items.iter().map(|album| album.year().unwrap_or_default()).collect();
+    let initial_years: Vec<String> = initial_fetch.iter().map(|album| album.year().unwrap_or_default()).collect();
     assert_eq!(vec!["2020", "2020"], initial_years);
 
     // actually zero events because we receive states directly
@@ -143,7 +143,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("MARK test.refetch");
     // Fetch again on the client
     let refetch = client_ctx.fetch::<AlbumView>("year >= '2020'").await?;
-    let refetch_years: Vec<String> = refetch.items.iter().map(|album| album.year().unwrap_or_default()).collect();
+    let refetch_years: Vec<String> = refetch.iter().map(|album| album.year().unwrap_or_default()).collect();
 
     // The client should receive only album1 with the correct state (year = "2020")
     // Album2 should not be returned since it no longer matches (year = "2019")

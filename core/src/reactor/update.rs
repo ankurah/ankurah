@@ -1,7 +1,6 @@
 use crate::{
     changes::{ChangeSet, ItemChange},
     entity::Entity,
-    resultset::ResultSet,
 };
 use ankurah_proto::{self as proto, Attested, Event};
 
@@ -47,37 +46,5 @@ impl<E, Ev: Clone> ReactorUpdateItem<E, Ev> {
     pub fn is_entity_only(&self) -> bool { self.entity_subscribed && self.predicate_relevance.is_empty() }
 }
 
-// Conversion from ReactorUpdate to ChangeSet for local subscriptions
-impl From<ReactorUpdate> for ChangeSet<Entity> {
-    fn from(update: ReactorUpdate) -> Self {
-        // Local subscriptions have exactly one predicate
-        let mut changes = Vec::new();
-        let mut all_entities = Vec::new();
-
-        for item in update.items {
-            all_entities.push(item.entity.clone());
-
-            // Get the membership change for the single predicate (if any)
-            let membership = item.predicate_relevance.first().map(|(_, m)| m);
-
-            let change = match membership {
-                Some(MembershipChange::Initial) => ItemChange::Initial { item: item.entity },
-                Some(MembershipChange::Add) => ItemChange::Add { item: item.entity, events: item.events },
-                Some(MembershipChange::Remove) => ItemChange::Remove { item: item.entity, events: item.events },
-                None if item.entity_subscribed => {
-                    // Entity subscription update without predicate membership change
-                    ItemChange::Update { item: item.entity, events: item.events }
-                }
-                None if !item.events.is_empty() => {
-                    // Entity still matches predicate and has changes
-                    ItemChange::Update { item: item.entity, events: item.events }
-                }
-                _ => continue, // Skip items with no relevance
-            };
-
-            changes.push(change);
-        }
-
-        ChangeSet { changes, resultset: ResultSet { loaded: true, items: all_entities } }
-    }
-}
+// Note: ReactorUpdate to ChangeSet<Entity> conversion removed since Entity doesn't implement View
+// ReactorUpdate should be converted to ChangeSet<R> at the LiveQuery level instead

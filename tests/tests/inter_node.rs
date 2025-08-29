@@ -11,7 +11,7 @@ use tracing::info;
 use common::{Album, AlbumView, Pet, PetView};
 
 pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> {
-    resultset.items.iter().map(|r| r.name().value().unwrap_or_default()).collect::<Vec<String>>()
+    resultset.iter().map(|r| r.name().value().unwrap_or_default()).collect::<Vec<String>>()
 }
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn server_edits_subscription() -> Result<()> {
     let client = client.context(c)?;
 
     let (server_watcher, check_server) = common::changeset_watcher::<PetView>();
-    let _server_handle = server.query("name = 'Rex' OR (age > 2 and age < 5)", server_watcher).await?;
+    let _server_handle = server.query("name = 'Rex' OR (age > 2 and age < 5)")?.subscribe(server_watcher);
 
     assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
 
@@ -108,7 +108,9 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Set up subscription on node2
     let (client_watcher, check_client) = common::changeset_watcher::<PetView>();
-    let _client_handle = client.query("name = 'Rex' OR (age > 2 and age < 5)", client_watcher).await?;
+    // FIXME: Does the SubscriptionGuard keep the LiveQuery<PetView> alive? I think it should, but we need to test it
+    // In this example, the LiveQuery<PetView> returned by client.query() gets immediately dropped, so hopefully the subscribe closure keeps a clone alive
+    let _client_handle = client.query("name = 'Rex' OR (age > 2 and age < 5)")?.subscribe(client_watcher);
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -214,8 +216,8 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     let (client_b_watcher, check_client_b) = common::changeset_watcher::<AlbumView>();
 
     // Set up subscriptions
-    let _server_sub = server.query("name = 'Origin of Symmetry'", server_watcher).await?;
-    let _client_b_sub = client_b.query("name = 'Origin of Symmetry'", client_b_watcher).await?;
+    let _server_sub = server.query("name = 'Origin of Symmetry'")?.subscribe(server_watcher);
+    let _client_b_sub = client_b.query("name = 'Origin of Symmetry'")?.subscribe(client_b_watcher);
 
     // Create an entity on client_a
     let album_id = {
@@ -270,7 +272,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Set up query subscription on client that matches our pet
     let (query_watcher, check_query_changes) = common::changeset_watcher::<PetView>();
-    let query_handle = client.query("name = 'Buddy'", query_watcher).await?;
+    let query_handle = client.query("name = 'Buddy'")?.subscribe(query_watcher);
 
     // Wait for initial sync
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -398,9 +400,9 @@ async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
 
     // Use fetch() to get the entity on client (no ongoing subscription)
     let fetch_result = client.fetch::<PetView>("name = 'Luna'").await?;
-    assert_eq!(fetch_result.items.len(), 1, "Should fetch one pet");
+    assert_eq!(fetch_result.len(), 1, "Should fetch one pet");
 
-    let client_pet = &fetch_result.items[0];
+    let client_pet = fetch_result.iter().next().unwrap();
 
     // Set up View/field subscriptions on the fetched entity
     let (view_watcher, check_view_changes) = common::generic_watcher::<PetView>();
