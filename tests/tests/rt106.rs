@@ -70,6 +70,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Resubscribe on the client
     let (watcher2, check2) = common::watcher::<AlbumView, String, _>(|change| change.entity().year().unwrap_or_default());
     // in the repro, it's failling here rather than on the arrival of the StateFragment
+    use ankurah::signals::Subscribe;
     let _handle2 = client_ctx.query("name = 'Test Album'").expect("failed to resubscribe").subscribe(watcher2);
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 

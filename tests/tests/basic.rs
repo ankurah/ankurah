@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
 mod pg_common;
-use ankurah::signals::Subscribe;
+use ankurah::signals::{CallbackObserver, Subscribe};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 

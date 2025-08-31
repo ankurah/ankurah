@@ -30,12 +30,11 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     let received_changesets_clone = received_changesets.clone();
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
-    let _handle = ctx
-        .query(predicate, move |changeset: ChangeSet<AlbumView>| {
-            let mut received = received_changesets_clone.lock().unwrap();
-            received.push(changeset);
-        })
-        .await?;
+    use ankurah::signals::Subscribe;
+    let _handle = ctx.query(predicate)?.subscribe(move |changeset: ChangeSet<AlbumView>| {
+        let mut received = received_changesets_clone.lock().unwrap();
+        received.push(changeset);
+    });
 
     // Initial state should have Two Vines and Ask That God
     {
@@ -49,8 +48,8 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     // Update an entity
     {
         let trx = ctx.begin();
-        let albums: ResultSet<AlbumView> = ctx.fetch("name = 'Ice on the Dune'").await?;
-        let album = albums.items[0].edit(&trx)?;
+        let albums: Vec<AlbumView> = ctx.fetch("name = 'Ice on the Dune'").await?;
+        let album = albums[0].edit(&trx)?;
         album.year().overwrite(0, 4, "2020")?;
         trx.commit().await?;
     }
@@ -77,7 +76,8 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     let (watcher, check) = common::changeset_watcher::<PetView>();
 
     // Subscribe to changes
-    let _handle = ctx.query("name = 'Rex' OR (age > 2 and age < 5)", watcher).await.unwrap();
+    use ankurah::signals::Subscribe;
+    let _handle = ctx.query("name = 'Rex' OR (age > 2 and age < 5)")?.subscribe(watcher);
 
     let (rex, snuffy, jasper);
     {

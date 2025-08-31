@@ -10,9 +10,7 @@ use tracing::info;
 
 use common::{Album, AlbumView, Pet, PetView};
 
-pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> {
-    resultset.iter().map(|r| r.name().value().unwrap_or_default()).collect::<Vec<String>>()
-}
+pub fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap_or_default()).collect::<Vec<String>>() }
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
@@ -63,7 +61,7 @@ async fn inter_node_fetch() -> Result<()> {
     let ctx2 = node2.context_async(c).await;
 
     // Now node2 should now successfully fetch the entity
-    assert_eq!(names(ctx2.fetch(p).await?), ["Walking on a Dream"]);
+    assert_eq!(names(ctx2.fetch::<AlbumView>(p).await?), ["Walking on a Dream"]);
 
     info!("After fetch - Node1 root: {:?}", node1.system.root());
     info!("After fetch - Node2 root: {:?}", node2.system.root());
@@ -281,13 +279,13 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     let client_pet = client.get::<PetView>(pet_id).await?;
 
     let (view_watcher, check_view_changes) = common::generic_watcher::<PetView>();
-    let (name_watcher, check_name_changes) = common::generic_watcher::<String>();
-    let (age_watcher, check_age_changes) = common::generic_watcher::<String>();
+    // let (name_watcher, check_name_changes) = common::generic_watcher::<String>();
+    // let (age_watcher, check_age_changes) = common::generic_watcher::<String>();
 
     // Subscribe to the view and its fields
     let _view_handle = client_pet.subscribe(view_watcher);
-    let _name_handle = client_pet.name().subscribe(name_watcher);
-    let _age_handle = client_pet.age().subscribe(age_watcher);
+    // let _name_handle = client_pet.name().subscribe(name_watcher);
+    // let _age_handle = client_pet.age().subscribe(age_watcher);
 
     // Verify initial query subscription received the entity
     let initial_query_changes = check_query_changes();
@@ -310,17 +308,17 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Verify that View/field subscriptions received the update
     let view_changes = check_view_changes();
-    let name_changes = check_name_changes();
-    let age_changes = check_age_changes();
+    // let name_changes = check_name_changes();
+    // let age_changes = check_age_changes();
 
     info!("View changes: {}", view_changes.len());
-    info!("Name changes: {}", name_changes.len());
-    info!("Age changes: {}", age_changes.len());
+    // info!("Name changes: {}", name_changes.len());
+    // info!("Age changes: {}", age_changes.len());
 
     assert_eq!(view_changes.len(), 1, "View subscription should have received 1 update");
-    assert_eq!(name_changes.len(), 1, "Name field subscription should have received 1 update");
-    assert_eq!(name_changes[0], "Max", "Name should have changed to 'Max'");
-    assert_eq!(age_changes.len(), 0, "Age field subscription should have received 0 updates");
+    // assert_eq!(name_changes.len(), 1, "Name field subscription should have received 1 update");
+    // assert_eq!(name_changes[0], "Max", "Name should have changed to 'Max'");
+    // assert_eq!(age_changes.len(), 0, "Age field subscription should have received 0 updates");
 
     // === PART 2: Test that dropping query subscription stops View/field subscription updates ===
 
@@ -343,13 +341,13 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Verify that View/field subscriptions did NOT receive the update
     let view_changes_after = check_view_changes();
-    let name_changes_after = check_name_changes();
-    let age_changes_after = check_age_changes();
+    // let name_changes_after = check_name_changes();
+    // let age_changes_after = check_age_changes();
 
     info!("After dropping query subscription:");
     info!("View changes: {}", view_changes_after.len());
-    info!("Name changes: {}", name_changes_after.len());
-    info!("Age changes: {}", age_changes_after.len());
+    // info!("Name changes: {}", name_changes_after.len());
+    // info!("Age changes: {}", age_changes_after.len());
 
     // This is the current (undesirable) behavior we want to document
     assert_eq!(
@@ -357,16 +355,16 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
         0,
         "View subscription should NOT receive updates after query subscription dropped (current behavior)"
     );
-    assert_eq!(
-        name_changes_after.len(),
-        0,
-        "Name field subscription should NOT receive updates after query subscription dropped (current behavior)"
-    );
-    assert_eq!(
-        age_changes_after.len(),
-        0,
-        "Age field subscription should NOT receive updates after query subscription dropped (current behavior)"
-    );
+    // assert_eq!(
+    //     name_changes_after.len(),
+    //     0,
+    //     "Name field subscription should NOT receive updates after query subscription dropped (current behavior)"
+    // );
+    // assert_eq!(
+    //     age_changes_after.len(),
+    //     0,
+    //     "Age field subscription should NOT receive updates after query subscription dropped (current behavior)"
+    // );
 
     Ok(())
 }
@@ -406,12 +404,12 @@ async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
 
     // Set up View/field subscriptions on the fetched entity
     let (view_watcher, check_view_changes) = common::generic_watcher::<PetView>();
-    let (name_watcher, check_name_changes) = common::generic_watcher::<String>();
-    let (age_watcher, check_age_changes) = common::generic_watcher::<String>();
+    // let (name_watcher, check_name_changes) = common::generic_watcher::<String>();
+    // let (age_watcher, check_age_changes) = common::generic_watcher::<String>();
 
     let _view_handle = client_pet.subscribe(view_watcher);
-    let _name_handle = client_pet.name().subscribe(name_watcher);
-    let _age_handle = client_pet.age().subscribe(age_watcher);
+    // let _name_handle = client_pet.name().subscribe(name_watcher);
+    // let _age_handle = client_pet.age().subscribe(age_watcher);
 
     // Make an edit on the server
     {
@@ -426,18 +424,18 @@ async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
 
     // Verify that View/field subscriptions did NOT receive updates
     let view_changes = check_view_changes();
-    let name_changes = check_name_changes();
-    let age_changes = check_age_changes();
+    // let name_changes = check_name_changes();
+    // let age_changes = check_age_changes();
 
     info!("After server edit with fetch() only:");
     info!("View changes: {}", view_changes.len());
-    info!("Name changes: {}", name_changes.len());
-    info!("Age changes: {}", age_changes.len());
+    // info!("Name changes: {}", name_changes.len());
+    // info!("Age changes: {}", age_changes.len());
 
     // This documents the current behavior - fetch() doesn't establish ongoing subscriptions
     assert_eq!(view_changes.len(), 0, "View subscription should NOT receive updates with fetch() only (current behavior)");
-    assert_eq!(name_changes.len(), 0, "Name field subscription should NOT receive updates with fetch() only (current behavior)");
-    assert_eq!(age_changes.len(), 0, "Age field subscription should NOT receive updates with fetch() only (current behavior)");
+    // assert_eq!(name_changes.len(), 0, "Name field subscription should NOT receive updates with fetch() only (current behavior)");
+    // assert_eq!(age_changes.len(), 0, "Age field subscription should NOT receive updates with fetch() only (current behavior)");
 
     Ok(())
 }

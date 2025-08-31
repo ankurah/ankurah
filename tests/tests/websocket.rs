@@ -50,7 +50,7 @@ async fn test_websocket_client_server_fetch() -> Result<()> {
 
     // Test fetching data through websocket connection
     let query = "name = 'Dark Side of the Moon'";
-    let results = client_ctx.fetch(query).await?;
+    let results = client_ctx.fetch::<AlbumView>(query).await?;
     assert_eq!(names(results), ["Dark Side of the Moon"]);
 
     // Test broader query
@@ -133,8 +133,9 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
     let (client_watcher, check_client) = changeset_watcher::<AlbumView>();
 
     // Subscribe on both ends
-    let _server_sub = server_ctx.query("name = 'Abbey Road'", server_watcher).await?;
-    let _client_sub = client_ctx.query("name = 'Abbey Road'", client_watcher).await?;
+    use ankurah::signals::Subscribe;
+    let _server_sub = server_ctx.query("name = 'Abbey Road'")?.subscribe(server_watcher);
+    let _client_sub = client_ctx.query("name = 'Abbey Road'")?.subscribe(client_watcher);
 
     // Initial state should be empty
     assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
@@ -204,8 +205,9 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     let (client_watcher, check_client) = changeset_watcher::<PetView>();
 
     // Subscribe to pets with age > 5
-    let _server_sub = server_ctx.query("age > 5", server_watcher).await?;
-    let _client_sub = client_ctx.query("age > 5", client_watcher).await?;
+    use ankurah::signals::Subscribe;
+    let _server_sub = server_ctx.query("age > 5")?.subscribe(server_watcher);
+    let _client_sub = client_ctx.query("age > 5")?.subscribe(client_watcher);
 
     // Create pet on server
     let server_pet_id = {
@@ -267,9 +269,7 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
 }
 
 /// Helper to extract names from album query results
-fn names(resultset: ankurah::ResultSet<AlbumView>) -> Vec<String> {
-    resultset.items.iter().map(|r| r.name().unwrap()).collect::<Vec<String>>()
-}
+fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap()).collect::<Vec<String>>() }
 
 /// Start a test websocket server and return the server node, URL, and task handle
 async fn start_test_server() -> Result<(Node<SledStorageEngine, PermissiveAgent>, String, tokio::task::JoinHandle<()>)> {
