@@ -10,7 +10,7 @@ use ankurah_signals::{
     porcelain::subscribe::{IntoSubscribeListener, SubscriptionGuard},
     Get, Peek, Signal, Subscribe,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     changes::ChangeSet,
@@ -38,6 +38,8 @@ struct Inner {
     pub(crate) resultset: EntityResultSet,
     pub(crate) has_error: AtomicBool,
     pub(crate) error: std::sync::Mutex<Option<RetrievalError>>,
+    pub(crate) initialized: tokio::sync::Notify,
+    pub(crate) is_initialized: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -71,21 +73,43 @@ impl EntityLiveQuery {
             resultset,
             has_error: AtomicBool::new(false),
             error: std::sync::Mutex::new(None),
+            initialized: tokio::sync::Notify::new(),
+            is_initialized: std::sync::atomic::AtomicBool::new(false),
         }));
 
         let me2 = me.clone();
         let node = node.clone(); // initialize needs the typed node. Drop only needs the erased node.
 
+        debug!("LiveQuery::new() spawning initialization task for predicate {}", predicate_id);
         crate::task::spawn(async move {
+            debug!("LiveQuery initialization task starting for predicate {}", predicate_id);
             if let Err(e) = me2.initialize(node, collection_id, predicate_id, args, rx).await {
+                debug!("LiveQuery initialization failed for predicate {}: {}", predicate_id, e);
                 me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
                 *me2.0.error.lock().unwrap() = Some(e);
+            } else {
+                debug!("LiveQuery initialization completed for predicate {}", predicate_id);
             }
+
+            // Signal that initialization is complete (success or failure)
+            me2.0.is_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+            me2.0.initialized.notify_waiters();
         });
 
         Ok(me)
     }
     pub fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
+
+    /// Wait for the LiveQuery to be fully initialized with initial states
+    pub async fn wait_initialized(&self) {
+        // If already initialized, return immediately
+        if self.0.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        // Otherwise wait for the notification
+        self.0.initialized.notified().await;
+    }
 
     async fn initialize<SE, PA>(
         &self,
@@ -113,6 +137,13 @@ impl EntityLiveQuery {
             _ => storage_collection.fetch_states(&args.predicate).await?,
         };
 
+        debug!(
+            "LiveQuery.initialize() fetched {} initial states for predicate {} with filter {:?}",
+            initial_states.len(),
+            predicate_id,
+            args.predicate
+        );
+
         // Convert states to entities
         let retriever = LocalRetriever::new(storage_collection);
         let mut initial_entities = Vec::with_capacity(initial_states.len());
@@ -122,6 +153,7 @@ impl EntityLiveQuery {
             initial_entities.push(entity);
         }
 
+        debug!("LiveQuery.initialize() calling reactor.initialize with {} entities for predicate {}", initial_entities.len(), predicate_id);
         node.reactor.initialize(self.0.subscription.id(), predicate_id, initial_entities)?;
         Ok(())
     }
@@ -137,7 +169,10 @@ impl Drop for Inner {
 //     fn broadcast_id(&self) -> BroadcastId { self.0.resultset.broadcast_id() }
 // }
 
-impl<R: View> LiveQuery<R> {}
+impl<R: View> LiveQuery<R> {
+    /// Wait for the LiveQuery to be fully initialized with initial states
+    pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
+}
 
 // impl<R: View> std::fmt::Debug for LiveQuery<R> {
 //     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -174,7 +209,7 @@ where R: Clone + Send + Sync + 'static
         // Subscribe to the underlying ReactorUpdate stream and convert to ChangeSet<R>
         let guard = self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
             // Convert ReactorUpdate to ChangeSet<R>
-            let changeset: ChangeSet<R> = (me.0 .0.resultset.map::<R>(), reactor_update).into();
+            let changeset: ChangeSet<R> = livequery_change_set_from(me.0 .0.resultset.map::<R>(), reactor_update);
             listener(changeset);
         });
 
@@ -182,34 +217,41 @@ where R: Clone + Send + Sync + 'static
     }
 }
 
-impl<R: View + Clone> From<(ResultSet<R>, ReactorUpdate)> for ChangeSet<R> {
-    fn from((resultset, reactor_update): (ResultSet<R>, ReactorUpdate)) -> Self {
-        use crate::changes::{ChangeSet, ItemChange};
+/// Notably, this function does not filter by predicate_id, because it should only be used by LiveQuery, which entails a single-predicate subscription
+fn livequery_change_set_from<R: View>(resultset: ResultSet<R>, reactor_update: ReactorUpdate) -> ChangeSet<R>
+where R: View {
+    use crate::changes::{ChangeSet, ItemChange};
 
-        let mut changes = Vec::new();
+    let mut changes = Vec::new();
 
-        for item in reactor_update.items {
-            let view = R::from_entity(item.entity.clone());
+    for item in reactor_update.items {
+        let view = R::from_entity(item.entity);
 
-            // Determine the change type based on predicate relevance
-            if let Some((_, membership_change)) = item.predicate_relevance.first() {
-                match membership_change {
-                    crate::reactor::MembershipChange::Initial => {
-                        changes.push(ItemChange::Initial { item: view.clone() });
-                    }
-                    crate::reactor::MembershipChange::Add => {
-                        changes.push(ItemChange::Add { item: view.clone(), events: item.events });
-                    }
-                    crate::reactor::MembershipChange::Remove => {
-                        changes.push(ItemChange::Remove { item: view.clone(), events: item.events });
-                    }
+        // Determine the change type based on predicate relevance
+        // ignore the predicate_id, because it should only be used by LiveQuery, which entails a single-predicate subscription
+        if let Some((_, membership_change)) = item.predicate_relevance.first() {
+            match membership_change {
+                crate::reactor::MembershipChange::Initial => {
+                    changes.push(ItemChange::Initial { item: view });
                 }
-            } else {
-                // No membership change, just an update
-                changes.push(ItemChange::Update { item: view.clone(), events: item.events });
+                crate::reactor::MembershipChange::Add => {
+                    changes.push(ItemChange::Add { item: view, events: item.events });
+                }
+                crate::reactor::MembershipChange::Remove => {
+                    changes.push(ItemChange::Remove { item: view, events: item.events });
+                }
             }
+        } else {
+            // No membership change, just an update
+            changes.push(ItemChange::Update { item: view, events: item.events });
         }
-
-        ChangeSet { changes, resultset }
     }
+
+    tracing::info!(
+        "ChangeSet.from() changes: {}, resultset.len(): {} - {}",
+        changes.len(),
+        resultset.len(),
+        changes.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+    );
+    ChangeSet { changes, resultset }
 }

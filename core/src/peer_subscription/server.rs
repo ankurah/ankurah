@@ -32,7 +32,15 @@ impl SubscriptionHandler {
 
         // Subscribe to changes on this subscription
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
+            tracing::info!(
+                "SubscriptionHandler[{}] received reactor update with {} items, initialized_predicate: {:?}",
+                peer_id,
+                update.items.len(),
+                update.initialized_predicate
+            );
+
             if let Some(node) = weak_node.upgrade() {
+                tracing::info!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
                 node.send_update(
                     peer_id,
                     proto::NodeUpdateBody::SubscriptionUpdate {

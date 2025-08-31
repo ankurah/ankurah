@@ -103,7 +103,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         predicate: ankql::ast::Predicate,
         context_data: CD,
     ) {
-        debug!("New predicate {} needs remote registration", predicate_id);
+        debug!("SubscriptionRelay.subscribe_predicate() - New predicate {} needs remote registration", predicate_id);
         {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
                 predicate_id.clone(),
@@ -191,7 +191,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     /// This should be called when a new durable peer connects. The relay will automatically
     /// attempt to register any pending predicates on the newly connected peer's subscription.
     pub fn notify_peer_connected(&self, peer_id: proto::EntityId) {
-        debug!("Peer {} connected, registering predicates on peer subscription", peer_id);
+        debug!("SubscriptionRelay.notify_peer_connected() - Peer {} connected, registering predicates on peer subscription", peer_id);
 
         // Add to connected peers
         self.inner.connected_peers.insert(peer_id);

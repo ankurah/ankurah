@@ -464,6 +464,7 @@ where
 
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { items, initialized_predicate } => {
+                tracing::info!("Node({}) received subscription update from peer {}", self.id, notification.from);
                 crate::peer_subscription::UpdateApplier::apply_updates(self, &notification.from, items, initialized_predicate).await?;
                 Ok(())
             }
