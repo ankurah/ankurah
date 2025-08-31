@@ -5,17 +5,18 @@ use async_trait::async_trait;
 use rand::prelude::*;
 use std::{
     fmt,
+    hash::Hash,
     ops::Deref,
     sync::{Arc, Weak},
 };
 use tokio::sync::oneshot;
 
 use crate::{
-    action_debug, action_error, action_info, action_warn,
+    action_error, action_info,
     changes::EntityChange,
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
-    context::{Context, NodeAndContext},
+    context::Context,
     entity::WeakEntitySet,
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
@@ -25,7 +26,7 @@ use crate::{
     retrieval::LocalRetriever,
     storage::StorageEngine,
     system::SystemManager,
-    util::{safemap::SafeMap, safeset::SafeSet},
+    util::{safemap::SafeMap, safeset::SafeSet, Iterable},
 };
 #[cfg(feature = "instrument")]
 use tracing::instrument;
@@ -104,7 +105,7 @@ where PA: PolicyAgent
 /// Represents the user session - or whatever other context the PolicyAgent
 /// Needs to perform it's evaluation.
 #[async_trait]
-pub trait ContextData: Send + Sync + Clone + 'static {}
+pub trait ContextData: Send + Sync + Clone + Hash + Eq + 'static {}
 
 pub struct NodeInner<SE, PA>
 where PA: PolicyAgent
@@ -256,12 +257,15 @@ where
         }
     }
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
-    pub async fn request(
+    pub async fn request<'a, C>(
         &self,
         node_id: proto::EntityId,
-        cdata: &PA::ContextData,
+        cdata: C,
         request_body: proto::NodeRequestBody,
-    ) -> Result<proto::NodeResponseBody, RequestError> {
+    ) -> Result<proto::NodeResponseBody, RequestError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
@@ -392,7 +396,8 @@ where
     }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
-    async fn handle_request(&self, cdata: &PA::ContextData, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody> {
+    async fn handle_request<C>(&self, cdata: C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
+    where C: Iterable<PA::ContextData> {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
@@ -404,13 +409,13 @@ where
                 }
             }
             proto::NodeRequestBody::Fetch { collection, predicate } => {
-                self.policy_agent.can_access_collection(cdata, &collection)?;
+                self.policy_agent.can_access_collection(&cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
-                let predicate = self.policy_agent.filter_predicate(cdata, &collection, predicate)?;
+                let predicate = self.policy_agent.filter_predicate(&cdata, &collection, predicate)?;
 
                 let mut states = Vec::new();
                 for state in storage_collection.fetch_states(&predicate).await? {
-                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
+                    if self.policy_agent.check_read(&cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
                         states.push(state);
                     }
                 }
@@ -498,12 +503,15 @@ where
     }
 
     /// Does all the things necessary to commit a remote transaction
-    pub async fn commit_remote_transaction(
+    pub async fn commit_remote_transaction<'a, C>(
         &self,
-        cdata: &PA::ContextData,
+        cdata: C,
         id: proto::TransactionId,
         mut events: Vec<Attested<proto::Event>>,
-    ) -> Result<(), MutationError> {
+    ) -> Result<(), MutationError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
         debug!("{self} commiting transaction {id} with {} events", events.len());
         let mut changes = Vec::new();
 
@@ -550,12 +558,15 @@ where
     }
 
     /// Fetch entities from the first available durable peer.
-    pub(crate) async fn fetch_from_peer(
+    pub(crate) async fn fetch_from_peer<'a, C>(
         &self,
         collection_id: &CollectionId,
         predicate: ankql::ast::Predicate,
-        cdata: &PA::ContextData,
-    ) -> anyhow::Result<Vec<Attested<EntityState>>, RetrievalError> {
+        cdata: C,
+    ) -> anyhow::Result<Vec<Attested<EntityState>>, RetrievalError>
+    where
+        C: Iterable<PA::ContextData>,
+    {
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self

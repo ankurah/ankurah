@@ -1,3 +1,4 @@
+use crate::util::Iterable;
 use crate::{
     entity::Entity,
     error::ValidationError,
@@ -53,25 +54,28 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
 
     /// Create relevant auth data for a given request
     /// This could be a JWT or a cryptographic signature, or some other arbitrary method of authentication as defined by the PolicyAgent
-    fn sign_request<SE: StorageEngine>(
+    fn sign_request<SE: StorageEngine, C>(
         &self,
         node: &NodeInner<SE, Self>,
-        cdata: &Self::ContextData,
+        cdata: C,
         request: &proto::NodeRequest,
-    ) -> proto::AuthData;
+    ) -> Vec<proto::AuthData>
+    where
+        C: Iterable<Self::ContextData>;
 
     /// Reverse of sign_request. This will typically parse + validate the auth data and return a ContextData if valid
     /// optionally, the PolicyAgent may introspect the request directly for signature validation, or other policy checks
     /// Note that check_read and check_write will be called with the ContextData as well if the request is approved
     /// Meaning that the PolicyAgent need not necessarily introspect the request directly here if it doesn't want to.
-    async fn check_request<SE: StorageEngine>(
+    async fn check_request<SE: StorageEngine, A>(
         &self,
         node: &Node<SE, Self>,
-        auth: &proto::AuthData,
+        auth: A,
         request: &proto::NodeRequest,
-    ) -> Result<Self::ContextData, ValidationError>
+    ) -> Result<Vec<Self::ContextData>, ValidationError>
     where
-        Self: Sized;
+        Self: Sized,
+        A: Iterable<proto::AuthData>;
 
     /// Check the event and optionally return an attestation
     /// This could be used to attest that the event has passed the policy check for a given context
@@ -104,31 +108,30 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     ) -> Result<(), AccessDenied>;
 
     // For checking if a context can access a collection
-    // For checking if a context can access a collection
-    fn can_access_collection(&self, data: &Self::ContextData, collection: &proto::CollectionId) -> Result<(), AccessDenied>;
+    fn can_access_collection<C>(&self, data: C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData>;
 
     /// Filter a predicate based on the context data
-    fn filter_predicate(
-        &self,
-        data: &Self::ContextData,
-        collection: &proto::CollectionId,
-        predicate: Predicate,
-    ) -> Result<Predicate, AccessDenied>;
+    fn filter_predicate<C>(&self, data: C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    where C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an entity
     /// If the policy agent wants to inspect the entity state, it can do so with either TemporaryEntity::new or entityset.with_state
     /// Optimization: Consider adding a common trait implemented by Entity and TemporaryEntity returned by entityset.get_evaluation_entity that
     /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
-    fn check_read(
+    fn check_read<C>(
         &self,
-        data: &Self::ContextData,
+        data: C,
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
-    ) -> Result<(), AccessDenied>;
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
-    fn check_read_event(&self, data: &Self::ContextData, event: &Attested<proto::Event>) -> Result<(), AccessDenied>;
+    fn check_read_event<C>(&self, data: C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData>;
 
     /// Check if a context can edit an entity
     fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
@@ -159,24 +162,32 @@ impl PolicyAgent for PermissiveAgent {
     type ContextData = &'static DefaultContext;
 
     /// Create relevant auth data for a given request
-    fn sign_request<SE: StorageEngine>(
+    fn sign_request<SE: StorageEngine, C>(
         &self,
         _node: &NodeInner<SE, Self>,
-        _cdata: &Self::ContextData,
+        cdata: C,
         _request: &proto::NodeRequest,
-    ) -> proto::AuthData {
+    ) -> Vec<proto::AuthData>
+    where
+        C: Iterable<Self::ContextData>,
+    {
         debug!("PermissiveAgent sign_request: {:?}", _request);
-        proto::AuthData(vec![])
+        // Create one AuthData per context (though PermissiveAgent doesn't really use them)
+        cdata.iter().map(|_| proto::AuthData(vec![])).collect()
     }
 
     /// Validate auth data and yield the context data if valid
-    async fn check_request<SE: StorageEngine>(
+    async fn check_request<SE: StorageEngine, A>(
         &self,
         _node: &Node<SE, Self>,
-        _auth: &proto::AuthData,
+        auth: A,
         _request: &proto::NodeRequest,
-    ) -> Result<Self::ContextData, ValidationError> {
-        Ok(DEFAULT_CONTEXT)
+    ) -> Result<Vec<Self::ContextData>, ValidationError>
+    where
+        A: Iterable<proto::AuthData>,
+    {
+        // PermissiveAgent accepts all auth attempts and returns one context per auth
+        Ok(auth.iter().map(|_| DEFAULT_CONTEXT).collect())
     }
 
     /// Create an attestation for an event
@@ -216,22 +227,29 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn can_access_collection(&self, _context: &Self::ContextData, _collection: &proto::CollectionId) -> Result<(), AccessDenied> { Ok(()) }
-
-    fn check_read(
-        &self,
-        _context: &Self::ContextData,
-        _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
-        _state: &proto::State,
-    ) -> Result<(), AccessDenied> {
-        // If your policy agent wants to inspect the entity properties, it can do so with either TemporaryEntity::new or entityset.with_state
+    fn can_access_collection<C>(&self, _data: C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        // PermissiveAgent allows access if any context is provided
         Ok(())
     }
 
-    fn check_read_event(&self, _context: &Self::ContextData, _event: &Attested<proto::Event>) -> Result<(), AccessDenied> {
-        // TODO - think about the best way to get the entity properties for cases where we want to inspect
-        // presumably this would need to be changed to async, and we'd need a way to retrieve entity state from storage, or possibly even a remote node
+    fn check_read<C>(
+        &self,
+        _data: C,
+        _id: &proto::EntityId,
+        _collection: &proto::CollectionId,
+        _state: &proto::State,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        // PermissiveAgent allows access if any context is provided
+        Ok(())
+    }
+
+    fn check_read_event<C>(&self, _data: C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        // PermissiveAgent allows access if any context is provided
         Ok(())
     }
 
@@ -239,12 +257,9 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn filter_predicate(
-        &self,
-        _context: &Self::ContextData,
-        _collection: &proto::CollectionId,
-        predicate: Predicate,
-    ) -> Result<Predicate, AccessDenied> {
+    fn filter_predicate<C>(&self, _data: C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        // PermissiveAgent allows access if any context is provided
         Ok(predicate)
     }
 
@@ -263,6 +278,7 @@ impl PolicyAgent for PermissiveAgent {
 
 /// A default context that is used when no context is needed
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DefaultContext {}
 pub static DEFAULT_CONTEXT: &DefaultContext = &DefaultContext {};
 

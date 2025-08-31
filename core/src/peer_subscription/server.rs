@@ -77,8 +77,9 @@ impl SubscriptionHandler {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         // Check access permissions first
-        node.policy_agent.can_access_collection(cdata, &collection_id)?;
-        let filtered_predicate = node.policy_agent.filter_predicate(cdata, &collection_id, predicate)?;
+        let cdata = vec![cdata];
+        node.policy_agent.can_access_collection(&cdata, &collection_id)?;
+        let filtered_predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, predicate)?;
         let storage_collection = node.collections.get(&collection_id).await?;
         let initial_states = storage_collection.fetch_states(&filtered_predicate).await?;
 

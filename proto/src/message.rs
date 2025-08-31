@@ -18,7 +18,7 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeMessage {
-    Request { auth: AuthData, request: NodeRequest },
+    Request { auth: Vec<AuthData>, request: NodeRequest },
     Response(NodeResponse),
     Update(NodeUpdate),
     UpdateAck(NodeUpdateAck),

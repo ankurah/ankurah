@@ -206,6 +206,22 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         subscriptions.get(&predicate_id).map(|info| info.status.clone())
     }
 
+    /// Get all unique contexts for predicates established with a specific peer
+    pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {
+        let subscriptions = self.inner.subscriptions.lock().unwrap();
+        let mut contexts = std::collections::HashSet::new();
+
+        for (_, state) in subscriptions.iter() {
+            if let Status::Established(established_peer) = &state.status {
+                if established_peer == peer_id {
+                    contexts.insert(state.content.context_data.clone());
+                }
+            }
+        }
+
+        contexts
+    }
+
     /// Register predicates on available durable peer subscriptions
     fn setup_remote_subscriptions(&self) {
         let sender = match self.inner.message_sender.get() {

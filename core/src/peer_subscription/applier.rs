@@ -1,9 +1,9 @@
 use crate::{
-    action_debug, action_info, action_warn, changes::EntityChange, context::NodeAndContext, error::MutationError, lineage::Retrieve,
-    node::Node, policy::PolicyAgent, retrieval::LocalRetriever, storage::StorageEngine,
+    action_warn, changes::EntityChange, error::MutationError, lineage::Retrieve, node::Node, policy::PolicyAgent,
+    retrieval::LocalRetriever, storage::StorageEngine,
 };
 use ankurah_proto::{self as proto, Event, EventId};
-use tracing::{debug, error};
+use tracing::debug;
 
 pub struct UpdateApplier;
 
@@ -26,19 +26,34 @@ impl UpdateApplier {
             from_peer_id,
             initialized_predicate
         );
-        // LEFT OFF HERE - we need a getter in case were missing events- and that getter needs a context, at least at present.
-        // but contests are per predicate, not per subscription - so we don't have one
-        let (nodeandcontext, tx) = match initialized_predicate {
+        // Get contexts from subscription relay for this peer, or fall back to single context for initialization
+        let (remote_contexts, tx) = match initialized_predicate {
             Some(predicate_id) => {
+                // For initialization, use the specific predicate context
                 if let Some(cdata) = node.predicate_context.get(&predicate_id) {
-                    (Some(NodeAndContext { node: node.clone(), cdata }), node.pending_predicate_subs.remove(&predicate_id))
+                    let mut contexts = std::collections::HashSet::new();
+                    contexts.insert(cdata);
+                    (Some(contexts), node.pending_predicate_subs.remove(&predicate_id))
                 } else {
                     (None, None)
                 }
             }
-            _ => (None, None),
+            None => {
+                // For regular updates, get all contexts for this peer from subscription relay
+                if let Some(ref relay) = node.subscription_relay {
+                    let contexts = relay.get_contexts_for_peer(from_peer_id);
+                    if !contexts.is_empty() {
+                        (Some(contexts), None)
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            }
         };
-        Self::apply_subscription_updates(node, from_peer_id, items, nodeandcontext).await?;
+
+        Self::apply_subscription_updates(node, from_peer_id, &items, remote_contexts).await?;
 
         if let Some(tx) = tx {
             let initial_states = items.iter().cloned().filter_map(|item| item.try_into().ok()).collect();
@@ -54,52 +69,72 @@ impl UpdateApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         updates: &[proto::SubscriptionUpdateItem],
-        nodeandcontext: Option<NodeAndContext<SE, PA>>,
+        remote_contexts: Option<std::collections::HashSet<PA::ContextData>>,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let mut changes = Vec::new();
-        for update in updates {
-            let collection = node.collections.get(&update.collection).await?;
-            // HACK - FIXME - do we need some kind of general context for retrieval?? is it all of the predicate contexts?
-            let retriever: &(dyn Retrieve<Id = EventId, Event = Event> + Send + Sync) = match &nodeandcontext {
-                Some(nodeandcontext) => &(update.collection.clone(), nodeandcontext),
-                None => &LocalRetriever::new(collection),
-            };
-            match Self::apply_subscription_update(node, from_peer_id, update, retriever).await {
-                Ok(Some(change)) => {
-                    changes.push(change);
+
+        // Use EphemeralNodeRetriever with multiple contexts or LocalRetriever
+        match remote_contexts {
+            Some(contexts) => {
+                for update in updates {
+                    let remote_retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, contexts.clone());
+                    match Self::apply_subscription_update(node, from_peer_id, update, &remote_retriever).await {
+                        Ok(Some(change)) => {
+                            changes.push(change);
+                        }
+                        Ok(None) => {
+                            continue;
+                        }
+                        Err(e) => {
+                            action_warn!(node, "received invalid update from peer", "{}: {}", from_peer_id.to_base64_short(), e);
+                        }
+                    }
                 }
-                Ok(None) => {
-                    continue;
-                }
-                Err(e) => {
-                    action_warn!(node, "received invalid update from peer", "{}: {}", from_peer_id.to_base64_short(), e);
+            }
+            None => {
+                for update in updates {
+                    let collection = node.collections.get(&update.collection).await?;
+                    let local_retriever = LocalRetriever::new(collection);
+                    match Self::apply_subscription_update(node, from_peer_id, update, &local_retriever).await {
+                        Ok(Some(change)) => {
+                            changes.push(change);
+                        }
+                        Ok(None) => {
+                            continue;
+                        }
+                        Err(e) => {
+                            action_warn!(node, "received invalid update from peer", "{}: {}", from_peer_id.to_base64_short(), e);
+                        }
+                    }
                 }
             }
         }
+
         debug!("{node} notifying reactor of {} changes", changes.len());
         node.reactor.notify_change(changes);
         Ok(())
     }
 
     // FIXME: This needs a full audit versus the old code - because of the criticality of this workflow
-    pub async fn apply_subscription_update<SE, PA>(
+    pub async fn apply_subscription_update<SE, PA, R>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         update: &proto::SubscriptionUpdateItem,
-        retriever: &(dyn Retrieve<Id = EventId, Event = Event> + Send + Sync),
+        retriever: &R,
     ) -> Result<Option<EntityChange>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
+        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
     {
         let proto::SubscriptionUpdateItem { entity_id, collection, content, predicate_relevance: _, entity_subscribed: _ } = update;
 
         let collection_wrapper = node.collections.get(&collection).await?;
-        let (state_fragment, event_fragments) = content.into_parts();
+        let (state_fragment, event_fragments) = content.clone().into_parts();
 
         let mut applied_events = Vec::new();
         let mut entity_changed = false;
@@ -108,7 +143,7 @@ impl UpdateApplier {
         // Apply events if present - store them first for lineage comparison
         if let Some(event_fragments) = event_fragments {
             for event_fragment in event_fragments {
-                let attested_event = (entity_id, collection.clone(), event_fragment).into();
+                let attested_event = (*entity_id, collection.clone(), event_fragment).into();
                 node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
 
                 // Store the validated event in case we need it for lineage comparison
@@ -128,10 +163,10 @@ impl UpdateApplier {
 
         // Apply state if present using with_state (preserves original semantics)
         if let Some(state_fragment) = state_fragment {
-            let attested_state = (entity_id, collection.clone(), state_fragment).into();
+            let attested_state = (*entity_id, collection.clone(), state_fragment).into();
             node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
-            match node.entities.with_state(retriever, entity_id, collection.clone(), attested_state.payload.state).await? {
+            match node.entities.with_state(retriever, *entity_id, collection.clone(), attested_state.payload.state).await? {
                 (Some(true), entity) => {
                     // State was newer and applied successfully
                     entity_changed = true;
