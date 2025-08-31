@@ -103,10 +103,9 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     }
 
                     pub fn query (context: &ankurah::core::context::Context, predicate: String) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
-                        // let livequery = context.query::<#view_name>(predicate.as_str())
-                        //     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
-                        // Ok(#livequery_name { inner: livequery })
-                        unimplemented!("query is not supported for wasm")
+                        let livequery = context.query::<#view_name>(predicate.as_str())
+                            .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                        Ok(#livequery_name(livequery))
                     }
 
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
