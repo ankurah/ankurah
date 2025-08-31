@@ -738,10 +738,10 @@ mod tests {
         // Set up a subscription with a predicate that matches status="pending"
         let rsub = reactor.subscribe();
         let (w, check) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
-        rsub.subscribe(w); // ReactorSubscription needs to implement ankurah_signals::Subscribe
+        let _guard = rsub.subscribe(w); // ReactorSubscription needs to implement ankurah_signals::Subscribe
 
         let predicate_id = PredicateId::new();
-        rsub.add_predicate(predicate_id, &CollectionId::fixed_name("album"), "status = 'pending'".try_into().unwrap());
+        let _ = rsub.add_predicate(predicate_id, &CollectionId::fixed_name("album"), "status = 'pending'".try_into().unwrap());
         let entity1 = TestEntity::new("Test Album", "pending");
 
         reactor.initialize(rsub.id(), predicate_id, vec![entity1.clone()]).unwrap();
