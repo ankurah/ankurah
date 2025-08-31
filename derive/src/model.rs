@@ -106,7 +106,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         // let livequery = context.query::<#view_name>(predicate.as_str())
                         //     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                         // Ok(#livequery_name { inner: livequery })
-                        unimplemented!()
+                        unimplemented!("query is not supported for wasm")
                     }
 
                     pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
@@ -138,12 +138,12 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     pub fn items(&self) -> Vec<#view_name> {
                         use ::ankurah::signals::Peek;
                         // self.0.get()
-                        unimplemented!()
+                        unimplemented!("items is not supported for wasm")
                     }
                     pub fn by_id(&self, id: ::ankurah::proto::EntityId) -> Option<#view_name> {
                         // ::ankurah::signals::CurrentObserver::track(&self);
                         // self.0.by_id(&id)
-                        unimplemented!()
+                        unimplemented!("by_id is not supported for wasm")
                         // todo generate a map on demand if there are more than a certain number of items (benchmark this)
                     }
                     #[wasm_bindgen(getter)]
@@ -155,12 +155,12 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 impl ankurah::signals::Signal for #resultset_name {
                     fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
                         // self.0.listen(listener)
-                        unimplemented!()
+                        unimplemented!("listen is not supported for wasm")
                     }
                     fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
                         // use ::ankurah::signals::Signal;
                         // self.0.broadcast_id()
-                        unimplemented!()
+                        unimplemented!("broadcast_id is not supported for wasm")
                     }
                 }
 
@@ -173,21 +173,21 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         // use ::ankurah::signals::Signal;
                         // ::ankurah::signals::CurrentObserver::track(&self);
                         // self.0.resultset.()
-                        unimplemented!()
+                        unimplemented!("items is not supported for wasm")
                     }
                     #[wasm_bindgen(getter)]
                     pub fn value(&self) -> #resultset_name {
                         // use ::ankurah::signals::Signal;
                         // ::ankurah::signals::CurrentObserver::track(&self);
                         // #resultset_name(::std::sync::Arc::new(self.0.peek()))
-                        unimplemented!()
+                        unimplemented!("value is not supported for wasm")
                     }
 
                     #[wasm_bindgen(getter)]
                     pub fn peek(&self) -> #resultset_name {
                         // use ::ankurah::signals::Peek;
                         // self.0.peek()
-                        unimplemented!()
+                        unimplemented!("peek is not supported for wasm")
                     }
 
                     pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
@@ -203,7 +203,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                         //         &resultset.into()
                         //     );
                         // })
-                        unimplemented!()
+                        unimplemented!("subscribe is not supported for wasm")
                     }
                 }
             };
@@ -277,13 +277,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
 
         impl ::ankurah::signals::Signal for #view_name {
             fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
-                // self.entity.broadcast().reference().listen(listener)
-                unimplemented!()
+                self.entity.broadcast().reference().listen(listener)
             }
             
             fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
-                // self.entity.broadcast().id()
-                unimplemented!()
+                self.entity.broadcast().id()
             }
         }
 
@@ -517,7 +515,7 @@ fn as_turbofish(type_path: &syn::Type) -> proc_macro2::TokenStream {
             }
         }
     } else {
-        unimplemented!()
+        unimplemented!("as_turbofish is not supported for non-path types")
     }
 }
 
