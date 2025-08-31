@@ -91,9 +91,12 @@ impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
             result.extend(subs.iter().cloned());
         }
 
-        // Check not equal
-        if let Some(subs) = self.ne.get(&bytes) {
-            result.extend(subs.iter().cloned());
+        // Check not equal - iterate through all != conditions
+        for (stored_bytes, subs) in &self.ne {
+            if bytes != *stored_bytes {
+                // query_value != stored_value
+                result.extend(subs.iter().cloned());
+            }
         }
 
         // Check greater than matches (x > threshold)
@@ -171,7 +174,7 @@ mod tests {
         let sub0 = proto::PredicateId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::NotEqual, sub0);
 
-        assert_eq!(index.find_matching(Value::Integer(8)).next(), Some(sub0));
-        assert!(index.find_matching(Value::Integer(9)).next().is_none());
+        assert_eq!(index.find_matching(Value::Integer(8)).collect::<Vec<_>>(), vec![]);
+        assert_eq!(index.find_matching(Value::Integer(9)).collect::<Vec<_>>(), vec![sub0]);
     }
 }
