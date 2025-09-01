@@ -8,38 +8,38 @@ pub trait Iterable<T> {
         Self: 'a,
         T: 'a;
 
-    fn iter(&self) -> Self::Iter<'_>;
+    fn iterable(&self) -> Self::Iter<'_>;
 }
 
 // Implementation for a single reference - treats it as a collection of one
-impl<T> Iterable<T> for &T {
+impl<T> Iterable<T> for T {
     type Iter<'a>
         = std::iter::Once<&'a T>
     where
         Self: 'a,
         T: 'a;
 
-    fn iter(&self) -> Self::Iter<'_> { std::iter::once(self) }
+    fn iterable(&self) -> Self::Iter<'_> { std::iter::once(self) }
 }
 
 // Implementation for a HashSet reference
-impl<T, S: BuildHasher> Iterable<T> for &HashSet<T, S> {
+impl<T, S: BuildHasher> Iterable<T> for HashSet<T, S> {
     type Iter<'a>
         = std::collections::hash_set::Iter<'a, T>
     where
         Self: 'a,
         T: 'a;
 
-    fn iter(&self) -> Self::Iter<'_> { self.iter() }
+    fn iterable(&self) -> Self::Iter<'_> { HashSet::iter(self) }
 }
 
 // Implementation for a Vec reference
-impl<T> Iterable<T> for &Vec<T> {
+impl<T> Iterable<T> for Vec<T> {
     type Iter<'a>
         = std::slice::Iter<'a, T>
     where
         Self: 'a,
         T: 'a;
 
-    fn iter(&self) -> Self::Iter<'_> { self.iter() }
+    fn iterable(&self) -> Self::Iter<'_> { (**self).iter() }
 }

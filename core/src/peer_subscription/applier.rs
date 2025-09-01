@@ -79,9 +79,9 @@ impl UpdateApplier {
 
         // Use EphemeralNodeRetriever with multiple contexts or LocalRetriever
         match remote_contexts {
-            Some(contexts) => {
+            Some(cdata) => {
                 for update in updates {
-                    let remote_retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, contexts.clone());
+                    let remote_retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
                     match Self::apply_subscription_update(node, from_peer_id, update, &remote_retriever).await {
                         Ok(Some(change)) => {
                             changes.push(change);

@@ -5,6 +5,7 @@ use crate::{
     error::RetrievalError,
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
+    util::Iterable,
     Node,
 };
 use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event, EventId};
@@ -90,31 +91,32 @@ impl Retrieve for LocalRetriever {
 }
 
 /// Ephemeral node retriever - retrieves events remotely, states locally, with multiple contexts for authentication
-pub struct EphemeralNodeRetriever<'a, SE, PA>
+pub struct EphemeralNodeRetriever<'a, SE, PA, C>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
     pub collection: proto::CollectionId,
     pub node: &'a Node<SE, PA>,
-    pub cdatas: std::collections::HashSet<PA::ContextData>,
+    pub cdata: &'a C,
 }
 
-impl<'a, SE, PA> EphemeralNodeRetriever<'a, SE, PA>
+impl<'a, SE, PA, C> EphemeralNodeRetriever<'a, SE, PA, C>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    pub fn new(collection: proto::CollectionId, node: &'a Node<SE, PA>, cdatas: std::collections::HashSet<PA::ContextData>) -> Self {
-        Self { collection, node, cdatas }
-    }
+    pub fn new(collection: proto::CollectionId, node: &'a Node<SE, PA>, cdata: &'a C) -> Self { Self { collection, node, cdata } }
 }
 
 #[async_trait]
-impl<'a, SE, PA> GetEvents for EphemeralNodeRetriever<'a, SE, PA>
+impl<'a, SE, PA, C> GetEvents for EphemeralNodeRetriever<'a, SE, PA, C>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
     type Id = EventId;
     type Event = Event;
@@ -135,7 +137,7 @@ where
                     .node
                     .request(
                         peer_id,
-                        &self.cdatas,
+                        self.cdata,
                         proto::NodeRequestBody::GetEvents { collection: self.collection.clone(), event_ids: missing_ids },
                     )
                     .await
@@ -163,10 +165,11 @@ where
 }
 
 #[async_trait]
-impl<'a, SE, PA> Retrieve for EphemeralNodeRetriever<'a, SE, PA>
+impl<'a, SE, PA, C> Retrieve for EphemeralNodeRetriever<'a, SE, PA, C>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
+    C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
         let collection = self.node.collections.get(&self.collection).await?;

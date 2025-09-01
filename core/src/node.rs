@@ -28,6 +28,7 @@ use crate::{
     system::SystemManager,
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
 };
+use itertools::Itertools;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
 
@@ -260,7 +261,7 @@ where
     pub async fn request<'a, C>(
         &self,
         node_id: proto::EntityId,
-        cdata: C,
+        cdata: &C,
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError>
     where
@@ -396,26 +397,27 @@ where
     }
 
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
-    async fn handle_request<C>(&self, cdata: C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
+    async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
     where C: Iterable<PA::ContextData> {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message
+                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for CommitTransaction"))?;
                 match self.commit_remote_transaction(cdata, id.clone(), events).await {
                     Ok(_) => Ok(proto::NodeResponseBody::CommitComplete { id }),
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
             proto::NodeRequestBody::Fetch { collection, predicate } => {
-                self.policy_agent.can_access_collection(&cdata, &collection)?;
+                self.policy_agent.can_access_collection(cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
-                let predicate = self.policy_agent.filter_predicate(&cdata, &collection, predicate)?;
+                let predicate = self.policy_agent.filter_predicate(cdata, &collection, predicate)?;
 
                 let mut states = Vec::new();
                 for state in storage_collection.fetch_states(&predicate).await? {
-                    if self.policy_agent.check_read(&cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
+                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
                         states.push(state);
                     }
                 }
@@ -457,6 +459,9 @@ where
             }
             proto::NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
+                // only one cdata is permitted for SubscribePredicate
+                use itertools::Itertools;
+                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
                 peer_state.subscription_handler.add_predicate(self, predicate_id, collection, predicate, cdata).await
             }
         }
@@ -503,15 +508,12 @@ where
     }
 
     /// Does all the things necessary to commit a remote transaction
-    pub async fn commit_remote_transaction<'a, C>(
+    pub async fn commit_remote_transaction(
         &self,
-        cdata: C,
+        cdata: &PA::ContextData,
         id: proto::TransactionId,
         mut events: Vec<Attested<proto::Event>>,
-    ) -> Result<(), MutationError>
-    where
-        C: Iterable<PA::ContextData>,
-    {
+    ) -> Result<(), MutationError> {
         debug!("{self} commiting transaction {id} with {} events", events.len());
         let mut changes = Vec::new();
 
@@ -562,7 +564,7 @@ where
         &self,
         collection_id: &CollectionId,
         predicate: ankql::ast::Predicate,
-        cdata: C,
+        cdata: &C,
     ) -> anyhow::Result<Vec<Attested<EntityState>>, RetrievalError>
     where
         C: Iterable<PA::ContextData>,

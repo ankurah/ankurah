@@ -164,7 +164,7 @@ where
 
         if !self.node.durable {
             // Fetch from peers and commit first response
-            match self.node.get_from_peer(collection_id, vec![id], std::iter::once(&self.cdata)).await {
+            match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
                 Ok(_) => (),
                 Err(RetrievalError::NoDurablePeers) if cached => (),
                 Err(e) => {
@@ -182,17 +182,13 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                let mut contexts = std::collections::HashSet::new();
-                contexts.insert(self.cdata.clone());
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, contexts);
+                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_changed, entity) =
                     self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;
                 Ok(entity)
             }
             Err(RetrievalError::EntityNotFound(id)) => {
-                let mut contexts = std::collections::HashSet::new();
-                contexts.insert(self.cdata.clone());
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, contexts);
+                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_, entity) = self.node.entities.with_state(&retriever, id, collection_id.clone(), proto::State::default()).await?;
                 Ok(entity)
             }
@@ -201,10 +197,10 @@ where
     }
     /// Fetch a list of entities based on a predicate
     pub async fn fetch_entities(&self, collection_id: &CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
-        self.node.policy_agent.can_access_collection(std::iter::once(&self.cdata), collection_id)?;
+        self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         // Fetch raw states from storage
 
-        let filtered_predicate = self.node.policy_agent.filter_predicate(std::iter::once(&self.cdata), collection_id, args.predicate)?;
+        let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
 
         // TODO implement cached: true
         let states = if !self.node.durable {
@@ -218,9 +214,7 @@ where
         // Convert states to entities
         let mut entities = Vec::new();
         for state in states {
-            let mut contexts = std::collections::HashSet::new();
-            contexts.insert(self.cdata.clone());
-            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, contexts);
+            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
             let (_, entity) =
                 self.node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
             entities.push(entity);
@@ -256,9 +250,7 @@ where
             let collection_id = &attested_event.payload.collection;
             // If this entity has an upstream, propagate the changes
             if let Some(ref upstream) = entity.upstream {
-                let mut contexts = std::collections::HashSet::new();
-                contexts.insert(self.cdata.clone());
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, contexts);
+                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 upstream.apply_event(&retriever, &attested_event.payload).await?;
             }
 

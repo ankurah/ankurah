@@ -57,7 +57,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn sign_request<SE: StorageEngine, C>(
         &self,
         node: &NodeInner<SE, Self>,
-        cdata: C,
+        cdata: &C,
         request: &proto::NodeRequest,
     ) -> Vec<proto::AuthData>
     where
@@ -70,12 +70,12 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     async fn check_request<SE: StorageEngine, A>(
         &self,
         node: &Node<SE, Self>,
-        auth: A,
+        auth: &A,
         request: &proto::NodeRequest,
     ) -> Result<Vec<Self::ContextData>, ValidationError>
     where
         Self: Sized,
-        A: Iterable<proto::AuthData>;
+        A: Iterable<proto::AuthData> + Send + Sync;
 
     /// Check the event and optionally return an attestation
     /// This could be used to attest that the event has passed the policy check for a given context
@@ -108,11 +108,11 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     ) -> Result<(), AccessDenied>;
 
     // For checking if a context can access a collection
-    fn can_access_collection<C>(&self, data: C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, data: &C, collection: &proto::CollectionId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Filter a predicate based on the context data
-    fn filter_predicate<C>(&self, data: C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, data: &C, collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an entity
@@ -121,7 +121,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// returns a real entity if resident, falling back to a temporary entity if not. (as the former case would save cycles creating/populating the backends)
     fn check_read<C>(
         &self,
-        data: C,
+        data: &C,
         id: &proto::EntityId,
         collection: &proto::CollectionId,
         state: &proto::State,
@@ -130,7 +130,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         C: Iterable<Self::ContextData>;
 
     /// Check if a context can read an event
-    fn check_read_event<C>(&self, data: C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, data: &C, event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData>;
 
     /// Check if a context can edit an entity
@@ -165,7 +165,7 @@ impl PolicyAgent for PermissiveAgent {
     fn sign_request<SE: StorageEngine, C>(
         &self,
         _node: &NodeInner<SE, Self>,
-        cdata: C,
+        cdata: &C,
         _request: &proto::NodeRequest,
     ) -> Vec<proto::AuthData>
     where
@@ -173,21 +173,21 @@ impl PolicyAgent for PermissiveAgent {
     {
         debug!("PermissiveAgent sign_request: {:?}", _request);
         // Create one AuthData per context (though PermissiveAgent doesn't really use them)
-        cdata.iter().map(|_| proto::AuthData(vec![])).collect()
+        cdata.iterable().map(|_| proto::AuthData(vec![])).collect()
     }
 
     /// Validate auth data and yield the context data if valid
     async fn check_request<SE: StorageEngine, A>(
         &self,
         _node: &Node<SE, Self>,
-        auth: A,
+        auth: &A,
         _request: &proto::NodeRequest,
     ) -> Result<Vec<Self::ContextData>, ValidationError>
     where
-        A: Iterable<proto::AuthData>,
+        A: Iterable<proto::AuthData> + Send + Sync,
     {
         // PermissiveAgent accepts all auth attempts and returns one context per auth
-        Ok(auth.iter().map(|_| DEFAULT_CONTEXT).collect())
+        Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
     }
 
     /// Create an attestation for an event
@@ -227,7 +227,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows access if any context is provided
         Ok(())
@@ -235,7 +235,7 @@ impl PolicyAgent for PermissiveAgent {
 
     fn check_read<C>(
         &self,
-        _data: C,
+        _data: &C,
         _id: &proto::EntityId,
         _collection: &proto::CollectionId,
         _state: &proto::State,
@@ -247,7 +247,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn check_read_event<C>(&self, _data: C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows access if any context is provided
         Ok(())
@@ -257,7 +257,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn filter_predicate<C>(&self, _data: C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
     where C: Iterable<Self::ContextData> {
         // PermissiveAgent allows access if any context is provided
         Ok(predicate)
