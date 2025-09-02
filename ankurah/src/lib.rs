@@ -77,11 +77,11 @@
 //! # use ankurah_connector_local_process::LocalProcessConnection;
 //! # use std::sync::Arc;
 //! # use serde::{Serialize, Deserialize};
-//! # #[derive(Model, Debug, Serialize, Deserialize)]
-//! # pub struct Album {
-//! #     name: String,
-//! #     year: String,
-//! # }
+//! #[derive(Model, Debug, Serialize, Deserialize)]
+//! pub struct Album {
+//!     name: String,
+//!     year: String,
+//! }
 //! #
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,10 +99,11 @@
 //!     let client = client.context(ankurah::policy::DEFAULT_CONTEXT)?;
 //!
 //!     // Create a LiveQuery and subscribe to changes on the client
-//!     let livequery = client.query("name = 'Origin of Symmetry'")?;
+//!     let livequery = client.query::<AlbumView>("name = 'Origin of Symmetry'")?;
+//!     use ankurah::signals::Subscribe;
 //!     let _guard = livequery.subscribe(|changes| {
 //!         println!("Received changes: {}", changes);
-//!     }).await?;
+//!     });
 //!
 //!     // Create a new album on the server
 //!     let trx = server.begin();
