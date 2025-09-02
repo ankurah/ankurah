@@ -3,15 +3,17 @@ use tracing::Level;
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
     model::View,
-    // property::{value::LWW, YrsString},
     proto,
+    signals::{broadcast::IntoListener, subscribe::IntoSubscribeListener},
     Model,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     str::FromStr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Model, Serialize, Deserialize)]
 pub struct Pet {
@@ -36,62 +38,134 @@ fn init_tracing() {
     }
 }
 
-#[allow(unused)]
-pub fn changeset_watcher<R: View + Send + Sync + 'static>(
-) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<Vec<(proto::EntityId, ChangeKind)>> + Send + Sync>) {
-    let changes = Arc::new(Mutex::new(Vec::new()));
-    let watcher = {
-        let changes = changes.clone();
-        Box::new(move |changeset: ChangeSet<R>| {
-            changes.lock().unwrap().push(changeset);
-        })
-    };
-
-    let check = Box::new(move || {
-        let changes: Vec<Vec<(proto::EntityId, ChangeKind)>> =
-            changes.lock().unwrap().drain(..).map(|c| c.changes.iter().map(|c| (c.entity().id(), c.into())).collect()).collect();
-        changes
-    });
-
-    (watcher, check)
+/// Generic watcher that accumulates notifications and provides async waiting methods
+#[derive(Clone)]
+pub struct TestWatcher<T, U> {
+    changes: Arc<Mutex<Vec<T>>>,
+    notify: Arc<Notify>,
+    transform: Arc<dyn Fn(T) -> U + Send + Sync>,
 }
 
-/// A generic watcher that allows extracting arbitrary data from the ChangeSet via a user-provided closure over ItemChange.
-#[allow(unused)]
-pub fn watcher<R, T, F>(extract: F) -> (Box<dyn Fn(ChangeSet<R>) + Send + Sync>, Box<dyn Fn() -> Vec<Vec<T>> + Send + Sync>)
-where
-    R: View + Send + Sync + 'static,
-    T: Send + 'static,
-    F: Fn(ankurah::changes::ItemChange<R>) -> T + Send + Sync + 'static,
-{
-    let changes = Arc::new(Mutex::new(Vec::new()));
-    let watcher = {
-        let changes = changes.clone();
-        Box::new(move |changeset: ChangeSet<R>| {
-            changes.lock().unwrap().push(changeset);
-        })
-    };
-
-    let check = Box::new(move || {
-        let changes: Vec<Vec<T>> =
-            changes.lock().unwrap().drain(..).map(|mut cset| cset.changes.into_iter().map(|c| extract(c)).collect()).collect();
-        changes
-    });
-
-    (watcher, check)
+impl<T> TestWatcher<T, T> {
+    pub fn new() -> Self { Self { changes: Arc::new(Mutex::new(Vec::new())), notify: Arc::new(Notify::new()), transform: Arc::new(|x| x) } }
 }
 
-/// Watcher that takes values by value (for use with Subscriber trait)
-pub fn generic_watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
-    let values = Arc::new(Mutex::new(Vec::new()));
-    let accumulate = {
-        let values = values.clone();
-        Box::new(move |value: T| {
-            values.lock().unwrap().push(value);
+impl<T, U> TestWatcher<T, U> {
+    /// Creates a new generic watcher with identity transform (T -> T)
+    pub fn transform(transform: impl Fn(T) -> U + Send + Sync + 'static) -> TestWatcher<T, U> {
+        Self { changes: Arc::new(Mutex::new(Vec::new())), notify: Arc::new(Notify::new()), transform: Arc::new(transform) }
+    }
+}
+
+impl<R: View + Send + Sync + 'static> TestWatcher<ChangeSet<R>, Vec<(proto::EntityId, ChangeKind)>> {
+    /// Creates a new changeset watcher that transforms ChangeSet<R> to Vec<(EntityId, ChangeKind)>
+    pub fn changeset() -> TestWatcher<ChangeSet<R>, Vec<(proto::EntityId, ChangeKind)>> {
+        TestWatcher {
+            changes: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+            transform: Arc::new(|changeset: ChangeSet<R>| changeset.changes.iter().map(|c| (c.entity().id(), c.into())).collect()),
+        }
+    }
+}
+impl<T, U> TestWatcher<T, U> {
+    pub fn notify(&self, item: T) {
+        self.changes.lock().unwrap().push(item);
+        self.notify.notify_waiters();
+    }
+
+    /// Takes (empties and returns) all accumulated items, applying the transform
+    pub fn drain(&self) -> Vec<U> { self.changes.lock().unwrap().drain(..).map(|item| (self.transform)(item)).collect() }
+
+    /// Waits for exactly `count` items to accumulate, then drains and returns them
+    pub async fn take(&self, count: usize) -> Vec<U> {
+        self.wait_for_count(count, Some(Duration::from_secs(10))).await;
+        let mut changes = self.changes.lock().unwrap();
+        changes.drain(0..count).map(|item| (self.transform)(item)).collect()
+    }
+
+    /// Returns the current number of accumulated changesets without draining them
+    pub fn count(&self) -> usize { self.changes.lock().unwrap().len() }
+
+    /// Waits for at least one changeset to be accumulated (with 10 second timeout)
+    pub async fn wait(&self) -> bool { self.wait_for_count(1, Some(Duration::from_secs(10))).await }
+
+    /// Waits for at least 1 item, then takes and returns exactly the first one
+    #[track_caller]
+    pub fn take_one(&self) -> impl std::future::Future<Output = U> + '_ {
+        async move {
+            let _success = self.wait_for_count(1, Some(Duration::from_secs(10))).await;
+            let mut changes = self.changes.lock().unwrap();
+            if changes.is_empty() {
+                panic!("take_one() timed out waiting for items (waited 10 seconds, got {} items)", changes.len());
+            }
+            let item = changes.remove(0);
+            (self.transform)(item)
+        }
+    }
+
+    /// Waits 100ms for any additional items, then returns the count (useful for asserting quiescence)
+    pub async fn quiesce(&self) -> usize {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.count()
+    }
+
+    /// Wait for at least `count` items to accumulate, then drain and return all items
+    pub async fn take_when(&self, count: usize) -> Vec<U> {
+        self.wait_for_count(count, Some(Duration::from_secs(10))).await;
+        self.drain()
+    }
+
+    /// Waits for at least `count` changesets to be accumulated, with optional timeout
+    pub async fn wait_for_count(&self, count: usize, timeout: Option<Duration>) -> bool {
+        // Check if we already have enough changes
+        {
+            let changes = self.changes.lock().unwrap();
+            if changes.len() >= count {
+                return true;
+            }
+        }
+
+        match timeout {
+            Some(duration) => tokio::time::timeout(duration, async {
+                loop {
+                    self.notify.notified().await;
+                    let changes = self.changes.lock().unwrap();
+                    if changes.len() >= count {
+                        return true;
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false),
+            None => loop {
+                self.notify.notified().await;
+                let changes = self.changes.lock().unwrap();
+                if changes.len() >= count {
+                    return true;
+                }
+            },
+        }
+    }
+}
+
+impl<T: Send + 'static, U> IntoListener<T> for &TestWatcher<T, U> {
+    fn into_listener(self) -> Arc<dyn Fn(T) + Send + Sync> {
+        let changes = self.changes.clone();
+        let notify = self.notify.clone();
+        Arc::new(move |item: T| {
+            changes.lock().unwrap().push(item);
+            notify.notify_waiters();
         })
-    };
+    }
+}
 
-    let check = Box::new(move || values.lock().unwrap().drain(..).collect());
-
-    (accumulate, check)
+impl<T: Send + 'static, U> IntoSubscribeListener<T> for &TestWatcher<T, U> {
+    fn into_subscribe_listener(self) -> Box<dyn Fn(T) + Send + Sync> {
+        let changes = self.changes.clone();
+        let notify = self.notify.clone();
+        Box::new(move |item: T| {
+            changes.lock().unwrap().push(item);
+            notify.notify_waiters();
+        })
+    }
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::info;
 
 mod common;
-use common::*;
+use common::{TestWatcher, *};
 
 #[tokio::test]
 async fn test_websocket_client_server_fetch() -> Result<()> {
@@ -42,7 +42,7 @@ async fn test_websocket_client_server_fetch() -> Result<()> {
 
     info!("Client connected successfully");
 
-    // Give time for initial data sync
+    // Give time for initial data sync - fetch still needs sleeps for now unfortunately. We can probably find a better way to do this though
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Get client context
@@ -129,25 +129,17 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
     let client_ctx = client_node.context(c)?;
 
     // Set up subscription watchers
-    let (server_watcher, check_server) = changeset_watcher::<AlbumView>();
-    let (client_watcher, check_client) = changeset_watcher::<AlbumView>();
+    let server_watcher = TestWatcher::changeset();
+    let client_watcher = TestWatcher::changeset();
 
-    // Subscribe on both ends
     use ankurah::signals::Subscribe;
-    let _server_sub = server_ctx.query("name = 'Abbey Road'")?.subscribe(server_watcher);
-    let _client_sub = client_ctx.query("name = 'Abbey Road'")?.subscribe(client_watcher);
+    // Create and initialize LiveQueries, then subscribe
+    let _server_sub = server_ctx.query_wait::<AlbumView>("name = 'Abbey Road'").await?.subscribe(&server_watcher);
+    let _client_sub = client_ctx.query_wait::<AlbumView>("name = 'Abbey Road'").await?.subscribe(&client_watcher);
 
-    // We should have received zero notifications, because .subscribe does not immediately call the listener
-    // the LiveQueries cannot have initialized yet because they are async and this part of the test is synchronous
-    assert_eq!(check_server(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
-    assert_eq!(check_client(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    // Now the LiveQueries should have initialized in the background.
-    // The only reason why we we received this Initial notification is because our .subscribe() frontran the LiveQuery initialization.
-    // had we called livequery.wait_initialized().await before .subscribe(), we would have received zero notifications in either case
-    assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
-    assert_eq!(check_client(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>); // Flaky here - maybe we need to wait for the update?
+    // No notifications because we waited for initialization before subscribing
+    assert_eq!(server_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+    assert_eq!(client_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
 
     // Create matching entity on server
     let album_id = {
@@ -158,22 +150,9 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
         id
     };
 
-    // Wait for propagation
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-    // Check that both server and client received the change
-    let server_changes = check_server();
-    let client_changes = check_client();
-
-    // Both should see exactly 1 change with the correct entity ID
-    assert_eq!(server_changes.len(), 1);
-    assert_eq!(client_changes.len(), 1);
-    assert_eq!(server_changes[0].len(), 1);
-    assert_eq!(client_changes[0].len(), 1);
-
-    // Check entity IDs match (ChangeKind may vary between Add/Initial)
-    assert_eq!(server_changes[0][0].0, album_id);
-    assert_eq!(client_changes[0][0].0, album_id);
+    // Wait for propagation and check changes
+    assert_eq!(server_watcher.take_one().await, vec![(album_id, ChangeKind::Add)]);
+    assert_eq!(client_watcher.take_one().await, vec![(album_id, ChangeKind::Add)]);
 
     info!("Subscription propagation test passed");
 
@@ -209,23 +188,20 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     let client_ctx = client_node.context(c)?;
 
     // Set up subscription watchers
-    let (server_watcher, check_server) = changeset_watcher::<PetView>();
-    let (client_watcher, check_client) = changeset_watcher::<PetView>();
+    let server_watcher = TestWatcher::changeset();
+    let client_watcher = TestWatcher::changeset();
 
     // Subscribe to pets with age > 5
     use ankurah::signals::Subscribe;
-    let server_livequery = server_ctx.query("age > 5")?;
-    let client_livequery = client_ctx.query("age > 5")?;
+    let server_livequery = server_ctx.query_wait::<PetView>("age > 5").await?;
+    let client_livequery = client_ctx.query_wait::<PetView>("age > 5").await?;
 
-    server_livequery.wait_initialized().await;
-    client_livequery.wait_initialized().await;
-
-    let _server_sub = server_livequery.subscribe(server_watcher);
-    let _client_sub = client_livequery.subscribe(client_watcher);
+    let _server_sub = server_livequery.subscribe(&server_watcher);
+    let _client_sub = client_livequery.subscribe(&client_watcher);
 
     // No notifications because we intentionally waited for the LiveQueries to be initialized before subscribing
-    assert_eq!(check_server(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
-    assert_eq!(check_client(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+    assert_eq!(server_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+    assert_eq!(client_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
 
     // Create pet on server
     let rex_id = {
@@ -236,11 +212,9 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
         id
     };
 
-    // Wait for propagation
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    assert_eq!(check_server(), vec![vec![(rex_id, ChangeKind::Add)]]);
-    assert_eq!(check_client(), vec![vec![(rex_id, ChangeKind::Add)]]);
+    // Wait for propagation and check changes
+    assert_eq!(server_watcher.take_one().await, vec![(rex_id, ChangeKind::Add)]);
+    assert_eq!(client_watcher.take_one().await, vec![(rex_id, ChangeKind::Add)]);
 
     // Create pet on client
     let buddy_id = {
@@ -251,11 +225,9 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
         id
     };
 
-    // Wait for propagation
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    assert_eq!(check_server(), vec![vec![(buddy_id, ChangeKind::Add)]]);
-    assert_eq!(check_client(), vec![vec![(buddy_id, ChangeKind::Add)]]);
+    // Wait for propagation and check changes
+    assert_eq!(server_watcher.take_one().await, vec![(buddy_id, ChangeKind::Add)]);
+    assert_eq!(client_watcher.take_one().await, vec![(buddy_id, ChangeKind::Add)]);
 
     use ankurah::signals::Peek;
     let server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
@@ -264,6 +236,10 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
 
     assert_eq!(server_pets, expected_pets);
     assert_eq!(client_pets, expected_pets);
+
+    // Ensure no additional unexpected changes
+    assert_eq!(server_watcher.quiesce().await, 0);
+    assert_eq!(client_watcher.quiesce().await, 0);
 
     info!("Bidirectional subscription test passed");
 

@@ -1,4 +1,4 @@
-use ankurah::changes::ChangeKind;
+use ankurah::changes::{ChangeKind, ChangeSet, ItemChange};
 use ankurah::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 mod common;
 use common::{Album, AlbumView};
+
+use crate::common::TestWatcher;
 
 #[tokio::test]
 async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -35,19 +37,19 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client
-    let (watcher, check) = common::watcher::<AlbumView, _, _>(|change| (change.entity().year().unwrap_or_default()));
-    let handle = client_ctx.query("name = 'Test Album'")?.subscribe(watcher);
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    let client_query = client_ctx.query_wait::<AlbumView>("name = 'Test Album'").await?;
 
-    assert_eq!(vec![vec!["2020"]], check());
+    //But the livequery should have the album
+    use ankurah::signals::Peek;
+    assert_eq!(client_query.peek().iter().map(|p| p.id()).collect::<Vec<_>>(), vec![album_id]);
 
     // actually zero events because we receive a state from ItemChange::Initial
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after subscribe
 
-    // Unsubscribe (drop the handle)
-    println!("MARK test.unsubscribe (dropping handle)");
-    drop(handle);
+    // Fully unsubscribe (drop the LiveQuery)
+    drop(client_query);
 
+    // wait for the unsubscribe to be propagated to the server (probably a better way to do this without the sleep)
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Make two changes on the server while client is unsubscribed
@@ -64,18 +66,20 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after edits
 
+    // Not sure what we're waiting for here exactly - for the update to NOT arrive?
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    println!("MARK test.resubscribe");
     // Resubscribe on the client
-    let (watcher2, check2) = common::watcher::<AlbumView, String, _>(|change| change.entity().year().unwrap_or_default());
     // in the repro, it's failling here rather than on the arrival of the StateFragment
-    use ankurah::signals::Subscribe;
-    let _handle2 = client_ctx.query("name = 'Test Album'").expect("failed to resubscribe").subscribe(watcher2);
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let client_query2 = client_ctx.query_wait::<AlbumView>("name = 'Test Album'").await?;
 
-    // The client should receive the correct, up-to-date state (year = "2022") via the watcher
-    assert_eq!(vec![vec!["2022".to_string()]], check2());
+    // Update: We don't need to subscribe to the livequery or wait for this test anymore, because the LiveQuery is already initialized
+    // and we can just inspect the LiveQuery directly
+
+    // The client should have the correct, up-to-date state (year = "2022") in the LiveQuery
+    let albums = client_query2.peek();
+    assert_eq!(albums.len(), 1);
+    assert_eq!(albums[0].year().unwrap_or_default(), "2022");
 
     // After resubscribe, the client should have retrieved the missing events during the lineage comparison
     assert_eq!(3, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after resubscribe

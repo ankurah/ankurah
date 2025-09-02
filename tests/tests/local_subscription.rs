@@ -5,6 +5,8 @@ use std::sync::Arc;
 mod common;
 use common::{Album, AlbumView, Pet, PetView};
 
+use crate::common::TestWatcher;
+
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
@@ -24,19 +26,15 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     };
 
     // Set up subscription using the watcher pattern
-    let (watcher, check_changes) = common::changeset_watcher::<AlbumView>();
+    let watcher = TestWatcher::changeset();
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
     use ankurah::signals::Subscribe;
-    let query = ctx.query(predicate)?;
-    query.wait_initialized().await;
-    let _handle = query.subscribe(watcher);
-
-    // Wait a moment for initialization to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let query = ctx.query_wait::<AlbumView>(predicate).await?;
+    let _handle = query.subscribe(&watcher);
 
     // Initial state should have Two Vines and Ask That God
-    assert_eq!(check_changes(), Vec::<Vec<(EntityId, ChangeKind)>>::new());
+    assert_eq!(watcher.quiesce().await, 0);
     use ankurah::signals::Peek;
     // TODO - implement deterministic ordering
     let mut ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
@@ -62,7 +60,7 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     assert_eq!(ids, expected_ids);
 
     // Should have received a notification about Ice on the Dune being added
-    assert_eq!(check_changes(), vec![vec![(ice_on_the_dune.id(), ChangeKind::Add)]]);
+    assert_eq!(watcher.drain(), vec![vec![(ice_on_the_dune.id(), ChangeKind::Add)]]);
 
     Ok(())
 }
@@ -74,13 +72,12 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     node.system.create().await?;
     let ctx = node.context(c)?;
 
-    let (watcher, check) = common::changeset_watcher::<PetView>();
+    let watcher = TestWatcher::changeset();
 
     // Subscribe to changes
     use ankurah::signals::Subscribe;
-    let query = ctx.query("name = 'Rex' OR (age > 2 and age < 5)")?;
-    query.wait_initialized().await;
-    let _handle = query.subscribe(watcher);
+    let query = ctx.query_wait::<PetView>("name = 'Rex' OR (age > 2 and age < 5)").await?;
+    let _handle = query.subscribe(&watcher);
 
     let (rex, snuffy, jasper);
     {
@@ -96,7 +93,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     };
 
     // Verify initial state
-    assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
+    assert_eq!(watcher.drain(), vec![vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
 
     {
         // Update Rex's age to 7
@@ -106,7 +103,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     }
 
     // Verify Rex's update was received - should be Edit since it still matches name = 'Rex'
-    assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Update)]]);
+    assert_eq!(watcher.drain(), vec![vec![(rex.id(), ChangeKind::Update)]]);
 
     {
         // Update Snuffy's age to 3
@@ -116,7 +113,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     }
 
     // Verify Snuffy's update was received (now matches age > 2 and age < 5)
-    assert_eq!(check(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
+    assert_eq!(watcher.drain(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
 
     // Update Jasper's age to 4
     {
@@ -126,7 +123,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     }
 
     // Verify Jasper's update was received (now matches age > 2 and age < 5)
-    assert_eq!(check(), vec![vec![(jasper.id(), ChangeKind::Add)]]);
+    assert_eq!(watcher.drain(), vec![vec![(jasper.id(), ChangeKind::Add)]]);
 
     // Update Snuffy and Jasper to ages outside the range
     let trx = ctx.begin();
@@ -138,7 +135,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
 
     // Verify both updates were received as removals
     // TODO - implement deterministic ordering
-    let mut changes = check();
+    let mut changes = watcher.drain();
     assert_eq!(changes.len(), 1);
     changes[0].sort_by(|a, b| a.0.cmp(&b.0));
     let mut expected_changes = vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]];
@@ -153,6 +150,6 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     trx.commit().await.unwrap();
 
     // Verify Rex's "removal" was received
-    assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Remove)]]);
+    assert_eq!(watcher.drain(), vec![vec![(rex.id(), ChangeKind::Remove)]]);
     Ok(())
 }

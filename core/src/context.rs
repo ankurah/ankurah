@@ -143,6 +143,19 @@ impl Context {
         use crate::model::Model;
         Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
+
+    /// Subscribe to changes in entities matching a predicate and wait for initialization
+    pub async fn query_wait<R>(
+        &self,
+        args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
+    ) -> Result<LiveQuery<R>, RetrievalError>
+    where
+        R: View,
+    {
+        let livequery = self.query::<R>(args)?;
+        livequery.wait_initialized().await;
+        Ok(livequery)
+    }
     pub async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.0.collection(id).await
     }
