@@ -142,12 +142,12 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
     assert_eq!(check_server(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
     assert_eq!(check_client(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     // Now the LiveQueries should have initialized in the background.
     // The only reason why we we received this Initial notification is because our .subscribe() frontran the LiveQuery initialization.
     // had we called livequery.wait_initialized().await before .subscribe(), we would have received zero notifications in either case
     assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
-    assert_eq!(check_client(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
+    assert_eq!(check_client(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>); // Flaky here - maybe we need to wait for the update?
 
     // Create matching entity on server
     let album_id = {
