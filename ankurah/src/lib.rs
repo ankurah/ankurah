@@ -98,9 +98,9 @@
 //!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT)?;
 //!     let client = client.context(ankurah::policy::DEFAULT_CONTEXT)?;
 //!
-//!
-//!     // Subscribe to changes on the client
-//!     let _subscription = client.subscribe::<_,AlbumView>("name = 'Origin of Symmetry'", |changes| {
+//!     // Create a LiveQuery and subscribe to changes on the client
+//!     let livequery = client.query("name = 'Origin of Symmetry'")?;
+//!     let _guard = livequery.subscribe(|changes| {
 //!         println!("Received changes: {}", changes);
 //!     }).await?;
 //!
