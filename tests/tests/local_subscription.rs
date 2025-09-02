@@ -78,7 +78,9 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
 
     // Subscribe to changes
     use ankurah::signals::Subscribe;
-    let _handle = ctx.query("name = 'Rex' OR (age > 2 and age < 5)")?.subscribe(watcher);
+    let query = ctx.query("name = 'Rex' OR (age > 2 and age < 5)")?;
+    query.wait_initialized().await;
+    let _handle = query.subscribe(watcher);
 
     let (rex, snuffy, jasper);
     {
@@ -94,7 +96,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     };
 
     // Verify initial state
-    assert_eq!(check(), vec![vec![], vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
+    assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
 
     {
         // Update Rex's age to 7
@@ -135,7 +137,13 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     trx.commit().await.unwrap();
 
     // Verify both updates were received as removals
-    assert_eq!(check(), vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]]);
+    // TODO - implement deterministic ordering
+    let mut changes = check();
+    assert_eq!(changes.len(), 1);
+    changes[0].sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected_changes = vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]];
+    expected_changes[0].sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(changes, expected_changes);
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches
