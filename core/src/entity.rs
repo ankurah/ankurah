@@ -251,6 +251,10 @@ impl Entity {
             }
             lineage::Ordering::Descends => {
                 debug!("{self} apply_state - new head descends from current, applying");
+                // TODO: Consider playing forward the event lineage instead of overwriting backends.
+                // Current approach has a security vulnerability: a malicious peer could send a state
+                // buffer that disagrees with the actual event operations. Playing forward events would
+                // ensure the state always matches the verified event lineage.
                 self.overwrite_backends(state)?;
                 *self.head.lock().unwrap() = new_head;
                 // Notify Signal subscribers about the change

@@ -131,6 +131,8 @@ pub enum MutationError {
     PeerRejected,
     #[error("invalid event")]
     InvalidEvent,
+    #[error("invalid update")]
+    InvalidUpdate(&'static str),
 }
 
 #[derive(Error, Debug)]

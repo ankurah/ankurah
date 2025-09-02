@@ -6,7 +6,7 @@ use std::{
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 
 use ankurah_signals::{
-    broadcast::{Broadcast, BroadcastId, Listener, ListenerGuard},
+    broadcast::{BroadcastId, Listener, ListenerGuard},
     porcelain::subscribe::{IntoSubscribeListener, SubscriptionGuard},
     Get, Peek, Signal, Subscribe,
 };
@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 
 use crate::{
     changes::ChangeSet,
+    entity::Entity,
     error::RetrievalError,
     model::View,
     node::{MatchArgs, TNodeErased},
@@ -117,7 +118,7 @@ impl EntityLiveQuery {
         collection_id: CollectionId,
         predicate_id: proto::PredicateId,
         args: MatchArgs,
-        rx: Option<tokio::sync::oneshot::Receiver<Vec<Attested<EntityState>>>>,
+        rx: Option<tokio::sync::oneshot::Receiver<Vec<Entity>>>,
     ) -> Result<(), RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -125,37 +126,49 @@ impl EntityLiveQuery {
     {
         let storage_collection = node.collections.get(&collection_id).await?;
 
-        // Get initial states from remote or local storage
-        let initial_states = match rx {
+        // Get initial entities from remote or local storage
+        let initial_entities = match rx {
             Some(rx) if !args.cached => match rx.await {
-                Ok(states) => states,
+                Ok(entities) => entities,
                 Err(_) => {
                     warn!("Failed to receive first remote update for subscription {}", predicate_id);
-                    storage_collection.fetch_states(&args.predicate).await?
+                    Self::fetch_entities_from_local(&node, &storage_collection, &collection_id, &args.predicate).await?
                 }
             },
-            _ => storage_collection.fetch_states(&args.predicate).await?,
+            _ => Self::fetch_entities_from_local(&node, &storage_collection, &collection_id, &args.predicate).await?,
         };
 
         debug!(
-            "LiveQuery.initialize() fetched {} initial states for predicate {} with filter {:?}",
-            initial_states.len(),
+            "LiveQuery.initialize() fetched {} initial entities for predicate {} with filter {:?}",
+            initial_entities.len(),
             predicate_id,
             args.predicate
         );
 
-        // Convert states to entities
-        let retriever = LocalRetriever::new(storage_collection);
-        let mut initial_entities = Vec::with_capacity(initial_states.len());
-        for state in initial_states {
-            let (_, entity) =
-                node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
-            initial_entities.push(entity);
-        }
-
         debug!("LiveQuery.initialize() calling reactor.initialize with {} entities for predicate {}", initial_entities.len(), predicate_id);
         node.reactor.initialize(self.0.subscription.id(), predicate_id, initial_entities)?;
         Ok(())
+    }
+
+    async fn fetch_entities_from_local<SE, PA>(
+        node: &Node<SE, PA>,
+        storage_collection: &crate::storage::StorageCollectionWrapper,
+        collection_id: &CollectionId,
+        predicate: &ankql::ast::Predicate,
+    ) -> Result<Vec<Entity>, RetrievalError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let initial_states = storage_collection.fetch_states(predicate).await?;
+        let retriever = LocalRetriever::new(storage_collection.clone());
+        let mut entities = Vec::with_capacity(initial_states.len());
+        for state in initial_states {
+            let (_, entity) =
+                node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+            entities.push(entity);
+        }
+        Ok(entities)
     }
 }
 

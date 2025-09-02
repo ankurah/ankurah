@@ -17,7 +17,7 @@ use crate::{
     collectionset::CollectionSet,
     connector::{PeerSender, SendError},
     context::Context,
-    entity::WeakEntitySet,
+    entity::{Entity, WeakEntitySet},
     error::{MutationError, RequestError, RetrievalError},
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
@@ -122,7 +122,7 @@ where PA: PolicyAgent
     pub(crate) predicate_context: SafeMap<proto::PredicateId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
-    pub(crate) pending_predicate_subs: SafeMap<proto::PredicateId, tokio::sync::oneshot::Sender<Vec<Attested<EntityState>>>>,
+    pub(crate) pending_predicate_subs: SafeMap<proto::PredicateId, tokio::sync::oneshot::Sender<Vec<Entity>>>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
@@ -681,7 +681,7 @@ where
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         cdata: PA::ContextData,
-    ) -> Option<tokio::sync::oneshot::Receiver<Vec<Attested<EntityState>>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
         match self.subscription_relay {
             Some(ref relay) => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
