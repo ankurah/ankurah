@@ -520,11 +520,6 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                         (false, true) => Some(MembershipChange::Add),
                         _ => None,
                     };
-                    tracing::info!(
-                        "Reactor.notify_change() membership_change: {:?}, entity_subscribed: {:?}",
-                        membership_change,
-                        entity_subscribed
-                    );
 
                     let entity_subscribed = entity_subscribed.contains(&predicate_id);
                     if membership_change.is_some() || entity_subscribed {

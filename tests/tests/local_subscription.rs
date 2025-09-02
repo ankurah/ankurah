@@ -1,10 +1,6 @@
-use ankurah::{
-    changes::{ChangeKind, ChangeSet},
-    policy::DEFAULT_CONTEXT as c,
-    Mutable, Node, PermissiveAgent, ResultSet,
-};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod common;
 use common::{Album, AlbumView, Pet, PetView};
@@ -16,34 +12,33 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     let ctx = node.context(c)?;
 
     // Create some initial entities
-    {
+    let (two_vines, ask_that_god, ice_on_the_dune) = {
         let trx = ctx.begin();
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
-        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
-        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
-        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
+        let ice_on_the_dune = trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?.read();
+        let two_vines = trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?.read();
+        let ask_that_god = trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?.read();
         trx.commit().await?;
-    }
 
-    // Set up subscription
-    let received_changesets = Arc::new(Mutex::new(Vec::new()));
-    let received_changesets_clone = received_changesets.clone();
+        (two_vines, ask_that_god, ice_on_the_dune)
+    };
+
+    // Set up subscription using the watcher pattern
+    let (watcher, check_changes) = common::changeset_watcher::<AlbumView>();
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
     use ankurah::signals::Subscribe;
-    let _handle = ctx.query(predicate)?.subscribe(move |changeset: ChangeSet<AlbumView>| {
-        let mut received = received_changesets_clone.lock().unwrap();
-        received.push(changeset);
-    });
+    let query = ctx.query(predicate)?;
+    query.wait_initialized().await;
+    let _handle = query.subscribe(watcher);
+
+    // Wait a moment for initialization to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // Initial state should have Two Vines and Ask That God
-    {
-        let changesets = received_changesets.lock().unwrap();
-        assert_eq!(changesets.len(), 1);
-        let changeset = &changesets[0];
-        assert_eq!(changeset.changes.len(), 2);
-        // TODO: Add more specific assertions about the changes
-    }
+    assert_eq!(check_changes(), Vec::<Vec<(EntityId, ChangeKind)>>::new());
+    use ankurah::signals::Peek;
+    assert_eq!(query.peek(), vec![two_vines.clone(), ask_that_god.clone()]);
 
     // Update an entity
     {
@@ -55,13 +50,8 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     }
 
     // Should have received a notification about Ice on the Dune being added
-    {
-        let changesets = received_changesets.lock().unwrap();
-        assert_eq!(changesets.len(), 2);
-        let changeset = &changesets[1];
-        assert_eq!(changeset.changes.len(), 1);
-        // TODO: Add more specific assertions about the changes
-    }
+    assert_eq!(check_changes(), vec![vec![(ice_on_the_dune.id(), ChangeKind::Add)]]);
+    assert_eq!(query.peek(), vec![two_vines, ask_that_god, ice_on_the_dune]);
 
     Ok(())
 }

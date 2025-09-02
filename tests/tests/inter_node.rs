@@ -250,12 +250,9 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
 
 #[tokio::test]
 async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
-    // Create server (durable) and client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-
-    // Connect the nodes
     let _conn = LocalProcessConnection::new(&client, &server).await?;
     client.system.wait_system_ready().await;
 
@@ -273,41 +270,39 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     info!("Created pet with id: {}", pet_id);
 
-    // === PART 1: Test that View/field subscriptions work while query subscription is active ===
+    // PART 1: Test that Livequery/View subscriptions work when active
 
     // Set up query subscription on client that matches our pet
-    let (query_watcher, check_query_changes) = common::changeset_watcher::<PetView>();
-    let query = client.query("name = 'Buddy'")?;
-    let query_handle = query.subscribe(query_watcher);
+    let (lq_listener, check_lq_notifs) = common::changeset_watcher::<PetView>();
+    // This is the actual livequery, which has a predicate subscription with the server because the client node is ephemeral.
+    let client_livequery = client.query("name = 'Buddy'")?;
+    // LOCALLY subscribe to notifications from the livequery. This is a different kind of subscription than above
+    // the guard does keep the livequery alive, but dropping it does not necessarily drop the LiveQuery and unsubscribe from the server.
+    let lq_subguard = client_livequery.subscribe(lq_listener);
 
-    // Wait for initial sync
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for initial state to be received from the server
+    client_livequery.wait_initialized().await;
+
+    // NOTE!
+    // calling .subscribe does not immediately call the listener. We are receiving the Initial change because every
+    // LiveQuery starts empty and is initialized asynchronously, and crucially for reproducibility here
+    // there are no awaits between the creation of the LiveQuery and the subscription.
+    assert_eq!(check_lq_notifs(), vec![vec![(pet_id, ChangeKind::Initial)]]);
 
     // Get the pet view from client and set up View/field subscriptions
     let client_pet = client.get::<PetView>(pet_id).await?;
-
     let (view_watcher, check_view_changes) = common::generic_watcher::<PetView>();
-    // let (name_watcher, check_name_changes) = common::generic_watcher::<String>();
-    // let (age_watcher, check_age_changes) = common::generic_watcher::<String>();
+    // subscribe to the View directly - this gets notified when any change to this view arrives from any source
+    let view_subguard = client_pet.subscribe(view_watcher);
 
-    // Subscribe to the view and its fields
-    let _view_handle = client_pet.subscribe(view_watcher);
-    // let _name_handle = client_pet.name().subscribe(name_watcher);
-    // let _age_handle = client_pet.age().subscribe(age_watcher);
-
-    // Verify initial query subscription received the entity
-    let initial_query_changes = check_query_changes();
-    info!("Initial query changes count: {}", initial_query_changes.len());
-    for (i, change) in initial_query_changes.iter().enumerate() {
-        info!("Change {}: {:?}", i, change);
-    }
-    assert!(initial_query_changes.len() >= 1, "Should have received at least 1 change (the initial entity)");
+    // The view subscription is a good example of this, because there's no such thing as an uninitialized view
+    assert_eq!(check_view_changes(), vec![]);
 
     // Make an edit on the server
     {
         let trx = server.begin();
         let server_pet = server.get::<PetView>(pet_id).await?;
-        server_pet.edit(&trx)?.name().replace("Max")?;
+        server_pet.edit(&trx)?.age().replace("4")?;
         trx.commit().await?;
     }
 
@@ -315,26 +310,11 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Verify that View/field subscriptions received the update
-    let view_changes = check_view_changes();
-    // let name_changes = check_name_changes();
-    // let age_changes = check_age_changes();
-
-    info!("View changes: {}", view_changes.len());
-    // info!("Name changes: {}", name_changes.len());
-    // info!("Age changes: {}", age_changes.len());
-
-    assert_eq!(view_changes.len(), 1, "View subscription should have received 1 update");
-    // assert_eq!(name_changes.len(), 1, "Name field subscription should have received 1 update");
-    // assert_eq!(name_changes[0], "Max", "Name should have changed to 'Max'");
-    // assert_eq!(age_changes.len(), 0, "Age field subscription should have received 0 updates");
-
-    // === PART 2: Test that dropping query subscription stops View/field subscription updates ===
+    assert_eq!(check_view_changes(), vec![client_pet.clone()]);
+    assert_eq!(check_lq_notifs(), vec![vec![(pet_id, ChangeKind::Update)]]); // Buddy's age changed to 4 - still matches the query
 
     info!("Dropping query subscription handle...");
-    drop(query_handle); // This should stop the remote subscription
-
-    // Wait for unsubscription to take effect - server needs time to process the unsubscription
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    drop(lq_subguard); // This should stop the local listener
 
     // Make another edit on the server
     {
@@ -344,35 +324,44 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
         trx.commit().await?;
     }
 
-    // Wait for potential propagation
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for propagation to client
 
-    // Verify that View/field subscriptions did NOT receive the update
-    let view_changes_after = check_view_changes();
-    // let name_changes_after = check_name_changes();
-    // let age_changes_after = check_age_changes();
-
-    info!("After dropping query subscription:");
-    info!("View changes: {}", view_changes_after.len());
-    // info!("Name changes: {}", name_changes_after.len());
-    // info!("Age changes: {}", age_changes_after.len());
-
-    // This is the current (undesirable) behavior we want to document
+    // Verify that subscriptions did NOT receive the update after being dropped
     assert_eq!(
-        view_changes_after.len(),
-        0,
-        "View subscription should NOT receive updates after query subscription dropped (current behavior)"
+        check_lq_notifs(),
+        Vec::<Vec<(EntityId, ChangeKind)>>::new(),
+        "subscription to LiveQuery signal should not receive updates after dropping lq_subguard"
     );
-    // assert_eq!(
-    //     name_changes_after.len(),
-    //     0,
-    //     "Name field subscription should NOT receive updates after query subscription dropped (current behavior)"
-    // );
-    // assert_eq!(
-    //     age_changes_after.len(),
-    //     0,
-    //     "Age field subscription should NOT receive updates after query subscription dropped (current behavior)"
-    // );
+    assert_eq!(
+        check_view_changes(),
+        vec![client_pet.clone()],
+        "Subscription to View signal should still receive updates because both client_livequery and _view_subguard are still alive"
+    );
+
+    drop(client_livequery);
+
+    {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("5")?;
+        trx.commit().await?;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for propagation to client
+    assert_eq!(check_lq_notifs(), Vec::<Vec<(EntityId, ChangeKind)>>::new(), "subscription to LiveQuery signal should still be dead");
+    assert_eq!(check_view_changes(), vec![], "The current expected behavior (though undesirable) is that the Entity itself should not receive updates after dropping client_livequery");
+
+    // TODO: After implementing implicit entity subscriptions, the entity should continue receiving updates after dropping client_livequery
+    // at which point the above assertion should change, and then
+    // drop(view_subguard);
+    // {
+    //     let trx = server.begin();
+    //     let server_pet = server.get::<PetView>(pet_id).await?;
+    //     server_pet.edit(&trx)?.age().replace("6")?;
+    //     trx.commit().await?;
+    // }
+    // tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for propagation to client
+    // assert_eq!(pet.age(), "6"); // Updates to the underlying entity should continue even after everything (other than the Entity itself) is dropped
+    // assert_eq!(check_view_changes(), vec![],"But the subscription to the View signal should be dead with the dropping of the view_subguard"
 
     Ok(())
 }

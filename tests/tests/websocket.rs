@@ -137,7 +137,15 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
     let _server_sub = server_ctx.query("name = 'Abbey Road'")?.subscribe(server_watcher);
     let _client_sub = client_ctx.query("name = 'Abbey Road'")?.subscribe(client_watcher);
 
-    // Initial state should be empty
+    // We should have received zero notifications, because .subscribe does not immediately call the listener
+    // the LiveQueries cannot have initialized yet because they are async and this part of the test is synchronous
+    assert_eq!(check_server(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+    assert_eq!(check_client(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    // Now the LiveQueries should have initialized in the background.
+    // The only reason why we we received this Initial notification is because our .subscribe() frontran the LiveQuery initialization.
+    // had we called livequery.wait_initialized().await before .subscribe(), we would have received zero notifications in either case
     assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
     assert_eq!(check_client(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
 
@@ -206,11 +214,21 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
 
     // Subscribe to pets with age > 5
     use ankurah::signals::Subscribe;
-    let _server_sub = server_ctx.query("age > 5")?.subscribe(server_watcher);
-    let _client_sub = client_ctx.query("age > 5")?.subscribe(client_watcher);
+    let server_livequery = server_ctx.query("age > 5")?;
+    let client_livequery = client_ctx.query("age > 5")?;
+
+    server_livequery.wait_initialized().await;
+    client_livequery.wait_initialized().await;
+
+    let _server_sub = server_livequery.subscribe(server_watcher);
+    let _client_sub = client_livequery.subscribe(client_watcher);
+
+    // No notifications because we intentionally waited for the LiveQueries to be initialized before subscribing
+    assert_eq!(check_server(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+    assert_eq!(check_client(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
 
     // Create pet on server
-    let server_pet_id = {
+    let rex_id = {
         let trx = server_ctx.begin();
         let pet = trx.create(&Pet { name: "Rex".to_string(), age: "7".to_string() }).await?;
         let id = pet.id();
@@ -221,8 +239,11 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     // Wait for propagation
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+    assert_eq!(check_server(), vec![vec![(rex_id, ChangeKind::Add)]]);
+    assert_eq!(check_client(), vec![vec![(rex_id, ChangeKind::Add)]]);
+
     // Create pet on client
-    let client_pet_id = {
+    let buddy_id = {
         let trx = client_ctx.begin();
         let pet = trx.create(&Pet { name: "Buddy".to_string(), age: "8".to_string() }).await?;
         let id = pet.id();
@@ -233,30 +254,13 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     // Wait for propagation
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Both sides should see both pets
-    let server_changes = check_server();
-    let client_changes = check_client();
+    assert_eq!(check_server(), vec![vec![(buddy_id, ChangeKind::Add)]]);
+    assert_eq!(check_client(), vec![vec![(buddy_id, ChangeKind::Add)]]);
 
-    info!("Server changes: {:?}", server_changes);
-    info!("Client changes: {:?}", client_changes);
-
-    // Both should see exactly 3 change events (empty initial + 2 pets)
-    assert_eq!(server_changes.len(), 3);
-    assert_eq!(client_changes.len(), 3);
-
-    // Initial should be empty
-    assert_eq!(server_changes[0], vec![]);
-    assert_eq!(client_changes[0], vec![]);
-
-    // Both should see both pets (event types may vary)
-    let mut server_pets: Vec<_> = server_changes.iter().skip(1).flat_map(|v| v.iter().map(|(id, _)| *id)).collect();
-    let mut client_pets: Vec<_> = client_changes.iter().skip(1).flat_map(|v| v.iter().map(|(id, _)| *id)).collect();
-
-    server_pets.sort();
-    client_pets.sort();
-
-    let mut expected_pets = vec![server_pet_id, client_pet_id];
-    expected_pets.sort();
+    use ankurah::signals::Peek;
+    let server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    let client_pets = client_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    let expected_pets = vec![rex_id, buddy_id];
 
     assert_eq!(server_pets, expected_pets);
     assert_eq!(client_pets, expected_pets);
