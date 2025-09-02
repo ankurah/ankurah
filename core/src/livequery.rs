@@ -185,6 +185,10 @@ impl Drop for Inner {
 impl<R: View> LiveQuery<R> {
     /// Wait for the LiveQuery to be fully initialized with initial states
     pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
+
+    pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.map::<R>() }
+
+    pub fn loaded(&self) -> bool { self.0 .0.resultset.is_loaded() }
 }
 
 // impl<R: View> std::fmt::Debug for LiveQuery<R> {

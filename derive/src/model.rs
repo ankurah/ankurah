@@ -135,74 +135,82 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                 impl #resultset_name {
                     #[wasm_bindgen(getter)]
                     pub fn items(&self) -> Vec<#view_name> {
-                        use ::ankurah::signals::Peek;
-                        // self.0.get()
-                        unimplemented!("items is not supported for wasm")
+                        use ::ankurah::signals::Get;
+                        self.0.get()
                     }
                     pub fn by_id(&self, id: ::ankurah::proto::EntityId) -> Option<#view_name> {
                         // ::ankurah::signals::CurrentObserver::track(&self);
                         // self.0.by_id(&id)
                         unimplemented!("by_id is not supported for wasm")
-                        // todo generate a map on demand if there are more than a certain number of items (benchmark this)
                     }
                     #[wasm_bindgen(getter)]
                     pub fn loaded(&self) -> bool {
                         self.0.is_loaded()
                     }
+                                        /// Call the provided callback on each item in the resultset, returning a new array of the results
+                    pub fn map(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::derive_deps::js_sys::Array {
+                        ::ankurah::core::model::js_resultset_map(&self.0, &callback)
+                    }
                 }
 
-                impl ankurah::signals::Signal for #resultset_name {
-                    fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
-                        // self.0.listen(listener)
-                        unimplemented!("listen is not supported for wasm")
-                    }
-                    fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
-                        // use ::ankurah::signals::Signal;
-                        // self.0.broadcast_id()
-                        unimplemented!("broadcast_id is not supported for wasm")
-                    }
-                }
+                // not sure if we actually need this
+                // impl ankurah::signals::Signal for #resultset_name {
+                //     fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
+                //         // self.0.listen(listener)
+                //         unimplemented!("listen is not supported for wasm")
+                //     }
+                //     fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
+                //         // use ::ankurah::signals::Signal;
+                //         // self.0.broadcast_id()
+                //         unimplemented!("broadcast_id is not supported for wasm")
+                //     }
+                // }
 
                 #[wasm_bindgen]
                 pub struct #livequery_name(::ankurah::LiveQuery<#view_name>);
 
                 #[wasm_bindgen]
                 impl #livequery_name {
-                    pub fn items(&self) -> Vec<#view_name> {
-                        // use ::ankurah::signals::Signal;
-                        // ::ankurah::signals::CurrentObserver::track(&self);
-                        // self.0.resultset.()
-                        unimplemented!("items is not supported for wasm")
+                    pub fn results(&self) -> #resultset_name {
+                        #resultset_name(self.0.resultset())
                     }
-                    #[wasm_bindgen(getter)]
-                    pub fn value(&self) -> #resultset_name {
-                        // use ::ankurah::signals::Signal;
-                        // ::ankurah::signals::CurrentObserver::track(&self);
-                        // #resultset_name(::std::sync::Arc::new(self.0.peek()))
-                        unimplemented!("value is not supported for wasm")
+                    pub fn map(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::derive_deps::js_sys::Array {
+                        ::ankurah::core::model::js_resultset_map(&self.0.resultset(), &callback)
                     }
 
                     #[wasm_bindgen(getter)]
-                    pub fn peek(&self) -> #resultset_name {
-                        // use ::ankurah::signals::Peek;
-                        // self.0.peek()
-                        unimplemented!("peek is not supported for wasm")
+                    pub fn peek(&self) -> Vec<#view_name> {
+                        use ::ankurah::signals::Peek;
+                        self.0.peek()
                     }
+
+                    #[wasm_bindgen(getter)]
+                    pub fn loaded(&self) -> bool {
+                        self.0.loaded()
+                    }
+
+                    #[wasm_bindgen(getter)]
+                    pub fn resultset(&self) -> #resultset_name {
+                        #resultset_name(self.0.resultset())
+                    }
+                    // #[wasm_bindgen(getter)]
+                    // pub fn error(&self) -> Option<String> {
+                    //     self.0.error()
+                    // }
 
                     pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
                         use ::ankurah::signals::Subscribe;
                         let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
 
-                        // self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                        //     // The ChangeSet already contains a ResultSet<View>, just wrap it
-                        //     let resultset = #resultset_name(changeset.resultset.map());
+                        self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
+                            // The ChangeSet already contains a ResultSet<View>, just wrap it
+                            let resultset = #resultset_name(changeset.resultset.map());
 
-                        //     let _ = callback.call1(
-                        //         &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
-                        //         &resultset.into()
-                        //     );
-                        // })
-                        unimplemented!("subscribe is not supported for wasm")
+                            let _ = callback.call1(
+                                &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
+                                &resultset.into()
+                            );
+                        })
                     }
                 }
             };
@@ -288,7 +296,7 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             where
                 F: ::ankurah::signals::subscribe::IntoSubscribeListener<#view_name>,
             {
-                ::ankurah::core::model::vsub_helper(self, listener)
+                ::ankurah::core::model::js_view_subscribe(self, listener)
             }
         }
 

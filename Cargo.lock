@@ -106,6 +106,7 @@ dependencies = [
  "futures-util",
  "indexmap 2.8.0",
  "itertools",
+ "js-sys",
  "rand 0.8.5",
  "serde",
  "serde-wasm-bindgen",

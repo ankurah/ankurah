@@ -76,9 +76,9 @@ const App: React.FC = signalObserver(() => {
 
   // ignore unused _h warning
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [test_items_signal, _h] = useMemo(() => {
+  const [entries, _h] = useMemo(() => {
     // subscribe to the ankurah query - returns a signal
-    const signal = Entry.subscribe(ctx(), "added = '2024-01-01'");
+    const signal = Entry.query(ctx(), "added = '2024-01-01'");
 
     // subscribe to the signal - not necessary for this page - just illustrating how to do it
     // the call to test_items_signal.value below is what is doing the real work here,
@@ -141,7 +141,7 @@ const App: React.FC = signalObserver(() => {
           <tbody>
             {(() => {
               // calling .value automatically subscribes the current observer to the signal
-              return test_items_signal.value.items.map((item: EntryView) => (
+              return entries.map((item: EntryView) => (
                 <EntryRow key={item.id().as_string()} entry={item} />
               ));
             })()}
