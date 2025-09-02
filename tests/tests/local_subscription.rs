@@ -36,12 +36,12 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     // Initial state should have Two Vines and Ask That God
     assert_eq!(watcher.quiesce().await, 0);
     use ankurah::signals::Peek;
-    // TODO - implement deterministic ordering
-    let mut ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
-    ids.sort();
+    // Order depends on ULID random component when created in same millisecond
+    let mut actual_ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    actual_ids.sort();
     let mut expected_ids = vec![two_vines.id(), ask_that_god.id()];
     expected_ids.sort();
-    assert_eq!(ids, expected_ids);
+    assert_eq!(actual_ids, expected_ids);
 
     // Update an entity
     {
@@ -52,12 +52,13 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
         trx.commit().await?;
     }
 
-    // TODO - implement deterministic ordering
-    let mut ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
-    ids.sort();
+    // After update, should have all three albums
+    // Order depends on ULID random component when created in same millisecond
+    let mut actual_ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    actual_ids.sort();
     let mut expected_ids = vec![two_vines.id(), ask_that_god.id(), ice_on_the_dune.id()];
     expected_ids.sort();
-    assert_eq!(ids, expected_ids);
+    assert_eq!(actual_ids, expected_ids);
 
     // Should have received a notification about Ice on the Dune being added
     assert_eq!(watcher.drain(), vec![vec![(ice_on_the_dune.id(), ChangeKind::Add)]]);
@@ -134,13 +135,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     trx.commit().await.unwrap();
 
     // Verify both updates were received as removals
-    // TODO - implement deterministic ordering
-    let mut changes = watcher.drain();
-    assert_eq!(changes.len(), 1);
-    changes[0].sort_by(|a, b| a.0.cmp(&b.0));
-    let mut expected_changes = vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]];
-    expected_changes[0].sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(changes, expected_changes);
+    assert_eq!(watcher.drain(), vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]]);
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches

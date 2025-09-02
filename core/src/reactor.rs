@@ -22,6 +22,7 @@ use crate::{
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{self as proto, Attested, EntityState};
+use indexmap::IndexMap;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -425,7 +426,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
     pub fn notify_change<C: ChangeNotification<Entity = E, Event = Ev>>(&self, changes: Vec<C>) {
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
 
-        let mut items: std::collections::HashMap<ReactorSubscriptionId, HashMap<proto::EntityId, ReactorUpdateItem<E, Ev>>> =
+        let mut items: std::collections::HashMap<ReactorSubscriptionId, IndexMap<proto::EntityId, ReactorUpdateItem<E, Ev>>> =
             std::collections::HashMap::new();
 
         debug!("Reactor.notify_change({:?})", changes);
@@ -525,7 +526,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                     if membership_change.is_some() || entity_subscribed {
                         tracing::info!("Reactor SENDING UPDATE to subscription {}", subscription_id);
                         match sub_entities.entry(AbstractEntity::id(&entity)) {
-                            std::collections::hash_map::Entry::Vacant(v) => {
+                            indexmap::map::Entry::Vacant(v) => {
                                 v.insert(ReactorUpdateItem {
                                     entity: entity.clone(),
                                     events: events.clone(),
@@ -533,7 +534,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                                     predicate_relevance: membership_change.map(|mc| (predicate_id, mc)).into_iter().collect(),
                                 });
                             }
-                            std::collections::hash_map::Entry::Occupied(mut o) => {
+                            indexmap::map::Entry::Occupied(mut o) => {
                                 if let Some(mc) = membership_change {
                                     o.get_mut().predicate_relevance.push((predicate_id, mc));
                                 }

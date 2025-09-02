@@ -104,6 +104,7 @@ dependencies = [
  "futures",
  "futures-signals",
  "futures-util",
+ "indexmap 2.8.0",
  "itertools",
  "rand 0.8.5",
  "serde",
