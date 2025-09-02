@@ -192,11 +192,11 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
                     pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
                         use ::ankurah::signals::Subscribe;
                         let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
-                        
+
                         // self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
                         //     // The ChangeSet already contains a ResultSet<View>, just wrap it
                         //     let resultset = #resultset_name(changeset.resultset.map());
-                            
+
                         //     let _ = callback.call1(
                         //         &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
                         //         &resultset.into()
@@ -278,7 +278,6 @@ pub fn derive_model_impl(stream: TokenStream) -> TokenStream {
             fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
                 self.entity.broadcast().reference().listen(listener)
             }
-            
             fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
                 self.entity.broadcast().id()
             }
@@ -536,12 +535,7 @@ pub fn expand_ts_model_type(input: &DeriveInput, interface_name: String) -> syn:
 }
 
 #[cfg(feature = "wasm")]
-fn get_static_methods_ts(
-    name: &syn::Ident,
-    view_name: &syn::Ident,
-    livequery_name: &syn::Ident,
-    pojo_interface: &syn::Ident,
-) -> String {
+fn get_static_methods_ts(name: &syn::Ident, view_name: &syn::Ident, livequery_name: &syn::Ident, pojo_interface: &syn::Ident) -> String {
     format!(
         r#"export class {name} {{
         /**
