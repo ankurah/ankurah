@@ -260,11 +260,5 @@ where R: View {
         }
     }
 
-    tracing::info!(
-        "ChangeSet.from() changes: {}, resultset.len(): {} - {}",
-        changes.len(),
-        resultset.len(),
-        changes.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
-    );
     ChangeSet { changes, resultset }
 }

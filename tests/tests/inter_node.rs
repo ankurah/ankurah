@@ -277,7 +277,8 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Set up query subscription on client that matches our pet
     let (query_watcher, check_query_changes) = common::changeset_watcher::<PetView>();
-    let query_handle = client.query("name = 'Buddy'")?.subscribe(query_watcher);
+    let query = client.query("name = 'Buddy'")?;
+    let query_handle = query.subscribe(query_watcher);
 
     // Wait for initial sync
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

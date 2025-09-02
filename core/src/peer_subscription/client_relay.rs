@@ -206,16 +206,20 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         subscriptions.get(&predicate_id).map(|info| info.status.clone())
     }
 
-    /// Get all unique contexts for predicates established with a specific peer
+    /// Get all unique contexts for predicates established or requested with a specific peer
+    /// TODO: update the data structure to do this via a direct lookup rather than having to scan the entire map
     pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {
         let subscriptions = self.inner.subscriptions.lock().unwrap();
         let mut contexts = std::collections::HashSet::new();
 
         for (_, state) in subscriptions.iter() {
-            if let Status::Established(established_peer) = &state.status {
-                if established_peer == peer_id {
-                    contexts.insert(state.content.context_data.clone());
+            match &state.status {
+                Status::Established(established_peer) | Status::Requested(established_peer) => {
+                    if established_peer == peer_id {
+                        contexts.insert(state.content.context_data.clone());
+                    }
                 }
+                _ => {}
             }
         }
 

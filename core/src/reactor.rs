@@ -551,7 +551,6 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
 
         for (sub_id, sub_items) in items {
             if let Some(subscription) = self.0.subscriptions.lock().unwrap().get(&sub_id) {
-                tracing::info!("Reactor.notify_change() notifying subscription {} with {} items", sub_id, sub_items.len());
                 subscription.notify(ReactorUpdate { items: sub_items.into_values().collect(), initialized_predicate: None });
             }
         }
