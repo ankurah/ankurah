@@ -9,8 +9,14 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-wasm       = ["wasm-bindgen", "wasm-bindgen-futures", "serde-wasm-bindgen", "js-sys", "ankurah-proto/wasm"]
-default    = []
+wasm = [
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "serde-wasm-bindgen",
+    "js-sys",
+    "ankurah-proto/wasm",
+]
+default = []
 instrument = []
 
 [dependencies]
