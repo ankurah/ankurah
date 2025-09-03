@@ -70,7 +70,7 @@ impl<'a> Container<'a> {
     pub fn generics(&self) -> &syn::Generics { self.serde_container.generics }
 
     /// Information about the data fields of the type as parsed by Serde.
-    pub fn serde_data(&self) -> &ast::Data { &self.serde_container.data }
+    pub fn serde_data(&self) -> &ast::Data<'_> { &self.serde_container.data }
 
     /// Add a new error to the list of processing errors.
     pub fn syn_error(&self, err: syn::Error) { self.errors.syn_error(err); }

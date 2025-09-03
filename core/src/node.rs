@@ -167,7 +167,7 @@ where
         // Set up the message sender for the subscription relay
         if let Some(ref relay) = node.subscription_relay {
             let weak_node = node.weak();
-            if let Err(_) = relay.set_message_sender(Arc::new(weak_node)) {
+            if relay.set_message_sender(Arc::new(weak_node)).is_err() {
                 warn!("Failed to set message sender for subscription relay");
             }
         }

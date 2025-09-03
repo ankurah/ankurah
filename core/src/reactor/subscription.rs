@@ -6,17 +6,22 @@ use crate::{
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
-    broadcast::{Broadcast, IntoListener, Listener, ListenerGuard},
-    porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard},
-    BroadcastId, Signal,
+    broadcast::Broadcast,
+    porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard}, Signal,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use ulid::Ulid;
 
 /// Unique identifier for a reactor subscription. This id is used only within a given reactor / node.
 /// it cannot be transported across nodes. Predicate id and Entity id are used for that instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReactorSubscriptionId(Ulid);
+
+impl Default for ReactorSubscriptionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ReactorSubscriptionId {
     pub fn new() -> Self { Self(Ulid::new()) }

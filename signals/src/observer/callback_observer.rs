@@ -24,7 +24,7 @@ struct Inner {
 struct WeakCallbackObserver(Weak<Inner>);
 
 impl WeakCallbackObserver {
-    fn upgrade(&self) -> Option<CallbackObserver> { self.0.upgrade().map(|inner| CallbackObserver(inner)) }
+    fn upgrade(&self) -> Option<CallbackObserver> { self.0.upgrade().map(CallbackObserver) }
 }
 
 impl CallbackObserver {

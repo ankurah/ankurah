@@ -1,6 +1,5 @@
 use crate::{entity::Entity, error::MutationError, model::View};
-use ankurah_proto::{self as proto, Attested, Event};
-use ulid::Ulid;
+use ankurah_proto::{Attested, Event};
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {

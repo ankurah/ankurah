@@ -53,6 +53,14 @@ impl<T> ListenerGuard<T> {
     }
 }
 
+impl<T> Default for Broadcast<T>
+where T: Clone
+ {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Broadcast<T>
 where T: Clone
 {
@@ -83,7 +91,7 @@ where T: Clone
 
     /// Get a read-only reference to this sender that can only subscribe to notifications.
     /// This avoids cloning the sender while still forbidding the user from sending notifications.
-    pub fn reference(&self) -> Ref<T> { Ref(&self) }
+    pub fn reference(&self) -> Ref<'_, T> { Ref(self) }
 }
 
 impl<'a, T> Ref<'a, T> {

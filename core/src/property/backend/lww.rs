@@ -48,7 +48,7 @@ impl LWWBackend {
 
     pub fn get(&self, property_name: &PropertyName) -> Option<PropertyValue> {
         let values = self.values.read().unwrap();
-        values.get(property_name).map(|entry| entry.value.clone()).flatten()
+        values.get(property_name).and_then(|entry| entry.value.clone())
     }
 }
 
@@ -154,7 +154,7 @@ impl PropertyBackend for LWWBackend {
     ) -> ankurah_signals::broadcast::ListenerGuard {
         // Get or create the broadcast for this field
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(|| ankurah_signals::broadcast::Broadcast::new());
+        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(ankurah_signals::broadcast::Broadcast::new);
 
         // Subscribe to the broadcast and return the guard
         broadcast.reference().listen(listener)
@@ -165,7 +165,7 @@ impl LWWBackend {
     /// Get the broadcast ID for a specific field, creating the broadcast if necessary
     pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(|| ankurah_signals::broadcast::Broadcast::new());
+        let broadcast = field_broadcasts.entry(field_name.clone()).or_insert_with(ankurah_signals::broadcast::Broadcast::new);
         broadcast.id()
     }
 }

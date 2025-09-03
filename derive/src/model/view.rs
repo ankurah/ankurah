@@ -1,6 +1,5 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::Ident;
 
 /// Generate the View struct and all its implementations
 pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenStream {

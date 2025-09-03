@@ -3,7 +3,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
+use ankurah_proto::{self as proto, CollectionId};
 
 use ankurah_signals::{
     broadcast::{BroadcastId, Listener, ListenerGuard},
@@ -224,13 +224,13 @@ where R: Clone + Send + Sync + 'static
 
         let me = self.clone();
         // Subscribe to the underlying ReactorUpdate stream and convert to ChangeSet<R>
-        let guard = self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
+        
+
+        self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
             // Convert ReactorUpdate to ChangeSet<R>
             let changeset: ChangeSet<R> = livequery_change_set_from(me.0 .0.resultset.map::<R>(), reactor_update);
             listener(changeset);
-        });
-
-        guard
+        })
     }
 }
 

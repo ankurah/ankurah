@@ -67,7 +67,7 @@ pub struct Inner {
 static HUMAN_READABLE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl ReactObserverWeak {
-    fn upgrade(&self) -> Option<ReactObserver> { self.0.upgrade().map(|inner| ReactObserver(inner)) }
+    fn upgrade(&self) -> Option<ReactObserver> { self.0.upgrade().map(ReactObserver) }
 }
 
 impl ReactObserver {
@@ -103,8 +103,8 @@ impl ReactObserver {
             version,
             entries: std::sync::RwLock::new(HashMap::new()),
             trigger_render,
-            subscribe_fn: subscribe_fn,
-            get_snapshot: get_snapshot,
+            subscribe_fn,
+            get_snapshot,
         }))
     }
     #[allow(unused)]

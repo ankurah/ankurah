@@ -9,28 +9,23 @@ pub(crate) use self::{
 };
 
 use crate::{
-    changes::{ChangeSet, EntityChange, ItemChange},
-    entity::{Entity, WeakEntitySet},
+    changes::EntityChange,
+    entity::Entity,
     error::SubscriptionError,
-    policy::PolicyAgent,
     reactor::subscription::ReactorSubInner,
     resultset::EntityResultSet,
-    retrieval::LocalRetriever,
-    storage::{StorageCollection, StorageCollectionWrapper, StorageEngine},
-    util::safemap::SafeMap,
+    storage::StorageEngine,
     value::Value,
 };
 use ankql::selection::filter::Filterable;
-use ankurah_proto::{self as proto, Attested, EntityState};
+use ankurah_proto::{self as proto};
 use indexmap::IndexMap;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
-#[cfg(feature = "instrument")]
-use tracing::instrument;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Trait for entities that can be used in reactor notifications
 pub trait AbstractEntity: ankql::selection::filter::Filterable + Clone + std::fmt::Debug {
@@ -137,6 +132,12 @@ impl<E: AbstractEntity, Ev> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
+impl<E: AbstractEntity, Ev: Clone> Default for Reactor<E, Ev> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<E: AbstractEntity, Ev: Clone> Reactor<E, Ev> {
     pub fn new() -> Self {
         Self(Arc::new(ReactorInner {
@@ -233,7 +234,7 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
 
             Ok(resultset)
         } else {
-            return Err(SubscriptionError::SubscriptionNotFound);
+            Err(SubscriptionError::SubscriptionNotFound)
         }
     }
 
@@ -464,7 +465,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                     if let Some(sub) = self.0.subscriptions.lock().unwrap().get(&sub_id.subscription_id()) {
                         for predicate_id in sub.predicates.keys() {
                             possibly_interested_watchers.insert((sub_id.subscription_id(), *predicate_id));
-                            entity_subscribed.insert(predicate_id.clone());
+                            entity_subscribed.insert(*predicate_id);
                         }
                     }
                 }
@@ -631,7 +632,7 @@ impl WatcherSet {
                     };
 
                     let field_id = FieldId(field_name);
-                    let index = self.index_watchers.entry((collection_id.clone(), field_id)).or_insert_with(|| ComparisonIndex::new());
+                    let index = self.index_watchers.entry((collection_id.clone(), field_id)).or_insert_with(ComparisonIndex::new);
 
                     match op {
                         WatcherOp::Add => {
@@ -656,7 +657,7 @@ impl WatcherSet {
                 unimplemented!("Not sure how to implement this")
             }
             Predicate::True => {
-                let set = self.wildcard_watchers.entry(collection_id.clone()).or_insert_with(|| HashSet::new());
+                let set = self.wildcard_watchers.entry(collection_id.clone()).or_insert_with(HashSet::new);
 
                 match op {
                     WatcherOp::Add => {
