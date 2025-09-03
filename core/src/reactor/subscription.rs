@@ -7,7 +7,8 @@ use crate::{
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
     broadcast::Broadcast,
-    porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard}, Signal,
+    porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard},
+    Signal,
 };
 use std::sync::Arc;
 use ulid::Ulid;
@@ -18,9 +19,7 @@ use ulid::Ulid;
 pub struct ReactorSubscriptionId(Ulid);
 
 impl Default for ReactorSubscriptionId {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl ReactorSubscriptionId {
