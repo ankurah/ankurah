@@ -58,7 +58,7 @@ pub trait Filterable {
 
 fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<String>, Error> {
     match expr {
-        Expr::Placeholder => return Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
+        Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(match lit {
             Literal::String(s) => s.clone(),
             Literal::Integer(i) => i.to_string(),
@@ -81,7 +81,7 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Stri
             }
             Ok(ExprOutput::List(result))
         }
-        _ => return Err(Error::UnsupportedExpression("Only literal, identifier, and list expressions are supported")),
+        _ => Err(Error::UnsupportedExpression("Only literal, identifier, and list expressions are supported")),
     }
 }
 

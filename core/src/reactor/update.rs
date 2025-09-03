@@ -1,7 +1,4 @@
-use crate::{
-    changes::{ChangeSet, ItemChange},
-    entity::Entity,
-};
+use crate::entity::Entity;
 use ankurah_proto::{self as proto, Attested, Event};
 
 /// Describes how an entity's membership changed for a specific predicate

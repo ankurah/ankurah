@@ -73,6 +73,12 @@ pub struct SubscriptionRelay<CD: ContextData> {
     inner: Arc<SubscriptionRelayInner<CD>>,
 }
 
+impl<CD: ContextData> Default for SubscriptionRelay<CD> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<CD: ContextData> SubscriptionRelay<CD> {
     pub fn new() -> Self {
         Self {
@@ -106,7 +112,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         debug!("SubscriptionRelay.subscribe_predicate() - New predicate {} needs remote registration", predicate_id);
         {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
-                predicate_id.clone(),
+                predicate_id,
                 SubscriptionState {
                     content: Arc::new(Content { collection_id, predicate, context_data, predicate_id }),
                     status: Status::PendingRemote,
@@ -271,7 +277,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         debug!("Registering {} predicates on {} peer subscriptions", pending.len(), self.inner.connected_peers.len());
 
         for content in pending {
-            crate::task::spawn(self.clone().peer_subscribe(sender.clone(), target_peer.clone(), content));
+            crate::task::spawn(self.clone().peer_subscribe(sender.clone(), target_peer, content));
         }
     }
 

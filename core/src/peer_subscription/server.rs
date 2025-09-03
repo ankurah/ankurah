@@ -1,5 +1,4 @@
 use ankurah_proto::{self as proto, Attested};
-use anyhow::anyhow;
 use tracing::{debug, warn};
 
 use crate::{

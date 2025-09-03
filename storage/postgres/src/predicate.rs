@@ -106,7 +106,8 @@ impl Sql {
         Ok(())
     }
 
-    pub fn comparison_op(&mut self, op: &ComparisonOperator) -> Result<(), SqlGenerationError> { Ok(self.sql(comparison_op_to_sql(op)?)) }
+    pub fn comparison_op(&mut self, op: &ComparisonOperator) -> Result<(), SqlGenerationError> { self.sql(comparison_op_to_sql(op)?);
+    Ok(()) }
 
     pub fn predicate(&mut self, predicate: &Predicate) -> Result<(), SqlGenerationError> {
         match predicate {

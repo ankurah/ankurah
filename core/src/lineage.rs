@@ -1,6 +1,5 @@
 use crate::error::RetrievalError;
 use crate::retrieval::{TClock, TEvent};
-use ankurah_proto::{Clock, Event, EventId};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
 

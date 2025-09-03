@@ -30,7 +30,7 @@ impl UpdateApplier {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
         }
 
-        if let Some(tx) = initialized_predicate.map(|p| node.pending_predicate_subs.remove(&p)).flatten() {
+        if let Some(tx) = initialized_predicate.and_then(|p| node.pending_predicate_subs.remove(&p)) {
             let mut changes = Vec::new();
             let mut entities = Vec::new();
             for update in items {
@@ -106,7 +106,7 @@ impl UpdateApplier {
                     }
                 }
 
-                if applied_events.len() > 0 {
+                if !applied_events.is_empty() {
                     changes.push(EntityChange::new(entity, applied_events)?);
                 }
             }
