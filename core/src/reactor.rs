@@ -790,8 +790,6 @@ mod tests {
         // 1. When notify_change is called with an entity that no longer matches the predicate
         // 2. The Predicate watcher should be removed (entity no longer matches)
         // 3. The Subscription watcher should remain (entity should stay watched)
-
-        println!("Test setup complete - entity is being watched by both predicate and subscription");
     }
 
     // TODO: Add more test cases:

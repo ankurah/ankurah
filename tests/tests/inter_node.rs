@@ -94,7 +94,6 @@ async fn server_edits_subscription() -> Result<()> {
         let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await?;
 
         let read = (rex.read(), snuffy.read(), jasper.read());
-        tracing::info!("MARK 1");
         trx.commit().await?;
         read
     };
@@ -248,8 +247,6 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
         id
     };
 
-    info!("Created pet with id: {}", pet_id);
-
     // PART 1: Test that Livequery/View subscriptions work when active
 
     // Set up query subscription on client that matches our pet
@@ -289,7 +286,6 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     // Verify that View/field subscriptions received the update
     assert_eq!(view_watcher.take_one().await, client_pet.clone());
 
-    info!("Dropping query subscription handle...");
     drop(lq_subguard); // This should stop the local listener
 
     // Make another edit on the server
@@ -357,8 +353,6 @@ async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
         trx.commit().await?;
         id
     };
-
-    info!("Created pet with id: {}", pet_id);
 
     // === Test fetch() behavior ===
 
