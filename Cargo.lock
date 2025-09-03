@@ -285,6 +285,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-wasm-integration-tests"
+version = "0.5.4"
+dependencies = [
+ "ankurah",
+ "ankurah-storage-indexeddb-wasm",
+ "console_error_panic_hook",
+ "getrandom 0.3.2",
+ "js-sys",
+ "lazy_static",
+ "once_cell",
+ "send_wrapper",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-wasm",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "ankurah-websocket-client"
 version = "0.5.4"
 dependencies = [

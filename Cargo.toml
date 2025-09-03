@@ -13,5 +13,6 @@ members = [
     "tests",
     "ankurah",
     "signals",
+    "wasm-integration-tests",
 ]
 resolver = "2"

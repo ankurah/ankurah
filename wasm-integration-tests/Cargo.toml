@@ -1,0 +1,32 @@
+[package]
+name    = "ankurah-wasm-integration-tests"
+version = "0.5.4"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ankurah = { path = "../ankurah", features = ["derive", "wasm"], version = "^0.5.4" }
+# ankurah-signals not needed for basic integration tests
+ankurah-storage-indexeddb-wasm = { path = "../storage/indexeddb-wasm", version = "^0.5.4" }
+wasm-bindgen                   = "0.2.84"
+wasm-bindgen-futures           = "0.4.42"
+js-sys                         = "0.3.69"
+web-sys                        = "0.3.69"
+tracing                        = "0.1.40"
+tracing-wasm                   = "0.2.1"
+console_error_panic_hook       = "0.1.7"
+serde                          = { version = "1.0", features = ["derive"] }
+
+send_wrapper = { version = "0.6.0" }
+tokio        = { version = "1.39.0", features = ["sync"] }
+lazy_static  = "1.4.0"
+once_cell    = "1.19.0"
+
+##### patch - something is wrong with the uuid crate for wasm
+getrandom = { version = "0.3", features = ["wasm_js"] }
+###### 
+
+    [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
+    dwarf-debug-info = true

@@ -1,0 +1,19 @@
+{
+    "name": "ankurah-wasm-integration-tests",
+    "private": true,
+    "version": "0.0.0",
+    "type": "module",
+    "scripts": {
+        "test": "playwright test",
+        "test:headed": "playwright test --headed",
+        "test:debug": "playwright test --debug"
+    },
+    "dependencies": {
+        "ankurah-wasm-integration-tests": "../pkg"
+    },
+    "devDependencies": {
+        "@playwright/test": "^1.48.0",
+        "@types/node": "^22.0.0",
+        "typescript": "^5.2.2"
+    }
+}
