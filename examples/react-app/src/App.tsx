@@ -162,10 +162,10 @@ const EntryRow: React.FC<EntryRowProps> = signalObserver(({ entry }) => {
     <Tr onClick={() => edit_entry(entry)} style={{ cursor: "pointer" }}>
       {/* These are not currently calling signal::Get, because they are using FromActiveType */}
       <Td>{entry.id().as_string()}</Td>
-      <Td>{entry.added()}</Td>
-      <Td>{entry.ip_address()}</Td>
-      <Td>{entry.node_id()}</Td>
-      <Td>{JSON.stringify(entry.complex())}</Td>
+      <Td>{entry.added}</Td>
+      <Td>{entry.ip_address}</Td>
+      <Td>{entry.node_id}</Td>
+      <Td>{JSON.stringify(entry.complex)}</Td>
     </Tr>
   );
 });
