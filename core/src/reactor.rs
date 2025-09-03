@@ -9,13 +9,8 @@ pub(crate) use self::{
 };
 
 use crate::{
-    changes::EntityChange,
-    entity::Entity,
-    error::SubscriptionError,
-    reactor::subscription::ReactorSubInner,
-    resultset::EntityResultSet,
-    storage::StorageEngine,
-    value::Value,
+    changes::EntityChange, entity::Entity, error::SubscriptionError, reactor::subscription::ReactorSubInner, resultset::EntityResultSet,
+    storage::StorageEngine, value::Value,
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{self as proto};
@@ -133,9 +128,7 @@ impl<E: AbstractEntity, Ev> Clone for Reactor<E, Ev> {
 }
 
 impl<E: AbstractEntity, Ev: Clone> Default for Reactor<E, Ev> {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl<E: AbstractEntity, Ev: Clone> Reactor<E, Ev> {

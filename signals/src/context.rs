@@ -42,10 +42,11 @@ impl CurrentObserver {
             let mut stack = stack.borrow_mut();
             // Check if the observer we want to remove is the last one
             if let Some(last) = stack.last()
-                && last.observer_id() == target_id {
-                    stack.pop();
-                    return;
-                }
+                && last.observer_id() == target_id
+            {
+                stack.pop();
+                return;
+            }
             // If not the last one, search and remove it
             stack.retain(|o| o.observer_id() != target_id);
         });

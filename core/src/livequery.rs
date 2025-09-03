@@ -176,12 +176,6 @@ impl Drop for Inner {
     fn drop(&mut self) { self.node.unsubscribe_remote_predicate(self.predicate_id); }
 }
 
-// impl Signal for EntityLiveQuery {
-//     fn listen(&self, listener: Listener) -> ListenerGuard { self.0.resultset.listen(listener) }
-
-//     fn broadcast_id(&self) -> BroadcastId { self.0.resultset.broadcast_id() }
-// }
-
 impl<R: View> LiveQuery<R> {
     /// Wait for the LiveQuery to be fully initialized with initial states
     pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
@@ -190,12 +184,6 @@ impl<R: View> LiveQuery<R> {
 
     pub fn loaded(&self) -> bool { self.0 .0.resultset.is_loaded() }
 }
-
-// impl<R: View> std::fmt::Debug for LiveQuery<R> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         write!(f, "LiveQuery({:?})", self.local_subscription.predicate_id)
-//     }
-// }
 
 // Implement Signal trait - delegate to the resultset
 impl<R: View> Signal for LiveQuery<R> {
@@ -224,7 +212,6 @@ where R: Clone + Send + Sync + 'static
 
         let me = self.clone();
         // Subscribe to the underlying ReactorUpdate stream and convert to ChangeSet<R>
-        
 
         self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
             // Convert ReactorUpdate to ChangeSet<R>

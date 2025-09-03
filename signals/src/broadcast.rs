@@ -55,10 +55,8 @@ impl<T> ListenerGuard<T> {
 
 impl<T> Default for Broadcast<T>
 where T: Clone
- {
-    fn default() -> Self {
-        Self::new()
-    }
+{
+    fn default() -> Self { Self::new() }
 }
 
 impl<T> Broadcast<T>

@@ -74,9 +74,7 @@ pub struct SubscriptionRelay<CD: ContextData> {
 }
 
 impl<CD: ContextData> Default for SubscriptionRelay<CD> {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl<CD: ContextData> SubscriptionRelay<CD> {
