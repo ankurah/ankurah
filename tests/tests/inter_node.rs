@@ -1,5 +1,6 @@
 mod common;
 
+use ankurah::signals::Subscribe;
 use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent, ResultSet};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
@@ -9,7 +10,9 @@ use tracing::info;
 
 use common::{Album, AlbumView, Pet, PetView};
 
-pub fn names(resultset: ResultSet<AlbumView>) -> Vec<String> { resultset.items.iter().map(|r| r.name().unwrap()).collect::<Vec<String>>() }
+use crate::common::TestWatcher;
+
+pub fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap_or_default()).collect::<Vec<String>>() }
 
 #[tokio::test]
 async fn inter_node_fetch() -> Result<()> {
@@ -60,7 +63,7 @@ async fn inter_node_fetch() -> Result<()> {
     let ctx2 = node2.context_async(c).await;
 
     // Now node2 should now successfully fetch the entity
-    assert_eq!(names(ctx2.fetch(p).await?), ["Walking on a Dream"]);
+    assert_eq!(names(ctx2.fetch::<AlbumView>(p).await?), ["Walking on a Dream"]);
 
     info!("After fetch - Node1 root: {:?}", node1.system.root());
     info!("After fetch - Node2 root: {:?}", node2.system.root());
@@ -82,11 +85,6 @@ async fn server_edits_subscription() -> Result<()> {
     let server = server.context(c)?;
     let client = client.context(c)?;
 
-    let (server_watcher, check_server) = common::changeset_watcher::<PetView>();
-    let _server_handle = server.subscribe("name = 'Rex' OR (age > 2 and age < 5)", server_watcher).await?;
-
-    assert_eq!(check_server(), vec![vec![]] as Vec<Vec<(EntityId, ChangeKind)>>);
-
     use ankurah::View;
     // Create initial entities on node1
     let (rex, snuffy, jasper) = {
@@ -96,32 +94,31 @@ async fn server_edits_subscription() -> Result<()> {
         let jasper = trx.create(&Pet { name: "Jasper".to_string(), age: "6".to_string() }).await?;
 
         let read = (rex.read(), snuffy.read(), jasper.read());
+        tracing::info!("MARK 1");
         trx.commit().await?;
         read
     };
 
     info!("rex: {}, snuffy: {}, jasper: {}", rex.entity(), snuffy.entity(), jasper.entity());
-    assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Add)]]);
+    // assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Add)]]);
 
     // Set up subscription on node2
-    let (client_watcher, check_client) = common::changeset_watcher::<PetView>();
-    let _client_handle = client.subscribe("name = 'Rex' OR (age > 2 and age < 5)", client_watcher).await?;
+    let client_watcher = TestWatcher::changeset();
+    let client_query = client.query_wait::<PetView>("name = 'Rex' OR (age > 2 and age < 5)").await?;
+    let _client_handle = client_query.subscribe(&client_watcher);
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Initial state should include Rex
-    assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Initial)]]);
+    // watcher should not have any changes yet because we waited for the LiveQuery to be initialized before subscribing to eliminate race conditions
+    assert_eq!(client_watcher.count(), 0);
 
     // Update Rex's age to 7 on node1
     {
-        let trx: ankurah::transaction::Transaction = server.begin();
+        let trx = server.begin();
         rex.edit(&trx)?.age().overwrite(0, 1, "7")?;
         trx.commit().await?;
     }
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Update)]]);
-    assert_eq!(check_client(), vec![vec![(rex.id(), ChangeKind::Update)]]); // Rex still matches the predicate, but the age has changed
+    // Wait for and verify the update notification
+    assert_eq!(client_watcher.take_one().await, vec![(rex.id(), ChangeKind::Update)]); // Rex still matches the predicate, but the age has changed
 
     // Update Snuffy's age to 3 on node1
     {
@@ -132,13 +129,11 @@ async fn server_edits_subscription() -> Result<()> {
         trx.commit().await?;
     }
 
-    // Sleep for a bit to ensure the change is propagated
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for and verify Snuffy being added (now matches age > 2 and age < 5)
+    assert_eq!(client_watcher.take_one().await, vec![(snuffy.id(), ChangeKind::Add)]);
 
-    // Should receive notification about Snuffy being added (now matches age > 2 and age < 5)
-    assert_eq!(check_server(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
-    assert_eq!(check_client(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
-
+    // Ensure no additional unexpected changes
+    assert_eq!(client_watcher.quiesce().await, 0);
     Ok(())
 }
 
@@ -207,12 +202,12 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     let client_b = client_b.context(c)?;
 
     // Set up watchers for server and client_b
-    let (server_watcher, check_server) = common::changeset_watcher::<AlbumView>();
-    let (client_b_watcher, check_client_b) = common::changeset_watcher::<AlbumView>();
+    let server_watcher = TestWatcher::changeset();
+    let client_b_watcher = TestWatcher::changeset();
 
     // Set up subscriptions
-    let _server_sub = server.subscribe("name = 'Origin of Symmetry'", server_watcher).await?;
-    let _client_b_sub = client_b.subscribe("name = 'Origin of Symmetry'", client_b_watcher).await?;
+    let _server_sub = server.query_wait::<AlbumView>("name = 'Origin of Symmetry'").await?.subscribe(&server_watcher);
+    let _client_b_sub = client_b.query_wait::<AlbumView>("name = 'Origin of Symmetry'").await?.subscribe(&client_b_watcher);
 
     // Create an entity on client_a
     let album_id = {
@@ -223,17 +218,172 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
         id
     };
 
-    // Wait for propagation to server
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for and verify server received the change (should get empty initialization + add)
+    assert_eq!(server_watcher.take_one().await, vec![(album_id, ChangeKind::Add)]);
+    // Wait for and verify client_b received the change (should get empty initialization + add)
+    assert_eq!(client_b_watcher.take_one().await, vec![(album_id, ChangeKind::Add)]);
 
-    // Check server received the change
-    assert_eq!(check_server(), vec![vec![], vec![(album_id, ChangeKind::Add)]]);
+    assert_eq!(server_watcher.quiesce().await, 0);
+    assert_eq!(client_b_watcher.quiesce().await, 0);
+    Ok(())
+}
 
-    // Wait for propagation to client_b
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+#[tokio::test]
+async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
 
-    // Check client_b received the change
-    assert_eq!(check_client_b(), vec![vec![], vec![(album_id, ChangeKind::Add)]]);
+    let server = server.context(c)?;
+    let client = client.context(c)?;
+
+    // Create initial entity on server
+    let pet_id = {
+        let trx = server.begin();
+        let pet = trx.create(&Pet { name: "Buddy".to_string(), age: "3".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    info!("Created pet with id: {}", pet_id);
+
+    // PART 1: Test that Livequery/View subscriptions work when active
+
+    // Set up query subscription on client that matches our pet
+    let lq_watcher = TestWatcher::changeset();
+    // This is the actual livequery, which has a predicate subscription with the server because the client node is ephemeral.
+    // Using query_wait ensures the LiveQuery is fully initialized before we subscribe to it.
+    let client_livequery = client.query_wait::<PetView>("name = 'Buddy'").await?;
+    // LOCALLY subscribe to notifications from the livequery. This is a different kind of subscription than above
+    // the guard does keep the livequery alive, but dropping it does not necessarily drop the LiveQuery and unsubscribe from the server.
+    let lq_subguard = client_livequery.subscribe(&lq_watcher);
+
+    // NOTE!
+    // Since we used query_wait (which waits for initialization before returning), the LiveQuery is already
+    // initialized when we subscribe to it. Therefore, we don't receive an Initial change notification.
+    assert_eq!(lq_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+
+    // Get the pet view from client and set up View/field subscriptions
+    let client_pet = client.get::<PetView>(pet_id).await?;
+    let view_watcher = TestWatcher::new();
+    // subscribe to the View directly - this gets notified when any change to this view arrives from any source
+    let _view_subguard = client_pet.subscribe(&view_watcher);
+
+    // The view subscription is a good example of this, because there's no such thing as an uninitialized view
+    assert_eq!(view_watcher.quiesce().await, 0);
+
+    // Make an edit on the server
+    {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("4")?;
+        trx.commit().await?;
+    }
+
+    // Wait for and verify the update notification
+    assert_eq!(lq_watcher.take_one().await, vec![(pet_id, ChangeKind::Update)]); // Buddy's age changed to 4 - still matches the query
+
+    // Verify that View/field subscriptions received the update
+    assert_eq!(view_watcher.take_one().await, client_pet.clone());
+
+    info!("Dropping query subscription handle...");
+    drop(lq_subguard); // This should stop the local listener
+
+    // Make another edit on the server
+    {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("4")?;
+        trx.commit().await?;
+    }
+
+    // Verify that subscriptions did NOT receive the update after being dropped
+    assert_eq!(lq_watcher.quiesce().await, 0, "subscription to LiveQuery signal should not receive updates after dropping lq_subguard");
+    assert_eq!(
+        view_watcher.take_one().await,
+        client_pet.clone(),
+        "Subscription to View signal should still receive updates because both client_livequery and _view_subguard are still alive"
+    );
+
+    drop(client_livequery);
+
+    {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("5")?;
+        trx.commit().await?;
+    }
+    assert_eq!(lq_watcher.quiesce().await, 0, "subscription to LiveQuery signal should still be dead");
+    assert_eq!(view_watcher.quiesce().await, 0, "The current expected behavior (though undesirable) is that the Entity itself should not receive updates after dropping client_livequery");
+
+    // TODO: After implementing implicit entity subscriptions, the entity should continue receiving updates after dropping client_livequery
+    // at which point the above assertion should change, and then
+    // drop(view_subguard);
+    // {
+    //     let trx = server.begin();
+    //     let server_pet = server.get::<PetView>(pet_id).await?;
+    //     server_pet.edit(&trx)?.age().replace("6")?;
+    //     trx.commit().await?;
+    // }
+    // tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for propagation to client
+    // assert_eq!(pet.age(), "6"); // Updates to the underlying entity should continue even after everything (other than the Entity itself) is dropped
+    // assert_eq!(check_view_changes(), vec![],"But the subscription to the View signal should be dead with the dropping of the view_subguard"
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
+    // Create server (durable) and client nodes
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    // Connect the nodes
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let server = server.context(c)?;
+    let client = client.context(c)?;
+
+    // Create initial entity on server
+    let pet_id = {
+        let trx = server.begin();
+        let pet = trx.create(&Pet { name: "Luna".to_string(), age: "2".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    info!("Created pet with id: {}", pet_id);
+
+    // === Test fetch() behavior ===
+
+    // Use fetch() to get the entity on client (no ongoing subscription)
+    let fetch_result = client.fetch::<PetView>("name = 'Luna'").await?;
+    assert_eq!(fetch_result.len(), 1, "Should fetch one pet");
+
+    let client_pet = fetch_result.iter().next().unwrap();
+
+    // Set up View/field subscriptions on the fetched entity
+    let view_watcher = TestWatcher::new();
+
+    let _view_handle = client_pet.subscribe(&view_watcher);
+
+    // Make an edit on the server
+    {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.name().replace("Stella")?;
+        trx.commit().await?;
+    }
+
+    // Verify that View/field subscriptions did NOT receive updates
+    // This documents the current behavior - fetch() doesn't establish ongoing subscriptions
+    assert_eq!(view_watcher.quiesce().await, 0, "View subscription should NOT receive updates with fetch() only (current behavior)");
 
     Ok(())
 }

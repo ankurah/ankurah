@@ -40,7 +40,7 @@ struct ListenerEntry {
 /// A React observer handle that manages signal subscriptions for a component
 #[wasm_bindgen]
 #[derive(Clone)]
-struct ReactObserver(Arc<Inner>);
+pub struct ReactObserver(Arc<Inner>);
 
 #[allow(unused)]
 struct ReactObserverWeak(Weak<Inner>);

@@ -22,25 +22,25 @@ async fn basic_where_clause() -> Result<()> {
     };
 
     let name = "Walking on a Dream";
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(client, { name }).await?;
+    let albums: Vec<AlbumView> = fetch!(client, { name }).await?;
 
     assert_eq!(
-        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
         vec!["Walking on a Dream".to_string()]
     );
 
     // TODO - figure out why the order is nondeterministic
     // Test IN with array expansion
     let names = vec!["Walking on a Dream", "Ice on the Dune"];
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(client, name IN {names}).await?;
-    let mut result = albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>();
+    let albums: Vec<AlbumView> = fetch!(client, name IN {names}).await?;
+    let mut result = albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>();
     result.sort();
     assert_eq!(vec!["Ice on the Dune".to_string(), "Walking on a Dream".to_string()], result);
 
     // Test IN with years using array expansion
     let years = vec!["2008", "2013"];
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(client, year IN {years}).await?;
-    let mut result = albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>();
+    let albums: Vec<AlbumView> = fetch!(client, year IN {years}).await?;
+    let mut result = albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>();
     result.sort();
     assert_eq!(vec!["Ice on the Dune".to_string(), "Walking on a Dream".to_string()], result);
 
@@ -61,10 +61,10 @@ async fn test_where_clause_with_id() -> Result<()> {
     };
 
     // Test querying by ID (EntityId now supports Into<Expr>)
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(ctx, id = { album_id }).await?;
+    let albums: Vec<AlbumView> = fetch!(ctx, id = { album_id }).await?;
 
     assert_eq!(
-        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
         vec!["Walking on a Dream".to_string()]
     );
 
@@ -95,38 +95,38 @@ async fn pg_basic_where_clause() -> Result<()> {
     };
 
     let name = "Walking on a Dream";
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(ctx, { name }).await?;
+    let albums: Vec<AlbumView> = fetch!(ctx, { name }).await?;
 
     assert_eq!(
-        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
         vec!["Walking on a Dream".to_string()]
     );
 
     let year = "2008";
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(ctx, { year }).await?;
+    let albums: Vec<AlbumView> = fetch!(ctx, { year }).await?;
 
     assert_eq!(
-        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
         vec!["Walking on a Dream".to_string(), "Death Magnetic".to_string()]
     );
 
     let old_year = "1800";
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(ctx, {name} AND year = {old_year}).await?;
+    let albums: Vec<AlbumView> = fetch!(ctx, {name} AND year = {old_year}).await?;
 
-    assert_eq!(albums.items.iter().map(|active_entity| active_entity.name().unwrap()).count(), 0,);
+    assert_eq!(albums.iter().map(|active_entity| active_entity.name().unwrap()).count(), 0,);
 
     // Test IN with array expansion (mixing variable and literal)
     let mixed_names = vec![name, "Death Magnetic"];
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(ctx, name IN {mixed_names}).await?;
+    let albums: Vec<AlbumView> = fetch!(ctx, name IN {mixed_names}).await?;
     assert_eq!(
-        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
         vec!["Walking on a Dream".to_string(), "Death Magnetic".to_string()]
     );
 
     let years = vec!["2008", "2013"];
-    let albums: ankurah::ResultSet<AlbumView> = fetch!(ctx, year IN {years}).await?;
+    let albums: Vec<AlbumView> = fetch!(ctx, year IN {years}).await?;
     assert_eq!(
-        albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+        albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
         vec!["Walking on a Dream".to_string(), "Death Magnetic".to_string(), "Ice on the Dune".to_string()]
     );
 

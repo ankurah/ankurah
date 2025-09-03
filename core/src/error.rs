@@ -89,6 +89,16 @@ impl From<SendError> for RequestError {
     fn from(err: SendError) -> Self { RequestError::SendError(err) }
 }
 
+#[derive(Error, Debug)]
+pub enum SubscriptionError {
+    #[error("predicate not found")]
+    PredicateNotFound,
+    #[error("already subscribed to predicate")]
+    PredicateAlreadySubscribed,
+    #[error("subscription not found")]
+    SubscriptionNotFound,
+}
+
 impl From<DecodeError> for RetrievalError {
     fn from(err: DecodeError) -> Self { RetrievalError::DecodeError(err) }
 }
@@ -121,6 +131,8 @@ pub enum MutationError {
     PeerRejected,
     #[error("invalid event")]
     InvalidEvent,
+    #[error("invalid update")]
+    InvalidUpdate(&'static str),
 }
 
 #[derive(Error, Debug)]
@@ -168,6 +180,10 @@ impl From<RetrievalError> for MutationError {
 }
 impl From<AccessDenied> for RetrievalError {
     fn from(err: AccessDenied) -> Self { RetrievalError::AccessDenied(err) }
+}
+
+impl From<SubscriptionError> for RetrievalError {
+    fn from(err: SubscriptionError) -> Self { RetrievalError::Anyhow(anyhow::anyhow!("Subscription error: {:?}", err)) }
 }
 
 #[derive(Error, Debug)]

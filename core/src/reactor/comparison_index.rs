@@ -1,5 +1,5 @@
-use ankurah_proto::{self as proto};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hash;
 
 use crate::collation::Collatable;
 use ankql::ast;
@@ -10,21 +10,25 @@ use ankql::ast;
 /// This is not efficient for large datasets. If this ends up being used in production
 /// we should consider using a more efficient index structure like a B+ tree with subscription
 /// registrations on intermediate nodes for range comparisons.
-#[derive(Debug, Default)]
-pub(crate) struct ComparisonIndex {
-    pub(crate) eq: HashMap<Vec<u8>, Vec<proto::SubscriptionId>>,
-    pub(crate) ne: HashMap<Vec<u8>, Vec<proto::SubscriptionId>>,
-    pub(crate) gt: BTreeMap<Vec<u8>, Vec<proto::SubscriptionId>>,
-    pub(crate) lt: BTreeMap<Vec<u8>, Vec<proto::SubscriptionId>>,
+#[derive(Debug)]
+pub(crate) struct ComparisonIndex<T> {
+    pub(crate) eq: HashMap<Vec<u8>, Vec<T>>,
+    pub(crate) ne: HashMap<Vec<u8>, Vec<T>>,
+    pub(crate) gt: BTreeMap<Vec<u8>, Vec<T>>,
+    pub(crate) lt: BTreeMap<Vec<u8>, Vec<T>>,
 }
 
-impl ComparisonIndex {
+impl<T> Default for ComparisonIndex<T> {
+    fn default() -> Self { Self { eq: HashMap::new(), ne: HashMap::new(), gt: BTreeMap::new(), lt: BTreeMap::new() } }
+}
+
+impl<T: Clone + Eq + Hash + Ord> ComparisonIndex<T> {
     #[allow(unused)]
-    pub fn new() -> Self { Self { eq: HashMap::new(), ne: HashMap::new(), gt: BTreeMap::new(), lt: BTreeMap::new() } }
+    pub fn new() -> Self { Self::default() }
 
     fn for_entry<F, V>(&mut self, value: V, op: ast::ComparisonOperator, f: F)
     where
-        F: FnOnce(&mut Vec<proto::SubscriptionId>),
+        F: FnOnce(&mut Vec<T>),
         V: Collatable,
     {
         match op {
@@ -66,19 +70,19 @@ impl ComparisonIndex {
         }
     }
 
-    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_id: proto::SubscriptionId) {
-        self.for_entry(value, op, |entries| entries.push(sub_id));
+    pub fn add<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, watcher_id: T) {
+        self.for_entry(value, op, |entries| entries.push(watcher_id));
     }
 
-    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, sub_id: proto::SubscriptionId) {
+    pub fn remove<V: Collatable>(&mut self, value: V, op: ast::ComparisonOperator, watcher_id: T) {
         self.for_entry(value, op, |entries| {
-            if let Some(pos) = entries.iter().position(|id| *id == sub_id) {
+            if let Some(pos) = entries.iter().position(|id| *id == watcher_id) {
                 entries.remove(pos);
             }
         });
     }
 
-    pub fn find_matching<V: Collatable>(&self, value: V) -> Vec<proto::SubscriptionId> {
+    pub fn find_matching<V: Collatable>(&self, value: V) -> std::collections::btree_set::IntoIter<T> {
         let mut result = BTreeSet::new();
         let bytes = value.to_bytes();
 
@@ -87,9 +91,12 @@ impl ComparisonIndex {
             result.extend(subs.iter().cloned());
         }
 
-        // Check not equal
-        if let Some(subs) = self.ne.get(&bytes) {
-            result.extend(subs.iter().cloned());
+        // Check not equal - iterate through all != conditions
+        for (stored_bytes, subs) in &self.ne {
+            if bytes != *stored_bytes {
+                // query_value != stored_value
+                result.extend(subs.iter().cloned());
+            }
         }
 
         // Check greater than matches (x > threshold)
@@ -105,7 +112,7 @@ impl ComparisonIndex {
         }
 
         // Should just return the BTreeSet but this sucks for test cases
-        result.into_iter().collect()
+        result.into_iter()
     }
 }
 
@@ -121,53 +128,53 @@ mod tests {
         let mut index = ComparisonIndex::new();
 
         // Less than 8 ------------------------------------------------------------
-        let sub0 = proto::SubscriptionId::test(0);
+        let sub0 = proto::PredicateId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::LessThan, sub0);
 
         // 8 should match nothing
-        assert!(index.find_matching(Value::Integer(8)).is_empty());
+        assert_eq!(index.find_matching(Value::Integer(8)).collect::<Vec<_>>(), vec![]);
 
         // 7 should match sub0
-        assert_eq!(index.find_matching(Value::Integer(7)), vec![sub0]);
+        assert_eq!(index.find_matching(Value::Integer(7)).collect::<Vec<_>>(), vec![sub0]);
 
-        let sub1 = proto::SubscriptionId::test(1);
+        let sub1 = proto::PredicateId::test(1);
 
         // Greater than 20 ------------------------------------------------------------
         index.add(ast::Literal::Integer(20), ast::ComparisonOperator::GreaterThan, sub1);
 
         // 20 should match nothing
-        assert!(index.find_matching(Value::Integer(20)).is_empty());
+        assert_eq!(index.find_matching(Value::Integer(20)).collect::<Vec<_>>(), vec![]);
 
         // 21 should match sub1
-        assert_eq!(index.find_matching(Value::Integer(21)), vec![sub1]);
+        assert_eq!(index.find_matching(Value::Integer(21)).collect::<Vec<_>>(), vec![sub1]);
 
         // // Add subscriptions for various numeric comparisons
         index.add(ast::Literal::Integer(5), ast::ComparisonOperator::Equal, sub0);
 
         // // Test exact match (5)
-        assert_eq!(index.find_matching(Value::Integer(5)), vec![sub0]);
+        assert_eq!(index.find_matching(Value::Integer(5)).collect::<Vec<_>>(), vec![sub0]);
 
         // Less than 25 ------------------------------------------------------------
         index.add(ast::Literal::Integer(25), ast::ComparisonOperator::LessThan, sub0);
 
-        // 22 should match sub0 and sub1 because > 20 and < 25
-        assert_eq!(index.find_matching(Value::Integer(22)), vec![sub0, sub1]);
+        // 22 should match sub0 (< 25) and sub1 (> 20)
+        assert_eq!(index.find_matching(Value::Integer(22)).collect::<Vec<_>>(), vec![sub0, sub1]);
 
-        // 25 should match sub1 because > 20 and !< 25
-        assert_eq!(index.find_matching(Value::Integer(25)), vec![sub1]);
+        // 25 should match sub1 because > 20
+        assert_eq!(index.find_matching(Value::Integer(25)).collect::<Vec<_>>(), vec![sub1]);
 
-        // 26 should match sub0 and sub1 because > 20 and !< 25
-        assert_eq!(index.find_matching(Value::Integer(26)), vec![sub1]);
+        // 26 should match sub1 because > 20
+        assert_eq!(index.find_matching(Value::Integer(26)).collect::<Vec<_>>(), vec![sub1]);
     }
 
     #[test]
     fn test_field_index_not_equal() {
-        let mut index = ComparisonIndex::new();
+        let mut index = ComparisonIndex::<proto::PredicateId>::new();
 
-        let sub0 = proto::SubscriptionId::test(0);
+        let sub0 = proto::PredicateId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::NotEqual, sub0);
 
-        assert_eq!(index.find_matching(Value::Integer(8)), vec![sub0]);
-        assert_eq!(index.find_matching(Value::Integer(9)), vec![]);
+        assert_eq!(index.find_matching(Value::Integer(8)).collect::<Vec<_>>(), vec![]);
+        assert_eq!(index.find_matching(Value::Integer(9)).collect::<Vec<_>>(), vec![sub0]);
     }
 }

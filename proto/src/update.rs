@@ -1,10 +1,4 @@
-use crate::{
-    auth::Attested,
-    data::{EntityState, Event},
-    id::EntityId,
-    subscription::SubscriptionId,
-    CollectionId, EventFragment, StateFragment,
-};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::PredicateId, CollectionId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -14,38 +8,63 @@ pub struct UpdateId(Ulid);
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeUpdateBody {
     /// New events for a subscription
-    SubscriptionUpdate { subscription_id: SubscriptionId, items: Vec<SubscriptionUpdateItem> },
+    SubscriptionUpdate { items: Vec<SubscriptionUpdateItem>, initialized_predicate: Option<PredicateId> },
 }
 
+/// Content of an update - either state, events, or both
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum SubscriptionUpdateItem {
-    Initial { entity_id: EntityId, collection: CollectionId, state: StateFragment },
-    Add { entity_id: EntityId, collection: CollectionId, state: StateFragment, events: Vec<EventFragment> },
-    Change { entity_id: EntityId, collection: CollectionId, events: Vec<EventFragment> },
-    // Note: this is not a resultset change, it's a subscription change
-    // that means we don't care about removes, because the reactor handles that
+pub enum UpdateContent {
+    /// Only state, no events (typically for initial population)
+    StateOnly(StateFragment),
+    /// Only events, no state (peer already has the state)
+    EventOnly(Vec<EventFragment>),
+    /// Both state and events (peer needs both)
+    StateAndEvent(StateFragment, Vec<EventFragment>),
 }
 
-impl SubscriptionUpdateItem {
-    pub fn initial(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>) -> Self {
-        Self::Initial { entity_id, collection, state: state.into() }
+impl UpdateContent {
+    /// Decompose into optional state and event fragments
+    pub fn into_parts(self) -> (Option<StateFragment>, Option<Vec<EventFragment>>) {
+        match self {
+            UpdateContent::StateOnly(state) => (Some(state), None),
+            UpdateContent::EventOnly(events) => (None, Some(events)),
+            UpdateContent::StateAndEvent(state, events) => (Some(state), Some(events)),
+        }
     }
-    pub fn add(entity_id: EntityId, collection: CollectionId, state: Attested<EntityState>, events: Vec<Attested<Event>>) -> Self {
-        // TODO sanity check to make sure the events are for the same entity
-        Self::Add { entity_id, collection, state: state.into(), events: events.into_iter().map(|e| e.into()).collect() }
-    }
-    pub fn change(entity_id: EntityId, collection: CollectionId, events: Vec<Attested<Event>>) -> Self {
-        Self::Change { entity_id, collection, events: events.into_iter().map(|e| e.into()).collect() }
-    }
+}
+
+/// How an entity's membership changed for a specific predicate
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum MembershipChange {
+    /// First time seeing this entity for this predicate
+    Initial,
+    /// Entity now matches predicate (wasn't matching before)
+    Add,
+    /// Entity no longer matches predicate (was matching before)  
+    Remove,
+}
+
+/// A single entity update with all subscription relevance information
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubscriptionUpdateItem {
+    pub entity_id: EntityId,
+    pub collection: CollectionId,
+    pub content: UpdateContent,
+    /// Which predicates this update is relevant to and how
+    /// Uses PredicateId for remote subscriptions
+    pub predicate_relevance: Vec<(PredicateId, MembershipChange)>,
+    /// Whether this entity has an explicit entity-level subscription
+    pub entity_subscribed: bool,
 }
 
 impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
     type Error = anyhow::Error;
     fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {
-        match value {
-            SubscriptionUpdateItem::Initial { entity_id, collection, state } => Ok((entity_id, collection, state).into()),
-            SubscriptionUpdateItem::Add { entity_id, collection, state, events: _ } => Ok((entity_id, collection, state).into()),
-            SubscriptionUpdateItem::Change { .. } => Err(anyhow::anyhow!("Cannot convert change to entity state")),
+        match value.content {
+            UpdateContent::StateOnly(state) | UpdateContent::StateAndEvent(state, _) => {
+                Ok((value.entity_id, value.collection, state).into())
+            }
+            UpdateContent::EventOnly(_) => Err(anyhow::anyhow!("Cannot convert event-only update to entity state")),
         }
     }
 }
@@ -101,12 +120,8 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeUpdateBody::SubscriptionUpdate { subscription_id, items } => {
-                write!(
-                    f,
-                    "SubscriptionUpdate {subscription_id} [{}]",
-                    items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", ")
-                )
+            NodeUpdateBody::SubscriptionUpdate { items, initialized_predicate: _ } => {
+                write!(f, "SubscriptionUpdate [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
             }
         }
     }
@@ -114,17 +129,23 @@ impl std::fmt::Display for NodeUpdateBody {
 
 impl std::fmt::Display for SubscriptionUpdateItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SubscriptionUpdateItem::Initial { entity_id, collection, state } => {
-                write!(f, "Initial: {} {} {}", entity_id, collection, state)
-            }
-            SubscriptionUpdateItem::Add { entity_id, collection, state, events: _ } => {
-                write!(f, "Add: {} {} {}", entity_id, collection, state)
-            }
-            SubscriptionUpdateItem::Change { entity_id, collection, events } => {
-                write!(f, "Change: {} {} {}", entity_id, collection, events.iter().map(|e| format!("{}", e)).collect::<Vec<_>>().join(", "))
-            }
+        write!(f, "{}/{}: ", self.collection, self.entity_id)?;
+
+        match &self.content {
+            UpdateContent::StateOnly(state) => write!(f, "State({})", state)?,
+            UpdateContent::EventOnly(events) => write!(f, "Events({})", events.len())?,
+            UpdateContent::StateAndEvent(state, events) => write!(f, "State+Events({}, {})", state, events.len())?,
         }
+
+        if !self.predicate_relevance.is_empty() {
+            write!(f, " predicates:{}", self.predicate_relevance.len())?;
+        }
+
+        if self.entity_subscribed {
+            write!(f, " [entity-sub]")?;
+        }
+
+        Ok(())
     }
 }
 impl std::fmt::Display for NodeUpdateAckBody {

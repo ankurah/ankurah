@@ -654,10 +654,10 @@ mod tests {
             trx.commit().await?;
         }
 
-        let albums: ankurah_core::resultset::ResultSet<AlbumView> = ctx.fetch("name = 'Walking on a Dream'").await?;
+        let albums: Vec<AlbumView> = ctx.fetch("name = 'Walking on a Dream'").await?;
 
         assert_eq!(
-            albums.items.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
+            albums.iter().map(|active_entity| active_entity.name().unwrap()).collect::<Vec<String>>(),
             vec!["Walking on a Dream".to_string()]
         );
 
