@@ -11,6 +11,11 @@ use crate::property::PropertyError;
 
 use anyhow::Result;
 
+#[cfg(feature = "wasm")]
+use js_sys;
+#[cfg(feature = "wasm")]
+use wasm_bindgen;
+
 /// A model is a struct that represents the present values for a given entity
 /// Schema is defined primarily by the Model object, and the View is derived from that via macro.
 pub trait Model {
@@ -65,7 +70,7 @@ pub trait Mutable<'rec> {
 // Helper function for Subscribe implementations in generated Views
 // don't document this
 #[doc(hidden)]
-pub fn vsub_helper<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
+pub fn js_view_subscribe<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
 where
     V: ankurah_signals::Signal + View + Clone + Send + Sync + 'static,
     F: ankurah_signals::subscribe::IntoSubscribeListener<V>,
@@ -77,4 +82,24 @@ where
         listener(view_clone.clone());
     }));
     ankurah_signals::SubscriptionGuard::new(subscription)
+}
+
+// Helper function for map implementations in generated WASM ResultSet wrappers
+// don't document this
+#[doc(hidden)]
+#[cfg(feature = "wasm")]
+pub fn js_resultset_map<V>(resultset: &crate::resultset::ResultSet<V>, callback: &js_sys::Function) -> js_sys::Array
+where V: View + Clone + 'static + Into<wasm_bindgen::JsValue> {
+    use ankurah_signals::Get;
+    let items = resultset.get();
+    let result_array = js_sys::Array::new();
+
+    for item in items {
+        let js_item = item.into();
+        if let Ok(mapped_value) = callback.call1(&wasm_bindgen::JsValue::NULL, &js_item) {
+            result_array.push(&mapped_value);
+        }
+    }
+
+    result_array
 }

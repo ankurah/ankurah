@@ -57,6 +57,9 @@ impl fmt::Display for EntityId {
         }
     }
 }
+impl std::fmt::Debug for EntityId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.to_base64()) }
+}
 
 impl TryFrom<&str> for EntityId {
     type Error = DecodeError;
@@ -79,10 +82,6 @@ impl TryInto<EntityId> for Vec<u8> {
         let bytes: [u8; 16] = self.try_into().map_err(|_| DecodeError::InvalidLength)?;
         Ok(EntityId(Ulid::from_bytes(bytes)))
     }
-}
-
-impl std::fmt::Debug for EntityId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0.to_string()) }
 }
 
 impl From<EntityId> for Ulid {

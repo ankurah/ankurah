@@ -17,6 +17,8 @@ impl<K: Hash + Eq, V> SafeMap<K, V> {
     pub fn len(&self) -> usize { self.0.read().expect("Failed to lock the map").len() }
 
     pub fn clear(&self) { self.0.write().expect("Failed to lock the map").clear(); }
+
+    pub fn contains_key(&self, key: &K) -> bool { self.0.read().expect("Failed to lock the map").contains_key(key) }
 }
 
 impl<K: Hash + Eq, V> SafeMap<K, V>
@@ -54,6 +56,17 @@ where
     pub fn to_vec(&self) -> Vec<(K, V)> {
         self.0.read().expect("Failed to lock the map").iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
+}
+impl<K: Hash + Eq, V> SafeMap<K, V>
+where K: Clone
+{
+    pub fn keys(&self) -> Vec<K> { self.0.read().expect("Failed to lock the map").keys().cloned().collect() }
+}
+
+impl<K: Hash + Eq, V> SafeMap<K, V>
+where V: Clone + 'static
+{
+    pub fn values(&self) -> Vec<V> { self.0.read().expect("Failed to lock the map").values().cloned().collect() }
 }
 
 impl<K: Hash + Eq, H: PartialEq> SafeMap<K, Vec<H>> {

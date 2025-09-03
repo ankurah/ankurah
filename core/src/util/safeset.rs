@@ -3,7 +3,6 @@ use std::{collections::HashSet, hash::Hash};
 /// A very basic concurrent hashset that is hard to misuse in an async context.
 /// The number one rule is that a lock can only be held very briefly - with no calls into
 /// other functions that might block.
-#[derive(Default)]
 pub struct SafeSet<T: Hash + Eq>(std::sync::RwLock<HashSet<T>>);
 
 impl<T: Hash + Eq> SafeSet<T> {
@@ -28,4 +27,8 @@ impl<T: Hash + Eq + std::fmt::Debug> std::fmt::Debug for SafeSet<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SafeSet {{ {:?} }}", self.0.read().expect("Failed to lock the set"))
     }
+}
+
+impl<T: Hash + Eq> Default for SafeSet<T> {
+    fn default() -> Self { Self::new() }
 }

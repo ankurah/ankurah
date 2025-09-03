@@ -77,11 +77,11 @@
 //! # use ankurah_connector_local_process::LocalProcessConnection;
 //! # use std::sync::Arc;
 //! # use serde::{Serialize, Deserialize};
-//! # #[derive(Model, Debug, Serialize, Deserialize)]
-//! # pub struct Album {
-//! #     name: String,
-//! #     year: String,
-//! # }
+//! #[derive(Model, Debug, Serialize, Deserialize)]
+//! pub struct Album {
+//!     name: String,
+//!     year: String,
+//! }
 //! #
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -98,11 +98,12 @@
 //!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT)?;
 //!     let client = client.context(ankurah::policy::DEFAULT_CONTEXT)?;
 //!
-//!
-//!     // Subscribe to changes on the client
-//!     let _subscription = client.subscribe::<_,AlbumView>("name = 'Origin of Symmetry'", |changes| {
+//!     // Create a LiveQuery and subscribe to changes on the client
+//!     let livequery = client.query::<AlbumView>("name = 'Origin of Symmetry'")?;
+//!     use ankurah::signals::Subscribe;
+//!     let _guard = livequery.subscribe(|changes| {
 //!         println!("Received changes: {}", changes);
-//!     }).await?;
+//!     });
 //!
 //!     // Create a new album on the server
 //!     let trx = server.begin();
@@ -140,16 +141,16 @@ pub use proto::EntityId;
 pub use ankurah_core::{
     changes,
     context::Context,
-    entity, error, model,
+    entity, error,
+    livequery::LiveQuery,
+    model,
     model::View,
     model::{Model, Mutable},
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
     property::{self, Property},
     resultset::ResultSet,
-    storage,
-    subscription::SubscriptionHandle,
-    transaction,
+    storage, transaction,
 };
 
 // Re-export the derive macro

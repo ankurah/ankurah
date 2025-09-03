@@ -1,6 +1,7 @@
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::Notify;
 use tracing::{error, warn};
@@ -40,7 +41,8 @@ struct Inner<SE, PA> {
     loading: Notify,
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
-    reactor: Arc<Reactor<SE, PA>>,
+    reactor: Reactor,
+    _phantom: PhantomData<PA>,
 }
 
 impl<SE, PA> SystemManager<SE, PA>
@@ -48,7 +50,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Arc<Reactor<SE, PA>>, durable: bool) -> Self {
+    pub(crate) fn new(collections: CollectionSet<SE>, entities: WeakEntitySet, reactor: Reactor, durable: bool) -> Self {
         let me = Self(Arc::new(Inner {
             collectionset: collections,
             entities,
@@ -61,6 +63,7 @@ where
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
             reactor,
+            _phantom: PhantomData,
         }));
         {
             let me = me.clone();

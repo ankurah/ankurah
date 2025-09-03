@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
 mod pg_common;
+use crate::common::TestWatcher;
 use ankurah::signals::{CallbackObserver, Subscribe};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
@@ -55,20 +56,21 @@ async fn test_sled() -> Result<()> {
     // (remote updates are another story)
     let album = context.get::<AlbumView>(album_id).await?;
 
-    let (w, check_view) = generic_watcher::<(AlbumView, String, String)>();
-    let (w2, check_rendered) = generic_watcher::<String>();
+    let view_watcher = TestWatcher::transform(|v: AlbumView| (v.clone(), v.name().unwrap(), v.year().unwrap()));
+    let render_watcher = TestWatcher::new();
 
     // store the handles to keep the subscriptions alive
-    let _h1 = album.subscribe(move |v: AlbumView| w((v.clone(), v.name().unwrap(), v.year().unwrap())));
+    let _h1 = album.subscribe(&view_watcher);
     let observer = {
         let album = album.clone();
+        let render_watcher = render_watcher.clone();
         CallbackObserver::new(Arc::new(move || {
             // Access the view fields - this should cause the View to be tracked by CurrentObserver
-            w2(format!("name: {}, year: {}", album.name().unwrap(), album.year().unwrap()));
+            render_watcher.notify(format!("name: {}, year: {}", album.name().unwrap(), album.year().unwrap()));
         }))
     };
     observer.trigger();
-    assert_eq!(check_rendered(), vec!["name: The rest of the bowl, year: 2024"]);
+    assert_eq!(render_watcher.take_one().await, "name: The rest of the bowl, year: 2024");
 
     // TODO LATER - figure out how to best access the Active type on the View
     //              until then we will not support this
@@ -81,23 +83,23 @@ async fn test_sled() -> Result<()> {
     album_mut2.name().delete(16, 1)?; // remove the "typo" b from bowl
 
     // we haven't committed the transaction yet - neither watcher should have received any changes
-    assert_eq!(check_view(), vec![]);
-    assert_eq!(check_rendered(), vec![] as Vec<String>);
+    assert_eq!(view_watcher.quiesce().await, 0);
+    assert_eq!(render_watcher.quiesce().await, 0);
 
     // commit the transaction
     trx2.commit().await?;
 
     // now we should have one change since we performed a delete operation
-    assert_eq!(check_view(), vec![(album.clone(), "The rest of the owl".to_owned(), "2024".to_owned())]);
-    assert_eq!(check_rendered(), vec!["name: The rest of the owl, year: 2024"]);
+    assert_eq!(view_watcher.take_one().await, (album.clone(), "The rest of the owl".to_owned(), "2024".to_owned()));
+    assert_eq!(render_watcher.take_one().await, "name: The rest of the owl, year: 2024");
 
     let trx3 = context.begin();
     let album_mut3 = album.edit(&trx3)?;
     album_mut3.year().replace("2025")?;
     trx3.commit().await?;
 
-    assert_eq!(check_view(), vec![(album.clone(), "The rest of the owl".to_owned(), "2025".to_owned())]); // AlbumView changed
-    assert_eq!(check_rendered(), vec!["name: The rest of the owl, year: 2025"]);
+    assert_eq!(view_watcher.take_one().await, (album.clone(), "The rest of the owl".to_owned(), "2025".to_owned())); // AlbumView changed
+    assert_eq!(render_watcher.take_one().await, "name: The rest of the owl, year: 2025");
 
     Ok(())
 }

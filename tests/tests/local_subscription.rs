@@ -1,13 +1,11 @@
-use ankurah::{
-    changes::{ChangeKind, ChangeSet},
-    policy::DEFAULT_CONTEXT as c,
-    Mutable, Node, PermissiveAgent, ResultSet,
-};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod common;
 use common::{Album, AlbumView, Pet, PetView};
+
+use crate::common::TestWatcher;
 
 #[tokio::test]
 async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -16,53 +14,54 @@ async fn basic_local_subscription() -> Result<(), Box<dyn std::error::Error + Se
     let ctx = node.context(c)?;
 
     // Create some initial entities
-    {
+    let (two_vines, ask_that_god, ice_on_the_dune) = {
         let trx = ctx.begin();
         trx.create(&Album { name: "Walking on a Dream".into(), year: "2008".into() }).await?;
-        trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?;
-        trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?;
-        trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
+        let ice_on_the_dune = trx.create(&Album { name: "Ice on the Dune".into(), year: "2013".into() }).await?.read();
+        let two_vines = trx.create(&Album { name: "Two Vines".into(), year: "2016".into() }).await?.read();
+        let ask_that_god = trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?.read();
         trx.commit().await?;
-    }
 
-    // Set up subscription
-    let received_changesets = Arc::new(Mutex::new(Vec::new()));
-    let received_changesets_clone = received_changesets.clone();
+        (two_vines, ask_that_god, ice_on_the_dune)
+    };
+
+    // Set up subscription using the watcher pattern
+    let watcher = TestWatcher::changeset();
 
     let predicate = ankql::parser::parse_selection("year > '2015'").unwrap();
-    let _handle = ctx
-        .subscribe(predicate, move |changeset: ChangeSet<AlbumView>| {
-            let mut received = received_changesets_clone.lock().unwrap();
-            received.push(changeset);
-        })
-        .await?;
+    use ankurah::signals::Subscribe;
+    let query = ctx.query_wait::<AlbumView>(predicate).await?;
+    let _handle = query.subscribe(&watcher);
 
     // Initial state should have Two Vines and Ask That God
-    {
-        let changesets = received_changesets.lock().unwrap();
-        assert_eq!(changesets.len(), 1);
-        let changeset = &changesets[0];
-        assert_eq!(changeset.changes.len(), 2);
-        // TODO: Add more specific assertions about the changes
-    }
+    assert_eq!(watcher.quiesce().await, 0);
+    use ankurah::signals::Peek;
+    // Order depends on ULID random component when created in same millisecond
+    let mut actual_ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    actual_ids.sort();
+    let mut expected_ids = vec![two_vines.id(), ask_that_god.id()];
+    expected_ids.sort();
+    assert_eq!(actual_ids, expected_ids);
 
     // Update an entity
     {
         let trx = ctx.begin();
-        let albums: ResultSet<AlbumView> = ctx.fetch("name = 'Ice on the Dune'").await?;
-        let album = albums.items[0].edit(&trx)?;
+        let albums: Vec<AlbumView> = ctx.fetch("name = 'Ice on the Dune'").await?;
+        let album = albums[0].edit(&trx)?;
         album.year().overwrite(0, 4, "2020")?;
         trx.commit().await?;
     }
 
+    // After update, should have all three albums
+    // Order depends on ULID random component when created in same millisecond
+    let mut actual_ids = query.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
+    actual_ids.sort();
+    let mut expected_ids = vec![two_vines.id(), ask_that_god.id(), ice_on_the_dune.id()];
+    expected_ids.sort();
+    assert_eq!(actual_ids, expected_ids);
+
     // Should have received a notification about Ice on the Dune being added
-    {
-        let changesets = received_changesets.lock().unwrap();
-        assert_eq!(changesets.len(), 2);
-        let changeset = &changesets[1];
-        assert_eq!(changeset.changes.len(), 1);
-        // TODO: Add more specific assertions about the changes
-    }
+    assert_eq!(watcher.drain(), vec![vec![(ice_on_the_dune.id(), ChangeKind::Add)]]);
 
     Ok(())
 }
@@ -74,10 +73,12 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     node.system.create().await?;
     let ctx = node.context(c)?;
 
-    let (watcher, check) = common::changeset_watcher::<PetView>();
+    let watcher = TestWatcher::changeset();
 
     // Subscribe to changes
-    let _handle = ctx.subscribe("name = 'Rex' OR (age > 2 and age < 5)", watcher).await.unwrap();
+    use ankurah::signals::Subscribe;
+    let query = ctx.query_wait::<PetView>("name = 'Rex' OR (age > 2 and age < 5)").await?;
+    let _handle = query.subscribe(&watcher);
 
     let (rex, snuffy, jasper);
     {
@@ -93,7 +94,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     };
 
     // Verify initial state
-    assert_eq!(check(), vec![vec![], vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
+    assert_eq!(watcher.drain(), vec![vec![(rex.id(), ChangeKind::Add)]]); // Initial state should be an Add
 
     {
         // Update Rex's age to 7
@@ -103,7 +104,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     }
 
     // Verify Rex's update was received - should be Edit since it still matches name = 'Rex'
-    assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Update)]]);
+    assert_eq!(watcher.drain(), vec![vec![(rex.id(), ChangeKind::Update)]]);
 
     {
         // Update Snuffy's age to 3
@@ -113,7 +114,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     }
 
     // Verify Snuffy's update was received (now matches age > 2 and age < 5)
-    assert_eq!(check(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
+    assert_eq!(watcher.drain(), vec![vec![(snuffy.id(), ChangeKind::Add)]]);
 
     // Update Jasper's age to 4
     {
@@ -123,7 +124,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     }
 
     // Verify Jasper's update was received (now matches age > 2 and age < 5)
-    assert_eq!(check(), vec![vec![(jasper.id(), ChangeKind::Add)]]);
+    assert_eq!(watcher.drain(), vec![vec![(jasper.id(), ChangeKind::Add)]]);
 
     // Update Snuffy and Jasper to ages outside the range
     let trx = ctx.begin();
@@ -134,7 +135,7 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     trx.commit().await.unwrap();
 
     // Verify both updates were received as removals
-    assert_eq!(check(), vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]]);
+    assert_eq!(watcher.drain(), vec![vec![(snuffy.id(), ChangeKind::Remove), (jasper.id(), ChangeKind::Remove)]]);
 
     // Update Rex to no longer match the query (instead of deleting)
     // This should still trigger a ChangeKind::Remove since it no longer matches
@@ -144,6 +145,6 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     trx.commit().await.unwrap();
 
     // Verify Rex's "removal" was received
-    assert_eq!(check(), vec![vec![(rex.id(), ChangeKind::Remove)]]);
+    assert_eq!(watcher.drain(), vec![vec![(rex.id(), ChangeKind::Remove)]]);
     Ok(())
 }
