@@ -7,9 +7,37 @@ mod tsify;
 mod wasm_signal;
 
 use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, DeriveInput};
 
 #[proc_macro_derive(Model, attributes(active_type, ephemeral, model))]
-pub fn derive_model(input: TokenStream) -> TokenStream { model::derive_model_impl(input) }
+pub fn derive_model(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    // Parse the model description
+    let desc = match model::description::ModelDescription::parse(&input) {
+        Ok(model) => model,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    // Generate implementations using the modular approach
+    let model_impl = model::model::model_impl(&desc);
+    let view_impl = model::view::view_impl(&desc);
+    let mutable_impl = model::mutable::mutable_impl(&desc);
+    let wasm_impl = if cfg!(feature = "wasm") {
+        model::wasm::wasm_impl(&input, &desc)
+    } else {
+        quote! {}
+    };
+    let expanded = quote! {
+        #model_impl
+        #view_impl
+        #mutable_impl
+        #wasm_impl
+    };
+
+    expanded.into()
+}
 
 #[cfg(feature = "wasm")]
 #[proc_macro_derive(WasmSignal)]
