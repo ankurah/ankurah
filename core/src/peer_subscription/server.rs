@@ -64,8 +64,7 @@ impl SubscriptionHandler {
     pub fn remove_predicate(&self, predicate_id: proto::PredicateId) { self.subscription.remove_predicate(predicate_id); }
 
     /// Handle a subscription request for this peer.
-    /// TODO: Rename this method from add_predicate to subscribe_predicate for consistency
-    pub async fn add_predicate<SE, PA>(
+    pub async fn subscribe_predicate<SE, PA>(
         &self,
         node: &Node<SE, PA>,
         predicate_id: proto::PredicateId,
@@ -116,18 +115,29 @@ impl SubscriptionHandler {
             initial_entities.push(entity);
         }
 
-        // TODO: Pass version and new predicate AST to set_predicate
-        // For now, create empty resultset for initial case, get from predicate state for update
-        let resultset = crate::resultset::EntityResultSet::empty(); // TODO: For v>0, get from existing predicate state
-        node.reactor.set_predicate(
-            self.subscription.id(),
-            predicate_id,
-            collection_id,
-            filtered_predicate,
-            resultset,
-            initial_entities,
-            version,
-        )?;
+        // Use add_predicate for v0, update_predicate for v>0
+        if version == 0 {
+            // Initial subscription - create new predicate with resultset
+            let resultset = crate::resultset::EntityResultSet::empty();
+            node.reactor.add_predicate(
+                self.subscription.id(),
+                predicate_id,
+                collection_id,
+                filtered_predicate,
+                resultset,
+                initial_entities,
+            )?;
+        } else {
+            // Update existing predicate
+            node.reactor.update_predicate(
+                self.subscription.id(),
+                predicate_id,
+                collection_id,
+                filtered_predicate,
+                initial_entities,
+                version,
+            )?;
+        }
 
         Ok(proto::NodeResponseBody::PredicateSubscribed { predicate_id })
     }

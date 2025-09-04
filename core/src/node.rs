@@ -464,7 +464,7 @@ where
                 // only one cdata is permitted for SubscribePredicate
                 use itertools::Itertools;
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
-                peer_state.subscription_handler.add_predicate(self, predicate_id, collection, predicate, cdata, version).await
+                peer_state.subscription_handler.subscribe_predicate(self, predicate_id, collection, predicate, cdata, version).await
             }
         }
     }
@@ -698,11 +698,76 @@ where
             None => None,
         }
     }
+    pub(crate) fn update_remote_predicate(
+        &self,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        version: u32,
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
+        match self.subscription_relay {
+            Some(ref relay) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                // no need to insert into predicate_context
+                {
+                    // update the version
+                    self.pending_predicate_subs.lock().unwrap().insert(predicate_id, (version, tx));
+                }
+                relay.update_predicate(predicate_id, collection_id, predicate, version);
+                Some(rx)
+            }
+            None => None,
+        }
+    }
+
+    pub async fn fetch_entities_from_local(
+        &self,
+        collection_id: &CollectionId,
+        predicate: &ankql::ast::Predicate,
+    ) -> Result<Vec<Entity>, RetrievalError> {
+        let storage_collection = self.collections.get(collection_id).await?;
+        let initial_states = storage_collection.fetch_states(predicate).await?;
+        let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
+        let mut entities = Vec::with_capacity(initial_states.len());
+        for state in initial_states {
+            let (_, entity) =
+                self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+            entities.push(entity);
+        }
+        Ok(entities)
+    }
 }
+#[async_trait::async_trait]
 pub trait TNodeErased: Send + Sync + 'static {
     fn unsubscribe_remote_predicate(&self, predicate_id: proto::PredicateId);
+    fn update_remote_predicate(
+        &self,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        version: u32,
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>;
+    async fn get_storage_collection(
+        &self,
+        collection_id: &CollectionId,
+    ) -> Result<crate::storage::StorageCollectionWrapper, RetrievalError>;
+    async fn fetch_entities_from_local_erased(
+        &self,
+        collection_id: &CollectionId,
+        predicate: &ankql::ast::Predicate,
+    ) -> Result<Vec<Entity>, RetrievalError>;
+    fn call_reactor_update_predicate(
+        &self,
+        subscription_id: crate::reactor::ReactorSubscriptionId,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        included_entities: Vec<Entity>,
+        version: u32,
+    ) -> Result<(), anyhow::Error>;
 }
 
+#[async_trait::async_trait]
 impl<SE, PA> TNodeErased for Node<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -720,6 +785,43 @@ where
         if let Some(ref relay) = self.subscription_relay {
             relay.unsubscribe_predicate(predicate_id);
         }
+    }
+
+    fn update_remote_predicate(
+        &self,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        version: u32,
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
+        self.update_remote_predicate(predicate_id, collection_id, predicate, version)
+    }
+
+    async fn get_storage_collection(
+        &self,
+        collection_id: &CollectionId,
+    ) -> Result<crate::storage::StorageCollectionWrapper, RetrievalError> {
+        self.collections.get(collection_id).await
+    }
+
+    async fn fetch_entities_from_local_erased(
+        &self,
+        collection_id: &CollectionId,
+        predicate: &ankql::ast::Predicate,
+    ) -> Result<Vec<Entity>, RetrievalError> {
+        self.fetch_entities_from_local(collection_id, predicate).await
+    }
+
+    fn call_reactor_update_predicate(
+        &self,
+        subscription_id: crate::reactor::ReactorSubscriptionId,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        included_entities: Vec<Entity>,
+        version: u32,
+    ) -> Result<(), anyhow::Error> {
+        self.reactor.update_predicate(subscription_id, predicate_id, collection_id, predicate, included_entities, version)
     }
 }
 

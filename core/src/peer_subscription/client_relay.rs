@@ -12,8 +12,9 @@ use crate::util::safeset::SafeSet;
 #[derive(Debug, Clone)]
 pub enum Status {
     PendingRemote,
-    Requested(proto::EntityId, u32),   // peer_id, version
-    Established(proto::EntityId, u32), // peer_id, version
+    Requested(proto::EntityId, u32),     // peer_id, version
+    Established(proto::EntityId, u32),   // peer_id, version
+    PendingUpdate(proto::EntityId, u32), // peer_id, version
     /// Non-retryable
     Failed,
 }
@@ -125,6 +126,75 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         if !self.inner.connected_peers.is_empty() {
             self.setup_remote_subscriptions()
         }
+    }
+    pub fn update_predicate(
+        &self,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        version: u32,
+    ) -> Result<(), anyhow::Error> {
+        debug!("SubscriptionRelay.update_predicate() - New predicate {} needs remote registration", predicate_id);
+        let update = {
+            let mut subscriptions = self.inner.subscriptions.lock().expect("poisoned lock");
+            match subscriptions.get_mut(&predicate_id) {
+                Some(state) => {
+                    // Update the content with new predicate and version
+                    let old_content = &state.content;
+                    state.content = Arc::new(Content {
+                        collection_id: old_content.collection_id.clone(),
+                        predicate: predicate.clone(),
+                        context_data: old_content.context_data.clone(),
+                        predicate_id: old_content.predicate_id,
+                        version,
+                    });
+
+                    match state.status {
+                        Status::Established(peer_id, _old_version) => {
+                            // Update to new version, mark as requested for this peer
+                            state.status = Status::Requested(peer_id, version);
+                            Some((peer_id, state.content.context_data.clone())) // Return the peer_id to send update to
+                        }
+                        _ => {
+                            // Not established yet, just update to PendingRemote and setup
+                            state.status = Status::PendingRemote;
+                            None
+                        }
+                    }
+                }
+                None => return Err(anyhow!("Predicate {} not found", predicate_id)),
+            }
+        };
+
+        match update {
+            Some((peer_id, context_data)) => {
+                self.update_predicate_on_peer(peer_id, predicate_id, collection_id, predicate, version, context_data);
+            }
+            None => {
+                // Not established yet - use setup_remote_subscriptions for initial setup
+                self.setup_remote_subscriptions();
+            }
+        };
+
+        Ok(())
+    }
+
+    fn update_predicate_on_peer(
+        &self,
+        peer_id: proto::EntityId,
+        predicate_id: proto::PredicateId,
+        collection_id: CollectionId,
+        predicate: ankql::ast::Predicate,
+        version: u32,
+        context_data: CD,
+    ) {
+        let me = self.clone();
+        crate::task::spawn(async move {
+            if let Some(sender) = me.inner.message_sender.get() {
+                // Send the updated predicate to the peer
+                let _ = sender.peer_subscribe(peer_id, predicate_id, collection_id, predicate, &context_data, version).await;
+            }
+        });
     }
 
     /// Notify the relay that a predicate should be removed from remote peer subscriptions
