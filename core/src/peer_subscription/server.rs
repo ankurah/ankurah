@@ -5,6 +5,7 @@ use crate::{
     node::Node,
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},
+    resultset::EntityResultSet,
     retrieval::LocalRetriever,
     storage::StorageEngine,
 };
@@ -97,11 +98,8 @@ impl SubscriptionHandler {
         // and only fetch/send the NEW ones that match the updated predicate
         let initial_states = storage_collection.fetch_states(&filtered_predicate).await?;
 
-        // TODO: Remove this add_predicate call once it's merged into initialize/set_predicate
-        // The predicate should be added atomically with its initial entities in a single operation
-        // For now, this creates an inactive predicate that waits for initialize() to activate
-        self.subscription.add_predicate(predicate_id, &collection_id, filtered_predicate)?;
-        debug!("Added predicate {} to subscription for peer {}", predicate_id, self.peer_id);
+        // Predicate will be added when set_predicate is called
+        debug!("Setting up predicate {} for peer {}", predicate_id, self.peer_id);
 
         let retriever = LocalRetriever::new(storage_collection);
         let mut initial_entities = Vec::with_capacity(initial_states.len());
@@ -118,9 +116,18 @@ impl SubscriptionHandler {
             initial_entities.push(entity);
         }
 
-        // TODO: Pass version and new predicate AST to set_predicate (formerly known as initialize)
-        // initialize should handle both initial and update cases
-        node.reactor.initialize(self.subscription.id(), predicate_id, initial_entities)?;
+        // TODO: Pass version and new predicate AST to set_predicate
+        // For now, create empty resultset for initial case, get from predicate state for update
+        let resultset = crate::resultset::EntityResultSet::empty(); // TODO: For v>0, get from existing predicate state
+        node.reactor.set_predicate(
+            self.subscription.id(),
+            predicate_id,
+            collection_id,
+            filtered_predicate,
+            resultset,
+            initial_entities,
+            version,
+        )?;
 
         Ok(proto::NodeResponseBody::PredicateSubscribed { predicate_id })
     }

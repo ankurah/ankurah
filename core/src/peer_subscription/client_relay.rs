@@ -503,7 +503,7 @@ mod tests {
         relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
 
         // Check initial state - subscription should immediately go to Requested state since peer is connected
-        assert!(matches!(relay.get_status(predicate_id), Some(Status::Requested(_))));
+        assert!(matches!(relay.get_status(predicate_id), Some(Status::Requested(_, _))));
 
         // Give async task time to complete (setup should happen automatically)
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -516,7 +516,9 @@ mod tests {
         assert_eq!(sent_requests[0].2, collection_id);
 
         // Verify subscription is marked as established
-        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+        );
     }
 
     #[tokio::test]
@@ -539,7 +541,9 @@ mod tests {
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+        );
 
         // Simulate peer disconnection
         relay.notify_peer_disconnected(peer_id);
@@ -579,7 +583,9 @@ mod tests {
         assert_eq!(sent_requests[0].1, predicate_id);
 
         // Verify subscription is established
-        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+        );
     }
 
     #[tokio::test]
@@ -601,7 +607,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Verify subscription is marked as established (since no error was set)
-        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+        );
 
         // Now test the retry behavior by disconnecting the peer (puts subscription back to PendingRemote)
         // then setting up the mock to fail, and reconnecting to trigger the retry
@@ -668,7 +676,7 @@ mod tests {
 
         // Verify states
         assert!(
-            matches!(relay.get_status(retryable_predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id)
+            matches!(relay.get_status(retryable_predicate_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
         );
         assert!(matches!(relay.get_status(non_retryable_predicate_id), Some(Status::Failed)));
     }
@@ -691,7 +699,9 @@ mod tests {
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+        );
 
         // Clear previous requests to focus on unsubscribe
         mock_sender.clear_sent_requests();
@@ -744,7 +754,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should now be established
-        assert!(matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(predicate_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+        );
         assert_eq!(mock_sender.get_sent_requests().len(), 1);
     }
 

@@ -56,14 +56,6 @@ impl<E: AbstractEntity, Ev: Clone> ReactorSubscription<E, Ev> {
     /// Add a predicate to this subscription
     // TODO: REMOVE this method - predicates should ONLY be added via set_predicate
     // This creates an inactive predicate that does nothing until initialize() is called
-    pub fn add_predicate(
-        &self,
-        predicate_id: proto::PredicateId,
-        collection_id: &proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) -> Result<EntityResultSet<E>, SubscriptionError> {
-        self.0.reactor.add_predicate(self.0.subscription_id, predicate_id, collection_id, predicate)
-    }
 
     /// Remove a predicate from this subscription
     pub fn remove_predicate(&self, predicate_id: proto::PredicateId) {

@@ -67,11 +67,6 @@ impl EntityLiveQuery {
         let subscription = node.reactor.subscribe();
 
         let predicate_id = proto::PredicateId::new();
-        // TODO: Remove this add_predicate call once it's merged into initialize/set_predicate
-        // The predicate should be added atomically with its initial entities
-        let resultset = subscription.add_predicate(predicate_id, &collection_id, args.predicate.clone())?;
-        // TODO: For version 0, predicate is still "pending" on the reactor until we call initialize
-        // The reactor doesn't actually apply the predicate until initialize is called with entities
         let rx = node.subscribe_remote_predicate(predicate_id, collection_id.clone(), args.predicate.clone(), cdata, 0);
 
         let me = Self(Arc::new(Inner {
@@ -79,7 +74,7 @@ impl EntityLiveQuery {
             node: Box::new(node.clone()),
             peers: Vec::new(),
             subscription,
-            resultset,
+            resultset: EntityResultSet::empty(),
             has_error: AtomicBool::new(false),
             error: std::sync::Mutex::new(None),
             initialized: tokio::sync::Notify::new(),
@@ -160,8 +155,22 @@ impl EntityLiveQuery {
             args.predicate
         );
 
-        debug!("LiveQuery.initialize() calling reactor.initialize with {} entities for predicate {}", initial_entities.len(), predicate_id);
-        node.reactor.initialize(self.0.subscription.id(), predicate_id, initial_entities)?;
+        debug!(
+            "LiveQuery.initialize() calling reactor.set_predicate with {} entities for predicate {}",
+            initial_entities.len(),
+            predicate_id
+        );
+        // For initial subscription, use version 0
+        node.reactor.set_predicate(
+            self.0.subscription.id(),
+            predicate_id,
+            collection_id,
+            args.predicate,
+            self.0.resultset.clone(), // Pass the existing resultset
+            initial_entities,
+            0, // Initial version
+        )?;
+
         Ok(())
     }
 

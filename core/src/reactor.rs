@@ -191,50 +191,6 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
         Ok(())
     }
 
-    /// Add a predicate to a subscription
-    // TODO: REMOVE this method - merge into set_predicate
-    // This method creates an inactive predicate (initialized=false) that is completely
-    // ignored by notify_change until initialize() is called
-    // The predicate does nothing of consequence until initialized
-    pub fn add_predicate(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        predicate_id: proto::PredicateId,
-        collection_id: &proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) -> Result<EntityResultSet<E>, SubscriptionError> {
-        let mut subscriptions = self.0.subscriptions.lock().unwrap();
-        let mut watcher_state = self.0.watcher_set.lock().unwrap();
-
-        // Add the predicate to the subscription
-        if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
-            use std::collections::hash_map::Entry;
-            let resultset = EntityResultSet::empty();
-            match subscription.predicates.entry(predicate_id) {
-                Entry::Vacant(v) => {
-                    v.insert(PredicateState {
-                        subscription_id,
-                        collection_id: collection_id.clone(),
-                        predicate: predicate.clone(),
-                        initialized: false,
-                        resultset: resultset.clone(),
-                    });
-                }
-                Entry::Occupied(o) => {
-                    return Err(SubscriptionError::PredicateAlreadySubscribed);
-                }
-            };
-
-            // Set up watchers
-            let watcher_id = (subscription_id, predicate_id);
-            watcher_state.recurse_predicate_watchers(collection_id, &predicate, watcher_id, WatcherOp::Add);
-
-            Ok(resultset)
-        } else {
-            Err(SubscriptionError::SubscriptionNotFound)
-        }
-    }
-
     /// Remove a predicate from a subscription
     pub fn remove_predicate(
         &self,
@@ -340,34 +296,67 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
 }
 
 impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
-    /// Initialize a specific predicate by performing initial evaluation
-    /// This is async and does the initial fetch and evaluation
-    /// TODO: RENAME to set_predicate and merge add_predicate functionality
-    /// This should be the ONLY method for setting/updating predicates
-    pub fn initialize(
+    /// Set a predicate for a subscription (handles both initial and updates)
+    /// This is the ONLY method for setting/updating predicates
+    pub fn set_predicate(
         &self,
         subscription_id: ReactorSubscriptionId,
         predicate_id: proto::PredicateId,
-        initial_entities: Vec<E>, // TODO: Rename to included_entities (not necessarily "initial")
-                                  // TODO: Add collection_id: proto::CollectionId parameter (from add_predicate)
-                                  // TODO: Add predicate: ankql::ast::Predicate parameter (ALWAYS needed)
-                                  // TODO: Add version: u32 parameter
+        collection_id: proto::CollectionId,
+        predicate: ankql::ast::Predicate,
+        resultset: EntityResultSet<E>, // TODO: For v0, pass existing resultset; for v>0, get from predicate state
+        included_entities: Vec<E>,     // TODO: For updates, these are only NEW entities from remote
+        version: u32,                  // TODO: Track version for predicate updates
     ) -> anyhow::Result<()> {
         // TODO: Check if predicate already exists for this predicate_id
         // If it exists, this is an update - store the old resultset for diff computation
         // If it doesn't exist, this is initial subscription - old resultset is empty
-        let predicate = {
-            let subscriptions = self.0.subscriptions.lock().unwrap();
+
+        // TODO: Break this up - for v0 use passed resultset, for v>0 get from predicate state
+        // First, add or update the predicate in the subscription (from add_predicate logic)
+        {
+            let mut subscriptions = self.0.subscriptions.lock().unwrap();
+            let mut watcher_state = self.0.watcher_set.lock().unwrap();
+
             let subscription =
-                subscriptions.get(&subscription_id).ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?;
-            let predicate_state =
-                subscription.predicates.get(&predicate_id).ok_or_else(|| anyhow::anyhow!("Predicate {:?} not found", predicate_id))?;
-            predicate_state.predicate.clone()
-        };
+                subscriptions.get_mut(&subscription_id).ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?;
+
+            // Check if this is an update or initial
+            let is_update = subscription.predicates.contains_key(&predicate_id);
+
+            if !is_update {
+                // Initial case: create new predicate state with the passed-in resultset
+                use std::collections::hash_map::Entry;
+                match subscription.predicates.entry(predicate_id) {
+                    Entry::Vacant(v) => {
+                        v.insert(PredicateState {
+                            subscription_id,
+                            collection_id: collection_id.clone(),
+                            predicate: predicate.clone(),
+                            initialized: false,
+                            resultset: resultset.clone(),
+                        });
+                    }
+                    Entry::Occupied(_) => {
+                        return Err(anyhow::anyhow!("Predicate already exists"));
+                    }
+                }
+
+                // Set up watchers for new predicate
+                let watcher_id = (subscription_id, predicate_id);
+                watcher_state.recurse_predicate_watchers(&collection_id, &predicate, watcher_id, WatcherOp::Add);
+            } else {
+                // TODO: Update case - update the predicate AST
+                // For v>0, should get the resultset from existing predicate state, not use passed one
+                if let Some(pred_state) = subscription.predicates.get_mut(&predicate_id) {
+                    pred_state.predicate = predicate.clone();
+                }
+            }
+        }
 
         // TODO: When predicate already exists (update case):
         // 1. Save the old matching entity IDs before any changes
-        // 2. The initial_entities parameter contains only NEW entities from remote
+        // 2. The included_entities parameter contains only NEW entities from remote
         //    that match the new predicate but weren't known before
         // 3. We need to re-evaluate ALL existing entities against the new predicate
         let mut matching_entities = Vec::new();
@@ -375,7 +364,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
 
         // TODO: This loop should only process truly new entities (not in old resultset)
         // For updates, these are entities the remote found that match new but not old predicate
-        for entity in initial_entities {
+        for entity in included_entities {
             if ankql::selection::filter::evaluate_predicate(&entity, &predicate).unwrap_or(false) {
                 matching_entities.push(entity);
             }
@@ -448,9 +437,8 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
             }
         }
 
-        // TODO: Track version number properly - should be passed as parameter
-        // For now using 0 for initial, but this should come from the version parameter
-        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items, initialized_predicate: Some((predicate_id, 0)) };
+        // Use the version parameter to track which update completed
+        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items, initialized_predicate: Some((predicate_id, version)) };
 
         // Notify the subscription
         {
@@ -804,10 +792,12 @@ mod tests {
         let _guard = rsub.subscribe(w); // ReactorSubscription needs to implement ankurah_signals::Subscribe
 
         let predicate_id = PredicateId::new();
-        let _ = rsub.add_predicate(predicate_id, &CollectionId::fixed_name("album"), "status = 'pending'".try_into().unwrap());
+        let collection_id = CollectionId::fixed_name("album");
+        let predicate = "status = 'pending'".try_into().unwrap();
         let entity1 = TestEntity::new("Test Album", "pending");
+        let resultset = EntityResultSet::empty();
 
-        reactor.initialize(rsub.id(), predicate_id, vec![entity1.clone()]).unwrap();
+        reactor.set_predicate(rsub.id(), predicate_id, collection_id, predicate, resultset, vec![entity1.clone()], 0).unwrap();
 
         // something like this
         assert_eq!(
@@ -819,7 +809,7 @@ mod tests {
                     entity_subscribed: true,
                     predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
                 }],
-                initialized_predicate: Some(predicate_id),
+                initialized_predicate: Some((predicate_id, 0)),
             }]
         );
 
