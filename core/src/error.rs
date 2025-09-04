@@ -133,6 +133,8 @@ pub enum MutationError {
     InvalidEvent,
     #[error("invalid update")]
     InvalidUpdate(&'static str),
+    #[error("property error: {0}")]
+    PropertyError(crate::property::PropertyError),
 }
 
 #[derive(Error, Debug)]
@@ -202,6 +204,10 @@ impl From<bincode::Error> for StateError {
 
 impl From<StateError> for MutationError {
     fn from(err: StateError) -> Self { MutationError::StateError(err) }
+}
+
+impl From<crate::property::PropertyError> for MutationError {
+    fn from(err: crate::property::PropertyError) -> Self { MutationError::PropertyError(err) }
 }
 
 impl From<StateError> for RetrievalError {

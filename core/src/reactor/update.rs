@@ -19,8 +19,9 @@ pub enum MembershipChange {
 pub struct ReactorUpdate<E = Entity, Ev = Attested<Event>> {
     /// All entities that changed, with their relevance information
     pub items: Vec<ReactorUpdateItem<E, Ev>>,
-    /// A predicate was initialized for this update
-    pub initialized_predicate: Option<proto::PredicateId>,
+    /// A this update contains initial records for this update (with version)
+    /// If this is a predicate update, the the items list may contain only those records which were NOT present in the previous update
+    pub initialized_query: Option<(proto::QueryId, u32)>,
 }
 
 /// A single entity update with all relevance information
@@ -34,7 +35,7 @@ pub struct ReactorUpdateItem<E = Entity, Ev = Attested<Event>> {
     pub entity_subscribed: bool,
     /// Which predicates this update is relevant to and how
     /// Empty if only relevant due to entity_subscribed
-    pub predicate_relevance: Vec<(proto::PredicateId, MembershipChange)>,
+    pub predicate_relevance: Vec<(proto::QueryId, MembershipChange)>,
 }
 
 impl<E, Ev: Clone> ReactorUpdateItem<E, Ev> {

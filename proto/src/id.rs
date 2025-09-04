@@ -37,7 +37,8 @@ impl EntityId {
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl EntityId {
-    pub fn as_string(&self) -> String { self.to_base64() }
+    #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = toString))]
+    pub fn to_string(&self) -> String { self.to_base64() }
 
     #[cfg(feature = "wasm")]
     #[wasm_bindgen(js_name = to_base64)]

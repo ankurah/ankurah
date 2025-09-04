@@ -123,13 +123,20 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 
                 self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
                     // The ChangeSet already contains a ResultSet<View>, just wrap it
-                    let resultset = #resultset_name(changeset.resultset.map());
+                    let resultset = #resultset_name(changeset.resultset.wrap());
 
                     let _ = callback.call1(
                         &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
                         &resultset.into()
                     );
                 })
+            }
+
+            /// Update the predicate for this query and return a promise that resolves when complete
+            pub async fn update_selection(&self, new_selection: &str) -> Result<(), ::wasm_bindgen::JsValue> {
+                self.0.update_selection_wait(new_selection)
+                    .await
+                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
             }
         }
     }

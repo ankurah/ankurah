@@ -15,7 +15,7 @@ use ankurah_signals::Signal;
 pub struct LWW<T: Property> {
     pub property_name: PropertyName,
     pub backend: Arc<LWWBackend>,
-
+    pub entity: Entity,
     phantom: PhantomData<T>,
 }
 
@@ -27,6 +27,9 @@ impl<T: Property> std::fmt::Debug for LWW<T> {
 
 impl<T: Property> LWW<T> {
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
+        if !self.entity.is_writable() {
+            return Err(PropertyError::TransactionClosed);
+        }
         let value = value.into_value()?;
         self.backend.set(self.property_name.clone(), value);
         Ok(())
@@ -43,7 +46,7 @@ impl<T: Property> LWW<T> {
 impl<T: Property> FromEntity for LWW<T> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        Self { property_name, backend, phantom: PhantomData }
+        Self { property_name, backend, entity: entity.clone(), phantom: PhantomData }
     }
 }
 
@@ -85,4 +88,11 @@ where T: Clone + Send + Sync + 'static
         }));
         ankurah_signals::SubscriptionGuard::new(subscription)
     }
+}
+
+#[cfg(feature = "wasm")]
+pub mod wasm {
+    //! WASM wrapper types for LWW backend
+    use ankurah_derive::impl_provided_wrapper_types;
+    impl_provided_wrapper_types!("src/property/value/lww.ron");
 }

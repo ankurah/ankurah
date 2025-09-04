@@ -1,4 +1,4 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::PredicateId, CollectionId, EventFragment, StateFragment};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, CollectionId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -8,7 +8,7 @@ pub struct UpdateId(Ulid);
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeUpdateBody {
     /// New events for a subscription
-    SubscriptionUpdate { items: Vec<SubscriptionUpdateItem>, initialized_predicate: Option<PredicateId> },
+    SubscriptionUpdate { items: Vec<SubscriptionUpdateItem>, initialized_query: Option<(QueryId, u32)> },
 }
 
 /// Content of an update - either state, events, or both
@@ -52,7 +52,7 @@ pub struct SubscriptionUpdateItem {
     pub content: UpdateContent,
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions
-    pub predicate_relevance: Vec<(PredicateId, MembershipChange)>,
+    pub predicate_relevance: Vec<(QueryId, MembershipChange)>,
     /// Whether this entity has an explicit entity-level subscription
     pub entity_subscribed: bool,
 }
@@ -120,7 +120,7 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeUpdateBody::SubscriptionUpdate { items, initialized_predicate: _ } => {
+            NodeUpdateBody::SubscriptionUpdate { items, initialized_query: _ } => {
                 write!(f, "SubscriptionUpdate [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
             }
         }

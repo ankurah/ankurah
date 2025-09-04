@@ -26,6 +26,7 @@ impl<T> ValueCell<T> {
         let guard = self.0.read().unwrap();
         f(&*guard)
     }
+    #[allow(unused)]
     pub fn set_with<R>(&self, value: T, f: impl Fn(&T) -> R) -> R {
         let mut current = self.0.write().unwrap();
         *current = value;

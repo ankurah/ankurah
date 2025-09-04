@@ -2,9 +2,11 @@ use ankurah_proto::{self as proto, Attested};
 use tracing::{debug, warn};
 
 use crate::{
+    error::SubscriptionError,
     node::Node,
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},
+    resultset::EntityResultSet,
     retrieval::LocalRetriever,
     storage::StorageEngine,
 };
@@ -17,7 +19,7 @@ use ankurah_signals::{Subscribe, SubscriptionGuard};
 pub struct SubscriptionHandler {
     peer_id: proto::EntityId,
     subscription: ReactorSubscription,
-    guard: SubscriptionGuard,
+    _guard: SubscriptionGuard,
 }
 
 impl SubscriptionHandler {
@@ -31,11 +33,18 @@ impl SubscriptionHandler {
 
         // Subscribe to changes on this subscription
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
+            if update.initialized_query.is_none() && !update.items.is_empty() {
+                tracing::warn!(
+                    "SubscriptionHandler[{}] received reactor update with {} items but NO initialized_predicate - this might be from notify_change",
+                    peer_id,
+                    update.items.len()
+                );
+            }
             tracing::info!(
                 "SubscriptionHandler[{}] received reactor update with {} items, initialized_predicate: {:?}",
                 peer_id,
                 update.items.len(),
-                update.initialized_predicate
+                update.initialized_query
             );
 
             if let Some(node) = weak_node.upgrade() {
@@ -44,13 +53,13 @@ impl SubscriptionHandler {
                     peer_id,
                     proto::NodeUpdateBody::SubscriptionUpdate {
                         items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
-                        initialized_predicate: update.initialized_predicate,
+                        initialized_query: update.initialized_query, // Now includes (PredicateId, u32)
                     },
                 );
             }
         });
 
-        Self { peer_id, subscription, guard }
+        Self { peer_id, subscription, _guard: guard }
     }
 
     /// Get the subscription ID for this peer.
@@ -60,41 +69,55 @@ impl SubscriptionHandler {
     pub fn subscription(&self) -> &ReactorSubscription { &self.subscription }
 
     /// Remove a predicate from this peer's subscription.
-    pub fn remove_predicate(&self, predicate_id: proto::PredicateId) { self.subscription.remove_predicate(predicate_id); }
+    pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
+        self.subscription.remove_predicate(query_id)?;
+        Ok(())
+    }
 
     /// Handle a subscription request for this peer.
-    pub async fn add_predicate<SE, PA>(
+    pub async fn subscribe_query<SE, PA>(
         &self,
         node: &Node<SE, PA>,
-        predicate_id: proto::PredicateId,
+        query_id: proto::QueryId,
         collection_id: proto::CollectionId,
-        predicate: ankql::ast::Predicate,
+        mut selection: ankql::ast::Selection,
         cdata: &PA::ContextData,
+        version: u32,
     ) -> anyhow::Result<proto::NodeResponseBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        // Check access permissions first
         node.policy_agent.can_access_collection(cdata, &collection_id)?;
-        let filtered_predicate = node.policy_agent.filter_predicate(cdata, &collection_id, predicate)?;
+        selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
         let storage_collection = node.collections.get(&collection_id).await?;
-        let initial_states = storage_collection.fetch_states(&filtered_predicate).await?;
 
-        // Add the predicate to this peer's subscription
-        self.subscription.add_predicate(predicate_id, &collection_id, filtered_predicate)?;
-        debug!("Added predicate {} to subscription for peer {}", predicate_id, self.peer_id);
-
+        let initial_states = storage_collection.fetch_states(&selection.predicate).await?;
         let retriever = LocalRetriever::new(storage_collection);
+
         let mut initial_entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
             let (_, entity) =
                 node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
             initial_entities.push(entity);
         }
-        node.reactor.initialize(self.subscription.id(), predicate_id, initial_entities)?;
 
-        Ok(proto::NodeResponseBody::PredicateSubscribed { predicate_id })
+        if version == 0 {
+            let resultset = EntityResultSet::from_vec(initial_entities, true);
+            node.reactor.add_query(self.subscription.id(), query_id, collection_id, selection, resultset)?;
+        } else {
+            node.reactor.update_query(
+                self.subscription.id(),
+                query_id,
+                collection_id,
+                selection,
+                initial_entities,
+                version,
+                false, // remote subscriptions do not need remove notifications
+            )?;
+        }
+
+        Ok(proto::NodeResponseBody::QuerySubscribed { query_id })
     }
 }
 

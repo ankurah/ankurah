@@ -213,7 +213,7 @@ impl StorageCollection for IndexedDBBucket {
             // Get the old entity if it exists to check for changes
             let transaction = step(self.db.transaction_with_str_and_mode("entities", Readwrite), "create transaction")?;
             let store = step(transaction.object_store("entities"), "get object store")?;
-            let old_request = step(store.get(&state.payload.entity_id.as_string().into()), "get old entity")?;
+            let old_request = step(store.get(&state.payload.entity_id.to_string().into()), "get old entity")?;
             let foo = CBFuture::new(&old_request, "success", "error").await;
             let _: () = step(foo, "get old entity")?;
 
@@ -235,14 +235,14 @@ impl StorageCollection for IndexedDBBucket {
             }
 
             let entity = js_sys::Object::new();
-            set_property(&entity, &ID_KEY, &state.payload.entity_id.as_string().into())?;
+            set_property(&entity, &ID_KEY, &state.payload.entity_id.to_string().into())?;
             set_property(&entity, &COLLECTION_KEY, &self.collection_id.as_str().into())?;
             set_property(&entity, &STATE_BUFFER_KEY, &(&state.payload.state.state_buffers).try_into()?)?;
             set_property(&entity, &HEAD_KEY, &(&(state.payload.state.head)).into())?;
             set_property(&entity, &ATTESTATIONS_KEY, &(&state.attestations).try_into()?)?;
 
             // Put the entity in the store
-            let request = step(store.put_with_key(&entity, &state.payload.entity_id.as_string().into()), "put entity in store")?;
+            let request = step(store.put_with_key(&entity, &state.payload.entity_id.to_string().into()), "put entity in store")?;
 
             step(CBFuture::new(&request, "success", "error").await, "put entity in store")?;
             step(CBFuture::new(&transaction, "complete", "error").await, "complete transaction")?;
@@ -261,7 +261,7 @@ impl StorageCollection for IndexedDBBucket {
             // Create transaction and get object store
             let transaction = step(self.db.transaction_with_str("entities"), "create transaction")?;
             let store = step(transaction.object_store("entities"), "get object store")?;
-            let request = step(store.get(&id.as_string().into()), "get entity")?;
+            let request = step(store.get(&id.to_string().into()), "get entity")?;
 
             step(CBFuture::new(&request, "success", "error").await, "await request")?;
 

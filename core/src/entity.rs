@@ -11,6 +11,7 @@ use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use anyhow::anyhow;
 use std::collections::{btree_map::Entry, BTreeMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::{debug, error, warn};
 
@@ -29,13 +30,15 @@ pub struct EntityInner {
     pub collection: CollectionId,
     pub(crate) backends: Arc<Mutex<BTreeMap<String, Arc<dyn PropertyBackend>>>>,
     head: std::sync::Mutex<Clock>,
-    // TODO when a transaction creates a downstream entity, we needf to provide a weak reference back to the transaction
-    // so we can error in the case that the transaction has been committed/rolled back (dropped)
-    // This is necessary for JsMutables (to be created) which cannot have a borrow of the transaction
-    // Standard Mutables will have a borrow of the transaction so it should not be possible for them to outlive the transaction
-    pub(crate) upstream: Option<Entity>,
+    pub(crate) kind: EntityKind,
     /// Broadcast for notifying Signal subscribers about entity changes
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast,
+}
+
+#[derive(Debug)]
+pub enum EntityKind {
+    Primary,                                                     // New or resident entity - TODO delineate these
+    Transacted { trx_alive: Arc<AtomicBool>, upstream: Entity }, // Transaction fork with liveness tracking
 }
 
 impl std::ops::Deref for Entity {
@@ -74,6 +77,14 @@ impl Entity {
 
     pub fn head(&self) -> Clock { self.head.lock().unwrap().clone() }
 
+    /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
+    pub fn is_writable(&self) -> bool {
+        match &self.kind {
+            EntityKind::Primary => false, // Primary entities are read-only
+            EntityKind::Transacted { trx_alive, .. } => trx_alive.load(Ordering::Acquire),
+        }
+    }
+
     pub fn to_state(&self) -> Result<State, StateError> {
         let backends = self.backends.lock().expect("other thread panicked, panic here too");
         let mut state_buffers = BTreeMap::default();
@@ -97,7 +108,7 @@ impl Entity {
             collection,
             backends: Arc::new(Mutex::new(BTreeMap::default())),
             head: std::sync::Mutex::new(Clock::default()),
-            upstream: None,
+            kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
     }
@@ -115,7 +126,7 @@ impl Entity {
             collection,
             backends: Arc::new(Mutex::new(backends)),
             head: std::sync::Mutex::new(state.head.clone()),
-            upstream: None,
+            kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))
     }
@@ -284,7 +295,8 @@ impl Entity {
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
-    pub fn snapshot(&self) -> Self {
+    /// The trx_alive parameter tracks whether the transaction that owns this snapshot is still alive
+    pub fn snapshot(&self, trx_alive: Arc<AtomicBool>) -> Self {
         // Inline fork logic
         let backends = self.backends.lock().expect("other thread panicked, panic here too");
         let mut forked = BTreeMap::new();
@@ -297,7 +309,7 @@ impl Entity {
             collection: self.collection.clone(),
             backends: Arc::new(Mutex::new(forked)),
             head: std::sync::Mutex::new(self.head.lock().unwrap().clone()),
-            upstream: Some(self.clone()),
+            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
     }
@@ -408,7 +420,7 @@ impl TemporaryEntity {
             collection,
             backends: Arc::new(Mutex::new(backends)),
             head: std::sync::Mutex::new(state.head.clone()),
-            upstream: None,
+            kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))

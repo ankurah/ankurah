@@ -28,6 +28,17 @@ pub enum Identifier {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Selection {
+    pub predicate: Predicate,
+    // order_by
+    // limit
+}
+
+impl std::fmt::Display for Selection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.predicate) }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
     Comparison { left: Box<Expr>, operator: ComparisonOperator, right: Box<Expr> },
     IsNull(Box<Expr>),

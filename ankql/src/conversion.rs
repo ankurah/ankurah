@@ -1,5 +1,5 @@
-use crate::ast;
 use crate::ast::Predicate;
+use crate::ast::{self, Selection};
 use crate::error::ParseError;
 use crate::parser;
 use std::convert::TryFrom;
@@ -13,6 +13,16 @@ impl TryFrom<String> for Predicate {
     type Error = ParseError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> { parser::parse_selection(&value) }
+}
+impl<'a> TryFrom<&'a str> for Selection {
+    type Error = ParseError;
+
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> { Ok(Selection { predicate: parser::parse_selection(value)? }) }
+}
+impl TryFrom<String> for Selection {
+    type Error = ParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> { Ok(Selection { predicate: parser::parse_selection(&value)? }) }
 }
 
 impl TryFrom<ast::Expr> for Predicate {

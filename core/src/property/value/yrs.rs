@@ -19,6 +19,7 @@ pub struct YrsString<Projected> {
     // but its got a lifetime of 'doc and that requires some refactoring
     pub property_name: PropertyName,
     pub backend: Arc<YrsBackend>,
+    pub entity: Entity,
     phantom: PhantomData<Projected>,
     // TODO: Pretty sure we need to store a clone of the Entity here so it's kept alive for the lifetime of the YrsString
     // Previously this didn't matter because the YrsString wasn't clonable. Followup question on this:
@@ -30,16 +31,34 @@ pub struct YrsString<Projected> {
 
 // Starting with basic string type operations
 impl<Projected> YrsString<Projected> {
-    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>) -> Self { Self { property_name, backend, phantom: PhantomData } }
+    pub fn new(property_name: PropertyName, backend: Arc<YrsBackend>, entity: Entity) -> Self {
+        Self { property_name, backend, entity, phantom: PhantomData }
+    }
     pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property_name) }
-    pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> { self.backend.insert(&self.property_name, index, value) }
-    pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> { self.backend.delete(&self.property_name, index, length) }
+    pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> {
+        if !self.entity.is_writable() {
+            return Err(PropertyError::TransactionClosed.into());
+        }
+        self.backend.insert(&self.property_name, index, value)
+    }
+    pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> {
+        if !self.entity.is_writable() {
+            return Err(PropertyError::TransactionClosed.into());
+        }
+        self.backend.delete(&self.property_name, index, length)
+    }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
+        if !self.entity.is_writable() {
+            return Err(PropertyError::TransactionClosed.into());
+        }
         self.backend.delete(&self.property_name, start, length)?;
         self.backend.insert(&self.property_name, start, value)?;
         Ok(())
     }
     pub fn replace(&self, value: &str) -> Result<(), MutationError> {
+        if !self.entity.is_writable() {
+            return Err(PropertyError::TransactionClosed.into());
+        }
         self.backend.delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32)?;
         self.backend.insert(&self.property_name, 0, value)?;
         Ok(())
@@ -49,7 +68,7 @@ impl<Projected> YrsString<Projected> {
 impl<Projected> FromEntity for YrsString<Projected> {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self {
         let backend = entity.get_backend::<YrsBackend>().expect("YrsBackend should exist");
-        Self::new(property_name, backend)
+        Self::new(property_name, backend, entity.clone())
     }
 }
 
@@ -123,4 +142,11 @@ where Projected: Clone + Send + Sync + 'static
         }));
         ankurah_signals::SubscriptionGuard::new(subscription)
     }
+}
+
+#[cfg(feature = "wasm")]
+pub mod wasm {
+    //! WASM wrapper types for YrsString backend
+    use ankurah_derive::impl_provided_wrapper_types;
+    impl_provided_wrapper_types!("src/property/value/yrs.ron");
 }

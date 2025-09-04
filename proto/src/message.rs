@@ -5,7 +5,7 @@ use crate::{
     id::EntityId,
     peering::Presence,
     request::{NodeRequest, NodeResponse},
-    subscription::PredicateId,
+    subscription::QueryId,
     update::{NodeUpdate, NodeUpdateAck},
 };
 
@@ -22,7 +22,7 @@ pub enum NodeMessage {
     Response(NodeResponse),
     Update(NodeUpdate),
     UpdateAck(NodeUpdateAck),
-    UnsubscribePredicate { from: EntityId, predicate_id: PredicateId },
+    UnsubscribeQuery { from: EntityId, query_id: QueryId },
 }
 
 impl std::fmt::Display for Message {
@@ -41,7 +41,7 @@ impl std::fmt::Display for NodeMessage {
             NodeMessage::Response(response) => write!(f, "Response: {}", response),
             NodeMessage::Update(update) => write!(f, "Update: {}", update),
             NodeMessage::UpdateAck(update_ack) => write!(f, "UpdateAck: {}", update_ack),
-            NodeMessage::UnsubscribePredicate { from, predicate_id } => write!(f, "Unsubscribe: {} {}", from, predicate_id),
+            NodeMessage::UnsubscribeQuery { from, query_id: query_id } => write!(f, "Unsubscribe: {} {}", from, query_id),
         }
     }
 }

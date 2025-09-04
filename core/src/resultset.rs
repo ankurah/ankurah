@@ -41,6 +41,93 @@ struct State<E: AbstractEntity> {
 }
 // TODO - figure out how to maintain ordering of entities
 
+/// A write guard for making atomic changes to a ResultSet
+/// Holds the mutex guard to ensure all changes happen atomically
+/// Sends a single notification when dropped (if any changes were made)
+pub struct ResultSetWrite<'a, E: AbstractEntity = Entity> {
+    resultset: &'a EntityResultSet<E>,
+    changed: bool,
+    guard: Option<std::sync::MutexGuard<'a, State<E>>>,
+}
+
+/// A read guard for read-only access to a ResultSet
+/// Holds the mutex guard to ensure consistent reads
+pub struct ResultSetRead<'a, E: AbstractEntity = Entity> {
+    guard: std::sync::MutexGuard<'a, State<E>>,
+}
+
+// TODO - build unit tests for this
+impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
+    /// Add an entity to the result set
+    pub fn add(&mut self, entity: E) -> bool {
+        let guard = self.guard.as_mut().expect("write guard already dropped");
+        let id = entity.id();
+        if guard.index.contains_key(&id) {
+            return false; // Already present
+        }
+        let pos = guard.order.len();
+        guard.order.push(entity);
+        guard.index.insert(id, pos);
+        self.changed = true;
+        true
+    }
+
+    /// Remove an entity from the result set
+    pub fn remove(&mut self, id: proto::EntityId) -> bool {
+        let guard = self.guard.as_mut().expect("write guard already dropped");
+        if let Some(idx) = guard.index.remove(&id) {
+            guard.order.remove(idx);
+            if idx < guard.order.len() {
+                fix_from(guard, idx);
+            }
+            self.changed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if an entity exists
+    pub fn contains(&self, id: &proto::EntityId) -> bool {
+        self.guard.as_ref().expect("write guard already dropped").index.contains_key(id)
+    }
+
+    /// Iterate over all entities
+    /// Returns an iterator over (entity_id, entity) pairs
+    pub fn iter_entities(&self) -> impl Iterator<Item = (proto::EntityId, &E)> {
+        let guard = self.guard.as_ref().expect("write guard already dropped");
+        guard.order.iter().map(|entity| (entity.id(), entity))
+    }
+}
+
+impl<'a, E: AbstractEntity> ResultSetRead<'a, E> {
+    /// Check if an entity exists
+    pub fn contains(&self, id: &proto::EntityId) -> bool { self.guard.index.contains_key(id) }
+
+    /// Iterate over all entities
+    /// Returns an iterator over (entity_id, entity) pairs
+    pub fn iter_entities(&self) -> impl Iterator<Item = (proto::EntityId, &E)> {
+        self.guard.order.iter().map(|entity| (entity.id(), entity))
+    }
+
+    /// Get the number of entities
+    pub fn len(&self) -> usize { self.guard.order.len() }
+
+    /// Check if the result set is empty
+    pub fn is_empty(&self) -> bool { self.guard.order.is_empty() }
+}
+
+impl<'a, E: AbstractEntity> Drop for ResultSetWrite<'a, E> {
+    fn drop(&mut self) {
+        // Send single notification via broadcast if changed
+        if self.changed {
+            // Drop the guard first to release the lock before broadcasting
+            drop(self.guard.take());
+            self.resultset.0.broadcast.send(());
+        }
+    }
+}
+
 impl<E: AbstractEntity> EntityResultSet<E> {
     pub fn from_vec(order: Vec<E>, loaded: bool) -> Self {
         let mut index = HashMap::new();
@@ -53,6 +140,26 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     pub fn empty() -> Self {
         let state = State { order: Vec::new(), index: HashMap::new() };
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(false), broadcast: Broadcast::new() }))
+    }
+    pub fn single(entity: E) -> Self {
+        let mut state = State { order: Vec::new(), index: HashMap::new() };
+        state.index.insert(entity.id(), 0);
+        state.order.push(entity);
+        Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(false), broadcast: Broadcast::new() }))
+    }
+
+    /// Begin a write operation for atomic changes to the resultset
+    /// All mutations happen through the returned write guard
+    /// A single notification is sent when the guard is dropped (if changes were made)
+    pub fn write(&self) -> ResultSetWrite<'_, E> {
+        let guard = self.0.state.lock().unwrap();
+        ResultSetWrite { resultset: self, changed: false, guard: Some(guard) }
+    }
+
+    /// Get a read guard for consistent read-only access to the resultset
+    pub fn read(&self) -> ResultSetRead<'_, E> {
+        let guard = self.0.state.lock().unwrap();
+        ResultSetRead { guard }
     }
     pub fn set_loaded(&self, loaded: bool) {
         self.0.loaded.store(loaded, Ordering::Relaxed);
@@ -279,5 +386,5 @@ impl Iterator for EntityResultSetKeyIterator {
 
 // Specific implementation for EntityResultSet<Entity> to provide map method
 impl EntityResultSet<Entity> {
-    pub fn map<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
+    pub fn wrap<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
 }

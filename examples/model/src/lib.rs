@@ -1,37 +1,49 @@
 use ankurah::Model;
-
-pub struct Album {
-    pub name: String,
-}
-
-// use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+// Control log generation on the server
 #[derive(Model, Debug, Serialize, Deserialize)]
-pub struct Entry {
-    pub added: String,
-    pub ip_address: String,
-    pub node_id: String,
-    pub complex: Complex,
+pub struct Flags {
+    pub name: String,
+    pub value: bool,
 }
 
 use ankurah::Property;
 #[cfg(feature = "wasm")]
 use tsify::Tsify;
+
 #[derive(Property, Serialize, Deserialize, Debug)]
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-pub struct Complex {
-    name: String,
-    value: i32,
-    thing: Thing,
+pub enum Level {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
 }
 
 #[derive(Property, Serialize, Deserialize, Debug)]
 #[cfg_attr(feature = "wasm", derive(Tsify))]
 #[cfg_attr(feature = "wasm", tsify(into_wasm_abi, from_wasm_abi))]
-pub enum Thing {
-    Alpha(String),
-    Bravo { b: String, c: i32 },
+pub enum Payload {
+    Text(String),
+    Json(serde_json::Value),
+}
+
+// Log entry structure
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct LogEntry {
+    #[active_type(LWW)]
+    pub timestamp: String, // ISO8601 timestamp
+    pub level: Level, // Log level enum
+    #[active_type(YrsString)]
+    pub message: String, // Log message
+    #[active_type(LWW)]
+    pub source: String, // Service/component name
+    #[active_type(LWW)]
+    pub node_id: String, // Which server generated it
+    pub payload: Payload, // Additional structured data
 }
 
 // #[derive(Serialize, Deserialize, Debug)]

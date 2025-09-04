@@ -47,25 +47,25 @@ impl PeerState {
 }
 
 pub struct MatchArgs {
-    pub predicate: ankql::ast::Predicate,
+    pub selection: ankql::ast::Selection,
     pub cached: bool,
 }
 
 impl TryInto<MatchArgs> for &str {
     type Error = ankql::error::ParseError;
     fn try_into(self) -> Result<MatchArgs, Self::Error> {
-        Ok(MatchArgs { predicate: ankql::parser::parse_selection(self)?, cached: false })
+        Ok(MatchArgs { selection: ankql::ast::Selection { predicate: ankql::parser::parse_selection(self)? }, cached: false })
     }
 }
 impl TryInto<MatchArgs> for String {
     type Error = ankql::error::ParseError;
     fn try_into(self) -> Result<MatchArgs, Self::Error> {
-        Ok(MatchArgs { predicate: ankql::parser::parse_selection(&self)?, cached: false })
+        Ok(MatchArgs { selection: ankql::ast::Selection { predicate: ankql::parser::parse_selection(&self)? }, cached: false })
     }
 }
 
 impl From<ankql::ast::Predicate> for MatchArgs {
-    fn from(val: ankql::ast::Predicate) -> Self { MatchArgs { predicate: val, cached: false } }
+    fn from(val: ankql::ast::Predicate) -> Self { MatchArgs { selection: ankql::ast::Selection { predicate: val }, cached: false } }
 }
 
 impl From<ankql::error::ParseError> for RetrievalError {
@@ -119,10 +119,12 @@ where PA: PolicyAgent
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
-    pub(crate) predicate_context: SafeMap<proto::PredicateId, PA::ContextData>,
+    pub(crate) predicate_context: SafeMap<proto::QueryId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
-    pub(crate) pending_predicate_subs: SafeMap<proto::PredicateId, tokio::sync::oneshot::Sender<Vec<Entity>>>,
+    // Maps PredicateId to (version, channel) - only one pending version per predicate at a time
+    pub(crate) pending_predicate_subs:
+        std::sync::Mutex<std::collections::HashMap<proto::QueryId, (u32, tokio::sync::oneshot::Sender<Vec<Entity>>)>>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
@@ -161,7 +163,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
-            pending_predicate_subs: SafeMap::new(),
+            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }));
 
         // Set up the message sender for the subscription relay
@@ -195,7 +197,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay: None,
-            pending_predicate_subs: SafeMap::new(),
+            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -386,10 +388,10 @@ where
                     tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
-            proto::NodeMessage::UnsubscribePredicate { from, predicate_id } => {
+            proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
                 // Remove predicate from the peer's subscription
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(predicate_id);
+                    peer_state.subscription_handler.remove_predicate(query_id)?;
                 }
             }
         }
@@ -410,13 +412,13 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::Fetch { collection, predicate } => {
+            proto::NodeRequestBody::Fetch { collection, mut selection } => {
                 self.policy_agent.can_access_collection(cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
-                let predicate = self.policy_agent.filter_predicate(cdata, &collection, predicate)?;
+                selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
 
                 let mut states = Vec::new();
-                for state in storage_collection.fetch_states(&predicate).await? {
+                for state in storage_collection.fetch_states(&selection.predicate).await? {
                     if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
                         states.push(state);
                     }
@@ -457,12 +459,12 @@ where
 
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
-            proto::NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
+            proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // only one cdata is permitted for SubscribePredicate
                 use itertools::Itertools;
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
-                peer_state.subscription_handler.add_predicate(self, predicate_id, collection, predicate, cdata).await
+                peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version).await
             }
         }
     }
@@ -473,7 +475,7 @@ where
         };
 
         match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { items, initialized_predicate } => {
+            proto::NodeUpdateBody::SubscriptionUpdate { items, initialized_query: initialized_predicate } => {
                 tracing::info!("Node({}) received subscription update from peer {}", self.id, notification.from);
                 crate::peer_subscription::UpdateApplier::apply_updates(self, &notification.from, items, initialized_predicate).await?;
                 Ok(())
@@ -563,7 +565,7 @@ where
     pub(crate) async fn fetch_from_peer<'a, C>(
         &self,
         collection_id: &CollectionId,
-        predicate: ankql::ast::Predicate,
+        selection: ankql::ast::Selection,
         cdata: &C,
     ) -> anyhow::Result<Vec<Attested<EntityState>>, RetrievalError>
     where
@@ -572,7 +574,7 @@ where
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self
-            .request(peer_id, cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), predicate })
+            .request(peer_id, cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection })
             .await
             .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
         {
@@ -649,10 +651,10 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub async fn request_remote_unsubscribe(&self, predicate_id: proto::PredicateId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
+    pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peer_connections.get_list(peers) {
             if let Some(connection) = item {
-                connection.send_message(proto::NodeMessage::UnsubscribePredicate { from: peer_id, predicate_id })?;
+                connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: peer_id, query_id })?;
             } else {
                 warn!("Peer {} not connected", peer_id);
             }
@@ -675,46 +677,114 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn subscribe_remote_predicate(
+    pub(crate) fn subscribe_remote_query(
         &self,
-        predicate_id: proto::PredicateId,
+        query_id: proto::QueryId,
         collection_id: CollectionId,
-        predicate: ankql::ast::Predicate,
+        selection: ankql::ast::Selection,
         cdata: PA::ContextData,
+        version: u32,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
         match self.subscription_relay {
             Some(ref relay) => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                self.predicate_context.insert(predicate_id, cdata.clone());
-                self.pending_predicate_subs.insert(predicate_id, tx);
-                relay.subscribe_predicate(predicate_id, collection_id, predicate, cdata);
+                self.predicate_context.insert(query_id, cdata.clone());
+                {
+                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
+                    pending_subs.insert(query_id, (version, tx));
+                }
+                relay.subscribe_query(query_id, collection_id, selection, cdata, version);
                 Some(rx)
             }
             None => None,
         }
     }
+
+    pub async fn fetch_entities_from_local(
+        &self,
+        collection_id: &CollectionId,
+        selection: &ankql::ast::Selection,
+    ) -> Result<Vec<Entity>, RetrievalError> {
+        let storage_collection = self.collections.get(collection_id).await?;
+        let initial_states = storage_collection.fetch_states(&selection.predicate).await?;
+        let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
+        let mut entities = Vec::with_capacity(initial_states.len());
+        for state in initial_states {
+            let (_, entity) =
+                self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+            entities.push(entity);
+        }
+        Ok(entities)
+    }
 }
+#[async_trait::async_trait]
 pub trait TNodeErased: Send + Sync + 'static {
-    fn unsubscribe_remote_predicate(&self, predicate_id: proto::PredicateId);
+    fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId);
+    fn update_remote_query(
+        &self,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection,
+        version: u32,
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>, anyhow::Error>;
+    async fn fetch_entities_from_local(
+        &self,
+        collection_id: &CollectionId,
+        selection: &ankql::ast::Selection,
+    ) -> Result<Vec<Entity>, RetrievalError>;
+    fn reactor(&self) -> &Reactor;
 }
 
+#[async_trait::async_trait]
 impl<SE, PA> TNodeErased for Node<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn unsubscribe_remote_predicate(&self, predicate_id: proto::PredicateId) {
+    fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId) {
         // Clean up subscription context
-        self.predicate_context.remove(&predicate_id);
+        self.predicate_context.remove(&query_id);
 
-        // Clean up any pending oneshot channel
-        self.pending_predicate_subs.remove(&predicate_id);
-
+        // Clean up any pending oneshot channel for this predicate
+        {
+            self.pending_predicate_subs.lock().unwrap().remove(&query_id);
+        }
         // Notify subscription relay for remote cleanup
         if let Some(ref relay) = self.subscription_relay {
-            relay.unsubscribe_predicate(predicate_id);
+            relay.unsubscribe_predicate(query_id);
         }
     }
+
+    fn update_remote_query(
+        &self,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection,
+        version: u32,
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>, anyhow::Error> {
+        match self.subscription_relay {
+            Some(ref relay) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                // no need to insert into predicate_context
+                {
+                    // update the version
+                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
+                    pending_subs.insert(query_id, (version, tx));
+                }
+                relay.update_query(query_id, selection, version)?;
+                Ok(Some(rx))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn fetch_entities_from_local(
+        &self,
+        collection_id: &CollectionId,
+        selection: &ankql::ast::Selection,
+    ) -> Result<Vec<Entity>, RetrievalError> {
+        Node::fetch_entities_from_local(self, collection_id, selection).await
+    }
+
+    fn reactor(&self) -> &Reactor { &self.0.reactor }
 }
 
 impl<SE, PA> fmt::Display for Node<SE, PA>

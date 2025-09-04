@@ -18,24 +18,34 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     };
     let active_field_name_strs = model.active_field_name_strs();
 
-    let hygeine_module = quote::format_ident!("__ankurah_derive_view_impl_{}", view_name);
-    let (use_statements, struct_attributes, impl_attributes, getter_attributes) = if cfg!(feature = "wasm") {
+    let (struct_attributes, impl_attributes, getter_attributes, wasm_edit_impl) = if cfg!(feature = "wasm") {
         (
-            quote! {
-                use ::ankurah::derive_deps::wasm_bindgen::prelude::*;
-            },
             quote! { #[wasm_bindgen] },
             quote! { #[wasm_bindgen] },
             quote! { #[wasm_bindgen(getter)] },
+            quote! {
+                #[wasm_bindgen]
+                impl #view_name {
+                    /// Edit this entity in a transaction (WASM version - returns owned Mutable)
+                    #[wasm_bindgen(js_name = "edit")]
+                    pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
+                        use ::ankurah::model::View;
+                        match trx.edit::<#name>(&self.entity) {
+                            Ok(mutable_borrow) => {
+                                // Extract the core mutable from the borrow wrapper
+                                Ok(mutable_borrow.into_core())
+                            }
+                            Err(e) => Err(::wasm_bindgen::JsValue::from(e.to_string()))
+                        }
+                    }
+                }
+            },
         )
     } else {
         (quote! {}, quote! {}, quote! {}, quote! {})
     };
 
-    quote! {
-        mod #hygeine_module {
-            use super::*;
-            #use_statements
+    let expanded = quote! {
 
             #struct_attributes
             #[derive(Clone, Debug, PartialEq)]
@@ -48,7 +58,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
 
             impl ::ankurah::model::View for #view_name {
                 type Model = #name;
-                type Mutable<'rec> = #mutable_name<'rec>;
+                type Mutable = #mutable_name;
 
                 // THINK ABOUT: to_model is the only thing that forces a clone requirement
                 // Even though most Models will be clonable, maybe we shouldn't force it?
@@ -94,17 +104,20 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
             }
 
-            // TODO wasm-bindgen this
             impl #view_name {
-                pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::policy::AccessDenied> {
+                /// Edit this entity in a transaction (Rust version - returns MutableBorrow with lifetime)
+                pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<::ankurah::model::MutableBorrow<'rec, #mutable_name>, ankurah::policy::AccessDenied> {
                     use ::ankurah::model::View;
                     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                     trx.edit::<#name>(&self.entity)
                 }
             }
 
+            #wasm_edit_impl
+
             #impl_attributes
             impl #view_name {
+                #getter_attributes
                 pub fn id(&self) -> ankurah::proto::EntityId {
                     self.entity.id().clone()
                 }
@@ -128,7 +141,6 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     self.entity.id()
                 }
             }
-        }
-        pub use #hygeine_module::*;
-    }
+    };
+    expanded.into()
 }

@@ -15,6 +15,7 @@ wasm = [
     "serde-wasm-bindgen",
     "js-sys",
     "ankurah-proto/wasm",
+    "ankurah-derive",
 ]
 default = []
 instrument = []

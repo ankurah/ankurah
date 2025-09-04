@@ -27,6 +27,8 @@ pub enum PropertyError {
     InvalidVariant { given: PropertyValue, ty: String },
     #[error("invalid value `{value}` for `{ty}`")]
     InvalidValue { value: String, ty: String },
+    #[error("transaction is no longer alive")]
+    TransactionClosed,
 }
 
 impl PartialEq for PropertyError {

@@ -232,7 +232,7 @@ impl StorageCollection for SledStorageCollection {
     }
 }
 
-enum SledRetrievalError {
+pub enum SledRetrievalError {
     StorageError(sled::Error),
     EntityNotFound(EntityId),
     EventNotFound(EventId),
