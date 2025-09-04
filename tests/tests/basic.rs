@@ -1,5 +1,6 @@
 #![cfg(feature = "postgres")]
 mod common;
+use ankurah::changes::ChangeKind;
 use anyhow::Result;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
@@ -100,6 +101,52 @@ async fn test_sled() -> Result<()> {
 
     assert_eq!(view_watcher.take_one().await, (album.clone(), "The rest of the owl".to_owned(), "2025".to_owned())); // AlbumView changed
     assert_eq!(render_watcher.take_one().await, "name: The rest of the owl, year: 2025");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_predicate_update() -> Result<()> {
+    use common::*;
+
+    let storage_engine = SledStorageEngine::new_test()?;
+    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+
+    // Initialize the node's system catalog
+    node.system.create().await?;
+
+    // Get context after system is ready
+    let context = node.context_async(c).await;
+
+    // Create some test albums
+    let trx = context.begin();
+    let a_id = trx.create(&Album { name: "Alpha".to_owned(), year: "2020".to_owned() }).await?.id();
+    let b_id = trx.create(&Album { name: "Bravo".to_owned(), year: "2021".to_owned() }).await?.id();
+    let c_id = trx.create(&Album { name: "Charlie".to_owned(), year: "2022".to_owned() }).await?.id();
+    trx.commit().await?;
+
+    let albums = context.query_wait::<AlbumView>("year > 2020").await?;
+
+    let watcher = TestWatcher::changeset();
+    let _guard = albums.subscribe(&watcher);
+
+    assert_eq!(albums.ids(), vec![b_id, c_id]); // Should have Bravo, Charlie
+    assert_eq!(watcher.quiesce().await, 0); // no changes yet
+
+    // Update the predicate to be more restrictive: year > 2021 - Should remove Bravo
+    albums.update_predicate_wait("year > 2021").await?;
+
+    assert_eq!(albums.ids(), vec![c_id]); // Should now have only 1 album (Charlie)
+    assert_eq!(watcher.take_one().await, vec![(b_id, ChangeKind::Remove)]);
+
+    // Update predicate to be less restrictive: year >= "2020"
+    albums.update_predicate_wait("year >= 2020").await?;
+
+    assert_eq!(albums.ids(), vec![a_id, b_id, c_id]); // Should now have all 3 albums
+    assert_eq!(watcher.take_one().await, vec![(a_id, ChangeKind::Add), (b_id, ChangeKind::Add)]);
+
+    // should have no more changes
+    assert_eq!(watcher.quiesce().await, 0);
 
     Ok(())
 }

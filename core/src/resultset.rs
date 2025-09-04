@@ -342,5 +342,5 @@ impl Iterator for EntityResultSetKeyIterator {
 
 // Specific implementation for EntityResultSet<Entity> to provide map method
 impl EntityResultSet<Entity> {
-    pub fn map<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
+    pub fn wrap<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
 }

@@ -123,7 +123,7 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 
                 self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
                     // The ChangeSet already contains a ResultSet<View>, just wrap it
-                    let resultset = #resultset_name(changeset.resultset.map());
+                    let resultset = #resultset_name(changeset.resultset.wrap());
 
                     let _ = callback.call1(
                         &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,

@@ -244,12 +244,12 @@ impl<R: View> Signal for LiveQuery<R> {
 
 // Implement Get trait - delegate to ResultSet<R>
 impl<R: View + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
-    fn get(&self) -> Vec<R> { self.0 .0.resultset.map::<R>().get() }
+    fn get(&self) -> Vec<R> { self.0 .0.resultset.wrap::<R>().get() }
 }
 
 // Implement Peek trait - delegate to ResultSet<R>
 impl<R: View + Clone + 'static> Peek<Vec<R>> for LiveQuery<R> {
-    fn peek(&self) -> Vec<R> { self.0 .0.resultset.map().peek() }
+    fn peek(&self) -> Vec<R> { self.0 .0.resultset.wrap().peek() }
 }
 
 // Implement Subscribe trait - convert ReactorUpdate to ChangeSet<R>
@@ -265,7 +265,7 @@ where R: Clone + Send + Sync + 'static
 
         self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
             // Convert ReactorUpdate to ChangeSet<R>
-            let changeset: ChangeSet<R> = livequery_change_set_from(me.0 .0.resultset.map::<R>(), reactor_update);
+            let changeset: ChangeSet<R> = livequery_change_set_from(me.0 .0.resultset.wrap::<R>(), reactor_update);
             listener(changeset);
         })
     }
