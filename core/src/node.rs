@@ -122,6 +122,7 @@ where PA: PolicyAgent
     pub(crate) predicate_context: SafeMap<proto::PredicateId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
+    // TODO: Change to SafeMap<(proto::PredicateId, u32), ...> to track version
     pub(crate) pending_predicate_subs: SafeMap<proto::PredicateId, tokio::sync::oneshot::Sender<Vec<Entity>>>,
 
     /// The reactor for handling subscriptions
@@ -457,12 +458,12 @@ where
 
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
-            proto::NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
+            proto::NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate, version } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // only one cdata is permitted for SubscribePredicate
                 use itertools::Itertools;
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
-                peer_state.subscription_handler.add_predicate(self, predicate_id, collection, predicate, cdata).await
+                peer_state.subscription_handler.add_predicate(self, predicate_id, collection, predicate, cdata, version).await
             }
         }
     }
@@ -681,12 +682,14 @@ where
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         cdata: PA::ContextData,
+        version: u32,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
         match self.subscription_relay {
             Some(ref relay) => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.predicate_context.insert(predicate_id, cdata.clone());
                 self.pending_predicate_subs.insert(predicate_id, tx);
+                // TODO: Pass version to subscribe_predicate
                 relay.subscribe_predicate(predicate_id, collection_id, predicate, cdata);
                 Some(rx)
             }

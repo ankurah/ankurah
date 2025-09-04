@@ -192,6 +192,10 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
     }
 
     /// Add a predicate to a subscription
+    // TODO: REMOVE this method - merge into set_predicate
+    // This method creates an inactive predicate (initialized=false) that is completely
+    // ignored by notify_change until initialize() is called
+    // The predicate does nothing of consequence until initialized
     pub fn add_predicate(
         &self,
         subscription_id: ReactorSubscriptionId,
@@ -338,12 +342,20 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
 impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
     /// Initialize a specific predicate by performing initial evaluation
     /// This is async and does the initial fetch and evaluation
+    /// TODO: RENAME to set_predicate and merge add_predicate functionality
+    /// This should be the ONLY method for setting/updating predicates
     pub fn initialize(
         &self,
         subscription_id: ReactorSubscriptionId,
         predicate_id: proto::PredicateId,
-        initial_entities: Vec<E>,
+        initial_entities: Vec<E>, // TODO: Rename to included_entities (not necessarily "initial")
+                                  // TODO: Add collection_id: proto::CollectionId parameter (from add_predicate)
+                                  // TODO: Add predicate: ankql::ast::Predicate parameter (ALWAYS needed)
+                                  // TODO: Add version: u32 parameter
     ) -> anyhow::Result<()> {
+        // TODO: Check if predicate already exists for this predicate_id
+        // If it exists, this is an update - store the old resultset for diff computation
+        // If it doesn't exist, this is initial subscription - old resultset is empty
         let predicate = {
             let subscriptions = self.0.subscriptions.lock().unwrap();
             let subscription =
@@ -353,9 +365,16 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
             predicate_state.predicate.clone()
         };
 
+        // TODO: When predicate already exists (update case):
+        // 1. Save the old matching entity IDs before any changes
+        // 2. The initial_entities parameter contains only NEW entities from remote
+        //    that match the new predicate but weren't known before
+        // 3. We need to re-evaluate ALL existing entities against the new predicate
         let mut matching_entities = Vec::new();
         let mut reactor_update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
+        // TODO: This loop should only process truly new entities (not in old resultset)
+        // For updates, these are entities the remote found that match new but not old predicate
         for entity in initial_entities {
             if ankql::selection::filter::evaluate_predicate(&entity, &predicate).unwrap_or(false) {
                 matching_entities.push(entity);
@@ -389,13 +408,39 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                     });
                 }
                 if let Some(pred_state) = subscription.predicates.get_mut(&predicate_id) {
-                    // Clear existing matching entities and populate with new ones
+                    // TODO: DO NOT use replace_all!
+                    // Instead:
+                    // 1. Add new matching_entities to resultset (from initial_entities param)
+                    // 2. Re-evaluate each entity currently in resultset against new predicate
+                    // 3. Remove entities that no longer match new predicate
+                    // 4. Track all changes for the ReactorUpdate (Add/Remove/Initial)
+                    // 5. Update the predicate AST to the new one
+
+                    // TEMPORARY: Current code assumes initial subscription only
                     tracing::info!(
                         "INITIALIZE predicate resultset.replace_all {} matching_entities.len(): {} len: {}",
                         predicate_id,
                         matching_entities.len(),
                         pred_state.resultset.len()
                     );
+                    // TODO: Use ResultSetBatch to apply diffs atomically
+                    // let mut batch = pred_state.resultset.batch();
+                    // for entity in matching_entities {
+                    //     if !pred_state.resultset.contains_key(&entity.id()) {
+                    //         batch.add(entity);  // NEW match
+                    //     }
+                    // }
+                    // for old_id in pred_state.resultset.keys() {
+                    //     if !matching_entities.iter().any(|e| e.id() == old_id) {
+                    //         batch.remove(old_id);  // No longer matches
+                    //     }
+                    // }
+                    // drop(batch);  // Triggers single notification
+                    // Do NOT use replace_all
+                    //
+                    // TODO: Consider optimization: Could use HashSet for O(1) lookups instead of O(n) scans
+                    // Note: Can't use lexicographic zip since resultsets maintain insertion order,
+                    // not EntityId order (and may later support custom sort orders)
                     pred_state.resultset.replace_all(matching_entities);
                     pred_state.initialized = true;
                     pred_state.resultset.set_loaded(true);
@@ -403,7 +448,9 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
             }
         }
 
-        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items, initialized_predicate: Some(predicate_id) };
+        // TODO: Track version number properly - should be passed as parameter
+        // For now using 0 for initial, but this should come from the version parameter
+        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items, initialized_predicate: Some((predicate_id, 0)) };
 
         // Notify the subscription
         {

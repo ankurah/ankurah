@@ -41,6 +41,10 @@ struct Inner {
     pub(crate) error: std::sync::Mutex<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
     pub(crate) is_initialized: std::sync::atomic::AtomicBool,
+    // Version tracking for predicate updates
+    pub(crate) current_version: std::sync::atomic::AtomicU32,
+    // TODO: Is the predicate pending in a version 0 case? I think it might be
+    pub(crate) pending_predicate: std::sync::Mutex<Option<(ankql::ast::Predicate, u32)>>,
 }
 
 #[derive(Clone)]
@@ -63,8 +67,12 @@ impl EntityLiveQuery {
         let subscription = node.reactor.subscribe();
 
         let predicate_id = proto::PredicateId::new();
+        // TODO: Remove this add_predicate call once it's merged into initialize/set_predicate
+        // The predicate should be added atomically with its initial entities
         let resultset = subscription.add_predicate(predicate_id, &collection_id, args.predicate.clone())?;
-        let rx = node.subscribe_remote_predicate(predicate_id, collection_id.clone(), args.predicate.clone(), cdata);
+        // TODO: For version 0, predicate is still "pending" on the reactor until we call initialize
+        // The reactor doesn't actually apply the predicate until initialize is called with entities
+        let rx = node.subscribe_remote_predicate(predicate_id, collection_id.clone(), args.predicate.clone(), cdata, 0);
 
         let me = Self(Arc::new(Inner {
             predicate_id,
@@ -76,6 +84,9 @@ impl EntityLiveQuery {
             error: std::sync::Mutex::new(None),
             initialized: tokio::sync::Notify::new(),
             is_initialized: std::sync::atomic::AtomicBool::new(false),
+            current_version: std::sync::atomic::AtomicU32::new(0),
+            // TODO: Even for version 0, predicate is "pending" until remote confirms (unless cached:true)
+            pending_predicate: std::sync::Mutex::new(None),
         }));
 
         let me2 = me.clone();
@@ -127,6 +138,10 @@ impl EntityLiveQuery {
         let storage_collection = node.collections.get(&collection_id).await?;
 
         // Get initial entities from remote or local storage
+        // TODO: This logic applies to both version 0 and updates:
+        // - cached:false + rx present = wait for remote (predicate is pending)
+        // - cached:true = use local immediately (predicate activates immediately)
+        // - no rx (durable node) = use local (predicate activates immediately)
         let initial_entities = match rx {
             Some(rx) if !args.cached => match rx.await {
                 Ok(entities) => entities,
@@ -183,6 +198,32 @@ impl<R: View> LiveQuery<R> {
     pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.map::<R>() }
 
     pub fn loaded(&self) -> bool { self.0 .0.resultset.is_loaded() }
+
+    /// Update the predicate for this query
+    pub fn update_predicate(&self, new_predicate: ankql::ast::Predicate) -> Result<(), RetrievalError> {
+        // TODO: Implement update_predicate with unified approach
+        // 1. Increment current_version atomically and get the new version number
+        // 2. Set is_initialized to false (query results are stale until update completes)
+        // 3. Store new predicate and version in pending_predicate mutex
+        // 4. Check if node has subscription_relay (ephemeral) or not (durable):
+        //    - Ephemeral: Call node.subscribe_remote_predicate with new predicate and version
+        //                 This returns a new rx channel for the update response
+        //                 Spawn task to wait for response and then update local reactor
+        //    - Durable: Directly call reactor.initialize with new predicate and version
+        //               The reactor will handle the diff computation locally
+        // 5. The reactor's initialize method (renamed to set_predicate) will:
+        //    - Detect this is an update (predicate already exists)
+        //    - Compute diff between old and new matching entities
+        //    - Send appropriate Add/Remove changes
+        unimplemented!("TODO: Implement update_predicate")
+    }
+
+    /// Update predicate and wait for initialization
+    pub async fn update_predicate_wait(&self, new_predicate: ankql::ast::Predicate) -> Result<(), RetrievalError> {
+        self.update_predicate(new_predicate)?;
+        self.wait_initialized().await;
+        Ok(())
+    }
 }
 
 // Implement Signal trait - delegate to the resultset

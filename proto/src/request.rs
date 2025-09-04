@@ -39,7 +39,7 @@ pub enum NodeRequestBody {
     Get { collection: CollectionId, ids: Vec<EntityId> },
     GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
     Fetch { collection: CollectionId, predicate: ast::Predicate },
-    SubscribePredicate { predicate_id: PredicateId, collection: CollectionId, predicate: ast::Predicate },
+    SubscribePredicate { predicate_id: PredicateId, collection: CollectionId, predicate: ast::Predicate, version: u32 },
 }
 
 /// A response from one node to another
@@ -90,8 +90,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::Fetch { collection, predicate } => {
                 write!(f, "Fetch {collection} {predicate}")
             }
-            NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
-                write!(f, "Subscribe {predicate_id} {collection} {predicate}")
+            NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate, version } => {
+                write!(f, "Subscribe {predicate_id} {collection} {predicate} v{version}")
             }
         }
     }

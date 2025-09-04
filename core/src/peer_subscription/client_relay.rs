@@ -12,8 +12,8 @@ use crate::util::safeset::SafeSet;
 #[derive(Debug, Clone)]
 pub enum Status {
     PendingRemote,
-    Requested(proto::EntityId),
-    Established(proto::EntityId),
+    Requested(proto::EntityId, u32),   // peer_id, version
+    Established(proto::EntityId, u32), // peer_id, version
     /// Non-retryable
     Failed,
 }
@@ -24,6 +24,7 @@ pub struct Content<CD: ContextData> {
     pub collection_id: CollectionId,
     pub predicate: ankql::ast::Predicate,
     pub context_data: CD,
+    pub version: u32,
 }
 
 pub struct SubscriptionState<CD: ContextData> {
@@ -112,7 +113,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
                 predicate_id,
                 SubscriptionState {
-                    content: Arc::new(Content { collection_id, predicate, context_data, predicate_id }),
+                    content: Arc::new(Content { collection_id, predicate, context_data, predicate_id, version: 0 }),
                     status: Status::PendingRemote,
                     last_error: None,
                 },
@@ -136,7 +137,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         {
             let mut subscriptions = self.inner.subscriptions.lock().unwrap();
             if let Some(info) = subscriptions.remove(&predicate_id) {
-                if let Status::Established(peer_id) = &info.status {
+                if let Status::Established(peer_id, _version) = &info.status {
                     let sender = self.inner.message_sender.get();
                     if let Some(sender) = sender {
                         let sender = sender.clone();
@@ -177,7 +178,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         self.inner.connected_peers.remove(&peer_id);
 
         for info in self.inner.subscriptions.lock().expect("poisoned lock").values_mut() {
-            if let Status::Established(established_peer_id) | Status::Requested(established_peer_id) = &info.status {
+            if let Status::Established(established_peer_id, _) | Status::Requested(established_peer_id, _) = &info.status {
                 if *established_peer_id == peer_id {
                     // Update state to pending
                     info.status = Status::PendingRemote;
@@ -218,7 +219,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
 
         for (_, state) in subscriptions.iter() {
             match &state.status {
-                Status::Established(established_peer) | Status::Requested(established_peer) => {
+                Status::Established(established_peer, _) | Status::Requested(established_peer, _) => {
                     if established_peer == peer_id {
                         contexts.insert(state.content.context_data.clone());
                     }
@@ -258,7 +259,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                 .values_mut()
                 .filter_map(|info| {
                     if let Status::PendingRemote = info.status {
-                        info.status = Status::Requested(target_peer);
+                        info.status = Status::Requested(target_peer, info.content.version);
                         Some(info.content.clone())
                     } else {
                         None
@@ -284,12 +285,13 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         let collection_id = content.collection_id.clone();
         let predicate = content.predicate.clone();
         let context_data = content.context_data.clone();
-        match sender.peer_subscribe(target_peer, predicate_id, collection_id, predicate, &context_data).await {
+        let version = content.version;
+        match sender.peer_subscribe(target_peer, predicate_id, collection_id, predicate, &context_data, version).await {
             Ok(()) => {
                 // Mark as established - update the state while preserving existing data
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap();
                 if let Some(info) = subscriptions.get_mut(&predicate_id) {
-                    info.status = Status::Established(target_peer);
+                    info.status = Status::Established(target_peer, version);
                 }
 
                 debug!("Successfully registered predicate {} on peer {} subscription", predicate_id, target_peer);
@@ -342,6 +344,7 @@ pub trait MessageSender<CD: ContextData>: Send + Sync {
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: &CD,
+        version: u32,
     ) -> Result<(), RequestError>;
 
     /// Send a predicate unregistration message to a remote peer
@@ -363,6 +366,7 @@ where
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: &PA::ContextData,
+        version: u32,
     ) -> Result<(), RequestError> {
         let node = self.upgrade().ok_or(RequestError::InternalChannelClosed)?;
 
@@ -370,7 +374,7 @@ where
             .request(
                 peer_id,
                 context_data,
-                ankurah_proto::NodeRequestBody::SubscribePredicate { predicate_id, collection: collection_id, predicate },
+                ankurah_proto::NodeRequestBody::SubscribePredicate { predicate_id, collection: collection_id, predicate, version },
             )
             .await?
         {
@@ -445,6 +449,7 @@ mod tests {
             collection_id: CollectionId,
             predicate: Predicate,
             _context_data: &CD,
+            _version: u32,
         ) -> Result<(), RequestError> {
             self.sent_requests.lock().unwrap().push((peer_id, predicate_id, collection_id.clone(), predicate.clone()));
 

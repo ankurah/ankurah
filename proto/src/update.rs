@@ -8,7 +8,7 @@ pub struct UpdateId(Ulid);
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeUpdateBody {
     /// New events for a subscription
-    SubscriptionUpdate { items: Vec<SubscriptionUpdateItem>, initialized_predicate: Option<PredicateId> },
+    SubscriptionUpdate { items: Vec<SubscriptionUpdateItem>, initialized_predicate: Option<(PredicateId, u32)> },
 }
 
 /// Content of an update - either state, events, or both

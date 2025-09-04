@@ -41,6 +41,42 @@ struct State<E: AbstractEntity> {
 }
 // TODO - figure out how to maintain ordering of entities
 
+/// A batch operation for making atomic changes to a ResultSet
+/// Holds the mutex guard to ensure all changes happen atomically
+/// Sends a single notification when dropped (if any changes were made)
+pub struct ResultSetBatch<'a, E: AbstractEntity = Entity> {
+    resultset: &'a EntityResultSet<E>,
+    // TODO: Track if any changes were made
+    // changed: bool,
+    // TODO: Hold the mutex guard for direct mutation of the state
+    // guard: std::sync::MutexGuard<'a, State<E>>,
+}
+
+impl<'a, E: AbstractEntity> ResultSetBatch<'a, E> {
+    // TODO: Implement methods that directly mutate the state through the guard
+    // pub fn add(&mut self, entity: E) {
+    //     self.guard.order.push(entity);
+    //     self.guard.index.insert(...);
+    //     self.changed = true;
+    // }
+    // pub fn remove(&mut self, id: proto::EntityId) {
+    //     if let Some(idx) = self.guard.index.remove(&id) {
+    //         self.guard.order.remove(idx);
+    //         fix_from(&mut self.guard, idx);
+    //         self.changed = true;
+    //     }
+    // }
+    // pub fn add_all(&mut self, entities: Vec<E>) { ... }
+    // pub fn remove_all(&mut self, ids: Vec<proto::EntityId>) { ... }
+}
+
+impl<'a, E: AbstractEntity> Drop for ResultSetBatch<'a, E> {
+    fn drop(&mut self) {
+        // TODO Send single notification via broadcast if changed
+        unimplemented!("TODO: Implement ResultSetBatch::drop - conditionally notify")
+    }
+}
+
 impl<E: AbstractEntity> EntityResultSet<E> {
     pub fn from_vec(order: Vec<E>, loaded: bool) -> Self {
         let mut index = HashMap::new();
@@ -53,6 +89,15 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     pub fn empty() -> Self {
         let state = State { order: Vec::new(), index: HashMap::new() };
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(false), broadcast: Broadcast::new() }))
+    }
+
+    /// Begin a batch operation for atomic changes to the resultset
+    /// All mutations happen through the returned batch object
+    /// A single notification is sent when the batch is dropped (if changes were made)
+    pub fn batch(&self) -> ResultSetBatch<E> {
+        // TODO: Acquire mutex guard and create batch
+        // The batch will hold the guard until dropped, ensuring atomicity
+        unimplemented!("TODO: Implement EntityResultSet::batch")
     }
     pub fn set_loaded(&self, loaded: bool) {
         self.0.loaded.store(loaded, Ordering::Relaxed);

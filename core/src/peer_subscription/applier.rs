@@ -12,7 +12,7 @@ impl UpdateApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-        initialized_predicate: Option<proto::PredicateId>,
+        initialized_predicate: Option<(proto::PredicateId, u32)>,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -30,7 +30,16 @@ impl UpdateApplier {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
         }
 
-        if let Some(tx) = initialized_predicate.and_then(|p| node.pending_predicate_subs.remove(&p)) {
+        // OLD: if let Some(tx) = initialized_predicate.and_then(|p| node.pending_predicate_subs.remove(&p)) {
+        //
+        // TODO: Change pending_predicate_subs to SafeMap<(PredicateId, u32), ...>
+        // Then simply check if we have a pending sub for this exact (predicate_id, version) pair
+        // If we do, resolve it. If not, ignore (could be old version or unexpected)
+
+        // For now, extract just the predicate_id for compatibility
+        let predicate_id_only = initialized_predicate.map(|(id, _version)| id);
+
+        if let Some(tx) = predicate_id_only.and_then(|p| node.pending_predicate_subs.remove(&p)) {
             let mut changes = Vec::new();
             let mut entities = Vec::new();
             for update in items {

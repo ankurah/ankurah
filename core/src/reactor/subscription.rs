@@ -54,6 +54,8 @@ impl<E: AbstractEntity, Ev: Clone> ReactorSubscription<E, Ev> {
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
     /// Add a predicate to this subscription
+    // TODO: REMOVE this method - predicates should ONLY be added via set_predicate
+    // This creates an inactive predicate that does nothing until initialize() is called
     pub fn add_predicate(
         &self,
         predicate_id: proto::PredicateId,
