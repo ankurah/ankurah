@@ -107,13 +107,14 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         context_data: CD,
+        version: u32,
     ) {
         debug!("SubscriptionRelay.subscribe_predicate() - New predicate {} needs remote registration", predicate_id);
         {
             self.inner.subscriptions.lock().expect("poisoned lock").insert(
                 predicate_id,
                 SubscriptionState {
-                    content: Arc::new(Content { collection_id, predicate, context_data, predicate_id, version: 0 }),
+                    content: Arc::new(Content { collection_id, predicate, context_data, predicate_id, version }),
                     status: Status::PendingRemote,
                     last_error: None,
                 },
@@ -500,7 +501,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Notify of new subscription
-        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
 
         // Check initial state - subscription should immediately go to Requested state since peer is connected
         assert!(matches!(relay.get_status(predicate_id), Some(Status::Requested(_, _))));
@@ -536,7 +537,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Setup established subscription by going through the full flow
-        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone(), 0);
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -564,7 +565,7 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add pending subscription (no peers connected yet)
-        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
         assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
 
         // Clear any previous requests
@@ -601,7 +602,7 @@ mod tests {
 
         // Connect peer and add subscription (should succeed initially)
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -649,8 +650,8 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add subscriptions
-        relay.subscribe_predicate(retryable_predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
-        relay.subscribe_predicate(non_retryable_predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(retryable_predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
+        relay.subscribe_predicate(non_retryable_predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
 
         // Manually set different failure types - retryable goes back to pending, non-retryable stays failed
         {
@@ -694,7 +695,7 @@ mod tests {
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone(), 0);
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -733,7 +734,7 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Test setup without message sender - should not crash
-        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
@@ -771,7 +772,7 @@ mod tests {
         let predicate = create_test_predicate();
 
         // Add subscription but don't establish it
-        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone());
+        relay.subscribe_predicate(predicate_id, collection_id.clone(), predicate, collection_id.clone(), 0);
         assert!(matches!(relay.get_status(predicate_id), Some(Status::PendingRemote)));
 
         // Unsubscribe from pending subscription

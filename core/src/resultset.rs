@@ -46,34 +46,53 @@ struct State<E: AbstractEntity> {
 /// Sends a single notification when dropped (if any changes were made)
 pub struct ResultSetBatch<'a, E: AbstractEntity = Entity> {
     resultset: &'a EntityResultSet<E>,
-    // TODO: Track if any changes were made
-    // changed: bool,
-    // TODO: Hold the mutex guard for direct mutation of the state
-    // guard: std::sync::MutexGuard<'a, State<E>>,
+    changed: bool,
+    guard: Option<std::sync::MutexGuard<'a, State<E>>>,
 }
 
+// TODO - build unit tests for this
 impl<'a, E: AbstractEntity> ResultSetBatch<'a, E> {
-    // TODO: Implement methods that directly mutate the state through the guard
-    // pub fn add(&mut self, entity: E) {
-    //     self.guard.order.push(entity);
-    //     self.guard.index.insert(...);
-    //     self.changed = true;
-    // }
-    // pub fn remove(&mut self, id: proto::EntityId) {
-    //     if let Some(idx) = self.guard.index.remove(&id) {
-    //         self.guard.order.remove(idx);
-    //         fix_from(&mut self.guard, idx);
-    //         self.changed = true;
-    //     }
-    // }
-    // pub fn add_all(&mut self, entities: Vec<E>) { ... }
-    // pub fn remove_all(&mut self, ids: Vec<proto::EntityId>) { ... }
+    /// Add an entity to the result set
+    pub fn add(&mut self, entity: E) -> bool {
+        let guard = self.guard.as_mut().expect("batch already dropped");
+        let id = entity.id();
+        if guard.index.contains_key(&id) {
+            return false; // Already present
+        }
+        let pos = guard.order.len();
+        guard.order.push(entity);
+        guard.index.insert(id, pos);
+        self.changed = true;
+        true
+    }
+
+    /// Remove an entity from the result set
+    pub fn remove(&mut self, id: proto::EntityId) -> bool {
+        let guard = self.guard.as_mut().expect("batch already dropped");
+        if let Some(idx) = guard.index.remove(&id) {
+            guard.order.remove(idx);
+            if idx < guard.order.len() {
+                fix_from(guard, idx);
+            }
+            self.changed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if an entity exists
+    pub fn contains(&self, id: &proto::EntityId) -> bool { self.guard.as_ref().expect("batch already dropped").index.contains_key(id) }
 }
 
 impl<'a, E: AbstractEntity> Drop for ResultSetBatch<'a, E> {
     fn drop(&mut self) {
-        // TODO Send single notification via broadcast if changed
-        unimplemented!("TODO: Implement ResultSetBatch::drop - conditionally notify")
+        // Send single notification via broadcast if changed
+        if self.changed {
+            // Drop the guard first to release the lock before broadcasting
+            drop(self.guard.take());
+            self.resultset.0.broadcast.send(());
+        }
     }
 }
 
@@ -95,9 +114,8 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     /// All mutations happen through the returned batch object
     /// A single notification is sent when the batch is dropped (if changes were made)
     pub fn batch(&self) -> ResultSetBatch<E> {
-        // TODO: Acquire mutex guard and create batch
-        // The batch will hold the guard until dropped, ensuring atomicity
-        unimplemented!("TODO: Implement EntityResultSet::batch")
+        let guard = self.0.state.lock().unwrap();
+        ResultSetBatch { resultset: self, changed: false, guard: Some(guard) }
     }
     pub fn set_loaded(&self, loaded: bool) {
         self.0.loaded.store(loaded, Ordering::Relaxed);
