@@ -23,9 +23,9 @@ pub enum Visibility {
 pub struct Video {
     #[active_type(YrsString)]
     pub title: String,
-    #[active_type(YrsString<_>)]
+    #[active_type(YrsString)]
     pub description: Option<String>,
-    #[active_type(LWW<_>)]
+    #[active_type(LWW)]
     pub visibility: Visibility,
     /*#[active_type(PNCounter)]
     pub views: i32,*/
@@ -52,8 +52,8 @@ async fn property_backends() -> Result<()> {
 
     let id = cat_video.id();
     //cat_video.views.add(2); // FIXME: applying twice for some reason
-    cat_video.visibility.set(&Visibility::Unlisted)?;
-    cat_video.title.insert(15, " (Very cute)")?;
+    cat_video.visibility().set(&Visibility::Unlisted)?;
+    cat_video.title().insert(15, " (Very cute)")?;
     trx.commit().await?;
 
     let video = ctx.get::<VideoView>(id).await?;
@@ -100,8 +100,8 @@ async fn pg_property_backends() -> Result<()> {
 
     let id = cat_video.id();
     //cat_video.views.add(2); // FIXME: applying twice for some reason
-    cat_video.visibility.set(&Visibility::Unlisted)?;
-    cat_video.title.insert(15, " (Very cute)")?;
+    cat_video.visibility().set(&Visibility::Unlisted)?;
+    cat_video.title().insert(15, " (Very cute)")?;
     trx.commit().await?;
 
     let video = ctx.get::<VideoView>(id).await?;

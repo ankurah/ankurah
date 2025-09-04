@@ -5,6 +5,7 @@ mod property;
 mod tsify;
 #[cfg(feature = "wasm")]
 mod wasm_signal;
+mod wrapper_macros;
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -20,6 +21,13 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
+    let wasm_imports = if cfg!(feature = "wasm") {
+        quote! { use ::ankurah::derive_deps::wasm_bindgen::prelude::*; }
+    } else {
+        quote! {}
+    };
+
     // Generate implementations using the modular approach
     let model_impl = model::model::model_impl(&desc);
     let view_impl = model::view::view_impl(&desc);
@@ -30,13 +38,34 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let wasm_impl = quote! {};
 
     let expanded = quote! {
-        #model_impl
-        #view_impl
-        #mutable_impl
-        #wasm_impl
+        mod #hygiene_module {
+            use super::*;
+            #wasm_imports
+
+            #model_impl
+            #view_impl
+            #mutable_impl
+            #wasm_impl
+        }
+        pub use #hygiene_module::*;
     };
 
     expanded.into()
+}
+
+/// Convert a PascalCase identifier to snake_case
+fn to_snake_case(ident: &str) -> String {
+    ident
+        .chars()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            if c.is_uppercase() && i > 0 {
+                vec!['_', c.to_lowercase().next().unwrap()]
+            } else {
+                vec![c.to_lowercase().next().unwrap()]
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "wasm")]
@@ -132,3 +161,35 @@ pub fn fetch(input: TokenStream) -> TokenStream { predicate::fetch_macro(input) 
 /// See [`ankurah_derive::predicate!`] documentation for complete syntax details.
 #[proc_macro]
 pub fn subscribe(input: TokenStream) -> TokenStream { predicate::subscribe_macro(input) }
+
+/// Generate WASM wrappers for all types marked as "provided" in the backend config
+///
+/// This macro should be called once per property backend to generate standard wrappers.
+/// Example usage in core/src/property/value/lww.rs:
+/// ```rust,ignore
+/// impl_provided_wrapper_types!("src/property/value/lww.ron");
+/// ```
+#[proc_macro]
+pub fn impl_provided_wrapper_types(input: TokenStream) -> TokenStream {
+    let config_filename = parse_macro_input!(input as syn::LitStr);
+    match wrapper_macros::impl_provided_wrapper_types_impl(&config_filename.value()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Generate a WASM wrapper for a specific custom type
+///
+/// This macro generates a wrapper for types not covered by the "provided" set.
+/// Example usage:
+/// ```rust,ignore
+/// impl_wrapper_type!(Complex);  // Generates LWWComplex, YrsStringComplex, etc.
+/// ```
+#[proc_macro]
+pub fn impl_wrapper_type(input: TokenStream) -> TokenStream {
+    let custom_type = parse_macro_input!(input as syn::Type);
+    match wrapper_macros::impl_wrapper_type_impl(&custom_type) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}

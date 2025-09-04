@@ -11,7 +11,7 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -37,10 +37,10 @@ where
 #[async_trait]
 pub trait TContext {
     fn node_id(&self) -> proto::EntityId;
-    /// Create a brand new entity, and add it to the WeakEntitySet
+    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
-    fn create_entity(&self, collection: proto::CollectionId) -> Entity;
+    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
@@ -53,7 +53,10 @@ pub trait TContext {
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn create_entity(&self, collection: proto::CollectionId) -> Entity { self.node.entities.create(collection) }
+    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        let primary_entity = self.node.entities.create(collection);
+        primary_entity.snapshot(trx_alive)
+    }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
         self.get_entity(collection, id, cached).await
@@ -136,7 +139,7 @@ impl Context {
         let views = self.fetch::<R>(args).await?;
         Ok(views.into_iter().next())
     }
-    /// Subscribe to changes in entities matching a predicate
+    /// Subscribe to changes in entities matching a selection
     pub fn query<R>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<LiveQuery<R>, RetrievalError>
     where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
@@ -144,7 +147,7 @@ impl Context {
         Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
 
-    /// Subscribe to changes in entities matching a predicate and wait for initialization
+    /// Subscribe to changes in entities matching a selection and wait for initialization
     pub async fn query_wait<R>(
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
@@ -208,20 +211,20 @@ where
             Err(e) => Err(e),
         }
     }
-    /// Fetch a list of entities based on a predicate
-    pub async fn fetch_entities(&self, collection_id: &CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
+    /// Fetch a list of entities based on a selection
+    pub async fn fetch_entities(&self, collection_id: &CollectionId, mut args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.node.policy_agent.can_access_collection(&self.cdata, collection_id)?;
         // Fetch raw states from storage
 
-        let filtered_predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.predicate)?;
+        args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
 
         // TODO implement cached: true
         let states = if !self.node.durable {
             // Fetch from peers and commit first response
-            self.node.fetch_from_peer(collection_id, filtered_predicate, &self.cdata).await?
+            self.node.fetch_from_peer(collection_id, args.selection, &self.cdata).await?
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
-            storage_collection.fetch_states(&filtered_predicate).await?
+            storage_collection.fetch_states(&args.selection.predicate).await?
         };
 
         // Convert states to entities
@@ -262,7 +265,7 @@ where
 
             let collection_id = &attested_event.payload.collection;
             // If this entity has an upstream, propagate the changes
-            if let Some(ref upstream) = entity.upstream {
+            if let crate::entity::EntityKind::Transacted { upstream, .. } = &entity.kind {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 upstream.apply_event(&retriever, &attested_event.payload).await?;
             }

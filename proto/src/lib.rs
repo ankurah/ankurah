@@ -28,6 +28,6 @@ pub use id::*;
 pub use message::*;
 pub use peering::*;
 pub use request::*;
-pub use subscription::PredicateId;
+pub use subscription::QueryId;
 pub use transaction::*;
 pub use update::*;

@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, collection::CollectionId, data::Event, id::EntityId, subscription::PredicateId, transaction::TransactionId,
-    EntityState, EventId,
+    auth::Attested, collection::CollectionId, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState,
+    EventId,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -38,8 +38,8 @@ pub enum NodeRequestBody {
     // Request to fetch entities matching a predicate
     Get { collection: CollectionId, ids: Vec<EntityId> },
     GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
-    Fetch { collection: CollectionId, predicate: ast::Predicate },
-    SubscribePredicate { predicate_id: PredicateId, collection: CollectionId, predicate: ast::Predicate },
+    Fetch { collection: CollectionId, selection: ast::Selection },
+    SubscribeQuery { query_id: QueryId, collection: CollectionId, selection: ast::Selection, version: u32 },
 }
 
 /// A response from one node to another
@@ -58,7 +58,7 @@ pub enum NodeResponseBody {
     Fetch(Vec<Attested<EntityState>>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    PredicateSubscribed { predicate_id: PredicateId },
+    QuerySubscribed { query_id: QueryId },
     Success,
     Error(String),
 }
@@ -87,11 +87,11 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::GetEvents { collection, event_ids } => {
                 write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
-            NodeRequestBody::Fetch { collection, predicate } => {
-                write!(f, "Fetch {collection} {predicate}")
+            NodeRequestBody::Fetch { collection, selection: query } => {
+                write!(f, "Fetch {collection} {query}")
             }
-            NodeRequestBody::SubscribePredicate { predicate_id, collection, predicate } => {
-                write!(f, "Subscribe {predicate_id} {collection} {predicate}")
+            NodeRequestBody::SubscribeQuery { query_id, collection, selection: query, version } => {
+                write!(f, "Subscribe {query_id} {collection} {query} v{version}")
             }
         }
     }
@@ -109,7 +109,7 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::PredicateSubscribed { predicate_id } => write!(f, "Subscribed {predicate_id}"),
+            NodeResponseBody::QuerySubscribed { query_id } => write!(f, "Subscribed {query_id}"),
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
         }

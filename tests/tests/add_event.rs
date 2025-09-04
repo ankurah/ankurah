@@ -26,12 +26,12 @@ async fn add_event_postgres() -> Result<()> {
 
     let album1 = trx1.get::<Album>(&album_id).await?;
 
-    album1.name.insert(0, "(o.")?;
+    album1.name().insert(0, "(o.")?;
     trx1.commit().await?;
 
     let trx2 = context.begin();
     let album2 = trx2.get::<Album>(&album_id).await?;
-    album2.name.insert(3, "o) ")?;
+    album2.name().insert(3, "o) ")?;
     trx2.commit().await?;
 
     let albums = context.collection(&"album".into()).await?;

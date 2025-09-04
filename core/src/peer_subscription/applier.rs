@@ -12,7 +12,7 @@ impl UpdateApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-        initialized_predicate: Option<proto::PredicateId>,
+        initialized_query: Option<(proto::QueryId, u32)>,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -30,16 +30,43 @@ impl UpdateApplier {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
         }
 
-        if let Some(tx) = initialized_predicate.and_then(|p| node.pending_predicate_subs.remove(&p)) {
+        // only call the initialization channel if the version matches what we expect
+        let notify_initial_set = if let Some((query_id, received_version)) = initialized_query {
+            let mut pending_subs = node.pending_predicate_subs.lock().unwrap();
+            match pending_subs.entry(query_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let (expected_version, _) = entry.get();
+                    if received_version == *expected_version {
+                        Some((entry.remove().1, query_id, received_version))
+                    } else {
+                        // Stale response - ignore it but keep the entry
+                        tracing::warn!("Received stale predicate update v{} but expecting v{}", received_version, expected_version);
+                        None
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(_) => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some((tx, query_id, version)) = notify_initial_set {
             let mut changes = Vec::new();
             let mut entities = Vec::new();
             for update in items {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
                 Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut entities).await?;
             }
+            // Pause the predicate if this is an update (v>0)
+            if version > 0 {
+                // TODO - figure out if this version check is actually necessary
+                node.reactor.pause_query(query_id);
+            }
 
-            // Important to notify the reactor before sending the initial entities
+            // Always notify the reactor about entity changes
             node.reactor.notify_change(changes);
+
+            // Send entities (we already verified this is the expected version)
             let _ = tx.send(entities); // Ignore if receiver was dropped
         } else {
             // Use unit type to avoid accumulation

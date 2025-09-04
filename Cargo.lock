@@ -126,9 +126,12 @@ name = "ankurah-derive"
 version = "0.5.4"
 dependencies = [
  "ankql",
+ "maplit",
  "proc-macro2",
  "quote",
  "regex",
+ "ron",
+ "serde",
  "serde_derive_internals 0.29.1",
  "syn",
 ]
@@ -141,6 +144,9 @@ dependencies = [
  "ankurah-storage-sled",
  "ankurah-websocket-server",
  "anyhow",
+ "chrono",
+ "example-model",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -623,6 +629,9 @@ name = "bitflags"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "block-buffer"
@@ -1038,6 +1047,7 @@ dependencies = [
  "chrono",
  "getrandom 0.3.2",
  "serde",
+ "serde_json",
  "tracing",
  "tsify",
  "wasm-bindgen",
@@ -1831,6 +1841,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30bde2b3dc3671ae49d8e2e9f044c7c005836e7a023ee57cffa25ab82764bb9e"
 
 [[package]]
+name = "maplit"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
+
+[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2356,6 +2372,19 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "ron"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db09040cc89e461f1a265139777a2bde7f8d8c67c4936f700c63ce3e2904d468"
+dependencies = [
+ "base64 0.22.1",
+ "bitflags 2.9.0",
+ "serde",
+ "serde_derive",
+ "unicode-ident",
 ]
 
 [[package]]

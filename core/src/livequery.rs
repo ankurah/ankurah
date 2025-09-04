@@ -21,7 +21,6 @@ use crate::{
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},
     resultset::{EntityResultSet, ResultSet},
-    retrieval::LocalRetriever,
     storage::StorageEngine,
     Node,
 };
@@ -31,9 +30,8 @@ use crate::{
 #[derive(Clone)]
 pub struct EntityLiveQuery(Arc<Inner>);
 struct Inner {
-    pub(crate) predicate_id: proto::PredicateId,
+    pub(crate) query_id: proto::QueryId,
     pub(crate) node: Box<dyn TNodeErased>,
-    pub(crate) peers: Vec<proto::EntityId>,
     // Store the actual subscription - now non-generic!
     pub(crate) subscription: ReactorSubscription,
     pub(crate) resultset: EntityResultSet,
@@ -41,10 +39,21 @@ struct Inner {
     pub(crate) error: std::sync::Mutex<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
     pub(crate) is_initialized: std::sync::atomic::AtomicBool,
+    // Version tracking for predicate updates
+    pub(crate) current_version: std::sync::atomic::AtomicU32,
+    // TODO: Is the selection pending in a version 0 case? I think it might be
+    pub(crate) pending_selection: std::sync::Mutex<Option<(ankql::ast::Selection, u32)>>,
+    // Store collection_id for selection updates
+    pub(crate) collection_id: CollectionId,
 }
 
 #[derive(Clone)]
 pub struct LiveQuery<R: View>(EntityLiveQuery, PhantomData<R>);
+
+impl<R: View> std::ops::Deref for LiveQuery<R> {
+    type Target = EntityLiveQuery;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
 
 impl EntityLiveQuery {
     pub fn new<SE, PA>(
@@ -58,38 +67,40 @@ impl EntityLiveQuery {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         node.policy_agent.can_access_collection(&cdata, &collection_id)?;
-        args.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.predicate)?;
+        args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
 
         let subscription = node.reactor.subscribe();
 
-        let predicate_id = proto::PredicateId::new();
-        let resultset = subscription.add_predicate(predicate_id, &collection_id, args.predicate.clone())?;
-        let rx = node.subscribe_remote_predicate(predicate_id, collection_id.clone(), args.predicate.clone(), cdata);
+        let query_id = proto::QueryId::new();
+        let rx = node.subscribe_remote_query(query_id, collection_id.clone(), args.selection.clone(), cdata, 0);
 
         let me = Self(Arc::new(Inner {
-            predicate_id,
+            query_id,
             node: Box::new(node.clone()),
-            peers: Vec::new(),
             subscription,
-            resultset,
+            resultset: EntityResultSet::empty(),
             has_error: AtomicBool::new(false),
             error: std::sync::Mutex::new(None),
             initialized: tokio::sync::Notify::new(),
             is_initialized: std::sync::atomic::AtomicBool::new(false),
+            current_version: std::sync::atomic::AtomicU32::new(0),
+            // TODO: Even for version 0, predicate is "pending" until remote confirms (unless cached:true)
+            pending_selection: std::sync::Mutex::new(None),
+            collection_id: collection_id.clone(),
         }));
 
         let me2 = me.clone();
         let node = node.clone(); // initialize needs the typed node. Drop only needs the erased node.
 
-        debug!("LiveQuery::new() spawning initialization task for predicate {}", predicate_id);
+        debug!("LiveQuery::new() spawning initialization task for predicate {}", query_id);
         crate::task::spawn(async move {
-            debug!("LiveQuery initialization task starting for predicate {}", predicate_id);
-            if let Err(e) = me2.initialize(node, collection_id, predicate_id, args, rx).await {
-                debug!("LiveQuery initialization failed for predicate {}: {}", predicate_id, e);
+            debug!("LiveQuery initialization task starting for predicate {}", query_id);
+            if let Err(e) = me2.initialize(node, collection_id, query_id, args, rx).await {
+                debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
                 me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
                 *me2.0.error.lock().unwrap() = Some(e);
             } else {
-                debug!("LiveQuery initialization completed for predicate {}", predicate_id);
+                debug!("LiveQuery initialization completed for predicate {}", query_id);
             }
 
             // Signal that initialization is complete (success or failure)
@@ -116,7 +127,7 @@ impl EntityLiveQuery {
         &self,
         node: Node<SE, PA>,
         collection_id: CollectionId,
-        predicate_id: proto::PredicateId,
+        query_id: proto::QueryId,
         args: MatchArgs,
         rx: Option<tokio::sync::oneshot::Receiver<Vec<Entity>>>,
     ) -> Result<(), RetrievalError>
@@ -124,65 +135,136 @@ impl EntityLiveQuery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let storage_collection = node.collections.get(&collection_id).await?;
-
         // Get initial entities from remote or local storage
         let initial_entities = match rx {
             Some(rx) if !args.cached => match rx.await {
                 Ok(entities) => entities,
                 Err(_) => {
-                    warn!("Failed to receive first remote update for subscription {}", predicate_id);
-                    Self::fetch_entities_from_local(&node, &storage_collection, &collection_id, &args.predicate).await?
+                    warn!("Failed to receive first remote update for subscription {}", query_id);
+                    node.fetch_entities_from_local(&collection_id, &args.selection).await?
                 }
             },
-            _ => Self::fetch_entities_from_local(&node, &storage_collection, &collection_id, &args.predicate).await?,
+            _ => node.fetch_entities_from_local(&collection_id, &args.selection).await?,
         };
 
         debug!(
             "LiveQuery.initialize() fetched {} initial entities for predicate {} with filter {:?}",
             initial_entities.len(),
-            predicate_id,
-            args.predicate
+            query_id,
+            args.selection
         );
 
-        debug!("LiveQuery.initialize() calling reactor.initialize with {} entities for predicate {}", initial_entities.len(), predicate_id);
-        node.reactor.initialize(self.0.subscription.id(), predicate_id, initial_entities)?;
+        debug!("LiveQuery.initialize() calling reactor.set_predicate with {} entities for predicate {}", initial_entities.len(), query_id);
+        // Pre-populate the resultset with initial entities
+        self.0.resultset.replace_all(initial_entities);
+        node.reactor.add_query(self.0.subscription.id(), query_id, collection_id, args.selection, self.0.resultset.clone())?;
+
         Ok(())
     }
 
-    async fn fetch_entities_from_local<SE, PA>(
-        node: &Node<SE, PA>,
-        storage_collection: &crate::storage::StorageCollectionWrapper,
-        collection_id: &CollectionId,
-        predicate: &ankql::ast::Predicate,
-    ) -> Result<Vec<Entity>, RetrievalError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let initial_states = storage_collection.fetch_states(predicate).await?;
-        let retriever = LocalRetriever::new(storage_collection.clone());
-        let mut entities = Vec::with_capacity(initial_states.len());
-        for state in initial_states {
-            let (_, entity) =
-                node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
-            entities.push(entity);
-        }
-        Ok(entities)
+    pub fn update_selection(
+        &self,
+        new_selection: impl TryInto<ankql::ast::Selection, Error = impl Into<RetrievalError>>,
+    ) -> Result<(), RetrievalError> {
+        let new_selection = new_selection.try_into().map_err(|e| e.into())?;
+
+        // 1. Increment current_version atomically and get the new version number
+        let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
+        // 2. Set is_initialized to false (query results are stale until update completes)
+        self.0.is_initialized.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // 3. Store new selection and version in pending_predicate mutex
+        *self.0.pending_selection.lock().unwrap() = Some((new_selection.clone(), new_version));
+
+        // 4. Call node.update_remote_predicate (synchronous)
+        let rx = self.0.node.update_remote_query(self.0.query_id, new_selection.clone(), new_version)?;
+
+        // Spawn task to handle async update (similar to ::new pattern)
+        let me2 = self.clone();
+        let collection_id = self.0.collection_id.clone();
+        let query_id = self.0.query_id;
+
+        crate::task::spawn(async move {
+            if let Err(e) = me2.update_selection_init(collection_id, new_selection, new_version, rx).await {
+                tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
+                me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                *me2.0.error.lock().unwrap() = Some(e);
+            }
+
+            // Signal that update is complete (success or failure)
+            me2.0.is_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+            me2.0.initialized.notify_waiters();
+        });
+
+        Ok(())
+    }
+
+    pub async fn update_selection_wait(
+        &self,
+        new_selection: impl TryInto<ankql::ast::Selection, Error = impl Into<RetrievalError>>,
+    ) -> Result<(), RetrievalError> {
+        self.update_selection(new_selection)?;
+        self.wait_initialized().await;
+        Ok(())
+    }
+
+    async fn update_selection_init(
+        &self,
+        collection_id: CollectionId,
+        new_selection: ankql::ast::Selection,
+        new_version: u32,
+        rx: Option<tokio::sync::oneshot::Receiver<Vec<Entity>>>,
+    ) -> Result<(), RetrievalError> {
+        // Get entities from remote or local storage (follow initialize pattern)
+        let included_entities = match rx {
+            Some(rx) => match rx.await {
+                Ok(entities) => entities,
+                Err(_) => {
+                    warn!("Failed to receive remote update for predicate {}, falling back to local", self.0.query_id);
+                    self.0.node.fetch_entities_from_local(&collection_id, &new_selection).await?
+                }
+            },
+            None => self.0.node.fetch_entities_from_local(&collection_id, &new_selection).await?,
+        };
+
+        // Call reactor.update_query via the trait
+        self.0
+            .node
+            .reactor()
+            .update_query(
+                self.0.subscription.id(),
+                self.0.query_id,
+                collection_id,
+                new_selection,
+                included_entities,
+                new_version,
+                true, // emit_removes: true for local subscriptions
+            )
+            .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?;
+
+        Ok(())
     }
 }
 
 impl Drop for Inner {
-    fn drop(&mut self) { self.node.unsubscribe_remote_predicate(self.predicate_id); }
+    fn drop(&mut self) { self.node.unsubscribe_remote_predicate(self.query_id); }
 }
 
 impl<R: View> LiveQuery<R> {
     /// Wait for the LiveQuery to be fully initialized with initial states
     pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
 
-    pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.map::<R>() }
+    pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.wrap::<R>() }
 
     pub fn loaded(&self) -> bool { self.0 .0.resultset.is_loaded() }
+
+    pub fn ids(&self) -> Vec<proto::EntityId> { self.0 .0.resultset.keys().collect() }
+
+    pub fn ids_sorted(&self) -> Vec<proto::EntityId> {
+        use itertools::Itertools;
+        self.0 .0.resultset.keys().sorted().collect()
+    }
 }
 
 // Implement Signal trait - delegate to the resultset
@@ -194,12 +276,12 @@ impl<R: View> Signal for LiveQuery<R> {
 
 // Implement Get trait - delegate to ResultSet<R>
 impl<R: View + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
-    fn get(&self) -> Vec<R> { self.0 .0.resultset.map::<R>().get() }
+    fn get(&self) -> Vec<R> { self.0 .0.resultset.wrap::<R>().get() }
 }
 
 // Implement Peek trait - delegate to ResultSet<R>
 impl<R: View + Clone + 'static> Peek<Vec<R>> for LiveQuery<R> {
-    fn peek(&self) -> Vec<R> { self.0 .0.resultset.map().peek() }
+    fn peek(&self) -> Vec<R> { self.0 .0.resultset.wrap().peek() }
 }
 
 // Implement Subscribe trait - convert ReactorUpdate to ChangeSet<R>
@@ -214,14 +296,16 @@ where R: Clone + Send + Sync + 'static
         // Subscribe to the underlying ReactorUpdate stream and convert to ChangeSet<R>
 
         self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
-            // Convert ReactorUpdate to ChangeSet<R>
-            let changeset: ChangeSet<R> = livequery_change_set_from(me.0 .0.resultset.map::<R>(), reactor_update);
+            // Convert ReactorUpdate to ChangeSet<R>");
+            tracing::info!("livequery_subscribe listener: got ReactorUpdate {reactor_update:?}");
+            let changeset: ChangeSet<R> = livequery_change_set_from(me.0 .0.resultset.wrap::<R>(), reactor_update);
+            tracing::info!("livequery_subscribe listener: converted to ChangeSet {changeset}");
             listener(changeset);
         })
     }
 }
 
-/// Notably, this function does not filter by predicate_id, because it should only be used by LiveQuery, which entails a single-predicate subscription
+/// Notably, this function does not filter by query_id, because it should only be used by LiveQuery, which entails a single-predicate subscription
 fn livequery_change_set_from<R: View>(resultset: ResultSet<R>, reactor_update: ReactorUpdate) -> ChangeSet<R>
 where R: View {
     use crate::changes::{ChangeSet, ItemChange};
@@ -232,7 +316,7 @@ where R: View {
         let view = R::from_entity(item.entity);
 
         // Determine the change type based on predicate relevance
-        // ignore the predicate_id, because it should only be used by LiveQuery, which entails a single-predicate subscription
+        // ignore the query_id, because it should only be used by LiveQuery, which entails a single-predicate subscription
         if let Some((_, membership_change)) = item.predicate_relevance.first() {
             match membership_change {
                 crate::reactor::MembershipChange::Initial => {

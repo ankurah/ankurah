@@ -33,7 +33,7 @@ extern "C" {
 }
 
 struct ListenerEntry {
-    guard: ListenerGuard<()>,
+    _guard: ListenerGuard<()>,
     marked_for_removal: bool,
 }
 
@@ -42,7 +42,6 @@ struct ListenerEntry {
 #[derive(Clone)]
 pub struct ReactObserver(Arc<Inner>);
 
-#[allow(unused)]
 struct ReactObserverWeak(Weak<Inner>);
 
 pub struct Inner {
@@ -53,14 +52,14 @@ pub struct Inner {
 
     /// This function gets called by react on the initial render with the notify_fn as an argument
     /// we have to store it to prevent it from being dropped.
-    subscribe_fn: Closure<dyn Fn(js_sys::Function) -> JsValue>,
+    subscribe_fn: SendWrapper<Closure<dyn Fn(js_sys::Function) -> JsValue>>,
     /// get_snapshot is called by react for every render to get the "snapshot" - which in our case is just the version number
     /// it's a goofy way to get react to re-render the component. We're using this instead of the typical
     /// 'let [_,forceUpdate] = useReducer((a) => a + 1, 0)' pattern because it's what preact-signals uses.
     /// I haven't yet analyzed the react dispatch cycle internals sufficiently well to know the difference, but
     /// the preact folks probably didn't choose useSyncExternalStore by throwing a dart at the dartboard,
     /// so I'm inclined to start there.
-    get_snapshot: Closure<dyn Fn() -> JsValue>,
+    get_snapshot: SendWrapper<Closure<dyn Fn() -> JsValue>>,
     version: Arc<AtomicUsize>,
 }
 
@@ -103,11 +102,10 @@ impl ReactObserver {
             version,
             entries: std::sync::RwLock::new(HashMap::new()),
             trigger_render,
-            subscribe_fn,
-            get_snapshot,
+            subscribe_fn: SendWrapper::new(subscribe_fn),
+            get_snapshot: SendWrapper::new(get_snapshot),
         }))
     }
-    #[allow(unused)]
     fn weak(&self) -> ReactObserverWeak { ReactObserverWeak(Arc::downgrade(&self.0)) }
 
     /// Mark all existing listeners for removal (mark phase of mark-and-sweep)
@@ -201,19 +199,20 @@ impl Observer for ReactObserver {
             return;
         }
 
-        // Create new listener
-        let version = self.0.version.clone();
-        let trigger_render = self.0.trigger_render.clone();
+        // Create new listener using weak reference to prevent circular reference
+        let weak = self.weak();
         entries.insert(
             broadcast_id,
             ListenerEntry {
-                guard: signal.listen(Arc::new(move |_| {
-                    // Increment version to trigger React re-render
-                    version.fetch_add(1, Ordering::Relaxed);
+                _guard: signal.listen(Arc::new(move |_| {
+                    if let Some(observer) = weak.upgrade() {
+                        // Increment version to trigger React re-render
+                        observer.0.version.fetch_add(1, Ordering::Relaxed);
 
-                    // Call React's callback if it's been set
-                    if let Some(callback) = trigger_render.get() {
-                        let _ = callback.call0(&JsValue::NULL);
+                        // Call React's callback if it's been set
+                        if let Some(callback) = observer.0.trigger_render.get() {
+                            let _ = callback.call0(&JsValue::NULL);
+                        }
                     }
                 })),
                 marked_for_removal: false,

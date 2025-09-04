@@ -1,5 +1,6 @@
 #![cfg(feature = "postgres")]
 mod common;
+use ankurah::changes::ChangeKind;
 use anyhow::Result;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
