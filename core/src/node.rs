@@ -391,7 +391,7 @@ where
             proto::NodeMessage::UnsubscribePredicate { from, predicate_id } => {
                 // Remove predicate from the peer's subscription
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(predicate_id);
+                    peer_state.subscription_handler.remove_predicate(predicate_id)?;
                 }
             }
         }

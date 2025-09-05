@@ -50,10 +50,6 @@ impl ModelDescription {
     #[cfg(feature = "wasm")]
     pub fn livequery_name(&self) -> Ident { format_ident!("{}LiveQuery", self.name) }
 
-    // Field accessors
-    pub fn active_fields(&self) -> &[syn::Field] { &self.active_fields }
-    pub fn ephemeral_fields(&self) -> &[syn::Field] { &self.ephemeral_fields }
-
     // Computed accessors for active fields
     pub fn active_field_visibility(&self) -> Vec<&Visibility> { self.active_fields.iter().map(|f| &f.vis).collect() }
     pub fn active_field_names(&self) -> Vec<&Option<Ident>> { self.active_fields.iter().map(|f| &f.ident).collect() }

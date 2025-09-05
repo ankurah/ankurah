@@ -10,9 +10,8 @@ pub(crate) use self::{
 
 use crate::{
     changes::EntityChange, entity::Entity, error::SubscriptionError, reactor::subscription::ReactorSubInner, resultset::EntityResultSet,
-    storage::StorageEngine, value::Value,
+    value::Value,
 };
-use ankql::selection::filter::Filterable;
 use ankurah_proto::{self as proto};
 use indexmap::IndexMap;
 use std::{
@@ -92,7 +91,6 @@ struct WatcherSet {
 #[derive(Debug, Clone)]
 struct PredicateState<E: AbstractEntity> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
-    pub(crate) subscription_id: ReactorSubscriptionId,
     pub(crate) collection_id: proto::CollectionId,
     pub(crate) predicate: ankql::ast::Predicate,
     // I think we need to move these out of PredicateState and into WatcherState
@@ -332,7 +330,6 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                 match subscription.predicates.entry(predicate_id) {
                     Entry::Vacant(v) => {
                         v.insert(PredicateState {
-                            subscription_id,
                             collection_id: collection_id.clone(),
                             predicate: predicate.clone(),
                             paused: true, // Start paused until initialization completes
@@ -736,7 +733,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
 
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
 
-        for (subscription_id, subscription_state) in subscriptions.iter_mut() {
+        for (_, subscription_state) in subscriptions.iter_mut() {
             let mut update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
             // For each predicate in this subscription
@@ -866,6 +863,7 @@ impl<E: AbstractEntity, Ev> std::fmt::Debug for SubscriptionState<E, Ev> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ankql::selection::filter::Filterable;
     use ankurah_signals::Subscribe;
     use proto::{CollectionId, PredicateId};
 

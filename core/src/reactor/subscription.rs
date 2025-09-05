@@ -1,10 +1,12 @@
-use crate::reactor::{AbstractEntity, Reactor, ReactorUpdate};
+use crate::{
+    error::SubscriptionError,
+    reactor::{AbstractEntity, Reactor, ReactorUpdate},
+};
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
     broadcast::Broadcast,
     porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard},
-    Signal,
 };
 use std::sync::Arc;
 use ulid::Ulid;
@@ -54,8 +56,9 @@ impl<E: AbstractEntity, Ev: Clone> ReactorSubscription<E, Ev> {
     // This creates an inactive predicate that does nothing until initialize() is called
 
     /// Remove a predicate from this subscription
-    pub fn remove_predicate(&self, predicate_id: proto::PredicateId) {
-        self.0.reactor.remove_predicate(self.0.subscription_id, predicate_id);
+    pub fn remove_predicate(&self, predicate_id: proto::PredicateId) -> Result<(), SubscriptionError> {
+        self.0.reactor.remove_predicate(self.0.subscription_id, predicate_id)?;
+        Ok(())
     }
 
     /// Add entity subscriptions

@@ -270,33 +270,6 @@ fn process_unquoted_template(template: &str) -> (String, Vec<(Option<String>, St
     (query_with_placeholders, variable_mapping)
 }
 
-fn replace_placeholders(template: &str, expected_count: usize) -> String {
-    let mut result = String::new();
-    let mut placeholder_count = 0;
-    let mut chars = template.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '{' {
-            if let Some(&'}') = chars.peek() {
-                chars.next(); // consume '}'
-                result.push('?');
-                placeholder_count += 1;
-            } else {
-                result.push(ch);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    // Validate placeholder count matches argument count
-    if placeholder_count != expected_count {
-        panic!("Placeholder count mismatch: found {} placeholders but {} arguments provided", placeholder_count, expected_count);
-    }
-
-    result
-}
-
 fn generate_predicate_from_template(template: &str, args: &[Expr]) -> proc_macro2::TokenStream {
     let (query_with_placeholders, final_args) = if args.is_empty() {
         // Unquoted syntax with {operator?identifier} patterns
@@ -569,17 +542,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_replace_placeholders() {
-        assert_eq!(replace_placeholders("name = {}", 1), "name = ?");
-        assert_eq!(replace_placeholders("name = {} AND age > {}", 2), "name = ? AND age > ?");
-        assert_eq!(replace_placeholders("status IN ({}, {}, {})", 3), "status IN (?, ?, ?)");
-        assert_eq!(replace_placeholders("no placeholders", 0), "no placeholders");
+    fn test_process_quoted_template_positional() {
+        // Test with positional arguments only
+        let args = vec![syn::parse_str::<syn::Expr>("name").unwrap(), syn::parse_str::<syn::Expr>("age").unwrap()];
+        let (query, vars) = process_quoted_template("name = {} AND age > {}", &args);
+        assert_eq!(query, "name = ? AND age > ?");
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].0, None); // positional
+        assert_eq!(vars[0].1, "arg_0");
+        assert_eq!(vars[1].0, None); // positional
+        assert_eq!(vars[1].1, "arg_1");
     }
 
     #[test]
-    #[should_panic(expected = "Placeholder count mismatch")]
-    fn test_placeholder_count_mismatch() {
-        replace_placeholders("name = {} AND age > {}", 1); // Should panic
+    fn test_process_quoted_template_named() {
+        // Test with named placeholders only
+        let (query, vars) = process_quoted_template("name = {name} AND age > {age}", &[]);
+        assert_eq!(query, "name = ? AND age > ?");
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].0, None); // named placeholder
+        assert_eq!(vars[0].1, "name");
+        assert_eq!(vars[1].0, None); // named placeholder
+        assert_eq!(vars[1].1, "age");
+    }
+
+    #[test]
+    fn test_process_quoted_template_mixed() {
+        // Test with mixed positional and named placeholders
+        let args = vec![syn::parse_str::<syn::Expr>("status").unwrap()];
+        let (query, vars) = process_quoted_template("name = {name} AND status = {} AND age > {age}", &args);
+        assert_eq!(query, "name = ? AND status = ? AND age > ?");
+        assert_eq!(vars.len(), 3);
+        assert_eq!(vars[0].0, None); // named
+        assert_eq!(vars[0].1, "name");
+        assert_eq!(vars[1].0, None); // positional
+        assert_eq!(vars[1].1, "arg_0");
+        assert_eq!(vars[2].0, None); // named
+        assert_eq!(vars[2].1, "age");
+    }
+
+    #[test]
+    fn test_process_quoted_template_no_placeholders() {
+        // Test with no placeholders
+        let (query, vars) = process_quoted_template("name = 'test'", &[]);
+        assert_eq!(query, "name = 'test'");
+        assert_eq!(vars.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Not enough positional arguments for {} placeholders")]
+    fn test_process_quoted_template_insufficient_positional_args() {
+        // Test with insufficient positional arguments
+        let args = vec![syn::parse_str::<syn::Expr>("name").unwrap()];
+        process_quoted_template("name = {} AND age > {}", &args);
+    }
+
+    #[test]
+    #[should_panic(expected = "Too many positional arguments provided")]
+    fn test_process_quoted_template_too_many_positional_args() {
+        // Test with too many positional arguments
+        let args = vec![
+            syn::parse_str::<syn::Expr>("name").unwrap(),
+            syn::parse_str::<syn::Expr>("age").unwrap(),
+            syn::parse_str::<syn::Expr>("status").unwrap(),
+        ];
+        process_quoted_template("name = {}", &args);
     }
 
     #[test]

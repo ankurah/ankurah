@@ -32,7 +32,6 @@ pub struct EntityLiveQuery(Arc<Inner>);
 struct Inner {
     pub(crate) predicate_id: proto::PredicateId,
     pub(crate) node: Box<dyn TNodeErased>,
-    pub(crate) peers: Vec<proto::EntityId>,
     // Store the actual subscription - now non-generic!
     pub(crate) subscription: ReactorSubscription,
     pub(crate) resultset: EntityResultSet,
@@ -78,7 +77,6 @@ impl EntityLiveQuery {
         let me = Self(Arc::new(Inner {
             predicate_id,
             node: Box::new(node.clone()),
-            peers: Vec::new(),
             subscription,
             resultset: EntityResultSet::empty(),
             has_error: AtomicBool::new(false),
@@ -137,13 +135,7 @@ impl EntityLiveQuery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let storage_collection = node.collections.get(&collection_id).await?;
-
         // Get initial entities from remote or local storage
-        // TODO: This logic applies to both version 0 and updates:
-        // - cached:false + rx present = wait for remote (predicate is pending)
-        // - cached:true = use local immediately (predicate activates immediately)
-        // - no rx (durable node) = use local (predicate activates immediately)
         let initial_entities = match rx {
             Some(rx) if !args.cached => match rx.await {
                 Ok(entities) => entities,

@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 #[derive(Clone)]
 pub struct CallbackObserver(Arc<Inner>);
 struct SubscriptionEntry {
-    guard: ListenerGuard<()>,
+    _guard: ListenerGuard<()>,
     marked_for_removal: bool,
 }
 
@@ -90,7 +90,7 @@ impl Observer for CallbackObserver {
         entries.insert(
             broadcast_id,
             SubscriptionEntry {
-                guard: signal.listen(Arc::new(move |_| {
+                _guard: signal.listen(Arc::new(move |_| {
                     if let Some(observer) = weak.upgrade() {
                         observer.trigger();
                     }

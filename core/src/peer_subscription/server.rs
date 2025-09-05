@@ -2,6 +2,7 @@ use ankurah_proto::{self as proto, Attested};
 use tracing::{debug, warn};
 
 use crate::{
+    error::SubscriptionError,
     node::Node,
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},
@@ -17,7 +18,7 @@ use ankurah_signals::{Subscribe, SubscriptionGuard};
 pub struct SubscriptionHandler {
     peer_id: proto::EntityId,
     subscription: ReactorSubscription,
-    guard: SubscriptionGuard,
+    _guard: SubscriptionGuard,
 }
 
 impl SubscriptionHandler {
@@ -57,7 +58,7 @@ impl SubscriptionHandler {
             }
         });
 
-        Self { peer_id, subscription, guard }
+        Self { peer_id, subscription, _guard: guard }
     }
 
     /// Get the subscription ID for this peer.
@@ -67,7 +68,10 @@ impl SubscriptionHandler {
     pub fn subscription(&self) -> &ReactorSubscription { &self.subscription }
 
     /// Remove a predicate from this peer's subscription.
-    pub fn remove_predicate(&self, predicate_id: proto::PredicateId) { self.subscription.remove_predicate(predicate_id); }
+    pub fn remove_predicate(&self, predicate_id: proto::PredicateId) -> Result<(), SubscriptionError> {
+        self.subscription.remove_predicate(predicate_id)?;
+        Ok(())
+    }
 
     /// Handle a subscription request for this peer.
     pub async fn subscribe_predicate<SE, PA>(

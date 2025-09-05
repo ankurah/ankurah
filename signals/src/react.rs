@@ -33,7 +33,7 @@ extern "C" {
 }
 
 struct ListenerEntry {
-    guard: ListenerGuard<()>,
+    _guard: ListenerGuard<()>,
     marked_for_removal: bool,
 }
 
