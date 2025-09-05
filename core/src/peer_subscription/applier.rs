@@ -37,7 +37,7 @@ impl UpdateApplier {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let (expected_version, _) = entry.get();
                     if received_version == *expected_version {
-                        Some((entry.remove().1, predicate_id))
+                        Some((entry.remove().1, predicate_id, received_version))
                     } else {
                         // Stale response - ignore it but keep the entry
                         tracing::warn!("Received stale predicate update v{} but expecting v{}", received_version, expected_version);
@@ -50,7 +50,7 @@ impl UpdateApplier {
             None
         };
 
-        if let Some((tx, predicate_id)) = notify_initial_set {
+        if let Some((tx, predicate_id, version)) = notify_initial_set {
             let mut changes = Vec::new();
             let mut entities = Vec::new();
             for update in items {
@@ -58,8 +58,10 @@ impl UpdateApplier {
                 Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut entities).await?;
             }
             // Pause the predicate if this is an update (v>0)
-
-            node.reactor.pause_predicate(predicate_id);
+            if version > 0 {
+                // TODO - figure out if this version check is actually necessary
+                node.reactor.pause_predicate(predicate_id);
+            }
 
             // Always notify the reactor about entity changes
             node.reactor.notify_change(changes);

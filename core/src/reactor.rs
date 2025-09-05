@@ -434,6 +434,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                     // Note: Can't use lexicographic zip since resultsets maintain insertion order,
                     // not EntityId order (and may later support custom sort orders)
                     pred_state.resultset.replace_all(matching_entities); // FIXME - switch to batch, audit TODOS, and search for sensible DRY code
+                    pred_state.paused = false; // Unpause now that initialization is complete
                     pred_state.resultset.set_loaded(true);
                 }
             }
