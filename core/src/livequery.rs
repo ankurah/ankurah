@@ -177,6 +177,7 @@ impl EntityLiveQuery {
             args.predicate,
             self.0.resultset.clone(), // Pass the existing resultset
             initial_entities,
+            0, // Initial version
         )?;
 
         Ok(())
@@ -198,33 +199,24 @@ impl EntityLiveQuery {
         *self.0.pending_predicate.lock().unwrap() = Some((new_predicate.clone(), new_version));
 
         // 4. Call node.update_remote_predicate (synchronous)
-        tracing::info!("update_predicate calling node.update_remote_predicate for predicate {}", self.0.predicate_id);
-        let rx = self.0.node.update_remote_predicate(self.0.predicate_id, self.0.collection_id.clone(), new_predicate.clone(), new_version);
-        tracing::info!("update_predicate got rx: {:?}", rx.is_some());
+        let rx = self.0.node.update_remote_predicate(self.0.predicate_id, new_predicate.clone(), new_version);
 
         // Spawn task to handle async update (similar to ::new pattern)
         let me2 = self.clone();
         let collection_id = self.0.collection_id.clone();
         let predicate_id = self.0.predicate_id;
 
-        tracing::info!("update_predicate spawning task for predicate {}", predicate_id);
         crate::task::spawn(async move {
-            tracing::info!("LiveQuery update task starting for predicate {}", predicate_id);
             if let Err(e) = me2.update_predicate_init(collection_id, new_predicate, new_version, rx).await {
-                tracing::info!("LiveQuery update failed for predicate {}: {}", predicate_id, e);
+                tracing::error!("LiveQuery update failed for predicate {}: {}", predicate_id, e);
                 me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
                 *me2.0.error.lock().unwrap() = Some(e);
-            } else {
-                tracing::info!("LiveQuery update completed for predicate {}", predicate_id);
             }
 
             // Signal that update is complete (success or failure)
             me2.0.is_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
             me2.0.initialized.notify_waiters();
-            tracing::info!("LiveQuery update task signaled completion for predicate {}", predicate_id);
         });
-
-        tracing::info!("update_predicate returning for predicate {}", self.0.predicate_id);
 
         Ok(())
     }
@@ -245,40 +237,17 @@ impl EntityLiveQuery {
         new_version: u32,
         rx: Option<tokio::sync::oneshot::Receiver<Vec<Entity>>>,
     ) -> Result<(), RetrievalError> {
-        tracing::info!("update_predicate_init starting for predicate {}", self.0.predicate_id);
-
-        let storage_collection = self.0.node.get_storage_collection(&collection_id).await?;
-        tracing::info!("update_predicate_init got storage_collection");
-
         // Get entities from remote or local storage (follow initialize pattern)
         let included_entities = match rx {
-            Some(rx) => {
-                tracing::info!("update_predicate_init waiting for rx (ephemeral case)");
-                match rx.await {
-                    Ok(entities) => {
-                        tracing::info!("update_predicate_init got {} entities from rx", entities.len());
-                        entities
-                    }
-                    Err(_) => {
-                        warn!("Failed to receive remote update for predicate {}, falling back to local", self.0.predicate_id);
-                        self.0.node.fetch_entities_from_local_erased(&collection_id, &new_predicate).await?
-                    }
+            Some(rx) => match rx.await {
+                Ok(entities) => entities,
+                Err(_) => {
+                    warn!("Failed to receive remote update for predicate {}, falling back to local", self.0.predicate_id);
+                    self.0.node.fetch_entities_from_local(&collection_id, &new_predicate).await?
                 }
-            }
-            None => {
-                tracing::info!("update_predicate_init fetching from local (durable case)");
-                let entities = self.0.node.fetch_entities_from_local_erased(&collection_id, &new_predicate).await?;
-                tracing::info!("update_predicate_init got {} entities from local", entities.len());
-                entities
-            }
+            },
+            None => self.0.node.fetch_entities_from_local(&collection_id, &new_predicate).await?,
         };
-
-        tracing::info!(
-            "update_predicate_init calling reactor.update_predicate with {} entities for predicate {} with filter {:?}",
-            included_entities.len(),
-            self.0.predicate_id,
-            new_predicate
-        );
 
         // Call reactor.update_predicate via the trait
         self.0
@@ -290,10 +259,9 @@ impl EntityLiveQuery {
                 new_predicate,
                 included_entities,
                 new_version,
+                true, // emit_removes: true for local subscriptions
             )
             .map_err(|e| RetrievalError::storage(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-        tracing::info!("update_predicate_init completed reactor call for predicate {}", self.0.predicate_id);
 
         Ok(())
     }

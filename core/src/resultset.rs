@@ -83,6 +83,13 @@ impl<'a, E: AbstractEntity> ResultSetBatch<'a, E> {
 
     /// Check if an entity exists
     pub fn contains(&self, id: &proto::EntityId) -> bool { self.guard.as_ref().expect("batch already dropped").index.contains_key(id) }
+
+    /// Iterate over all entities and collect those to remove
+    /// Returns (entity_id, entity) pairs for processing
+    pub fn iter_entities(&self) -> Vec<(proto::EntityId, E)> {
+        let guard = self.guard.as_ref().expect("batch already dropped");
+        guard.order.iter().map(|entity| (entity.id(), entity.clone())).collect()
+    }
 }
 
 impl<'a, E: AbstractEntity> Drop for ResultSetBatch<'a, E> {

@@ -153,7 +153,7 @@ async fn test_predicate_update() -> Result<()> {
     let mut all_expected = vec![a_id, b_id, c_id];
     all_expected.sort();
     assert_eq!(final_ids, all_expected);
-    assert_eq!(watcher.take_one().await, vec![(a_id, ChangeKind::Add), (b_id, ChangeKind::Add)]);
+    assert_eq!(watcher.take_one().await, vec![(a_id, ChangeKind::Initial), (b_id, ChangeKind::Initial)]);
 
     // should have no more changes
     assert_eq!(watcher.quiesce().await, 0);

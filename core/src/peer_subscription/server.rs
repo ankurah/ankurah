@@ -126,6 +126,7 @@ impl SubscriptionHandler {
                 filtered_predicate,
                 resultset,
                 initial_entities,
+                version,
             )?;
         } else {
             // Update existing predicate
@@ -136,6 +137,7 @@ impl SubscriptionHandler {
                 filtered_predicate,
                 initial_entities,
                 version,
+                false, // emit_removes: false for remote subscriptions
             )?;
         }
 

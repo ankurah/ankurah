@@ -298,7 +298,7 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
 impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
     /// Set a predicate for a subscription (handles both initial and updates)
     /// This is the ONLY method for setting/updating predicates
-    pub fn set_predicate(
+    pub fn add_predicate(
         &self,
         subscription_id: ReactorSubscriptionId,
         predicate_id: proto::PredicateId,
@@ -453,21 +453,6 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
 
     /// Add a new predicate to a subscription (v0 - initial subscription)
     /// Takes a resultset and does no diffing
-    pub fn add_predicate(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        predicate_id: proto::PredicateId,
-        collection_id: proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-        resultset: EntityResultSet<E>,
-        included_entities: Vec<E>,
-    ) -> anyhow::Result<()> {
-        let mut subscriptions = self.0.subscriptions.lock().unwrap();
-        let mut watcher_state = self.0.watcher_set.lock().unwrap();
-
-        // TODO: Set up predicate state, create batch, process entities, mark initialized, send update
-        unimplemented!("TODO: Implement with single lock")
-    }
 
     /// Update an existing predicate (v>0)
     /// Does diffing against the current resultset
@@ -479,15 +464,120 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
         predicate: ankql::ast::Predicate,
         included_entities: Vec<E>,
         version: u32,
+        emit_removes: bool, // Whether to emit Remove events for entities that no longer match
     ) -> anyhow::Result<()> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
         let mut watcher_state = self.0.watcher_set.lock().unwrap();
 
-        // TODO: Update predicate state, create batch, process entities, remove non-matching, mark initialized, send update
-        unimplemented!("TODO: Implement with single lock")
+        // Get the subscription
+        let subscription =
+            subscriptions.get_mut(&subscription_id).ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?;
+
+        // Get mutable reference to predicate state (must exist for v>0)
+        let pred_state = subscription.predicates.get_mut(&predicate_id).ok_or_else(|| anyhow::anyhow!("Predicate not found for update"))?;
+
+        // Update the predicate AST
+        let old_predicate = pred_state.predicate.clone();
+        pred_state.predicate = predicate.clone();
+
+        // Update index watchers if predicate changed
+        let watcher_id = (subscription_id, predicate_id);
+        watcher_state.recurse_predicate_watchers(&collection_id, &old_predicate, watcher_id, WatcherOp::Remove);
+        watcher_state.recurse_predicate_watchers(&collection_id, &predicate, watcher_id, WatcherOp::Add);
+
+        // Create batch for atomic updates
+        let mut batch = pred_state.resultset.batch();
+        let mut reactor_update_items = Vec::new();
+
+        // Process included entities (only truly new ones from remote)
+        for entity in included_entities {
+            if ankql::selection::filter::evaluate_predicate(&entity, &predicate).unwrap_or(false) {
+                let entity_id = AbstractEntity::id(&entity);
+
+                // Check if this is truly new to the resultset
+                if !batch.contains(&entity_id) {
+                    // Add to batch
+                    batch.add(entity.clone());
+
+                    // Add to subscription entities map
+                    subscription.entities.insert(entity_id, entity.clone());
+
+                    // Set up entity watchers
+                    subscription.entity_subscriptions.insert(entity_id);
+                    let entity_watcher = watcher_state.entity_watchers.entry(entity_id).or_default();
+                    entity_watcher.insert(EntityWatcherId::Subscription(subscription_id));
+                    entity_watcher.insert(EntityWatcherId::Predicate(subscription_id, predicate_id));
+
+                    // Create reactor update item (Initial for truly new entities)
+                    reactor_update_items.push(ReactorUpdateItem {
+                        entity,
+                        events: vec![],
+                        entity_subscribed: true,
+                        predicate_relevance: vec![(predicate_id, MembershipChange::Initial)],
+                    });
+                }
+            }
+        }
+
+        // Remove entities that no longer match the new predicate
+        let mut to_remove = Vec::new();
+        for (entity_id, entity) in batch.iter_entities() {
+            if !ankql::selection::filter::evaluate_predicate(&entity, &predicate).unwrap_or(false) {
+                tracing::debug!("Entity {:?} no longer matches predicate", entity_id);
+
+                // If emit_removes is true, create a Remove event for local subscriptions
+                if emit_removes {
+                    tracing::debug!("Creating Remove event for entity {:?}", entity_id);
+                    reactor_update_items.push(ReactorUpdateItem {
+                        entity: entity.clone(),
+                        events: vec![],
+                        entity_subscribed: false,
+                        predicate_relevance: vec![(predicate_id, MembershipChange::Remove)],
+                    });
+                }
+
+                to_remove.push(entity_id);
+            }
+        }
+        tracing::info!("Removing {} entities that no longer match", to_remove.len());
+
+        // Remove non-matching entities from the resultset and clean up watchers
+        for entity_id in to_remove {
+            batch.remove(entity_id);
+
+            // Clean up entity predicate watcher (but keep subscription watcher)
+            if let Some(entity_watcher) = watcher_state.entity_watchers.get_mut(&entity_id) {
+                entity_watcher.remove(&EntityWatcherId::Predicate(subscription_id, predicate_id));
+
+                // TODO: Investigate if subscription.entities is being correctly populated and used
+                // If no more predicates are watching this entity, remove it from subscription.entities
+                // (but only if it's not explicitly subscribed)
+                if !subscription.entity_subscriptions.contains(&entity_id) {
+                    let has_other_predicates =
+                        entity_watcher.iter().any(|w| matches!(w, EntityWatcherId::Predicate(sub_id, _) if *sub_id == subscription_id));
+                    if !has_other_predicates {
+                        subscription.entities.remove(&entity_id);
+                    }
+                }
+            }
+        }
+
+        // Mark as initialized
+        pred_state.initialized = true;
+        pred_state.resultset.set_loaded(true);
+
+        // Drop batch to apply changes
+        drop(batch);
+
+        // Send reactor update
+        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items, initialized_predicate: Some((predicate_id, version)) };
+        subscription.notify(reactor_update);
+
+        Ok(())
     }
 
-    // Private helper methods
+    // Private helper methods are no longer needed since add_predicate and update_predicate
+    // handle everything inline with a single lock acquisition
 
     fn setup_predicate_state(
         &self,

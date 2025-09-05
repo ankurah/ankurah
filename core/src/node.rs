@@ -701,7 +701,6 @@ where
     pub(crate) fn update_remote_predicate(
         &self,
         predicate_id: proto::PredicateId,
-        collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         version: u32,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
@@ -713,7 +712,7 @@ where
                     // update the version
                     self.pending_predicate_subs.lock().unwrap().insert(predicate_id, (version, tx));
                 }
-                relay.update_predicate(predicate_id, collection_id, predicate, version);
+                relay.update_predicate(predicate_id, predicate, version);
                 Some(rx)
             }
             None => None,
@@ -743,15 +742,10 @@ pub trait TNodeErased: Send + Sync + 'static {
     fn update_remote_predicate(
         &self,
         predicate_id: proto::PredicateId,
-        collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         version: u32,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>;
-    async fn get_storage_collection(
-        &self,
-        collection_id: &CollectionId,
-    ) -> Result<crate::storage::StorageCollectionWrapper, RetrievalError>;
-    async fn fetch_entities_from_local_erased(
+    async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
@@ -764,6 +758,7 @@ pub trait TNodeErased: Send + Sync + 'static {
         predicate: ankql::ast::Predicate,
         included_entities: Vec<Entity>,
         version: u32,
+        emit_removes: bool,
     ) -> Result<(), anyhow::Error>;
 }
 
@@ -790,26 +785,18 @@ where
     fn update_remote_predicate(
         &self,
         predicate_id: proto::PredicateId,
-        collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         version: u32,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
-        self.update_remote_predicate(predicate_id, collection_id, predicate, version)
+        self.update_remote_predicate(predicate_id, predicate, version)
     }
 
-    async fn get_storage_collection(
-        &self,
-        collection_id: &CollectionId,
-    ) -> Result<crate::storage::StorageCollectionWrapper, RetrievalError> {
-        self.collections.get(collection_id).await
-    }
-
-    async fn fetch_entities_from_local_erased(
+    async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        self.fetch_entities_from_local(collection_id, predicate).await
+        Node::fetch_entities_from_local(self, collection_id, predicate).await
     }
 
     fn call_reactor_update_predicate(
@@ -820,8 +807,9 @@ where
         predicate: ankql::ast::Predicate,
         included_entities: Vec<Entity>,
         version: u32,
+        emit_removes: bool,
     ) -> Result<(), anyhow::Error> {
-        self.reactor.update_predicate(subscription_id, predicate_id, collection_id, predicate, included_entities, version)
+        self.reactor.update_predicate(subscription_id, predicate_id, collection_id, predicate, included_entities, version, emit_removes)
     }
 }
 

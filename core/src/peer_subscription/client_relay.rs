@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, CollectionId};
+use ankurah_proto::{self as proto, collection, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -130,7 +130,6 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     pub fn update_predicate(
         &self,
         predicate_id: proto::PredicateId,
-        collection_id: CollectionId,
         predicate: ankql::ast::Predicate,
         version: u32,
     ) -> Result<(), anyhow::Error> {
@@ -153,7 +152,8 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                         Status::Established(peer_id, _old_version) => {
                             // Update to new version, mark as requested for this peer
                             state.status = Status::Requested(peer_id, version);
-                            Some((peer_id, state.content.context_data.clone())) // Return the peer_id to send update to
+                            Some((peer_id, state.content.collection_id.clone(), state.content.context_data.clone()))
+                            // Return the peer_id to send update to
                         }
                         _ => {
                             // Not established yet, just update to PendingRemote and setup
@@ -167,7 +167,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
         };
 
         match update {
-            Some((peer_id, context_data)) => {
+            Some((peer_id, collection_id, context_data)) => {
                 self.update_predicate_on_peer(peer_id, predicate_id, collection_id, predicate, version, context_data);
             }
             None => {
