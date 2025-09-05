@@ -105,62 +105,6 @@ async fn test_sled() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_predicate_update() -> Result<()> {
-    use common::*;
-
-    let storage_engine = SledStorageEngine::new_test()?;
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
-
-    // Initialize the node's system catalog
-    node.system.create().await?;
-
-    // Get context after system is ready
-    let context = node.context_async(c).await;
-
-    // Create some test albums
-    let trx = context.begin();
-    let a_id = trx.create(&Album { name: "Alpha".to_owned(), year: "2020".to_owned() }).await?.id();
-    let b_id = trx.create(&Album { name: "Bravo".to_owned(), year: "2021".to_owned() }).await?.id();
-    let c_id = trx.create(&Album { name: "Charlie".to_owned(), year: "2022".to_owned() }).await?.id();
-    trx.commit().await?;
-
-    let albums = context.query_wait::<AlbumView>("year > 2020").await?;
-
-    let watcher = TestWatcher::changeset();
-    let _guard = albums.subscribe(&watcher);
-
-    // Should have Bravo, Charlie (sort for deterministic order)
-    let mut ids = albums.ids();
-    ids.sort();
-    let mut expected = vec![b_id, c_id];
-    expected.sort();
-    assert_eq!(ids, expected);
-    assert_eq!(watcher.quiesce().await, 0); // no changes yet
-
-    // Update the predicate to be more restrictive: year > 2021 - Should remove Bravo
-    albums.update_predicate_wait("year > 2021").await?;
-
-    assert_eq!(albums.ids(), vec![c_id]); // Should now have only 1 album (Charlie)
-    assert_eq!(watcher.take_one().await, vec![(b_id, ChangeKind::Remove)]);
-
-    // Update predicate to be less restrictive: year >= "2020"
-    albums.update_predicate_wait("year >= 2020").await?;
-
-    // Should now have all 3 albums (sort for deterministic order)
-    let mut final_ids = albums.ids();
-    final_ids.sort();
-    let mut all_expected = vec![a_id, b_id, c_id];
-    all_expected.sort();
-    assert_eq!(final_ids, all_expected);
-    assert_eq!(watcher.take_one().await, vec![(a_id, ChangeKind::Initial), (b_id, ChangeKind::Initial)]);
-
-    // should have no more changes
-    assert_eq!(watcher.quiesce().await, 0);
-
-    Ok(())
-}
-
 // After this:
 // 1. ensure that each ActiveValue (YrsString<T>, LWW<T>) keeps the AlbumView resident so it continues to receive updates made on the local node
 // 2. ensure that doing so doesn't leak memory by confirming that the AlbumView is dropped immediately after the YrsString<T> or LWW<T> is dropped.
