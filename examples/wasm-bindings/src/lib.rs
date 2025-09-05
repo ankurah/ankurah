@@ -72,7 +72,7 @@ pub async fn edit_entry(entry: &EntryView) -> Result<(), JsValue> {
     let trx = ctx.begin();
     tracing::info!("Editing entry: {:?}", entry);
     let w = entry.edit(&trx)?;
-    w.ip_address.insert(0, "meow");
+    w.ip_address.insert(0, "meow")?;
     tracing::info!("IP address: {:?}", w.ip_address.value());
 
     trx.commit().await?;

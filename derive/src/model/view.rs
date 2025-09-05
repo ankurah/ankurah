@@ -18,7 +18,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     };
     let active_field_name_strs = model.active_field_name_strs();
 
-    let hygeine_module = quote::format_ident!("__ankurah_derive_view_impl_{}", view_name);
+    let hygeine_module = quote::format_ident!("__ankurah_derive_view_impl_{}", to_snake_case(&view_name.to_string()));
     let (use_statements, struct_attributes, impl_attributes, getter_attributes) = if cfg!(feature = "wasm") {
         (
             quote! {
@@ -131,4 +131,19 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
         }
         pub use #hygeine_module::*;
     }
+}
+
+/// Convert a PascalCase identifier to snake_case
+fn to_snake_case(ident: &str) -> String {
+    ident
+        .chars()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            if c.is_uppercase() && i > 0 {
+                vec!['_', c.to_lowercase().next().unwrap()]
+            } else {
+                vec![c.to_lowercase().next().unwrap()]
+            }
+        })
+        .collect()
 }
