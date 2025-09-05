@@ -700,27 +700,6 @@ where
             None => None,
         }
     }
-    pub(crate) fn update_remote_predicate(
-        &self,
-        predicate_id: proto::PredicateId,
-        predicate: ankql::ast::Predicate,
-        version: u32,
-    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
-        match self.subscription_relay {
-            Some(ref relay) => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                // no need to insert into predicate_context
-                {
-                    // update the version
-                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
-                    pending_subs.insert(predicate_id, (version, tx));
-                }
-                relay.update_predicate(predicate_id, predicate, version);
-                Some(rx)
-            }
-            None => None,
-        }
-    }
 
     pub async fn fetch_entities_from_local(
         &self,
@@ -747,22 +726,13 @@ pub trait TNodeErased: Send + Sync + 'static {
         predicate_id: proto::PredicateId,
         predicate: ankql::ast::Predicate,
         version: u32,
-    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>;
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>, anyhow::Error>;
     async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
         predicate: &ankql::ast::Predicate,
     ) -> Result<Vec<Entity>, RetrievalError>;
-    fn call_reactor_update_predicate(
-        &self,
-        subscription_id: crate::reactor::ReactorSubscriptionId,
-        predicate_id: proto::PredicateId,
-        collection_id: CollectionId,
-        predicate: ankql::ast::Predicate,
-        included_entities: Vec<Entity>,
-        version: u32,
-        emit_removes: bool,
-    ) -> Result<(), anyhow::Error>;
+    fn reactor(&self) -> &Reactor;
 }
 
 #[async_trait::async_trait]
@@ -790,8 +760,21 @@ where
         predicate_id: proto::PredicateId,
         predicate: ankql::ast::Predicate,
         version: u32,
-    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
-        self.update_remote_predicate(predicate_id, predicate, version)
+    ) -> Result<Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>, anyhow::Error> {
+        match self.subscription_relay {
+            Some(ref relay) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                // no need to insert into predicate_context
+                {
+                    // update the version
+                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
+                    pending_subs.insert(predicate_id, (version, tx));
+                }
+                relay.update_predicate(predicate_id, predicate, version)?;
+                Ok(Some(rx))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn fetch_entities_from_local(
@@ -802,18 +785,7 @@ where
         Node::fetch_entities_from_local(self, collection_id, predicate).await
     }
 
-    fn call_reactor_update_predicate(
-        &self,
-        subscription_id: crate::reactor::ReactorSubscriptionId,
-        predicate_id: proto::PredicateId,
-        collection_id: CollectionId,
-        predicate: ankql::ast::Predicate,
-        included_entities: Vec<Entity>,
-        version: u32,
-        emit_removes: bool,
-    ) -> Result<(), anyhow::Error> {
-        self.reactor.update_predicate(subscription_id, predicate_id, collection_id, predicate, included_entities, version, emit_removes)
-    }
+    fn reactor(&self) -> &Reactor { &self.0.reactor }
 }
 
 impl<SE, PA> fmt::Display for Node<SE, PA>

@@ -199,7 +199,7 @@ impl EntityLiveQuery {
         *self.0.pending_predicate.lock().unwrap() = Some((new_predicate.clone(), new_version));
 
         // 4. Call node.update_remote_predicate (synchronous)
-        let rx = self.0.node.update_remote_predicate(self.0.predicate_id, new_predicate.clone(), new_version);
+        let rx = self.0.node.update_remote_predicate(self.0.predicate_id, new_predicate.clone(), new_version)?;
 
         // Spawn task to handle async update (similar to ::new pattern)
         let me2 = self.clone();
@@ -252,7 +252,8 @@ impl EntityLiveQuery {
         // Call reactor.update_predicate via the trait
         self.0
             .node
-            .call_reactor_update_predicate(
+            .reactor()
+            .update_predicate(
                 self.0.subscription.id(),
                 self.0.predicate_id,
                 collection_id,
