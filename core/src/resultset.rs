@@ -120,7 +120,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     /// Begin a batch operation for atomic changes to the resultset
     /// All mutations happen through the returned batch object
     /// A single notification is sent when the batch is dropped (if changes were made)
-    pub fn batch(&self) -> ResultSetBatch<E> {
+    pub fn batch(&self) -> ResultSetBatch<'_, E> {
         let guard = self.0.state.lock().unwrap();
         ResultSetBatch { resultset: self, changed: false, guard: Some(guard) }
     }

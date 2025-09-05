@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, collection, CollectionId};
+use ankurah_proto::{self as proto, CollectionId};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use std::collections::HashMap;

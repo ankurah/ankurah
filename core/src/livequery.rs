@@ -3,7 +3,6 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use ankql::ast::Predicate;
 use ankurah_proto::{self as proto, CollectionId};
 
 use ankurah_signals::{
@@ -22,7 +21,6 @@ use crate::{
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},
     resultset::{EntityResultSet, ResultSet},
-    retrieval::LocalRetriever,
     storage::StorageEngine,
     Node,
 };
@@ -262,7 +260,7 @@ impl EntityLiveQuery {
                 new_version,
                 true, // emit_removes: true for local subscriptions
             )
-            .map_err(|e| RetrievalError::storage(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?;
 
         Ok(())
     }

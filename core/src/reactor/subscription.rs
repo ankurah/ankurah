@@ -1,8 +1,4 @@
-use crate::{
-    error::SubscriptionError,
-    reactor::{AbstractEntity, Reactor, ReactorUpdate},
-    resultset::EntityResultSet,
-};
+use crate::reactor::{AbstractEntity, Reactor, ReactorUpdate};
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{

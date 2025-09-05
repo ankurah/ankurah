@@ -804,7 +804,7 @@ impl WatcherSet {
                     };
 
                     let field_id = FieldId(field_name);
-                    let index = self.index_watchers.entry((collection_id.clone(), field_id)).or_insert_with(ComparisonIndex::new);
+                    let index = self.index_watchers.entry((collection_id.clone(), field_id)).or_default();
 
                     match op {
                         WatcherOp::Add => {
@@ -829,7 +829,7 @@ impl WatcherSet {
                 unimplemented!("Not sure how to implement this")
             }
             Predicate::True => {
-                let set = self.wildcard_watchers.entry(collection_id.clone()).or_insert_with(HashSet::new);
+                let set = self.wildcard_watchers.entry(collection_id.clone()).or_default();
 
                 match op {
                     WatcherOp::Add => {

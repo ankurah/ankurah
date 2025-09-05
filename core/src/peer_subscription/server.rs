@@ -5,7 +5,6 @@ use crate::{
     node::Node,
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},
-    resultset::EntityResultSet,
     retrieval::LocalRetriever,
     storage::StorageEngine,
 };
