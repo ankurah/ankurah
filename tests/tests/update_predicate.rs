@@ -33,12 +33,8 @@ async fn test_predicate_update() -> Result<()> {
     let watcher = TestWatcher::changeset();
     let _guard = albums.subscribe(&watcher);
 
-    // Should have Bravo, Charlie (sort for deterministic order)
-    let mut ids = albums.ids();
-    ids.sort();
-    let mut expected = vec![b_id, c_id];
-    expected.sort();
-    assert_eq!(ids, expected);
+    // Should have Bravo, Charlie (sort for deterministic order - update_predicate has to fetch and ulids created in the same ms)
+    assert_eq!(albums.ids_sorted(), sorted![b_id, c_id]);
     assert_eq!(watcher.quiesce().await, 0); // no changes yet
 
     // Update the predicate to be more restrictive: year > 2021 - Should remove Bravo
@@ -50,13 +46,9 @@ async fn test_predicate_update() -> Result<()> {
     // Update predicate to be less restrictive: year >= "2020"
     albums.update_predicate_wait("year >= 2020").await?;
 
-    // Should now have all 3 albums (sort for deterministic order)
-    let mut final_ids = albums.ids();
-    final_ids.sort();
-    let mut all_expected = vec![a_id, b_id, c_id];
-    all_expected.sort();
-    assert_eq!(final_ids, all_expected);
-    assert_eq!(watcher.drain(), vec![vec![(a_id, ChangeKind::Initial), (b_id, ChangeKind::Initial)]]);
+    // Should now have all 3 albums
+    assert_eq!(albums.ids_sorted(), sorted![a_id, b_id, c_id]);
+    assert_eq!(watcher.drain_sorted(), vec![sortby_t0![(a_id, ChangeKind::Initial), (b_id, ChangeKind::Initial)]]);
 
     // should have no more changes
     assert_eq!(watcher.quiesce().await, 0);
@@ -99,12 +91,8 @@ async fn test_predicate_update_inter_node() -> Result<()> {
     let watcher = TestWatcher::changeset();
     let _guard = albums.subscribe(&watcher);
 
-    // Should have Bravo, Charlie (sort for deterministic order)
-    let mut ids = albums.ids();
-    ids.sort();
-    let mut expected = vec![b_id, c_id];
-    expected.sort();
-    assert_eq!(ids, expected);
+    // Should have Bravo, Charlie (sort for deterministic order - update_predicate has to fetch and ulids created in the same ms)
+    assert_eq!(albums.ids_sorted(), sorted![b_id, c_id]);
     assert_eq!(watcher.quiesce().await, 0); // no changes yet
 
     // Update the predicate to be more restrictive: year > 2021 - Should remove Bravo
@@ -116,13 +104,9 @@ async fn test_predicate_update_inter_node() -> Result<()> {
     // Update predicate to be less restrictive: year >= "2020"
     albums.update_predicate_wait("year >= 2020").await?;
 
-    // Should now have all 3 albums (sort for deterministic order)
-    let mut final_ids = albums.ids();
-    final_ids.sort();
-    let mut all_expected = vec![a_id, b_id, c_id];
-    all_expected.sort();
-    assert_eq!(final_ids, all_expected);
-    assert_eq!(watcher.drain(), vec![vec![(a_id, ChangeKind::Initial), (b_id, ChangeKind::Initial)]]);
+    // Should now have all 3 albums (sort for deterministic order - update_predicate has to fetch and ulids created in the same ms)
+    assert_eq!(albums.ids_sorted(), sorted![a_id, b_id, c_id]);
+    assert_eq!(watcher.drain_sorted(), vec![sortby_t0![(a_id, ChangeKind::Initial), (b_id, ChangeKind::Initial)]]);
 
     // should have no more changes
     assert_eq!(watcher.quiesce().await, 0);

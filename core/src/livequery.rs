@@ -281,6 +281,11 @@ impl<R: View> LiveQuery<R> {
     pub fn loaded(&self) -> bool { self.0 .0.resultset.is_loaded() }
 
     pub fn ids(&self) -> Vec<proto::EntityId> { self.0 .0.resultset.keys().collect() }
+
+    pub fn ids_sorted(&self) -> Vec<proto::EntityId> {
+        use itertools::Itertools;
+        self.0 .0.resultset.keys().sorted().collect()
+    }
 }
 
 // Implement Signal trait - delegate to the resultset

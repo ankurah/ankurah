@@ -66,6 +66,16 @@ impl<R: View + Send + Sync + 'static> TestWatcher<ChangeSet<R>, Vec<(proto::Enti
             transform: Arc::new(|changeset: ChangeSet<R>| changeset.changes.iter().map(|c| (c.entity().id(), c.into())).collect()),
         }
     }
+
+    /// Drains and returns all accumulated changesets, sorting each changeset by the first element of the tuple
+    /// Importantly, this does not sort the list of changesets, only the items within each changeset
+    pub fn drain_sorted(&self) -> Vec<Vec<(proto::EntityId, ChangeKind)>> {
+        let mut changes = self.drain();
+        for change in changes.iter_mut() {
+            change.sort_by_key(|c| c.0);
+        }
+        changes
+    }
 }
 impl<T, U> TestWatcher<T, U> {
     pub fn notify(&self, item: T) {
@@ -168,4 +178,25 @@ impl<T: Send + 'static, U> IntoSubscribeListener<T> for &TestWatcher<T, U> {
             notify.notify_waiters();
         })
     }
+}
+
+/// Macro to create a sorted vector from a list of items
+/// Usage: sorted![1, 3, 2] -> vec![1, 2, 3]
+#[macro_export]
+macro_rules! sorted {
+    ($($item:expr),* $(,)?) => {{
+        let mut vec = vec![$($item),*];
+        vec.sort();
+        vec
+    }};
+}
+
+// Macro to create a sorted vector from a list of tuples - sorted by the first element of the tuple
+#[macro_export]
+macro_rules! sortby_t0 {
+    ($($item:expr),* $(,)?) => {{
+        let mut vec = vec![$($item),*];
+        vec.sort_by_key(|i| i.0);
+        vec
+    }};
 }
