@@ -32,6 +32,13 @@ impl SubscriptionHandler {
 
         // Subscribe to changes on this subscription
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
+            if update.initialized_predicate.is_none() && !update.items.is_empty() {
+                tracing::warn!(
+                    "SubscriptionHandler[{}] received reactor update with {} items but NO initialized_predicate - this might be from notify_change",
+                    peer_id,
+                    update.items.len()
+                );
+            }
             tracing::info!(
                 "SubscriptionHandler[{}] received reactor update with {} items, initialized_predicate: {:?}",
                 peer_id,

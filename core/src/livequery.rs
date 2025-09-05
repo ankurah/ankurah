@@ -311,8 +311,10 @@ where R: Clone + Send + Sync + 'static
         // Subscribe to the underlying ReactorUpdate stream and convert to ChangeSet<R>
 
         self.0 .0.subscription.subscribe(move |reactor_update: ReactorUpdate| {
-            // Convert ReactorUpdate to ChangeSet<R>
+            // Convert ReactorUpdate to ChangeSet<R>");
+            tracing::info!("livequery_subscribe listener: got ReactorUpdate {reactor_update:?}");
             let changeset: ChangeSet<R> = livequery_change_set_from(me.0 .0.resultset.wrap::<R>(), reactor_update);
+            tracing::info!("livequery_subscribe listener: converted to ChangeSet {changeset}");
             listener(changeset);
         })
     }

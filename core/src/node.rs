@@ -123,8 +123,9 @@ where PA: PolicyAgent
     pub(crate) predicate_context: SafeMap<proto::PredicateId, PA::ContextData>,
 
     // Pending subscriptions waiting for first remote update
-    // Maps PredicateId to (version, channel) - only one pending version per predicate
-    pub(crate) pending_predicate_subs: SafeMap<(proto::PredicateId, u32), tokio::sync::oneshot::Sender<Vec<Entity>>>,
+    // Maps PredicateId to (version, channel) - only one pending version per predicate at a time
+    pub(crate) pending_predicate_subs:
+        std::sync::Mutex<std::collections::HashMap<proto::PredicateId, (u32, tokio::sync::oneshot::Sender<Vec<Entity>>)>>,
 
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
@@ -163,7 +164,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
-            pending_predicate_subs: SafeMap::new(),
+            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }));
 
         // Set up the message sender for the subscription relay
@@ -197,7 +198,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay: None,
-            pending_predicate_subs: SafeMap::new(),
+            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -690,7 +691,8 @@ where
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.predicate_context.insert(predicate_id, cdata.clone());
                 {
-                    self.pending_predicate_subs.insert((predicate_id, version), tx);
+                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
+                    pending_subs.insert(predicate_id, (version, tx));
                 }
                 relay.subscribe_predicate(predicate_id, collection_id, predicate, cdata, version);
                 Some(rx)
@@ -710,7 +712,8 @@ where
                 // no need to insert into predicate_context
                 {
                     // update the version
-                    self.pending_predicate_subs.insert((predicate_id, version), tx);
+                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
+                    pending_subs.insert(predicate_id, (version, tx));
                 }
                 relay.update_predicate(predicate_id, predicate, version);
                 Some(rx)
@@ -774,7 +777,7 @@ where
 
         // Clean up any pending oneshot channel for this predicate
         {
-            self.pending_predicate_subs.retain(|k, _| k.0 != predicate_id);
+            self.pending_predicate_subs.lock().unwrap().remove(&predicate_id);
         }
         // Notify subscription relay for remote cleanup
         if let Some(ref relay) = self.subscription_relay {
