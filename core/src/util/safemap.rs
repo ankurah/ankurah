@@ -13,6 +13,8 @@ impl<K: Hash + Eq, V> SafeMap<K, V> {
 
     pub fn remove(&self, key: &K) -> Option<V> { self.0.write().expect("Failed to lock the map").remove(key) }
 
+    pub fn retain(&self, cb: impl Fn(&K, &V) -> bool) { self.0.write().expect("Failed to lock the map").retain(|k, v| cb(k, v)); }
+
     pub fn is_empty(&self) -> bool { self.0.read().expect("Failed to lock the map").is_empty() }
     pub fn len(&self) -> usize { self.0.read().expect("Failed to lock the map").len() }
 

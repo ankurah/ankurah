@@ -30,29 +30,10 @@ impl UpdateApplier {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
         }
 
-        // Check if we have a pending subscription for this predicate with matching version
-        let pending_tx = if let Some((predicate_id, version)) = initialized_predicate {
-            let mut pending_subs = node.pending_predicate_subs.lock().unwrap();
-            if let Some((expected_version, _)) = pending_subs.get(&predicate_id) {
-                if version == *expected_version {
-                    // Version matches - remove and resolve the pending subscription
-                    pending_subs.remove(&predicate_id).map(|(_, tx)| tx)
-                } else {
-                    // Version mismatch - this is an old update, ignore for pending_predicate_subs
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // If we have a pending subscription to resolve, do it now
-        if let Some(tx) = pending_tx {
+        if let Some(tx) = initialized_predicate.and_then(|p| node.pending_predicate_subs.remove(&p)) {
             let mut changes = Vec::new();
             let mut entities = Vec::new();
-            for update in items.clone() {
+            for update in items {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
                 Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut entities).await?;
             }
@@ -60,10 +41,7 @@ impl UpdateApplier {
             // Important to notify the reactor before sending the initial entities
             node.reactor.notify_change(changes);
             let _ = tx.send(entities); // Ignore if receiver was dropped
-        }
-
-        // Always apply updates to the reactor regardless of version matching
-        {
+        } else {
             // Use unit type to avoid accumulation
             let mut changes = Vec::new();
             for update in items {
