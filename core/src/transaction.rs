@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ankurah_proto::Event;
@@ -9,7 +10,7 @@ use crate::{
     context::TContext,
     entity::Entity,
     error::MutationError,
-    model::{Model, Mutable},
+    model::{Model, MutableBorrow},
 };
 
 use append_only_vec::AppendOnlyVec;
@@ -25,6 +26,7 @@ pub struct Transaction {
     pub(crate) dyncontext: Option<Arc<dyn TContext + Send + Sync + 'static>>,
     id: proto::TransactionId,
     entities: AppendOnlyVec<Entity>,
+    pub(crate) alive: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "wasm")]
@@ -40,7 +42,12 @@ impl Transaction {
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
-        Self { dyncontext: Some(dyncontext), id: proto::TransactionId::new(), entities: AppendOnlyVec::new() }
+        Self {
+            dyncontext: Some(dyncontext),
+            id: proto::TransactionId::new(),
+            entities: AppendOnlyVec::new(),
+            alive: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     pub(crate) fn add_entity(&self, entity: Entity) -> &Entity {
@@ -59,19 +66,19 @@ impl Transaction {
         Ok((self.id.clone(), events))
     }
 
-    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<M::Mutable<'rec>, MutationError> {
+    pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let context = self.dyncontext.as_ref().expect("Transaction already consumed");
-        let entity = context.create_entity(M::collection());
+        let entity = context.create_entity(M::collection(), self.alive.clone());
         model.initialize_new_entity(&entity);
         context.check_write(&entity)?;
 
         let entity_ref = self.add_entity(entity);
-        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity_ref))
+        Ok(MutableBorrow::new(entity_ref))
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
-    pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<M::Mutable<'rec>, RetrievalError> {
+    pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
         match self.get_trx_entity(id) {
-            Some(entity) => Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity)),
+            Some(entity) => Ok(MutableBorrow::new(entity)),
             None => {
                 // go fetch the entity from the context
                 let retrieved_entity =
@@ -81,20 +88,20 @@ impl Transaction {
                 if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
                     // if this happens, I don't think we want to refresh the entity, because it's already snapshotted in the trx
                     // and we should leave it that way to honor the consistency model
-                    Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity))
+                    Ok(MutableBorrow::new(entity))
                 } else {
-                    Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(self.add_entity(retrieved_entity.snapshot())))
+                    Ok(MutableBorrow::new(self.add_entity(retrieved_entity.snapshot(self.alive.clone()))))
                 }
             }
         }
     }
-    pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<M::Mutable<'rec>, AccessDenied> {
+    pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<MutableBorrow<'rec, M::Mutable>, AccessDenied> {
         if let Some(entity) = self.get_trx_entity(&entity.id) {
-            return Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(entity));
+            return Ok(MutableBorrow::new(entity));
         }
         self.dyncontext.as_ref().expect("Transaction already consumed").check_write(entity)?;
 
-        Ok(<M::Mutable<'rec> as Mutable<'rec>>::new(self.add_entity(entity.snapshot())))
+        Ok(MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()))))
     }
 
     #[must_use]
@@ -105,6 +112,8 @@ impl Transaction {
 
     pub fn rollback(self) {
         tracing::info!("trx.rollback");
+        // Mark transaction as no longer alive
+        self.alive.store(false, Ordering::Release);
         // The transaction will be dropped without committing
     }
 
@@ -126,6 +135,8 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
+        // Mark transaction as no longer alive when dropped
+        self.alive.store(false, Ordering::Release);
         // how do we want to do the rollback?
     }
 }

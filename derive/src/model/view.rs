@@ -18,24 +18,13 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     };
     let active_field_name_strs = model.active_field_name_strs();
 
-    let hygeine_module = quote::format_ident!("__ankurah_derive_view_impl_{}", to_snake_case(&view_name.to_string()));
-    let (use_statements, struct_attributes, impl_attributes, getter_attributes) = if cfg!(feature = "wasm") {
-        (
-            quote! {
-                use ::ankurah::derive_deps::wasm_bindgen::prelude::*;
-            },
-            quote! { #[wasm_bindgen] },
-            quote! { #[wasm_bindgen] },
-            quote! { #[wasm_bindgen(getter)] },
-        )
+    let (struct_attributes, impl_attributes, getter_attributes) = if cfg!(feature = "wasm") {
+        (quote! { #[wasm_bindgen] }, quote! { #[wasm_bindgen] }, quote! { #[wasm_bindgen(getter)] })
     } else {
-        (quote! {}, quote! {}, quote! {}, quote! {})
+        (quote! {}, quote! {}, quote! {})
     };
 
-    quote! {
-        mod #hygeine_module {
-            use super::*;
-            #use_statements
+    let expanded = quote! {
 
             #struct_attributes
             #[derive(Clone, Debug, PartialEq)]
@@ -48,7 +37,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
 
             impl ::ankurah::model::View for #view_name {
                 type Model = #name;
-                type Mutable<'rec> = #mutable_name<'rec>;
+                type Mutable = #mutable_name;
 
                 // THINK ABOUT: to_model is the only thing that forces a clone requirement
                 // Even though most Models will be clonable, maybe we shouldn't force it?
@@ -94,12 +83,29 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
             }
 
-            // TODO wasm-bindgen this
             impl #view_name {
-                pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<#mutable_name<'rec>, ankurah::policy::AccessDenied> {
+                /// Edit this entity in a transaction (Rust version - returns MutableBorrow with lifetime)
+                pub fn edit<'rec, 'trx: 'rec>(&self, trx: &'trx ankurah::transaction::Transaction) -> Result<::ankurah::model::MutableBorrow<'rec, #mutable_name>, ankurah::policy::AccessDenied> {
                     use ::ankurah::model::View;
                     // TODO - get rid of this in favor of directly cloning the entity of the ModelView struct
                     trx.edit::<#name>(&self.entity)
+                }
+            }
+
+            #impl_attributes
+            impl #view_name {
+                /// Edit this entity in a transaction (WASM version - returns owned Mutable)
+                #[cfg(feature = "wasm")]
+                #[wasm_bindgen(js_name = "edit")]
+                pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
+                    use ::ankurah::model::View;
+                    match trx.edit::<#name>(&self.entity) {
+                        Ok(mutable_borrow) => {
+                            // Extract the core mutable from the borrow wrapper
+                            Ok(mutable_borrow.into_core())
+                        }
+                        Err(e) => Err(::wasm_bindgen::JsValue::from(e.to_string()))
+                    }
                 }
             }
 
@@ -128,22 +134,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     self.entity.id()
                 }
             }
-        }
-        pub use #hygeine_module::*;
-    }
-}
-
-/// Convert a PascalCase identifier to snake_case
-fn to_snake_case(ident: &str) -> String {
-    ident
-        .chars()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            if c.is_uppercase() && i > 0 {
-                vec!['_', c.to_lowercase().next().unwrap()]
-            } else {
-                vec![c.to_lowercase().next().unwrap()]
-            }
-        })
-        .collect()
+    };
+    println!("Expanded: {}", quote!(#expanded));
+    expanded.into()
 }

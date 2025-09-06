@@ -1,0 +1,30 @@
+BackendConfig(
+    backend_name: "LWWBackend",
+    values: [
+        ValueConfig(
+            type_pattern: "LWW(?:<(.+)>)?",
+            fully_qualified_type: "::ankurah::property::value::LWW<{T}>",
+            accepts: ".*",
+            generic_params: ["T"],
+            materialized_pattern: "LWW{T}",
+            methods: [
+                Method(
+                    name: "set",
+                    args: [("value", "{T}")],
+                    return_type: "Result<(), ::ankurah::property::PropertyError>",
+                ),
+                Method(
+                    name: "get", 
+                    args: [],
+                    return_type: "Result<{T}, ::ankurah::property::PropertyError>",
+                ),
+                Method(
+                    name: "get_value",
+                    args: [],
+                    return_type: "Option<::ankurah::property::PropertyValue>",
+                    wasm: false,
+                ),
+            ],
+        ),
+    ],
+)

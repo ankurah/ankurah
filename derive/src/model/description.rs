@@ -10,6 +10,9 @@ pub struct ModelDescription {
     // Field collections - only store what we actually parsed
     active_fields: Vec<syn::Field>,
     ephemeral_fields: Vec<syn::Field>,
+
+    // Backend manager for configuration lookup
+    backend_manager: crate::backends::BackendManager,
 }
 
 impl ModelDescription {
@@ -36,7 +39,10 @@ impl ModelDescription {
             }
         }
 
-        Ok(Self { name, active_fields, ephemeral_fields })
+        // Load backend configurations at compile time
+        let backend_manager = crate::backends::BackendManager::new()?;
+
+        Ok(Self { name, active_fields, ephemeral_fields, backend_manager })
     }
 
     // Basic identifier accessors
@@ -51,13 +57,26 @@ impl ModelDescription {
     pub fn livequery_name(&self) -> Ident { format_ident!("{}LiveQuery", self.name) }
 
     // Computed accessors for active fields
+    pub fn active_fields(&self) -> &[syn::Field] { &self.active_fields }
     pub fn active_field_visibility(&self) -> Vec<&Visibility> { self.active_fields.iter().map(|f| &f.vis).collect() }
     pub fn active_field_names(&self) -> Vec<&Option<Ident>> { self.active_fields.iter().map(|f| &f.ident).collect() }
     pub fn active_field_name_strs(&self) -> Vec<String> {
         self.active_fields.iter().map(|f| f.ident.as_ref().unwrap().to_string().to_lowercase()).collect()
     }
     pub fn projected_field_types(&self) -> Vec<&Type> { self.active_fields.iter().map(|f| &f.ty).collect() }
-    pub fn active_field_types(&self) -> syn::Result<Vec<syn::Type>> { self.active_fields.iter().map(get_active_type).collect() }
+    pub fn active_field_types(&self) -> syn::Result<Vec<syn::Type>> {
+        let mut results = Vec::new();
+        for field in &self.active_fields {
+            match get_active_type(field, &self.backend_manager) {
+                Ok(active_type) => results.push(active_type),
+                Err(e) => {
+                    let field_name = field.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "unnamed".to_string());
+                    return Err(syn::Error::new_spanned(field, format!("Error processing field '{}': {}", field_name, e)));
+                }
+            }
+        }
+        Ok(results)
+    }
     pub fn projected_field_types_turbofish(&self) -> Vec<TokenStream> { self.active_fields.iter().map(|f| as_turbofish(&f.ty)).collect() }
     pub fn active_field_types_turbofish(&self) -> syn::Result<Vec<proc_macro2::TokenStream>> {
         let active_types = self.active_field_types()?;
@@ -68,10 +87,12 @@ impl ModelDescription {
     pub fn ephemeral_field_names(&self) -> Vec<&Option<Ident>> { self.ephemeral_fields.iter().map(|f| &f.ident).collect() }
     pub fn ephemeral_field_types(&self) -> Vec<&Type> { self.ephemeral_fields.iter().map(|f| &f.ty).collect() }
     pub fn ephemeral_field_visibility(&self) -> Vec<&Visibility> { self.ephemeral_fields.iter().map(|f| &f.vis).collect() }
+
+    // Backend configuration accessors
+    pub fn backend_manager(&self) -> &crate::backends::BackendManager { &self.backend_manager }
 }
 
-static ACTIVE_TYPE_MOD_PREFIX: &str = "::ankurah::property::value";
-fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
+fn get_active_type(field: &syn::Field, backend_manager: &crate::backends::BackendManager) -> Result<syn::Type, syn::Error> {
     let active_type_ident = format_ident!("active_type");
 
     let mut active_type = None;
@@ -79,30 +100,57 @@ fn get_active_type(field: &syn::Field) -> Result<syn::Type, syn::Error> {
     if let Some(active_type_attr) = field.attrs.iter().find(|attr| attr.path().get_ident() == Some(&active_type_ident)) {
         active_type = Some(active_type_attr.parse_args::<syn::Type>()?);
     } else {
-        // Check for exact type matches and provide default Active types
-        if let Type::Path(type_path) = &field.ty {
-            let path_str = quote!(#type_path).to_string().replace(" ", "");
-            match path_str.as_str() {
-                // Add more default mappings here as needed
-                "String" | "std::string::String" => {
-                    let path = format!("{}::YrsString", ACTIVE_TYPE_MOD_PREFIX);
-                    let yrs = syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"))?;
-                    active_type = Some(yrs);
-                }
-                _ => {
-                    // Everything else should use `LWW`` by default.
-                    // TODO: Return a list of compile_error! for these types to specify
-                    // that these need to be `Serialize + for<'de> Deserialize<'de>``
-                    let path = format!("{}::LWW", ACTIVE_TYPE_MOD_PREFIX);
-                    let lww = syn::parse_str(&path).map_err(|_| syn::Error::new_spanned(&field.ty, "Failed to create YrsString path"))?;
-                    active_type = Some(lww);
-                }
+        // Use backend manager for type inference
+        if let Some(backend_desc) = backend_manager.infer_active_type(&field.ty) {
+            let fully_qualified_type = backend_desc.value_config.fully_qualified_type;
+            let mut type_str = fully_qualified_type;
+
+            // Substitute generic parameters
+            for (param, concrete_type) in &backend_desc.concrete_types {
+                let placeholder = format!("{{{}}}", param);
+                type_str = type_str.replace(&placeholder, concrete_type);
             }
-        };
+
+            active_type =
+                Some(syn::parse_str(&type_str).map_err(|e| {
+                    syn::Error::new_spanned(&field.ty, format!("Failed to parse inferred active type '{}': {}", type_str, e))
+                })?);
+        }
     }
 
     if let Some(active_type) = active_type {
-        Ok(ActiveFieldType::convert_type_with_projected(&active_type, &field.ty))
+        // Use backend matching system for explicit attributes too
+        if let Some(backend_desc) = backend_manager.describe_active_type(&active_type) {
+            // Found a match in the backend configs - use the fully qualified type
+            let fully_qualified_type = backend_desc.value_config.fully_qualified_type;
+            let mut type_str = fully_qualified_type;
+
+            // Substitute generic parameters
+            for (param, concrete_type) in &backend_desc.concrete_types {
+                let placeholder = format!("{{{}}}", param);
+                type_str = type_str.replace(&placeholder, concrete_type);
+            }
+
+            // If no generics were captured, use the field type as T
+            if backend_desc.concrete_types.is_empty() && backend_desc.value_config.generic_params.len() == 1 {
+                let param = &backend_desc.value_config.generic_params[0];
+                let field_type = &field.ty;
+                let field_type_str = quote!(#field_type).to_string().replace(" ", "");
+                let placeholder = format!("{{{}}}", param);
+                type_str = type_str.replace(&placeholder, &field_type_str);
+            }
+
+            syn::parse_str(&type_str).map_err(|e| {
+                syn::Error::new_spanned(&active_type, format!("Failed to parse backend-resolved active type '{}': {}", type_str, e))
+            })
+        } else {
+            // Fallback to old behavior if no backend match found
+            if ActiveFieldType::has_generics(&active_type) {
+                Ok(active_type)
+            } else {
+                Ok(ActiveFieldType::convert_type_with_projected(&active_type, &field.ty))
+            }
+        }
     } else {
         // If we get here, we don't have a supported default Active type
         let field_name = field.ident.as_ref().map(|i| i.to_string()).unwrap_or_else(|| "unnamed".to_string());
@@ -129,6 +177,15 @@ impl ActiveFieldType {
         let mut base = Self::from_type(ty);
         base.with_projected(projected);
         base.as_type()
+    }
+
+    pub fn has_generics(ty: &syn::Type) -> bool {
+        if let syn::Type::Path(path) = ty {
+            if let Some(last_segment) = path.path.segments.last() {
+                return matches!(last_segment.arguments, syn::PathArguments::AngleBracketed(_));
+            }
+        }
+        false
     }
 
     pub fn from_type(ty: &syn::Type) -> Self {

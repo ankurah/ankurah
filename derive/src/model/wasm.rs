@@ -131,6 +131,13 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
                     );
                 })
             }
+
+            /// Update the predicate for this query and return a promise that resolves when complete
+            pub async fn update_predicate(&self, new_predicate: &str) -> Result<(), ::wasm_bindgen::JsValue> {
+                self.0.update_predicate_wait(new_predicate)
+                    .await
+                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
+            }
         }
     }
 }

@@ -8,10 +8,19 @@ pub struct Album {
 use serde::{Deserialize, Serialize};
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Entry {
+    total: i32, // defaults to LWW for numbers
+    #[active_type(LWW)]
+    pub count: i32,
+    #[active_type(LWW<i32>)]
+    pub timestamp: i32,
+    #[active_type(LWW)]
     pub added: String,
+    #[active_type(LWW<String>)]
     pub ip_address: String,
-    pub node_id: String,
-    pub complex: Complex,
+    pub node_id: String, // defaults to YrsString for strings
+    #[active_type(YrsString<String>)]
+    pub description: String,
+    // pub complex: Complex,  // Commented out to focus on basic WASM wrapper generation
 }
 
 use ankurah::Property;

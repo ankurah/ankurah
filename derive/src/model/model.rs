@@ -11,13 +11,13 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
     let active_field_name_strs = model.active_field_name_strs();
     let active_field_types_turbofish = match model.active_field_types_turbofish() {
         Ok(types) => types,
-        Err(_) => return quote! { compile_error!("Failed to generate active field types"); },
+        Err(e) => return e.into_compile_error(),
     };
 
     quote! {
         impl ::ankurah::model::Model for #name {
             type View = #view_name;
-            type Mutable<'rec> = #mutable_name<'rec>;
+            type Mutable = #mutable_name;
             fn collection() -> ankurah::proto::CollectionId {
                 #collection_str.into()
             }

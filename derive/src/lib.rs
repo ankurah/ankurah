@@ -1,3 +1,4 @@
+mod backends;
 mod model;
 mod predicate;
 mod property;
@@ -20,6 +21,13 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
+    let wasm_imports = if cfg!(feature = "wasm") {
+        quote! { use ::ankurah::derive_deps::wasm_bindgen::prelude::*; }
+    } else {
+        quote! {}
+    };
+
     // Generate implementations using the modular approach
     let model_impl = model::model::model_impl(&desc);
     let view_impl = model::view::view_impl(&desc);
@@ -30,13 +38,34 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let wasm_impl = quote! {};
 
     let expanded = quote! {
-        #model_impl
-        #view_impl
-        #mutable_impl
-        #wasm_impl
+        mod #hygiene_module {
+            use super::*;
+            #wasm_imports
+
+            #model_impl
+            #view_impl
+            #mutable_impl
+            #wasm_impl
+        }
+        pub use #hygiene_module::*;
     };
 
     expanded.into()
+}
+
+/// Convert a PascalCase identifier to snake_case
+fn to_snake_case(ident: &str) -> String {
+    ident
+        .chars()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            if c.is_uppercase() && i > 0 {
+                vec!['_', c.to_lowercase().next().unwrap()]
+            } else {
+                vec![c.to_lowercase().next().unwrap()]
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "wasm")]

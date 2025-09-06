@@ -11,7 +11,7 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -37,10 +37,10 @@ where
 #[async_trait]
 pub trait TContext {
     fn node_id(&self) -> proto::EntityId;
-    /// Create a brand new entity, and add it to the WeakEntitySet
+    /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
-    fn create_entity(&self, collection: proto::CollectionId) -> Entity;
+    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
@@ -53,7 +53,10 @@ pub trait TContext {
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn create_entity(&self, collection: proto::CollectionId) -> Entity { self.node.entities.create(collection) }
+    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        let primary_entity = self.node.entities.create(collection);
+        primary_entity.snapshot(trx_alive)
+    }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
         self.get_entity(collection, id, cached).await
@@ -262,7 +265,7 @@ where
 
             let collection_id = &attested_event.payload.collection;
             // If this entity has an upstream, propagate the changes
-            if let Some(ref upstream) = entity.upstream {
+            if let crate::entity::EntityKind::Transacted { upstream, .. } = &entity.kind {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 upstream.apply_event(&retriever, &attested_event.payload).await?;
             }

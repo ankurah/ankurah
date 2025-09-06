@@ -20,7 +20,7 @@ use wasm_bindgen;
 /// Schema is defined primarily by the Model object, and the View is derived from that via macro.
 pub trait Model {
     type View: View;
-    type Mutable<'trx>: Mutable<'trx>;
+    type Mutable: Mutable;
     fn collection() -> CollectionId;
     // TODO - this seems to be necessary, but I don't understand why
     // Backend fields should be getting initialized on demand when the values are set
@@ -30,7 +30,7 @@ pub trait Model {
 /// A read only view of an Entity which offers typed accessors
 pub trait View {
     type Model: Model;
-    type Mutable<'trx>: Mutable<'trx>;
+    type Mutable: Mutable;
     fn id(&self) -> EntityId { self.entity().id() }
 
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
@@ -39,16 +39,39 @@ pub trait View {
     fn to_model(&self) -> Result<Self::Model, PropertyError>;
 }
 
+/// A lifetime-constrained wrapper around a Mutable for compile-time transaction safety
+#[derive(Debug)]
+pub struct MutableBorrow<'rec, T: Mutable> {
+    mutable: T,
+    _entity_ref: &'rec Entity,
+}
+
+impl<'rec, T: Mutable> MutableBorrow<'rec, T> {
+    pub fn new(entity_ref: &'rec Entity) -> Self { Self { mutable: T::new(entity_ref.clone()), _entity_ref: entity_ref } }
+
+    /// Extract the core mutable (for WASM usage)
+    pub fn into_core(self) -> T { self.mutable }
+}
+
+impl<'rec, T: Mutable> std::ops::Deref for MutableBorrow<'rec, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target { &self.mutable }
+}
+
+impl<'rec, T: Mutable> std::ops::DerefMut for MutableBorrow<'rec, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.mutable }
+}
+
 /// A mutable Model instance for an Entity with typed accessors.
 /// It is associated with a transaction, and may not outlive said transaction.
-pub trait Mutable<'rec> {
+pub trait Mutable {
     type Model: Model;
     type View: View;
     fn id(&self) -> EntityId { self.entity().id() }
     fn collection() -> CollectionId { <Self::Model as Model>::collection() }
 
     fn entity(&self) -> &Entity;
-    fn new(inner: &'rec Entity) -> Self
+    fn new(entity: Entity) -> Self
     where Self: Sized;
 
     fn state(&self) -> Result<State, StateError> { self.entity().to_state() }
@@ -56,11 +79,11 @@ pub trait Mutable<'rec> {
     fn read(&self) -> Self::View {
         let inner = self.entity();
 
-        let new_inner = match &inner.upstream {
+        let new_inner = match &inner.kind {
             // If there is an upstream, use it
-            Some(upstream) => upstream.clone(),
+            crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
             // Else we're a new Entity, and we have to rely on the commit to add this to the node
-            None => inner.clone(),
+            crate::entity::EntityKind::Primary => inner.clone(),
         };
 
         Self::View::from_entity(new_inner)

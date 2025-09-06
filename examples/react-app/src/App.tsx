@@ -5,7 +5,6 @@ import {
   ctx,
   ws_client,
   EntryView,
-  edit_entry,
 } from "example-wasm-bindings";
 import { useMemo } from "react";
 
@@ -97,19 +96,23 @@ const App: React.FC = signalObserver(() => {
     (async () => {
       const transaction = ctx().begin();
       await Entry.create(transaction, {
+        total: 42,
+        count: 1,
+        timestamp: Math.floor(Date.now() / 1000), // Unix timestamp in seconds
         added: "2024-01-01",
         ip_address: "127.0.0.1",
         node_id: ctx().node_id().to_base64(),
-        complex: {
-          name: "wesh",
-          value: 123,
-          thing: {
-            Bravo: {
-              b: "ça dit quoi",
-              c: 123,
-            },
-          },
-        },
+        description: "Test entry created from React",
+        // complex: {
+        //   name: "wesh",
+        //   value: 123,
+        //   thing: {
+        //     Bravo: {
+        //       b: "ça dit quoi",
+        //       c: 123,
+        //     },
+        //   },
+        // },
       });
       transaction.commit();
     })();
@@ -135,7 +138,7 @@ const App: React.FC = signalObserver(() => {
               <Th>Date Connected</Th>
               <Th>IP Address</Th>
               <Th>Node ID</Th>
-              <Th>Complex</Th>
+              <Th>Description</Th>
             </tr>
           </thead>
           <tbody>
@@ -158,14 +161,38 @@ interface EntryRowProps {
 
 const EntryRow: React.FC<EntryRowProps> = signalObserver(({ entry }) => {
   console.log("RENDER EntryRow");
+
+  const handleEntryClick = async () => {
+    try {
+      // Create a new transaction
+      const transaction = ctx().begin();
+
+      // Edit the entry to get a mutable version
+      const mutableEntry = entry.edit(transaction);
+
+      // Mutate the entry using the config-driven WASM wrappers
+      const ipAddress = mutableEntry.ip_address; // Returns LWWString wrapper (getter)
+      await ipAddress.set("192.168.1." + Math.floor(Math.random() * 255));
+
+      const nodeId = mutableEntry.node_id; // Returns YrsStringString wrapper (getter)
+      nodeId.insert(0, "EDITED-");
+
+      // Commit the transaction
+      await transaction.commit();
+
+      console.log("Entry updated successfully!");
+    } catch (error) {
+      console.error("Failed to update entry:", error);
+    }
+  };
+
   return (
-    <Tr onClick={() => edit_entry(entry)} style={{ cursor: "pointer" }}>
-      {/* These are not currently calling signal::Get, because they are using FromActiveType */}
+    <Tr onClick={handleEntryClick} style={{ cursor: "pointer" }}>
       <Td>{entry.id().as_string()}</Td>
       <Td>{entry.added}</Td>
       <Td>{entry.ip_address}</Td>
       <Td>{entry.node_id}</Td>
-      <Td>{JSON.stringify(entry.complex)}</Td>
+      <Td>{entry.description}</Td>
     </Tr>
   );
 });

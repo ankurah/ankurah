@@ -1,0 +1,39 @@
+BackendConfig(
+    backend_name: "YrsBackend",
+    values: [
+        ValueConfig(
+            type_pattern: "YrsString(?:<(.+)>)?",
+            fully_qualified_type: "::ankurah::property::value::YrsString<{T}>",
+            accepts: "^String$",
+            generic_params: ["T"],
+            materialized_pattern: "YrsString{T}",
+            methods: [
+                Method(
+                    name: "value",
+                    args: [],
+                    return_type: "Option<String>",
+                ),
+                Method(
+                    name: "insert",
+                    args: [("index", "u32"), ("value", "&str")],
+                    return_type: "Result<(), ::ankurah::error::MutationError>",
+                ),
+                Method(
+                    name: "delete",
+                    args: [("index", "u32"), ("length", "u32")],
+                    return_type: "Result<(), ::ankurah::error::MutationError>",
+                ),
+                Method(
+                    name: "overwrite",
+                    args: [("start", "u32"), ("length", "u32"), ("value", "&str")],
+                    return_type: "Result<(), ::ankurah::error::MutationError>",
+                ),
+                Method(
+                    name: "replace",
+                    args: [("value", "&str")],
+                    return_type: "Result<(), ::ankurah::error::MutationError>",
+                ),
+            ],
+        ),
+    ],
+)
