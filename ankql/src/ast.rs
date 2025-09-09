@@ -30,12 +30,12 @@ pub enum Identifier {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
     pub predicate: Predicate,
-    pub order_by: Option<Vec<OrderByClause>>,
+    pub order_by: Option<Vec<OrderByItem>>,
     pub limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OrderByClause {
+pub struct OrderByItem {
     pub identifier: Identifier,
     pub direction: OrderDirection,
 }
@@ -73,6 +73,12 @@ impl std::fmt::Display for Predicate {
             Ok(sql) => write!(f, "{}", sql),
             Err(e) => write!(f, "SQL Error: {}", e),
         }
+    }
+}
+
+impl Selection {
+    pub fn assume_null(&self, columns: &[String]) -> Self {
+        Self { predicate: self.predicate.assume_null(columns), order_by: self.order_by.clone(), limit: self.limit.clone() }
     }
 }
 

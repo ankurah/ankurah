@@ -92,7 +92,7 @@ impl SubscriptionHandler {
         selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
         let storage_collection = node.collections.get(&collection_id).await?;
 
-        let initial_states = storage_collection.fetch_states(&selection.predicate).await?;
+        let initial_states = storage_collection.fetch_states(&selection).await?;
         let retriever = LocalRetriever::new(storage_collection);
 
         let mut initial_entities = Vec::with_capacity(initial_states.len());

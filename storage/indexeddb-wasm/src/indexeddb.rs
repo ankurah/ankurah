@@ -289,7 +289,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let collection_id = self.collection_id.clone();
 
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
@@ -331,7 +331,7 @@ impl StorageCollection for IndexedDBBucket {
                 // Create entity to evaluate predicate
                 let entity = TemporaryEntity::new(id, collection_id.clone(), &attested_state.payload.state)?;
                 // Apply predicate filter
-                if evaluate_predicate(&entity, predicate)? {
+                if evaluate_predicate(&entity, &selection.predicate)? {
                     output.push(attested_state);
                 }
 
