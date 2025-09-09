@@ -25,12 +25,12 @@ fn debug_print_pairs(pairs: Pairs<grammar::Rule>) {
     }
 }
 
-/// Parse a selection expression into a predicate AST.
-/// The selection must be a valid boolean expression using AND, OR, and comparison operators.
-pub fn parse_selection(input: &str) -> Result<ast::Predicate, ParseError> {
+/// Parse a selection expression into a Selection AST.
+/// The selection includes a predicate and optional ORDER BY and LIMIT clauses.
+pub fn parse_selection(input: &str) -> Result<ast::Selection, ParseError> {
     // TODO: Improve grammar to handle these cases more elegantly
     if input.trim().is_empty() {
-        return Ok(ast::Predicate::True);
+        return Ok(ast::Selection { predicate: ast::Predicate::True, order_by: None, limit: None });
     }
 
     let pairs = grammar::AnkqlParser::parse(grammar::Rule::Selection, input).map_err(|e| ParseError::SyntaxError(format!("{}", e)))?;
@@ -38,13 +38,31 @@ pub fn parse_selection(input: &str) -> Result<ast::Predicate, ParseError> {
     #[cfg(test)]
     debug_print_pairs(pairs.clone());
 
-    // Since Selection is a silent rule (_), we get the Expr directly
-    let expr = pairs.into_iter().next().ok_or(ParseError::EmptyExpression)?;
-    if expr.as_rule() != grammar::Rule::Expr {
-        return Err(ParseError::UnexpectedRule { expected: "Expr", got: expr.as_rule() });
+    let mut predicate = None;
+    let mut order_by = None;
+    let mut limit = None;
+
+    for pair in pairs {
+        match pair.as_rule() {
+            grammar::Rule::Expr => {
+                predicate = Some(parse_expr(pair)?);
+            }
+            grammar::Rule::OrderByClause => {
+                order_by = Some(parse_order_by_clause(pair)?);
+            }
+            grammar::Rule::LimitClause => {
+                limit = Some(parse_limit_clause(pair)?);
+            }
+            grammar::Rule::EOI => {} // End of input, ignore
+            _ => {
+                return Err(ParseError::UnexpectedRule { expected: "Expr, OrderByClause, or LimitClause", got: pair.as_rule() });
+            }
+        }
     }
 
-    parse_expr(expr)
+    let predicate = predicate.ok_or(ParseError::EmptyExpression)?;
+
+    Ok(ast::Selection { predicate, order_by, limit })
 }
 
 /// Parse a boolean expression, which can be a comparison, AND, or OR expression
@@ -77,14 +95,8 @@ fn parse_expr(pair: Pair<grammar::Rule>) -> Result<ast::Predicate, ParseError> {
     while let Some(op) = pairs.next() {
         match op.as_rule() {
             grammar::Rule::IsNullPostfix => {
-                // Check if this is "IS NULL" or "IS NOT NULL" by looking at inner rules
-                let mut is_not = false;
-                for inner in op.into_inner() {
-                    if inner.as_rule() == grammar::Rule::NotFlag {
-                        is_not = true;
-                        break;
-                    }
-                }
+                // Check if this is "IS NULL" or "IS NOT NULL" by examining the text
+                let is_not = op.as_str().to_uppercase().contains("NOT");
 
                 let is_null = ast::Expr::Predicate(ast::Predicate::IsNull(Box::new(result)));
                 result = if is_not { ast::Expr::Predicate(ast::Predicate::Not(Box::new(is_null.try_into()?))) } else { is_null };
@@ -272,6 +284,60 @@ fn parse_number(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     Ok(ast::Expr::Literal(ast::Literal::Integer(num)))
 }
 
+/// Parse a LIMIT clause
+fn parse_limit_clause(pair: Pair<grammar::Rule>) -> Result<u64, ParseError> {
+    if pair.as_rule() != grammar::Rule::LimitClause {
+        return Err(ParseError::UnexpectedRule { expected: "LimitClause", got: pair.as_rule() });
+    }
+
+    // Since LimitClause is compound atomic ($), we can access the inner Unsigned token directly
+    let unsigned_pair = pair
+        .into_inner()
+        .find(|p| p.as_rule() == grammar::Rule::Unsigned)
+        .ok_or(ParseError::InvalidPredicate("Missing limit value".into()))?;
+
+    let limit =
+        unsigned_pair.as_str().trim().parse::<u64>().map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse limit: {}", e)))?;
+
+    Ok(limit)
+}
+
+fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByClause>, ParseError> {
+    if pair.as_rule() != grammar::Rule::OrderByClause {
+        return Err(ParseError::UnexpectedRule { expected: "OrderByClause", got: pair.as_rule() });
+    }
+
+    // Since OrderByClause is compound atomic ($), we can access the inner tokens directly
+    let inner_pairs: Vec<_> = pair.into_inner().collect();
+
+    let identifier_pair = inner_pairs
+        .iter()
+        .find(|p| p.as_rule() == grammar::Rule::Identifier)
+        .ok_or(ParseError::InvalidPredicate("Missing column name in ORDER BY".into()))?;
+
+    let identifier_str = identifier_pair.as_str().trim();
+
+    // Only simple identifiers are supported in ORDER BY (no dotted identifiers)
+    if identifier_str.contains('.') {
+        return Err(ParseError::InvalidPredicate("Dotted identifiers are not supported in ORDER BY clauses".into()));
+    }
+
+    let identifier = ast::Identifier::Property(identifier_str.to_string());
+
+    let direction = inner_pairs
+        .iter()
+        .find(|p| p.as_rule() == grammar::Rule::OrderDirection)
+        .map(|p| match p.as_str().trim().to_uppercase().as_str() {
+            "ASC" => Ok(ast::OrderDirection::Asc),
+            "DESC" => Ok(ast::OrderDirection::Desc),
+            _ => Err(ParseError::InvalidPredicate(format!("Invalid order direction: {}", p.as_str()))),
+        })
+        .transpose()?
+        .unwrap_or(ast::OrderDirection::Asc); // Default
+
+    Ok(vec![ast::OrderByClause { identifier, direction }])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,13 +345,17 @@ mod tests {
     #[test]
     fn test_parse_selection_status_active() {
         let input = r#"status = 'active'"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
-            ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
-                operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+            selection,
+            ast::Selection {
+                predicate: ast::Predicate::Comparison {
+                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                    operator: ast::ComparisonOperator::Equal,
+                    right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                },
+                order_by: None,
+                limit: None,
             }
         );
     }
@@ -293,30 +363,34 @@ mod tests {
     #[test]
     fn test_parse_selection_user_and_status() {
         let input = r#"user = 123 AND status = 'active'"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
-            ast::Predicate::And(
-                Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
-                    operator: ast::ComparisonOperator::Equal,
-                    right: Box::new(ast::Expr::Literal(ast::Literal::Integer(123)))
-                }),
-                Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
-                    operator: ast::ComparisonOperator::Equal,
-                    right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
-                })
-            )
+            selection,
+            ast::Selection {
+                predicate: ast::Predicate::And(
+                    Box::new(ast::Predicate::Comparison {
+                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
+                        operator: ast::ComparisonOperator::Equal,
+                        right: Box::new(ast::Expr::Literal(ast::Literal::Integer(123)))
+                    }),
+                    Box::new(ast::Predicate::Comparison {
+                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                        operator: ast::ComparisonOperator::Equal,
+                        right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+                    })
+                ),
+                order_by: None,
+                limit: None,
+            }
         );
     }
 
     #[test]
     fn test_parse_selection_user_or_and_status() {
         let input = r#"(user = 123 OR user = 456) AND status = 'active'"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::And(
                 Box::new(ast::Predicate::Or(
                     Box::new(ast::Predicate::Comparison {
@@ -342,16 +416,19 @@ mod tests {
     #[test]
     fn test_parse_selection_status_is_null() {
         let input = r#"status IS NULL"#;
-        let predicate = parse_selection(input).unwrap();
-        assert_eq!(predicate, ast::Predicate::IsNull(Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string())))));
+        let selection = parse_selection(input).unwrap();
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::IsNull(Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))))
+        );
     }
 
     #[test]
     fn test_parse_selection_status_is_not_null() {
         let input = r#"status IS NOT NULL"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::Not(Box::new(ast::Predicate::IsNull(Box::new(ast::Expr::Identifier(ast::Identifier::Property(
                 "status".to_string()
             ))))))
@@ -361,9 +438,9 @@ mod tests {
     #[test]
     fn unary_not_parenthesized() {
         let input = r#"NOT (status = 'active')"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::Not(Box::new(ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
@@ -385,23 +462,23 @@ mod tests {
     #[test]
     fn test_parse_empty_string() {
         let input = "";
-        let predicate = parse_selection(input).unwrap();
-        assert_eq!(predicate, ast::Predicate::True);
+        let selection = parse_selection(input).unwrap();
+        assert_eq!(selection.predicate, ast::Predicate::True);
     }
 
     #[test]
     fn test_parse_true_literal() {
         let input = "true";
-        let predicate = parse_selection(input).unwrap();
-        assert_eq!(predicate, ast::Predicate::True);
+        let selection = parse_selection(input).unwrap();
+        assert_eq!(selection.predicate, ast::Predicate::True);
     }
 
     #[test]
     fn test_parse_selection_in_clause() {
         let input = r#"status IN ('active', 'pending')"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
                 operator: ast::ComparisonOperator::In,
@@ -416,9 +493,9 @@ mod tests {
     #[test]
     fn test_parse_selection_in_clause_numbers() {
         let input = r#"user_id IN (1, 2, 3)"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
                 operator: ast::ComparisonOperator::In,
@@ -434,9 +511,9 @@ mod tests {
     #[test]
     fn test_comparison_to_true() {
         let input = r#"bool_field = true"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
@@ -448,9 +525,9 @@ mod tests {
     #[test]
     fn test_comparison_to_false() {
         let input = r#"bool_field <> false"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::NotEqual,
@@ -462,9 +539,9 @@ mod tests {
     #[test]
     fn test_comparison_to_left_operand_boolean() {
         let input = r#"false <> bool_field"#;
-        let predicate = parse_selection(input).unwrap();
+        let selection = parse_selection(input).unwrap();
         assert_eq!(
-            predicate,
+            selection.predicate,
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Literal(ast::Literal::Boolean(false))),
                 operator: ast::ComparisonOperator::NotEqual,
@@ -477,7 +554,7 @@ mod tests {
     fn test_placeholders() -> anyhow::Result<()> {
         // Single literal placeholder in comparison
         assert_eq!(
-            parse_selection("user_id = ?")?,
+            parse_selection("user_id = ?")?.predicate,
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
@@ -487,7 +564,7 @@ mod tests {
 
         // Multiple literal placeholders in AND expression
         assert_eq!(
-            parse_selection("user_id = ? AND status = ?")?,
+            parse_selection("user_id = ? AND status = ?")?.predicate,
             ast::Predicate::And(
                 Box::new(ast::Predicate::Comparison {
                     left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
@@ -504,7 +581,7 @@ mod tests {
 
         // Literal placeholders in IN clause
         assert_eq!(
-            parse_selection("status IN (?, ?, ?)")?,
+            parse_selection("status IN (?, ?, ?)")?.predicate,
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
                 operator: ast::ComparisonOperator::In,
@@ -514,22 +591,22 @@ mod tests {
 
         // predicate placeholders connected by AND
         assert_eq!(
-            parse_selection("? AND ?")?,
+            parse_selection("? AND ?")?.predicate,
             ast::Predicate::And(Box::new(ast::Predicate::Placeholder), Box::new(ast::Predicate::Placeholder))
         );
 
         // predicate placeholders connected by OR
         assert_eq!(
-            parse_selection("? OR ?")?,
+            parse_selection("? OR ?")?.predicate,
             ast::Predicate::Or(Box::new(ast::Predicate::Placeholder), Box::new(ast::Predicate::Placeholder))
         );
 
         // Test a single predicate placeholder
-        assert_eq!(parse_selection("?")?, ast::Predicate::Placeholder);
+        assert_eq!(parse_selection("?")?.predicate, ast::Predicate::Placeholder);
 
         // test a mix of predicate and literal placeholders
         assert_eq!(
-            parse_selection("? AND foo = ?")?,
+            parse_selection("? AND foo = ?")?.predicate,
             ast::Predicate::And(
                 Box::new(ast::Predicate::Placeholder),
                 Box::new(ast::Predicate::Comparison {
@@ -546,11 +623,200 @@ mod tests {
     #[test]
     fn test_boolean_literals() -> anyhow::Result<()> {
         // Test that "true" parses correctly through the TryFrom path
-        assert_eq!(parse_selection("true")?, ast::Predicate::True);
+        assert_eq!(parse_selection("true")?.predicate, ast::Predicate::True);
 
         // Test that "false" parses correctly through the TryFrom path
-        assert_eq!(parse_selection("false")?, ast::Predicate::False);
+        assert_eq!(parse_selection("false")?.predicate, ast::Predicate::False);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_order_by_basic() -> anyhow::Result<()> {
+        let selection = parse_selection("status = 'active' ORDER BY name")?;
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+            }
+        );
+        assert_eq!(
+            selection.order_by,
+            Some(vec![ast::OrderByClause {
+                identifier: ast::Identifier::Property("name".to_string()),
+                direction: ast::OrderDirection::Asc
+            }])
+        );
+        assert_eq!(selection.limit, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_with_direction() -> anyhow::Result<()> {
+        let selection = parse_selection("true ORDER BY created_at DESC")?;
+        assert_eq!(selection.predicate, ast::Predicate::True);
+        assert_eq!(
+            selection.order_by,
+            Some(vec![ast::OrderByClause {
+                identifier: ast::Identifier::Property("created_at".to_string()),
+                direction: ast::OrderDirection::Desc
+            }])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_dotted_identifier_not_supported() -> anyhow::Result<()> {
+        // Dotted identifiers are intentionally not supported in ORDER BY
+        let result = parse_selection("true ORDER BY user.name ASC");
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_limit_basic() -> anyhow::Result<()> {
+        let selection = parse_selection("status = 'active' LIMIT 10")?;
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
+            }
+        );
+        assert_eq!(selection.order_by, None);
+        assert_eq!(selection.limit, Some(10));
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_and_limit() -> anyhow::Result<()> {
+        let selection = parse_selection("user_id > 100 ORDER BY created_at DESC LIMIT 5")?;
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                operator: ast::ComparisonOperator::GreaterThan,
+                right: Box::new(ast::Expr::Literal(ast::Literal::Integer(100)))
+            }
+        );
+        assert_eq!(
+            selection.order_by,
+            Some(vec![ast::OrderByClause {
+                identifier: ast::Identifier::Property("created_at".to_string()),
+                direction: ast::OrderDirection::Desc
+            }])
+        );
+        assert_eq!(selection.limit, Some(5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_limit_only() -> anyhow::Result<()> {
+        let selection = parse_selection("true LIMIT 100")?;
+        assert_eq!(selection.predicate, ast::Predicate::True);
+        assert_eq!(selection.order_by, None);
+        assert_eq!(selection.limit, Some(100));
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_only() -> anyhow::Result<()> {
+        let selection = parse_selection("true ORDER BY score")?;
+        assert_eq!(selection.predicate, ast::Predicate::True);
+        assert_eq!(
+            selection.order_by,
+            Some(vec![ast::OrderByClause {
+                identifier: ast::Identifier::Property("score".to_string()),
+                direction: ast::OrderDirection::Asc
+            }])
+        );
+        assert_eq!(selection.limit, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pathological_keyword_cases() -> anyhow::Result<()> {
+        // Test that keywords can be used as identifiers in appropriate contexts
+        let selection = parse_selection("limit = 1")?;
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("limit".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::Integer(1)))
+            }
+        );
+
+        let selection = parse_selection("order = 2 ORDER BY name")?;
+        assert_eq!(
+            selection.predicate,
+            ast::Predicate::Comparison {
+                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("order".to_string()))),
+                operator: ast::ComparisonOperator::Equal,
+                right: Box::new(ast::Expr::Literal(ast::Literal::Integer(2)))
+            }
+        );
+        assert_eq!(
+            selection.order_by,
+            Some(vec![ast::OrderByClause {
+                identifier: ast::Identifier::Property("name".to_string()),
+                direction: ast::OrderDirection::Asc
+            }])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_raw_parsing() {
+        println!("=== Testing Raw Grammar Parsing ===\n");
+
+        let test_cases = vec![
+            "true",
+            "true or false",
+            "true and false",
+            "true LIMIT 10",
+            "status = 'active'",
+            "status = 'active' LIMIT 5",
+            "limit = 1",          // pathological case - limit as identifier
+            "limit = 1 LIMIT 10", // pathological case
+            "foo = 1 order by name",
+            "true ORDER BY name ASC",
+            "true ORDER BY name DESC",
+            "true ORDER BY name LIMIT 10",
+            "order = 1",               // pathological case - order as identifier
+            "by = 2",                  // pathological case - by as identifier
+            "order = 1 ORDER BY name", // pathological case
+        ];
+
+        for (i, input) in test_cases.iter().enumerate() {
+            println!("Test {}: '{}'", i + 1, input);
+
+            // Just try to parse with pest, don't interpret
+            match grammar::AnkqlParser::parse(grammar::Rule::Selection, input) {
+                Ok(pairs) => {
+                    println!("✅ Grammar parsed successfully!");
+                    for pair in pairs {
+                        print_parse_tree(pair, 0);
+                    }
+                }
+                Err(e) => {
+                    panic!("❌ Grammar parse error: {}", e);
+                }
+            }
+        }
+    }
+
+    // Helper function to print the parse tree
+    fn print_parse_tree(pair: pest::iterators::Pair<grammar::Rule>, indent: usize) {
+        let indent_str = "  ".repeat(indent);
+        println!("{}Rule::{:?} -> '{}'", indent_str, pair.as_rule(), pair.as_str());
+
+        for inner_pair in pair.into_inner() {
+            print_parse_tree(inner_pair, indent + 1);
+        }
     }
 }

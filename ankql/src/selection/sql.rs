@@ -210,40 +210,40 @@ mod tests {
 
     #[test]
     fn test_simple_equality() -> Result<()> {
-        let predicate = parse_selection("name = 'Alice'").unwrap();
-        let sql = generate_selection_sql(&predicate, None)?;
+        let selection = parse_selection("name = 'Alice'").unwrap();
+        let sql = generate_selection_sql(&selection.predicate, None)?;
         assert_eq!(sql, r#""name" = 'Alice'"#);
         Ok(())
     }
 
     #[test]
     fn test_and_condition() -> Result<()> {
-        let predicate = parse_selection("name = 'Alice' AND age = '30'").unwrap();
-        let sql = generate_selection_sql(&predicate, None)?;
+        let selection = parse_selection("name = 'Alice' AND age = '30'").unwrap();
+        let sql = generate_selection_sql(&selection.predicate, None)?;
         assert_eq!(sql, r#""name" = 'Alice' AND "age" = '30'"#);
         Ok(())
     }
 
     #[test]
     fn test_complex_condition() -> Result<()> {
-        let predicate = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
-        let sql = generate_selection_sql(&predicate, None)?;
+        let selection = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
+        let sql = generate_selection_sql(&selection.predicate, None)?;
         assert_eq!(sql, r#"("name" = 'Alice' OR "name" = 'Charlie') AND "age" >= '30' AND "age" <= '40'"#);
         Ok(())
     }
 
     #[test]
     fn test_including_collection_identifier() -> Result<()> {
-        let predicate = parse_selection("person.name = 'Alice'").unwrap();
-        let sql = generate_selection_sql(&predicate, None)?;
+        let selection = parse_selection("person.name = 'Alice'").unwrap();
+        let sql = generate_selection_sql(&selection.predicate, None)?;
         assert_eq!(sql, r#""person"."name" = 'Alice'"#);
         Ok(())
     }
 
     #[test]
     fn test_in_operator() -> Result<()> {
-        let predicate = parse_selection("name IN ('Alice', 'Bob', 'Charlie')").unwrap();
-        let sql = generate_selection_sql(&predicate, None)?;
+        let selection = parse_selection("name IN ('Alice', 'Bob', 'Charlie')").unwrap();
+        let sql = generate_selection_sql(&selection.predicate, None)?;
         assert_eq!(sql, r#""name" IN ('Alice', 'Bob', 'Charlie')"#);
         Ok(())
     }
@@ -251,8 +251,8 @@ mod tests {
     #[test]
     fn test_placeholder_with_none_count() -> Result<()> {
         let query = "user_id = ?";
-        let predicate = parse_selection(query).unwrap();
-        let sql = generate_selection_sql(&predicate, None)?;
+        let selection = parse_selection(query).unwrap();
+        let sql = generate_selection_sql(&selection.predicate, None)?;
         assert_eq!(sql, r#""user_id" = ?"#);
         Ok(())
     }
@@ -260,16 +260,16 @@ mod tests {
     #[test]
     fn test_placeholder_with_exact_count() -> Result<()> {
         let query = "user_id = ? AND status = ?";
-        let predicate = parse_selection(query).unwrap();
-        let sql = generate_selection_sql(&predicate, Some(2))?;
+        let selection = parse_selection(query).unwrap();
+        let sql = generate_selection_sql(&selection.predicate, Some(2))?;
         assert_eq!(sql, r#""user_id" = ? AND "status" = ?"#);
         Ok(())
     }
 
     #[test]
     fn test_placeholder_count_mismatch_too_few() -> Result<()> {
-        let predicate = parse_selection("user_id = ? AND status = ?")?;
-        match generate_selection_sql(&predicate, Some(1)) {
+        let selection = parse_selection("user_id = ? AND status = ?")?;
+        match generate_selection_sql(&selection.predicate, Some(1)) {
             Err(SqlGenerationError::PlaceholderCountMismatch { expected, found }) => {
                 assert_eq!(expected, 1);
                 assert_eq!(found, 2);
@@ -281,8 +281,8 @@ mod tests {
 
     #[test]
     fn test_placeholder_count_mismatch_too_many() -> Result<()> {
-        let predicate = parse_selection("user_id = ?")?;
-        match generate_selection_sql(&predicate, Some(2)) {
+        let selection = parse_selection("user_id = ?")?;
+        match generate_selection_sql(&selection.predicate, Some(2)) {
             Err(SqlGenerationError::PlaceholderCountMismatch { expected, found }) => {
                 assert_eq!(expected, 2);
                 assert_eq!(found, 1);
@@ -295,8 +295,8 @@ mod tests {
     #[test]
     fn test_placeholder_in_lists() -> Result<()> {
         let query = "status IN (?, ?, ?)";
-        let predicate = parse_selection(query).unwrap();
-        let sql = generate_selection_sql(&predicate, Some(3))?;
+        let selection = parse_selection(query).unwrap();
+        let sql = generate_selection_sql(&selection.predicate, Some(3))?;
         assert_eq!(sql, r#""status" IN (?, ?, ?)"#);
         Ok(())
     }
@@ -304,8 +304,8 @@ mod tests {
     #[test]
     fn test_placeholder_with_zero_count() -> Result<()> {
         let query = "user_id = 123";
-        let predicate = parse_selection(query).unwrap();
-        let sql = generate_selection_sql(&predicate, Some(0))?;
+        let selection = parse_selection(query).unwrap();
+        let sql = generate_selection_sql(&selection.predicate, Some(0))?;
         assert_eq!(sql, r#""user_id" = 123"#);
         Ok(())
     }
@@ -338,8 +338,8 @@ mod tests {
 
     #[test]
     fn test_placeholder_with_zero_count_but_has_placeholder() -> Result<()> {
-        let predicate = parse_selection("user_id = ?")?;
-        match generate_selection_sql(&predicate, Some(0)) {
+        let selection = parse_selection("user_id = ?")?;
+        match generate_selection_sql(&selection.predicate, Some(0)) {
             Err(SqlGenerationError::PlaceholderCountMismatch { expected, found }) => {
                 assert_eq!(expected, 0);
                 assert_eq!(found, 1);
