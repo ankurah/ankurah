@@ -83,6 +83,20 @@ impl Selection {
 }
 
 impl Predicate {
+    /// Recursively walk a predicate tree and accumulate results using a closure
+    pub fn walk<T, F>(&self, accumulator: T, visitor: &mut F) -> T
+    where F: FnMut(T, &Predicate) -> T {
+        let accumulator = visitor(accumulator, self);
+        match self {
+            Predicate::And(left, right) | Predicate::Or(left, right) => {
+                let accumulator = left.walk(accumulator, visitor);
+                right.walk(accumulator, visitor)
+            }
+            Predicate::Not(inner) => inner.walk(accumulator, visitor),
+            _ => accumulator,
+        }
+    }
+
     /// Clones the predicate tree and evaluates comparisons involving missing columns as if they were NULL
     pub fn assume_null(&self, columns: &[String]) -> Self {
         match self {
