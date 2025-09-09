@@ -1,13 +1,13 @@
 // Stripped down version of the SQL grammar focusing on Selection
 // From https://raw.githubusercontent.com/pest-parser/pest/refs/heads/master/grammars/src/grammars/sql.pest
 
-Selection = _{ SOI ~ Expr ~ EOI }
+Selection = _{ SOI ~ Expr ~ OrderByClause? ~ LimitClause? ~ EOI }
 
 Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
     ExprInfixOp = _{ Between | ArithInfixOp | CmpInfixOp | And | Or }
         Between       = { NotFlag? ~ ^"between" }
-        And           = { ^"and" }
-        Or            = { ^"or" }
+        And           = @{ ^"and" ~ !IDENT_CONT }
+        Or            = @{ ^"or" ~ !IDENT_CONT }
         ArithInfixOp  = _{ Add | Subtract | Multiply | Divide }
             Add      = { "+" }
             Subtract = { "-" }
@@ -26,9 +26,9 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
         IsNullPostfix = { ^"is" ~ NotFlag? ~ ^"null" }
         AtomicExpr = _{ Literal | QuestionParameter | IdentifierWithOptionalContinuation | ExpressionInParentheses | Row }
             Literal = _{ True | False | Null | Double | Decimal | Unsigned | Integer | SingleQuotedString }
-                True     = { ^"true" }
-                False    = { ^"false" }
-                Null     = { ^"null" }
+                True     = @{ ^"true" ~ !IDENT_CONT }
+                False    = @{ ^"false" ~ !IDENT_CONT }
+                Null     = @{ ^"null" ~ !IDENT_CONT }
                 Decimal = @{ Integer ~ ("." ~ ASCII_DIGIT*) }
                 Double = @{ Integer ~ ("." ~ ASCII_DIGIT*)? ~ (^"e" ~ Integer) }
                 Integer = @{ ("+" | "-")? ~ ASCII_DIGIT+ }
@@ -44,14 +44,20 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
 
 Identifier = @{ DoubleQuotedIdentifier | IdentifierInner  }
     DoubleQuotedIdentifier = @{ ("\"" ~ IdentifierInner ~ "\"") }
-    IdentifierInner = @{ !(Keyword ~ ("(" | WHITESPACE | "," | EOF)) ~ (IdentifierNonDigit ~ (IdentifierNonDigit | ASCII_DIGIT)*) }
+    IdentifierInner = @{ !(Reserved ~ ("(" | WHITESPACE | "," | EOF)) ~ (IdentifierNonDigit ~ (IdentifierNonDigit | ASCII_DIGIT)*) }
         IdentifierNonDigit = _{ ('a'..'z' | 'A' .. 'Z' | 'А' .. 'Я' | 'а' .. 'я' | "-" | "_") }
-    Keyword = { ^"left" | ^"having" | ^"not" | ^"inner" | ^"group"
+    Reserved = { ^"left" | ^"having" | ^"not" | ^"inner" | ^"group"
                 | ^"on" | ^"join" | ^"from" | ^"exists" | ^"except"
                 | ^"union" | ^"where" | ^"distinct" | ^"between" | ^"option"
-                | ^"values"}
+                | ^"values" | LimitClause | OrderByClause }
+
+OrderByClause = ${ ^"order" ~ WS+ ~ ^"by" ~ WS+ ~ Identifier ~ (WS+ ~ OrderDirection)? }
+OrderDirection = { ^"asc" | ^"desc" }
+LimitClause = ${ ^"limit" ~ WS+ ~ Unsigned }
 
 NotFlag = { ^"not" }
 
 EOF = { EOI | ";" }
+WS = _{ WHITESPACE }
 WHITESPACE = _{ " " | "\t" | "\n" | "\r\n" }
+IDENT_CONT  = _{ ASCII_ALPHANUMERIC | "_" }

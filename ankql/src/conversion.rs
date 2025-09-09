@@ -7,22 +7,22 @@ use std::convert::TryFrom;
 impl<'a> TryFrom<&'a str> for Predicate {
     type Error = ParseError;
 
-    fn try_from(value: &'a str) -> Result<Self, Self::Error> { parser::parse_selection(value) }
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> { Ok(parser::parse_selection(value)?.predicate) }
 }
 impl TryFrom<String> for Predicate {
     type Error = ParseError;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> { parser::parse_selection(&value) }
+    fn try_from(value: String) -> Result<Self, Self::Error> { Ok(parser::parse_selection(&value)?.predicate) }
 }
 impl<'a> TryFrom<&'a str> for Selection {
     type Error = ParseError;
 
-    fn try_from(value: &'a str) -> Result<Self, Self::Error> { Ok(Selection { predicate: parser::parse_selection(value)? }) }
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> { parser::parse_selection(value) }
 }
 impl TryFrom<String> for Selection {
     type Error = ParseError;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> { Ok(Selection { predicate: parser::parse_selection(&value)? }) }
+    fn try_from(value: String) -> Result<Self, Self::Error> { parser::parse_selection(&value) }
 }
 
 impl TryFrom<ast::Expr> for Predicate {
