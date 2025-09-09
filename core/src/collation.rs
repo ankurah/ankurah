@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 
 use ankql::ast;
+use ankurah_proto::EntityId;
 /// Represents a bound in a range query
 #[derive(Debug, Clone, PartialEq)]
 pub enum RangeBound<T> {
@@ -274,6 +275,58 @@ impl Collatable for f64 {
     fn is_minimum(&self) -> bool { *self == f64::NEG_INFINITY }
 
     fn is_maximum(&self) -> bool { *self == f64::INFINITY }
+}
+
+// Implementation for EntityId (ULIDs have natural lexicographic ordering)
+impl Collatable for EntityId {
+    fn to_bytes(&self) -> Vec<u8> {
+        // EntityId is based on ULID which has lexicographic ordering
+        self.to_bytes().to_vec()
+    }
+
+    fn successor_bytes(&self) -> Option<Vec<u8>> {
+        if self.is_maximum() {
+            None
+        } else {
+            let mut bytes = self.to_bytes();
+            // Find the rightmost byte that can be incremented
+            for i in (0..bytes.len()).rev() {
+                if bytes[i] < 255 {
+                    bytes[i] += 1;
+                    // Zero out all bytes to the right
+                    for j in (i + 1)..bytes.len() {
+                        bytes[j] = 0;
+                    }
+                    return Some(bytes.to_vec());
+                }
+            }
+            None // All bytes are 255, no successor
+        }
+    }
+
+    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
+        if self.is_minimum() {
+            None
+        } else {
+            let mut bytes = self.to_bytes();
+            // Find the rightmost byte that can be decremented
+            for i in (0..bytes.len()).rev() {
+                if bytes[i] > 0 {
+                    bytes[i] -= 1;
+                    // Set all bytes to the right to 255
+                    for j in (i + 1)..bytes.len() {
+                        bytes[j] = 255;
+                    }
+                    return Some(bytes.to_vec());
+                }
+            }
+            None // All bytes are 0, no predecessor
+        }
+    }
+
+    fn is_minimum(&self) -> bool { self.to_bytes().iter().all(|&b| b == 0) }
+
+    fn is_maximum(&self) -> bool { self.to_bytes().iter().all(|&b| b == 255) }
 }
 
 #[cfg(test)]
