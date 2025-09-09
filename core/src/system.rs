@@ -254,7 +254,9 @@ where
 
         let retriever = LocalRetriever::new(storage.clone());
 
-        for state in storage.fetch_states(&ankql::ast::Predicate::True).await? {
+        for state in
+            storage.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?
+        {
             let (_entity_changed, entity) =
                 self.0.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state.clone()).await?;
             let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");

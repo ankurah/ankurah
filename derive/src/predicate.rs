@@ -282,8 +282,8 @@ fn generate_predicate_from_template(template: &str, args: &[Expr]) -> proc_macro
     };
 
     // Parse the query at compile time
-    let predicate = match ankql::parser::parse_selection(&query_with_placeholders) {
-        Ok(pred) => pred,
+    let selection = match ankql::parser::parse_selection(&query_with_placeholders) {
+        Ok(sel) => sel,
         Err(e) => {
             return syn::Error::new(proc_macro2::Span::call_site(), format!("Failed to parse predicate: {}", e)).to_compile_error();
         }
@@ -291,7 +291,7 @@ fn generate_predicate_from_template(template: &str, args: &[Expr]) -> proc_macro
 
     // Generate Rust code that constructs the AST with placeholders replaced
     let mut arg_index = 0;
-    generate_predicate_code_with_replacements(&predicate, &final_args, &mut arg_index)
+    generate_predicate_code_with_replacements(&selection.predicate, &final_args, &mut arg_index)
 }
 
 fn generate_predicate_code_with_replacements(

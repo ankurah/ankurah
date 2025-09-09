@@ -147,8 +147,8 @@ impl StorageCollection for SledStorageCollection {
         }
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let predicate = predicate.clone();
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        let predicate = selection.predicate.clone();
         let collection_id = self.collection_id.clone();
         let copied_state = self.state.iter().collect::<Vec<_>>();
 

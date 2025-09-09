@@ -224,7 +224,7 @@ where
             self.node.fetch_from_peer(collection_id, args.selection, &self.cdata).await?
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
-            storage_collection.fetch_states(&args.selection.predicate).await?
+            storage_collection.fetch_states(&args.selection).await?
         };
 
         // Convert states to entities

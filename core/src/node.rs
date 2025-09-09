@@ -54,18 +54,24 @@ pub struct MatchArgs {
 impl TryInto<MatchArgs> for &str {
     type Error = ankql::error::ParseError;
     fn try_into(self) -> Result<MatchArgs, Self::Error> {
-        Ok(MatchArgs { selection: ankql::ast::Selection { predicate: ankql::parser::parse_selection(self)? }, cached: false })
+        Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: false })
     }
 }
 impl TryInto<MatchArgs> for String {
     type Error = ankql::error::ParseError;
     fn try_into(self) -> Result<MatchArgs, Self::Error> {
-        Ok(MatchArgs { selection: ankql::ast::Selection { predicate: ankql::parser::parse_selection(&self)? }, cached: false })
+        Ok(MatchArgs { selection: ankql::parser::parse_selection(&self)?, cached: false })
     }
 }
 
 impl From<ankql::ast::Predicate> for MatchArgs {
-    fn from(val: ankql::ast::Predicate) -> Self { MatchArgs { selection: ankql::ast::Selection { predicate: val }, cached: false } }
+    fn from(val: ankql::ast::Predicate) -> Self {
+        MatchArgs { selection: ankql::ast::Selection { predicate: val, order_by: None, limit: None }, cached: false }
+    }
+}
+
+impl From<ankql::ast::Selection> for MatchArgs {
+    fn from(val: ankql::ast::Selection) -> Self { MatchArgs { selection: val, cached: false } }
 }
 
 impl From<ankql::error::ParseError> for RetrievalError {
@@ -418,7 +424,7 @@ where
                 selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
 
                 let mut states = Vec::new();
-                for state in storage_collection.fetch_states(&selection.predicate).await? {
+                for state in storage_collection.fetch_states(&selection).await? {
                     if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
                         states.push(state);
                     }
@@ -706,7 +712,7 @@ where
         selection: &ankql::ast::Selection,
     ) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
-        let initial_states = storage_collection.fetch_states(&selection.predicate).await?;
+        let initial_states = storage_collection.fetch_states(&selection).await?;
         let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {

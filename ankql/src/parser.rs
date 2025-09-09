@@ -302,7 +302,7 @@ fn parse_limit_clause(pair: Pair<grammar::Rule>) -> Result<u64, ParseError> {
     Ok(limit)
 }
 
-fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByClause>, ParseError> {
+fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByItem>, ParseError> {
     if pair.as_rule() != grammar::Rule::OrderByClause {
         return Err(ParseError::UnexpectedRule { expected: "OrderByClause", got: pair.as_rule() });
     }
@@ -335,7 +335,7 @@ fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByCl
         .transpose()?
         .unwrap_or(ast::OrderDirection::Asc); // Default
 
-    Ok(vec![ast::OrderByClause { identifier, direction }])
+    Ok(vec![ast::OrderByItem { identifier, direction }])
 }
 
 #[cfg(test)]
@@ -644,10 +644,7 @@ mod tests {
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByClause {
-                identifier: ast::Identifier::Property("name".to_string()),
-                direction: ast::OrderDirection::Asc
-            }])
+            Some(vec![ast::OrderByItem { identifier: ast::Identifier::Property("name".to_string()), direction: ast::OrderDirection::Asc }])
         );
         assert_eq!(selection.limit, None);
         Ok(())
@@ -659,7 +656,7 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByClause {
+            Some(vec![ast::OrderByItem {
                 identifier: ast::Identifier::Property("created_at".to_string()),
                 direction: ast::OrderDirection::Desc
             }])
@@ -704,7 +701,7 @@ mod tests {
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByClause {
+            Some(vec![ast::OrderByItem {
                 identifier: ast::Identifier::Property("created_at".to_string()),
                 direction: ast::OrderDirection::Desc
             }])
@@ -728,7 +725,7 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByClause {
+            Some(vec![ast::OrderByItem {
                 identifier: ast::Identifier::Property("score".to_string()),
                 direction: ast::OrderDirection::Asc
             }])
@@ -761,10 +758,7 @@ mod tests {
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByClause {
-                identifier: ast::Identifier::Property("name".to_string()),
-                direction: ast::OrderDirection::Asc
-            }])
+            Some(vec![ast::OrderByItem { identifier: ast::Identifier::Property("name".to_string()), direction: ast::OrderDirection::Asc }])
         );
 
         Ok(())
