@@ -10,7 +10,7 @@ use ankurah_core::{
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
 
-use futures_util::TryStreamExt;
+use futures_util::{pin_mut, TryStreamExt};
 
 pub mod sql_builder;
 pub mod value;
@@ -419,11 +419,8 @@ impl StorageCollection for PostgresBucket {
         let (sql, args) = builder.build()?;
         debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, sql, args);
 
-        let rows = match client.query_raw(&sql, args).await {
-            Ok(stream) => match stream.try_collect::<Vec<_>>().await {
-                Ok(rows) => rows,
-                Err(err) => return Err(RetrievalError::StorageError(err.into())),
-            },
+        let stream = match client.query_raw(&sql, args).await {
+            Ok(stream) => stream,
             Err(err) => {
                 let kind = error_kind(&err);
                 match kind {
@@ -446,8 +443,9 @@ impl StorageCollection for PostgresBucket {
                 return Err(RetrievalError::StorageError(err.into()));
             }
         };
+        pin_mut!(stream);
 
-        for row in rows {
+        while let Some(row) = stream.try_next().await.map_err(RetrievalError::storage)? {
             let id: EntityId = row.try_get(0).map_err(RetrievalError::storage)?;
             let state_buffer: Vec<u8> = row.try_get(1).map_err(RetrievalError::storage)?;
             let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer).map_err(RetrievalError::storage)?;
