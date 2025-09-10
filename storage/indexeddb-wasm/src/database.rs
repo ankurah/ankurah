@@ -139,9 +139,9 @@ impl Connection {
                 };
 
                 // Create default indexes
-                // Primary index on collection + id (for efficient collection scans)
+                // Default index on collection + id (IndexedDB naming: __collection__id)
                 if let Err(e) =
-                    store.create_index_with_str_sequence("by_collection", &js_sys::Array::of2(&"__collection".into(), &"id".into()))
+                    store.create_index_with_str_sequence("__collection__id", &js_sys::Array::of2(&"__collection".into(), &"id".into()))
                 {
                     tracing::error!("Failed to create collection+id index: {:?}", e);
                 }

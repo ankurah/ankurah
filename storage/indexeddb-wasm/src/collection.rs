@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::{JsCast, JsValue};
 
-use crate::{cb_future::CBFuture, database::Database, object::Object, statics::*};
+use crate::{cb_future::CBFuture, cb_stream::CBStream, database::Database, object::Object, statics::*};
 
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
@@ -61,10 +61,9 @@ impl StorageCollection for IndexedDBBucket {
             // Check if the entity changed
             if !old_entity.is_undefined() && !old_entity.is_null() {
                 let old_entity_obj = Object::new(old_entity);
-                let old_head = old_entity_obj.get(&HEAD_KEY)?;
 
-                if !old_head.is_undefined() && !old_head.is_null() {
-                    let old_clock: proto::Clock = old_head.try_into()?;
+                if let Some(old_clock) = old_entity_obj.get_opt::<proto::Clock>(&HEAD_KEY)? {
+                    // let old_clock: proto::Clock = old_head.try_into()?;
                     if old_clock == state.payload.state.head {
                         // return false if the head is the same. This was formerly disabled for IndexedDB because it was breaking things
                         // by *accurately* reporting that the stored entity had not changed, because it was applied by another browser window moments earlier.
@@ -122,18 +121,72 @@ impl StorageCollection for IndexedDBBucket {
                 payload: EntityState {
                     entity_id: id,
                     collection: self.collection_id.clone(),
-                    state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?.try_into()?, head: entity.get(&HEAD_KEY)?.try_into()? },
+                    state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?, head: entity.get(&HEAD_KEY)? },
                 },
-                attestations: entity.get(&ATTESTATIONS_KEY)?.try_into()?,
+                attestations: entity.get(&ATTESTATIONS_KEY)?,
             })
         })
         .await
     }
 
     async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        // TODO: Implement this properly with query execution logic from quarantine
-        let _ = selection;
-        Ok(Vec::new())
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+            res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
+        }
+
+        let _invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _lock = self.mutex.lock().await;
+
+        // Step 1: Use optimizer to select the best index
+        let optimizer = crate::indexes::Optimizer::new();
+        let (index_spec, scan_direction, range_constraint) =
+            optimizer.pick_index(selection).map_err(|e| RetrievalError::StorageError(format!("index selection: {}", e).into()))?;
+
+        // Step 2: Ensure the index exists
+        self.db
+            .assure_index_exists(&index_spec)
+            .await
+            .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
+
+        // Step 3: Execute the query using the selected index
+        let db_connection = self.db.get_connection().await;
+        let collection_id = self.collection_id.clone();
+        let limit = selection.limit;
+
+        SendWrapper::new(async move {
+            let transaction = step(db_connection.transaction_with_str("entities"), "create transaction")?;
+            let store = step(transaction.object_store("entities"), "get object store")?;
+
+            // Always use index cursor - we never use the object store cursor directly
+            // All our indexes are composite: [__collection, field_name]
+            let index = step(store.index(index_spec.name()), "get index")?;
+
+            // Convert range constraint to IndexedDB key range
+            let key_range = if let Some(constraint) = range_constraint {
+                Some(step(constraint.to_idb_key_range(&collection_id), "create constraint key range")?)
+            } else {
+                let collection_js_value: JsValue = collection_id.clone().into();
+
+                // For composite indexes, we need to create a range that matches the collection prefix
+                // Following IndexedDB best practices for composite key ranges:
+                // Lower bound: ['album', ''] - collection + empty string (lowest possible)
+                // Upper bound: ['album', Infinity] - collection + Infinity (highest possible)
+                let lower_bound = js_sys::Array::new_with_length(2);
+                lower_bound.set(0, collection_js_value.clone());
+                lower_bound.set(1, JsValue::from_str("")); // Empty string for lowest possible second key
+
+                let upper_bound = js_sys::Array::new_with_length(2);
+                upper_bound.set(0, collection_js_value);
+                upper_bound.set(1, JsValue::from_str("\u{10FFFF}")); // Highest Unicode code point for string comparison
+
+                Some(step(web_sys::IdbKeyRange::bound(&lower_bound, &upper_bound), "create collection prefix key range")?)
+            };
+
+            let results = execute_index_query(&index, key_range, &selection.predicate, scan_direction, limit, &collection_id).await?;
+
+            Ok(results)
+        })
+        .await
     }
 
     async fn add_event(&self, attested_event: &Attested<ankurah_proto::Event>) -> Result<bool, MutationError> {
@@ -203,11 +256,11 @@ impl StorageCollection for IndexedDBBucket {
                 let event = Attested {
                     payload: ankurah_proto::Event {
                         collection: self.collection_id.clone(),
-                        entity_id: event_obj.get(&ENTITY_ID_KEY)?.try_into()?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?.try_into()?,
-                        parent: event_obj.get(&PARENT_KEY)?.try_into()?,
+                        entity_id: event_obj.get(&ENTITY_ID_KEY)?,
+                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        parent: event_obj.get(&PARENT_KEY)?,
                     },
-                    attestations: event_obj.get(&ATTESTATIONS_KEY)?.try_into()?,
+                    attestations: event_obj.get(&ATTESTATIONS_KEY)?,
                 };
                 events.push(event);
             }
@@ -248,11 +301,11 @@ impl StorageCollection for IndexedDBBucket {
                     payload: ankurah_proto::Event {
                         collection: self.collection_id.clone(),
                         // id: event_obj.get(&ID_KEY)?.try_into()?,
-                        entity_id: event_obj.get(&ENTITY_ID_KEY)?.try_into()?,
-                        operations: event_obj.get(&OPERATIONS_KEY)?.try_into()?,
-                        parent: event_obj.get(&PARENT_KEY)?.try_into()?,
+                        entity_id: event_obj.get(&ENTITY_ID_KEY)?,
+                        operations: event_obj.get(&OPERATIONS_KEY)?,
+                        parent: event_obj.get(&PARENT_KEY)?,
                     },
-                    attestations: event_obj.get(&ATTESTATIONS_KEY)?.try_into()?,
+                    attestations: event_obj.get(&ATTESTATIONS_KEY)?,
                 };
                 events.push(event);
 
@@ -266,7 +319,117 @@ impl StorageCollection for IndexedDBBucket {
 }
 
 impl IndexedDBBucket {
-    // TODO: Add helper methods when we move query execution logic from quarantine
+    // Helper methods for query execution
+}
+
+// We always use index cursors for fetch operations
+// Store cursors are only used for direct ID lookups (get_state, not fetch_states)
+
+/// Execute queries using index cursors (we always use indexes for fetch operations)
+/// Convert IndexDirection to IdbCursorDirection
+pub fn to_idb_cursor_direction(direction: crate::indexes::IndexDirection) -> web_sys::IdbCursorDirection {
+    match direction {
+        crate::indexes::IndexDirection::Asc => web_sys::IdbCursorDirection::Next,
+        crate::indexes::IndexDirection::Desc => web_sys::IdbCursorDirection::Prev,
+    }
+}
+
+async fn execute_index_query(
+    index: &web_sys::IdbIndex,
+    key_range: Option<web_sys::IdbKeyRange>,
+    predicate: &ankql::ast::Predicate,
+    direction: crate::indexes::IndexDirection,
+    limit: Option<u64>,
+    collection_id: &ankurah_proto::CollectionId,
+) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+        res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
+    }
+
+    // Convert direction to IndexedDB cursor direction
+    let cursor_direction = to_idb_cursor_direction(direction);
+
+    // Open index cursor with optional key range and direction
+    // Convert IdbKeyRange to JsValue for the API call
+    let cursor_request = if let Some(range) = &key_range {
+        step(index.open_cursor_with_range_and_direction(range.as_ref(), cursor_direction), "open index cursor with range and direction")?
+    } else {
+        step(
+            index.open_cursor_with_range_and_direction(&wasm_bindgen::JsValue::NULL, cursor_direction),
+            "open index cursor with direction only",
+        )?
+    };
+
+    let mut results = Vec::new();
+    let mut stream = CBStream::new(&cursor_request, "success", "error");
+    let mut count = 0u64;
+
+    while let Some(result) = stream.next().await {
+        let cursor_result = step(result, "cursor error")?;
+        if cursor_result.is_null() || cursor_result.is_undefined() {
+            break;
+        }
+
+        let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
+        let entity_obj = Object::new(step(cursor.value(), "get cursor value")?);
+
+        // Create a wrapper that provides collection context for filtering
+        let filterable_entity = FilterableObject { object: &entity_obj, collection_id: &collection_id };
+
+        // Apply predicate filtering first (cheaper than entity conversion)
+        if ankql::selection::filter::evaluate_predicate(&filterable_entity, predicate)
+            .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
+        {
+            // Only convert to EntityState if predicate matches
+            if let Ok(entity_state) = js_object_to_entity_state(&entity_obj, &collection_id) {
+                results.push(entity_state);
+                count += 1;
+
+                if let Some(limit_val) = limit {
+                    if count >= limit_val {
+                        break;
+                    }
+                }
+            } else {
+            }
+        } else {
+        }
+
+        step(cursor.continue_(), "advance cursor")?;
+    }
+
+    Ok(results)
+}
+
+/// Extract ID range from predicate for primary key queries
+fn extract_id_range(predicate: &ankql::ast::Predicate) -> Option<web_sys::IdbKeyRange> {
+    // TODO: Implement proper ID range extraction from predicate
+    // For now, return None to scan all records
+    let _ = predicate;
+    None
+}
+
+/// Convert JS object to EntityState using the correct field extraction
+fn js_object_to_entity_state(
+    entity_obj: &Object,
+    collection_id: &ankurah_proto::CollectionId,
+) -> Result<Attested<EntityState>, RetrievalError> {
+    use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
+    use ankurah_proto::{Attested, EntityId, EntityState, State};
+
+    // Extract the specific fields that are stored in IndexedDB using Object::get
+    let id: EntityId = entity_obj.get(&ID_KEY)?;
+
+    let entity_state = EntityState {
+        collection: collection_id.clone(),
+        entity_id: id,
+        state: State { state_buffers: entity_obj.get(&STATE_BUFFER_KEY)?, head: entity_obj.get(&HEAD_KEY)? },
+    };
+
+    let attestations = entity_obj.get(&ATTESTATIONS_KEY)?;
+    let attested_state = Attested { payload: entity_state, attestations };
+
+    Ok(attested_state)
 }
 
 /// Extract all fields from entity state and set them directly on the IndexedDB entity object
@@ -287,9 +450,26 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
             }
 
             // Set field directly on entity object (no prefix - they become the primary fields)
-            entity_obj.set(&field_name, value)?;
+            let js_value = match value {
+                Some(ref prop_value) => JsValue::from(prop_value),
+                None => JsValue::NULL,
+            };
+            entity_obj.set(&field_name, js_value)?;
         }
     }
 
     Ok(())
+}
+
+/// Wrapper struct to provide collection context for predicate filtering
+struct FilterableObject<'a> {
+    object: &'a Object,
+    collection_id: &'a ankurah_proto::CollectionId,
+}
+
+/// Implement Filterable for FilterableObject to enable direct predicate evaluation on JS objects
+impl<'a> ankql::selection::filter::Filterable for FilterableObject<'a> {
+    fn collection(&self) -> &str { self.collection_id.as_str() }
+
+    fn value(&self, name: &str) -> Option<String> { self.object.get_opt::<String>(&name.into()).unwrap_or(None) }
 }

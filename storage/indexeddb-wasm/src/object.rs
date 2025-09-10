@@ -13,9 +13,27 @@ impl std::ops::Deref for Object {
 
 impl Object {
     pub fn new(obj: JsValue) -> Self { Self { obj: SendWrapper::new(obj) } }
-    pub fn get(&self, key: &Property) -> Result<JsValue, RetrievalError> {
-        js_sys::Reflect::get(&self.obj, key).map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key).into()))
+    pub fn get<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<T, RetrievalError> {
+        let v = js_sys::Reflect::get(&self.obj, key)
+            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
+        // if v.is_null() || v.is_undefined() {
+        //     return Err(RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key).into()));
+        // }
+        Ok(v.try_into().map_err(|e| {
+            RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into())
+        })?)
     }
+    pub fn get_opt<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<Option<T>, RetrievalError> {
+        let v = js_sys::Reflect::get(&self.obj, key)
+            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
+        if v.is_null() || v.is_undefined() {
+            return Ok(None);
+        }
+        Ok(Some(v.try_into().map_err(|e| {
+            RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into())
+        })?))
+    }
+
     pub fn set<K, V>(&self, key: K, value: V) -> Result<bool, MutationError>
     where
         K: Into<JsValue>,
