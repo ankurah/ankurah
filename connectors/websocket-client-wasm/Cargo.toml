@@ -67,6 +67,7 @@ tracing-wasm             = "0.2"
 thiserror                = "2.0.9"
 strum                    = { version = "0.26.3", features = ["derive"] }
 ##### patch - something is wrong with the uuid crate for wasm
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 ###### 
 
