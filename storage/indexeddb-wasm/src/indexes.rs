@@ -223,6 +223,7 @@ impl Optimizer {
     }
 
     /// Recursively search for constraints on the target field
+    /// TODO - better define what "constraint" means here
     fn find_field_constraint(
         &self,
         predicate: &ankql::ast::Predicate,

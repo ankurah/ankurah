@@ -2,17 +2,17 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse::Parse, parse::ParseStream, parse_macro_input, Expr, Result, Token};
 
-// Parse the macro input: predicate!(template, arg1, arg2, ...)
-struct PredicateInput {
+// Parse the macro input: selection!(template, arg1, arg2, ...)
+struct SelectionInput {
     template: String,
     args: Vec<Expr>,
 }
 
-impl Parse for PredicateInput {
+impl Parse for SelectionInput {
     fn parse(input: ParseStream) -> Result<Self> {
         // Support both quoted and unquoted syntax
         if input.peek(syn::LitStr) {
-            // Quoted syntax: predicate!("name = {}", value)
+            // Quoted syntax: selection!("name = {}", value)
             let literal = input.parse::<syn::LitStr>()?;
             let mut args = Vec::new();
 
@@ -24,16 +24,16 @@ impl Parse for PredicateInput {
                 args.push(input.parse::<Expr>()?);
             }
 
-            Ok(PredicateInput { template: literal.value(), args })
+            Ok(SelectionInput { template: literal.value(), args })
         } else {
-            // Unquoted syntax: predicate!(name = {name})
+            // Unquoted syntax: selection!(name = {name})
             let mut tokens = proc_macro2::TokenStream::new();
             while !input.is_empty() {
                 let token = input.parse::<proc_macro2::TokenTree>()?;
                 tokens.extend(std::iter::once(token));
             }
 
-            Ok(PredicateInput { template: tokens_to_template_string(&tokens), args: Vec::new() })
+            Ok(SelectionInput { template: tokens_to_template_string(&tokens), args: Vec::new() })
         }
     }
 }
@@ -41,7 +41,7 @@ impl Parse for PredicateInput {
 // Parse the fetch macro input: fetch!(ctx, template, arg1, arg2, ...)
 struct FetchInput {
     context: Expr,
-    predicate_input: PredicateInput,
+    predicate_input: SelectionInput,
 }
 
 impl Parse for FetchInput {
@@ -63,7 +63,7 @@ impl Parse for FetchInput {
                 args.push(input.parse::<Expr>()?);
             }
 
-            PredicateInput { template: literal.value(), args }
+            SelectionInput { template: literal.value(), args }
         } else {
             // Unquoted syntax: fetch!(ctx, name = {name})
             let mut tokens = proc_macro2::TokenStream::new();
@@ -72,7 +72,7 @@ impl Parse for FetchInput {
                 tokens.extend(std::iter::once(token));
             }
 
-            PredicateInput { template: tokens_to_template_string(&tokens), args: Vec::new() }
+            SelectionInput { template: tokens_to_template_string(&tokens), args: Vec::new() }
         };
 
         Ok(FetchInput { context, predicate_input })
@@ -83,7 +83,7 @@ impl Parse for FetchInput {
 struct SubscribeInput {
     context: Expr,
     callback: Expr,
-    predicate_input: PredicateInput,
+    predicate_input: SelectionInput,
 }
 
 impl Parse for SubscribeInput {
@@ -107,7 +107,7 @@ impl Parse for SubscribeInput {
                 args.push(input.parse::<Expr>()?);
             }
 
-            PredicateInput { template: literal.value(), args }
+            SelectionInput { template: literal.value(), args }
         } else {
             // Unquoted syntax: subscribe!(ctx, callback, name = {name})
             let mut tokens = proc_macro2::TokenStream::new();
@@ -116,7 +116,7 @@ impl Parse for SubscribeInput {
                 tokens.extend(std::iter::once(token));
             }
 
-            PredicateInput { template: tokens_to_template_string(&tokens), args: Vec::new() }
+            SelectionInput { template: tokens_to_template_string(&tokens), args: Vec::new() }
         };
 
         Ok(SubscribeInput { context, callback, predicate_input })
@@ -126,14 +126,14 @@ impl Parse for SubscribeInput {
 /// Implementation function for the predicate macro.
 ///
 /// This function handles the actual parsing and code generation.
-/// See the `predicate!` macro documentation for usage examples.
-pub fn predicate_macro(input: TokenStream) -> TokenStream {
-    let PredicateInput { template, args } = parse_macro_input!(input as PredicateInput);
-    let predicate_code = generate_predicate_from_template(&template, &args);
+/// See the `selection!` macro documentation for usage examples.
+pub fn selection_macro(input: TokenStream) -> TokenStream {
+    let SelectionInput { template, args } = parse_macro_input!(input as SelectionInput);
+    let selection_code = generate_selection_from_template(&template, &args);
 
     let expanded = quote! {
         {
-            #predicate_code
+            #selection_code
         }
     };
 
@@ -143,7 +143,7 @@ pub fn predicate_macro(input: TokenStream) -> TokenStream {
 /// Implementation function for the fetch macro.
 pub fn fetch_macro(input: TokenStream) -> TokenStream {
     let FetchInput { context, predicate_input } = parse_macro_input!(input as FetchInput);
-    let predicate_code = generate_predicate_from_template(&predicate_input.template, &predicate_input.args);
+    let predicate_code = generate_selection_from_template(&predicate_input.template, &predicate_input.args);
 
     let expanded = quote! {
         (#context).fetch({#predicate_code})
@@ -155,7 +155,7 @@ pub fn fetch_macro(input: TokenStream) -> TokenStream {
 /// Implementation function for the subscribe macro.
 pub fn subscribe_macro(input: TokenStream) -> TokenStream {
     let SubscribeInput { context, callback, predicate_input } = parse_macro_input!(input as SubscribeInput);
-    let predicate_code = generate_predicate_from_template(&predicate_input.template, &predicate_input.args);
+    let predicate_code = generate_selection_from_template(&predicate_input.template, &predicate_input.args);
 
     let expanded = quote! {
         (#context).subscribe({#predicate_code}, #callback)
@@ -270,7 +270,7 @@ fn process_unquoted_template(template: &str) -> (String, Vec<(Option<String>, St
     (query_with_placeholders, variable_mapping)
 }
 
-fn generate_predicate_from_template(template: &str, args: &[Expr]) -> proc_macro2::TokenStream {
+fn generate_selection_from_template(template: &str, args: &[Expr]) -> proc_macro2::TokenStream {
     let (query_with_placeholders, final_args) = if args.is_empty() {
         // Unquoted syntax with {operator?identifier} patterns
         let (query, extracted_args) = process_unquoted_template(template);
@@ -291,7 +291,54 @@ fn generate_predicate_from_template(template: &str, args: &[Expr]) -> proc_macro
 
     // Generate Rust code that constructs the AST with placeholders replaced
     let mut arg_index = 0;
-    generate_predicate_code_with_replacements(&selection.predicate, &final_args, &mut arg_index)
+    generate_selection_code_with_replacements(&selection, &final_args, &mut arg_index)
+}
+
+fn generate_selection_code_with_replacements(
+    selection: &ankql::ast::Selection,
+    args: &[(Option<String>, String, Expr)],
+    arg_index: &mut usize,
+) -> proc_macro2::TokenStream {
+    let predicate_code = generate_predicate_code_with_replacements(&selection.predicate, args, arg_index);
+
+    let order_by_code = if let Some(order_by) = &selection.order_by {
+        let order_items: Vec<_> = order_by
+            .iter()
+            .map(|item| {
+                let identifier_code = generate_identifier_code(&item.identifier);
+                let direction_code = match item.direction {
+                    ankql::ast::OrderDirection::Asc => quote! { ::ankql::ast::OrderDirection::Asc },
+                    ankql::ast::OrderDirection::Desc => quote! { ::ankql::ast::OrderDirection::Desc },
+                };
+                quote! {
+                    ::ankql::ast::OrderByItem {
+                        identifier: match #identifier_code {
+                            ::ankql::ast::Expr::Identifier(id) => id,
+                            _ => panic!("Expected identifier in order by"),
+                        },
+                        direction: #direction_code,
+                    }
+                }
+            })
+            .collect();
+        quote! { Some(vec![#(#order_items),*]) }
+    } else {
+        quote! { None }
+    };
+
+    let limit_code = if let Some(limit) = selection.limit {
+        quote! { Some(#limit) }
+    } else {
+        quote! { None }
+    };
+
+    quote! {
+        ::ankql::ast::Selection {
+            predicate: #predicate_code,
+            order_by: #order_by_code,
+            limit: #limit_code,
+        }
+    }
 }
 
 fn generate_predicate_code_with_replacements(

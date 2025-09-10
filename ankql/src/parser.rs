@@ -307,13 +307,34 @@ fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByIt
         return Err(ParseError::UnexpectedRule { expected: "OrderByClause", got: pair.as_rule() });
     }
 
-    // Since OrderByClause is compound atomic ($), we can access the inner tokens directly
+    let mut order_by_items = Vec::new();
+
+    // Parse each OrderByItem in the clause
+    for inner_pair in pair.into_inner() {
+        if inner_pair.as_rule() == grammar::Rule::OrderByItem {
+            let order_by_item = parse_order_by_item(inner_pair)?;
+            order_by_items.push(order_by_item);
+        }
+    }
+
+    if order_by_items.is_empty() {
+        return Err(ParseError::InvalidPredicate("Missing ORDER BY items".into()));
+    }
+
+    Ok(order_by_items)
+}
+
+fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, ParseError> {
+    if pair.as_rule() != grammar::Rule::OrderByItem {
+        return Err(ParseError::UnexpectedRule { expected: "OrderByItem", got: pair.as_rule() });
+    }
+
     let inner_pairs: Vec<_> = pair.into_inner().collect();
 
     let identifier_pair = inner_pairs
         .iter()
         .find(|p| p.as_rule() == grammar::Rule::Identifier)
-        .ok_or(ParseError::InvalidPredicate("Missing column name in ORDER BY".into()))?;
+        .ok_or(ParseError::InvalidPredicate("Missing column name in ORDER BY item".into()))?;
 
     let identifier_str = identifier_pair.as_str().trim();
 
@@ -335,7 +356,7 @@ fn parse_order_by_clause(pair: Pair<grammar::Rule>) -> Result<Vec<ast::OrderByIt
         .transpose()?
         .unwrap_or(ast::OrderDirection::Asc); // Default
 
-    Ok(vec![ast::OrderByItem { identifier, direction }])
+    Ok(ast::OrderByItem { identifier, direction })
 }
 
 #[cfg(test)]
@@ -729,6 +750,25 @@ mod tests {
                 identifier: ast::Identifier::Property("score".to_string()),
                 direction: ast::OrderDirection::Asc
             }])
+        );
+        assert_eq!(selection.limit, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_by_multiple_items() -> anyhow::Result<()> {
+        let selection = parse_selection("true ORDER BY name ASC, created_at DESC, id")?;
+        assert_eq!(selection.predicate, ast::Predicate::True);
+        assert_eq!(
+            selection.order_by,
+            Some(vec![
+                ast::OrderByItem { identifier: ast::Identifier::Property("name".to_string()), direction: ast::OrderDirection::Asc },
+                ast::OrderByItem { identifier: ast::Identifier::Property("created_at".to_string()), direction: ast::OrderDirection::Desc },
+                ast::OrderByItem {
+                    identifier: ast::Identifier::Property("id".to_string()),
+                    direction: ast::OrderDirection::Asc // Default
+                }
+            ])
         );
         assert_eq!(selection.limit, None);
         Ok(())
