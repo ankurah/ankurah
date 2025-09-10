@@ -63,12 +63,15 @@ tracing-wasm             = "0.2"
 thiserror                = "2.0.9"
 strum                    = { version = "0.26.3", features = ["derive"] }
 lazy_static              = "1.5.0"
+##### patch - something is wrong with the uuid crate for wasm
+getrandom = { version = "0.3", features = ["wasm_js"] }
+###### 
 
 #[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 ankurah           = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.5.4" }
-
+tracing-subscriber = "0.3"
 
     [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
     # Should we enable wasm-bindgen's debug assertions in its generated JS glue?
