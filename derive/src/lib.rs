@@ -1,6 +1,6 @@
 mod model;
-mod predicate;
 mod property;
+mod selection;
 #[cfg(feature = "wasm")]
 mod tsify;
 #[cfg(feature = "wasm")]
@@ -85,25 +85,25 @@ pub fn derive_property(input: TokenStream) -> TokenStream { property::derive_pro
 /// **Unquoted form** - The most terse syntax. Supports inlined variable substitution:
 /// ```rust,ignore
 /// // Expand variables into comparisons of the same name. Equivalent to status = {status}
-/// let result = predicate!({status});
+/// let result = selection!({status});
 /// // Default comparison is equality but you can prefix with >, <, >=, <=, !=
-/// let result = predicate!({name} AND {>age});
+/// let result = selection!({name} AND {>age});
 /// // Equivalent to the above
-/// let result = predicate!({name} AND age > {age});
+/// let result = selection!({name} AND age > {age});
 /// ```
 ///
 /// **Quoted form** - Required for quoted string literals and positional arguments:
 /// ```rust,ignore
-/// let result = predicate!("status = 'active'");              // Pure literals
-/// let result = predicate!("status = 'active' AND {name}");   // Mixed: variable + literal
-/// let result = predicate!("status = 'active' AND {}", name); // Equivalent to the above
+/// let result = selection!("status = 'active'");              // Pure literals
+/// let result = selection!("status = 'active' AND {name}");   // Mixed: variable + literal
+/// let result = selection!("status = 'active' AND {}", name); // Equivalent to the above
 /// ```
 #[proc_macro]
-pub fn predicate(input: TokenStream) -> TokenStream { predicate::predicate_macro(input) }
+pub fn selection(input: TokenStream) -> TokenStream { selection::selection_macro(input) }
 
 /// Convenience macro for fetch operations with predicate syntax.
 ///
-/// This macro forwards all arguments (except the context) to the `predicate!` macro
+/// This macro forwards all arguments (except the context) to the `selection!` macro
 /// and then calls `fetch` on the context with the resulting predicate.
 ///
 /// # Examples
@@ -117,7 +117,7 @@ pub fn predicate(input: TokenStream) -> TokenStream { predicate::predicate_macro
 /// // Equivalent to the above
 /// let results = fetch!(ctx, {name} AND age > {age}).await?;
 /// // Equivalent to:
-/// let results = ctx.fetch(predicate!({name} AND {>age})).await?;
+/// let results = ctx.fetch(selection!({name} AND {>age})).await?;
 /// ```
 ///
 /// **Quoted form** - Required for quoted string literals and positional arguments:
@@ -127,13 +127,13 @@ pub fn predicate(input: TokenStream) -> TokenStream { predicate::predicate_macro
 /// let results = fetch!(ctx, "status = 'active' AND {}", name).await?; // Equivalent to the above
 /// ```
 ///
-/// See [`ankurah_derive::predicate!`] documentation for complete syntax details.
+/// See [`ankurah_derive::selection!`] documentation for complete syntax details.
 #[proc_macro]
-pub fn fetch(input: TokenStream) -> TokenStream { predicate::fetch_macro(input) }
+pub fn fetch(input: TokenStream) -> TokenStream { selection::fetch_macro(input) }
 
 /// Convenience macro for subscribe operations with predicate syntax.
 ///
-/// This macro forwards all arguments (except the context and callback) to the `predicate!` macro
+/// This macro forwards all arguments (except the context and callback) to the `selection!` macro
 /// and then calls `subscribe` on the context with the resulting predicate and callback,
 /// returning a subscription handle.
 ///
@@ -148,7 +148,7 @@ pub fn fetch(input: TokenStream) -> TokenStream { predicate::fetch_macro(input) 
 /// // Equivalent to the above
 /// let handle = subscribe!(ctx, callback, {name} AND age > {age}).await?;
 /// // Equivalent to:
-/// let handle = ctx.subscribe(predicate!({name} AND {>age}), callback).await?;
+/// let handle = ctx.subscribe(selection!({name} AND {>age}), callback).await?;
 /// ```
 ///
 /// **Quoted form** - Required for quoted string literals and positional arguments:
@@ -158,9 +158,9 @@ pub fn fetch(input: TokenStream) -> TokenStream { predicate::fetch_macro(input) 
 /// let handle = subscribe!(ctx, callback, "status = 'active' AND {}", name).await?; // Equivalent to the above
 /// ```
 ///
-/// See [`ankurah_derive::predicate!`] documentation for complete syntax details.
+/// See [`ankurah_derive::selection!`] documentation for complete syntax details.
 #[proc_macro]
-pub fn subscribe(input: TokenStream) -> TokenStream { predicate::subscribe_macro(input) }
+pub fn subscribe(input: TokenStream) -> TokenStream { selection::subscribe_macro(input) }
 
 /// Generate WASM wrappers for all types marked as "provided" in the backend config
 ///

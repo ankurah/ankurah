@@ -51,7 +51,8 @@ Identifier = @{ DoubleQuotedIdentifier | IdentifierInner  }
                 | ^"union" | ^"where" | ^"distinct" | ^"between" | ^"option"
                 | ^"values" | LimitClause | OrderByClause }
 
-OrderByClause = ${ ^"order" ~ WS+ ~ ^"by" ~ WS+ ~ Identifier ~ (WS+ ~ OrderDirection)? }
+OrderByClause = ${ ^"order" ~ WS+ ~ ^"by" ~ WS+ ~ (OrderByItem ~ WS* ~ ("," ~ WS* ~ OrderByItem)*)? }
+OrderByItem = ${ Identifier ~ (WS+ ~ OrderDirection)? }
 OrderDirection = { ^"asc" | ^"desc" }
 LimitClause = ${ ^"limit" ~ WS+ ~ Unsigned }
 

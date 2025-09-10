@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Mutable, Node, PermissiveAgent};
-use ankurah_proto::{AttestationSet, StateBuffers};
+use ankurah_proto::{AttestationSet, CollectionId, StateBuffers};
 use ankurah_storage_indexeddb_wasm::{
     database::Database,
-    indexes::{IndexDirection, IndexSpec},
+    indexes::{ConstraintValue, IndexDirection, IndexSpec, RangeConstraint},
     IndexedDBStorageEngine,
 };
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ pub struct Album {
 
 wasm_bindgen_test_configure!(run_in_browser);
 
-async fn setup() -> anyhow::Result<()> {
+fn setup() -> () {
     console_error_panic_hook::set_once();
 
     std::panic::set_hook(Box::new(|info| {
@@ -47,48 +47,27 @@ async fn setup() -> anyhow::Result<()> {
                 .build(),
         )),
     );
-
-    // tracing::debug!("Test setup complete");
-    Ok(())
 }
 
 #[wasm_bindgen_test]
 async fn test_open_database() {
-    setup().await.expect("Failed to setup test");
+    setup();
 
     let db_name = format!("test_db_{}", ulid::Ulid::new());
-    tracing::info!("Starting test_open_database");
-    let result = IndexedDBStorageEngine::open(&db_name).await;
-    tracing::info!("Open result: {:?}", result.is_ok());
-
-    assert!(result.is_ok(), "Failed to open database: {:?}", result.err());
-
-    let engine = result.unwrap();
-    tracing::info!("Successfully opened database: {}", engine.name());
+    let engine = IndexedDBStorageEngine::open(&db_name).await.expect("Failed to open database");
     assert_eq!(engine.name(), db_name, "Database name mismatch");
+    let engine2 = IndexedDBStorageEngine::open(&db_name).await.expect("Failed to reopen database");
+    assert_eq!(engine2.name(), db_name, "Database name mismatch");
 
-    // Test reopening existing database
-    tracing::info!("Attempting to reopen database 'test_db'");
-    let result2 = IndexedDBStorageEngine::open(&db_name).await;
-
-    assert!(result2.is_ok(), "Failed to reopen database: {:?}", result2.err());
-    tracing::info!("Test completed successfully");
-
-    // Drop both engine instances
     drop(engine);
-    if let Ok(engine2) = result2 {
-        drop(engine2);
-    }
-    // Cleanup
+    drop(engine2);
+
     IndexedDBStorageEngine::cleanup(&db_name).await.expect("Failed to cleanup database");
 }
 
 #[wasm_bindgen_test]
 async fn test_range_constraint_conversion() -> Result<(), anyhow::Error> {
-    setup().await.expect("Failed to setup test");
-
-    use ankurah_proto::CollectionId;
-    use ankurah_storage_indexeddb_wasm::indexes::{ConstraintValue, RangeConstraint};
+    setup();
 
     let collection_id = CollectionId::from("test_collection");
 
@@ -119,7 +98,7 @@ async fn test_range_constraint_conversion() -> Result<(), anyhow::Error> {
 
 #[wasm_bindgen_test]
 async fn test_cursor_direction() -> Result<(), anyhow::Error> {
-    setup().await.expect("Failed to setup test");
+    setup();
 
     use ankurah_storage_indexeddb_wasm::indexes::IndexDirection;
     use ankurah_storage_indexeddb_wasm::to_idb_cursor_direction;
@@ -141,7 +120,7 @@ async fn test_cursor_direction() -> Result<(), anyhow::Error> {
 
 #[wasm_bindgen_test]
 async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error> {
-    setup().await.expect("Failed to setup test");
+    setup();
 
     let db_name = format!("test_index_{}", ulid::Ulid::new());
     let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
@@ -185,7 +164,7 @@ async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error> {
 
 #[wasm_bindgen_test]
 async fn test_indexeddb_basic_workflow() -> Result<(), anyhow::Error> {
-    setup().await.expect("Failed to setup test");
+    setup();
     let db_name = format!("test_db_{}", ulid::Ulid::new());
     let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
@@ -216,7 +195,7 @@ async fn test_indexeddb_basic_workflow() -> Result<(), anyhow::Error> {
 
 #[wasm_bindgen_test]
 async fn test_indexeddb_order_by_and_index_creation() -> Result<(), anyhow::Error> {
-    setup().await.expect("Failed to setup test");
+    setup();
 
     let db_name = format!("test_db_{}", ulid::Ulid::new());
     let storage_engine = IndexedDBStorageEngine::open(&db_name).await?;

@@ -105,7 +105,7 @@ mod tests {
             rule: Rule::Selection,
             tokens: [
                 Expr(0, 5, [True(0, 4)]),
-                OrderByClause(5, 18, [Identifier(14, 18)])
+                OrderByClause(5, 18, [OrderByItem(14, 18, [Identifier(14, 18)])])
             ]
         };
     }
@@ -118,7 +118,7 @@ mod tests {
             rule: Rule::Selection,
             tokens: [
                 Expr(0, 5, [True(0, 4)]),
-                OrderByClause(5, 23, [Identifier(14, 18), OrderDirection(19, 23)])
+                OrderByClause(5, 23, [OrderByItem(14, 23, [Identifier(14, 18), OrderDirection(19, 23)])])
             ]
         };
     }
@@ -148,8 +148,25 @@ mod tests {
                     Eq(7, 8),
                     SingleQuotedString(9, 17)
                 ]),
-                OrderByClause(18, 35, [Identifier(27, 31), OrderDirection(32, 35)]),
+                OrderByClause(18, 36, [OrderByItem(27, 35, [Identifier(27, 31), OrderDirection(32, 35)])]),
                 LimitClause(36, 43, [Unsigned(42, 43)])
+            ]
+        };
+    }
+
+    #[test]
+    fn test_order_by_multiple_items() {
+        parses_to! {
+            parser: AnkqlParser,
+            input: "true ORDER BY name ASC, created_at DESC,id", // intentionally omitted the space on the last item
+            rule: Rule::Selection,
+            tokens: [
+                Expr(0, 5, [True(0, 4)]),
+                OrderByClause(5, 42, [
+                    OrderByItem(14, 22, [Identifier(14, 18), OrderDirection(19, 22)]),
+                    OrderByItem(24, 39, [Identifier(24, 34), OrderDirection(35, 39)]),
+                    OrderByItem(40, 42, [Identifier(40, 42)])
+                ])
             ]
         };
     }
@@ -180,7 +197,7 @@ mod tests {
                     Eq(6, 7),
                     Unsigned(8, 9)
                 ]),
-                OrderByClause(10, 23, [Identifier(19, 23)])
+                OrderByClause(10, 23, [OrderByItem(19, 23, [Identifier(19, 23)])])
             ]
         };
     }
