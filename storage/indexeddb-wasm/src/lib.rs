@@ -7,5 +7,5 @@ pub mod indexes;
 mod object;
 mod statics;
 
-pub use collection::IndexedDBBucket;
+pub use collection::{to_idb_cursor_direction, IndexedDBBucket};
 pub use indexeddb::IndexedDBStorageEngine;
