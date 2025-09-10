@@ -56,8 +56,6 @@ impl YrsBackend {
     }
 
     fn apply_update(&self, update: &[u8], changed_fields: &Arc<Mutex<std::collections::HashSet<String>>>) -> Result<(), MutationError> {
-        tracing::info!("apply_update: {:?}", update);
-
         let mut txn = self.doc.transact_mut();
 
         // TODO: There's gotta be a better way to do this - but I don't see it at the time of this writing
