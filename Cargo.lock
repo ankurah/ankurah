@@ -189,6 +189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-storage-common"
+version = "0.1.0"
+dependencies = [
+ "ankql",
+ "ankurah-core",
+ "ankurah-derive",
+]
+
+[[package]]
 name = "ankurah-storage-indexeddb-wasm"
 version = "0.5.4"
 dependencies = [
