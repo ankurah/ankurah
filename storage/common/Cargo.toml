@@ -1,12 +1,12 @@
 [package]
-name = "ankurah-storage-common"
+name    = "ankurah-storage-common"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ankql = { path = "../../ankql" }
+ankql        = { path = "../../ankql" }
 ankurah-core = { path = "../../core" }
-indexmap = "2.0"
+indexmap     = "2.0"
 
 
 [dev-dependencies]
