@@ -6,59 +6,11 @@ The Planner generates all possible index scan plans for a query. Each plan repre
 
 ## Core Data Structures
 
-### 1. Plan (formerly IndexScan)
+All core data structures are now implemented in `planner.rs`. Key points:
 
-```rust
-pub struct Plan {
-    index_fields: Vec<IndexField>,  // The fields and their directions in the index
-    scan_direction: ScanDirection,  // Direction to scan the index (forward/backward)
-    range: Range,
-    amended_predicate: ankql::ast::Predicate,  // Original predicate minus consumed conjuncts
-    requires_sort: bool,  // Future-proofing: true if ORDER BY doesn't match index
-}
-
-pub struct IndexField {
-    name: String,
-    direction: IndexDirection,  // Direction of this field in the index structure
-}
-
-pub enum IndexDirection {
-    Asc,
-    Desc,
-}
-```
-
-### 2. Range
-
-```rust
-pub struct Range {
-    from: Bound,
-    to: Bound,
-}
-
-pub enum Bound {
-    Unbounded,
-    Inclusive(Vec<Property>),  // Uses core/src/property types
-    Exclusive(Vec<Property>),
-}
-```
-
-### 3. ScanDirection
-
-```rust
-pub enum ScanDirection {
-    Asc,
-    Desc,
-}
-```
-
-## Planner Configuration
-
-```rust
-pub struct PlannerConfig {
-    supports_desc_indexes: bool,  // false for IndexedDB, true for engines with real DESC indexes
-}
-```
+- Uses `PropertyValue` from `ankurah_core::property` for bound values
+- Uses `remaining_predicate` field name (not `remaining_predicate`)
+- All structs are public with appropriate derives
 
 ## Implementation Tasks
 
@@ -77,12 +29,7 @@ pub struct PlannerConfig {
 
 ### Phase 2: Plan Generation (`planner.rs`)
 
-2. **Define Plan Structure**
-
-   - Create Plan, Range, Bound, and ScanDirection types
-   - Use Property types from core/src/property for values
-
-3. **Implement Planner::plan()**
+2. **Implement Planner::plan()**
 
    - Input: `ankql::ast::Selection`, `PlannerConfig`
    - Output: `Vec<Plan>`
@@ -103,11 +50,11 @@ pub struct PlannerConfig {
      g. Generate default [__collection, id] plan
      h. Deduplicate plans based on index_fields
      i. For each plan:
-        - Calculate amended_predicate (remove consumed conjuncts)
+        - Calculate remaining_predicate (remove consumed conjuncts)
         - Set requires_sort based on ORDER BY alignment
      ```
 
-4. **ORDER BY Plan Generation**
+3. **ORDER BY Plan Generation**
 
    - If ORDER BY exists, ALL components must be in the index in the same order
    - Index structure: [__collection, ...equalities, inequality_if_on_first_orderby_field, ...order_by_fields]
@@ -129,22 +76,22 @@ pub struct PlannerConfig {
      Query: __collection = "album" AND age > 25 ORDER BY foo, bar
      Plan: index_fields: [__collection, age, foo, bar]
            range: { from: Exclusive(["album", 25]), to: Unbounded }
-           amended_predicate: (empty - all consumed)
+           remaining_predicate: (empty - all consumed)
      ```
 
    - All ORDER BY fields must have same direction
    - Set requires_sort = false when index aligns with ORDER BY
 
-5. **Conjunct-based Plan Generation**
+4. **Conjunct-based Plan Generation**
 
    - For each conjunct that's a comparison:
      - Extract field name and operator
      - Determine optimal scan direction
      - Create appropriate Range based on operator
      - Track which conjuncts were "consumed"
-   - Generate amended_predicate (original minus consumed conjuncts)
+   - Generate remaining_predicate (original minus consumed conjuncts)
 
-6. **Range Construction Algorithm**
+5. **Range Construction Algorithm**
 
    - Handle operator types:
      - `=` → `Range { from: Inclusive([...values]), to: Inclusive([...values]) }`
@@ -179,17 +126,17 @@ pub struct PlannerConfig {
      Query: __collection = "album" AND age = 30 AND score > 50 ORDER BY score
      Plan: index_fields: [__collection, age, score]
            range: { from: Exclusive(["album", 30, 50]), to: Unbounded }
-           amended_predicate: (empty - all consumed)
+           remaining_predicate: (empty - all consumed)
      ```
 
-7. **Index Field Direction Handling**
+6. **Index Field Direction Handling**
    - For IndexedDB (supports_desc_indexes = false):
      - All IndexField directions set to Asc
      - Use scan_direction to control cursor direction
    - For other engines (supports_desc_indexes = true):
      - IndexField directions can be Asc or Desc
      - Match ORDER BY directions when possible
-8. **Conjunct Consumption Rules**
+7. **Conjunct Consumption Rules**
 
    - A conjunct is "consumed" by an index if:
      - It's an equality on any prefix field of the index
@@ -211,7 +158,7 @@ pub struct PlannerConfig {
            Range: { from: Exclusive(["album", 100, 25]), to: Exclusive(["album", 100, 50]) }
      ```
 
-9. **Plan Deduplication**
+8. **Plan Deduplication**
    - Plans are considered duplicate if they have identical:
      - index_fields (same fields in same order with same directions)
      - scan_direction
@@ -225,13 +172,13 @@ pub struct PlannerConfig {
 - Test Range construction for different operators
 - Test Plan generation for simple queries
 - Test Plan generation with ORDER BY
-- Test amended predicate generation
+- Test remaining predicate generation
 
 11. **Integration Tests**
 
 - Port relevant tests from current indexes.rs
 - Ensure all plans are valid (would return correct results)
-- Verify amended predicates are correct
+- Verify remaining predicates are correct
 
 ### Phase 4: Migration (Future)
 
@@ -245,7 +192,7 @@ pub struct PlannerConfig {
 1. **Empty Conjuncts**
 
    - If no conjuncts found (e.g., all ORs), only generate default plan
-   - Amended predicate = original predicate
+   - Remaining predicate = original predicate
 
 2. **Incompatible ORDER BY**
 
@@ -264,7 +211,7 @@ pub struct PlannerConfig {
 
 5. **IN and BETWEEN Operators**
    - Currently not supported in range construction
-   - Remain in amended_predicate for post-scan filtering
+   - Remain in remaining_predicate for post-scan filtering
 
 ## Key Design Decisions
 

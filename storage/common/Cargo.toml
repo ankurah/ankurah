@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ankql = { path = "../../ankql" }
 ankurah-core = { path = "../../core" }
+indexmap = "2.0"
 
 
 [dev-dependencies]

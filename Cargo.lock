@@ -195,6 +195,7 @@ dependencies = [
  "ankql",
  "ankurah-core",
  "ankurah-derive",
+ "indexmap 2.8.0",
 ]
 
 [[package]]
