@@ -2,15 +2,18 @@
 
 ## Overview
 
-Implement ORDER BY and LIMIT functionality in IndexedDB using native indexes with on-demand creation. Indexes are created synchronously on first use, blocking the query until ready.
+Implement ORDER BY and LIMIT functionality in IndexedDB using the common `Planner` from `ankurah-storage-common` with on-demand index creation. The `Planner` generates index plans that IndexedDB executes using native indexes.
 
 ## Key Design Decisions
 
-1. **On-Demand Index Creation**: Create indexes when first needed, no prediction or thresholds
-2. **Full Field Extraction**: Extract ALL fields during `set_state` for comprehensive indexing
-3. **Native IndexedDB Sorting**: Use IndexedDB's built-in collation rules (no custom control)
-4. **Synchronous Creation**: First query blocks until index exists
-5. **No Backward Compatibility**: Clean break - all entities must have extracted fields
+1. **Common Query Planner**: Use `ankurah_storage_common::planner::Planner` for index selection
+2. **Predicate Amendment**: Prefix all predicates with `__collection = 'value'` before planning
+3. **First Plan Selection**: Always use the first plan from the planner
+4. **On-Demand Index Creation**: Create indexes exactly as specified by the plan if they don't exist
+5. **Full Field Extraction**: Extract ALL fields during `set_state` (regular fields unprefixed, special fields with `__` prefix)
+6. **Native IndexedDB Sorting**: Use IndexedDB's built-in collation rules (no custom control)
+7. **Synchronous Creation**: First query blocks until index exists
+8. **Plan-Driven Execution**: Execute queries based on `Plan` structures from the planner
 
 ## Architecture
 
@@ -22,15 +25,15 @@ Extract ALL fields from state_buffer during `set_state`, similar to Postgres:
 // New entity structure
 {
   id: "entity_id",           // Primary key (already indexed)
-  collection: "albums",       // Already has index
-  state_buffer: {...},        // Original serialized data
-  head: {...},
-  attestations: [...],
-  // Extracted fields with _idx_ prefix
-  _idx_name: "The Dark Side of the Moon",
-  _idx_year: 1973,
-  _idx_artist: "Pink Floyd",
-  _idx_duration: 42.5
+  __collection: "albums",    // Special field (prefixed)
+  __state_buffer: {...},     // Special field (prefixed)
+  __head: {...},            // Special field (prefixed)
+  __attestations: [...],    // Special field (prefixed)
+  // Regular extracted fields (no prefix)
+  name: "The Dark Side of the Moon",
+  year: 1973,
+  artist: "Pink Floyd",
+  duration: 42.5
 }
 ```
 
@@ -179,19 +182,32 @@ async fn fetch_states(selection: &Selection) -> Result<Vec<EntityState>> {
     // 1. Extract all fields during previous set_state operations
     //    (already done)
 
-    // 2. Analyze query to determine optimal index
-    let index_spec = analyze_query(selection)?;
+    // 2. Amend predicate with __collection comparison
+    let amended_selection = Selection {
+        predicate: Predicate::And(
+            Box::new(Predicate::Comparison {
+                left: Box::new(Expr::Identifier(Identifier::Property("__collection".to_string()))),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String(collection_id.to_string()))),
+            }),
+            Box::new(selection.predicate.clone())
+        ),
+        order_by: selection.order_by.clone(),
+        limit: selection.limit,
+    };
 
-    // 3. Ensure index exists (may block for creation)
-    if index_spec.is_some() {
-        ensure_index(&index_spec).await?;
-    }
+    // 3. Use common Planner to generate query plans
+    let planner = Planner::new(PlannerConfig::default());
+    let plans = planner.plan(&amended_selection);
 
-    // 4. Execute query
-    match index_spec {
-        Some(spec) => execute_indexed_query(selection, &spec).await,
-        None => execute_id_optimized_query(selection).await,
-    }
+    // 4. Pick the first plan (always)
+    let plan = plans.first().ok_or("No plan generated")?;
+
+    // 5. Ensure index exists (may block for creation)
+    ensure_index_from_plan(&plan).await?;
+
+    // 6. Execute query using the plan
+    execute_plan_query(&amended_selection, &plan).await
 }
 ```
 
@@ -317,16 +333,183 @@ fn to_indexeddb_value(value: Option<PropertyValue>) -> JsValue {
 - Optimize index reuse detection
 - Add telemetry for index usage
 
+## Integration with Common Planner
+
+### Plan to IndexedDB Mapping
+
+The common `Planner` generates `Plan` structures that need to be mapped to IndexedDB operations:
+
+```rust
+// Plan from common planner (after predicate amendment)
+Plan {
+    index_fields: vec![
+        IndexField { name: "__collection", direction: Asc },
+        IndexField { name: "age", direction: Asc }
+    ],
+    scan_direction: ScanDirection::Asc,  // PRIMARY: determines cursor direction
+    range: Range {
+        from: Bound::Exclusive([String("album"), Integer(25)]),
+        to: Bound::Unbounded
+    },
+    remaining_predicate: Predicate::...,
+    requires_sort: false,
+}
+
+// Maps to IndexedDB:
+// - Index name: "__collection__age" (exactly as specified by planner)
+// - IdbKeyRange: lowerBound(["album", 25], true) (direct conversion from Range)
+// - Cursor direction: "next" (from scan_direction, not index_fields[].direction)
+// - Post-filter: Apply remaining_predicate after fetching
+```
+
+### Index Creation from Plan
+
+```rust
+fn index_name_from_plan(plan: &Plan) -> String {
+    // Create index name from all fields in the exact order specified
+    // No special handling for __collection - it's just another field
+    let field_names: Vec<_> = plan.index_fields
+        .iter()
+        .map(|f| &f.name)
+        .collect();
+    field_names.join("__")
+}
+
+fn create_index_from_plan(store: &IdbObjectStore, plan: &Plan) {
+    let index_name = index_name_from_plan(plan);
+
+    // Key path must match the exact field order from the plan
+    let key_path = plan.index_fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<js_sys::Array>();
+
+    store.create_index_with_str_sequence(&index_name, &key_path);
+}
+```
+
+### Range Conversion
+
+Direct conversion from `Plan::range` to `IdbKeyRange`:
+
+```rust
+fn plan_range_to_idb_range(range: &Range) -> Result<IdbKeyRange> {
+    use ankurah_storage_common::planner::Bound;
+
+    match (&range.from, &range.to) {
+        (Bound::Inclusive(from_vals), Bound::Inclusive(to_vals)) => {
+            IdbKeyRange::bound(
+                &property_values_to_js_array(from_vals),
+                &property_values_to_js_array(to_vals),
+                false, // from_exclusive = false (inclusive)
+                false  // to_exclusive = false (inclusive)
+            )
+        }
+        (Bound::Exclusive(from_vals), Bound::Inclusive(to_vals)) => {
+            IdbKeyRange::bound(
+                &property_values_to_js_array(from_vals),
+                &property_values_to_js_array(to_vals),
+                true,  // from_exclusive = true
+                false  // to_exclusive = false
+            )
+        }
+        (Bound::Inclusive(from_vals), Bound::Exclusive(to_vals)) => {
+            IdbKeyRange::bound(
+                &property_values_to_js_array(from_vals),
+                &property_values_to_js_array(to_vals),
+                false, // from_exclusive = false
+                true   // to_exclusive = true
+            )
+        }
+        (Bound::Exclusive(from_vals), Bound::Exclusive(to_vals)) => {
+            IdbKeyRange::bound(
+                &property_values_to_js_array(from_vals),
+                &property_values_to_js_array(to_vals),
+                true,  // from_exclusive = true
+                true   // to_exclusive = true
+            )
+        }
+        (Bound::Inclusive(from_vals), Bound::Unbounded) => {
+            IdbKeyRange::lower_bound(
+                &property_values_to_js_array(from_vals),
+                false  // exclusive = false (inclusive)
+            )
+        }
+        (Bound::Exclusive(from_vals), Bound::Unbounded) => {
+            IdbKeyRange::lower_bound(
+                &property_values_to_js_array(from_vals),
+                true   // exclusive = true
+            )
+        }
+        (Bound::Unbounded, Bound::Inclusive(to_vals)) => {
+            IdbKeyRange::upper_bound(
+                &property_values_to_js_array(to_vals),
+                false  // exclusive = false (inclusive)
+            )
+        }
+        (Bound::Unbounded, Bound::Exclusive(to_vals)) => {
+            IdbKeyRange::upper_bound(
+                &property_values_to_js_array(to_vals),
+                true   // exclusive = true
+            )
+        }
+        (Bound::Unbounded, Bound::Unbounded) => {
+            // No range constraint - scan all
+            Ok(None)
+        }
+    }
+}
+
+fn property_values_to_js_array(values: &[PropertyValue]) -> js_sys::Array {
+    let array = js_sys::Array::new();
+    for value in values {
+        array.push(&JsValue::from(value));
+    }
+    array
+}
+```
+
 ## Design Constraints
 
 1. **No Unique Indexes**: Primary key on `id` is sufficient, no additional unique constraints needed
-2. **Single Field ORDER BY**: Only support single field ORDER BY clauses, return error for multiple fields
-3. **Index Naming**: Use `|` delimiter for compound index names (e.g., `status|asc|created_at|desc`)
+2. **Index Field Order**: Preserve exact field order from planner - never reorder
+3. **Index Naming**: Use `__` delimiter for composite index names (e.g., `__collection__age`)
+4. **Scan Direction**: Use `plan.scan_direction` for cursor direction, ignore `index_fields[].direction`
+5. **No Descending Indexes**: IndexedDB doesn't support DESC indexes structurally (only via reverse cursor scan)
 
 ## Next Steps
 
-1. Verify `id` field is properly set as primary key
-2. Implement Phase 1 (field extraction)
-3. Test version upgrade mechanism
-4. Build Web Locks coordination
-5. Create test suite for query patterns
+1. **Update Collection::fetch_states**:
+
+   - Amend predicate with `__collection = 'value'` comparison
+   - Use `Planner` to generate plans
+   - Take first plan from the list
+   - Ensure index exists (create if needed)
+   - Execute using plan's index and range
+
+2. **Implement Helper Functions**:
+
+   - `amend_predicate_with_collection()` - Add \_\_collection comparison
+   - `index_name_from_plan()` - Generate index name from plan
+   - `plan_range_to_idb_range()` - Convert Range to IdbKeyRange
+   - `ensure_index_from_plan()` - Create index if doesn't exist
+   - `execute_plan_query()` - Execute query using plan
+
+3. **Clean Break from Old Code**:
+
+   - Delete `indexes.rs::Optimizer` and related types
+   - Remove `quarantine.rs` entirely
+   - Remove intermediate `RangeConstraint` type
+   - Keep only minimal index creation utilities
+
+4. **Field Storage Updates**:
+
+   - Regular fields: store without prefix (e.g., `name`, `age`)
+   - Special fields: store with `__` prefix (e.g., `__collection`, `__head`)
+   - Update `extract_all_fields()` accordingly
+
+5. **Testing**:
+   - Verify existing queries still work
+   - Test ORDER BY with new planner
+   - Test multiple inequality scenarios
+   - Test index creation on first use
