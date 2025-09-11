@@ -75,6 +75,9 @@ macro_rules! into {
                 }
             }
         }
+        impl From<$ty> for PropertyValue {
+            fn from(value: $ty) -> Self { PropertyValue::$variant(value) }
+        }
     };
 }
 
@@ -105,6 +108,10 @@ impl Property for EntityId {
             None => Err(PropertyError::Missing),
         }
     }
+}
+
+impl From<&str> for PropertyValue {
+    fn from(value: &str) -> Self { PropertyValue::String(value.to_string()) }
 }
 
 // WASM JsValue conversions for IndexedDB
