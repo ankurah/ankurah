@@ -1,5 +1,5 @@
 mod common;
-use ankurah_storage_common::planner::{IndexDirection, IndexField, IndexSpec};
+use ankurah_storage_common::index_spec::{IndexDirection, IndexField, IndexSpec};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 
