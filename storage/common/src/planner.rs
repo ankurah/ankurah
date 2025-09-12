@@ -88,7 +88,7 @@ impl Planner {
 
     /// Generate all possible index scan plans for a query
     ///
-    /// Input: Selection with predicate already containing __collection = collection_id
+    /// Input: Selection with predicate
     /// Output: Vector of all viable plans
     pub fn plan(&self, selection: &ankql::ast::Selection) -> Vec<Plan> {
         let conjuncts = ConjunctFinder::find(&selection.predicate);
@@ -203,21 +203,13 @@ impl Planner {
         order_by: &[ankql::ast::OrderByItem],
         conjuncts: &[Predicate],
     ) -> Option<Plan> {
-        // Extract ORDER BY field names
-        let order_by_fields: Vec<String> = order_by
-            .iter()
-            .filter_map(|item| match &item.identifier {
-                Identifier::Property(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-
-        if order_by_fields.is_empty() {
+        if order_by.is_empty() {
             return None;
         }
 
         // Build index fields: [...equalities, inequality_if_matches_first_orderby, ...order_by_fields]
         let mut index_fields = Vec::new();
+        let mut sort_fields = Vec::new();
 
         // Add equality fields first
         for (field, _) in equalities {
@@ -225,20 +217,70 @@ impl Planner {
         }
 
         // Check if first ORDER BY field has an inequality - if so, add it before other ORDER BY fields
-        let first_order_field = &order_by_fields[0];
+        let first_order_field = match &order_by[0].identifier {
+            Identifier::Property(name) => name,
+            _ => return None,
+        };
         let has_inequality_on_first_order = inequalities.contains_key(first_order_field);
 
         if has_inequality_on_first_order {
             // Add the inequality field (it's the same as first ORDER BY field)
             index_fields.push(IndexField::new(first_order_field.clone(), IndexDirection::Asc));
-            // Add remaining ORDER BY fields
-            for field in &order_by_fields[1..] {
-                index_fields.push(IndexField::new(field.clone(), IndexDirection::Asc));
+        }
+
+        // Process ORDER BY fields, handling direction changes
+        if self.config.supports_desc_indexes {
+            // Full support: can handle mixed directions in index
+            if has_inequality_on_first_order {
+                // Skip first field since it's already added as inequality field
+                for item in &order_by[1..] {
+                    if let Identifier::Property(name) = &item.identifier {
+                        let direction = match item.direction {
+                            ankql::ast::OrderDirection::Asc => IndexDirection::Asc,
+                            ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
+                        };
+                        index_fields.push(IndexField::new(name.clone(), direction));
+                    }
+                }
+            } else {
+                // Add all ORDER BY fields
+                for item in order_by {
+                    if let Identifier::Property(name) = &item.identifier {
+                        let direction = match item.direction {
+                            ankql::ast::OrderDirection::Asc => IndexDirection::Asc,
+                            ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
+                        };
+                        index_fields.push(IndexField::new(name.clone(), direction));
+                    }
+                }
             }
         } else {
-            // Add all ORDER BY fields
-            for field in &order_by_fields {
-                index_fields.push(IndexField::new(field.clone(), IndexDirection::Asc));
+            // IndexedDB: only ASC indexes, stop at first direction change
+            let current_direction = order_by[0].direction.clone();
+            let mut order_by_idx = if has_inequality_on_first_order { 1 } else { 0 };
+
+            // If we don't have an inequality on first order field, add the first ORDER BY field
+            if !has_inequality_on_first_order {
+                if let Identifier::Property(name) = &order_by[0].identifier {
+                    index_fields.push(IndexField::new(name.clone(), IndexDirection::Asc));
+                    order_by_idx = 1;
+                }
+            }
+
+            // Process remaining ORDER BY fields until direction changes
+            for (i, item) in order_by[order_by_idx..].iter().enumerate() {
+                if let Identifier::Property(name) = &item.identifier {
+                    if item.direction == current_direction {
+                        // Same direction, add to index
+                        index_fields.push(IndexField::new(name.clone(), IndexDirection::Asc));
+                    } else {
+                        // Direction changed, add this and all remaining fields to sort_fields
+                        for remaining_item in &order_by[order_by_idx + i..] {
+                            sort_fields.push(remaining_item.clone());
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -255,16 +297,20 @@ impl Planner {
             if has_inequality_on_first_order { Some(first_order_field) } else { None },
         );
 
-        // Determine scan direction based on ORDER BY direction
-        // For IndexedDB (supports_desc_indexes = false), we use ASC indexes but scan backwards for DESC
-        let scan_direction = if order_by.iter().any(|item| item.direction == ankql::ast::OrderDirection::Desc) {
-            ScanDirection::Reverse
-        } else {
+        // Determine scan direction
+        let scan_direction = if self.config.supports_desc_indexes {
+            // With full support, always scan forward (direction is in index)
             ScanDirection::Forward
+        } else {
+            // For IndexedDB, scan backwards if ORDER BY starts with DESC
+            match order_by[0].direction {
+                ankql::ast::OrderDirection::Desc => ScanDirection::Reverse,
+                ankql::ast::OrderDirection::Asc => ScanDirection::Forward,
+            }
         };
 
         let index_spec = IndexSpec::new(index_fields);
-        Some(Plan { index_spec, scan_direction, range, remaining_predicate, sort_fields: vec![] })
+        Some(Plan { index_spec, scan_direction, range, remaining_predicate, sort_fields })
     }
 
     /// Generate plan for inequality-based queries
@@ -329,9 +375,9 @@ impl Planner {
 
         if let Some((_, inequalities)) = inequality {
             // Handle multiple inequalities on the same field
-            // TODO: Should choose most restrictive bounds, but currently last one wins
-            let mut from_bound = Bound::Inclusive(from_values.clone()); // Default to collection pref
-            let mut to_bound = Bound::Unbounded;
+            // Currently uses last inequality for each direction - TODO: implement most restrictive selection
+            let mut from_bound = Bound::Inclusive(from_values.clone()); // Default to equality prefix
+            let mut to_bound = Bound::Inclusive(to_values.clone()); // Default to equality prefix
 
             for (op, value) in inequalities {
                 match op {
@@ -380,24 +426,19 @@ impl Planner {
 
             // Check if this conjunct is consumed by equalities
             if let Some((field, _, _)) = self.extract_comparison(conjunct) {
-                // Always consume __collection field
-                if field == "__collection" {
-                    consumed = true;
-                } else {
-                    // Check if it's a consumed equality
-                    for (eq_field, _) in consumed_equalities {
-                        if field == *eq_field {
-                            consumed = true;
-                            break;
-                        }
+                // Check if it's a consumed equality
+                for (eq_field, _) in consumed_equalities {
+                    if field == *eq_field {
+                        consumed = true;
+                        break;
                     }
+                }
 
-                    // Check if it's a consumed inequality
-                    if !consumed {
-                        if let Some(ineq_field) = consumed_inequality_field {
-                            if field == ineq_field {
-                                consumed = true;
-                            }
+                // Check if it's a consumed inequality
+                if !consumed {
+                    if let Some(ineq_field) = consumed_inequality_field {
+                        if field == ineq_field {
+                            consumed = true;
                         }
                     }
                 }
@@ -540,7 +581,23 @@ mod tests {
         }
 
         #[test]
-        fn test_order_by_with_equality_and_different_inequality() {
+        fn no_collection_field() {
+            // the __collection field is not special for the planner
+            assert_eq!(
+                plan!("age = 30 ORDER BY foo, bar"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("age"), asc!("foo"), asc!("bar")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact![30],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        // was incorrectly named before
+        #[test]
+        fn test_order_by_with_equality() {
             assert_eq!(
                 plan!("__collection = 'album' AND age = 30 ORDER BY foo, bar"),
                 vec![Plan {
@@ -987,11 +1044,10 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                     scan_direction: ScanDirection::Forward,
-                    // age >= 25 wins over age > 20 the more restrictive of the conjunct predicate wins
-                    // from: is incl because the lower bound of the inequality (age) is >= 25
-                    //    it would have been excl!("album", 20) had the 25 comparison not been there)
-                    // to: is incl because the upper bound of the inequality (age) is <= 50
-                    range: Range::new(incl!["album", 25], incl!["album", 50]),
+                    // age > 20 wins over age >= 25 because it comes last (last wins behavior)
+                    // from: is excl because the final lower bound inequality (age) is > 20
+                    // to: is incl because the upper bound inequality (age) is <= 50
+                    range: Range::new(excl!["album", 20], incl!["album", 50]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![],
                 }]
