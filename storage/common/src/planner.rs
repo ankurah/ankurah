@@ -530,7 +530,9 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("foo"), asc!("bar")]),
                     scan_direction: ScanDirection::Forward,
-                    range: Range::new(excl!["album", 10], Bound::Unbounded),
+                    // from is excl because the inequality (foo) is > 10
+                    // to is incl because there is no foo < ? in the predicate
+                    range: Range::new(excl!["album", 10], incl!["album"]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![]
                 }]
@@ -649,7 +651,9 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                     scan_direction: ScanDirection::Reverse,
-                    range: Range::new(excl!["album", 25], Bound::Unbounded),
+                    // from is excl because the inequality (age) is > 25
+                    // to is incl because there is no age < ? in the predicate
+                    range: Range::new(excl!["album", 25], incl!["album"]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![]
                 }]
@@ -733,7 +737,9 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                     scan_direction: ScanDirection::Forward,
-                    range: Range::new(excl!["album", 25], Bound::Unbounded),
+                    // from is excl because the inequality (age) is > 25
+                    // to is incl because there is no age < ? in the predicate
+                    range: Range::new(excl!["album", 25], incl!["album"]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![]
                 }]
@@ -747,6 +753,8 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                     scan_direction: ScanDirection::Forward,
+                    // from is excl because the inequality (age) is > 25
+                    // to is excl because the inequality (age) is < 50
                     range: Range::new(excl!["album", 25], excl!["album", 50]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![]
@@ -764,7 +772,9 @@ mod tests {
                     Plan {
                         index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                         scan_direction: ScanDirection::Forward,
-                        range: Range::new(excl!["album", 25], Bound::Unbounded),
+                        // from is excl because the inequality (age) is > 25
+                        // from is incl because there is no age < ? in the predicate
+                        range: Range::new(excl!["album", 25], incl!["album"]),
                         remaining_predicate: selection!("score < 100").predicate,
                         sort_fields: vec![]
                     },
@@ -772,6 +782,8 @@ mod tests {
                     Plan {
                         index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("score")]),
                         scan_direction: ScanDirection::Forward,
+                        // from is incl because there is no score < ? in the predicate
+                        // to is excl because the inequality (score) is < 100
                         range: Range::new(incl!["album"], excl!["album", 100]),
                         remaining_predicate: selection!("age > 25").predicate,
                         sort_fields: vec![]
@@ -825,7 +837,9 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name"), asc!("age")]),
                     scan_direction: ScanDirection::Forward,
-                    range: Range::new(excl!["album", "Alice", 25], Bound::Unbounded),
+                    // from is excl because the final inequality (age) is > 25
+                    // to is incl and the final component is omitted because there is no age < ? in the predicate
+                    range: Range::new(excl!["album", "Alice", 25], incl!["album", "Alice"]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![]
                 }]
@@ -839,7 +853,9 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age"), asc!("score")]), // equalities first, then inequalities, preserving order of appearance
                     scan_direction: ScanDirection::Forward,
-                    range: Range::new(excl!["album", 30, 50], Bound::Unbounded),
+                    // from is excl because the final inequality (score) is > 50
+                    // to is incl and the final component is omitted because there is no score < ? in the predicate
+                    range: Range::new(excl!["album", 30, 50], incl!["album", 30]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![]
                 }]
@@ -886,7 +902,9 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                     scan_direction: ScanDirection::Forward,
-                    range: Range::new(excl!["album", 25], Bound::Unbounded),
+                    // from is excl because the inequality (age) is > 25
+                    // to is incl and the final component is omitted because there is no age < ? in the predicate
+                    range: Range::new(excl!["album", 25], incl!["album"]),
                     remaining_predicate: selection!("name != 'Alice'").predicate,
                     sort_fields: vec![],
                 }]
@@ -902,6 +920,8 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                     scan_direction: ScanDirection::Forward,
+                    // from is excl because the inequality (age) is > 50
+                    // to is excl because the inequality (age) is < 30
                     range: Range::new(excl!["album", 50], excl!["album", 30]), // Impossible but we generate it anyway
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![],
@@ -918,6 +938,7 @@ mod tests {
                     index_spec: IndexSpec::new(vec![asc!("__collection")]),
                     scan_direction: ScanDirection::Forward,
                     range: range_exact!["album"],
+                    // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
                     remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
                     sort_fields: vec![],
                 }]
@@ -933,6 +954,7 @@ mod tests {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("score")]),
                     scan_direction: ScanDirection::Forward,
                     range: range_exact!["album", 100],
+                    // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
                     remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
                     sort_fields: vec![],
                 }]
@@ -965,7 +987,11 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
                     scan_direction: ScanDirection::Forward,
-                    range: Range::new(excl!["album", 20], incl!["album", 50]), // > 20 and <= 50 (last bounds win)
+                    // age >= 25 wins over age > 20 the more restrictive of the conjunct predicate wins
+                    // from: is incl because the lower bound of the inequality (age) is >= 25
+                    //    it would have been excl!("album", 20) had the 25 comparison not been there)
+                    // to: is incl because the upper bound of the inequality (age) is <= 50
+                    range: Range::new(incl!["album", 25], incl!["album", 50]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![],
                 }]
@@ -980,7 +1006,9 @@ mod tests {
                 vec![Plan {
                     index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("timestamp")]),
                     scan_direction: ScanDirection::Forward,
-                    range: Range::new(excl!["album", 9223372036854775807i64], Bound::Unbounded),
+                    // from is excl because the inequality (timestamp) is > 9223372036854775807
+                    // to is incl because there is no timestamp < ? in the predicate
+                    range: Range::new(excl!["album", 9223372036854775807i64], incl!["album"]),
                     remaining_predicate: Predicate::True,
                     sort_fields: vec![]
                 }]
