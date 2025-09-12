@@ -14,7 +14,7 @@ use crate::{cb_future::CBFuture, cb_stream::CBStream, database::Database, object
 
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct IndexedDBBucket {
@@ -153,6 +153,7 @@ impl StorageCollection for IndexedDBBucket {
             .await
             .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
 
+        info!("LOOK fetching with range: {:?}", plan.range);
         // Step 5: Check for impossible ranges and return empty results immediately
         if crate::planner_integration::is_impossible_range(&plan.range) {
             return Ok(Vec::new());
