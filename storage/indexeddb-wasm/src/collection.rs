@@ -135,20 +135,30 @@ impl StorageCollection for IndexedDBBucket {
         }
 
         let _invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _lock = self.mutex.lock().await;
+        let _lock = self.mutex.lock().await; // TODO why are we locking here?
 
-        // Step 1: Use optimizer to select the best index
-        let optimizer = crate::indexes::Optimizer::new();
-        let (index_spec, scan_direction, range_constraint) =
-            optimizer.pick_index(selection).map_err(|e| RetrievalError::StorageError(format!("index selection: {}", e).into()))?;
+        // Step 1: Amend predicate with __collection comparison
+        let amended_selection = add_collection(selection, &self.collection_id);
 
-        // Step 2: Ensure the index exists
+        // Step 2: Use planner to generate query plans
+        let planner = ankurah_storage_common::planner::Planner::new(ankurah_storage_common::planner::PlannerConfig::indexeddb());
+        let plans = planner.plan(&amended_selection);
+
+        // Step 3: Pick the first plan (always)
+        let plan = plans.first().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
+
+        // Step 4: Ensure index exists using plan's IndexSpec
         self.db
-            .assure_index_exists(&index_spec)
+            .assure_index_exists(&plan.index_spec)
             .await
             .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
 
-        // Step 3: Execute the query using the selected index
+        // Step 5: Check for impossible ranges and return empty results immediately
+        if crate::planner_integration::is_impossible_range(&plan.range) {
+            return Ok(Vec::new());
+        }
+
+        // Step 6: Execute the query using the plan
         let db_connection = self.db.get_connection().await;
         let collection_id = self.collection_id.clone();
         let limit = selection.limit;
@@ -157,32 +167,17 @@ impl StorageCollection for IndexedDBBucket {
             let transaction = step(db_connection.transaction_with_str("entities"), "create transaction")?;
             let store = step(transaction.object_store("entities"), "get object store")?;
 
-            // Always use index cursor - we never use the object store cursor directly
-            // All our indexes are composite: [__collection, field_name]
-            let index = step(store.index(index_spec.name()), "get index")?;
+            // Get the index specified by the plan
+            let index = step(store.index(&plan.index_spec.name("", "__")), "get index")?;
 
-            // Convert range constraint to IndexedDB key range
-            let key_range = if let Some(constraint) = range_constraint {
-                Some(step(constraint.to_idb_key_range(&collection_id), "create constraint key range")?)
-            } else {
-                let collection_js_value: JsValue = collection_id.clone().into();
+            // Convert plan range to IndexedDB key range
+            let key_range = crate::planner_integration::plan_range_to_idb_range(&plan.range)
+                .map_err(|e| RetrievalError::StorageError(format!("range conversion: {}", e).into()))?;
 
-                // For composite indexes, we need to create a range that matches the collection prefix
-                // Following IndexedDB best practices for composite key ranges:
-                // Lower bound: ['album', ''] - collection + empty string (lowest possible)
-                // Upper bound: ['album', Infinity] - collection + Infinity (highest possible)
-                let lower_bound = js_sys::Array::new_with_length(2);
-                lower_bound.set(0, collection_js_value.clone());
-                lower_bound.set(1, JsValue::from_str("")); // Empty string for lowest possible second key
+            // Convert scan direction to cursor direction
+            let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(&plan.scan_direction);
 
-                let upper_bound = js_sys::Array::new_with_length(2);
-                upper_bound.set(0, collection_js_value);
-                upper_bound.set(1, JsValue::from_str("\u{10FFFF}")); // Highest Unicode code point for string comparison
-
-                Some(step(web_sys::IdbKeyRange::bound(&lower_bound, &upper_bound), "create collection prefix key range")?)
-            };
-
-            let results = execute_index_query(&index, key_range, &selection.predicate, scan_direction, limit, &collection_id).await?;
+            let results = execute_plan_query(&index, key_range, &plan.remaining_predicate, cursor_direction, limit, &collection_id).await?;
 
             Ok(results)
         })
@@ -327,18 +322,18 @@ impl IndexedDBBucket {
 
 /// Execute queries using index cursors (we always use indexes for fetch operations)
 /// Convert IndexDirection to IdbCursorDirection
-pub fn to_idb_cursor_direction(direction: crate::indexes::IndexDirection) -> web_sys::IdbCursorDirection {
+pub fn to_idb_cursor_direction(direction: ankurah_storage_common::planner::IndexDirection) -> web_sys::IdbCursorDirection {
     match direction {
-        crate::indexes::IndexDirection::Asc => web_sys::IdbCursorDirection::Next,
-        crate::indexes::IndexDirection::Desc => web_sys::IdbCursorDirection::Prev,
+        ankurah_storage_common::planner::IndexDirection::Asc => web_sys::IdbCursorDirection::Next,
+        ankurah_storage_common::planner::IndexDirection::Desc => web_sys::IdbCursorDirection::Prev,
     }
 }
 
-async fn execute_index_query(
+async fn execute_plan_query(
     index: &web_sys::IdbIndex,
     key_range: Option<web_sys::IdbKeyRange>,
     predicate: &ankql::ast::Predicate,
-    direction: crate::indexes::IndexDirection,
+    cursor_direction: web_sys::IdbCursorDirection,
     limit: Option<u64>,
     collection_id: &ankurah_proto::CollectionId,
 ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
@@ -346,8 +341,7 @@ async fn execute_index_query(
         res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
     }
 
-    // Convert direction to IndexedDB cursor direction
-    let cursor_direction = to_idb_cursor_direction(direction);
+    // cursor_direction is already provided as parameter
 
     // Open index cursor with optional key range and direction
     // Convert IdbKeyRange to JsValue for the API call
@@ -472,4 +466,21 @@ impl<'a> ankql::selection::filter::Filterable for FilterableObject<'a> {
     fn collection(&self) -> &str { self.collection_id.as_str() }
 
     fn value(&self, name: &str) -> Option<String> { self.object.get_opt::<String>(&name.into()).unwrap_or(None) }
+}
+
+/// Amend a selection with __collection = 'value' comparison
+pub fn add_collection(selection: &ankql::ast::Selection, collection_id: &ankurah_proto::CollectionId) -> ankql::ast::Selection {
+    use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
+
+    let collection_comparison = Predicate::Comparison {
+        left: Box::new(Expr::Identifier(Identifier::Property("__collection".to_string()))),
+        operator: ComparisonOperator::Equal,
+        right: Box::new(Expr::Literal(Literal::String(collection_id.to_string()))),
+    };
+
+    ankql::ast::Selection {
+        predicate: Predicate::And(Box::new(collection_comparison), Box::new(selection.predicate.clone())),
+        order_by: selection.order_by.clone(),
+        limit: selection.limit,
+    }
 }
