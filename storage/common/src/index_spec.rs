@@ -225,5 +225,4 @@ pub struct IndexField {
 pub enum IndexDirection {
     Asc,
     Desc,
-    Any, // usable when we're doing an equality check on this field. can default to Asc when we need to create an index versus just matching
 }

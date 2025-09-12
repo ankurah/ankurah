@@ -1,5 +1,5 @@
 use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
-use ankurah_storage_common::planner::IndexSpec;
+use ankurah_storage_common::index_spec::IndexSpec;
 use anyhow::Result;
 use js_sys::Function;
 use send_wrapper::SendWrapper;

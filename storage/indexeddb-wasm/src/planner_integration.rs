@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_plan_index_spec_name() {
-        use ankurah_storage_common::planner::{IndexDirection, IndexField, IndexSpec};
+        use ankurah_storage_common::index_spec::{IndexDirection, IndexField, IndexSpec};
 
         let plan = Plan {
             index_spec: IndexSpec::new(vec![
@@ -120,7 +120,7 @@ mod tests {
             scan_direction: ankurah_storage_common::planner::ScanDirection::Forward,
             range: Range::new(Bound::Unbounded, Bound::Unbounded),
             remaining_predicate: Predicate::True,
-            requires_sort: false,
+            sort_fields: vec![],
         };
 
         let index_name = plan.index_spec.name("", "__");
