@@ -42,6 +42,7 @@ fn compare_property_values(a: &PropertyValue, b: &PropertyValue) -> Option<std::
 }
 
 /// Check if a range is impossible (lower bound > upper bound)
+/// FIXME: This needs to work for different length bounds
 pub fn is_impossible_range(range: &Range) -> bool {
     use Bound::*;
     match (&range.from, &range.to) {
