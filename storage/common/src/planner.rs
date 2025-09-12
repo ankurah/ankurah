@@ -1,40 +1,29 @@
-use crate::predicate::ConjunctFinder;
+use crate::{
+    index_spec::{IndexDirection, IndexField, IndexSpec},
+    predicate::ConjunctFinder,
+};
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Predicate};
 use ankurah_core::property::PropertyValue;
 use indexmap::IndexMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
-    /// The fields and their directions in the index structure
-    pub index_fields: Vec<IndexField>,
+    /// The index specification for this plan
+    pub index_spec: IndexSpec,
     /// Direction to scan the index (forward/backward)
     pub scan_direction: ScanDirection,
     /// Range bounds for the index scan
     pub range: Range,
     /// Original predicate minus consumed conjuncts
     pub remaining_predicate: ankql::ast::Predicate,
-    /// True if ORDER BY doesn't match index (future-proofing)
-    pub requires_sort: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct IndexField {
-    /// Field name
-    pub name: String,
-    /// Direction of this field in the index structure
-    pub direction: IndexDirection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum IndexDirection {
-    Asc,
-    Desc,
+    /// ORDER BY fields that require in-memory sorting after index scan
+    pub sort_fields: Vec<ankql::ast::OrderByItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScanDirection {
-    Asc,
-    Desc,
+    Forward,
+    Reverse,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +57,21 @@ impl PlannerConfig {
 }
 
 impl IndexField {
-    pub fn new(name: String, direction: IndexDirection) -> Self { Self { name, direction } }
+    pub fn new<T: Into<String>>(name: T, direction: IndexDirection) -> Self { Self { name: name.into(), direction } }
+}
+
+impl IndexSpec {
+    /// Create a new IndexSpec with the given fields
+    pub fn new(fields: Vec<IndexField>) -> Self { Self { fields } }
+
+    /// Generate index name with custom prefix and delimiter
+    pub fn name(&self, prefix: &str, delimiter: &str) -> String {
+        let field_names: Vec<_> = self.fields.iter().map(|f| f.name.as_str()).collect();
+        if prefix.is_empty() { field_names.join(delimiter) } else { format!("{}{}{}", prefix, delimiter, field_names.join(delimiter)) }
+    }
+
+    /// Get the index fields
+    pub fn fields(&self) -> &[IndexField] { &self.fields }
 }
 
 impl Range {
@@ -252,7 +255,16 @@ impl Planner {
             if has_inequality_on_first_order { Some(first_order_field) } else { None },
         );
 
-        Some(Plan { index_fields, scan_direction: ScanDirection::Asc, range, remaining_predicate, requires_sort: false })
+        // Determine scan direction based on ORDER BY direction
+        // For IndexedDB (supports_desc_indexes = false), we use ASC indexes but scan backwards for DESC
+        let scan_direction = if order_by.iter().any(|item| item.direction == ankql::ast::OrderDirection::Desc) {
+            ScanDirection::Reverse
+        } else {
+            ScanDirection::Forward
+        };
+
+        let index_spec = IndexSpec::new(index_fields);
+        Some(Plan { index_spec, scan_direction, range, remaining_predicate, sort_fields: vec![] })
     }
 
     /// Generate plan for inequality-based queries
@@ -278,7 +290,8 @@ impl Planner {
         // Calculate remaining predicate (exclude this inequality field)
         let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, Some(inequality_field));
 
-        Some(Plan { index_fields, scan_direction: ScanDirection::Asc, range, remaining_predicate, requires_sort: false })
+        let index_spec = IndexSpec::new(index_fields);
+        Some(Plan { index_spec, scan_direction: ScanDirection::Forward, range, remaining_predicate, sort_fields: vec![] })
     }
 
     /// Generate plan for equality-only queries
@@ -295,7 +308,8 @@ impl Planner {
         // Calculate remaining predicate
         let remaining_predicate = self.calculate_remaining_predicate(conjuncts, equalities, None);
 
-        Some(Plan { index_fields, scan_direction: ScanDirection::Asc, range, remaining_predicate, requires_sort: false })
+        let index_spec = IndexSpec::new(index_fields);
+        Some(Plan { index_spec, scan_direction: ScanDirection::Forward, range, remaining_predicate, sort_fields: vec![] })
     }
 
     /// Build range based on equalities and optional inequality
@@ -316,7 +330,6 @@ impl Planner {
         if let Some((_, inequalities)) = inequality {
             // Handle multiple inequalities on the same field
             // TODO: Should choose most restrictive bounds, but currently last one wins
-            // FIXME: is this correc
             let mut from_bound = Bound::Inclusive(from_values.clone()); // Default to collection pref
             let mut to_bound = Bound::Unbounded;
 
@@ -416,9 +429,10 @@ impl Planner {
         let mut seen = std::collections::HashSet::new();
 
         for plan in plans {
-            let key = (plan.index_fields.clone(), plan.scan_direction.clone());
-            if !seen.contains(&key) {
-                seen.insert(key);
+            // Create a key that owns the data we need for comparison
+            let key = (plan.index_spec.fields.clone(), plan.scan_direction.clone());
+            if seen.insert(key) {
+                // insert returns true if the key was not already present
                 unique_plans.push(plan);
             }
         }
@@ -433,6 +447,7 @@ mod tests {
     use ankurah_core::property::PropertyValue;
     use ankurah_derive::selection;
 
+    // FIX_ME: rename to plan_indexeddb
     macro_rules! plan {
         ($($selection:tt)*) => {{
             let selection = selection!($($selection)*);
@@ -440,9 +455,37 @@ mod tests {
             planner.plan(&selection)
         }};
     }
+    macro_rules! plan_full_support {
+        ($($selection:tt)*) => {{
+            let selection = selection!($($selection)*);
+            let planner = Planner::new(PlannerConfig::full_support());
+            planner.plan(&selection)
+        }};
+    }
     macro_rules! asc {
         ($name:expr) => {
             IndexField::new($name.to_string(), IndexDirection::Asc)
+        };
+    }
+    macro_rules! desc {
+        ($name:expr) => {
+            IndexField::new($name.to_string(), IndexDirection::Desc)
+        };
+    }
+    macro_rules! oby_asc {
+        ($name:expr) => {
+            ankql::ast::OrderByItem {
+                identifier: ankql::ast::Identifier::Property($name.to_string()),
+                direction: ankql::ast::OrderDirection::Asc,
+            }
+        };
+    }
+    macro_rules! oby_desc {
+        ($name:expr) => {
+            ankql::ast::OrderByItem {
+                identifier: ankql::ast::Identifier::Property($name.to_string()),
+                direction: ankql::ast::OrderDirection::Desc,
+            }
         };
     }
 
@@ -471,11 +514,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' ORDER BY foo, bar"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("foo"), asc!("bar")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("foo"), asc!("bar")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album"],
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -485,11 +528,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND foo > 10 ORDER BY foo, bar"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("foo"), asc!("bar")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("foo"), asc!("bar")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 10], Bound::Unbounded),
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -499,11 +542,181 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND age = 30 ORDER BY foo, bar"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age"), asc!("foo"), asc!("bar")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age"), asc!("foo"), asc!("bar")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album", 30],
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_order_by_desc_single_field() {
+            // Single DESC field - should scan backwards with ASC index
+            assert_eq!(
+                plan!("__collection = 'album' ORDER BY name DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name")]),
+                    scan_direction: ScanDirection::Reverse,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_order_by_all_desc() {
+            // All DESC fields - should scan backwards with ASC indexes
+            assert_eq!(
+                plan!("__collection = 'album' ORDER BY name DESC, year DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name"), asc!("year")]),
+                    scan_direction: ScanDirection::Reverse,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_order_by_mixed_directions_asc_first() {
+            // Mixed directions starting with ASC - should stop at first DESC, require sort
+            assert_eq!(
+                plan!("__collection = 'album' ORDER BY name ASC, year DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![oby_desc!("year")]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_order_by_mixed_directions_desc_first() {
+            // Mixed directions starting with DESC - should stop at first ASC, require sort
+            assert_eq!(
+                plan!("__collection = 'album' ORDER BY name DESC, year ASC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name")]),
+                    scan_direction: ScanDirection::Reverse,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![oby_asc!("year")]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_order_by_mixed_three_fields() {
+            // Three fields: ASC, DESC, DESC - should only include first field
+            assert_eq!(
+                plan!("__collection = 'album' ORDER BY foo ASC, bar DESC, baz DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("foo")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![oby_desc!("bar"), oby_desc!("baz")]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_order_by_with_equality_and_desc() {
+            // Equality + DESC ORDER BY
+            assert_eq!(
+                plan!("__collection = 'album' AND status = 'active' ORDER BY name DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("status"), asc!("name")]),
+                    scan_direction: ScanDirection::Reverse,
+                    range: range_exact!["album", "active"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_order_by_with_inequality_and_desc() {
+            // Inequality on ORDER BY field + DESC
+            assert_eq!(
+                plan!("__collection = 'album' AND age > 25 ORDER BY age DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
+                    scan_direction: ScanDirection::Reverse,
+                    range: Range::new(excl!["album", 25], Bound::Unbounded),
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+    }
+
+    // Test cases for full DESC index support (supports_desc_indexes = true)
+    mod full_support_tests {
+        use super::*;
+
+        #[test]
+        fn test_full_support_single_desc() {
+            // With full support, DESC should create DESC index fields
+            assert_eq!(
+                plan_full_support!("__collection = 'album' ORDER BY name DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), desc!("name")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_full_support_mixed_directions() {
+            // With full support, mixed directions should preserve all fields
+            assert_eq!(
+                plan_full_support!("__collection = 'album' ORDER BY name ASC, year DESC, score ASC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name"), desc!("year"), asc!("score")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_full_support_all_desc() {
+            // With full support, all DESC should create DESC index fields
+            assert_eq!(
+                plan_full_support!("__collection = 'album' ORDER BY name DESC, year DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), desc!("name"), desc!("year")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_full_support_with_equality_and_mixed_order() {
+            // Full support with equality and mixed ORDER BY directions
+            assert_eq!(
+                plan_full_support!("__collection = 'album' AND status = 'active' ORDER BY name ASC, year DESC"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("status"), asc!("name"), desc!("year")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album", "active"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -518,11 +731,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND age > 25"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 25], Bound::Unbounded),
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -532,11 +745,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND age > 25 AND age < 50"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 25], excl!["album", 50]),
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -549,19 +762,19 @@ mod tests {
                 vec![
                     // Plan 1: Uses age index, score remains in predicate
                     Plan {
-                        index_fields: vec![asc!("__collection"), asc!("age")],
-                        scan_direction: ScanDirection::Asc,
+                        index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
+                        scan_direction: ScanDirection::Forward,
                         range: Range::new(excl!["album", 25], Bound::Unbounded),
                         remaining_predicate: selection!("score < 100").predicate,
-                        requires_sort: false
+                        sort_fields: vec![]
                     },
                     // Plan 2: Uses score index, age remains in predicate
                     Plan {
-                        index_fields: vec![asc!("__collection"), asc!("score")],
-                        scan_direction: ScanDirection::Asc,
+                        index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("score")]),
+                        scan_direction: ScanDirection::Forward,
                         range: Range::new(incl!["album"], excl!["album", 100]),
                         remaining_predicate: selection!("age > 25").predicate,
-                        requires_sort: false
+                        sort_fields: vec![]
                     }
                 ]
             );
@@ -577,11 +790,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND name = 'Alice'"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("name")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album", "Alice"],
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -591,11 +804,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND name = 'Alice' AND age = 30"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("name"), asc!("age")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name"), asc!("age")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album", "Alice", 30],
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -610,11 +823,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND name = 'Alice' AND age > 25"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("name"), asc!("age")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name"), asc!("age")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", "Alice", 25], Bound::Unbounded),
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -624,11 +837,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND score > 50 AND age = 30 ORDER BY score"), // inequality intentionally in the middle to test index_field sequencing
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age"), asc!("score")], // equalities first, then inequalities, preserving order of appearance
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age"), asc!("score")]), // equalities first, then inequalities, preserving order of appearance
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 30, 50], Bound::Unbounded),
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
                 }]
             );
         }
@@ -644,11 +857,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album'"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album"],
                     remaining_predicate: Predicate::True,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
         }
@@ -659,11 +872,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND name != 'Alice'"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album"],
                     remaining_predicate: selection!("name != 'Alice'").predicate,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
 
@@ -671,11 +884,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND age > 25 AND name != 'Alice'"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 25], Bound::Unbounded),
                     remaining_predicate: selection!("name != 'Alice'").predicate,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
         }
@@ -687,11 +900,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND age > 50 AND age < 30"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 50], excl!["album", 30]), // Impossible but we generate it anyway
                     remaining_predicate: Predicate::True,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
         }
@@ -702,11 +915,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND (age > 25 OR name = 'Alice')"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album"],
                     remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
         }
@@ -717,11 +930,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND score = 100 AND (age > 25 OR name = 'Alice')"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("score")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("score")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album", 100],
                     remaining_predicate: selection!("age > 25 OR name = 'Alice'").predicate,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
         }
@@ -733,11 +946,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND age = 30 ORDER BY name, score"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age"), asc!("name"), asc!("score")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age"), asc!("name"), asc!("score")]),
+                    scan_direction: ScanDirection::Forward,
                     range: range_exact!["album", 30],
                     remaining_predicate: Predicate::True,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
         }
@@ -750,11 +963,11 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND age >= 25 AND age <= 50 AND age > 20"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("age")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("age")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 20], incl!["album", 50]), // > 20 and <= 50 (last bounds win)
                     remaining_predicate: Predicate::True,
-                    requires_sort: false,
+                    sort_fields: vec![],
                 }]
             );
         }
@@ -765,11 +978,41 @@ mod tests {
             assert_eq!(
                 plan!("__collection = 'album' AND timestamp > 9223372036854775807"),
                 vec![Plan {
-                    index_fields: vec![asc!("__collection"), asc!("timestamp")],
-                    scan_direction: ScanDirection::Asc,
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("timestamp")]),
+                    scan_direction: ScanDirection::Forward,
                     range: Range::new(excl!["album", 9223372036854775807i64], Bound::Unbounded),
                     remaining_predicate: Predicate::True,
-                    requires_sort: false
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_empty_string_equality() {
+            // Test that empty strings are handled correctly in equality comparisons
+            assert_eq!(
+                plan!("__collection = 'album' AND name = ''"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album", ""],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
+                }]
+            );
+        }
+
+        #[test]
+        fn test_empty_string_with_other_fields() {
+            // Test empty string with other fields
+            assert_eq!(
+                plan!("__collection = 'album' AND name = '' AND year = '2000'"),
+                vec![Plan {
+                    index_spec: IndexSpec::new(vec![asc!("__collection"), asc!("name"), asc!("year")]),
+                    scan_direction: ScanDirection::Forward,
+                    range: range_exact!["album", "", "2000"],
+                    remaining_predicate: Predicate::True,
+                    sort_fields: vec![]
                 }]
             );
         }

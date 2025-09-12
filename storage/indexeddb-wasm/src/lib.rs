@@ -3,8 +3,8 @@ mod cb_stream;
 mod collection;
 pub mod database;
 mod engine;
-pub mod indexes;
 mod object;
+mod planner_integration;
 mod statics;
 
 pub use collection::{to_idb_cursor_direction, IndexedDBBucket};

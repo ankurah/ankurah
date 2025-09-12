@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "ankurah-storage-common"
-version = "0.1.0"
+version = "0.5.4"
 dependencies = [
  "ankql",
  "ankurah-core",
@@ -207,6 +207,7 @@ dependencies = [
  "ankurah-core",
  "ankurah-derive",
  "ankurah-proto",
+ "ankurah-storage-common",
  "anyhow",
  "async-trait",
  "bincode",

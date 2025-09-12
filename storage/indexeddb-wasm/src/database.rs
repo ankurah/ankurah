@@ -1,5 +1,5 @@
-use crate::indexes::IndexSpec;
-use ankurah_core::{error::RetrievalError, notice_info};
+use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
+use ankurah_storage_common::planner::IndexSpec;
 use anyhow::Result;
 use js_sys::Function;
 use send_wrapper::SendWrapper;
@@ -18,6 +18,8 @@ struct Inner {
     connection: Arc<tokio::sync::Mutex<Connection>>,
     db_name: String,
     _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
+    /// Cache of existing index names to avoid repeated checks
+    index_cache: SafeSet<String>,
 }
 
 #[derive(Debug)]
@@ -34,6 +36,7 @@ impl Database {
             connection: Arc::new(tokio::sync::Mutex::new(connection)),
             db_name: db_name.to_string(),
             _callbacks: SendWrapper::new(Vec::new()), // Callbacks are now stored in Connection
+            index_cache: SafeSet::new(),
         })))
     }
 
@@ -42,19 +45,34 @@ impl Database {
 
     /// Ensure an index exists, creating it if necessary via database version upgrade
     pub async fn assure_index_exists(&self, index_spec: &IndexSpec) -> Result<(), RetrievalError> {
-        tracing::info!("assure_index_exists: Starting for index {}", index_spec.name());
+        let name = index_spec.name("", "__");
+        tracing::info!("assure_index_exists: Starting for index {}", &name);
+
+        // Check cache first
+        if self.0.index_cache.contains(&name) {
+            tracing::debug!("assure_index_exists: Index {} found in cache, returning", &name);
+            return Ok(());
+        }
 
         let mut connection_guard = self.0.connection.lock().await;
         tracing::info!("assure_index_exists: Acquired connection lock");
 
-        // Check if index already exists
-        tracing::info!("assure_index_exists: Checking if index exists");
-        if self.index_exists(&connection_guard.db, &index_spec.name())? {
-            tracing::info!("assure_index_exists: Index already exists, returning");
+        // Double-check cache after acquiring lock (in case another thread added it)
+        if self.0.index_cache.contains(&name) {
+            tracing::debug!("assure_index_exists: Index {} found in cache after lock, returning", &name);
             return Ok(());
         }
 
-        tracing::info!("Creating index: {} for fields: {:?}", index_spec.name(), index_spec.fields());
+        // Check if index already exists in database
+        tracing::info!("assure_index_exists: Checking if index exists in database");
+        if self.index_exists(&connection_guard.db, &name)? {
+            tracing::info!("assure_index_exists: Index already exists in database, adding to cache");
+            // Add to cache
+            self.0.index_cache.insert(name);
+            return Ok(());
+        }
+
+        tracing::info!("Creating index: {} for fields: {:?}", &name, index_spec.fields());
 
         // Get current version before closing
         let current_version = connection_guard.db.version() as u32;
@@ -73,16 +91,47 @@ impl Database {
         tracing::info!("assure_index_exists: Replacing connection");
         *connection_guard = new_connection;
 
-        tracing::info!("Successfully created index: {}", index_spec.name());
+        tracing::info!("Successfully created index: {}", &name);
+
+        // Add to cache
+        self.0.index_cache.insert(name);
+
         Ok(())
     }
 
     /// Check if an index exists in the entities object store
-    fn index_exists(&self, _db: &IdbDatabase, _index_name: &str) -> Result<bool, RetrievalError> {
-        // We need to check this via a transaction since we can't directly inspect object store structure
-        // For now, we'll assume indexes don't exist and always try to create them
-        // TODO: Implement proper index existence checking via metadata store
-        Ok(false)
+    fn index_exists(&self, db: &IdbDatabase, index_name: &str) -> Result<bool, RetrievalError> {
+        // Check if index exists by trying to access the index directly
+        // If the object store doesn't exist, the index definitely doesn't exist
+        let transaction = match db.transaction_with_str_and_mode("albums", web_sys::IdbTransactionMode::Readonly) {
+            Ok(tx) => tx,
+            Err(_) => {
+                // Object store doesn't exist, so index doesn't exist either
+                tracing::debug!("Object store 'albums' doesn't exist, so index {} doesn't exist", index_name);
+                return Ok(false);
+            }
+        };
+
+        let store = match transaction.object_store("albums") {
+            Ok(store) => store,
+            Err(_) => {
+                // Object store doesn't exist, so index doesn't exist either
+                tracing::debug!("Failed to get object store 'albums', so index {} doesn't exist", index_name);
+                return Ok(false);
+            }
+        };
+
+        // Try to access the index - if it exists, this will succeed; if not, it will throw
+        match store.index(index_name) {
+            Ok(_) => {
+                tracing::debug!("Index {} exists", index_name);
+                Ok(true)
+            }
+            Err(_) => {
+                tracing::debug!("Index {} doesn't exist", index_name);
+                Ok(false)
+            }
+        }
     }
 
     /// Get database name
@@ -241,14 +290,23 @@ impl Connection {
                     // Create the index
                     let key_path: js_sys::Array = js_sys::Array::new();
                     for field in index_spec_for_closure.fields() {
-                        key_path.push(&JsValue::from_str(field.name()));
+                        key_path.push(&JsValue::from_str(&field.name));
                     }
 
                     tracing::info!("Connection::open_with_index: Creating index with key_path");
-                    if let Err(e) = store.create_index_with_str_sequence(index_spec_for_closure.name(), &key_path) {
-                        tracing::error!("Failed to create index {}: {:?}", index_spec_for_closure.name(), e);
-                    } else {
-                        tracing::info!("Successfully created index in upgrade handler: {}", index_spec_for_closure.name());
+                    match store.create_index_with_str_sequence(&index_spec_for_closure.name("", "__"), &key_path) {
+                        Ok(_) => {
+                            tracing::info!("Successfully created index in upgrade handler: {}", index_spec_for_closure.name("", "__"));
+                        }
+                        Err(e) => {
+                            // Check if it's a "ConstraintError" indicating the index already exists
+                            let error_string = format!("{:?}", e);
+                            if error_string.contains("ConstraintError") && error_string.contains("already exists") {
+                                tracing::debug!("Index {} already exists, skipping creation", index_spec_for_closure.name("", "__"));
+                            } else {
+                                tracing::error!("Failed to create index {}: {:?}", index_spec_for_closure.name("", "__"), e);
+                            }
+                        }
                     }
                 }) as Box<dyn FnMut(_)>);
 
