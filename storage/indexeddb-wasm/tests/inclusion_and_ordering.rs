@@ -49,7 +49,7 @@ pub async fn test_comprehensive_set_inclusion_and_ordering() -> Result<(), anyho
     assert_eq!(years(&ctx.fetch("year >= '1965' ORDER BY year DESC LIMIT 3").await?), vec!["1970", "1969", "1969"]);
 
     // Set exclusion validation. Should NOT contain Help! (1965), Revolver (1966), Sgt. Pepper (1967)
-    assert_eq!(sort_names(&ctx.fetch("year >= '1968'").await?), vec!["Abbey Road", "Abbey Road Deluxe", "The White Album", "Let It Be"]);
+    assert_eq!(sort_names(&ctx.fetch("year >= '1968'").await?), vec!["Abbey Road", "Abbey Road Deluxe", "Let It Be", "The White Album"]);
 
     // Cleanup
     IndexedDBStorageEngine::cleanup(&db_name).await?;

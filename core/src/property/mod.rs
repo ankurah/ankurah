@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub type PropertyName = String;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PropertyValue {
     // Numbers
     I16(i16),
