@@ -24,8 +24,8 @@ pub trait StorageCollection: Send + Sync {
     async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError>;
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
 
-    // Fetch raw entity states matching a predicate
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    // Fetch raw entity states matching a selection (predicate + order by + limit)
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
 
     async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), MutationError> {
         for state in states {

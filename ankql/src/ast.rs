@@ -30,12 +30,29 @@ pub enum Identifier {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Selection {
     pub predicate: Predicate,
-    // order_by
-    // limit
+    pub order_by: Option<Vec<OrderByItem>>,
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderByItem {
+    pub identifier: Identifier,
+    pub direction: OrderDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum OrderDirection {
+    Asc,
+    Desc,
 }
 
 impl std::fmt::Display for Selection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.predicate) }
+}
+
+// Backward compatibility
+impl From<Predicate> for Selection {
+    fn from(predicate: Predicate) -> Self { Selection { predicate, order_by: None, limit: None } }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,7 +76,27 @@ impl std::fmt::Display for Predicate {
     }
 }
 
+impl Selection {
+    pub fn assume_null(&self, columns: &[String]) -> Self {
+        Self { predicate: self.predicate.assume_null(columns), order_by: self.order_by.clone(), limit: self.limit.clone() }
+    }
+}
+
 impl Predicate {
+    /// Recursively walk a predicate tree and accumulate results using a closure
+    pub fn walk<T, F>(&self, accumulator: T, visitor: &mut F) -> T
+    where F: FnMut(T, &Predicate) -> T {
+        let accumulator = visitor(accumulator, self);
+        match self {
+            Predicate::And(left, right) | Predicate::Or(left, right) => {
+                let accumulator = left.walk(accumulator, visitor);
+                right.walk(accumulator, visitor)
+            }
+            Predicate::Not(inner) => inner.walk(accumulator, visitor),
+            _ => accumulator,
+        }
+    }
+
     /// Clones the predicate tree and evaluates comparisons involving missing columns as if they were NULL
     pub fn assume_null(&self, columns: &[String]) -> Self {
         match self {
@@ -261,8 +298,8 @@ mod tests {
     use crate::parser::parse_selection;
 
     fn nullify_columns(input: &str, null_columns: &[&str]) -> Result<String, ParseError> {
-        let pred = parse_selection(input)?;
-        let result = pred.assume_null(&null_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let selection = parse_selection(input)?;
+        let result = selection.predicate.assume_null(&null_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         generate_selection_sql(&result, None).map_err(|_| ParseError::InvalidPredicate("SQL generation failed".to_string()))
     }
 
@@ -288,8 +325,8 @@ mod tests {
 
     #[test]
     fn test_populate_single_placeholder() {
-        let predicate = parse_selection("name = ?").unwrap();
-        let populated = predicate.populate(vec!["Alice"]).unwrap();
+        let selection = parse_selection("name = ?").unwrap();
+        let populated = selection.predicate.populate(vec!["Alice"]).unwrap();
 
         let expected = Predicate::Comparison {
             left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
@@ -302,9 +339,9 @@ mod tests {
 
     #[test]
     fn test_populate_multiple_placeholders() {
-        let predicate = parse_selection("age > ? AND name = ?").unwrap();
+        let selection = parse_selection("age > ? AND name = ?").unwrap();
         let values: Vec<Expr> = vec![25i64.into(), "Bob".into()];
-        let populated = predicate.populate(values).unwrap();
+        let populated = selection.predicate.populate(values).unwrap();
 
         let expected = Predicate::And(
             Box::new(Predicate::Comparison {
@@ -324,8 +361,8 @@ mod tests {
 
     #[test]
     fn test_populate_in_clause() {
-        let predicate = parse_selection("status IN (?, ?, ?)").unwrap();
-        let populated = predicate.populate(vec!["active", "pending", "review"]).unwrap();
+        let selection = parse_selection("status IN (?, ?, ?)").unwrap();
+        let populated = selection.predicate.populate(vec!["active", "pending", "review"]).unwrap();
 
         let expected = Predicate::Comparison {
             left: Box::new(Expr::Identifier(Identifier::Property("status".to_string()))),
@@ -342,9 +379,9 @@ mod tests {
 
     #[test]
     fn test_populate_mixed_types() {
-        let predicate = parse_selection("active = ? AND score > ? AND name = ?").unwrap();
+        let selection = parse_selection("active = ? AND score > ? AND name = ?").unwrap();
         let values: Vec<Expr> = vec![true.into(), 95.5f64.into(), "Charlie".into()];
-        let populated = predicate.populate(values).unwrap();
+        let populated = selection.predicate.populate(values).unwrap();
 
         // Verify the structure is correct
         if let Predicate::And(left, right) = populated {
@@ -367,8 +404,8 @@ mod tests {
 
     #[test]
     fn test_populate_too_few_values() {
-        let predicate = parse_selection("name = ? AND age = ?").unwrap();
-        let result = predicate.populate(vec!["Alice"]);
+        let selection = parse_selection("name = ? AND age = ?").unwrap();
+        let result = selection.predicate.populate(vec!["Alice"]);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Not enough values"));
@@ -376,8 +413,8 @@ mod tests {
 
     #[test]
     fn test_populate_too_many_values() {
-        let predicate = parse_selection("name = ?").unwrap();
-        let result = predicate.populate(vec!["Alice", "Bob"]);
+        let selection = parse_selection("name = ?").unwrap();
+        let result = selection.predicate.populate(vec!["Alice", "Bob"]);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Too many values"));
@@ -385,11 +422,11 @@ mod tests {
 
     #[test]
     fn test_populate_no_placeholders() {
-        let predicate = parse_selection("name = 'Alice'").unwrap();
-        let populated = predicate.clone().populate(Vec::<String>::new()).unwrap();
+        let selection = parse_selection("name = 'Alice'").unwrap();
+        let populated = selection.clone().predicate.populate(Vec::<String>::new()).unwrap();
 
         // Should be unchanged
-        assert_eq!(populated, predicate);
+        assert_eq!(populated, selection.predicate);
     }
 }
 

@@ -189,6 +189,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-storage-common"
+version = "0.5.4"
+dependencies = [
+ "ankql",
+ "ankurah-core",
+ "ankurah-derive",
+ "indexmap 2.8.0",
+]
+
+[[package]]
 name = "ankurah-storage-indexeddb-wasm"
 version = "0.5.4"
 dependencies = [
@@ -197,21 +207,25 @@ dependencies = [
  "ankurah-core",
  "ankurah-derive",
  "ankurah-proto",
+ "ankurah-storage-common",
  "anyhow",
  "async-trait",
  "bincode",
  "console_error_panic_hook",
  "futures",
+ "getrandom 0.3.2",
  "gloo-timers",
  "js-sys",
  "lazy_static",
  "send_wrapper",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "strum 0.26.3",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tracing-wasm",
  "ulid",
  "wasm-bindgen",

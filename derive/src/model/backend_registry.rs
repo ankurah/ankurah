@@ -1,10 +1,7 @@
-use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
-use serde::{Deserialize, Serialize};
+use quote::quote;
 use std::collections::HashMap;
-use syn::Type;
 
-use crate::model::backend::{ActiveTypeDesc, BackendConfig, ValueConfig};
+use crate::model::backend::{ActiveTypeDesc, BackendConfig};
 
 /// Global backend configuration manager
 pub struct BackendRegistry {

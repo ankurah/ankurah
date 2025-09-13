@@ -532,7 +532,7 @@ mod tests {
                 peer_id,
                 query_id,
                 CollectionId::from("unsubscribe"),
-                ankql::ast::Selection { predicate: ankql::ast::Predicate::True },
+                ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
             ));
 
             // Check if there's an error to fail with
@@ -551,7 +551,7 @@ mod tests {
 
     fn create_test_selection() -> ankql::ast::Selection {
         // Create a simple test predicate
-        ankql::ast::Selection { predicate: ankql::ast::Predicate::True }
+        ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }
     }
 
     fn create_test_collection_id() -> CollectionId { CollectionId::from("test_collection") }

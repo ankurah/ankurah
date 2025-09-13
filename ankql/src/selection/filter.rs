@@ -187,8 +187,8 @@ mod tests {
     fn test_simple_equality() {
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "25"), TestItem::new("Charlie", "35")];
 
-        let predicate = parse_selection("name = 'Alice'").unwrap();
-        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
+        let selection = parse_selection("name = 'Alice'").unwrap();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
             results,
@@ -204,8 +204,8 @@ mod tests {
     fn test_and_condition() {
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "30"), TestItem::new("Charlie", "35")];
 
-        let predicate = parse_selection("name = 'Alice' AND age = '30'").unwrap();
-        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
+        let selection = parse_selection("name = 'Alice' AND age = '30'").unwrap();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
             results,
@@ -227,8 +227,8 @@ mod tests {
             TestItem::new("Eve", "40"),
         ];
 
-        let predicate = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
-        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
+        let selection = parse_selection("(name = 'Alice' OR name = 'Charlie') AND age >= '30' AND age <= '40'").unwrap();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
             results,
@@ -253,8 +253,8 @@ mod tests {
         ];
 
         // Test IN with names
-        let predicate = parse_selection("name IN ('Alice', 'Charlie', 'Eve')").unwrap();
-        let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), predicate).collect();
+        let selection = parse_selection("name IN ('Alice', 'Charlie', 'Eve')").unwrap();
+        let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
 
         assert_eq!(
             results,
@@ -268,8 +268,8 @@ mod tests {
         );
 
         // Test IN with ages
-        let predicate = parse_selection("age IN ('20', '30', '40')").unwrap();
-        let results: Vec<_> = FilterIterator::new(items.into_iter(), predicate).collect();
+        let selection = parse_selection("age IN ('20', '30', '40')").unwrap();
+        let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
         assert_eq!(
             results,

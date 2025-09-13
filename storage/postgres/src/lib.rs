@@ -10,9 +10,9 @@ use ankurah_core::{
 };
 use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventId, OperationSet, State, StateBuffers};
 
-use futures_util::TryStreamExt;
+use futures_util::{pin_mut, TryStreamExt};
 
-pub mod predicate;
+pub mod sql_builder;
 pub mod value;
 
 use value::PGValue;
@@ -407,30 +407,20 @@ impl StorageCollection for PostgresBucket {
         })
     }
 
-    async fn fetch_states(&self, predicate: &ankql::ast::Predicate) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        debug!("fetch_states: {:?}", predicate);
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        debug!("fetch_states: {:?}", selection);
         let client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
 
         let mut results = Vec::new();
+        let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "attestations"]);
+        builder.table_name(self.state_table());
+        builder.selection(selection)?;
 
-        let mut ankql_sql = predicate::Sql::new();
-        ankql_sql.predicate(predicate).map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
+        let (sql, args) = builder.build()?;
+        debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, sql, args);
 
-        let (sql, args) = ankql_sql.collapse();
-
-        let filtered_query = if !sql.is_empty() {
-            format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}" WHERE {}"#, self.state_table(), sql,)
-        } else {
-            format!(r#"SELECT "id", "state_buffer", "head", "attestations" FROM "{}""#, self.state_table())
-        };
-
-        debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, filtered_query, args);
-
-        let rows = match client.query_raw(&filtered_query, args).await {
-            Ok(stream) => match stream.try_collect::<Vec<_>>().await {
-                Ok(rows) => rows,
-                Err(err) => return Err(RetrievalError::StorageError(err.into())),
-            },
+        let stream = match client.query_raw(&sql, args).await {
+            Ok(stream) => stream,
             Err(err) => {
                 let kind = error_kind(&err);
                 match kind {
@@ -441,18 +431,11 @@ impl StorageCollection for PostgresBucket {
                         }
                     }
                     ErrorKind::UndefinedColumn { table, column } => {
-                        // not an error, just didn't write the column yet
+                        // this means we didn't write the column yet, which suggests that all values are null
+                        // So we can recompute the predicate to treat this column as always NULL and retry
                         debug!("Undefined column: {} in table: {:?}, {}", column, table, self.state_table());
-                        match table {
-                            Some(table) if table == self.state_table() => {
-                                // Modify the predicate treating this column as NULL and retry
-                                return self.fetch_states(&predicate.assume_null(&[column])).await;
-                            }
-                            None => {
-                                return self.fetch_states(&predicate.assume_null(&[column])).await;
-                            }
-                            _ => {}
-                        }
+                        let new_selection = selection.assume_null(&[column]);
+                        return self.fetch_states(&new_selection).await;
                     }
                     _ => {}
                 }
@@ -460,8 +443,9 @@ impl StorageCollection for PostgresBucket {
                 return Err(RetrievalError::StorageError(err.into()));
             }
         };
+        pin_mut!(stream);
 
-        for row in rows {
+        while let Some(row) = stream.try_next().await.map_err(RetrievalError::storage)? {
             let id: EntityId = row.try_get(0).map_err(RetrievalError::storage)?;
             let state_buffer: Vec<u8> = row.try_get(1).map_err(RetrievalError::storage)?;
             let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&state_buffer).map_err(RetrievalError::storage)?;
@@ -676,6 +660,8 @@ pub struct MissingMaterialized {
 
 use bytes::BytesMut;
 use tokio_postgres::types::{to_sql_checked, IsNull, Type};
+
+use crate::sql_builder::SqlBuilder;
 
 #[derive(Debug)]
 struct UntypedNull;

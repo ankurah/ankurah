@@ -1,3 +1,2 @@
-mod sled;
-
-pub use sled::SledStorageEngine;
+pub mod sled;
+pub use sled::*;

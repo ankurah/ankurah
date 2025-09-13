@@ -17,7 +17,7 @@ use ankurah_signals::{Subscribe, SubscriptionGuard};
 /// This handler owns both the ReactorSubscription and the SubscriptionGuard
 /// for listening to changes on that subscription.
 pub struct SubscriptionHandler {
-    peer_id: proto::EntityId,
+    _peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
 }
@@ -59,7 +59,7 @@ impl SubscriptionHandler {
             }
         });
 
-        Self { peer_id, subscription, _guard: guard }
+        Self { _peer_id: peer_id, subscription, _guard: guard }
     }
 
     /// Get the subscription ID for this peer.
@@ -92,7 +92,7 @@ impl SubscriptionHandler {
         selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
         let storage_collection = node.collections.get(&collection_id).await?;
 
-        let initial_states = storage_collection.fetch_states(&selection.predicate).await?;
+        let initial_states = storage_collection.fetch_states(&selection).await?;
         let retriever = LocalRetriever::new(storage_collection);
 
         let mut initial_entities = Vec::with_capacity(initial_states.len());

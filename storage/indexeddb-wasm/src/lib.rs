@@ -1,5 +1,11 @@
 mod cb_future;
 mod cb_stream;
-mod indexeddb;
+mod collection;
+pub mod database;
+mod engine;
+mod object;
+mod planner_integration;
+mod statics;
 
-pub use indexeddb::IndexedDBStorageEngine;
+pub use collection::{to_idb_cursor_direction, IndexedDBBucket};
+pub use engine::IndexedDBStorageEngine;
