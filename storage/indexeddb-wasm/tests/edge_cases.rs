@@ -10,6 +10,12 @@ use {
 use tracing::info;
 use wasm_bindgen_test::*;
 
+// TODO: Add test coverage for IndexedDB playbook section 7 requirements:
+// - i64 values around ±2^53 boundary to test string encoding
+// - Boolean ordering in compound keys (0/1 mapping)
+// - Binary/Object ordering tests
+// - Type mismatch assertions for better error handling
+
 #[wasm_bindgen_test]
 pub async fn test_edge_cases() -> Result<(), anyhow::Error> {
     let (ctx, db_name) = setup_context().await?;
@@ -56,7 +62,6 @@ pub async fn test_edge_cases() -> Result<(), anyhow::Error> {
     );
 
     // Test range queries with string comparison edge cases
-    // FIXME: This test is failing
     assert_eq!(years(&ctx.fetch("year > '2005' AND year < '2008'").await?), vec!["2006", "2007"]);
 
     // Test impossible range (conflicting inequalities) - should return empty results, not crash
