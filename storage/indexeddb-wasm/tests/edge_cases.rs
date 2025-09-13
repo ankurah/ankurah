@@ -1,6 +1,11 @@
 mod common;
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
+#[cfg(debug_assertions)]
+use {
+    ankurah::{policy::DEFAULT_CONTEXT, Node, PermissiveAgent},
+    std::sync::Arc,
+};
 
 use tracing::info;
 use wasm_bindgen_test::*;
@@ -65,6 +70,57 @@ pub async fn test_edge_cases() -> Result<(), anyhow::Error> {
 
     info!("MARK2");
     // Cleanup
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[wasm_bindgen_test]
+pub async fn test_prefix_guard_collection_boundary() -> Result<(), anyhow::Error> {
+    let db_name = format!("test_db_{}", ulid::Ulid::new());
+    let storage_engine = Arc::new(IndexedDBStorageEngine::open(&db_name).await?);
+    let node = Node::new_durable(storage_engine.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+
+    // Insert albums and books with overlapping names to ensure sorted adjacency
+    create_albums(
+        &ctx,
+        vec![("Album1", "1965"), ("Album2", "1966"), ("Album3", "1967"), ("Album4", "1968"), ("Album5", "1969"), ("Album6", "1970")],
+    )
+    .await?;
+
+    create_books(&ctx, vec![("Book1", "2001"), ("Book2", "2002")]).await?;
+
+    // Note that `fn names` causes fetch to infer AlbumView (we should probably rename it to album_names)
+    // which means that books should be excluded. we are testing that the prefix guard is doing its job.
+    // ORDER-FIRST plan over (__collection, name), open-ended prefix over __collection
+    // LIMIT 5 should only include album records, never book
+    assert_eq!(names(&ctx.fetch("year >= '1900' ORDER BY name LIMIT 5").await?), vec!["Album1", "Album2", "Album3", "Album4", "Album5"]);
+
+    // Larger limit should still exclude books when scanning album bucket
+    assert_eq!(
+        names(&ctx.fetch("year >= '1900' ORDER BY name LIMIT 100").await?),
+        vec!["Album1", "Album2", "Album3", "Album4", "Album5", "Album6"]
+    );
+
+    // Disable prefix guard and assert over-matching occurs (books appear after albums)
+    storage_engine.set_prefix_guard_disabled(true);
+
+    assert_eq!(
+        names(&ctx.fetch("year >= '1900' ORDER BY name LIMIT 100").await?),
+        vec!["Album1", "Album2", "Album3", "Album4", "Album5", "Album6", "Book1", "Book2"]
+    );
+
+    // Re-enable on the same engine for hygiene
+    storage_engine.set_prefix_guard_disabled(false);
+
+    // Test again to confirm guard limit is enforced (no books included)
+    assert_eq!(
+        names(&ctx.fetch("year >= '1900' ORDER BY name LIMIT 100").await?),
+        vec!["Album1", "Album2", "Album3", "Album4", "Album5", "Album6"]
+    );
+
     IndexedDBStorageEngine::cleanup(&db_name).await?;
     Ok(())
 }

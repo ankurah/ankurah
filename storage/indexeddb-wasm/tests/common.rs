@@ -14,6 +14,13 @@ pub struct Album {
     pub year: String,
 }
 
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Book {
+    #[active_type(LWW)]
+    pub name: String,
+    pub year: String,
+}
+
 wasm_bindgen_test_configure!(run_in_browser);
 
 pub fn names(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.name().unwrap()).collect() }
@@ -66,6 +73,16 @@ pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>
     for (name, year) in vec {
         let album = Album { name: name.to_owned(), year: year.to_owned() };
         let _album = trx.create(&album).await?;
+    }
+    trx.commit().await?;
+    Ok(())
+}
+
+pub async fn create_books(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {
+    let trx = ctx.begin();
+    for (name, year) in vec {
+        let book = Book { name: name.to_owned(), year: year.to_owned() };
+        let _book = trx.create(&book).await?;
     }
     trx.commit().await?;
     Ok(())
