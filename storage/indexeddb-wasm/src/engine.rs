@@ -10,6 +10,8 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 use crate::{collection::IndexedDBBucket, database::Database};
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct IndexedDBStorageEngine {
     // We need SendWrapper because despite the ability to declare an async trait as ?Send,
@@ -19,25 +21,42 @@ pub struct IndexedDBStorageEngine {
     // See this thread for more information
     // https://users.rust-lang.org/t/send-not-send-variant-of-async-trait-object-without-duplication/115294
     pub db: Database,
+    #[cfg(debug_assertions)]
+    pub prefix_guard_disabled: std::sync::Arc<AtomicBool>,
 }
 
 impl IndexedDBStorageEngine {
     pub async fn open(name: &str) -> anyhow::Result<Self> {
         let db = Database::open(name).await?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            #[cfg(debug_assertions)]
+            prefix_guard_disabled: std::sync::Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub async fn cleanup(name: &str) -> anyhow::Result<()> { Database::cleanup(name).await }
 
     /// Get the database name
     pub fn name(&self) -> &str { self.db.name() }
+
+    /// For wasm tests: enable/disable prefix guard at runtime
+    #[cfg(debug_assertions)]
+    pub fn set_prefix_guard_disabled(&self, disabled: bool) { self.prefix_guard_disabled.store(disabled, Ordering::Relaxed); }
 }
 
 #[async_trait]
 impl StorageEngine for IndexedDBStorageEngine {
     type Value = JsValue;
     async fn collection(&self, collection_id: &proto::CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
-        Ok(Arc::new(IndexedDBBucket::new(self.db.clone(), collection_id.clone())))
+        Ok(Arc::new(IndexedDBBucket {
+            db: self.db.clone(),
+            collection_id: collection_id.clone(),
+            mutex: tokio::sync::Mutex::new(()),
+            invocation_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            prefix_guard_disabled: self.prefix_guard_disabled.clone(),
+        }))
     }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {

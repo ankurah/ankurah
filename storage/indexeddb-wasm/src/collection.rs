@@ -18,16 +18,12 @@ use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct IndexedDBBucket {
-    db: Database,
-    collection_id: proto::CollectionId,
-    mutex: tokio::sync::Mutex<()>, // should probably be implemented by Database, but not certain
-    invocation_count: AtomicUsize,
-}
-
-impl IndexedDBBucket {
-    pub fn new(db: Database, collection_id: proto::CollectionId) -> Self {
-        Self { db, collection_id, mutex: tokio::sync::Mutex::new(()), invocation_count: AtomicUsize::new(0) }
-    }
+    pub(crate) db: Database,
+    pub(crate) collection_id: proto::CollectionId,
+    pub(crate) mutex: tokio::sync::Mutex<()>, // should probably be implemented by Database, but not certain
+    pub(crate) invocation_count: AtomicUsize,
+    #[cfg(debug_assertions)]
+    pub(crate) prefix_guard_disabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Display for IndexedDBBucket {
@@ -182,18 +178,19 @@ impl StorageCollection for IndexedDBBucket {
                     // Convert scan direction to cursor direction
                     let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(scan_direction);
 
-                    let results = execute_plan_query(
-                        &index,
-                        Some(key_range),
-                        remaining_predicate,
-                        cursor_direction,
-                        limit,
-                        &collection_id,
-                        upper_open_ended,
-                        eq_prefix_len,
-                        eq_prefix_values,
-                    )
-                    .await?;
+                    let results = self
+                        .execute_plan_query(
+                            &index,
+                            Some(key_range),
+                            remaining_predicate,
+                            cursor_direction,
+                            limit,
+                            &collection_id,
+                            upper_open_ended,
+                            eq_prefix_len,
+                            eq_prefix_values,
+                        )
+                        .await?;
 
                     Ok(results)
                 })
@@ -331,10 +328,6 @@ impl StorageCollection for IndexedDBBucket {
     }
 }
 
-impl IndexedDBBucket {
-    // Helper methods for query execution
-}
-
 // We always use index cursors for fetch operations
 // Store cursors are only used for direct ID lookups (get_state, not fetch_states)
 
@@ -347,94 +340,104 @@ pub fn to_idb_cursor_direction(direction: ankurah_storage_common::index_spec::In
     }
 }
 
-async fn execute_plan_query(
-    index: &web_sys::IdbIndex,
-    key_range: Option<web_sys::IdbKeyRange>,
-    predicate: &ankql::ast::Predicate,
-    cursor_direction: web_sys::IdbCursorDirection,
-    limit: Option<u64>,
-    collection_id: &ankurah_proto::CollectionId,
-    upper_open_ended: bool,
-    eq_prefix_len: usize,
-    eq_prefix_values: Vec<ankurah_core::property::PropertyValue>,
-) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-    fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
-        res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
-    }
-
-    // cursor_direction is already provided as parameter
-
-    // Open index cursor with optional key range and direction
-    // Convert IdbKeyRange to JsValue for the API call
-    let cursor_request = if let Some(range) = &key_range {
-        step(index.open_cursor_with_range_and_direction(range.as_ref(), cursor_direction), "open index cursor with range and direction")?
-    } else {
-        step(
-            index.open_cursor_with_range_and_direction(&wasm_bindgen::JsValue::NULL, cursor_direction),
-            "open index cursor with direction only",
-        )?
-    };
-
-    let mut results = Vec::new();
-    let mut stream = CBStream::new(&cursor_request, "success", "error");
-    let mut count = 0u64;
-
-    // Equality-prefix guard: enabled when scanning open-ended ranges with a non-empty equality prefix
-    let use_prefix_guard = upper_open_ended && eq_prefix_len > 0;
-    let eq_prefix_js: Vec<JsValue> =
-        if use_prefix_guard { eq_prefix_values.iter().map(|p| propertyvalue_to_js(p)).collect() } else { Vec::new() };
-
-    'scan: while let Some(result) = stream.next().await {
-        let cursor_result = step(result, "cursor error")?;
-        if cursor_result.is_null() || cursor_result.is_undefined() {
-            break;
+impl IndexedDBBucket {
+    async fn execute_plan_query(
+        &self,
+        index: &web_sys::IdbIndex,
+        key_range: Option<web_sys::IdbKeyRange>,
+        predicate: &ankql::ast::Predicate,
+        cursor_direction: web_sys::IdbCursorDirection,
+        limit: Option<u64>,
+        collection_id: &ankurah_proto::CollectionId,
+        upper_open_ended: bool,
+        eq_prefix_len: usize,
+        eq_prefix_values: Vec<ankurah_core::property::PropertyValue>,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
+            res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
         }
 
-        let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
+        // cursor_direction is already provided as parameter
 
-        if use_prefix_guard {
-            let key_js = step(cursor.key(), "get cursor key")?;
-            if !key_js.is_undefined() && !key_js.is_null() {
-                let key_arr = js_sys::Array::from(&key_js);
-                for i in 0..(eq_prefix_len as u32) {
-                    let lhs = key_arr.get(i);
-                    let rhs = &eq_prefix_js[i as usize];
-                    if !js_sys::Object::is(&lhs, rhs) {
-                        break 'scan;
+        // Open index cursor with optional key range and direction
+        // Convert IdbKeyRange to JsValue for the API call
+        let cursor_request = if let Some(range) = &key_range {
+            step(
+                index.open_cursor_with_range_and_direction(range.as_ref(), cursor_direction),
+                "open index cursor with range and direction",
+            )?
+        } else {
+            step(
+                index.open_cursor_with_range_and_direction(&wasm_bindgen::JsValue::NULL, cursor_direction),
+                "open index cursor with direction only",
+            )?
+        };
+
+        let mut results = Vec::new();
+        let mut stream = CBStream::new(&cursor_request, "success", "error");
+        let mut count = 0u64;
+
+        // Equality-prefix guard: enabled when scanning open-ended ranges with a non-empty equality prefix
+        #[cfg(debug_assertions)]
+        let use_prefix_guard =
+            upper_open_ended && eq_prefix_len > 0 && !self.prefix_guard_disabled.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(debug_assertions))]
+        let use_prefix_guard = upper_open_ended && eq_prefix_len > 0;
+
+        let eq_prefix_js: Vec<JsValue> =
+            if use_prefix_guard { eq_prefix_values.iter().map(|p| propertyvalue_to_js(p)).collect() } else { Vec::new() };
+
+        'scan: while let Some(result) = stream.next().await {
+            let cursor_result = step(result, "cursor error")?;
+            if cursor_result.is_null() || cursor_result.is_undefined() {
+                break;
+            }
+
+            let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
+
+            if use_prefix_guard {
+                let key_js = step(cursor.key(), "get cursor key")?;
+                if !key_js.is_undefined() && !key_js.is_null() {
+                    let key_arr = js_sys::Array::from(&key_js);
+                    for i in 0..(eq_prefix_len as u32) {
+                        let lhs = key_arr.get(i);
+                        let rhs = &eq_prefix_js[i as usize];
+                        if !js_sys::Object::is(&lhs, rhs) {
+                            break 'scan;
+                        }
                     }
                 }
             }
-        }
-        let entity_obj = Object::new(step(cursor.value(), "get cursor value")?);
+            let entity_obj = Object::new(step(cursor.value(), "get cursor value")?);
 
-        // Create a wrapper that provides collection context for filtering
-        let filterable_entity = FilterableObject { object: &entity_obj, collection_id: &collection_id };
+            // Create a wrapper that provides collection context for filtering
+            let filterable_entity = FilterableObject { object: &entity_obj, collection_id: &collection_id };
 
-        // Apply predicate filtering first (cheaper than entity conversion)
-        if ankql::selection::filter::evaluate_predicate(&filterable_entity, predicate)
-            .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
-        {
-            // Only convert to EntityState if predicate matches
-            if let Ok(entity_state) = js_object_to_entity_state(&entity_obj, &collection_id) {
-                results.push(entity_state);
-                count += 1;
+            // Apply predicate filtering first (cheaper than entity conversion)
+            if ankql::selection::filter::evaluate_predicate(&filterable_entity, predicate)
+                .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
+            {
+                // Only convert to EntityState if predicate matches
+                if let Ok(entity_state) = js_object_to_entity_state(&entity_obj, &collection_id) {
+                    results.push(entity_state);
+                    count += 1;
 
-                if let Some(limit_val) = limit {
-                    if count >= limit_val {
-                        break;
+                    if let Some(limit_val) = limit {
+                        if count >= limit_val {
+                            break;
+                        }
                     }
+                } else {
                 }
             } else {
             }
-        } else {
+
+            step(cursor.continue_(), "advance cursor")?;
         }
 
-        step(cursor.continue_(), "advance cursor")?;
+        Ok(results)
     }
-
-    Ok(results)
 }
-
 // FIXME: use (or update and use) the Into<JsValue> impl from core/src/property/mod.rs
 // Convert PropertyValue to JsValue using the same mapping as key encoding
 fn propertyvalue_to_js(p: &ankurah_core::property::PropertyValue) -> JsValue {
