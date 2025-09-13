@@ -175,15 +175,25 @@ impl StorageCollection for IndexedDBBucket {
                     let index = step(store.index(&index_spec.name_with("", "__")), "get index")?;
 
                     // Convert plan bounds to IndexedDB key range using new pipeline
-                    let (key_range, _upper_open_ended, _eq_prefix_len, _eq_prefix_values) =
+                    let (key_range, upper_open_ended, eq_prefix_len, eq_prefix_values) =
                         crate::planner_integration::plan_bounds_to_idb_range(bounds)
                             .map_err(|e| RetrievalError::StorageError(format!("bounds conversion: {}", e).into()))?;
 
                     // Convert scan direction to cursor direction
                     let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(scan_direction);
 
-                    let results =
-                        execute_plan_query(&index, Some(key_range), remaining_predicate, cursor_direction, limit, &collection_id).await?;
+                    let results = execute_plan_query(
+                        &index,
+                        Some(key_range),
+                        remaining_predicate,
+                        cursor_direction,
+                        limit,
+                        &collection_id,
+                        upper_open_ended,
+                        eq_prefix_len,
+                        eq_prefix_values,
+                    )
+                    .await?;
 
                     Ok(results)
                 })
@@ -344,6 +354,9 @@ async fn execute_plan_query(
     cursor_direction: web_sys::IdbCursorDirection,
     limit: Option<u64>,
     collection_id: &ankurah_proto::CollectionId,
+    upper_open_ended: bool,
+    eq_prefix_len: usize,
+    eq_prefix_values: Vec<ankurah_core::property::PropertyValue>,
 ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
     fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
         res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
@@ -366,13 +379,32 @@ async fn execute_plan_query(
     let mut stream = CBStream::new(&cursor_request, "success", "error");
     let mut count = 0u64;
 
-    while let Some(result) = stream.next().await {
+    // Equality-prefix guard: enabled when scanning open-ended ranges with a non-empty equality prefix
+    let use_prefix_guard = upper_open_ended && eq_prefix_len > 0;
+    let eq_prefix_js: Vec<JsValue> =
+        if use_prefix_guard { eq_prefix_values.iter().map(|p| propertyvalue_to_js(p)).collect() } else { Vec::new() };
+
+    'scan: while let Some(result) = stream.next().await {
         let cursor_result = step(result, "cursor error")?;
         if cursor_result.is_null() || cursor_result.is_undefined() {
             break;
         }
 
         let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
+
+        if use_prefix_guard {
+            let key_js = step(cursor.key(), "get cursor key")?;
+            if !key_js.is_undefined() && !key_js.is_null() {
+                let key_arr = js_sys::Array::from(&key_js);
+                for i in 0..(eq_prefix_len as u32) {
+                    let lhs = key_arr.get(i);
+                    let rhs = &eq_prefix_js[i as usize];
+                    if !js_sys::Object::is(&lhs, rhs) {
+                        break 'scan;
+                    }
+                }
+            }
+        }
         let entity_obj = Object::new(step(cursor.value(), "get cursor value")?);
 
         // Create a wrapper that provides collection context for filtering
@@ -401,6 +433,26 @@ async fn execute_plan_query(
     }
 
     Ok(results)
+}
+
+// FIXME: use (or update and use) the Into<JsValue> impl from core/src/property/mod.rs
+// Convert PropertyValue to JsValue using the same mapping as key encoding
+fn propertyvalue_to_js(p: &ankurah_core::property::PropertyValue) -> JsValue {
+    match p {
+        ankurah_core::property::PropertyValue::I16(x) => JsValue::from_f64(*x as f64),
+        ankurah_core::property::PropertyValue::I32(x) => JsValue::from_f64(*x as f64),
+        ankurah_core::property::PropertyValue::I64(x) => {
+            // Order-preserving string encoding for i64 (matches planner_integration)
+            let u = (*x as i128) - (i64::MIN as i128);
+            JsValue::from_str(&format!("{:020}", u))
+        }
+        ankurah_core::property::PropertyValue::Bool(b) => JsValue::from_f64(if *b { 1.0 } else { 0.0 }),
+        ankurah_core::property::PropertyValue::String(s) => JsValue::from_str(s),
+        ankurah_core::property::PropertyValue::Object(bytes) | ankurah_core::property::PropertyValue::Binary(bytes) => {
+            let u8_array = unsafe { js_sys::Uint8Array::view(bytes) };
+            u8_array.buffer().into()
+        }
+    }
 }
 
 /// Extract ID range from predicate for primary key queries
