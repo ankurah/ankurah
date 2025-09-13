@@ -52,13 +52,10 @@ pub async fn test_edge_cases() -> Result<(), anyhow::Error> {
 
     // Test range queries with string comparison edge cases
     // FIXME: This test is failing
-    // assert_eq!(years(&ctx.fetch("year > '2005' AND year < '2008'").await?), vec!["2006", "2007"]);
+    assert_eq!(years(&ctx.fetch("year > '2005' AND year < '2008'").await?), vec!["2006", "2007"]);
 
     // Test impossible range (conflicting inequalities) - should return empty results, not crash
-    // FIXME: This test is failing
-    // Error: Storage error: range conversion: Failed to create IdbKeyRange: JsValue(DataError: Failed to execute 'bound' on 'IDBKeyRange': The lower key is greater than the upper key.
-    // DataError: Failed to execute 'bound' on 'IDBKeyRange': The lower key is greater than the upper key.
-    // assert_eq!(names(&ctx.fetch("year > '2010' AND year < '2005'").await?), vec![] as Vec<&str>);
+    assert_eq!(names(&ctx.fetch("year > '2010' AND year < '2005'").await?), vec![] as Vec<&str>);
 
     // Test ordering with special characters and case
     assert_eq!(

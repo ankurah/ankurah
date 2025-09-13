@@ -11,7 +11,7 @@ use send_wrapper::SendWrapper;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::{cb_future::CBFuture, cb_stream::CBStream, database::Database, object::Object, statics::*};
-
+use ankurah_storage_common::Plan;
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
 use tracing::{debug, info};
@@ -147,41 +147,48 @@ impl StorageCollection for IndexedDBBucket {
         // Step 3: Pick the first plan (always)
         let plan = plans.first().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
 
-        // Step 4: Ensure index exists using plan's IndexSpec
-        self.db
-            .assure_index_exists(&plan.index_spec)
-            .await
-            .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
+        // Handle Plan enum
+        match plan {
+            Plan::EmptyScan => {
+                // Empty scan - return empty results immediately
+                return Ok(Vec::new());
+            }
+            Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, .. } => {
+                // Step 4: Ensure index exists using plan's IndexSpec
+                self.db
+                    .assure_index_exists(index_spec)
+                    .await
+                    .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
 
-        info!("LOOK fetching with range: {:?}", plan.range);
-        // Step 5: Check for impossible ranges and return empty results immediately
-        if crate::planner_integration::is_impossible_range(&plan.range) {
-            return Ok(Vec::new());
+                info!("LOOK fetching with bounds: {:?}", bounds);
+
+                // Step 6: Execute the query using the plan
+                let db_connection = self.db.get_connection().await;
+                let collection_id = self.collection_id.clone();
+                let limit = selection.limit;
+
+                SendWrapper::new(async move {
+                    let transaction = step(db_connection.transaction_with_str("entities"), "create transaction")?;
+                    let store = step(transaction.object_store("entities"), "get object store")?;
+
+                    // Get the index specified by the plan
+                    let index = step(store.index(&index_spec.name_with("", "__")), "get index")?;
+
+                    // Convert plan bounds to IndexedDB key range using new pipeline
+                    let (key_range, _upper_open_ended, _eq_prefix_len, _eq_prefix_values) =
+                        crate::planner_integration::plan_bounds_to_idb_range(bounds)
+                            .map_err(|e| RetrievalError::StorageError(format!("bounds conversion: {}", e).into()))?;
+
+                    // Convert scan direction to cursor direction
+                    let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(scan_direction);
+
+                    let results =
+                        execute_plan_query(&index, Some(key_range), remaining_predicate, cursor_direction, limit, &collection_id).await?;
+
+                    Ok(results)
+                })
+            }
         }
-
-        // Step 6: Execute the query using the plan
-        let db_connection = self.db.get_connection().await;
-        let collection_id = self.collection_id.clone();
-        let limit = selection.limit;
-
-        SendWrapper::new(async move {
-            let transaction = step(db_connection.transaction_with_str("entities"), "create transaction")?;
-            let store = step(transaction.object_store("entities"), "get object store")?;
-
-            // Get the index specified by the plan
-            let index = step(store.index(&plan.index_spec.name("", "__")), "get index")?;
-
-            // Convert plan range to IndexedDB key range
-            let key_range = crate::planner_integration::plan_range_to_idb_range(&plan.range)
-                .map_err(|e| RetrievalError::StorageError(format!("range conversion: {}", e).into()))?;
-
-            // Convert scan direction to cursor direction
-            let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(&plan.scan_direction);
-
-            let results = execute_plan_query(&index, key_range, &plan.remaining_predicate, cursor_direction, limit, &collection_id).await?;
-
-            Ok(results)
-        })
         .await
     }
 

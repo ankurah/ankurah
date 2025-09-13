@@ -45,7 +45,7 @@ impl Database {
 
     /// Ensure an index exists, creating it if necessary via database version upgrade
     pub async fn assure_index_exists(&self, index_spec: &IndexSpec) -> Result<(), RetrievalError> {
-        let name = index_spec.name("", "__");
+        let name = index_spec.name_with("", "__");
         tracing::info!("assure_index_exists: Starting for index {}", &name);
 
         // Check cache first
@@ -72,7 +72,7 @@ impl Database {
             return Ok(());
         }
 
-        tracing::info!("Creating index: {} for fields: {:?}", &name, index_spec.fields());
+        tracing::info!("Creating index: {} for keyparts: {:?}", &name, index_spec.keyparts);
 
         // Get current version before closing
         let current_version = connection_guard.db.version() as u32;
@@ -289,22 +289,22 @@ impl Connection {
 
                     // Create the index
                     let key_path: js_sys::Array = js_sys::Array::new();
-                    for field in index_spec_for_closure.fields() {
-                        key_path.push(&JsValue::from_str(&field.name));
+                    for field in &index_spec_for_closure.keyparts {
+                        key_path.push(&JsValue::from_str(&field.column));
                     }
 
                     tracing::info!("Connection::open_with_index: Creating index with key_path");
-                    match store.create_index_with_str_sequence(&index_spec_for_closure.name("", "__"), &key_path) {
+                    match store.create_index_with_str_sequence(&index_spec_for_closure.name_with("", "__"), &key_path) {
                         Ok(_) => {
-                            tracing::info!("Successfully created index in upgrade handler: {}", index_spec_for_closure.name("", "__"));
+                            tracing::info!("Successfully created index in upgrade handler: {}", index_spec_for_closure.name_with("", "__"));
                         }
                         Err(e) => {
                             // Check if it's a "ConstraintError" indicating the index already exists
                             let error_string = format!("{:?}", e);
                             if error_string.contains("ConstraintError") && error_string.contains("already exists") {
-                                tracing::debug!("Index {} already exists, skipping creation", index_spec_for_closure.name("", "__"));
+                                tracing::debug!("Index {} already exists, skipping creation", index_spec_for_closure.name_with("", "__"));
                             } else {
-                                tracing::error!("Failed to create index {}: {:?}", index_spec_for_closure.name("", "__"), e);
+                                tracing::error!("Failed to create index {}: {:?}", index_spec_for_closure.name_with("", "__"), e);
                             }
                         }
                     }

@@ -1,5 +1,5 @@
 mod common;
-use ankurah_storage_common::index_spec::{IndexDirection, IndexField, IndexSpec};
+use ankurah_storage_common::{IndexKeyPart, IndexSpec};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 
@@ -20,9 +20,8 @@ pub async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error>
     tracing::info!("Initial database version: {}", initial_version);
 
     // Create an index spec for testing using the new common IndexSpec
-    let index_spec =
-        IndexSpec::new(vec![IndexField::new("__collection", IndexDirection::Asc), IndexField::new("name", IndexDirection::Asc)]);
-    tracing::info!("Creating index: {}", index_spec.name("", "__"));
+    let index_spec = IndexSpec::new(vec![IndexKeyPart::asc("__collection"), IndexKeyPart::asc("name")]);
+    tracing::info!("Creating index: {}", index_spec.name_with("", "__"));
 
     // Test index creation (this should trigger reconnection)
     db.assure_index_exists(&index_spec).await?;
@@ -40,7 +39,7 @@ pub async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error>
     let store = transaction.object_store("entities").map_err(|e| anyhow::anyhow!("Failed to get object store: {:?}", e))?;
 
     // Verify the index exists by trying to access it
-    let index_result = store.index(&index_spec.name("", "__"));
+    let index_result = store.index(&index_spec.name_with("", "__"));
     assert!(index_result.is_ok(), "Index should exist after creation: {:?}", index_result.err());
 
     tracing::info!("Index creation and reconnection test passed!");
