@@ -83,6 +83,11 @@ pub fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize, Vec<PropertyVa
 
 /// Convert CanonicalRange to IdbKeyRange following the playbook
 /// Returns (IdbKeyRange, upper_open_ended_flag)
+///
+/// TODO: Implement micro-optimizations from playbook section 6:
+/// - Use IDBKeyRange.only() for exact equality matches
+/// - Support openKeyCursor() for key-only scans
+/// - Implement reverse scan early stop optimization
 pub fn to_idb_keyrange(canonical_range: &CanonicalRange) -> Result<(web_sys::IdbKeyRange, bool)> {
     match (&canonical_range.lower, &canonical_range.upper) {
         // Upper = None (open-ended)

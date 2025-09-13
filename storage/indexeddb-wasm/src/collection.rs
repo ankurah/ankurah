@@ -438,8 +438,17 @@ impl IndexedDBBucket {
         Ok(results)
     }
 }
-// FIXME: use (or update and use) the Into<JsValue> impl from core/src/property/mod.rs
-// Convert PropertyValue to JsValue using the same mapping as key encoding
+// NOTE: This differs from core's Into<JsValue> impl - this version uses IndexedDB key encoding:
+// - i64: Order-preserving string encoding (for values > ±2^53)
+// - bool: 0/1 numbers (IndexedDB doesn't support boolean keys)
+// - Binary: ArrayBuffer (for lexicographic byte ordering)
+// Convert PropertyValue to JsValue using IndexedDB-compatible key encoding
+//
+// TODO: Implement remaining IndexedDB playbook optimizations:
+// - Add offset support via cursor.advance(k) for OFFSET queries
+// - Implement IDBKeyRange.only() optimization for exact matches
+// - Add openKeyCursor support for key-only pre-filtering
+// - Enhanced type mismatch error handling and assertions
 fn propertyvalue_to_js(p: &ankurah_core::property::PropertyValue) -> JsValue {
     match p {
         ankurah_core::property::PropertyValue::I16(x) => JsValue::from_f64(*x as f64),
