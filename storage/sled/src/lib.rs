@@ -2,7 +2,6 @@ pub mod collection;
 pub mod database;
 pub mod engine;
 pub mod error;
-pub mod fetch;
 pub mod index;
 pub mod materialization;
 pub mod planner_integration;

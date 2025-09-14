@@ -34,6 +34,8 @@ pub struct SledStorageCollection {
 
 #[async_trait]
 impl StorageCollection for SledStorageCollection {
+    // stub functions in the trait impl should all call out to their blocking counterparts
+    // in order to keep this tidy
     async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
         let me = self.clone();
         // Use spawn_blocking since sled operations are not async
@@ -54,6 +56,7 @@ impl StorageCollection for SledStorageCollection {
     async fn add_event(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
         let binary_state = bincode::serialize(event)?;
 
+        // TODO implement self.add_event_blocking
         let last = self
             .events
             .insert(event.payload.id().as_bytes(), binary_state.clone())
@@ -67,6 +70,7 @@ impl StorageCollection for SledStorageCollection {
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        // TODO implement self.get_events_blocking
         let mut events = Vec::new();
         for event_id in event_ids {
             match self.events.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
@@ -83,6 +87,7 @@ impl StorageCollection for SledStorageCollection {
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
         let mut events = Vec::new();
 
+        // TODO implement self.dump_entity_events_blocking
         // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
         for event_data in self.events.iter() {
             let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
@@ -97,6 +102,7 @@ impl StorageCollection for SledStorageCollection {
 }
 
 impl SledStorageCollection {
+    // I think this one is done - did it myself
     fn set_state_blocking(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
         let (entity_id, collection, sfrag) = state.to_parts();
         if self.collection_id != collection {
@@ -125,6 +131,7 @@ impl SledStorageCollection {
 
         Ok(changed)
     }
+    // I think this one is done - did it myself
     fn get_state_blocking(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
         match self.database.entities_tree.get(id.to_bytes()).map_err(sled_error)? {
             Some(ivec) => {
@@ -135,25 +142,39 @@ impl SledStorageCollection {
             None => Err(RetrievalError::EntityNotFound(id)),
         }
     }
+    // this is the one that needs the most work
+    // unlike IndexedDB, we are using separate Trees for each materialized collection - which is what we scan over
+    // so there will be some times when there is no predicate or range restriction - just a full scan
+    // I don't know if this produces zero plans, or a plan with an empty IndexSpec and predicate::True
+    // I actually don't have a preference which way the planner goes, but we should understand it either way.
+    // TODO: make a test for that in storage/common/planner.rs
+    // Whatever way that goes, we need to handle it here.
+    // ideally we would DRY a bit between exec_index_plan and exec_fallback_scan (which we should call full_scan or table_scan I think)
+    // the difference being that exec_index_plan iterates over the index iterator, while exec_fallback_scan iterates over the collection iterator
+    // They BOTH need to then do a secondary lookup in the entities tree to get the state fragment
+    // (and we need to make sure that both are using industry best practices for that sort of index -> record scan)
+
     fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let plans = Planner::new(PlannerConfig::full_support()).plan(&selection);
 
         // Fallback to naive full-scan path if no viable plan
-        let Some(plan) = plans.into_iter().next() else {
-            return self.exec_fallback_scan(&self.tree, &self.collection_id, &selection, selection.limit);
-        };
+        // let Some(plan) = plans.into_iter().next() else {
+        //     return self.exec_fallback_scan(&self.tree, &self.collection_id, &selection, selection.limit);
+        // };
 
-        let prefix_guard_disabled = {
-            #[cfg(debug_assertions)]
-            {
-                use std::sync::atomic::Ordering;
-                self.prefix_guard_disabled.load(Ordering::Relaxed)
-            }
-            #[cfg(not(debug_assertions))]
-            false
-        };
+        // used by the test suite to validate that the prefix guard is working - by intentionally breaking it, and comparing the results
+        // let prefix_guard_disabled = {
+        //     #[cfg(debug_assertions)]
+        //     {
+        //         use std::sync::atomic::Ordering;
+        //         self.prefix_guard_disabled.load(Ordering::Relaxed)
+        //     }
+        //     #[cfg(not(debug_assertions))]
+        //     false
+        // };
 
-        self.exec_index_plan(plan, selection.limit, prefix_guard_disabled)
+        // self.exec_index_plan(plan, selection.limit, prefix_guard_disabled)
+        unimplemented!()
     }
     pub fn exec_index_plan(
         &self,
@@ -398,7 +419,7 @@ pub fn order_by_matches_iteration(order_by: &Option<Vec<ankql::ast::OrderByItem>
     }
 }
 
-/// Apply in-memory sorting to results based on ORDER BY clause
+/// Apply in-memory sorting to results based on ORDER BY clause when order_by_spill is nonzero length
 pub(crate) fn apply_order_by_sort(
     results: &mut Vec<Attested<EntityState>>,
     order_by: &Option<Vec<ankql::ast::OrderByItem>>,
