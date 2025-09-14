@@ -18,30 +18,35 @@
 - Best-effort multi-tree consistency is acceptable in V1; repair/rebuild paths can exist.
 - Non-unique index strategy: Option A. Append `entity_id` to the composite key; store empty value.
 - Result hydration: always from `entities`. Spilled predicate evaluation is done against `collection_{collection}` materialized values for efficiency.
-- Index tree naming: `index_{collection}_{id}`.
+- Index tree naming: `index_{id}` (global; the index's `collection` lives in metadata).
 
 ## Storage layout (trees)
 
 - `entities` (single, all collections)
   - key: `EntityId.to_bytes()`
   - val: `StateFragment` (bincode)
-- `indexes` (metadata registry)
-  - key: `index_id` (stable hash of (collection, IndexSpec))
-  - val: `IndexMeta` (bincode)
+- `index_config` (metadata registry)
+  - key: `u32` index id (big-endian)
+  - val: `IndexRecord` (bincode)
 - `properties` (global name → `u32` shortener)
   - key: `PropertyId` (string/canonical id)
   - val: `SledPropertyId(u32)`
 - `collection_{collection}` (per-collection materialized values)
   - key: `EntityId.to_bytes()`
   - val: `Vec<(SledPropertyId, PropertyValue)>` (bincode)
-- `index_{collection}_{index_id_or_name}` (per-collection index)
+- `index_{index_id}` (per-index tree; bound to one collection via metadata)
+
   - key: composite tuple bytes (per `IndexSpec`) `|| 0x00 || entity_id_bytes`
   - val: empty
+
+- `events` (append-only; no secondary index in V1)
+  - key: `EventId.to_bytes()`
+  - val: `Attested<Event>` (bincode)
 
 Notes:
 
 - Canonical state is only in `entities`. Materialized values live in per-collection trees.
-- Index trees are per-collection; no `__collection` keypart is required.
+- Index trees are per-index; each index is tied to one collection via metadata; no `__collection` keypart is required.
 
 ### Non-unique index keys
 
@@ -55,18 +60,18 @@ This keeps maintenance simple, enables natural range scans, and provides a deter
 ## Index metadata
 
 ```rust
-struct IndexMeta {
-  id: String,                 // stable hash of (collection, spec)
-  collection: String,
-  name: String,               // human-friendly label
-  spec: IndexSpec,            // full spec (serde/bincode)
+struct IndexRecord {
+  id: u32,                   // key in index_config (big-endian)
+  collection: String,        // collection this index belongs to
+  name: String,              // human-friendly label
+  spec: IndexSpec,           // full spec (serde/bincode)
   created_at: SystemTime,
-  build_status: BuildStatus,  // NotBuilt | Building { progress } | Ready
+  build_status: BuildStatus, // NotBuilt | Building | Ready
 }
 ```
 
-- `indexes` maps `id` → `IndexMeta`.
-- `index_{collection}_{id}` exists iff `build_status == Ready`.
+- `index_config` maps `id` → `IndexRecord`.
+- `index_{id}` exists iff `build_status == Ready`.
 - V1 backfill is synchronous (create meta as Building → build → Ready).
 
 ## Key encoding & collation
@@ -82,6 +87,10 @@ struct IndexMeta {
 
 Rationale: length-prefix + type-tag ensures lexicographic order over tuples and disambiguates boundaries without escaping. Big-endian length preserves prefix ordering.
 
+Lexicographic successor for inclusive upper bounds:
+
+- Use a true bytewise successor (increment-with-carry) over the composite tuple bytes. If all bytes are 0xFF, the successor does not exist and the bound is effectively unbounded-high for end-exclusive ranges.
+
 ## Mapping planner bounds → sled ranges
 
 - Input: `IndexBounds` (multi-column), per-keypart `Endpoint::{Value{datum, inclusive}, UnboundedLow, UnboundedHigh}`
@@ -89,23 +98,27 @@ Rationale: length-prefix + type-tag ensures lexicographic order over tuples and 
   - Output: `lower: Option<(Vec<PropertyValue>, lower_open)>`, `upper: Option<(Vec<PropertyValue>, upper_open)>`, and `eq_prefix_len/values`
 - Build sled byte keys over the composite tuple (index key portion):
   - `encode_tuple(values: &[PropertyValue]) -> Vec<u8>` → `tuple_key`
-  - `start_tuple = encode_tuple(lower_tuple)`; if `lower_open`, set `start_tuple = lex_successor(start_tuple)`
-  - If `upper == None` (open-ended): use prefix guard
-  - Else: `end_tuple = encode_tuple(upper_tuple)`; if `upper_open == false`, set `end_tuple = lex_successor(end_tuple)`
+  - `start_tuple = encode_tuple(lower_tuple)`; if `lower_open`, set `start_tuple = lex_successor(start_tuple)` (if successor is None → empty scan)
+  - If `upper == None` (open-ended): use equality-prefix guard
+  - Else: `end_tuple = encode_tuple(upper_tuple)`; if `upper_open == false`, set `end_tuple = lex_successor(end_tuple)` (if successor is None, treat as unbounded-high)
 - Form full-range bounds for the actual sled keys that include `entity_id` suffix:
   - `start_full = start_tuple || 0x00` (smallest possible suffix)
   - If bounded upper: `end_full = end_tuple || 0x00` and use `tree.range(start_full .. end_full)` (end exclusive)
   - If unbounded upper: iterate `tree.range(start_full ..)` with a prefix guard on the equality prefix
 - Prefix guard for open-ended scans: stop when the tuple portion no longer matches the equality-prefix tuple
 
+Reverse scans:
+
+- To satisfy DESC without separate DESC indexes, iterate `rev()` over the constructed ranges and apply the same equality-prefix guard logic.
+
 ## Query execution (planner integration)
 
 1. No `__collection` amendment; `SledStorageCollection` is already collection-scoped
-2. Plan: `planner.plan(&selection)` (sled planner config: no `__collection` keypart)
+2. Plan: `planner.plan(&selection)` (use common planner; collection is implicit in the bucket)
 3. `assure_index_exists(collection, index_spec)`
-   - Check `indexes`; if missing/not built → create meta, backfill `index_{collection}_{id}` synchronously; mark Ready
+   - If missing/not built → allocate `u32 id`, persist `IndexRecord` as Building, backfill `index_{id}` synchronously, mark Ready
 4. Convert `bounds` → sled key-range over composite tuple
-5. Open `index_{collection}_{id}` and iterate `range(start_full..end_full)` or `range(start_full..)` + prefix guard
+5. Open `index_{id}` and iterate `range(start_full..end_full)` or `range(start_full..)` + equality-prefix guard (debug flag allows disabling guard in tests)
 6. Decode `EntityId` from key suffix; use `collection_{collection}` to evaluate any spilled predicates (skip non-matching rows early)
 7. For rows that pass filters, hydrate from `entities`
 8. If `order_by_spill` is needed, sort survivors (may use materialized values where possible), then apply `limit`
@@ -117,7 +130,7 @@ Rationale: length-prefix + type-tag ensures lexicographic order over tuples and 
   - Compute composite tuple bytes
   - Insert key `composite_tuple_bytes || 0x00 || entity_id` → empty
 - Backfill in batches to limit memory; flush periodically
-- After success, mark meta Ready
+- After success, mark meta Ready and persist snapshot to `index_config`
 - For V1, synchronous. Follow-up: batched/incremental with progress saved in meta
 
 ## Index maintenance on writes
@@ -137,7 +150,7 @@ Notes:
 
 ## ORDER BY and LIMIT
 
-- When planner chooses ORDER-FIRST, the index keyparts include the order-by fields to satisfy native order
+- When planner chooses ORDER-FIRST, the index keyparts include the order-by fields. DESC is satisfied via reverse scans over ASC keys (no separate DESC indexes in V1).
 - Otherwise, collect rows and apply `order_by_spill` using in-memory sort (reuse collation helpers)
 - LIMIT applied during scan when native order is satisfied; otherwise truncate after sort
 
@@ -150,13 +163,17 @@ Notes:
 - Maintain a small top-K heap when `order_by_spill` with `limit` is present, to avoid full materialization.
 - Batch writes with `sled::Batch` for index maintenance; keep read path streaming and low-allocation.
 
+Prefix guard toggle for testing:
+
+- Provide a debug-only flag to disable the equality-prefix guard to validate correctness via tests that compare guarded vs unguarded scans.
+
 ## Deletion
 
 - On delete (future API): remove entity from `entities` and delete its entries from all indexes
 
 ## Migration considerations
 
-- Current Sled backend uses one state tree per collection; new design uses unified `entities` and index trees
+- Current Sled backend uses unified `entities`, `index_config`, and per-index `index_{id}` trees
 - Non-breaking option: detect old layout and offer a migrator that reads old trees and writes to the new layout
 - For tests/dev: new test engine `SledStorageEngine::new_test()` will initialize the new layout directly
 
@@ -167,6 +184,7 @@ Notes:
 - Backfill: create index on existing dataset; verify entries and scans
 - Maintenance: set_state replacing values updates index entries; delete path
 - Planner integration: end-to-end queries with equality-only, inequality, ORDER BY, LIMIT
+- No-predicate case: behavior when selection has no comparisons/order-by; support either an equality-only plan or fallback table scan.
 
 ## Follow-ups / TODOs
 
