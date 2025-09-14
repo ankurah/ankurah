@@ -1,5 +1,7 @@
 use crate::collation::Collatable;
 
+// DEPRECATED: Use PropertyValue instead
+
 /// A dynamically typed value
 /// This is a short term expedience. Ideally we would NOT have one canonical set of types, but rather a pairwise mapping between the
 /// storage engine types and the backend types.
