@@ -14,6 +14,8 @@ pub use yrs::YrsBackend;
 
 use super::{PropertyName, PropertyValue};
 
+// TODO - implement a property backend value iterator so we don't have to alloc a HashMap for every call to values()
+
 pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn as_arc_dyn_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
     fn as_debug(&self) -> &dyn Debug;

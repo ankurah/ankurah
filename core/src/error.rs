@@ -32,7 +32,7 @@ pub enum RetrievalError {
     #[error("ankql filter: {0}")]
     AnkqlFilter(ankql::selection::filter::Error),
     #[error("Future join: {0}")]
-    FutureJoin(Box<dyn std::error::Error + Send + Sync + 'static>),
+    FutureJoin(tokio::task::JoinError),
     #[error("{0}")]
     Anyhow(anyhow::Error),
     #[error("Decode error: {0}")]
@@ -43,14 +43,16 @@ pub enum RetrievalError {
     MutationError(Box<MutationError>),
 }
 
+impl From<tokio::task::JoinError> for RetrievalError {
+    fn from(err: tokio::task::JoinError) -> Self { RetrievalError::FutureJoin(err) }
+}
+
 impl From<MutationError> for RetrievalError {
     fn from(err: MutationError) -> Self { RetrievalError::MutationError(Box::new(err)) }
 }
 
 impl RetrievalError {
     pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::StorageError(Box::new(err)) }
-
-    pub fn future_join(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::FutureJoin(Box::new(err)) }
 }
 
 impl From<bincode::Error> for RetrievalError {
@@ -135,6 +137,12 @@ pub enum MutationError {
     InvalidUpdate(&'static str),
     #[error("property error: {0}")]
     PropertyError(crate::property::PropertyError),
+    #[error("future join: {0}")]
+    FutureJoin(tokio::task::JoinError),
+}
+
+impl From<tokio::task::JoinError> for MutationError {
+    fn from(err: tokio::task::JoinError) -> Self { MutationError::FutureJoin(err) }
 }
 
 #[derive(Error, Debug)]

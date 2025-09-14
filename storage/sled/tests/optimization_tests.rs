@@ -1,6 +1,6 @@
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, OrderByItem, OrderDirection, Predicate};
 use ankurah_proto::EntityId;
-use ankurah_storage_sled::{determine_iteration_strategy, order_by_matches_iteration, IterationStrategy};
+use ankurah_storage_sled::{determine_iteration_strategy, order_by_matches_iteration, IterationStrategy, SledStorageEngine};
 
 #[test]
 fn test_id_range_strategy_optimization() {
@@ -99,4 +99,16 @@ fn test_direction_mismatch_requires_sorting() {
     // Test that direction mismatch requires sorting
     let skip_sorting = order_by_matches_iteration(&order_by, &strategy);
     assert!(!skip_sorting, "ORDER BY id DESC with forward IdRange should require sorting");
+}
+
+#[test]
+fn test_assure_index_exists_creates_meta_and_tree() {
+    let engine = SledStorageEngine::new_test().unwrap();
+    let spec = ankurah_storage_common::IndexSpec::from_names_asc(["name", "age"]);
+    let meta = engine.assure_index_exists("people", &spec).unwrap();
+    assert_eq!(meta.collection, "people");
+    assert_eq!(meta.build_status, super::super::sled::BuildStatus::Ready);
+    // id should be deterministic and tree should exist
+    let tree_name = format!("index_{}_{}", meta.collection, meta.id);
+    assert!(engine.database.open_tree(tree_name).is_ok());
 }

@@ -1,0 +1,60 @@
+use std::sync::Arc;
+
+use ankurah::{error::MutationError, policy::DEFAULT_CONTEXT, Context, Model, Node, PermissiveAgent};
+use ankurah_storage_sled::SledStorageEngine;
+use serde::{Deserialize, Serialize};
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Album {
+    #[active_type(LWW)]
+    pub name: String,
+    pub year: String,
+}
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Book {
+    #[active_type(LWW)]
+    pub name: String,
+    pub year: String,
+}
+
+pub fn names(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.name().unwrap()).collect() }
+
+pub fn sort_names(albums: &[AlbumView]) -> Vec<String> {
+    let mut names = names(albums);
+    names.sort();
+    names
+}
+
+pub fn years(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.year().unwrap()).collect() }
+
+pub async fn setup_context() -> Result<Context, anyhow::Error> {
+    let storage_engine = SledStorageEngine::new_test()?;
+    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
+    node.system.create().await?;
+    Ok(node.context_async(DEFAULT_CONTEXT).await)
+}
+
+pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {
+    let trx = ctx.begin();
+    for (name, year) in vec {
+        let album = Album { name: name.to_owned(), year: year.to_owned() };
+        let _album = trx.create(&album).await?;
+    }
+    trx.commit().await?;
+    Ok(())
+}
+
+pub async fn create_books(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {
+    let trx = ctx.begin();
+    for (name, year) in vec {
+        let book = Book { name: name.to_owned(), year: year.to_owned() };
+        let _book = trx.create(&book).await?;
+    }
+    trx.commit().await?;
+    Ok(())
+}
+
+// Convenience fetch API to mirror wasm tests style
+#[allow(dead_code)]
+pub async fn fetch(ctx: &Context, q: &str) -> Result<Vec<AlbumView>, anyhow::Error> { ctx.fetch::<AlbumView>(q).await.map_err(Into::into) }

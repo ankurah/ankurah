@@ -425,6 +425,10 @@ impl TemporaryEntity {
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))
     }
+    pub fn values(&self) -> Vec<(String, Option<PropertyValue>)> {
+        let backends = self.0.backends.lock().expect("other thread panicked, panic here too");
+        backends.values().flat_map(|backend| backend.property_values()).collect()
+    }
 }
 
 // TODO - clean this up and consolidate with Entity somehow, while still preventing anyone from creating unregistered (non-temporary) Entities

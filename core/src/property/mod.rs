@@ -9,6 +9,7 @@ use ankurah_proto::EntityId;
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
 pub use value::YrsString;
 
+use crate::collation::Collatable;
 use serde::{Deserialize, Serialize};
 
 pub type PropertyName = String;
@@ -112,6 +113,125 @@ impl Property for EntityId {
 
 impl From<&str> for PropertyValue {
     fn from(value: &str) -> Self { PropertyValue::String(value.to_string()) }
+}
+
+// Collation for PropertyValue (single value). Tuple framing (type tags/lengths) is handled by higher-level encoders.
+impl Collatable for PropertyValue {
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            PropertyValue::String(s) => s.as_bytes().to_vec(),
+            // Use fixed-width big-endian encoding to preserve numeric order across widths
+            PropertyValue::I16(x) => (*x as i64).to_be_bytes().to_vec(),
+            PropertyValue::I32(x) => (*x as i64).to_be_bytes().to_vec(),
+            PropertyValue::I64(x) => x.to_be_bytes().to_vec(),
+            PropertyValue::Bool(b) => vec![*b as u8],
+            // For binary/object, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
+            PropertyValue::Object(bytes) | PropertyValue::Binary(bytes) => bytes.clone(),
+        }
+    }
+
+    fn successor_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            PropertyValue::String(s) => {
+                let mut bytes = s.as_bytes().to_vec();
+                bytes.push(0);
+                Some(bytes)
+            }
+            PropertyValue::I16(x) => {
+                if *x == i16::MAX {
+                    None
+                } else {
+                    Some(((*x as i64) + 1).to_be_bytes().to_vec())
+                }
+            }
+            PropertyValue::I32(x) => {
+                if *x == i32::MAX {
+                    None
+                } else {
+                    Some(((*x as i64) + 1).to_be_bytes().to_vec())
+                }
+            }
+            PropertyValue::I64(x) => {
+                if *x == i64::MAX {
+                    None
+                } else {
+                    Some((x + 1).to_be_bytes().to_vec())
+                }
+            }
+            PropertyValue::Bool(b) => {
+                if *b {
+                    None
+                } else {
+                    Some(vec![1])
+                }
+            }
+            PropertyValue::Object(_) | PropertyValue::Binary(_) => None,
+        }
+    }
+
+    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            PropertyValue::String(s) => {
+                let bytes = s.as_bytes();
+                if bytes.is_empty() {
+                    None
+                } else {
+                    Some(bytes[..bytes.len() - 1].to_vec())
+                }
+            }
+            PropertyValue::I16(x) => {
+                if *x == i16::MIN {
+                    None
+                } else {
+                    Some(((*x as i64) - 1).to_be_bytes().to_vec())
+                }
+            }
+            PropertyValue::I32(x) => {
+                if *x == i32::MIN {
+                    None
+                } else {
+                    Some(((*x as i64) - 1).to_be_bytes().to_vec())
+                }
+            }
+            PropertyValue::I64(x) => {
+                if *x == i64::MIN {
+                    None
+                } else {
+                    Some((x - 1).to_be_bytes().to_vec())
+                }
+            }
+            PropertyValue::Bool(b) => {
+                if *b {
+                    Some(vec![0])
+                } else {
+                    None
+                }
+            }
+            PropertyValue::Object(_) | PropertyValue::Binary(_) => None,
+        }
+    }
+
+    fn is_minimum(&self) -> bool {
+        match self {
+            PropertyValue::String(s) => s.is_empty(),
+            PropertyValue::I16(x) => *x == i16::MIN,
+            PropertyValue::I32(x) => *x == i32::MIN,
+            PropertyValue::I64(x) => *x == i64::MIN,
+            PropertyValue::Bool(b) => !b,
+            PropertyValue::Object(_) | PropertyValue::Binary(_) => false,
+        }
+    }
+
+    fn is_maximum(&self) -> bool {
+        match self {
+            PropertyValue::String(_) => false,
+            PropertyValue::I16(x) => *x == i16::MAX,
+            PropertyValue::I32(x) => *x == i32::MAX,
+            PropertyValue::I64(x) => *x == i64::MAX,
+            PropertyValue::Bool(b) => *b,
+            PropertyValue::Object(_) | PropertyValue::Binary(_) => false,
+        }
+    }
 }
 
 // WASM JsValue conversions for IndexedDB

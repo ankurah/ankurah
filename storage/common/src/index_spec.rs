@@ -1,21 +1,23 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IndexSpec {
     pub keyparts: Vec<IndexKeyPart>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IndexDirection {
     Asc,
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NullsOrder {
     First,
     Last,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IndexKeyPart {
     pub column: String,
     pub direction: IndexDirection, // ASC/DESC
@@ -77,9 +79,9 @@ impl IndexSpec {
     /// Returns Yes if this is a prefix subset of other
     /// Returns Inverse if this is a prefix subset of other with all directions flipped
     /// Returns No if neither condition is met
-    pub fn matches(&self, other: &IndexSpec) -> IndexSpecMatch {
+    pub fn matches(&self, other: &IndexSpec) -> Option<IndexSpecMatch> {
         if self.keyparts.len() > other.keyparts.len() {
-            return IndexSpecMatch::No;
+            return None;
         }
 
         let mut direct_match = true;
@@ -87,7 +89,7 @@ impl IndexSpec {
 
         for (self_keypart, other_keypart) in self.keyparts.iter().zip(other.keyparts.iter()) {
             if self_keypart.column != other_keypart.column {
-                return IndexSpecMatch::No;
+                return None;
             }
 
             if self_keypart.direction != other_keypart.direction {
@@ -100,21 +102,19 @@ impl IndexSpec {
         }
 
         if direct_match {
-            IndexSpecMatch::Yes
+            Some(IndexSpecMatch::Match)
         } else if inverse_match {
-            IndexSpecMatch::Inverse
+            Some(IndexSpecMatch::Inverse)
         } else {
-            IndexSpecMatch::No
+            None
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IndexSpecMatch {
-    /// The index specs do not match
-    No,
     /// The index specs match
-    Yes,
+    Match,
     /// The index specs match, but scan direction must be inverted
     Inverse,
 }
@@ -128,7 +128,7 @@ mod tests {
         let spec1 = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b")] };
         let spec2 = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b")] };
 
-        assert_eq!(spec1.matches(&spec2), IndexSpecMatch::Yes);
+        assert_eq!(spec1.matches(&spec2), Some(IndexSpecMatch::Match));
     }
 
     #[test]
@@ -137,7 +137,7 @@ mod tests {
         let query_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b")] };
         let index_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b"), IndexKeyPart::asc("c")] };
 
-        assert_eq!(query_spec.matches(&index_spec), IndexSpecMatch::Yes);
+        assert_eq!(query_spec.matches(&index_spec), Some(IndexSpecMatch::Match));
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
         let query_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b")] };
         let index_spec = IndexSpec { keyparts: vec![IndexKeyPart::desc("a"), IndexKeyPart::asc("b")] };
 
-        assert_eq!(query_spec.matches(&index_spec), IndexSpecMatch::Inverse);
+        assert_eq!(query_spec.matches(&index_spec), Some(IndexSpecMatch::Inverse));
     }
 
     #[test]
@@ -155,7 +155,7 @@ mod tests {
         let query_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b")] };
         let index_spec = IndexSpec { keyparts: vec![IndexKeyPart::desc("a"), IndexKeyPart::asc("b"), IndexKeyPart::asc("c")] };
 
-        assert_eq!(query_spec.matches(&index_spec), IndexSpecMatch::Inverse);
+        assert_eq!(query_spec.matches(&index_spec), Some(IndexSpecMatch::Inverse));
     }
 
     #[test]
@@ -165,11 +165,11 @@ mod tests {
 
         // Test direct match: +a, -b, +c
         let index_spec1 = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b"), IndexKeyPart::asc("c")] };
-        assert_eq!(query_spec.matches(&index_spec1), IndexSpecMatch::Yes);
+        assert_eq!(query_spec.matches(&index_spec1), Some(IndexSpecMatch::Match));
 
         // Test inverse match: -a, +b, -c
         let index_spec2 = IndexSpec { keyparts: vec![IndexKeyPart::desc("a"), IndexKeyPart::asc("b"), IndexKeyPart::desc("c")] };
-        assert_eq!(query_spec.matches(&index_spec2), IndexSpecMatch::Inverse);
+        assert_eq!(query_spec.matches(&index_spec2), Some(IndexSpecMatch::Inverse));
     }
 
     #[test]
@@ -177,7 +177,7 @@ mod tests {
         let query_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b")] };
         let index_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("x"), IndexKeyPart::desc("y")] };
 
-        assert_eq!(query_spec.matches(&index_spec), IndexSpecMatch::No);
+        assert_eq!(query_spec.matches(&index_spec), None);
     }
 
     #[test]
@@ -186,7 +186,7 @@ mod tests {
         let query_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b")] };
         let index_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::asc("b")] };
 
-        assert_eq!(query_spec.matches(&index_spec), IndexSpecMatch::No);
+        assert_eq!(query_spec.matches(&index_spec), None);
     }
 
     #[test]
@@ -195,7 +195,7 @@ mod tests {
         let query_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b"), IndexKeyPart::asc("c")] };
         let index_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a")] };
 
-        assert_eq!(query_spec.matches(&index_spec), IndexSpecMatch::No);
+        assert_eq!(query_spec.matches(&index_spec), None);
     }
 
     #[test]
@@ -204,11 +204,11 @@ mod tests {
         let non_empty_spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a")] };
 
         // Empty spec matches any spec (empty prefix)
-        assert_eq!(empty_spec.matches(&non_empty_spec), IndexSpecMatch::Yes);
-        assert_eq!(empty_spec.matches(&empty_spec), IndexSpecMatch::Yes);
+        assert_eq!(empty_spec.matches(&non_empty_spec), Some(IndexSpecMatch::Match));
+        assert_eq!(empty_spec.matches(&empty_spec), Some(IndexSpecMatch::Match));
 
         // Non-empty spec does not match empty spec
-        assert_eq!(non_empty_spec.matches(&empty_spec), IndexSpecMatch::No);
+        assert_eq!(non_empty_spec.matches(&empty_spec), None);
     }
 
     #[test]
@@ -217,11 +217,11 @@ mod tests {
         let desc_spec = IndexSpec { keyparts: vec![IndexKeyPart::desc("a")] };
 
         // Direct match
-        assert_eq!(asc_spec.matches(&asc_spec), IndexSpecMatch::Yes);
+        assert_eq!(asc_spec.matches(&asc_spec), Some(IndexSpecMatch::Match));
 
         // Inverse match
-        assert_eq!(asc_spec.matches(&desc_spec), IndexSpecMatch::Inverse);
-        assert_eq!(desc_spec.matches(&asc_spec), IndexSpecMatch::Inverse);
+        assert_eq!(asc_spec.matches(&desc_spec), Some(IndexSpecMatch::Inverse));
+        assert_eq!(desc_spec.matches(&asc_spec), Some(IndexSpecMatch::Inverse));
     }
 
     #[test]
@@ -232,16 +232,16 @@ mod tests {
         // Exact match with additional fields
         let index_spec1 =
             IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b"), IndexKeyPart::asc("c"), IndexKeyPart::desc("d")] };
-        assert_eq!(query_spec.matches(&index_spec1), IndexSpecMatch::Yes);
+        assert_eq!(query_spec.matches(&index_spec1), Some(IndexSpecMatch::Match));
 
         // Inverse match with additional fields
         let index_spec2 =
             IndexSpec { keyparts: vec![IndexKeyPart::desc("a"), IndexKeyPart::asc("b"), IndexKeyPart::desc("c"), IndexKeyPart::asc("d")] };
-        assert_eq!(query_spec.matches(&index_spec2), IndexSpecMatch::Inverse);
+        assert_eq!(query_spec.matches(&index_spec2), Some(IndexSpecMatch::Inverse));
 
         // No match - mixed directions that don't form inverse
         let index_spec3 = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::asc("b"), IndexKeyPart::desc("c")] };
-        assert_eq!(query_spec.matches(&index_spec3), IndexSpecMatch::No);
+        assert_eq!(query_spec.matches(&index_spec3), None);
     }
 
     #[test]
@@ -266,10 +266,10 @@ mod tests {
         let spec = IndexSpec { keyparts: vec![IndexKeyPart::asc("a"), IndexKeyPart::desc("b"), IndexKeyPart::asc("c")] };
 
         // Self-match should always be Yes
-        assert_eq!(spec.matches(&spec), IndexSpecMatch::Yes);
+        assert_eq!(spec.matches(&spec), Some(IndexSpecMatch::Match));
 
         // Empty spec matches any spec
         let empty = IndexSpec { keyparts: vec![] };
-        assert_eq!(empty.matches(&spec), IndexSpecMatch::Yes);
+        assert_eq!(empty.matches(&spec), Some(IndexSpecMatch::Match));
     }
 }
