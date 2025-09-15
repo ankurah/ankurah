@@ -188,21 +188,22 @@ impl SledStorageCollection {
                     if remaining_predicate.is_some() || order_by_spill.is_some() {
                         let materialized_stream = SledCollectionLookup = scan.to_materialized(&self.tree)?;
                         let materialized_stream = if let Some(remaining_predicate) = remaining_predicate {
-                            let filtered_stream: <std::iter::Filter<_, _> as Try>::Output = materialized_stream.filter(remaining_predicate)?;
+                            let filtered_stream: <std::iter::Filter<_, _> as Try>::Output =
+                                materialized_stream.filter(remaining_predicate)?;
                             materialized_stream = filtered_stream;
-                        }else{
+                        } else {
                             materialized_stream
                         };
                         let materialized_stream = if let Some(order_by_spill) = order_by_spill {
                             let ordered_stream = materialized_stream.order_by(order_by_spill)?;
                             materialized_stream = ordered_stream;
-                        }else{
+                        } else {
                             materialized_stream
                         };
-                    }else{
+                    } else {
                         scan.to_materialized(&self.tree)?
                     }
-                    let entity_id_stream = if let Some(remaining_predicate) = remaining_predicate { // TODO or order_by_spill
+                    let entity_id_stream = if let Some(remaining_predicate) = remaining_predicate {
                         let filtered_stream: <std::iter::Filter<_, _> as Try>::Output = materialized_stream.filter(remaining_predicate)?;
                         let entity_id_stream = if let Some(order_by_spill) = order_by_spill {
                             let ordered_stream = filtered_stream.order_by(order_by_spill)?;
@@ -216,7 +217,7 @@ impl SledStorageCollection {
                     };
 
                     let state_stream: SledStateLookup = entity_id_stream.to_state_stream(&self.database.entities_tree)?;
-                state_stream
+                    state_stream
                 }
                 Plan::TableScan { bounds, scan_direction, remaining_predicate, order_by_spill: _ } => {
                     let scan = SledCollectionScanner::new(&self.tree, &bounds, &scan_direction).scan();
@@ -231,9 +232,8 @@ impl SledStorageCollection {
                     let state_stream: SledStateLookup = scan.to_state_stream(&self.database.entities_tree)?;
                     state_stream
                 }
-                }
+
                 Plan::EmptyScan => Ok(Vec::new()),
-            
             };
             return state_stream.accumulate(selection.limit);
         }
