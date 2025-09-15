@@ -88,7 +88,73 @@ pub fn encode_tuple_for_sled(parts: &[PropertyValue]) -> Vec<u8> {
 
 /// Compute the lexicographic successor of a composite tuple encoding
 pub fn lex_successor(mut key: Vec<u8>) -> Option<Vec<u8>> {
-    // Simple successor: append a null byte; relies on non-zero terminator between tuple and entity id
-    key.push(0);
-    Some(key)
+    // True bytewise successor: increment with carry; if overflow (all 0xFF), no successor
+    for i in (0..key.len()).rev() {
+        if key[i] != 0xFF {
+            key[i] += 1;
+            for j in (i + 1)..key.len() {
+                key[j] = 0x00;
+            }
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// Convert canonical range and eq-prefix into sled key bounds over the composite tuple
+/// Returns: (start_full, end_full_opt, upper_open_ended, eq_prefix_bytes)
+pub fn bounds_to_sled_range(
+    canonical: &CanonicalRange,
+    eq_prefix_len: usize,
+    eq_prefix_values: &[PropertyValue],
+) -> (Vec<u8>, Option<Vec<u8>>, bool, Vec<u8>) {
+    let mut upper_open_ended = false;
+    let start_full = match &canonical.lower {
+        Some((vals, lower_open)) => {
+            let mut start = encode_tuple_for_sled(vals);
+            if *lower_open {
+                start = match lex_successor(start) {
+                    Some(s) => s,
+                    None => Vec::new(), // will indicate empty range to caller if needed
+                };
+            }
+            start.push(0);
+            start
+        }
+        None => {
+            // Unbounded low: start at minimal tuple (empty) which is before any encoded tuple
+            let mut start = Vec::new();
+            start.push(0);
+            start
+        }
+    };
+
+    let end_full_opt = match &canonical.upper {
+        Some((vals, upper_open)) => {
+            let mut end = encode_tuple_for_sled(vals);
+            if !*upper_open {
+                if let Some(s) = lex_successor(end) {
+                    end = s;
+                } else {
+                    // No successor → treat as unbounded-high
+                    upper_open_ended = true;
+                    return (
+                        start_full,
+                        None,
+                        upper_open_ended,
+                        if eq_prefix_len > 0 { encode_tuple_for_sled(eq_prefix_values) } else { Vec::new() },
+                    );
+                }
+            }
+            end.push(0);
+            Some(end)
+        }
+        None => {
+            upper_open_ended = true;
+            None
+        }
+    };
+
+    let eq_prefix_bytes = if eq_prefix_len > 0 { encode_tuple_for_sled(eq_prefix_values) } else { Vec::new() };
+    (start_full, end_full_opt, upper_open_ended, eq_prefix_bytes)
 }

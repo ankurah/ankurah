@@ -6,7 +6,6 @@ use ankql::{
     selection::filter::evaluate_predicate,
 };
 use ankurah_core::{
-    collation::RangeBound,
     entity::TemporaryEntity,
     error::{MutationError, RetrievalError},
     storage::StorageCollection,
@@ -18,6 +17,7 @@ use async_trait::async_trait;
 
 use tokio::task;
 
+use crate::planner_integration::{bounds_to_sled_range, normalize};
 use crate::{
     database::Database,
     error::{sled_error, SledRetrievalError},
@@ -58,7 +58,8 @@ impl StorageCollection for SledStorageCollection {
 
         // TODO implement self.add_event_blocking
         let last = self
-            .events
+            .database
+            .events_tree
             .insert(event.payload.id().as_bytes(), binary_state.clone())
             .map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
 
@@ -73,7 +74,7 @@ impl StorageCollection for SledStorageCollection {
         // TODO implement self.get_events_blocking
         let mut events = Vec::new();
         for event_id in event_ids {
-            match self.events.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
+            match self.database.events_tree.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
                 Some(event) => {
                     let event: Attested<Event> = bincode::deserialize(&event)?;
                     events.push(event);
@@ -89,7 +90,7 @@ impl StorageCollection for SledStorageCollection {
 
         // TODO implement self.dump_entity_events_blocking
         // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
-        for event_data in self.events.iter() {
+        for event_data in self.database.events_tree.iter() {
             let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
             let event: Attested<Event> = bincode::deserialize(&data)?;
             if event.payload.entity_id == entity_id {
@@ -112,7 +113,7 @@ impl SledStorageCollection {
         let binary_state = bincode::serialize(&sfrag)?;
         let id_bytes = entity_id.to_bytes();
         // 1) Write canonical state
-        let last = self.tree.insert(id_bytes, binary_state.clone()).map_err(sled_error)?;
+        let last = self.database.entities_tree.insert(id_bytes, binary_state.clone()).map_err(sled_error)?;
         let changed = if let Some(last_bytes) = last { last_bytes != binary_state } else { true };
 
         // 2) Write-time materialization into collection_{collection}
@@ -155,26 +156,88 @@ impl SledStorageCollection {
     // (and we need to make sure that both are using industry best practices for that sort of index -> record scan)
 
     fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let plans = Planner::new(PlannerConfig::full_support()).plan(&selection);
+        let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
 
-        // Fallback to naive full-scan path if no viable plan
-        // let Some(plan) = plans.into_iter().next() else {
-        //     return self.exec_fallback_scan(&self.tree, &self.collection_id, &selection, selection.limit);
-        // };
+        // Choose first non-empty plan; if none, return empty for now (TODO: table scan fallback wiring)
+        if let Some(plan) = plans.into_iter().find(|p| !matches!(p, Plan::EmptyScan)) {
+            let prefix_guard_disabled = {
+                #[cfg(debug_assertions)]
+                {
+                    use std::sync::atomic::Ordering;
+                    self.prefix_guard_disabled.load(Ordering::Relaxed)
+                }
+                #[cfg(not(debug_assertions))]
+                false
+            };
+            // return self.exec_index_plan(plan, selection.limit, prefix_guard_disabled);
 
-        // used by the test suite to validate that the prefix guard is working - by intentionally breaking it, and comparing the results
-        // let prefix_guard_disabled = {
-        //     #[cfg(debug_assertions)]
-        //     {
-        //         use std::sync::atomic::Ordering;
-        //         self.prefix_guard_disabled.load(Ordering::Relaxed)
-        //     }
-        //     #[cfg(not(debug_assertions))]
-        //     false
-        // };
+            // Notional design
+            // Each engine provides its own concrete types:
+            // SledIndexScanner, SledCollectionScanner,SledCollectionLookup, SledStateLookup
+            // TiKVIndexScanner, TiKVCollectionLookup, TiKVStateLookup
+            let state_stream = match plan {
+                Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, order_by_spill: _ } => {
+                    let (index, index_match_type) = self.database.index_manager.assure_index_exists(
+                        self.collection_id.as_str(),
+                        &index_spec,
+                        &self.database.db,
+                        &self.database.property_manager,
+                    )?;
+                    let scan = SledIndexScanner::new(&index, index_match_type, &index_spec, &bounds, &scan_direction).scan();
 
-        // self.exec_index_plan(plan, selection.limit, prefix_guard_disabled)
-        unimplemented!()
+                    if remaining_predicate.is_some() || order_by_spill.is_some() {
+                        let materialized_stream = SledCollectionLookup = scan.to_materialized(&self.tree)?;
+                        let materialized_stream = if let Some(remaining_predicate) = remaining_predicate {
+                            let filtered_stream: <std::iter::Filter<_, _> as Try>::Output = materialized_stream.filter(remaining_predicate)?;
+                            materialized_stream = filtered_stream;
+                        }else{
+                            materialized_stream
+                        };
+                        let materialized_stream = if let Some(order_by_spill) = order_by_spill {
+                            let ordered_stream = materialized_stream.order_by(order_by_spill)?;
+                            materialized_stream = ordered_stream;
+                        }else{
+                            materialized_stream
+                        };
+                    }else{
+                        scan.to_materialized(&self.tree)?
+                    }
+                    let entity_id_stream = if let Some(remaining_predicate) = remaining_predicate { // TODO or order_by_spill
+                        let filtered_stream: <std::iter::Filter<_, _> as Try>::Output = materialized_stream.filter(remaining_predicate)?;
+                        let entity_id_stream = if let Some(order_by_spill) = order_by_spill {
+                            let ordered_stream = filtered_stream.order_by(order_by_spill)?;
+                            ordered_stream.to_entity_id_stream()
+                        } else {
+                            filtered_stream.to_entity_id_stream()
+                        };
+                        entity_id_stream
+                    } else {
+                        scan.to_entity_id_stream()
+                    };
+
+                    let state_stream: SledStateLookup = entity_id_stream.to_state_stream(&self.database.entities_tree)?;
+                state_stream
+                }
+                Plan::TableScan { bounds, scan_direction, remaining_predicate, order_by_spill: _ } => {
+                    let scan = SledCollectionScanner::new(&self.tree, &bounds, &scan_direction).scan();
+                    if let Some(remaining_predicate) = remaining_predicate {
+                        let filtered_stream: <std::iter::Filter<_, _> as Try>::Output = scan.filter(remaining_predicate)?;
+                        scan = filtered_stream;
+                    }
+                    if let Some(order_by_spill) = order_by_spill {
+                        let ordered_stream = scan.order_by(order_by_spill)?;
+                        scan = ordered_stream;
+                    }
+                    let state_stream: SledStateLookup = scan.to_state_stream(&self.database.entities_tree)?;
+                    state_stream
+                }
+                }
+                Plan::EmptyScan => Ok(Vec::new()),
+            
+            };
+            return state_stream.accumulate(selection.limit);
+        }
+        Ok(Vec::new())
     }
     pub fn exec_index_plan(
         &self,
@@ -182,7 +245,74 @@ impl SledStorageCollection {
         limit: Option<u64>,
         prefix_guard_disabled: bool,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        unimplemented!()
+        match plan {
+            Plan::EmptyScan => Ok(Vec::new()),
+            Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, order_by_spill: _ } => {
+                // Ensure index exists and is built
+                let (index, _match_type) = self.database.index_manager.assure_index_exists(
+                    self.collection_id.as_str(),
+                    &index_spec,
+                    &self.database.db,
+                    &self.database.property_manager,
+                )?;
+
+                // Normalize and convert bounds to sled range keys
+                let (canonical, eq_prefix_len, eq_prefix_values) = normalize(&bounds);
+                let (start_full, end_full_opt, upper_open_ended, eq_prefix_bytes) =
+                    bounds_to_sled_range(&canonical, eq_prefix_len, &eq_prefix_values);
+
+                let base_iter: Box<dyn Iterator<Item = Result<(sled::IVec, sled::IVec), sled::Error>>> = match &end_full_opt {
+                    Some(end_full) => Box::new(index.tree().range(start_full.clone()..end_full.clone())),
+                    None => Box::new(index.tree().range(start_full.clone()..)),
+                };
+                let iter: Box<dyn Iterator<Item = Result<(sled::IVec, sled::IVec), sled::Error>>> = match scan_direction {
+                    ankurah_storage_common::ScanDirection::Forward => base_iter,
+                    ankurah_storage_common::ScanDirection::Reverse => match &end_full_opt {
+                        Some(end_full) => Box::new(index.tree().range(start_full.clone()..end_full.clone()).rev()),
+                        None => Box::new(index.tree().range(start_full.clone()..).rev()),
+                    },
+                };
+
+                let mut results: Vec<Attested<EntityState>> = Vec::new();
+                let mut count: u64 = 0;
+
+                let mut use_prefix_guard = upper_open_ended && eq_prefix_len > 0;
+                #[cfg(debug_assertions)]
+                if prefix_guard_disabled {
+                    use_prefix_guard = false;
+                }
+
+                for kv in iter {
+                    let (k, _v) = kv.map_err(SledRetrievalError::StorageError)?;
+                    let key_bytes = k.as_ref();
+
+                    // Equality-prefix guard for open-ended scans
+                    if use_prefix_guard {
+                        if key_bytes.len() < eq_prefix_bytes.len() || &key_bytes[..eq_prefix_bytes.len()] != eq_prefix_bytes.as_slice() {
+                            break;
+                        }
+                    }
+
+                    let eid = decode_entity_id_from_index_key(key_bytes)?;
+                    if let Some(ivec) = self.database.entities_tree.get(eid.to_bytes()).map_err(sled_error)? {
+                        let sfrag: StateFragment = bincode::deserialize(ivec.as_ref())?;
+                        let es = Attested::<EntityState>::from_parts(eid, self.collection_id.clone(), sfrag);
+                        let entity = TemporaryEntity::new(es.payload.entity_id, self.collection_id.clone(), &es.payload.state)?;
+                        if evaluate_predicate(&entity, &remaining_predicate)? {
+                            results.push(es);
+                            if let Some(l) = limit {
+                                count += 1;
+                                if count >= l {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Ok(results)
+            }
+        }
     }
 
     pub(crate) fn exec_fallback_scan(
@@ -191,32 +321,32 @@ impl SledStorageCollection {
         order_by: Option<Vec<ankql::ast::OrderByItem>>,
         limit: Option<u32>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let strategy = determine_iteration_strategy(&predicate, &order_by);
-        let skip_sorting = order_by_matches_iteration(&order_by, &strategy);
-
+        // TODO: Replace with new pipeline architecture
+        // For now, use simple full scan - this will be replaced by the streaming pipeline
         let mut results: Vec<Attested<EntityState>> = Vec::new();
-        let iter = create_tree_iterator(tree, strategy);
+        let iter = self.tree.iter();
         for item in iter {
             let (key_bytes, value_bytes) = item.map_err(SledRetrievalError::StorageError)?;
             let id = EntityId::from_bytes(key_bytes.as_ref().try_into().map_err(RetrievalError::storage)?);
             let sfrag: StateFragment = bincode::deserialize(&value_bytes)?;
-            let es = Attested::<EntityState>::from_parts(id, collection_id.clone(), sfrag);
+            let es = Attested::<EntityState>::from_parts(id, self.collection_id.clone(), sfrag);
 
-            let entity = TemporaryEntity::new(id, collection_id.clone(), &es.payload.state)?;
+            let entity = TemporaryEntity::new(id, self.collection_id.clone(), &es.payload.state)?;
             if evaluate_predicate(&entity, &predicate)? {
                 results.push(es);
-                if skip_sorting {
-                    if let Some(limit_val) = limit {
-                        if results.len() >= limit_val as usize {
-                            break;
-                        }
+                // Apply limit during scan for efficiency
+                if let Some(limit_val) = limit {
+                    if results.len() >= limit_val as usize {
+                        break;
                     }
                 }
             }
         }
 
-        if !skip_sorting {
-            apply_order_by_sort(&mut results, &order_by, &collection_id)?;
+        // TODO: Replace with pipeline sorting logic
+        // For now, always sort if ORDER BY is present
+        if order_by.is_some() {
+            ankurah_storage_common::sorting::apply_order_by_sort(&mut results, &order_by, &self.collection_id)?;
         }
         if let Some(limit_val) = limit {
             results.truncate(limit_val as usize);
@@ -226,263 +356,26 @@ impl SledStorageCollection {
 }
 
 /// Create the appropriate iterator based on the strategy
-pub(crate) fn create_tree_iterator(
-    tree: &sled::Tree,
-    strategy: IterationStrategy,
-) -> Box<dyn Iterator<Item = Result<(sled::IVec, sled::IVec), sled::Error>>> {
-    match strategy {
-        IterationStrategy::FullScan { reverse } => {
-            if reverse {
-                Box::new(tree.iter().rev())
-            } else {
-                Box::new(tree.iter())
-            }
-        }
-        IterationStrategy::IdRange { range, reverse } => {
-            let start_key = match &range.lower {
-                RangeBound::Included(id) => Some(id.to_bytes()),
-                RangeBound::Excluded(id) => id.successor_bytes().map(|b| b.try_into().unwrap_or_else(|_| id.to_bytes())),
-                RangeBound::Unbounded => None,
-            };
 
-            let end_key = match &range.upper {
-                RangeBound::Included(id) => id.successor_bytes().map(|b| b.try_into().unwrap_or_else(|_| id.to_bytes())),
-                RangeBound::Excluded(id) => Some(id.to_bytes()),
-                RangeBound::Unbounded => None,
-            };
-
-            match (start_key, end_key) {
-                (Some(start), Some(end)) => {
-                    if reverse {
-                        Box::new(tree.range(start..end).rev())
-                    } else {
-                        Box::new(tree.range(start..end))
-                    }
-                }
-                (Some(start), None) => {
-                    if reverse {
-                        Box::new(tree.range(start..).rev())
-                    } else {
-                        Box::new(tree.range(start..))
-                    }
-                }
-                (None, Some(end)) => {
-                    if reverse {
-                        Box::new(tree.range(..end).rev())
-                    } else {
-                        Box::new(tree.range(..end))
-                    }
-                }
-                (None, None) => {
-                    if reverse {
-                        Box::new(tree.iter().rev())
-                    } else {
-                        Box::new(tree.iter())
-                    }
-                }
+fn entity_id_successor_bytes(id: &EntityId) -> Option<[u8; 16]> {
+    let mut bytes = id.to_bytes();
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] != 0xFF {
+            bytes[i] = bytes[i].saturating_add(1);
+            for j in (i + 1)..bytes.len() {
+                bytes[j] = 0x00;
             }
+            return Some(bytes);
         }
     }
+    None
 }
 
-/// Extract EntityId from a comparison if it's an id field comparison
-fn extract_id_from_comparison(left: &Expr, right: &Expr, operator: &ComparisonOperator) -> Option<(EntityId, IdRange)> {
-    // Check if this is an id comparison and extract the value
-    let (is_id_field, id_value) = match (left, right) {
-        (Expr::Identifier(Identifier::Property(name)), Expr::Literal(Literal::String(s))) if name == "id" => {
-            (true, EntityId::from_base64(s).ok()?)
-        }
-        (Expr::Literal(Literal::String(s)), Expr::Identifier(Identifier::Property(name))) if name == "id" => {
-            (true, EntityId::from_base64(s).ok()?)
-        }
-        _ => return None,
-    };
-
-    if !is_id_field {
-        return None;
+fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, RetrievalError> {
+    if key.len() < 1 + 16 {
+        return Err(RetrievalError::StorageError("index key too short".into()));
     }
-
-    // Convert comparison to range bounds
-    let (lower, upper) = match operator {
-        ComparisonOperator::Equal => (RangeBound::Included(id_value), RangeBound::Included(id_value)),
-        ComparisonOperator::GreaterThan => (RangeBound::Excluded(id_value), RangeBound::Unbounded),
-        ComparisonOperator::GreaterThanOrEqual => (RangeBound::Included(id_value), RangeBound::Unbounded),
-        ComparisonOperator::LessThan => (RangeBound::Unbounded, RangeBound::Excluded(id_value)),
-        ComparisonOperator::LessThanOrEqual => (RangeBound::Unbounded, RangeBound::Included(id_value)),
-        _ => return None, // Other operators not supported for range optimization
-    };
-
-    Some((id_value, IdRange { lower, upper }))
-}
-
-/// Intersect two ID ranges to get the most restrictive bounds
-fn intersect_ranges(left: &IdRange, right: &IdRange) -> IdRange {
-    let lower = match (&left.lower, &right.lower) {
-        (RangeBound::Unbounded, other) | (other, RangeBound::Unbounded) => other.clone(),
-        (RangeBound::Included(a), RangeBound::Included(b)) => RangeBound::Included(std::cmp::max(*a, *b)),
-        (RangeBound::Included(a), RangeBound::Excluded(b)) | (RangeBound::Excluded(b), RangeBound::Included(a)) => {
-            if a >= b {
-                RangeBound::Included(*a)
-            } else {
-                RangeBound::Excluded(*b)
-            }
-        }
-        (RangeBound::Excluded(a), RangeBound::Excluded(b)) => RangeBound::Excluded(std::cmp::max(*a, *b)),
-    };
-
-    let upper = match (&left.upper, &right.upper) {
-        (RangeBound::Unbounded, other) | (other, RangeBound::Unbounded) => other.clone(),
-        (RangeBound::Included(a), RangeBound::Included(b)) => RangeBound::Included(std::cmp::min(*a, *b)),
-        (RangeBound::Included(a), RangeBound::Excluded(b)) | (RangeBound::Excluded(b), RangeBound::Included(a)) => {
-            if a <= b {
-                RangeBound::Included(*a)
-            } else {
-                RangeBound::Excluded(*b)
-            }
-        }
-        (RangeBound::Excluded(a), RangeBound::Excluded(b)) => RangeBound::Excluded(std::cmp::min(*a, *b)),
-    };
-
-    IdRange { lower, upper }
-}
-
-/// Determine the optimal iteration strategy based on predicate and ORDER BY
-pub fn determine_iteration_strategy(predicate: &Predicate, order_by: &Option<Vec<ankql::ast::OrderByItem>>) -> IterationStrategy {
-    // Check if ORDER BY is on id field
-    let id_ordering = order_by.as_ref().and_then(|items| {
-        if items.len() == 1 {
-            if let Identifier::Property(name) = &items[0].identifier {
-                if name == "id" {
-                    return Some(items[0].direction.clone());
-                }
-            }
-        }
-        None
-    });
-
-    // Extract all id constraints from the predicate
-    let mut visitor = |mut acc: Vec<IdRange>, pred: &Predicate| {
-        if let Predicate::Comparison { left, operator, right } = pred {
-            if let Some((_, range)) = extract_id_from_comparison(left, right, operator) {
-                acc.push(range);
-            }
-        }
-        acc
-    };
-    let id_ranges = predicate.walk(Vec::new(), &mut visitor);
-
-    // If we have id constraints, use range optimization
-    if !id_ranges.is_empty() {
-        let combined_range =
-            id_ranges.into_iter().reduce(|acc, range| intersect_ranges(&acc, &range)).expect("We know there's at least one range");
-
-        return IterationStrategy::IdRange {
-            range: combined_range,
-            reverse: false, // Range queries don't benefit from reverse iteration
-        };
-    }
-
-    // If ORDER BY id, use full scan with appropriate direction
-    if let Some(direction) = id_ordering {
-        return IterationStrategy::FullScan { reverse: matches!(direction, OrderDirection::Desc) };
-    }
-
-    // Default: full scan forward
-    IterationStrategy::FullScan { reverse: false }
-}
-
-/// Check if ORDER BY matches the natural iteration order, making sorting unnecessary
-pub fn order_by_matches_iteration(order_by: &Option<Vec<ankql::ast::OrderByItem>>, strategy: &IterationStrategy) -> bool {
-    let Some(order_items) = order_by else { return true }; // No ORDER BY means any order is fine
-
-    // Only single-field id ordering can match iteration order
-    if order_items.len() != 1 {
-        return false;
-    }
-
-    let Identifier::Property(field_name) = &order_items[0].identifier else { return false };
-    if field_name != "id" {
-        return false;
-    }
-
-    let expected_direction = &order_items[0].direction;
-
-    match strategy {
-        IterationStrategy::FullScan { reverse } => {
-            let actual_direction = if *reverse { OrderDirection::Desc } else { OrderDirection::Asc };
-            expected_direction == &actual_direction
-        }
-        IterationStrategy::IdRange { reverse, .. } => {
-            let actual_direction = if *reverse { OrderDirection::Desc } else { OrderDirection::Asc };
-            expected_direction == &actual_direction
-        }
-    }
-}
-
-/// Apply in-memory sorting to results based on ORDER BY clause when order_by_spill is nonzero length
-pub(crate) fn apply_order_by_sort(
-    results: &mut Vec<Attested<EntityState>>,
-    order_by: &Option<Vec<ankql::ast::OrderByItem>>,
-    collection_id: &CollectionId,
-) -> Result<(), RetrievalError> {
-    let Some(order_items) = order_by else { return Ok(()) };
-
-    results.sort_by(|a, b| {
-        for order_item in order_items {
-            if let Identifier::Property(field_name) = &order_item.identifier {
-                // Create temporary entities for comparison
-                let entity_a = TemporaryEntity::new(a.payload.entity_id, collection_id.clone(), &a.payload.state).ok();
-                let entity_b = TemporaryEntity::new(b.payload.entity_id, collection_id.clone(), &b.payload.state).ok();
-
-                use ankql::selection::filter::Filterable;
-                if let (Some(ent_a), Some(ent_b)) = (entity_a, entity_b) {
-                    let val_a = ent_a.value(field_name);
-                    let val_b = ent_b.value(field_name);
-
-                    let cmp = match (val_a, val_b) {
-                        (Some(a_str), Some(b_str)) => {
-                            // Try to parse as different types for proper collation
-                            if let (Ok(a_int), Ok(b_int)) = (a_str.parse::<i64>(), b_str.parse::<i64>()) {
-                                a_int.compare(&b_int)
-                            } else if let (Ok(a_float), Ok(b_float)) = (a_str.parse::<f64>(), b_str.parse::<f64>()) {
-                                a_float.compare(&b_float)
-                            } else {
-                                a_str.as_str().compare(&b_str.as_str())
-                            }
-                        }
-                        (Some(_), None) => std::cmp::Ordering::Greater, // Non-null > null
-                        (None, Some(_)) => std::cmp::Ordering::Less,    // null < non-null
-                        (None, None) => std::cmp::Ordering::Equal,      // null == null
-                    };
-
-                    let final_cmp = match order_item.direction {
-                        OrderDirection::Asc => cmp,
-                        OrderDirection::Desc => cmp.reverse(),
-                    };
-
-                    if final_cmp != std::cmp::Ordering::Equal {
-                        return final_cmp;
-                    }
-                }
-            }
-        }
-        // Tie-breaker: sort by entity ID for deterministic results
-        a.payload.entity_id.cmp(&b.payload.entity_id)
-    });
-
-    Ok(())
-}
-
-/// Represents a range constraint on EntityId for optimization
-#[derive(Debug, Clone)]
-pub struct IdRange {
-    pub lower: RangeBound<EntityId>,
-    pub upper: RangeBound<EntityId>,
-}
-
-/// Strategy for iterating through the sled tree
-#[derive(Debug)]
-pub enum IterationStrategy {
-    FullScan { reverse: bool },
-    IdRange { range: IdRange, reverse: bool },
+    let eid_bytes: [u8; 16] =
+        key[key.len() - 16..].try_into().map_err(|_| RetrievalError::StorageError("invalid entity id suffix".into()))?;
+    Ok(EntityId::from_bytes(eid_bytes))
 }

@@ -138,7 +138,7 @@ impl StorageCollection for IndexedDBBucket {
 
         // Step 2: Use planner to generate query plans
         let planner = ankurah_storage_common::planner::Planner::new(ankurah_storage_common::planner::PlannerConfig::indexeddb());
-        let plans = planner.plan(&amended_selection);
+        let plans = planner.plan(&amended_selection, "id");
 
         // Step 3: Pick the first plan (always)
         let plan = plans.first().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
@@ -194,6 +194,11 @@ impl StorageCollection for IndexedDBBucket {
 
                     Ok(results)
                 })
+            }
+            Plan::TableScan { .. } => {
+                unreachable!(
+                    "We should always have an IndexPlan or EmptyScan due to the amendment of the selection to include the collection"
+                )
             }
         }
         .await

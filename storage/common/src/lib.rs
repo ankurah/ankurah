@@ -1,6 +1,8 @@
+pub mod bounds;
 pub mod index_spec;
 pub mod planner;
 pub mod predicate;
+pub mod sorting;
 pub mod types;
 
 pub use index_spec::*;

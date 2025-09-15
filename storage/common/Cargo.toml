@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ankql        = { path = "../../ankql" }
 ankurah-core = { path = "../../core" }
+ankurah-proto = { path = "../../proto" }
 indexmap     = "2.0"
 serde        = { version = "1.0", features = ["derive"] }
 
