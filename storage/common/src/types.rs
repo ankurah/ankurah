@@ -24,6 +24,12 @@ pub enum Plan {
         remaining_predicate: ankql::ast::Predicate,   // residual quals
         order_by_spill: Vec<ankql::ast::OrderByItem>, // extra sort keys
     },
+    TableScan {
+        bounds: IndexBounds, // primary key bounds (empty if no constraints). TODO: Consider renaming IndexBounds to KeyBounds for clarity
+        scan_direction: ScanDirection, // forward/reverse based on primary key ORDER BY
+        remaining_predicate: ankql::ast::Predicate, // all predicates (no index to satisfy any)
+        order_by_spill: Vec<ankql::ast::OrderByItem>, // ORDER BY fields not satisfied by scan direction
+    },
     EmptyScan, // "scan" over an emptyset - the query can never match anything
 }
 
@@ -113,6 +119,7 @@ pub struct IndexBounds {
 
 impl IndexBounds {
     pub fn new(keyparts: Vec<IndexColumnBound>) -> Self { Self { keyparts } }
+    pub fn empty() -> Self { Self { keyparts: vec![] } }
 }
 
 // --- Canonical, lexicographic interval after normalization -------------------
