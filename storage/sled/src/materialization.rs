@@ -1,8 +1,9 @@
 use ankql::selection::filter::Filterable;
+use ankurah_core::error::RetrievalError;
 use ankurah_proto::{CollectionId, EntityId};
 
 // Lightweight filterable over materialized values
-pub(crate) struct MatEntity {
+pub struct MatEntity {
     pub(crate) id: EntityId,
     pub(crate) collection: CollectionId,
     pub(crate) map: std::collections::BTreeMap<String, ankurah_core::property::PropertyValue>,
@@ -25,3 +26,22 @@ impl Filterable for MatEntity {
         })
     }
 }
+
+// Temporary wrapper to make Result<(IVec, MatEntity), RetrievalError> implement Filterable
+// This allows our iterators to work with GetPropertyValueStream until we implement proper error handling
+pub struct MatRow {
+    pub id: EntityId,
+    pub mat: MatEntity,
+}
+
+impl Filterable for MatRow {
+    fn collection(&self) -> &str { self.mat.collection() }
+    fn value(&self, name: &str) -> Option<String> { self.mat.value(name) }
+}
+
+impl ankurah_storage_common::filtering::HasEntityId for MatRow {
+    fn entity_id(&self) -> EntityId { self.id }
+}
+
+// TODO: We'll need to handle Result<(IVec, MatEntity), RetrievalError> in the iterator logic
+// instead of trying to make it implement Filterable directly (orphan rules prevent this)

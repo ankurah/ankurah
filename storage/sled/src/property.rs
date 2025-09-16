@@ -37,6 +37,8 @@ impl PropertyManager {
 
     /// Gets or creates a property ID for the given property name
     pub fn get_property_id(&self, name: &str) -> Result<u32, RetrievalError> {
+        // FIXME - I think we need a mutex here to avoid race conditions creating conflicting
+        // registrations for the same property
         match self.0.property_config_tree.get(name.as_bytes()).map_err(sled_error)? {
             Some(ivec) => {
                 let mut arr = [0u8; 4];

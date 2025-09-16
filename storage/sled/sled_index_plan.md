@@ -34,6 +34,7 @@
 - `collection_{collection}` (per-collection materialized values)
   - key: `EntityId.to_bytes()`
   - val: `Vec<(SledPropertyId, PropertyValue)>` (bincode)
+  - Sled exposes `MatRow { id: EntityId, mat: MatEntity }` per-row for filtering/sorting; `MatEntity` implements `Filterable` (to be renamed `GetPropertyValue`)
 - `index_{index_id}` (per-index tree; bound to one collection via metadata)
 
   - key: composite tuple bytes (per `IndexSpec`) `|| 0x00 || entity_id_bytes`
@@ -119,9 +120,9 @@ Reverse scans:
    - If missing/not built → allocate `u32 id`, persist `IndexRecord` as Building, backfill `index_{id}` synchronously, mark Ready
 4. Convert `bounds` → sled key-range over composite tuple
 5. Open `index_{id}` and iterate `range(start_full..end_full)` or `range(start_full..)` + equality-prefix guard (debug flag allows disabling guard in tests)
-6. Decode `EntityId` from key suffix; use `collection_{collection}` to evaluate any spilled predicates (skip non-matching rows early)
-7. For rows that pass filters, hydrate from `entities`
-8. If `order_by_spill` is needed, sort survivors (may use materialized values where possible), then apply `limit`
+6. Decode `EntityId` from key suffix. If spilled predicates or ORDER BY spill exist, fetch materialized values from `collection_{collection}` first and evaluate there to skip non-matching rows early
+7. For rows that pass filters, hydrate canonical state from `entities`
+8. ORDER BY and LIMIT are applied via the streaming pipeline rules (see below): use in-memory sort or top-K as appropriate; do not combine full sort with limit – prefer `top_k` when both are present
 
 ## Index creation & backfill
 
@@ -151,14 +152,30 @@ Notes:
 ## ORDER BY and LIMIT
 
 - When planner chooses ORDER-FIRST, the index keyparts include the order-by fields. DESC is satisfied via reverse scans over ASC keys (no separate DESC indexes in V1).
-- Otherwise, collect rows and apply `order_by_spill` using in-memory sort (reuse collation helpers)
-- LIMIT applied during scan when native order is satisfied; otherwise truncate after sort
+- When order cannot be satisfied natively, the streaming pipeline applies ordering/limiting on materialized rows using the following rules:
+  - If only ORDER BY is present: perform a full in-memory sort over the filtered materialized rows
+  - If only LIMIT is present: terminate upstream once `N` matches are yielded
+  - If both ORDER BY and LIMIT are present: use a bounded top-K heap (avoid full materialization)
+  - Never combine full sort with limit; prefer top-K
 
-## Scanning and execution efficiency
+## Scanning and execution efficiency (streaming pipeline)
 
 - Use canonical range normalization, lexicographic successor for inclusive upper bounds, and prefix guards for open-ended scans.
-- Stream index scans and stop early when `limit` is reached (when native order satisfied).
-- Evaluate spilled predicates using `collection_{collection}` before hydrating entities to minimize IO.
+- Pipeline is composed from engine-specific scanners and generic combinators:
+  - EntityIdStream: iterates `EntityId`s
+  - GetPropertyValueStream: iterates materialized rows (`MatRow = { id, mat }`), where `mat` implements `Filterable` (later renamed `GetPropertyValue`)
+  - EntityStateStream: iterates hydrated `Attested<EntityState>`
+- Sled concrete stream producers:
+  - `SledIndexEntityIdScanner` → EntityIdStream
+  - `SledCollectionEntityIdScanner` → EntityIdStream (table scan for IDs-only)
+  - `SledCollectionMatValueScanner` → GetPropertyValueStream (table scan for materialized values)
+  - `SledMatValueLookupFromIds` (EntityIdStream → GetPropertyValueStream)
+  - `SledEntityLookup` (EntityIdStream → EntityStateStream)
+- Generic combinators over GetPropertyValueStream:
+  - `filter_predicate(predicate)` (evaluate on materialized values)
+  - `sort_by(order_by)` (full sort)
+  - `limit(n)` (early termination; generic over any stream)
+  - `top_k(order_by, n)` (bounded heap; sort + limit)
 - Reverse scans: leverage double-ended iteration (`rev()`) when scanning Desc over natively ordered keys.
 - Maintain a small top-K heap when `order_by_spill` with `limit` is present, to avoid full materialization.
 - Batch writes with `sled::Batch` for index maintenance; keep read path streaming and low-allocation.
@@ -197,3 +214,45 @@ Prefix guard toggle for testing:
 ## Remaining questions
 
 None at this time.
+
+## Examples: Pipeline compositions
+
+This section shows the concrete stream compositions the engine builds for common scenarios. Streams are engine-specific producers; combinators are generic.
+
+- Index plan, no residual predicate, no ORDER BY spill (native order satisfied):
+
+  - `SledIndexEntityIdScanner(bounds, direction)` → EntityIdStream
+  - Optional: `limit(N)` (native order allows early termination)
+  - `SledEntityLookup::from_ids(...)` → EntityStateStream
+  - `collect_states(...)`
+
+- Index plan with residual predicate and/or ORDER BY spill:
+
+  - `SledIndexEntityIdScanner(bounds, direction)` → EntityIdStream
+  - `SledMatValueLookupFromIds::from_ids(...)` → GetPropertyValueStream (MatRow)
+  - `filter_predicate(predicate)` (on materialized values)
+  - If ORDER BY + LIMIT: `top_k(order_by, N)`
+  - Else if ORDER BY only: `sort_by(order_by)`
+  - Else if LIMIT only: `limit(N)`
+  - `SledEntityLookup::from_ids(...)` → EntityStateStream
+  - `collect_states(...)`
+
+- Table scan (primary-key scan):
+  - IDs-only path (no residual, no spill):
+    - `SledCollectionEntityIdScanner(bounds, direction)` → EntityIdStream
+    - Optional: `limit(N)`
+    - `SledEntityLookup::from_ids(...)` → EntityStateStream
+    - `collect_states(...)`
+  - Values path (residual and/or spill present):
+    - `SledCollectionMatValueScanner(bounds, direction)` → GetPropertyValueStream (MatRow)
+    - `filter_predicate(predicate)`
+    - If ORDER BY + LIMIT: `top_k(order_by, N)`
+    - Else if ORDER BY only: `sort_by(order_by)`
+    - Else if LIMIT only: `limit(N)`
+    - `SledEntityLookup::from_ids(...)` → EntityStateStream
+    - `collect_states(...)`
+
+Notes:
+
+- GetPropertyValueStream items carry `MatRow { id, mat }` so hydration can proceed without additional mapping.
+- When only IDs are required, prefer entity-id scanners to avoid over-fetching materialized values.
