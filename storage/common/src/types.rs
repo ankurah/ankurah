@@ -33,7 +33,7 @@ pub enum Plan {
     EmptyScan, // "scan" over an emptyset - the query can never match anything
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScanDirection {
     Forward,
     Reverse,
