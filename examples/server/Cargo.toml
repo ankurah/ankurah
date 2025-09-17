@@ -13,5 +13,5 @@ tracing                  = "0.1"
 tracing-subscriber       = "0.3"
 tokio                    = { version = "1.38", features = ["rt-multi-thread"] }
 anyhow                   = "1.0"
-chrono                   = { version = "0.4", features = ["serde"] }
+chrono                   = { version = "0.4", default-features = false, features = ["serde"] }
 serde_json               = "1.0"

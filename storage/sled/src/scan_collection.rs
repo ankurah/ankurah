@@ -154,10 +154,12 @@ impl<'a> Iterator for SledCollectionScanner<'a> {
             Err(_e) => return None, // Skip errors for now - TODO: proper error handling
         };
 
-        // Convert to MatEntity - store by property ID for now
+        // Convert to MatEntity - store by property name (not ID)
         let mut map = std::collections::BTreeMap::new();
         for (property_id, value) in property_values {
-            map.insert(property_id.to_string(), value);
+            if let Some(property_name) = self.property_manager.get_property_name(property_id) {
+                map.insert(property_name, value);
+            }
         }
 
         let mat_entity = crate::materialization::MatEntity {
@@ -171,7 +173,7 @@ impl<'a> Iterator for SledCollectionScanner<'a> {
 }
 
 // Implement GetPropertyValueStream for SledCollectionScanner so it can be used with filtering/sorting
-impl<'a> GetPropertyValueStream for SledCollectionScanner<'a> {}
+// impl<'a> GetPropertyValueStream for SledCollectionScanner<'a> {}
 
 /// Helper function to extract EntityId from PropertyValue (for primary key bounds)
 fn entity_id_from_property_value(value: &ankurah_core::property::PropertyValue) -> Option<EntityId> {
@@ -227,7 +229,11 @@ impl<S: EntityIdStream> Iterator for SledMaterializeIter<S> {
         let mut map = std::collections::BTreeMap::new();
         for (property_id, value) in property_values {
             // For now, use property_id as string key - we can optimize this later
-            map.insert(property_id.to_string(), value);
+            // do it:
+            let property_name = self.property_manager.get_property_name(property_id);
+            if let Some(property_name) = property_name {
+                map.insert(property_name, value);
+            }
         }
 
         let mat_entity = crate::materialization::MatEntity {
@@ -241,4 +247,4 @@ impl<S: EntityIdStream> Iterator for SledMaterializeIter<S> {
 }
 
 // Implement GetPropertyValueStream for SledMaterializeIter so it can be used with filtering/sorting
-impl<S: EntityIdStream> GetPropertyValueStream for SledMaterializeIter<S> {}
+// impl<S: EntityIdStream> GetPropertyValueStream for SledMaterializeIter<S> {}

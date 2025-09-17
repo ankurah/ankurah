@@ -109,8 +109,11 @@ impl IndexManager {
 
 impl Index {
     pub fn tree(&self) -> &sled::Tree { &self.0.tree }
+    pub fn id(&self) -> u32 { self.0.id }
     pub fn collection(&self) -> &str { &self.0.collection }
+    pub fn name(&self) -> &str { &self.0.name }
     pub fn spec(&self) -> &ankurah_storage_common::IndexSpec { &self.0.spec }
+    pub fn created_at_unix_ms(&self) -> i64 { self.0.created_at_unix_ms }
     pub fn from_record(rec: IndexRecord, db: &Db, index_config_tree: Tree, property_manager: PropertyManager) -> Result<Self, IndexError> {
         Ok(Self(Arc::new(IndexInner {
             id: rec.id,

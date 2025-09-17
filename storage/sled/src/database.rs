@@ -10,11 +10,11 @@ use crate::index::{Index, IndexManager, IndexRecord};
 use crate::property::PropertyManager;
 
 pub struct Database {
-    pub(crate) db: Db,
+    pub db: Db,
     pub(crate) entities_tree: sled::Tree,
     pub(crate) events_tree: sled::Tree,
-    pub(crate) property_manager: PropertyManager,
-    pub(crate) index_manager: IndexManager,
+    pub property_manager: PropertyManager,
+    pub index_manager: IndexManager,
 }
 
 impl Database {
@@ -30,4 +30,10 @@ impl Database {
 
         Ok(Self { db, entities_tree, events_tree, property_manager, index_manager })
     }
+
+    /// Convenience method for tests - delegates to underlying sled db
+    pub fn tree_names(&self) -> Vec<sled::IVec> { self.db.tree_names() }
+
+    /// Convenience method for tests - delegates to underlying sled db
+    pub fn open_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<sled::Tree, sled::Error> { self.db.open_tree(name) }
 }
