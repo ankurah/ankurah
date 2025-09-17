@@ -1,6 +1,7 @@
 use ankql::selection::filter::Filterable;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use tracing::info;
 
 /// Helper function to sort items by ORDER BY clauses
 fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::OrderByItem]) {
@@ -121,6 +122,7 @@ where I: Iterator
     type Item = I::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
+        tracing::info!("LimitedStream::next {} of {:?}", self.count, self.limit);
         // Check if we've reached the limit
         if let Some(limit) = self.limit {
             if self.count >= limit {
@@ -223,23 +225,23 @@ where
 // All stream wrappers should implement GetPropertyValueStream for chaining
 use crate::filtering::GetPropertyValueStream;
 
-impl<I> GetPropertyValueStream for SortedStream<I>
-where
-    I: Iterator,
-    I::Item: Filterable,
-{
-}
+// impl<I> GetPropertyValueStream for SortedStream<I>
+// where
+//     I: Iterator,
+//     I::Item: Filterable,
+// {
+// }
 
-impl<I> GetPropertyValueStream for LimitedStream<I>
-where
-    I: Iterator,
-    I::Item: Filterable,
-{
-}
+// impl<I> GetPropertyValueStream for LimitedStream<I>
+// where
+//     I: Iterator,
+//     I::Item: Filterable,
+// {
+// }
 
-impl<I> GetPropertyValueStream for TopKStream<I>
-where
-    I: Iterator,
-    I::Item: Filterable,
-{
-}
+// impl<I> GetPropertyValueStream for TopKStream<I>
+// where
+//     I: Iterator,
+//     I::Item: Filterable,
+// {
+// }

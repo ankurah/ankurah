@@ -52,4 +52,22 @@ impl PropertyManager {
             }
         }
     }
+
+    /// Gets the property name for the given property ID
+    pub fn get_property_name(&self, id: u32) -> Option<String> {
+        // Scan the property_config_tree to find the name for this ID
+        for item in self.0.property_config_tree.iter() {
+            if let Ok((key_bytes, value_bytes)) = item {
+                if value_bytes.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&value_bytes);
+                    let property_id = u32::from_be_bytes(arr);
+                    if property_id == id {
+                        return String::from_utf8(key_bytes.to_vec()).ok();
+                    }
+                }
+            }
+        }
+        None
+    }
 }

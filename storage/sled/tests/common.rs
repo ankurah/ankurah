@@ -1,8 +1,23 @@
 use std::sync::Arc;
 
-use ankurah::{error::MutationError, policy::DEFAULT_CONTEXT, Context, Model, Node, PermissiveAgent};
+use ankurah::Model;
+use ankurah::{error::MutationError, policy::DEFAULT_CONTEXT, Context, Node, PermissiveAgent};
+
 use ankurah_storage_sled::SledStorageEngine;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use tracing::Level;
+
+// Initialize tracing for tests
+#[ctor::ctor]
+fn init_tracing() {
+    // if LOG_LEVEL env var is set, use it
+    if let Ok(level) = std::env::var("LOG_LEVEL") {
+        tracing_subscriber::fmt().with_max_level(Level::from_str(&level).unwrap()).with_test_writer().init();
+    } else {
+        tracing_subscriber::fmt().with_max_level(Level::INFO).with_test_writer().init();
+    }
+}
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Album {

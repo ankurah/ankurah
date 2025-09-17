@@ -3,6 +3,7 @@ use ankurah_core::error::RetrievalError;
 use ankurah_proto::{CollectionId, EntityId};
 
 // Lightweight filterable over materialized values
+#[derive(Debug)]
 pub struct MatEntity {
     pub(crate) id: EntityId,
     pub(crate) collection: CollectionId,
@@ -29,6 +30,7 @@ impl Filterable for MatEntity {
 
 // Temporary wrapper to make Result<(IVec, MatEntity), RetrievalError> implement Filterable
 // This allows our iterators to work with GetPropertyValueStream until we implement proper error handling
+#[derive(Debug)]
 pub struct MatRow {
     pub id: EntityId,
     pub mat: MatEntity,

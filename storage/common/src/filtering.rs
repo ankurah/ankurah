@@ -57,12 +57,19 @@ where
 }
 
 // FilteredStream should also implement GetPropertyValueStream for chaining
-impl<I> GetPropertyValueStream for FilteredStream<I>
-where
-    I: Iterator,
-    I::Item: Filterable,
-{
-}
+// impl<I> GetPropertyValueStream for FilteredStream<I>
+// where
+//     I: Iterator,
+//     I::Item: Filterable,
+// {
+// }
+
+// impl<T, F> GetPropertyValueStream for T
+// where
+//     T: Iterator<Item = F>,
+//     F: Filterable,
+// {
+// }
 
 /// Wrapper for extracting entity IDs from materialized values
 pub struct ExtractIdsStream<I> {
@@ -89,3 +96,11 @@ pub trait HasEntityId {
 }
 
 // ExtractIdsStream implements EntityIdStream (via blanket impl) since it yields Result<EntityId, RetrievalError>
+
+// Blanket implementation for any Iterator with Filterable items
+impl<I> GetPropertyValueStream for I
+where
+    I: Iterator,
+    I::Item: Filterable,
+{
+}

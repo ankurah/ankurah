@@ -1,12 +1,15 @@
 use crate::{
     filtering::FilteredStream,
-    sorting::{SortedStream, TopKStream},
+    sorting::{LimitedStream, SortedStream, TopKStream},
 };
 use ankurah_core::{EntityId, error::RetrievalError};
 use ankurah_proto::{Attested, EntityState};
 
 /// Stream of entity IDs - generic over any storage engine
-pub trait EntityIdStream: Iterator<Item = Result<EntityId, RetrievalError>> {}
+pub trait EntityIdStream: Iterator<Item = Result<EntityId, RetrievalError>> + Sized {
+    /// Limit the number of entity IDs returned
+    fn limit(self, limit: Option<u64>) -> LimitedStream<Self> { LimitedStream::new(self, limit) }
+}
 
 /// Stream of entity states - generic over any storage engine  
 pub trait EntityStateStream: Iterator<Item = Result<Attested<EntityState>, RetrievalError>> {
@@ -24,12 +27,7 @@ pub trait EntityStateStream: Iterator<Item = Result<Attested<EntityState>, Retri
     }
 }
 
-/// Generic limit adapter for iterators used in the pipeline.
-pub trait LimitExt: Sized {
-    fn limit(self, _limit: Option<u64>) -> Self {
-        todo!("limit: terminate upstream once satisfied");
-    }
-}
+// LimitExt removed - limit functionality moved to specific stream traits
 
 /// Generic scan operations that can be implemented by any KV store
 pub trait ScanExt: Sized {
@@ -43,7 +41,6 @@ pub trait ScanExt: Sized {
 // Blanket implementations for common iterator types
 impl<I> EntityIdStream for I where I: Iterator<Item = Result<EntityId, RetrievalError>> {}
 impl<I> EntityStateStream for I where I: Iterator<Item = Result<Attested<EntityState>, RetrievalError>> {}
-impl<I, T> LimitExt for I where I: Iterator<Item = Result<T, RetrievalError>> {}
 
 /// GetPropertyValueStream: default combinators that construct wrapper streams
 pub trait GetPropertyValueStream: Iterator + Sized {
