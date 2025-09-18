@@ -50,14 +50,17 @@ pub async fn setup_context() -> Result<Context, anyhow::Error> {
     Ok(node.context_async(DEFAULT_CONTEXT).await)
 }
 
-pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {
+pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<Vec<AlbumView>, MutationError> {
+    use ankurah::Mutable;
     let trx = ctx.begin();
+    let mut albums = Vec::new();
     for (name, year) in vec {
         let album = Album { name: name.to_owned(), year: year.to_owned() };
-        let _album = trx.create(&album).await?;
+        let album = trx.create(&album).await?.read();
+        albums.push(album);
     }
     trx.commit().await?;
-    Ok(())
+    Ok(albums)
 }
 
 pub async fn create_books(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {

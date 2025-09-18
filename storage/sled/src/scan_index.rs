@@ -1,13 +1,16 @@
-use crate::planner_integration::{bounds_to_sled_range, normalize};
+use crate::{
+    error::IndexError,
+    planner_integration::{key_bounds_to_sled_range, SledRangeBounds},
+};
 use ankurah_core::{error::RetrievalError, EntityId};
-use ankurah_storage_common::{IndexBounds, IndexSpecMatch, ScanDirection};
+use ankurah_storage_common::{IndexSpecMatch, KeyBounds, ScanDirection};
 
 use crate::index::Index;
 
 /// Scanner over a sled index tree yielding EntityId directly
 pub struct SledIndexScanner<'a> {
     pub index: &'a Index,
-    pub bounds: &'a IndexBounds,
+    pub bounds: &'a KeyBounds,
     pub direction: ScanDirection,
     pub match_type: IndexSpecMatch,
     pub prefix_guard_disabled: bool,
@@ -36,17 +39,16 @@ impl Iterator for SledIndexIter {
 impl<'a> SledIndexScanner<'a> {
     pub fn new(
         index: &'a Index,
-        bounds: &'a IndexBounds,
+        bounds: &'a KeyBounds,
         direction: ScanDirection,
         match_type: IndexSpecMatch,
         prefix_guard_disabled: bool,
-    ) -> Self {
+    ) -> Result<Self, IndexError> {
         // Setup iterator immediately in constructor
-        let (canonical, eq_prefix_len, eq_prefix_values) = normalize(bounds);
-        let (start_full, end_full_opt, upper_open_ended, eq_prefix_bytes) =
-            bounds_to_sled_range(&canonical, eq_prefix_len, &eq_prefix_values);
+        let SledRangeBounds { start: start_full, end: end_full_opt, upper_open_ended, eq_prefix_guard: eq_prefix_bytes } =
+            key_bounds_to_sled_range(bounds, index.spec())?;
 
-        let use_prefix_guard = upper_open_ended && eq_prefix_len > 0 && !prefix_guard_disabled;
+        let use_prefix_guard = upper_open_ended && !eq_prefix_bytes.is_empty() && !prefix_guard_disabled;
 
         let effective_direction = match match_type {
             IndexSpecMatch::Match => direction,
@@ -67,7 +69,7 @@ impl<'a> SledIndexScanner<'a> {
             },
         };
 
-        Self { index, bounds, direction, match_type, prefix_guard_disabled, iter, eq_prefix_bytes, use_prefix_guard }
+        Ok(Self { index, bounds, direction, match_type, prefix_guard_disabled, iter, eq_prefix_bytes, use_prefix_guard })
     }
 
     /// Get the effective scan direction, accounting for index match type
@@ -114,7 +116,7 @@ impl<'a> Iterator for SledIndexScanner<'a> {
 // TODO: Add extract_ids method for streams that need to convert back to EntityId streams
 
 /// Decode EntityId from index key suffix (last 16 bytes)
-fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, RetrievalError> {
+pub fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, RetrievalError> {
     if key.len() < 1 + 16 {
         return Err(RetrievalError::StorageError("index key too short".into()));
     }

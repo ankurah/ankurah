@@ -3,6 +3,7 @@ use ankurah_core::{
     EntityId,
 };
 use ankurah_proto::EventId;
+use ankurah_storage_common::ValueType;
 use thiserror::Error;
 
 pub enum SledRetrievalError {
@@ -39,6 +40,8 @@ pub enum IndexError {
     PropertyNotFound(String),
     #[error("UTF8 error: {0}")]
     Utf8Error(#[from] std::string::FromUtf8Error),
+    #[error("Type mismatch: expected {0:?}, got {1:?}")]
+    TypeMismatch(ValueType, ValueType),
 }
 
 impl From<IndexError> for RetrievalError {

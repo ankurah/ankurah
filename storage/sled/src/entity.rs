@@ -24,7 +24,6 @@ impl<S: EntityIdStream> Iterator for SledEntityLookup<S> {
             Ok(id) => id,
             Err(e) => return Some(Err(e)),
         };
-        tracing::info!("SledEntityLookup::next {:?}", entity_id);
 
         // Lookup entity state from entities tree
         let key = entity_id.to_bytes();

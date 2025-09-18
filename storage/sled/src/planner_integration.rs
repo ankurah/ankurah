@@ -1,9 +1,30 @@
-use ankurah_core::collation::Collatable;
-use ankurah_core::property::PropertyValue;
-use ankurah_storage_common::{CanonicalRange, Endpoint, IndexBounds, KeyDatum};
+// Refactored planner integration - cleaner and more cohesive
 
-/// Normalize IndexBounds to CanonicalRange (reuse the same logic shape as IndexedDB)
-pub fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize, Vec<PropertyValue>) {
+use ankurah_core::{collation::Collatable, property::PropertyValue};
+use ankurah_storage_common::{Endpoint, IndexDirection, KeyBounds, KeyDatum, KeySpec, ValueType};
+
+use crate::error::IndexError;
+
+/// Represents the result of converting logical bounds to physical Sled ranges
+#[derive(Debug)]
+pub struct SledRangeBounds {
+    pub start: Vec<u8>,
+    pub end: Option<Vec<u8>>,
+    pub upper_open_ended: bool,
+    pub eq_prefix_guard: Vec<u8>,
+}
+
+/// Convert IndexBounds directly to Sled byte ranges for a specific index
+///
+/// This is the main entry point that combines:
+/// 1. Extracting logical bounds from the query
+/// 2. Converting to physical byte ranges based on the index specification
+///
+/// # Arguments
+/// * `bounds` - The logical query bounds (e.g., "year >= 1969")
+/// * `key_spec` - The key specification including column order and directions
+pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec) -> Result<SledRangeBounds, IndexError> {
+    // Process the bounds
     let mut lower_tuple = Vec::new();
     let mut upper_tuple = Vec::new();
     let mut lower_open = false;
@@ -11,6 +32,7 @@ pub fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize, Vec<PropertyVa
     let mut eq_prefix_len = 0;
     let mut eq_prefix_values = Vec::new();
 
+    // Build logical bounds from IndexBounds (copied from original normalize logic)
     for bound in &bounds.keyparts {
         // Equality check (low==high, both inclusive)
         if let (Endpoint::Value { datum: low_datum, inclusive: low_incl }, Endpoint::Value { datum: high_datum, inclusive: high_incl }) =
@@ -33,8 +55,7 @@ pub fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize, Vec<PropertyVa
                 lower_tuple.push(val.clone());
                 lower_open = !inclusive;
             }
-            Endpoint::UnboundedLow(_) => {}
-            _ => break,
+            _ => {}
         }
 
         // Upper side
@@ -43,50 +64,391 @@ pub fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize, Vec<PropertyVa
                 upper_tuple.push(val.clone());
                 upper_open = !inclusive;
             }
-            Endpoint::UnboundedHigh(_) => {
-                return (CanonicalRange { lower: Some((lower_tuple, lower_open)), upper: None }, eq_prefix_len, eq_prefix_values);
-            }
-            _ => {
-                return (CanonicalRange { lower: Some((lower_tuple, lower_open)), upper: None }, eq_prefix_len, eq_prefix_values);
-            }
+            _ => {}
         }
-
-        break; // stop after first non-equality column
+        break; // Only process first bound with actual constraints
     }
 
-    if eq_prefix_len == bounds.keyparts.len() && eq_prefix_len == 1 {
-        return (CanonicalRange { lower: Some((lower_tuple, lower_open)), upper: None }, eq_prefix_len, eq_prefix_values);
-    }
+    // Extract directions from the key spec
+    let directions: Vec<IndexDirection> = key_spec.keyparts.iter().map(|kp| kp.direction).collect();
 
-    let canonical_range = CanonicalRange {
-        lower: if lower_tuple.is_empty() { None } else { Some((lower_tuple, lower_open)) },
-        upper: if upper_tuple.is_empty() { None } else { Some((upper_tuple, upper_open)) },
-    };
-
-    (canonical_range, eq_prefix_len, eq_prefix_values)
+    // Now convert to physical bounds based on key spec
+    convert_to_physical_bounds(lower_tuple, upper_tuple, lower_open, upper_open, eq_prefix_len, eq_prefix_values, key_spec)
 }
 
-/// Encode a tuple of PropertyValue into a composite key (type/tag prefixed length segments)
-/// Rationale: type tags + length delimiters preserve lexicographic ordering and make tuples unambiguous.
-pub fn encode_tuple_for_sled(parts: &[PropertyValue]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for p in parts {
-        let (tag, body) = match p {
-            PropertyValue::String(_) => (0x10u8, p.to_bytes()),
-            PropertyValue::I16(_) | PropertyValue::I32(_) | PropertyValue::I64(_) => (0x20u8, p.to_bytes()),
-            PropertyValue::Bool(_) => (0x40u8, p.to_bytes()),
-            PropertyValue::Object(_) | PropertyValue::Binary(_) => (0x50u8, p.to_bytes()),
-        };
-        // type tag then length header then body
-        out.push(tag);
-        let len = (body.len() as u32).to_be_bytes();
-        out.extend_from_slice(&len);
-        out.extend_from_slice(&body);
+fn convert_to_physical_bounds(
+    lower_tuple: Vec<PropertyValue>,
+    upper_tuple: Vec<PropertyValue>,
+    lower_open: bool,
+    upper_open: bool,
+    eq_prefix_len: usize,
+    eq_prefix_values: Vec<PropertyValue>,
+    key_spec: &KeySpec,
+) -> Result<SledRangeBounds, IndexError> {
+    // Case 1: Equality bounds
+    if eq_prefix_len > 0 && lower_tuple == upper_tuple && lower_tuple.len() == eq_prefix_len {
+        let encoded_prefix = encode_tuple_values_with_key_spec(&eq_prefix_values[..eq_prefix_len], key_spec)?;
+
+        if key_spec.keyparts.len() > eq_prefix_len {
+            // Multi-key partial equality: use prefix guard
+            let mut start = encoded_prefix.clone();
+            start.push(0); // tuple terminator
+
+            return Ok(SledRangeBounds {
+                start,
+                end: None,
+                upper_open_ended: true,
+                eq_prefix_guard: encoded_prefix, // No terminator in guard
+            });
+        } else {
+            // Single-key or full equality: use tight range
+            let mut start = encoded_prefix.clone();
+            start.push(0);
+
+            let end = lex_successor(start.clone());
+
+            return Ok(SledRangeBounds {
+                start,
+                end,
+                upper_open_ended: false,
+                eq_prefix_guard: Vec::new(), // No guard needed
+            });
+        }
     }
-    out
+
+    // Case 2: Single-component DESC inequality
+    if let Some(first_keypart) = key_spec.keyparts.get(0) {
+        if first_keypart.direction.is_desc() {
+            let is_single = (lower_tuple.len() <= 1) && (upper_tuple.len() <= 1);
+            if is_single {
+                return handle_desc_inequality(lower_tuple, upper_tuple, lower_open, upper_open, eq_prefix_len, eq_prefix_values, key_spec);
+            }
+        }
+    }
+
+    // Case 3: General bounds (ASC or multi-component)
+    handle_general_bounds(lower_tuple, upper_tuple, lower_open, upper_open, eq_prefix_len, eq_prefix_values, key_spec)
+}
+
+fn handle_desc_inequality(
+    lower_tuple: Vec<PropertyValue>,
+    upper_tuple: Vec<PropertyValue>,
+    lower_open: bool,
+    upper_open: bool,
+    eq_prefix_len: usize,
+    eq_prefix_values: Vec<PropertyValue>,
+    key_spec: &KeySpec,
+) -> Result<SledRangeBounds, IndexError> {
+    // DESC swaps logical lower/upper to physical upper/lower
+    // x > 5 on DESC becomes scan from start to enc(5) (exclusive)
+    // x < 5 on DESC becomes scan from enc(5) to end
+
+    let (start_bytes, end_bytes_opt) = match (!lower_tuple.is_empty(), !upper_tuple.is_empty()) {
+        // x > L or x >= L
+        (true, false) => {
+            let mut start = vec![0x00]; // Start from beginning
+            let mut end = encode_tuple_values_with_key_spec(&lower_tuple, key_spec)?;
+            if !lower_open {
+                // >= L → end = succ(enc(L))
+                if let Some(s) = lex_successor(end.clone()) {
+                    end = s;
+                }
+            }
+            end.push(0);
+            (start, Some(end))
+        }
+        // x < U or x <= U
+        (false, true) => {
+            let mut start = encode_tuple_values_with_key_spec(&upper_tuple, key_spec)?;
+            if upper_open {
+                // < U → start = succ(enc(U))
+                if let Some(s) = lex_successor(start.clone()) {
+                    start = s;
+                } else {
+                    start.clear();
+                }
+            }
+            start.push(0);
+            (start, None)
+        }
+        // L <= x <= U
+        (true, true) => {
+            let mut start = encode_tuple_values_with_key_spec(&upper_tuple, &key_spec)?;
+            if upper_open {
+                if let Some(s) = lex_successor(start.clone()) {
+                    start = s;
+                }
+            }
+            start.push(0);
+
+            let mut end = encode_tuple_values_with_key_spec(&lower_tuple, &key_spec)?;
+            if !lower_open {
+                if let Some(s) = lex_successor(end.clone()) {
+                    end = s;
+                }
+            }
+            end.push(0);
+            (start, Some(end))
+        }
+        // No bounds
+        _ => (vec![0x00], None),
+    };
+
+    let eq_guard =
+        if eq_prefix_len > 0 { encode_tuple_values_with_key_spec(&eq_prefix_values[..eq_prefix_len], &key_spec)? } else { Vec::new() };
+
+    let upper_open_ended = end_bytes_opt.is_none();
+    Ok(SledRangeBounds { start: start_bytes, end: end_bytes_opt, upper_open_ended, eq_prefix_guard: eq_guard })
+}
+
+fn handle_general_bounds(
+    lower_tuple: Vec<PropertyValue>,
+    upper_tuple: Vec<PropertyValue>,
+    lower_open: bool,
+    upper_open: bool,
+    eq_prefix_len: usize,
+    eq_prefix_values: Vec<PropertyValue>,
+    key_spec: &KeySpec,
+) -> Result<SledRangeBounds, IndexError> {
+    // Standard ASC bounds or multi-component bounds
+    let start = if !lower_tuple.is_empty() {
+        let mut start = encode_tuple_values_with_key_spec(&lower_tuple, key_spec)?;
+        if lower_open {
+            start = match lex_successor(start) {
+                Some(s) => s,
+                None => Vec::new(),
+            };
+        }
+        start.push(0);
+        start
+    } else {
+        vec![0x00]
+    };
+
+    let (end, upper_open_ended) = if !upper_tuple.is_empty() {
+        let mut end = encode_tuple_values_with_key_spec(&upper_tuple, key_spec)?;
+        if !upper_open {
+            if let Some(s) = lex_successor(end) {
+                end = s;
+            } else {
+                return Ok(SledRangeBounds {
+                    start,
+                    end: None,
+                    upper_open_ended: true,
+                    eq_prefix_guard: if eq_prefix_len > 0 {
+                        encode_tuple_values_with_key_spec(&eq_prefix_values, &key_spec)?
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+        }
+        end.push(0);
+        (Some(end), false)
+    } else {
+        (None, true)
+    };
+
+    let eq_guard = if eq_prefix_len > 0 { encode_tuple_values_with_key_spec(&eq_prefix_values, &key_spec)? } else { Vec::new() };
+
+    Ok(SledRangeBounds { start, end, upper_open_ended, eq_prefix_guard: eq_guard })
+}
+
+/// Encode a single component for Sled storage.
+pub fn encode_component_for_sled(value: &PropertyValue, descending: bool) -> Vec<u8> {
+    match value {
+        PropertyValue::String(s) => {
+            if !descending {
+                // ASC: [0x10][escaped UTF-8][0x00]
+                let mut out = Vec::with_capacity(1 + s.len() + 1);
+                out.push(0x10u8);
+                for &b in s.as_bytes() {
+                    if b == 0x00 {
+                        out.push(0x00);
+                        out.push(0xFF);
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out.push(0x00);
+                out
+            } else {
+                // DESC: [0x10][inv(payload) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
+                let mut out = Vec::with_capacity(1 + s.len() + 1);
+                out.push(0x10u8);
+                for &b in s.as_bytes() {
+                    let inv = 0xFFu8.wrapping_sub(b);
+                    if inv == 0xFF {
+                        out.push(0xFF);
+                        out.push(0x00);
+                    } else {
+                        out.push(inv);
+                    }
+                }
+                out.push(0xFF);
+                out.push(0xFF);
+                out
+            }
+        }
+        PropertyValue::I16(_) | PropertyValue::I32(_) | PropertyValue::I64(_) => {
+            // Integers are encoded big-endian (order-preserving). DESC: invert payload bytes.
+            let mut out = Vec::with_capacity(1 + 8);
+            out.push(0x20u8);
+            let bytes = value.to_bytes();
+            if !descending {
+                out.extend_from_slice(&bytes);
+            } else {
+                out.extend(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)));
+            }
+            out
+        }
+        PropertyValue::Bool(_) => {
+            // ASC: false(0) < true(1). DESC: invert payload to flip order.
+            let mut out = Vec::with_capacity(1 + 1);
+            out.push(0x40u8);
+            let b = value.to_bytes()[0];
+            out.push(if !descending { b } else { 0xFFu8.wrapping_sub(b) });
+            out
+        }
+        PropertyValue::Object(bytes) | PropertyValue::Binary(bytes) => {
+            if !descending {
+                // ASC: [0x50][escaped bytes][0x00]
+                let mut out = Vec::with_capacity(1 + bytes.len() + 1);
+                out.push(0x50u8);
+                for &b in bytes {
+                    if b == 0x00 {
+                        out.push(0x00);
+                        out.push(0xFF);
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out.push(0x00);
+                out
+            } else {
+                // DESC: [0x50][inv(bytes) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
+                let mut out = Vec::with_capacity(1 + bytes.len() + 1);
+                out.push(0x50u8);
+                for &b in bytes {
+                    let inv = 0xFFu8.wrapping_sub(b);
+                    if inv == 0xFF {
+                        out.push(0xFF);
+                        out.push(0x00);
+                    } else {
+                        out.push(inv);
+                    }
+                }
+                out.push(0xFF);
+                out.push(0xFF);
+                out
+            }
+        }
+    }
+}
+
+/// Type-aware component encoding without type tags - requires KeySpec for type validation
+pub fn encode_component_typed(value: &PropertyValue, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
+    // Validate that the value matches the expected type
+    if ValueType::of(value) != expected_type {
+        return Err(IndexError::TypeMismatch(expected_type, ValueType::of(value)));
+    }
+
+    match (value, expected_type) {
+        (PropertyValue::String(s), ValueType::String) => {
+            if !descending {
+                // ASC: [escaped UTF-8][0x00] - no type tag needed
+                let mut out = Vec::with_capacity(s.len() + 1);
+                for &b in s.as_bytes() {
+                    if b == 0x00 {
+                        out.push(0x00);
+                        out.push(0xFF);
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out.push(0x00);
+                Ok(out)
+            } else {
+                // DESC: [inv(payload) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
+                let mut out = Vec::with_capacity(s.len() + 2);
+                for &b in s.as_bytes() {
+                    let inv = 0xFFu8.wrapping_sub(b);
+                    if inv == 0xFF {
+                        out.push(0xFF);
+                        out.push(0x00);
+                    } else {
+                        out.push(inv);
+                    }
+                }
+                out.push(0xFF);
+                out.push(0xFF);
+                Ok(out)
+            }
+        }
+        (PropertyValue::I16(_) | PropertyValue::I32(_) | PropertyValue::I64(_), ValueType::I16 | ValueType::I32 | ValueType::I64) => {
+            // Integers are encoded big-endian (order-preserving). DESC: invert payload bytes.
+            let bytes = value.to_bytes();
+            if !descending {
+                Ok(bytes)
+            } else {
+                Ok(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)).collect())
+            }
+        }
+        (PropertyValue::Bool(_), ValueType::Bool) => {
+            // ASC: false(0) < true(1). DESC: invert payload to flip order.
+            let b = value.to_bytes()[0];
+            Ok(vec![if !descending { b } else { 0xFFu8.wrapping_sub(b) }])
+        }
+        (PropertyValue::Object(bytes) | PropertyValue::Binary(bytes), ValueType::Binary) => {
+            if !descending {
+                // ASC: [escaped bytes][0x00] - no type tag needed
+                let mut out = Vec::with_capacity(bytes.len() + 1);
+                for &b in bytes {
+                    if b == 0x00 {
+                        out.push(0x00);
+                        out.push(0xFF);
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out.push(0x00);
+                Ok(out)
+            } else {
+                // DESC: [inv(bytes) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
+                let mut out = Vec::with_capacity(bytes.len() + 2);
+                for &b in bytes {
+                    let inv = 0xFFu8.wrapping_sub(b);
+                    if inv == 0xFF {
+                        out.push(0xFF);
+                        out.push(0x00);
+                    } else {
+                        out.push(inv);
+                    }
+                }
+                out.push(0xFF);
+                out.push(0xFF);
+                Ok(out)
+            }
+        }
+        _ => Err(IndexError::TypeMismatch(expected_type, ValueType::of(value))),
+    }
 }
 
 /// Compute the lexicographic successor of a composite tuple encoding
+///
+/// This is different from `Collatable::successor_bytes()` in several important ways:
+///
+/// 1. **Input**: Works on encoded composite keys (multiple fields encoded together with type tags)
+///    vs. individual logical values
+/// 2. **Algorithm**: Pure bytewise arithmetic (increment with carry) vs. type-aware logic
+/// 3. **Purpose**: Creates tight byte ranges for Sled storage layer vs. query planning logic
+///
+/// Example: For encoded key `[0x10, 0x41, 0x6C, 0x69, 0x63, 0x65, 0x00]` (String "Alice")
+/// - This function: `[0x10, 0x41, 0x6C, 0x69, 0x63, 0x65, 0x01]` (increment last byte)
+/// - Collatable: Would work on "Alice" logically → "Alice\0"
+///
+/// This function is essential for creating exclusive upper bounds in Sled ranges, allowing
+/// us to convert inclusive bounds to exclusive ones for proper range scanning.
 pub fn lex_successor(mut key: Vec<u8>) -> Option<Vec<u8>> {
     // True bytewise successor: increment with carry; if overflow (all 0xFF), no successor
     for i in (0..key.len()).rev() {
@@ -101,60 +463,77 @@ pub fn lex_successor(mut key: Vec<u8>) -> Option<Vec<u8>> {
     None
 }
 
-/// Convert canonical range and eq-prefix into sled key bounds over the composite tuple
-/// Returns: (start_full, end_full_opt, upper_open_ended, eq_prefix_bytes)
-pub fn bounds_to_sled_range(
-    canonical: &CanonicalRange,
-    eq_prefix_len: usize,
-    eq_prefix_values: &[PropertyValue],
-) -> (Vec<u8>, Option<Vec<u8>>, bool, Vec<u8>) {
-    let mut upper_open_ended = false;
-    let start_full = match &canonical.lower {
-        Some((vals, lower_open)) => {
-            let mut start = encode_tuple_for_sled(vals);
-            if *lower_open {
-                start = match lex_successor(start) {
-                    Some(s) => s,
-                    None => Vec::new(), // will indicate empty range to caller if needed
-                };
-            }
-            start.push(0);
-            start
+/// Type-aware encoding using KeySpec for validation and optimization
+pub fn encode_tuple_values_with_key_spec(values: &[PropertyValue], key_spec: &KeySpec) -> Result<Vec<u8>, IndexError> {
+    let mut out = Vec::new();
+    for (i, v) in values.iter().enumerate() {
+        if i >= key_spec.keyparts.len() {
+            break; // Don't encode more values than key spec defines
         }
-        None => {
-            // Unbounded low: start at minimal tuple (empty) which is before any encoded tuple
-            let mut start = Vec::new();
-            start.push(0);
-            start
-        }
-    };
+        let keypart = &key_spec.keyparts[i];
 
-    let end_full_opt = match &canonical.upper {
-        Some((vals, upper_open)) => {
-            let mut end = encode_tuple_for_sled(vals);
-            if !*upper_open {
-                if let Some(s) = lex_successor(end) {
-                    end = s;
-                } else {
-                    // No successor → treat as unbounded-high
-                    upper_open_ended = true;
-                    return (
-                        start_full,
-                        None,
-                        upper_open_ended,
-                        if eq_prefix_len > 0 { encode_tuple_for_sled(eq_prefix_values) } else { Vec::new() },
-                    );
-                }
-            }
-            end.push(0);
-            Some(end)
-        }
-        None => {
-            upper_open_ended = true;
-            None
-        }
-    };
+        // Use type-aware encoding without type tags
+        let bytes = encode_component_typed(v, keypart.value_type, keypart.direction.is_desc())?;
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
 
-    let eq_prefix_bytes = if eq_prefix_len > 0 { encode_tuple_for_sled(eq_prefix_values) } else { Vec::new() };
-    (start_full, end_full_opt, upper_open_ended, eq_prefix_bytes)
+#[cfg(test)]
+mod order_inversion_tests {
+    use super::*;
+
+    fn cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering { a.cmp(b) }
+
+    #[test]
+    fn string_inversion_reverses_order() {
+        let a = PropertyValue::String("Album".into());
+        let b = PropertyValue::String("Album-with-dashes".into());
+        let asc_a = encode_component_for_sled(&a, false);
+        let asc_b = encode_component_for_sled(&b, false);
+        assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);
+
+        let desc_a = encode_component_for_sled(&a, true);
+        let desc_b = encode_component_for_sled(&b, true);
+        assert!(cmp(&desc_a, &desc_b) == std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn string_with_nulls_roundtrips_and_orders() {
+        let a = PropertyValue::String("A\0B".into());
+        let b = PropertyValue::String("A\0B\0C".into());
+        let asc_a = encode_component_for_sled(&a, false);
+        let asc_b = encode_component_for_sled(&b, false);
+        assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);
+
+        let desc_a = encode_component_for_sled(&a, true);
+        let desc_b = encode_component_for_sled(&b, true);
+        assert!(cmp(&desc_a, &desc_b) == std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn integers_inversion_reverses_order() {
+        let a = PropertyValue::I64(42);
+        let b = PropertyValue::I64(100);
+        let asc_a = encode_component_for_sled(&a, false);
+        let asc_b = encode_component_for_sled(&b, false);
+        assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);
+
+        let desc_a = encode_component_for_sled(&a, true);
+        let desc_b = encode_component_for_sled(&b, true);
+        assert!(cmp(&desc_a, &desc_b) == std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn binary_inversion_reverses_order() {
+        let a = PropertyValue::Binary(vec![0x00, 0x10, 0x20]);
+        let b = PropertyValue::Binary(vec![0x00, 0x10, 0x21]);
+        let asc_a = encode_component_for_sled(&a, false);
+        let asc_b = encode_component_for_sled(&b, false);
+        assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);
+
+        let desc_a = encode_component_for_sled(&a, true);
+        let desc_b = encode_component_for_sled(&b, true);
+        assert!(cmp(&desc_a, &desc_b) == std::cmp::Ordering::Greater);
+    }
 }
