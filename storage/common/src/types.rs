@@ -1,6 +1,7 @@
 use ankurah_core::property::PropertyValue;
+use serde::{Deserialize, Serialize};
 
-use crate::index_spec::IndexSpec;
+use crate::index_spec::KeySpec;
 
 // TODO
 // Build IndexBounds per keypart from WHERE/ORDER BY (like PG’s per-column ScanKey/IndexBounds).
@@ -18,14 +19,14 @@ use crate::index_spec::IndexSpec;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
     Index {
-        index_spec: IndexSpec,                        // key order (ASC/DESC per part)
+        index_spec: KeySpec,                          // key order (ASC/DESC per part)
         scan_direction: ScanDirection,                // engine scan direction
-        bounds: IndexBounds,                          // per-column bounds (planner IR)
+        bounds: KeyBounds,                            // per-column bounds (planner IR)
         remaining_predicate: ankql::ast::Predicate,   // residual quals
         order_by_spill: Vec<ankql::ast::OrderByItem>, // extra sort keys
     },
     TableScan {
-        bounds: IndexBounds, // primary key bounds (empty if no constraints). TODO: Consider renaming IndexBounds to KeyBounds for clarity
+        bounds: KeyBounds, // primary key bounds (empty if no constraints). TODO: Consider renaming IndexBounds to KeyBounds for clarity
         scan_direction: ScanDirection, // forward/reverse based on primary key ORDER BY
         remaining_predicate: ankql::ast::Predicate, // all predicates (no index to satisfy any)
         order_by_spill: Vec<ankql::ast::OrderByItem>, // ORDER BY fields not satisfied by scan direction
@@ -40,7 +41,7 @@ pub enum ScanDirection {
 }
 
 // --- Types & sentinels -------------------------------------------------------
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ValueType {
     I16,
     I32,
@@ -103,7 +104,7 @@ impl Endpoint {
 
 /// Bound for a single index column, in index key order (PG: per keypart).
 #[derive(Debug, Clone, PartialEq)]
-pub struct IndexColumnBound {
+pub struct KeyBoundComponent {
     pub column: String, // column / keypart name (optional but handy)
     pub low: Endpoint,  // lower endpoint for this column
     pub high: Endpoint, // upper endpoint for this column
@@ -113,12 +114,12 @@ pub struct IndexColumnBound {
 
 /// Full multi-column bounds for an index scan (PG: IndexBounds).
 #[derive(Debug, Clone, PartialEq)]
-pub struct IndexBounds {
-    pub keyparts: Vec<IndexColumnBound>, // one per index column, in order
+pub struct KeyBounds {
+    pub keyparts: Vec<KeyBoundComponent>, // one per index column, in order
 }
 
-impl IndexBounds {
-    pub fn new(keyparts: Vec<IndexColumnBound>) -> Self { Self { keyparts } }
+impl KeyBounds {
+    pub fn new(keyparts: Vec<KeyBoundComponent>) -> Self { Self { keyparts } }
     pub fn empty() -> Self { Self { keyparts: vec![] } }
 }
 

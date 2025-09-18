@@ -9,7 +9,7 @@ use ankurah_core::{
     EntityId,
 };
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
-use ankurah_storage_common::{filtering::GetPropertyValueStream, IndexBounds, IndexSpec, Plan, Planner, PlannerConfig, ScanDirection};
+use ankurah_storage_common::{filtering::GetPropertyValueStream, KeyBounds, KeySpec, Plan, Planner, PlannerConfig, ScanDirection};
 use async_trait::async_trait;
 
 use tokio::task;
@@ -164,10 +164,33 @@ impl SledStorageCollection {
         // Generate query plans and choose the first non-empty one
         let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
 
-        tracing::info!("fetch_states_blocking: plans={:#?}", plans);
         let plan = plans.into_iter().next().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
         tracing::info!("fetch_states_blocking: plan={:#?}", plan);
 
+        // Execute the chosen plan using streaming pipeline architecture
+        match plan {
+            Plan::EmptyScan => Ok(Vec::new()),
+
+            Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, order_by_spill } =>
+            //
+            {
+                self.exec_index_scan_plan(index_spec, bounds, scan_direction, remaining_predicate, order_by_spill, selection.limit)
+            }
+
+            Plan::TableScan { bounds, scan_direction, remaining_predicate, order_by_spill } => {
+                self.exec_table_scan_plan(bounds, scan_direction, remaining_predicate, order_by_spill, selection.limit)
+            }
+        }
+    }
+    fn exec_index_scan_plan(
+        &self,
+        index_spec: KeySpec,
+        bounds: KeyBounds,
+        scan_direction: ScanDirection,
+        remaining_predicate: Predicate,
+        order_by_spill: Vec<OrderByItem>,
+        limit: Option<u64>,
+    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         // Debug flag for disabling equality-prefix guard (testing only)
         let prefix_guard_disabled = {
             #[cfg(debug_assertions)]
@@ -179,48 +202,14 @@ impl SledStorageCollection {
             false
         };
 
-        // Execute the chosen plan using streaming pipeline architecture
-        match plan {
-            Plan::EmptyScan => Ok(Vec::new()),
-
-            Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, order_by_spill } =>
-            //
-            {
-                self.exec_index_scan_plan(
-                    index_spec,
-                    bounds,
-                    scan_direction,
-                    remaining_predicate,
-                    order_by_spill,
-                    selection.limit,
-                    prefix_guard_disabled,
-                )
-            }
-
-            Plan::TableScan { bounds, scan_direction, remaining_predicate, order_by_spill } => {
-                tracing::info!("call exec_table_scan_plan");
-                self.exec_table_scan_plan(bounds, scan_direction, remaining_predicate, order_by_spill, selection.limit)
-            }
-        }
-    }
-    fn exec_index_scan_plan(
-        &self,
-        index_spec: IndexSpec,
-        bounds: IndexBounds,
-        scan_direction: ScanDirection,
-        remaining_predicate: Predicate,
-        order_by_spill: Vec<OrderByItem>,
-        limit: Option<u64>,
-        prefix_guard_disabled: bool,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        tracing::info!("MARK 0");
         let (index, match_type) = self.database.index_manager.assure_index_exists(
             self.collection_id.as_str(),
             &index_spec,
             &self.database.db,
             &self.database.property_manager,
         )?;
-        let ids = SledIndexScanner::new(&index, &bounds, scan_direction, match_type, prefix_guard_disabled);
+
+        let ids = SledIndexScanner::new(&index, &bounds, scan_direction, match_type, prefix_guard_disabled)?;
 
         if remaining_predicate == Predicate::True && order_by_spill.is_empty() {
             return ids.limit(limit).entities(&self.database.entities_tree, &self.collection_id).collect_states();
@@ -229,13 +218,7 @@ impl SledStorageCollection {
         // Values path: ids → materialized lookup → filter/sort/topk/limit → hydrate → collect
         let e_tree = &self.database.entities_tree;
         let sort: Option<Vec<OrderByItem>> = if order_by_spill.is_empty() { None } else { Some(order_by_spill) };
-        let ids: Vec<_> = ids.collect();
-        tracing::info!("MARK 0.1 {:?}", ids);
-        let mats = SledMaterializeIter::new(&self.tree, &self.database.property_manager, ids.into_iter());
-
-        let mats: Vec<_> = mats.collect();
-        tracing::info!("MARK 0.2 {:?}", mats);
-        let mats = mats.into_iter();
+        let mats = SledMaterializeIter::new(&self.tree, &self.database.property_manager, ids);
 
         match remaining_predicate {
             Predicate::True => {
@@ -261,15 +244,10 @@ impl SledStorageCollection {
                 }
             }
             _ => {
-                tracing::info!("MARK 1");
                 let filtered = mats.filter_predicate(&remaining_predicate);
-                let filtered: Vec<_> = filtered.collect();
-                tracing::info!("MARK 1.1 {:?}", filtered);
-                let filtered = filtered.into_iter();
                 match (sort, limit) {
                     // filter + order by + limit
                     (Some(sort), Some(limit)) => {
-                        tracing::info!("MARK 2");
                         filtered
                             .top_k(&sort, limit as usize) //
                             .entities(e_tree, &self.collection_id)
@@ -277,7 +255,6 @@ impl SledStorageCollection {
                     }
                     // filter + order by
                     (Some(sort), None) => {
-                        tracing::info!("MARK 3");
                         filtered
                             .sort_by(&sort) //
                             .entities(e_tree, &self.collection_id)
@@ -285,10 +262,6 @@ impl SledStorageCollection {
                     }
                     // filter + limit
                     (None, limit) => {
-                        let filtered: Vec<_> = filtered.collect();
-                        tracing::info!("MARK 4 {:?}", filtered);
-                        let filtered = filtered.into_iter();
-
                         filtered
                             .limit(limit) //
                             .entities(e_tree, &self.collection_id)
@@ -300,23 +273,14 @@ impl SledStorageCollection {
     }
     fn exec_table_scan_plan(
         &self,
-        bounds: IndexBounds,
+        bounds: KeyBounds,
         scan_direction: ScanDirection,
         remaining_predicate: Predicate,
         order_by_spill: Vec<OrderByItem>,
         limit: Option<u64>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        tracing::info!(
-            "exec_table_scan_plan: bounds={:?}, scan_direction={:?}, remaining_predicate={:?}, order_by_spill.len()={}, limit={:?}",
-            bounds,
-            scan_direction,
-            remaining_predicate,
-            order_by_spill.len(),
-            limit
-        );
-
         if remaining_predicate == Predicate::True && order_by_spill.is_empty() {
-            let ids = SledCollectionKeyScanner::new(&self.tree, &bounds, scan_direction);
+            let ids = SledCollectionKeyScanner::new(&self.tree, &bounds, scan_direction)?;
             let states = SledEntityLookup::new(&self.database.entities_tree, &self.collection_id, ids.limit(limit));
             return states.collect_states();
         }
@@ -324,7 +288,7 @@ impl SledStorageCollection {
         // Values path: kvs → decode mats → filter/sort/topk/limit → hydrate → collect
         let e_tree = &self.database.entities_tree;
         let sort: Option<Vec<OrderByItem>> = if order_by_spill.is_empty() { None } else { Some(order_by_spill) };
-        let scanner = SledCollectionScanner::new(&self.tree, &bounds, scan_direction, &self.database.property_manager);
+        let scanner = SledCollectionScanner::new(&self.tree, &bounds, scan_direction, &self.database.property_manager)?;
 
         match remaining_predicate {
             Predicate::True => {

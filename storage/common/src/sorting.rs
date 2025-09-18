@@ -122,7 +122,6 @@ where I: Iterator
     type Item = I::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        tracing::info!("LimitedStream::next {} of {:?}", self.count, self.limit);
         // Check if we've reached the limit
         if let Some(limit) = self.limit {
             if self.count >= limit {

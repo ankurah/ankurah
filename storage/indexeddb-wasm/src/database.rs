@@ -1,5 +1,5 @@
 use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
-use ankurah_storage_common::index_spec::IndexSpec;
+use ankurah_storage_common::index_spec::KeySpec;
 use anyhow::Result;
 use js_sys::Function;
 use send_wrapper::SendWrapper;
@@ -44,7 +44,7 @@ impl Database {
     pub async fn get_connection(&self) -> SendWrapper<IdbDatabase> { self.0.connection.lock().await.db.clone() }
 
     /// Ensure an index exists, creating it if necessary via database version upgrade
-    pub async fn assure_index_exists(&self, index_spec: &IndexSpec) -> Result<(), RetrievalError> {
+    pub async fn assure_index_exists(&self, index_spec: &KeySpec) -> Result<(), RetrievalError> {
         let name = index_spec.name_with("", "__");
         tracing::info!("assure_index_exists: Starting for index {}", &name);
 
@@ -240,7 +240,7 @@ impl Connection {
     }
 
     /// Open database connection with a specific index to be created
-    pub async fn open_with_index(db_name: &str, version: u32, index_spec: &IndexSpec) -> Result<Self, RetrievalError> {
+    pub async fn open_with_index(db_name: &str, version: u32, index_spec: &KeySpec) -> Result<Self, RetrievalError> {
         tracing::info!("Connection::open_with_index: Starting for {} v{}", db_name, version);
         let index_spec_clone = index_spec.clone();
 

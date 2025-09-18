@@ -1,12 +1,13 @@
-use crate::planner_integration::{bounds_to_sled_range, normalize};
+use crate::error::IndexError;
+use crate::planner_integration::{key_bounds_to_sled_range, SledRangeBounds};
 use crate::property::PropertyManager;
 use ankurah_core::{error::RetrievalError, EntityId};
-use ankurah_storage_common::{filtering::GetPropertyValueStream, traits::EntityIdStream, IndexBounds, ScanDirection};
+use ankurah_storage_common::{traits::EntityIdStream, IndexDirection, IndexKeyPart, KeyBounds, KeySpec, ScanDirection, ValueType};
 
 /// Scanner over a materialized collection tree yielding EntityId directly (for ID-only queries)
 pub struct SledCollectionKeyScanner<'a> {
     pub tree: &'a sled::Tree,
-    pub bounds: &'a IndexBounds,
+    pub bounds: &'a KeyBounds,
     pub direction: ScanDirection,
     // Iterator state
     iter: SledCollectionIter,
@@ -29,33 +30,20 @@ impl Iterator for SledCollectionIter {
 }
 
 impl<'a> SledCollectionKeyScanner<'a> {
-    pub fn new(tree: &'a sled::Tree, bounds: &'a IndexBounds, direction: ScanDirection) -> Self {
+    pub fn new(tree: &'a sled::Tree, bounds: &'a KeyBounds, direction: ScanDirection) -> Result<Self, IndexError> {
         // Setup iterator immediately in constructor
-        let (canonical, _eq_prefix_len, _eq_prefix_values) = normalize(bounds);
-
-        // Extract EntityId range from canonical bounds
-        let (start_key, end_key_opt) = match (&canonical.lower, &canonical.upper) {
-            (Some((lower_vals, _)), Some((upper_vals, _))) if !lower_vals.is_empty() && !upper_vals.is_empty() => {
-                // Both bounds present - extract EntityIds
-                let start_id = entity_id_from_property_value(&lower_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0u8; 16]));
-                let end_id = entity_id_from_property_value(&upper_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0xFFu8; 16]));
-                (start_id.to_bytes().to_vec(), Some(end_id.to_bytes().to_vec()))
-            }
-            (Some((lower_vals, _)), None) if !lower_vals.is_empty() => {
-                // Only lower bound
-                let start_id = entity_id_from_property_value(&lower_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0u8; 16]));
-                (start_id.to_bytes().to_vec(), None)
-            }
-            (None, Some((upper_vals, _))) if !upper_vals.is_empty() => {
-                // Only upper bound - start from beginning
-                let end_id = entity_id_from_property_value(&upper_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0xFFu8; 16]));
-                (vec![0u8; 16], Some(end_id.to_bytes().to_vec()))
-            }
-            _ => {
-                // No bounds or empty bounds - scan everything
-                (vec![0u8; 16], None)
-            }
+        // Create a primary key spec (single ascending EntityId component)
+        let primary_key_spec = KeySpec {
+            keyparts: vec![IndexKeyPart {
+                column: "id".to_string(),
+                direction: IndexDirection::Asc, // Primary keys are always ascending
+                value_type: ValueType::Binary,  // EntityId is 16-byte binary
+                nulls: None,
+                collation: None,
+            }],
         };
+
+        let SledRangeBounds { start: start_key, end: end_key_opt, .. } = key_bounds_to_sled_range(bounds, &primary_key_spec)?;
 
         let iter = match direction {
             ScanDirection::Forward => match &end_key_opt {
@@ -68,7 +56,7 @@ impl<'a> SledCollectionKeyScanner<'a> {
             },
         };
 
-        Self { tree, bounds, direction, iter }
+        Ok(Self { tree, bounds, direction, iter })
     }
 }
 
@@ -92,33 +80,32 @@ impl<'a> Iterator for SledCollectionKeyScanner<'a> {
 /// Scanner over a materialized collection tree yielding materialized values directly
 pub struct SledCollectionScanner<'a> {
     pub tree: &'a sled::Tree,
-    pub bounds: &'a IndexBounds,
+    pub bounds: &'a KeyBounds,
     pub direction: ScanDirection,
     pub property_manager: &'a PropertyManager,
     iter: SledCollectionIter,
 }
 
 impl<'a> SledCollectionScanner<'a> {
-    pub fn new(tree: &'a sled::Tree, bounds: &'a IndexBounds, direction: ScanDirection, property_manager: &'a PropertyManager) -> Self {
+    pub fn new(
+        tree: &'a sled::Tree,
+        bounds: &'a KeyBounds,
+        direction: ScanDirection,
+        property_manager: &'a PropertyManager,
+    ) -> Result<Self, IndexError> {
         // Setup iterator immediately in constructor (same logic as SledCollectionKeyScanner)
-        let (canonical, _eq_prefix_len, _eq_prefix_values) = normalize(bounds);
-
-        let (start_key, end_key_opt) = match (&canonical.lower, &canonical.upper) {
-            (Some((lower_vals, _)), Some((upper_vals, _))) if !lower_vals.is_empty() && !upper_vals.is_empty() => {
-                let start_id = entity_id_from_property_value(&lower_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0u8; 16]));
-                let end_id = entity_id_from_property_value(&upper_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0xFFu8; 16]));
-                (start_id.to_bytes().to_vec(), Some(end_id.to_bytes().to_vec()))
-            }
-            (Some((lower_vals, _)), None) if !lower_vals.is_empty() => {
-                let start_id = entity_id_from_property_value(&lower_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0u8; 16]));
-                (start_id.to_bytes().to_vec(), None)
-            }
-            (None, Some((upper_vals, _))) if !upper_vals.is_empty() => {
-                let end_id = entity_id_from_property_value(&upper_vals[0]).unwrap_or_else(|| EntityId::from_bytes([0xFFu8; 16]));
-                (vec![0u8; 16], Some(end_id.to_bytes().to_vec()))
-            }
-            _ => (vec![0u8; 16], None),
+        // Create a primary key spec (single ascending EntityId component)
+        let primary_key_spec = KeySpec {
+            keyparts: vec![IndexKeyPart {
+                column: "id".to_string(),
+                direction: IndexDirection::Asc, // Primary keys are always ascending
+                value_type: ValueType::Binary,  // EntityId is 16-byte binary
+                nulls: None,
+                collation: None,
+            }],
         };
+
+        let SledRangeBounds { start: start_key, end: end_key_opt, .. } = key_bounds_to_sled_range(bounds, &primary_key_spec)?;
 
         let iter = match direction {
             ScanDirection::Forward => match &end_key_opt {
@@ -131,7 +118,7 @@ impl<'a> SledCollectionScanner<'a> {
             },
         };
 
-        Self { tree, bounds, direction, property_manager, iter }
+        Ok(Self { tree, bounds, direction, property_manager, iter })
     }
 }
 
@@ -169,22 +156,6 @@ impl<'a> Iterator for SledCollectionScanner<'a> {
         };
 
         Some(crate::materialization::MatRow { id: entity_id, mat: mat_entity })
-    }
-}
-
-// Implement GetPropertyValueStream for SledCollectionScanner so it can be used with filtering/sorting
-// impl<'a> GetPropertyValueStream for SledCollectionScanner<'a> {}
-
-/// Helper function to extract EntityId from PropertyValue (for primary key bounds)
-fn entity_id_from_property_value(value: &ankurah_core::property::PropertyValue) -> Option<EntityId> {
-    match value {
-        ankurah_core::property::PropertyValue::String(s) => EntityId::from_base64(s).ok(),
-        ankurah_core::property::PropertyValue::Binary(bytes) if bytes.len() == 16 => {
-            let mut array = [0u8; 16];
-            array.copy_from_slice(bytes);
-            Some(EntityId::from_bytes(array))
-        }
-        _ => None,
     }
 }
 

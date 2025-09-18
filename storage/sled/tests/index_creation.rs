@@ -1,4 +1,4 @@
-use ankurah_storage_common::{IndexKeyPart, IndexSpec};
+use ankurah_storage_common::{IndexKeyPart, KeySpec};
 use ankurah_storage_sled::SledStorageEngine;
 
 #[tokio::test]
@@ -9,7 +9,7 @@ async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error> {
     let initial = engine.database.tree_names().len();
 
     // Create an index spec and ensure it exists
-    let index_spec = IndexSpec::new(vec![IndexKeyPart::asc("name")]);
+    let index_spec = KeySpec::new(vec![IndexKeyPart::asc("name", ankurah_storage_common::ValueType::String)]);
     let (index, _match_type) =
         engine.database.index_manager.assure_index_exists("album", &index_spec, &engine.database.db, &engine.database.property_manager)?;
 

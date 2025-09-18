@@ -1,5 +1,5 @@
 mod common;
-use ankurah_storage_common::{IndexKeyPart, IndexSpec};
+use ankurah_storage_common::{IndexKeyPart, KeySpec};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 
@@ -20,7 +20,7 @@ pub async fn test_index_creation_and_reconnection() -> Result<(), anyhow::Error>
     tracing::info!("Initial database version: {}", initial_version);
 
     // Create an index spec for testing using the new common IndexSpec
-    let index_spec = IndexSpec::new(vec![IndexKeyPart::asc("__collection"), IndexKeyPart::asc("name")]);
+    let index_spec = KeySpec::new(vec![IndexKeyPart::asc("__collection"), IndexKeyPart::asc("name")]);
     tracing::info!("Creating index: {}", index_spec.name_with("", "__"));
 
     // Test index creation (this should trigger reconnection)

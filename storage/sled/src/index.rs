@@ -1,13 +1,13 @@
-use ankurah_core::error::RetrievalError;
+use ankurah_core::{error::RetrievalError, property::PropertyValue};
 use ankurah_proto::EntityId;
-use ankurah_storage_common::IndexSpecMatch;
+use ankurah_storage_common::{IndexDirection, IndexSpecMatch};
 use serde::{Deserialize, Serialize};
 use sled::{Db, Tree};
 use std::collections::HashMap;
 // use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::{error::IndexError, planner_integration::encode_tuple_for_sled, property::PropertyManager};
+use crate::{error::IndexError, planner_integration::encode_tuple_values_with_key_spec, property::PropertyManager};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum BuildStatus {
@@ -21,7 +21,7 @@ pub struct IndexRecord {
     pub id: u32,
     pub collection: String,
     pub name: String,
-    pub spec: ankurah_storage_common::IndexSpec,
+    pub spec: ankurah_storage_common::KeySpec,
     pub created_at_unix_ms: i64,
     pub build_status: BuildStatus,
 }
@@ -34,7 +34,7 @@ struct IndexInner {
     pub id: u32,
     pub collection: String,
     pub name: String,
-    pub spec: ankurah_storage_common::IndexSpec,
+    pub spec: ankurah_storage_common::KeySpec,
     pub created_at_unix_ms: i64,
     build_status: Mutex<BuildStatus>,
     pub build_lock: Mutex<()>,
@@ -75,7 +75,7 @@ impl IndexManager {
     pub fn assure_index_exists(
         &self,
         collection: &str,
-        spec: &ankurah_storage_common::IndexSpec,
+        spec: &ankurah_storage_common::KeySpec,
         db: &Db,
         property_manager: &PropertyManager,
     ) -> Result<(Index, IndexSpecMatch), RetrievalError> {
@@ -112,7 +112,7 @@ impl Index {
     pub fn id(&self) -> u32 { self.0.id }
     pub fn collection(&self) -> &str { &self.0.collection }
     pub fn name(&self) -> &str { &self.0.name }
-    pub fn spec(&self) -> &ankurah_storage_common::IndexSpec { &self.0.spec }
+    pub fn spec(&self) -> &ankurah_storage_common::KeySpec { &self.0.spec }
     pub fn created_at_unix_ms(&self) -> i64 { self.0.created_at_unix_ms }
     pub fn from_record(rec: IndexRecord, db: &Db, index_config_tree: Tree, property_manager: PropertyManager) -> Result<Self, IndexError> {
         Ok(Self(Arc::new(IndexInner {
@@ -131,7 +131,7 @@ impl Index {
 
     pub fn new_from_spec(
         collection: &str,
-        spec: ankurah_storage_common::IndexSpec,
+        spec: ankurah_storage_common::KeySpec,
         db: &Db,
         id: u32,
         index_config_tree: Tree,
@@ -169,9 +169,21 @@ impl Index {
             let mat: Vec<(u32, ankurah_core::property::PropertyValue)> = bincode::deserialize(&v)?;
             let map: std::collections::BTreeMap<_, _> = mat.into_iter().collect();
 
-            let tuple_parts: Vec<_> = pids.iter().filter_map(|pid| map.get(pid).cloned()).collect();
-            if tuple_parts.len() == pids.len() {
-                let mut key = encode_tuple_for_sled(&tuple_parts);
+            // Build composite key using per-keypart direction from spec
+            let mut tuple_parts_with_directions: Vec<(PropertyValue, IndexDirection)> = Vec::with_capacity(self.0.spec.keyparts.len());
+            for (i, pid) in pids.iter().enumerate() {
+                if let Some(val) = map.get(pid).cloned() {
+                    tuple_parts_with_directions.push((val, self.0.spec.keyparts[i].direction));
+                } else {
+                    // Missing a required keypart value; skip indexing this row
+                    tuple_parts_with_directions.clear();
+                    break;
+                }
+            }
+            if !tuple_parts_with_directions.is_empty() {
+                let values: Vec<PropertyValue> = tuple_parts_with_directions.iter().map(|(v, _)| v.clone()).collect();
+                let mut key = encode_tuple_values_with_key_spec(&values, &self.0.spec)?;
+                // Tuple terminator to ensure composite < id boundary
                 key.push(0);
                 key.extend_from_slice(&eid.to_bytes());
                 self.0.tree.insert(key, &[])?;

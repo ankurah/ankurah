@@ -1,11 +1,11 @@
 use ankurah_core::property::PropertyValue;
-use ankurah_storage_common::{CanonicalRange, Endpoint, IndexBounds, KeyDatum, ScanDirection};
+use ankurah_storage_common::{CanonicalRange, Endpoint, KeyBounds, KeyDatum, ScanDirection};
 use anyhow::Result;
 use wasm_bindgen::JsValue;
 
 /// Normalize IndexBounds to CanonicalRange following the playbook algorithm
 /// Returns (CanonicalRange, eq_prefix_len, eq_prefix_values)
-pub fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize, Vec<PropertyValue>) {
+pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<PropertyValue>) {
     let mut lower_tuple = Vec::new();
     let mut upper_tuple = Vec::new();
     let mut lower_open = false;
@@ -152,7 +152,7 @@ fn encode_i64_for_idb(x: i64) -> Result<JsValue> {
 
 /// Convert Plan bounds to IndexedDB IdbKeyRange using the new IR pipeline
 /// Returns (IdbKeyRange, upper_open_ended_flag, eq_prefix_len, eq_prefix_values)
-pub fn plan_bounds_to_idb_range(bounds: &IndexBounds) -> Result<(web_sys::IdbKeyRange, bool, usize, Vec<PropertyValue>)> {
+pub fn plan_bounds_to_idb_range(bounds: &KeyBounds) -> Result<(web_sys::IdbKeyRange, bool, usize, Vec<PropertyValue>)> {
     // Step 1: Normalize IR to CanonicalRange
     let (canonical_range, eq_prefix_len, eq_prefix_values) = normalize(bounds);
 
@@ -174,14 +174,14 @@ pub fn scan_direction_to_cursor_direction(scan_direction: &ScanDirection) -> web
 mod tests {
     use super::*;
     use ankql::ast::Predicate;
-    use ankurah_storage_common::{IndexColumnBound, IndexKeyPart, IndexSpec, Plan, ValueType};
+    use ankurah_storage_common::{IndexKeyPart, KeySpec, KeyBoundComponent, Plan, ValueType};
 
     #[test]
     fn test_plan_index_spec_name() {
         let plan = Plan::Index {
-            index_spec: IndexSpec::new(vec![IndexKeyPart::asc("__collection"), IndexKeyPart::asc("age"), IndexKeyPart::asc("score")]),
+            index_spec: KeySpec::new(vec![IndexKeyPart::asc("__collection"), IndexKeyPart::asc("age"), IndexKeyPart::asc("score")]),
             scan_direction: ScanDirection::Forward,
-            bounds: IndexBounds::new(vec![]), // Empty bounds for this test
+            bounds: KeyBounds::new(vec![]), // Empty bounds for this test
             remaining_predicate: Predicate::True,
             order_by_spill: vec![],
         };
@@ -206,13 +206,13 @@ mod tests {
     #[test]
     fn test_normalize_equality_only() {
         // Test normalization of equality-only bounds: __collection = 'album' AND age = 30
-        let bounds = IndexBounds::new(vec![
-            IndexColumnBound {
+        let bounds = KeyBounds::new(vec![
+            KeyBoundComponent {
                 column: "__collection".to_string(),
                 low: Endpoint::incl(PropertyValue::String("album".to_string())),
                 high: Endpoint::incl(PropertyValue::String("album".to_string())),
             },
-            IndexColumnBound {
+            KeyBoundComponent {
                 column: "age".to_string(),
                 low: Endpoint::incl(PropertyValue::I32(30)),
                 high: Endpoint::incl(PropertyValue::I32(30)),
@@ -234,13 +234,13 @@ mod tests {
     #[test]
     fn test_normalize_with_inequality() {
         // Test normalization with inequality: __collection = 'album' AND age > 25
-        let bounds = IndexBounds::new(vec![
-            IndexColumnBound {
+        let bounds = KeyBounds::new(vec![
+            KeyBoundComponent {
                 column: "__collection".to_string(),
                 low: Endpoint::incl(PropertyValue::String("album".to_string())),
                 high: Endpoint::incl(PropertyValue::String("album".to_string())),
             },
-            IndexColumnBound {
+            KeyBoundComponent {
                 column: "age".to_string(),
                 low: Endpoint::excl(PropertyValue::I32(25)),
                 high: Endpoint::UnboundedHigh(ValueType::I32),
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_plan_bounds_to_idb_range() {
         // Test the full pipeline: IndexBounds → CanonicalRange → IdbKeyRange
-        let bounds = IndexBounds::new(vec![IndexColumnBound {
+        let bounds = KeyBounds::new(vec![IndexColumnBound {
             column: "__collection".to_string(),
             low: Endpoint::incl(PropertyValue::String("album".to_string())),
             high: Endpoint::incl(PropertyValue::String("album".to_string())),
