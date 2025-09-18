@@ -96,10 +96,8 @@ impl<'a> Iterator for SledIndexScanner<'a> {
             };
 
             // Apply prefix guard if needed
-            if self.use_prefix_guard && !self.eq_prefix_bytes.is_empty() {
-                if !key_bytes.starts_with(&self.eq_prefix_bytes) {
-                    return None; // End of prefix range
-                }
+            if self.use_prefix_guard && !self.eq_prefix_bytes.is_empty() && !key_bytes.starts_with(&self.eq_prefix_bytes) {
+                return None; // End of prefix range
             }
 
             // Decode EntityId from key suffix

@@ -174,12 +174,16 @@ pub fn scan_direction_to_cursor_direction(scan_direction: &ScanDirection) -> web
 mod tests {
     use super::*;
     use ankql::ast::Predicate;
-    use ankurah_storage_common::{IndexKeyPart, KeySpec, KeyBoundComponent, Plan, ValueType};
+    use ankurah_storage_common::{IndexKeyPart, KeyBoundComponent, KeySpec, Plan, ValueType};
 
     #[test]
     fn test_plan_index_spec_name() {
         let plan = Plan::Index {
-            index_spec: KeySpec::new(vec![IndexKeyPart::asc("__collection"), IndexKeyPart::asc("age"), IndexKeyPart::asc("score")]),
+            index_spec: KeySpec::new(vec![
+                IndexKeyPart::asc("__collection", ValueType::String),
+                IndexKeyPart::asc("age", ValueType::I32),
+                IndexKeyPart::asc("score", ValueType::I32),
+            ]),
             scan_direction: ScanDirection::Forward,
             bounds: KeyBounds::new(vec![]), // Empty bounds for this test
             remaining_predicate: Predicate::True,
@@ -264,7 +268,7 @@ mod tests {
     #[test]
     fn test_plan_bounds_to_idb_range() {
         // Test the full pipeline: IndexBounds → CanonicalRange → IdbKeyRange
-        let bounds = KeyBounds::new(vec![IndexColumnBound {
+        let bounds = KeyBounds::new(vec![KeyBoundComponent {
             column: "__collection".to_string(),
             low: Endpoint::incl(PropertyValue::String("album".to_string())),
             high: Endpoint::incl(PropertyValue::String("album".to_string())),

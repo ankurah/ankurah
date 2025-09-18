@@ -225,7 +225,7 @@ impl StorageCollection for IndexedDBBucket {
             let event_obj = Object::new(js_sys::Object::new().into());
             let payload = &attested_event.payload;
             event_obj.set(&*ID_KEY, &payload.id())?;
-            event_obj.set(&*ENTITY_ID_KEY, &payload.entity_id)?;
+            event_obj.set(&*ENTITY_ID_KEY, payload.entity_id)?;
             event_obj.set(&*OPERATIONS_KEY, &payload.operations)?;
             event_obj.set(&*ATTESTATIONS_KEY, &attested_event.attestations)?;
             event_obj.set(&*PARENT_KEY, &payload.parent)?;
@@ -390,7 +390,7 @@ impl IndexedDBBucket {
         let use_prefix_guard = upper_open_ended && eq_prefix_len > 0;
 
         let eq_prefix_js: Vec<JsValue> =
-            if use_prefix_guard { eq_prefix_values.iter().map(|p| propertyvalue_to_js(p)).collect() } else { Vec::new() };
+            if use_prefix_guard { eq_prefix_values.iter().map(propertyvalue_to_js).collect() } else { Vec::new() };
 
         'scan: while let Some(result) = stream.next().await {
             let cursor_result = step(result, "cursor error")?;
@@ -416,14 +416,14 @@ impl IndexedDBBucket {
             let entity_obj = Object::new(step(cursor.value(), "get cursor value")?);
 
             // Create a wrapper that provides collection context for filtering
-            let filterable_entity = FilterableObject { object: &entity_obj, collection_id: &collection_id };
+            let filterable_entity = FilterableObject { object: &entity_obj, collection_id: collection_id };
 
             // Apply predicate filtering first (cheaper than entity conversion)
             if ankql::selection::filter::evaluate_predicate(&filterable_entity, predicate)
                 .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
             {
                 // Only convert to EntityState if predicate matches
-                if let Ok(entity_state) = js_object_to_entity_state(&entity_obj, &collection_id) {
+                if let Ok(entity_state) = js_object_to_entity_state(&entity_obj, collection_id) {
                     results.push(entity_state);
                     count += 1;
 
@@ -432,9 +432,7 @@ impl IndexedDBBucket {
                             break;
                         }
                     }
-                } else {
                 }
-            } else {
             }
 
             step(cursor.continue_(), "advance cursor")?;

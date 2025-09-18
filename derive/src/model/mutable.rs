@@ -97,5 +97,5 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
 
     };
 
-    expanded.into()
+    expanded
 }

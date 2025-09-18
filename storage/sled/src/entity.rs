@@ -1,6 +1,6 @@
 use ankurah_proto::CollectionId;
 use ankurah_storage_common::filtering::{GetPropertyValueStream, HasEntityId};
-use ankurah_storage_common::traits::{EntityIdStream, EntityStateStream};
+use ankurah_storage_common::traits::EntityIdStream;
 
 /// Sled-specific entity state lookup that hydrates EntityIds into full EntityStates
 pub struct SledEntityLookup<S> {
@@ -27,7 +27,7 @@ impl<S: EntityIdStream> Iterator for SledEntityLookup<S> {
 
         // Lookup entity state from entities tree
         let key = entity_id.to_bytes();
-        let value_bytes = match self.entities_tree.get(&key) {
+        let value_bytes = match self.entities_tree.get(key) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Some(Err(ankurah_core::error::RetrievalError::StorageError("Entity not found".to_string().into()))),
             Err(e) => return Some(Err(ankurah_core::error::RetrievalError::StorageError(e.to_string().into()))),

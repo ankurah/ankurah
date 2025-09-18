@@ -1,5 +1,5 @@
-use crate::ast::{self, Expr, Selection};
-use crate::ast::{Literal, Predicate};
+use crate::ast::Predicate;
+use crate::ast::{self, Selection};
 use crate::error::ParseError;
 use crate::parser;
 use std::convert::TryFrom;

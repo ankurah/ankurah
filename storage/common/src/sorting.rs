@@ -1,7 +1,6 @@
 use ankql::selection::filter::Filterable;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use tracing::info;
 
 /// Helper function to sort items by ORDER BY clauses
 fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::OrderByItem]) {
@@ -93,11 +92,11 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         // Lazy initialization: collect and sort all items on first call
-        if self.sorted_items.is_none() {
-            if let Some(inner) = self.inner.take() {
-                let sorted_items = collect_and_sort(inner, &self.order_by);
-                self.sorted_items = Some(sorted_items.into_iter());
-            }
+        if self.sorted_items.is_none()
+            && let Some(inner) = self.inner.take()
+        {
+            let sorted_items = collect_and_sort(inner, &self.order_by);
+            self.sorted_items = Some(sorted_items.into_iter());
         }
 
         // Return next item from sorted collection
@@ -123,10 +122,10 @@ where I: Iterator
 
     fn next(&mut self) -> Option<Self::Item> {
         // Check if we've reached the limit
-        if let Some(limit) = self.limit {
-            if self.count >= limit {
-                return None;
-            }
+        if let Some(limit) = self.limit
+            && self.count >= limit
+        {
+            return None;
         }
 
         // Get next item and increment counter
@@ -209,11 +208,11 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         // Lazy initialization: use bounded heap to find top K efficiently
-        if self.top_k_items.is_none() {
-            if let Some(inner) = self.inner.take() {
-                let top_k_items = collect_top_k(inner, &self.order_by, self.k);
-                self.top_k_items = Some(top_k_items.into_iter());
-            }
+        if self.top_k_items.is_none()
+            && let Some(inner) = self.inner.take()
+        {
+            let top_k_items = collect_top_k(inner, &self.order_by, self.k);
+            self.top_k_items = Some(top_k_items.into_iter());
         }
 
         // Return next item from top-K collection

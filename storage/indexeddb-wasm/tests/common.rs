@@ -23,16 +23,20 @@ pub struct Book {
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+#[allow(unused)]
 pub fn names(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.name().unwrap()).collect() }
 
+#[allow(unused)]
 pub fn sort_names(albums: &[AlbumView]) -> Vec<String> {
     let mut names = names(albums);
     names.sort();
     names
 }
 
+#[allow(unused)]
 pub fn years(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.year().unwrap()).collect() }
 
+#[allow(unused)]
 pub fn setup() -> () {
     console_error_panic_hook::set_once();
 
@@ -59,6 +63,7 @@ pub fn setup() -> () {
     );
 }
 
+#[allow(unused)]
 pub async fn setup_context() -> Result<(Context, String), anyhow::Error> {
     setup();
     let db_name = format!("test_db_{}", ulid::Ulid::new());
@@ -68,6 +73,7 @@ pub async fn setup_context() -> Result<(Context, String), anyhow::Error> {
     Ok((node.context_async(DEFAULT_CONTEXT).await, db_name))
 }
 
+#[allow(unused)]
 pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {
     let trx = ctx.begin();
     for (name, year) in vec {
@@ -78,6 +84,7 @@ pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>
     Ok(())
 }
 
+#[allow(unused)]
 pub async fn create_books(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {
     let trx = ctx.begin();
     for (name, year) in vec {

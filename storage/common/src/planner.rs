@@ -1,4 +1,5 @@
 use crate::{
+    KeyBounds,
     index_spec::{IndexKeyPart, KeySpec},
     predicate::ConjunctFinder,
     types::*,
@@ -56,32 +57,33 @@ impl Planner {
         let mut plans = Vec::new();
 
         // New ORDER BY strategies
-        if let Some(order_by) = &selection.order_by {
-            if !order_by.is_empty() {
-                if let Some(plan) = self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts) {
-                    plans.push(plan);
-                }
-                // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
-                let covered_ineq = order_by.iter().any(|item| match &item.identifier {
-                    Identifier::Property(name) => inequalities.contains_key(name),
-                    _ => false,
-                });
-                if !covered_ineq && !inequalities.is_empty() {
-                    if let Some(plan) = self.build_ineq_first_plan(&equalities, &inequalities, order_by, &conjuncts) {
-                        plans.push(plan);
-                    }
-                }
-                // Apply the same TableScan fallback logic as the main path
-                let deduplicated_plans = self.deduplicate_plans(plans);
-                let has_empty_scan = deduplicated_plans.iter().any(|plan| matches!(plan, Plan::EmptyScan));
-                if !has_empty_scan {
-                    let mut final_plans = deduplicated_plans;
-                    let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by);
-                    final_plans.push(table_scan);
-                    return final_plans;
-                } else {
-                    return deduplicated_plans;
-                }
+        if let Some(order_by) = &selection.order_by
+            && !order_by.is_empty()
+        {
+            if let Some(plan) = self.build_order_first_plan(&equalities, &inequalities, order_by, &conjuncts) {
+                plans.push(plan);
+            }
+            // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
+            let covered_ineq = order_by.iter().any(|item| match &item.identifier {
+                Identifier::Property(name) => inequalities.contains_key(name),
+                _ => false,
+            });
+            if !covered_ineq
+                && !inequalities.is_empty()
+                && let Some(plan) = self.build_ineq_first_plan(&equalities, &inequalities, order_by, &conjuncts)
+            {
+                plans.push(plan);
+            }
+            // Apply the same TableScan fallback logic as the main path
+            let deduplicated_plans = self.deduplicate_plans(plans);
+            let has_empty_scan = deduplicated_plans.iter().any(|plan| matches!(plan, Plan::EmptyScan));
+            if !has_empty_scan {
+                let mut final_plans = deduplicated_plans;
+                let table_scan = self.build_table_scan_plan(&conjuncts, primary_key, &selection.order_by);
+                final_plans.push(table_scan);
+                return final_plans;
+            } else {
+                return deduplicated_plans;
             }
         }
 
@@ -259,10 +261,10 @@ impl Planner {
         covered.insert(primary.0);
         let mut order_by_spill = Vec::new();
         for item in order_by {
-            if let Identifier::Property(name) = &item.identifier {
-                if !covered.contains(name.as_str()) {
-                    order_by_spill.push(item.clone());
-                }
+            if let Identifier::Property(name) = &item.identifier
+                && !covered.contains(name.as_str())
+            {
+                order_by_spill.push(item.clone());
             }
         }
 
@@ -292,7 +294,7 @@ impl Planner {
                     | ComparisonOperator::GreaterThanOrEqual
                     | ComparisonOperator::LessThan
                     | ComparisonOperator::LessThanOrEqual => {
-                        inequalities.entry(field).or_insert_with(Vec::new).push((op, value));
+                        inequalities.entry(field).or_default().push((op, value));
                     }
                     _ => {
                         // NotEqual, In, Between - not supported for index ranges
@@ -389,10 +391,10 @@ impl Planner {
                 equalities.iter().map(|(f, _)| f.as_str()).chain(std::iter::once(inequality_field)).collect();
 
             for item in order_by_items {
-                if let Identifier::Property(name) = &item.identifier {
-                    if !covered_fields.contains(name.as_str()) {
-                        order_by_spill.push(item.clone());
-                    }
+                if let Identifier::Property(name) = &item.identifier
+                    && !covered_fields.contains(name.as_str())
+                {
+                    order_by_spill.push(item.clone());
                 }
             }
         }
@@ -625,12 +627,11 @@ impl Planner {
                 }
 
                 // Check if it's a consumed inequality
-                if !consumed {
-                    if let Some(ineq_field) = consumed_inequality_field {
-                        if field == ineq_field {
-                            consumed = true;
-                        }
-                    }
+                if !consumed
+                    && let Some(ineq_field) = consumed_inequality_field
+                    && field == ineq_field
+                {
+                    consumed = true;
                 }
             }
 
@@ -663,7 +664,7 @@ impl Planner {
             match &plan {
                 Plan::Index { index_spec, scan_direction, .. } => {
                     // Create a key that owns the data we need for comparison
-                    let key = (index_spec.keyparts.clone(), scan_direction.clone());
+                    let key = (index_spec.keyparts.clone(), *scan_direction);
                     if seen.insert(key) {
                         // insert returns true if the key was not already present
                         unique_plans.push(plan);
@@ -743,7 +744,7 @@ impl Planner {
             return KeyBounds::empty();
         }
 
-        // Combine multiple bounds into a single IndexBounds via intersection
+        // Combine multiple bounds into a single KeyBounds via intersection
         if primary_key_bounds.len() == 1 {
             KeyBounds { keyparts: primary_key_bounds }
         } else {
@@ -876,12 +877,11 @@ impl Planner {
 
     /// Check if ORDER BY is on the primary key (should skip index generation)
     fn has_primary_key_order_by(&self, order_by: &Option<Vec<ankql::ast::OrderByItem>>, primary_key: &str) -> bool {
-        if let Some(order_items) = order_by {
-            if let Some(first_item) = order_items.first() {
-                if let ankql::ast::Identifier::Property(field_name) = &first_item.identifier {
-                    return field_name == primary_key;
-                }
-            }
+        if let Some(order_items) = order_by
+            && let Some(first_item) = order_items.first()
+            && let ankql::ast::Identifier::Property(field_name) = &first_item.identifier
+        {
+            return field_name == primary_key;
         }
         false
     }
@@ -939,13 +939,13 @@ mod tests {
         }};
     }
     macro_rules! asc {
-        ($name:expr) => {
-            IndexKeyPart::asc($name.to_string())
+        ($name:expr, $ty:expr) => {
+            IndexKeyPart::asc($name.to_string(), $ty)
         };
     }
     macro_rules! desc {
-        ($name:expr) => {
-            IndexKeyPart::desc($name.to_string())
+        ($name:expr, $ty:expr) => {
+            IndexKeyPart::desc($name.to_string(), $ty)
         };
     }
     macro_rules! oby_asc {
@@ -978,60 +978,60 @@ mod tests {
         ($col:expr => $lo:tt .. $hi:tt) => {{
             let __lo: PropertyValue = ($lo).into();
             let __hi: PropertyValue = ($hi).into();
-            IndexColumnBound { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
+            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
         }};
         ($col:expr => $lo:tt ..= $hi:tt) => {{
             let __lo: PropertyValue = ($lo).into();
             let __hi: PropertyValue = ($hi).into();
-            IndexColumnBound { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
+            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
         }};
         ($col:expr => .. $hi:tt) => {{
             let __hi: PropertyValue = ($hi).into();
-            IndexColumnBound { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
+            KeyBoundComponent { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
         }};
         ($col:expr => $lo:tt ..) => {{
             let __lo: PropertyValue = ($lo).into();
-            IndexColumnBound { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
+            KeyBoundComponent { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
         }};
 
         // parenthesized ranges (to avoid parsing conflicts in bounds! macro)
         ($col:expr, ($lo:tt .. $hi:tt)) => {{
             let __lo: PropertyValue = ($lo).into();
             let __hi: PropertyValue = ($hi).into();
-            IndexColumnBound { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
+            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
         }};
         ($col:expr, ($lo:tt ..= $hi:tt)) => {{
             let __lo: PropertyValue = ($lo).into();
             let __hi: PropertyValue = ($hi).into();
-            IndexColumnBound { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
+            KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
         }};
         ($col:expr, (.. $hi:tt)) => {{
             let __hi: PropertyValue = ($hi).into();
-            IndexColumnBound { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
+            KeyBoundComponent { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
         }};
         ($col:expr, ($lo:tt ..)) => {{
             let __lo: PropertyValue = ($lo).into();
-            IndexColumnBound { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
+            KeyBoundComponent { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
         }};
 
         // explicit equality: = v   (clear and unambiguous)
         ($col:expr, = $v:tt) => {{
             let __pv: PropertyValue = ($v).into();
-            IndexColumnBound { column: $col.to_string(), low: ge(__pv.clone()), high: le(__pv) }
+            KeyBoundComponent { column: $col.to_string(), low: ge(__pv.clone()), high: le(__pv) }
         }};
     }
 
-    // ---- collect multiple columns into IndexBounds ----
+    // ---- collect multiple columns into KeyBounds ----
     macro_rules! bounds {
         ( $( $col:expr => $spec:tt ),+ $(,)? ) => {
-            IndexBounds::new(vec![ $( col_range!($col, $spec) ),+ ])
+            KeyBounds::new(vec![ $( col_range!($col, $spec) ),+ ])
         };
     }
 
-    // this one takes an array of IndexColumnBound
+    // this one takes an array of KeyBoundComponent
     macro_rules! bounds_list {
         ( $( $bound:expr ),+ $(,)? ) => {
-            IndexBounds::new(vec![ $( $bound ),+ ])
+            KeyBounds::new(vec![ $( $bound ),+ ])
         };
     }
 
@@ -1066,7 +1066,11 @@ mod tests {
                 plan!("__collection = 'album' ORDER BY foo, bar"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("foo"), asc!("bar")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("foo", ValueType::String),
+                            asc!("bar", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1088,7 +1092,11 @@ mod tests {
                 plan!("__collection = 'album' AND foo > 10 ORDER BY foo, bar"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("foo"), asc!("bar")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("foo", ValueType::String),
+                            asc!("bar", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the inequality (foo) is > 10
                         // to is incl because there is no foo < ? in the predicate
@@ -1112,7 +1120,11 @@ mod tests {
                 plan!("age = 30 ORDER BY foo, bar"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("age"), asc!("foo"), asc!("bar")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("age", ValueType::I32),
+                            asc!("foo", ValueType::String),
+                            asc!("bar", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("age" => (30..=30)),
                         remaining_predicate: Predicate::True,
@@ -1135,7 +1147,12 @@ mod tests {
                 plan!("__collection = 'album' AND age = 30 ORDER BY foo, bar"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age"), asc!("foo"), asc!("bar")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("age", ValueType::I32),
+                            asc!("foo", ValueType::String),
+                            asc!("bar", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (30..=30)),
                         remaining_predicate: Predicate::True,
@@ -1158,7 +1175,7 @@ mod tests {
                 plan!("__collection = 'album' ORDER BY name DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1181,7 +1198,11 @@ mod tests {
                 plan!("__collection = 'album' ORDER BY name DESC, year DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name"), asc!("year")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("name", ValueType::String),
+                            asc!("year", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1204,7 +1225,7 @@ mod tests {
                 plan!("__collection = 'album' ORDER BY name ASC, year DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1227,7 +1248,7 @@ mod tests {
                 plan!("__collection = 'album' ORDER BY name DESC, year ASC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1250,7 +1271,7 @@ mod tests {
                 plan!("__collection = 'album' ORDER BY foo ASC, bar DESC, baz DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("foo")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("foo", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1273,7 +1294,11 @@ mod tests {
                 plan!("__collection = 'album' AND status = 'active' ORDER BY name DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("status"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("status", ValueType::String),
+                            asc!("name", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Reverse,
                         bounds: bounds!("__collection" => ("album"..="album"), "status" => ("active"..="active")),
                         remaining_predicate: Predicate::True,
@@ -1296,7 +1321,7 @@ mod tests {
                 plan!("__collection = 'album' AND age > 25 ORDER BY age DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Reverse,
                         // from is excl because the inequality (age) is > 25
                         // to is incl because there is no age < ? in the predicate
@@ -1326,7 +1351,7 @@ mod tests {
                 plan_full_support!("__collection = 'album' ORDER BY name DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), desc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), desc!("name", ValueType::String),]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1349,7 +1374,12 @@ mod tests {
                 plan_full_support!("__collection = 'album' ORDER BY name ASC, year DESC, score ASC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name"), desc!("year"), asc!("score")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("name", ValueType::String),
+                            desc!("year", ValueType::String),
+                            asc!("score", ValueType::I32)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1372,7 +1402,11 @@ mod tests {
                 plan_full_support!("__collection = 'album' ORDER BY name DESC, year DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), desc!("name"), desc!("year")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            desc!("name", ValueType::String),
+                            desc!("year", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1395,7 +1429,12 @@ mod tests {
                 plan_full_support!("__collection = 'album' AND status = 'active' ORDER BY name ASC, year DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("status"), asc!("name"), desc!("year")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("status", ValueType::String),
+                            asc!("name", ValueType::String),
+                            desc!("year", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "status" => ("active"..="active")),
                         remaining_predicate: Predicate::True,
@@ -1422,7 +1461,7 @@ mod tests {
                 plan!("__collection = 'album' AND age > 25"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the inequality (age) is > 25
                         // to is incl because there is no age < ? in the predicate
@@ -1446,7 +1485,7 @@ mod tests {
                 plan!("__collection = 'album' AND age > 25 AND age < 50"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the inequality (age) is > 25
                         // to is excl because the inequality (age) is < 50
@@ -1472,7 +1511,7 @@ mod tests {
                 vec![
                     // Plan 1: Uses age index, score remains in predicate
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the inequality (age) is > 25
                         // from is incl because there is no age < ? in the predicate
@@ -1482,7 +1521,7 @@ mod tests {
                     },
                     // Plan 2: Uses score index, age remains in predicate
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("score")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("score", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         // from is incl because there is no score < ? in the predicate
                         // to is excl because the inequality (score) is < 100
@@ -1511,7 +1550,7 @@ mod tests {
                 plan!("__collection = 'album' AND name = 'Alice'"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => ("Alice"..="Alice")),
                         remaining_predicate: Predicate::True,
@@ -1533,7 +1572,11 @@ mod tests {
                 plan!("__collection = 'album' AND name = 'Alice' AND age = 30"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("name", ValueType::String),
+                            asc!("age", ValueType::I32)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => ("Alice"..="Alice"), "age" => (30..=30)),
                         remaining_predicate: Predicate::True,
@@ -1560,7 +1603,11 @@ mod tests {
                 plan!("__collection = 'album' AND name = 'Alice' AND age > 25"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("name", ValueType::String),
+                            asc!("age", ValueType::I32)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the final inequality (age) is > 25
                         // to is incl and the final component is omitted because there is no age < ? in the predicate
@@ -1588,7 +1635,11 @@ mod tests {
                 plan!("__collection = 'album' AND score > 50 AND age = 30 ORDER BY score"), // inequality intentionally in the middle to test index_field sequencing
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age"), asc!("score")]), // equalities first, then inequalities, preserving order of appearance
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("age", ValueType::I32),
+                            asc!("score", ValueType::I32)
+                        ]), // equalities first, then inequalities, preserving order of appearance
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the final inequality (score) is > 50
                         // to is incl and the final component is omitted because there is no score < ? in the predicate
@@ -1622,7 +1673,7 @@ mod tests {
                 plan!("__collection = 'album'"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::True,
@@ -1645,7 +1696,7 @@ mod tests {
                 plan!("__collection = 'album' AND name != 'Alice'"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: selection!("name != 'Alice'").predicate,
@@ -1665,7 +1716,7 @@ mod tests {
                 plan!("__collection = 'album' AND age > 25 AND name != 'Alice'"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the inequality (age) is > 25
                         // to is incl and the final component is omitted because there is no age < ? in the predicate
@@ -1697,7 +1748,7 @@ mod tests {
                 plan!("__collection = 'album' AND (age > 25 OR name = 'Alice')"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
@@ -1721,7 +1772,7 @@ mod tests {
                 plan!("__collection = 'album' AND score = 100 AND (age > 25 OR name = 'Alice')"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("score")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("score", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "score" => (100..=100)),
                         // the OR-containing parenthetical is a disjunction, so it must remain in the predicate
@@ -1747,7 +1798,12 @@ mod tests {
                 plan!("__collection = 'album' AND age = 30 ORDER BY name, score"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age"), asc!("name"), asc!("score")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("age", ValueType::I32),
+                            asc!("name", ValueType::String),
+                            asc!("score", ValueType::I32)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (30..=30)),
                         remaining_predicate: Predicate::True,
@@ -1775,7 +1831,7 @@ mod tests {
                 vec![
                     // Strategy 1: Scan by name, filter by year
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::Comparison {
@@ -1787,7 +1843,7 @@ mod tests {
                     },
                     // Strategy 2: Scan by year, sort by name
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("year")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("year", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "year" => ("2001"..)),
                         remaining_predicate: Predicate::True,
@@ -1814,7 +1870,7 @@ mod tests {
                 plan!("__collection = 'album' AND age >= 25 AND age <= 50 AND age > 20"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("age")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
                         scan_direction: ScanDirection::Forward,
                         // age >= 25 wins over age > 20 because it's more restrictive
                         // from: is incl because the most restrictive lower bound inequality (age) is >= 25
@@ -1840,7 +1896,7 @@ mod tests {
                 plan!("__collection = 'album' AND timestamp > 9223372036854775807"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("timestamp")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("timestamp", ValueType::I64)]),
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the inequality (timestamp) is > 9223372036854775807
                         // to is incl because there is no timestamp < ? in the predicate
@@ -1869,7 +1925,7 @@ mod tests {
                 plan!("__collection = 'album' AND name = ''"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => (""..="")),
                         remaining_predicate: Predicate::True,
@@ -1892,7 +1948,11 @@ mod tests {
                 plan!("__collection = 'album' AND name = '' AND year = '2000'"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name"), asc!("year")]),
+                        index_spec: KeySpec::new(vec![
+                            asc!("__collection", ValueType::String),
+                            asc!("name", ValueType::String),
+                            asc!("year", ValueType::String)
+                        ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => (""..=""), "year" => ("2000"..="2000")),
                         remaining_predicate: Predicate::True,
@@ -2020,7 +2080,7 @@ mod tests {
                 plan!("__collection = 'album' AND id > '12345678-1234-1234-1234-123456789abc' AND name = 'Alice'"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection"), asc!("name")]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("name", ValueType::String)]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "name" => ("Alice"..="Alice")),
                         remaining_predicate: selection!("id > '12345678-1234-1234-1234-123456789abc'").predicate,

@@ -35,14 +35,17 @@ pub struct Book {
 
 pub fn names(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.name().unwrap()).collect() }
 
+#[allow(unused)]
 pub fn sort_names(albums: &[AlbumView]) -> Vec<String> {
     let mut names = names(albums);
     names.sort();
     names
 }
 
+#[allow(unused)]
 pub fn years(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.year().unwrap()).collect() }
 
+#[allow(unused)]
 pub async fn setup_context() -> Result<Context, anyhow::Error> {
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
@@ -50,6 +53,7 @@ pub async fn setup_context() -> Result<Context, anyhow::Error> {
     Ok(node.context_async(DEFAULT_CONTEXT).await)
 }
 
+#[allow(unused)]
 pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<Vec<AlbumView>, MutationError> {
     use ankurah::Mutable;
     let trx = ctx.begin();
@@ -63,6 +67,7 @@ pub async fn create_albums(ctx: &Context, vec: Vec<(&'static str, &'static str)>
     Ok(albums)
 }
 
+#[allow(unused)]
 pub async fn create_books(ctx: &Context, vec: Vec<(&'static str, &'static str)>) -> Result<(), MutationError> {
     let trx = ctx.begin();
     for (name, year) in vec {

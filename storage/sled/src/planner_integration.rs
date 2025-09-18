@@ -50,27 +50,18 @@ pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec) -> Resul
         }
 
         // Lower side
-        match &bound.low {
-            Endpoint::Value { datum: KeyDatum::Val(val), inclusive } => {
-                lower_tuple.push(val.clone());
-                lower_open = !inclusive;
-            }
-            _ => {}
+        if let Endpoint::Value { datum: KeyDatum::Val(val), inclusive } = &bound.low {
+            lower_tuple.push(val.clone());
+            lower_open = !inclusive;
         }
 
         // Upper side
-        match &bound.high {
-            Endpoint::Value { datum: KeyDatum::Val(val), inclusive } => {
-                upper_tuple.push(val.clone());
-                upper_open = !inclusive;
-            }
-            _ => {}
+        if let Endpoint::Value { datum: KeyDatum::Val(val), inclusive } = &bound.high {
+            upper_tuple.push(val.clone());
+            upper_open = !inclusive;
         }
         break; // Only process first bound with actual constraints
     }
-
-    // Extract directions from the key spec
-    let directions: Vec<IndexDirection> = key_spec.keyparts.iter().map(|kp| kp.direction).collect();
 
     // Now convert to physical bounds based on key spec
     convert_to_physical_bounds(lower_tuple, upper_tuple, lower_open, upper_open, eq_prefix_len, eq_prefix_values, key_spec)
@@ -117,7 +108,7 @@ fn convert_to_physical_bounds(
     }
 
     // Case 2: Single-component DESC inequality
-    if let Some(first_keypart) = key_spec.keyparts.get(0) {
+    if let Some(first_keypart) = key_spec.keyparts.first() {
         if first_keypart.direction.is_desc() {
             let is_single = (lower_tuple.len() <= 1) && (upper_tuple.len() <= 1);
             if is_single {
@@ -146,7 +137,7 @@ fn handle_desc_inequality(
     let (start_bytes, end_bytes_opt) = match (!lower_tuple.is_empty(), !upper_tuple.is_empty()) {
         // x > L or x >= L
         (true, false) => {
-            let mut start = vec![0x00]; // Start from beginning
+            let start = vec![0x00]; // Start from beginning
             let mut end = encode_tuple_values_with_key_spec(&lower_tuple, key_spec)?;
             if !lower_open {
                 // >= L → end = succ(enc(L))
@@ -173,7 +164,7 @@ fn handle_desc_inequality(
         }
         // L <= x <= U
         (true, true) => {
-            let mut start = encode_tuple_values_with_key_spec(&upper_tuple, &key_spec)?;
+            let mut start = encode_tuple_values_with_key_spec(&upper_tuple, key_spec)?;
             if upper_open {
                 if let Some(s) = lex_successor(start.clone()) {
                     start = s;
@@ -181,7 +172,7 @@ fn handle_desc_inequality(
             }
             start.push(0);
 
-            let mut end = encode_tuple_values_with_key_spec(&lower_tuple, &key_spec)?;
+            let mut end = encode_tuple_values_with_key_spec(&lower_tuple, key_spec)?;
             if !lower_open {
                 if let Some(s) = lex_successor(end.clone()) {
                     end = s;
@@ -195,7 +186,7 @@ fn handle_desc_inequality(
     };
 
     let eq_guard =
-        if eq_prefix_len > 0 { encode_tuple_values_with_key_spec(&eq_prefix_values[..eq_prefix_len], &key_spec)? } else { Vec::new() };
+        if eq_prefix_len > 0 { encode_tuple_values_with_key_spec(&eq_prefix_values[..eq_prefix_len], key_spec)? } else { Vec::new() };
 
     let upper_open_ended = end_bytes_opt.is_none();
     Ok(SledRangeBounds { start: start_bytes, end: end_bytes_opt, upper_open_ended, eq_prefix_guard: eq_guard })
@@ -214,10 +205,7 @@ fn handle_general_bounds(
     let start = if !lower_tuple.is_empty() {
         let mut start = encode_tuple_values_with_key_spec(&lower_tuple, key_spec)?;
         if lower_open {
-            start = match lex_successor(start) {
-                Some(s) => s,
-                None => Vec::new(),
-            };
+            start = lex_successor(start).unwrap_or_default();
         }
         start.push(0);
         start
@@ -236,7 +224,7 @@ fn handle_general_bounds(
                     end: None,
                     upper_open_ended: true,
                     eq_prefix_guard: if eq_prefix_len > 0 {
-                        encode_tuple_values_with_key_spec(&eq_prefix_values, &key_spec)?
+                        encode_tuple_values_with_key_spec(&eq_prefix_values, key_spec)?
                     } else {
                         Vec::new()
                     },
@@ -249,7 +237,7 @@ fn handle_general_bounds(
         (None, true)
     };
 
-    let eq_guard = if eq_prefix_len > 0 { encode_tuple_values_with_key_spec(&eq_prefix_values, &key_spec)? } else { Vec::new() };
+    let eq_guard = if eq_prefix_len > 0 { encode_tuple_values_with_key_spec(&eq_prefix_values, key_spec)? } else { Vec::new() };
 
     Ok(SledRangeBounds { start, end, upper_open_ended, eq_prefix_guard: eq_guard })
 }

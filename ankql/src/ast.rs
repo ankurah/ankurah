@@ -78,7 +78,7 @@ impl std::fmt::Display for Predicate {
 
 impl Selection {
     pub fn assume_null(&self, columns: &[String]) -> Self {
-        Self { predicate: self.predicate.assume_null(columns), order_by: self.order_by.clone(), limit: self.limit.clone() }
+        Self { predicate: self.predicate.assume_null(columns), order_by: self.order_by.clone(), limit: self.limit }
     }
 }
 

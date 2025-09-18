@@ -1,2 +1,2 @@
-[build]
+[target.'cfg(target_arch = "wasm32")'.build]
 rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

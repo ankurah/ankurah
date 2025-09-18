@@ -1,12 +1,6 @@
 use sled::Db;
 
-use ankurah_core::error::RetrievalError;
-
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-
-use crate::error::sled_error;
-use crate::index::{Index, IndexManager, IndexRecord};
+use crate::index::IndexManager;
 use crate::property::PropertyManager;
 
 pub struct Database {

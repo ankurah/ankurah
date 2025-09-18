@@ -18,7 +18,7 @@ If empty → emit no scan.
 
 1. Normalization (IR → CanonicalRange)
 
-Input: IndexBounds { keyparts: Vec<IndexColumnBound> }
+Input: IndexBounds { keyparts: Vec<KeyBoundComponent> }
 Output: CanonicalRange { lower: Option<(Vec<PropertyValue>, bool)>, upper: Option<(Vec<PropertyValue>, bool)> }
 
 Algorithm (left→right over keyparts):
@@ -182,7 +182,7 @@ Empty string "" is fine; the shorter lower tuple (e.g., ["album"]) correctly inc
 
 Contradictory predicates (e.g., year > "2010" AND year < "2005"): your normalization must detect lower ≥ upper ⇒ no scan.
 
-Multiple inequalities same column: tighten to the max lower and min upper before building IndexColumnBound.
+Multiple inequalities same column: tighten to the max lower and min upper before building KeyBoundComponent.
 
 Stacked ±∞ in IR: accepted, but collapse at the first occurrence during normalization.
 
@@ -213,14 +213,14 @@ Bool: verify 0/1 mapping remains ordered across compound keys.
 i64 big: include values around ±2^53 and far beyond; confirm string encoding preserves order.
 
 8. Drop-in lowering helpers (signatures)
-   // 1) IR → CanonicalRange (+ eq_prefix_len metadata)
-   fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize /_eq_prefix_len_/, Vec<PropertyValue> /_eq_prefix_values_/);
+   // 1) IR → CanonicalRange (+ eq*prefix_len metadata)
+   fn normalize(bounds: &IndexBounds) -> (CanonicalRange, usize /\_eq_prefix_len*/, Vec<PropertyValue> /_eq_prefix_values_/);
 
 // 2) CanonicalRange → (IdbKeyRange, UpperOpenEndedFlag)
-fn to_idb_keyrange(
+fn to*idb_keyrange(
 index: &web_sys::IdbIndex,
 cr: &CanonicalRange
-) -> Result<(web_sys::IdbKeyRange, bool /_upper_open_/), Error>;
+) -> Result<(web_sys::IdbKeyRange, bool /\_upper_open*/), Error>;
 
 // 3) Cursor runner (prefix guard, direction, limit/offset)
 async fn run_cursor(
