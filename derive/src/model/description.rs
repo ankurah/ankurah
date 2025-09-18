@@ -79,7 +79,7 @@ impl ModelDescription {
                 };
 
             // Resolve the active type using the unified method
-            if let Some(backend_desc) = self.backend_registry.resolve_active_type(&field) {
+            if let Some(backend_desc) = self.backend_registry.resolve_active_type(field) {
                 results.push(backend_desc);
             } else {
                 // No backend match found
@@ -130,7 +130,7 @@ impl ModelDescription {
         for field in self.active_fields().iter() {
             let field_name = field.ident.as_ref().unwrap();
 
-            if let Some(backend_desc) = self.backend_registry.resolve_active_type(&field) {
+            if let Some(backend_desc) = self.backend_registry.resolve_active_type(field) {
                 // Get the fully qualified wrapper type path
                 let wrapper_type_path = backend_desc.get_wrapper_type_path();
 

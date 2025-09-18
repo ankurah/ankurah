@@ -712,7 +712,7 @@ where
         selection: &ankql::ast::Selection,
     ) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
-        let initial_states = storage_collection.fetch_states(&selection).await?;
+        let initial_states = storage_collection.fetch_states(selection).await?;
         let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {

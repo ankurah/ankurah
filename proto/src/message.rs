@@ -41,7 +41,7 @@ impl std::fmt::Display for NodeMessage {
             NodeMessage::Response(response) => write!(f, "Response: {}", response),
             NodeMessage::Update(update) => write!(f, "Update: {}", update),
             NodeMessage::UpdateAck(update_ack) => write!(f, "UpdateAck: {}", update_ack),
-            NodeMessage::UnsubscribeQuery { from, query_id: query_id } => write!(f, "Unsubscribe: {} {}", from, query_id),
+            NodeMessage::UnsubscribeQuery { from, query_id } => write!(f, "Unsubscribe: {} {}", from, query_id),
         }
     }
 }

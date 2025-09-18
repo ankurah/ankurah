@@ -83,7 +83,7 @@ impl IndexManager {
         if let Some((_, existing, match_type)) = self.indexes.read().unwrap().iter().find_map(|(id, idx)| {
             if idx.collection() == collection {
                 if let Some(match_result) = spec.matches(idx.spec()) {
-                    return Some((id.clone(), idx.clone(), match_result));
+                    return Some((*id, idx.clone(), match_result));
                 }
             }
             None
@@ -204,7 +204,7 @@ impl Index {
             created_at_unix_ms: self.0.created_at_unix_ms,
             build_status: self.status(),
         })?;
-        self.0.index_config_tree.insert(&self.0.id.to_be_bytes(), bytes)?;
+        self.0.index_config_tree.insert(self.0.id.to_be_bytes(), bytes)?;
         Ok(())
     }
     pub fn build_if_needed(&self, db: &Db) -> Result<(), RetrievalError> {

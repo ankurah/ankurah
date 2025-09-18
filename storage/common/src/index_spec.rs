@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_no_match_different_fields() {
         let query_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("a", ValueType::String), IndexKeyPart::desc("b", ValueType::String)] };
-        let index_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("x"), IndexKeyPart::desc("y")] };
+        let index_spec = KeySpec { keyparts: vec![IndexKeyPart::asc("x", ValueType::String), IndexKeyPart::desc("y", ValueType::String)] };
 
         assert_eq!(query_spec.matches(&index_spec), None);
     }
@@ -298,13 +298,13 @@ mod tests {
     #[test]
     fn test_helper_methods() {
         // Test IndexKeyPart helper methods
-        let asc_keypart = IndexKeyPart::asc("test");
+        let asc_keypart = IndexKeyPart::asc("test", ValueType::String);
         assert_eq!(asc_keypart.column, "test");
         assert_eq!(asc_keypart.direction, IndexDirection::Asc);
         assert_eq!(asc_keypart.nulls, None);
         assert_eq!(asc_keypart.collation, None);
 
-        let desc_keypart = IndexKeyPart::desc("test");
+        let desc_keypart = IndexKeyPart::desc("test", ValueType::String);
         assert_eq!(desc_keypart.column, "test");
         assert_eq!(desc_keypart.direction, IndexDirection::Desc);
         assert_eq!(desc_keypart.nulls, None);

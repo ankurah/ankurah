@@ -184,7 +184,7 @@ impl<S: EntityIdStream> Iterator for SledMaterializeIter<S> {
 
         // Lookup materialized values from collection tree
         let key = entity_id.to_bytes();
-        let value_bytes = match self.tree.get(&key) {
+        let value_bytes = match self.tree.get(key) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return None, // Entity not found
             Err(_e) => return None,  // Skip errors for now - TODO: proper error handling

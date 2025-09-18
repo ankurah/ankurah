@@ -19,9 +19,8 @@ impl Object {
         // if v.is_null() || v.is_undefined() {
         //     return Err(RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key).into()));
         // }
-        Ok(v.try_into().map_err(|e| {
-            RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into())
-        })?)
+        v.try_into()
+            .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into()))
     }
     pub fn get_opt<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<Option<T>, RetrievalError> {
         let v = js_sys::Reflect::get(&self.obj, key)

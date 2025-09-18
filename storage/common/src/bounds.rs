@@ -13,16 +13,16 @@ pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<PropertyValu
     for bound in &bounds.keyparts {
         if let (Endpoint::Value { datum: low_datum, inclusive: low_incl }, Endpoint::Value { datum: high_datum, inclusive: high_incl }) =
             (&bound.low, &bound.high)
+            && let (KeyDatum::Val(low_val), KeyDatum::Val(high_val)) = (low_datum, high_datum)
+            && low_val == high_val
+            && *low_incl
+            && *high_incl
         {
-            if let (KeyDatum::Val(low_val), KeyDatum::Val(high_val)) = (low_datum, high_datum) {
-                if low_val == high_val && *low_incl && *high_incl {
-                    lower_tuple.push(low_val.clone());
-                    upper_tuple.push(high_val.clone());
-                    eq_prefix_values.push(low_val.clone());
-                    eq_prefix_len += 1;
-                    continue;
-                }
-            }
+            lower_tuple.push(low_val.clone());
+            upper_tuple.push(high_val.clone());
+            eq_prefix_values.push(low_val.clone());
+            eq_prefix_len += 1;
+            continue;
         }
 
         match &bound.low {

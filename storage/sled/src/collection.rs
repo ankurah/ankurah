@@ -14,10 +14,7 @@ use async_trait::async_trait;
 
 use tokio::task;
 
-use crate::{
-    entity::{SledEntityExt, SledEntityExtFromMats, SledEntityLookup},
-    materialization::MatRow,
-};
+use crate::entity::{SledEntityExt, SledEntityExtFromMats, SledEntityLookup};
 // TODO: Will need bounds_to_sled_range and normalize when implementing scanner logic
 use crate::scan_collection::SledMaterializeIter;
 use crate::scan_collection::{SledCollectionKeyScanner, SledCollectionScanner};

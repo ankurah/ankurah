@@ -43,80 +43,76 @@ where
     S: Signal + GetReadCell<T> + Sync,
     T: Clone + Send + Sync + 'static,
 {
-    fn wait_value(&self, target_value: T) -> impl std::future::Future<Output = ()> + Send
+    async fn wait_value(&self, target_value: T)
     where T: PartialEq + Clone + Send + Sync {
-        async move {
-            // Check if current value already matches
+        // Check if current value already matches
 
-            use std::sync::Arc;
-            if self.get_readcell().with(|v| *v == target_value) {
-                return;
-            }
+        use std::sync::Arc;
+        if self.get_readcell().with(|v| *v == target_value) {
+            return;
+        }
 
-            // Create a channel to bridge sync broadcast to async
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create a channel to bridge sync broadcast to async
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Subscribe to change notifications
-            let _subscription = self.listen(Arc::new(move |_| {
-                let _ = tx.send(());
-            }));
+        // Subscribe to change notifications
+        let _subscription = self.listen(Arc::new(move |_| {
+            let _ = tx.send(());
+        }));
 
-            // Loop over notifications until we find a match
-            loop {
-                match rx.recv().await {
-                    Some(_) => {
-                        if self.get_readcell().with(|v| *v == target_value) {
-                            break;
-                        }
-                    }
-                    None => {
-                        // Channel was closed, stop waiting
+        // Loop over notifications until we find a match
+        loop {
+            match rx.recv().await {
+                Some(_) => {
+                    if self.get_readcell().with(|v| *v == target_value) {
                         break;
                     }
+                }
+                None => {
+                    // Channel was closed, stop waiting
+                    break;
                 }
             }
         }
     }
 
-    fn wait_for<F, R>(&self, predicate: F) -> impl std::future::Future<Output = R::Output> + Send
+    async fn wait_for<F, R>(&self, predicate: F) -> R::Output
     where
         F: Fn(&T) -> R + Send + Sync + 'static,
         R: WaitResult,
         T: Send + Sync,
     {
-        async move {
-            // Check current value first
+        // Check current value first
 
-            use std::sync::Arc;
-            if let Some(result) = self.get_readcell().with(|value| predicate(value).result()) {
-                return result;
-            }
+        use std::sync::Arc;
+        if let Some(result) = self.get_readcell().with(|value| predicate(value).result()) {
+            return result;
+        }
 
-            // Create a channel to bridge sync broadcast to async
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create a channel to bridge sync broadcast to async
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-            // Subscribe to change notifications
-            let _subscription = self.listen(Arc::new(move |_| {
-                let _ = tx.send(());
-            }));
+        // Subscribe to change notifications
+        let _subscription = self.listen(Arc::new(move |_| {
+            let _ = tx.send(());
+        }));
 
-            // Wait for notifications
-            loop {
-                match rx.recv().await {
-                    Some(_) => {
-                        if let Some(result) = self.get_readcell().with(|value| predicate(value).result()) {
-                            return result;
-                        }
-                    }
-                    None => {
-                        // Channel was closed, this should not happen since we hold &self
-                        break;
+        // Wait for notifications
+        loop {
+            match rx.recv().await {
+                Some(_) => {
+                    if let Some(result) = self.get_readcell().with(|value| predicate(value).result()) {
+                        return result;
                     }
                 }
+                None => {
+                    // Channel was closed, this should not happen since we hold &self
+                    break;
+                }
             }
-
-            // This should never happen since the signal cannot be dropped while we hold &self
-            unreachable!("Subscription channel closed unexpectedly - this should not be possible");
         }
+
+        // This should never happen since the signal cannot be dropped while we hold &self
+        unreachable!("Subscription channel closed unexpectedly - this should not be possible");
     }
 }

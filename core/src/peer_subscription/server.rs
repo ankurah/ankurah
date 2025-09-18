@@ -1,5 +1,5 @@
 use ankurah_proto::{self as proto, Attested};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     error::SubscriptionError,

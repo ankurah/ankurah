@@ -142,5 +142,5 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
             }
     };
-    expanded.into()
+    expanded
 }

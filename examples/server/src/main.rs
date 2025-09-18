@@ -74,12 +74,12 @@ async fn log_generation_task(node: Node<SledStorageEngine, PermissiveAgent>) -> 
             let message = match level {
                 LogLevel::Info => format!("Processing request #{}", log_counter),
                 LogLevel::Warn => format!("Slow query detected ({}ms)", 500 + (log_counter % 1000)),
-                LogLevel::Error => format!("Connection timeout to external service"),
+                LogLevel::Error => "Connection timeout to external service".to_string(),
                 LogLevel::Debug => format!("Cache hit for key: user_{}", log_counter % 100),
                 LogLevel::Trace => format!("Trace message {}", log_counter),
             };
 
-            let payload = if log_counter % 3 == 0 {
+            let payload = if log_counter.is_multiple_of(3) {
                 Payload::Json(serde_json::json!({
                     "request_id": format!("req_{}", log_counter),
                     "duration_ms": log_counter % 1000,
