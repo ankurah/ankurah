@@ -1,17 +1,5 @@
 use crate::collation::Collatable;
-
-// DEPRECATED: Use PropertyValue instead
-
-/// A dynamically typed value
-/// This is a short term expedience. Ideally we would NOT have one canonical set of types, but rather a pairwise mapping between the
-/// storage engine types and the backend types.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    String(String),
-    Integer(i64),
-    Float(f64),
-    Boolean(bool),
-}
+use crate::value::Value;
 
 impl Collatable for Value {
     fn to_bytes(&self) -> Vec<u8> {
