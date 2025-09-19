@@ -37,8 +37,8 @@ impl<'a> SledCollectionKeyScanner<'a> {
         let primary_key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
                 column: "id".to_string(),
-                direction: IndexDirection::Asc, // Primary keys are always ascending
-                value_type: ValueType::Binary,  // EntityId is 16-byte binary
+                direction: IndexDirection::Asc,  // Primary keys are always ascending
+                value_type: ValueType::EntityId, // EntityId type
                 nulls: None,
                 collation: None,
             }],
@@ -99,8 +99,8 @@ impl<'a> SledCollectionScanner<'a> {
         let primary_key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
                 column: "id".to_string(),
-                direction: IndexDirection::Asc, // Primary keys are always ascending
-                value_type: ValueType::Binary,  // EntityId is 16-byte binary
+                direction: IndexDirection::Asc,  // Primary keys are always ascending
+                value_type: ValueType::EntityId, // EntityId type
                 nulls: None,
                 collation: None,
             }],

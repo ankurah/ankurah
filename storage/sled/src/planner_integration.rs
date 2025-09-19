@@ -2,7 +2,7 @@
 
 use ankurah_core::value::ValueType;
 use ankurah_core::{collation::Collatable, value::Value};
-use ankurah_storage_common::{Endpoint, IndexDirection, KeyBounds, KeyDatum, KeySpec};
+use ankurah_storage_common::{Endpoint, KeyBounds, KeyDatum, KeySpec};
 
 use crate::error::IndexError;
 
@@ -328,7 +328,7 @@ pub fn encode_component_for_sled(value: &Value, descending: bool) -> Vec<u8> {
                 // ASC: [0x50][escaped bytes][0x00]
                 let mut out = Vec::with_capacity(1 + bytes.len() + 1);
                 out.push(0x50u8);
-                for &b in bytes {
+                for &b in bytes.iter() {
                     if b == 0x00 {
                         out.push(0x00);
                         out.push(0xFF);
@@ -342,7 +342,7 @@ pub fn encode_component_for_sled(value: &Value, descending: bool) -> Vec<u8> {
                 // DESC: [0x50][inv(bytes) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
                 let mut out = Vec::with_capacity(1 + bytes.len() + 1);
                 out.push(0x50u8);
-                for &b in bytes {
+                for &b in bytes.iter() {
                     let inv = 0xFFu8.wrapping_sub(b);
                     if inv == 0xFF {
                         out.push(0xFF);
@@ -361,12 +361,10 @@ pub fn encode_component_for_sled(value: &Value, descending: bool) -> Vec<u8> {
 
 /// Type-aware component encoding without type tags - requires KeySpec for type validation
 pub fn encode_component_typed(value: &Value, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
-    // Validate that the value matches the expected type
-    if ValueType::of(value) != expected_type {
-        return Err(IndexError::TypeMismatch(expected_type, ValueType::of(value)));
-    }
+    // Cast value to expected type (short-circuits if types already match)
+    let value = value.cast_to(expected_type).map_err(|_| IndexError::TypeMismatch(expected_type, ValueType::of(value)))?;
 
-    match (value, expected_type) {
+    match (&value, expected_type) {
         (Value::String(s), ValueType::String) => {
             if !descending {
                 // ASC: [escaped UTF-8][0x00] - no type tag needed
@@ -412,11 +410,21 @@ pub fn encode_component_typed(value: &Value, expected_type: ValueType, descendin
             let b = value.to_bytes()[0];
             Ok(vec![if !descending { b } else { 0xFFu8.wrapping_sub(b) }])
         }
+        (Value::EntityId(entity_id), ValueType::EntityId) => {
+            // EntityId is encoded as 16-byte binary
+            let bytes = entity_id.to_bytes();
+            if !descending {
+                Ok(bytes.to_vec())
+            } else {
+                // FIXME - validate this is the correct inversion
+                Ok(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)).collect())
+            }
+        }
         (Value::Object(bytes) | Value::Binary(bytes), ValueType::Binary) => {
             if !descending {
                 // ASC: [escaped bytes][0x00] - no type tag needed
                 let mut out = Vec::with_capacity(bytes.len() + 1);
-                for &b in bytes {
+                for &b in bytes.iter() {
                     if b == 0x00 {
                         out.push(0x00);
                         out.push(0xFF);
@@ -429,7 +437,7 @@ pub fn encode_component_typed(value: &Value, expected_type: ValueType, descendin
             } else {
                 // DESC: [inv(bytes) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
                 let mut out = Vec::with_capacity(bytes.len() + 2);
-                for &b in bytes {
+                for &b in bytes.iter() {
                     let inv = 0xFFu8.wrapping_sub(b);
                     if inv == 0xFF {
                         out.push(0xFF);
@@ -443,7 +451,7 @@ pub fn encode_component_typed(value: &Value, expected_type: ValueType, descendin
                 Ok(out)
             }
         }
-        _ => Err(IndexError::TypeMismatch(expected_type, ValueType::of(value))),
+        _ => Err(IndexError::TypeMismatch(expected_type, ValueType::of(&value))),
     }
 }
 
