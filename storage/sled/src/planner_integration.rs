@@ -1,7 +1,8 @@
 // Refactored planner integration - cleaner and more cohesive
 
-use ankurah_core::{collation::Collatable, property::PropertyValue};
-use ankurah_storage_common::{Endpoint, IndexDirection, KeyBounds, KeyDatum, KeySpec, ValueType};
+use ankurah_core::value::ValueType;
+use ankurah_core::{collation::Collatable, value::Value};
+use ankurah_storage_common::{Endpoint, IndexDirection, KeyBounds, KeyDatum, KeySpec};
 
 use crate::error::IndexError;
 
@@ -68,12 +69,12 @@ pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec) -> Resul
 }
 
 fn convert_to_physical_bounds(
-    lower_tuple: Vec<PropertyValue>,
-    upper_tuple: Vec<PropertyValue>,
+    lower_tuple: Vec<Value>,
+    upper_tuple: Vec<Value>,
     lower_open: bool,
     upper_open: bool,
     eq_prefix_len: usize,
-    eq_prefix_values: Vec<PropertyValue>,
+    eq_prefix_values: Vec<Value>,
     key_spec: &KeySpec,
 ) -> Result<SledRangeBounds, IndexError> {
     // Case 1: Equality bounds
@@ -122,12 +123,12 @@ fn convert_to_physical_bounds(
 }
 
 fn handle_desc_inequality(
-    lower_tuple: Vec<PropertyValue>,
-    upper_tuple: Vec<PropertyValue>,
+    lower_tuple: Vec<Value>,
+    upper_tuple: Vec<Value>,
     lower_open: bool,
     upper_open: bool,
     eq_prefix_len: usize,
-    eq_prefix_values: Vec<PropertyValue>,
+    eq_prefix_values: Vec<Value>,
     key_spec: &KeySpec,
 ) -> Result<SledRangeBounds, IndexError> {
     // DESC swaps logical lower/upper to physical upper/lower
@@ -193,12 +194,12 @@ fn handle_desc_inequality(
 }
 
 fn handle_general_bounds(
-    lower_tuple: Vec<PropertyValue>,
-    upper_tuple: Vec<PropertyValue>,
+    lower_tuple: Vec<Value>,
+    upper_tuple: Vec<Value>,
     lower_open: bool,
     upper_open: bool,
     eq_prefix_len: usize,
-    eq_prefix_values: Vec<PropertyValue>,
+    eq_prefix_values: Vec<Value>,
     key_spec: &KeySpec,
 ) -> Result<SledRangeBounds, IndexError> {
     // Standard ASC bounds or multi-component bounds
@@ -243,9 +244,9 @@ fn handle_general_bounds(
 }
 
 /// Encode a single component for Sled storage.
-pub fn encode_component_for_sled(value: &PropertyValue, descending: bool) -> Vec<u8> {
+pub fn encode_component_for_sled(value: &Value, descending: bool) -> Vec<u8> {
     match value {
-        PropertyValue::String(s) => {
+        Value::String(s) => {
             if !descending {
                 // ASC: [0x10][escaped UTF-8][0x00]
                 let mut out = Vec::with_capacity(1 + s.len() + 1);
@@ -278,7 +279,7 @@ pub fn encode_component_for_sled(value: &PropertyValue, descending: bool) -> Vec
                 out
             }
         }
-        PropertyValue::I16(_) | PropertyValue::I32(_) | PropertyValue::I64(_) => {
+        Value::I16(_) | Value::I32(_) | Value::I64(_) => {
             // Integers are encoded big-endian (order-preserving). DESC: invert payload bytes.
             let mut out = Vec::with_capacity(1 + 8);
             out.push(0x20u8);
@@ -290,7 +291,19 @@ pub fn encode_component_for_sled(value: &PropertyValue, descending: bool) -> Vec
             }
             out
         }
-        PropertyValue::Bool(_) => {
+        Value::F64(_) => {
+            // F64 uses collation ordering (NaN sorts last, proper IEEE 754 ordering). DESC: invert payload bytes.
+            let mut out = Vec::with_capacity(1 + 8);
+            out.push(0x30u8);
+            let bytes = value.to_bytes();
+            if !descending {
+                out.extend_from_slice(&bytes);
+            } else {
+                out.extend(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)));
+            }
+            out
+        }
+        Value::Bool(_) => {
             // ASC: false(0) < true(1). DESC: invert payload to flip order.
             let mut out = Vec::with_capacity(1 + 1);
             out.push(0x40u8);
@@ -298,7 +311,19 @@ pub fn encode_component_for_sled(value: &PropertyValue, descending: bool) -> Vec
             out.push(if !descending { b } else { 0xFFu8.wrapping_sub(b) });
             out
         }
-        PropertyValue::Object(bytes) | PropertyValue::Binary(bytes) => {
+        Value::EntityId(entity_id) => {
+            // EntityId uses binary collation of the ULID bytes with prefix 0x35
+            let bytes = entity_id.to_bytes();
+            let mut out = Vec::with_capacity(1 + 16);
+            out.push(0x35u8);
+            if !descending {
+                out.extend_from_slice(&bytes);
+            } else {
+                out.extend(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)));
+            }
+            out
+        }
+        Value::Object(bytes) | Value::Binary(bytes) => {
             if !descending {
                 // ASC: [0x50][escaped bytes][0x00]
                 let mut out = Vec::with_capacity(1 + bytes.len() + 1);
@@ -335,14 +360,14 @@ pub fn encode_component_for_sled(value: &PropertyValue, descending: bool) -> Vec
 }
 
 /// Type-aware component encoding without type tags - requires KeySpec for type validation
-pub fn encode_component_typed(value: &PropertyValue, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
+pub fn encode_component_typed(value: &Value, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
     // Validate that the value matches the expected type
     if ValueType::of(value) != expected_type {
         return Err(IndexError::TypeMismatch(expected_type, ValueType::of(value)));
     }
 
     match (value, expected_type) {
-        (PropertyValue::String(s), ValueType::String) => {
+        (Value::String(s), ValueType::String) => {
             if !descending {
                 // ASC: [escaped UTF-8][0x00] - no type tag needed
                 let mut out = Vec::with_capacity(s.len() + 1);
@@ -373,7 +398,7 @@ pub fn encode_component_typed(value: &PropertyValue, expected_type: ValueType, d
                 Ok(out)
             }
         }
-        (PropertyValue::I16(_) | PropertyValue::I32(_) | PropertyValue::I64(_), ValueType::I16 | ValueType::I32 | ValueType::I64) => {
+        (Value::I16(_) | Value::I32(_) | Value::I64(_), ValueType::I16 | ValueType::I32 | ValueType::I64) => {
             // Integers are encoded big-endian (order-preserving). DESC: invert payload bytes.
             let bytes = value.to_bytes();
             if !descending {
@@ -382,12 +407,12 @@ pub fn encode_component_typed(value: &PropertyValue, expected_type: ValueType, d
                 Ok(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)).collect())
             }
         }
-        (PropertyValue::Bool(_), ValueType::Bool) => {
+        (Value::Bool(_), ValueType::Bool) => {
             // ASC: false(0) < true(1). DESC: invert payload to flip order.
             let b = value.to_bytes()[0];
             Ok(vec![if !descending { b } else { 0xFFu8.wrapping_sub(b) }])
         }
-        (PropertyValue::Object(bytes) | PropertyValue::Binary(bytes), ValueType::Binary) => {
+        (Value::Object(bytes) | Value::Binary(bytes), ValueType::Binary) => {
             if !descending {
                 // ASC: [escaped bytes][0x00] - no type tag needed
                 let mut out = Vec::with_capacity(bytes.len() + 1);
@@ -452,7 +477,7 @@ pub fn lex_successor(mut key: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// Type-aware encoding using KeySpec for validation and optimization
-pub fn encode_tuple_values_with_key_spec(values: &[PropertyValue], key_spec: &KeySpec) -> Result<Vec<u8>, IndexError> {
+pub fn encode_tuple_values_with_key_spec(values: &[Value], key_spec: &KeySpec) -> Result<Vec<u8>, IndexError> {
     let mut out = Vec::new();
     for (i, v) in values.iter().enumerate() {
         if i >= key_spec.keyparts.len() {
@@ -475,8 +500,8 @@ mod order_inversion_tests {
 
     #[test]
     fn string_inversion_reverses_order() {
-        let a = PropertyValue::String("Album".into());
-        let b = PropertyValue::String("Album-with-dashes".into());
+        let a = Value::String("Album".into());
+        let b = Value::String("Album-with-dashes".into());
         let asc_a = encode_component_for_sled(&a, false);
         let asc_b = encode_component_for_sled(&b, false);
         assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);
@@ -488,8 +513,8 @@ mod order_inversion_tests {
 
     #[test]
     fn string_with_nulls_roundtrips_and_orders() {
-        let a = PropertyValue::String("A\0B".into());
-        let b = PropertyValue::String("A\0B\0C".into());
+        let a = Value::String("A\0B".into());
+        let b = Value::String("A\0B\0C".into());
         let asc_a = encode_component_for_sled(&a, false);
         let asc_b = encode_component_for_sled(&b, false);
         assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);
@@ -501,8 +526,8 @@ mod order_inversion_tests {
 
     #[test]
     fn integers_inversion_reverses_order() {
-        let a = PropertyValue::I64(42);
-        let b = PropertyValue::I64(100);
+        let a = Value::I64(42);
+        let b = Value::I64(100);
         let asc_a = encode_component_for_sled(&a, false);
         let asc_b = encode_component_for_sled(&b, false);
         assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);
@@ -514,8 +539,8 @@ mod order_inversion_tests {
 
     #[test]
     fn binary_inversion_reverses_order() {
-        let a = PropertyValue::Binary(vec![0x00, 0x10, 0x20]);
-        let b = PropertyValue::Binary(vec![0x00, 0x10, 0x21]);
+        let a = Value::Binary(vec![0x00, 0x10, 0x20]);
+        let b = Value::Binary(vec![0x00, 0x10, 0x21]);
         let asc_a = encode_component_for_sled(&a, false);
         let asc_b = encode_component_for_sled(&b, false);
         assert!(cmp(&asc_a, &asc_b) == std::cmp::Ordering::Less);

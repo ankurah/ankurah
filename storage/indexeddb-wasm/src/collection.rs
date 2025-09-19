@@ -356,7 +356,7 @@ impl IndexedDBBucket {
         collection_id: &ankurah_proto::CollectionId,
         upper_open_ended: bool,
         eq_prefix_len: usize,
-        eq_prefix_values: Vec<ankurah_core::property::PropertyValue>,
+        eq_prefix_values: Vec<ankurah_core::value::Value>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
             res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
@@ -452,18 +452,20 @@ impl IndexedDBBucket {
 // - Implement IDBKeyRange.only() optimization for exact matches
 // - Add openKeyCursor support for key-only pre-filtering
 // - Enhanced type mismatch error handling and assertions
-fn propertyvalue_to_js(p: &ankurah_core::property::PropertyValue) -> JsValue {
+fn propertyvalue_to_js(p: &ankurah_core::value::Value) -> JsValue {
     match p {
-        ankurah_core::property::PropertyValue::I16(x) => JsValue::from_f64(*x as f64),
-        ankurah_core::property::PropertyValue::I32(x) => JsValue::from_f64(*x as f64),
-        ankurah_core::property::PropertyValue::I64(x) => {
+        ankurah_core::value::Value::I16(x) => JsValue::from_f64(*x as f64),
+        ankurah_core::value::Value::I32(x) => JsValue::from_f64(*x as f64),
+        ankurah_core::value::Value::I64(x) => {
             // Order-preserving string encoding for i64 (matches planner_integration)
             let u = (*x as i128) - (i64::MIN as i128);
             JsValue::from_str(&format!("{:020}", u))
         }
-        ankurah_core::property::PropertyValue::Bool(b) => JsValue::from_f64(if *b { 1.0 } else { 0.0 }),
-        ankurah_core::property::PropertyValue::String(s) => JsValue::from_str(s),
-        ankurah_core::property::PropertyValue::Object(bytes) | ankurah_core::property::PropertyValue::Binary(bytes) => {
+        ankurah_core::value::Value::F64(x) => JsValue::from_f64(*x),
+        ankurah_core::value::Value::Bool(b) => JsValue::from_f64(if *b { 1.0 } else { 0.0 }),
+        ankurah_core::value::Value::String(s) => JsValue::from_str(s),
+        ankurah_core::value::Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
+        ankurah_core::value::Value::Object(bytes) | ankurah_core::value::Value::Binary(bytes) => {
             let u8_array = unsafe { js_sys::Uint8Array::view(bytes) };
             u8_array.buffer().into()
         }

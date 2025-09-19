@@ -5,7 +5,7 @@ use crate::{
     property::{
         backend::{LWWBackend, PropertyBackend},
         traits::{FromActiveType, FromEntity, PropertyError},
-        InitializeWith, Property, PropertyName, PropertyValue,
+        InitializeWith, Property, PropertyName, Value,
     },
 };
 
@@ -40,7 +40,7 @@ impl<T: Property> LWW<T> {
         T::from_value(value)
     }
 
-    pub fn get_value(&self) -> Option<PropertyValue> { self.backend.get(&self.property_name) }
+    pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property_name) }
 }
 
 impl<T: Property> FromEntity for LWW<T> {

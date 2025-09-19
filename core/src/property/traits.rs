@@ -4,7 +4,7 @@ use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
 
 use thiserror::Error;
 
-use super::PropertyValue;
+use super::Value;
 
 pub trait InitializeWith<T> {
     fn initialize_with(entity: &Entity, property_name: PropertyName, value: &T) -> Self;
@@ -24,7 +24,7 @@ pub enum PropertyError {
     #[error("retrieval error: {0}")]
     RetrievalError(crate::error::RetrievalError),
     #[error("invalid variant `{given}` for `{ty}`")]
-    InvalidVariant { given: PropertyValue, ty: String },
+    InvalidVariant { given: Value, ty: String },
     #[error("invalid value `{value}` for `{ty}`")]
     InvalidValue { value: String, ty: String },
     #[error("transaction is no longer alive")]

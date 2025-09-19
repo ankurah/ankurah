@@ -8,7 +8,7 @@ The Planner generates all possible index scan plans for a query. Each plan repre
 
 All core data structures are now implemented in `planner.rs`. Key points:
 
-- Uses `PropertyValue` from `ankurah_core::property` for bound values
+- Uses `Value` from `ankurah_core::value` for bound values
 - Uses `remaining_predicate` field name (not `remaining_predicate`)
 - All structs are public with appropriate derives
 

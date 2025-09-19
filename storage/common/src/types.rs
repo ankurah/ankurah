@@ -1,4 +1,4 @@
-use ankurah_core::property::PropertyValue;
+use ankurah_core::value::{Value, ValueType};
 use serde::{Deserialize, Serialize};
 
 use crate::index_spec::KeySpec;
@@ -41,35 +41,11 @@ pub enum ScanDirection {
 }
 
 // --- Types & sentinels -------------------------------------------------------
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ValueType {
-    I16,
-    I32,
-    I64,
-    Bool,
-    String,
-    Object,
-    Binary,
-}
-
-impl ValueType {
-    pub fn of(v: &PropertyValue) -> Self {
-        match v {
-            PropertyValue::I16(_) => ValueType::I16,
-            PropertyValue::I32(_) => ValueType::I32,
-            PropertyValue::I64(_) => ValueType::I64,
-            PropertyValue::Bool(_) => ValueType::Bool,
-            PropertyValue::String(_) => ValueType::String,
-            PropertyValue::Object(_) => ValueType::Object,
-            PropertyValue::Binary(_) => ValueType::Binary,
-        }
-    }
-}
 
 /// Planner-only atom for a single column position (PG: like a Datum + flags).
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyDatum {
-    Val(PropertyValue),
+    Val(Value),
     NegInfinity(ValueType), // -∞ for this column’s type
     PosInfinity(ValueType), // +∞ for this column’s type
 }
@@ -83,8 +59,8 @@ impl KeyDatum {
     }
 }
 
-impl From<PropertyValue> for KeyDatum {
-    fn from(v: PropertyValue) -> Self { KeyDatum::Val(v) }
+impl From<Value> for KeyDatum {
+    fn from(v: Value) -> Self { KeyDatum::Val(v) }
 }
 
 // --- Endpoints & per-column bounds (PG: per-column ScanKey / bound) ----------
@@ -98,8 +74,8 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
-    pub fn incl(v: PropertyValue) -> Self { Endpoint::Value { datum: KeyDatum::Val(v), inclusive: true } }
-    pub fn excl(v: PropertyValue) -> Self { Endpoint::Value { datum: KeyDatum::Val(v), inclusive: false } }
+    pub fn incl(v: Value) -> Self { Endpoint::Value { datum: KeyDatum::Val(v), inclusive: true } }
+    pub fn excl(v: Value) -> Self { Endpoint::Value { datum: KeyDatum::Val(v), inclusive: false } }
 }
 
 /// Bound for a single index column, in index key order (PG: per keypart).
@@ -129,6 +105,6 @@ impl KeyBounds {
 /// lower/upper: (tuple, open?) where open==true means exclusive.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalRange {
-    pub lower: Option<(Vec<PropertyValue>, bool)>, // None => unbounded low
-    pub upper: Option<(Vec<PropertyValue>, bool)>, // None => unbounded high
+    pub lower: Option<(Vec<Value>, bool)>, // None => unbounded low
+    pub upper: Option<(Vec<Value>, bool)>, // None => unbounded high
 }

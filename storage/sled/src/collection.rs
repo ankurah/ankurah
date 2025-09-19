@@ -9,7 +9,7 @@ use ankurah_core::{
     EntityId,
 };
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
-use ankurah_storage_common::{filtering::GetPropertyValueStream, KeyBounds, KeySpec, Plan, Planner, PlannerConfig, ScanDirection};
+use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, KeySpec, Plan, Planner, PlannerConfig, ScanDirection};
 use async_trait::async_trait;
 
 use tokio::task;
@@ -122,7 +122,7 @@ impl SledStorageCollection {
         let entity = TemporaryEntity::new(entity_id, collection, &sfrag.state)?;
 
         // Compact property IDs and materialized list
-        let mut mat: Vec<(u32, ankurah_core::property::PropertyValue)> = Vec::new();
+        let mut mat: Vec<(u32, ankurah_core::value::Value)> = Vec::new();
         for (name, opt_val) in entity.values().into_iter() {
             if let Some(val) = opt_val {
                 mat.push((self.database.property_manager.get_property_id(&name)?, val));
@@ -130,7 +130,7 @@ impl SledStorageCollection {
         }
 
         // 2b) Read old materialization for index maintenance
-        let old_mat: Option<Vec<(u32, ankurah_core::property::PropertyValue)>> =
+        let old_mat: Option<Vec<(u32, ankurah_core::value::Value)>> =
             match self.tree.get(entity_id.to_bytes()).map_err(|e| MutationError::UpdateFailed(Box::new(e)))? {
                 Some(ivec) => Some(bincode::deserialize(&ivec)?),
                 None => None,

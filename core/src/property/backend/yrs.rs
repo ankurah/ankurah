@@ -12,7 +12,7 @@ use crate::{
     error::{MutationError, StateError},
     property::{
         backend::{Operation, PropertyBackend},
-        PropertyName, PropertyValue,
+        PropertyName, Value,
     },
 };
 
@@ -81,7 +81,7 @@ impl YrsBackend {
         Ok(())
     }
 
-    fn get_property_string(&self, trx: &yrs::Transaction, property_name: &PropertyName) -> Option<PropertyValue> {
+    fn get_property_string(&self, trx: &yrs::Transaction, property_name: &PropertyName) -> Option<Value> {
         let value = match trx.get_text(property_name.clone()) {
             Some(text_ref) => {
                 let text = text_ref.get_string(trx);
@@ -90,7 +90,7 @@ impl YrsBackend {
             None => None,
         };
 
-        value.map(PropertyValue::String)
+        value.map(Value::String)
     }
 }
 
@@ -112,12 +112,12 @@ impl PropertyBackend for YrsBackend {
         root_refs.map(|(name, _)| name.to_owned()).collect()
     }
 
-    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
+    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
         let trx = Transact::transact(&self.doc);
         self.get_property_string(&trx, property_name)
     }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
+    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
         let properties = self.properties();
 
         let mut values = BTreeMap::new();

@@ -12,7 +12,7 @@ pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
 
-use super::{PropertyName, PropertyValue};
+use super::{PropertyName, Value};
 
 // TODO - implement a property backend value iterator so we don't have to alloc a HashMap for every call to values()
 
@@ -22,11 +22,11 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn fork(&self) -> Arc<dyn PropertyBackend>;
 
     fn properties(&self) -> Vec<PropertyName>;
-    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> {
+    fn property_value(&self, property_name: &PropertyName) -> Option<Value> {
         let mut map = self.property_values();
         map.remove(property_name).flatten()
     }
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>>;
+    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>>;
 
     /// Unique property backend identifier.
     fn property_backend_name() -> String

@@ -54,16 +54,17 @@ pub struct LogEntry {
 //     fn deref(&self) -> &Self::Target { &self.0 }
 // }
 
-// use ankurah::property::{Property, PropertyError, PropertyValue};
+// use ankurah::property::{Property, PropertyError};
+// use ankurah::value::Value;
 // impl Property for TimeStamp {
-//     fn into_value(&self) -> Result<Option<ankurah::property::PropertyValue>, ankurah::property::PropertyError> {
-//         Ok(Some(ankurah::property::PropertyValue::String(self.0.to_rfc3339())))
+//     fn into_value(&self) -> Result<Option<ankurah::value::Value>, ankurah::property::PropertyError> {
+//         Ok(Some(ankurah::value::Value::String(self.0.to_rfc3339())))
 //     }
 
-//     fn from_value(value: Option<ankurah::property::PropertyValue>) -> Result<Self, ankurah::property::PropertyError> {
+//     fn from_value(value: Option<ankurah::value::Value>) -> Result<Self, ankurah::property::PropertyError> {
 //         let value = value.ok_or(ankurah::property::PropertyError::Missing)?;
 //         let value = match value {
-//             PropertyValue::String(value) => value,
+//             Value::String(value) => value,
 //             _ => return Err(PropertyError::InvalidVariant { given: value, ty: "TimeStamp".to_string() }),
 //         };
 //         Ok(TimeStamp(

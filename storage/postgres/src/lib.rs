@@ -292,6 +292,7 @@ impl StorageCollection for PostgresBucket {
                     PGValue::SmallInt(number) => params.push(number),
                     PGValue::Integer(number) => params.push(number),
                     PGValue::BigInt(number) => params.push(number),
+                    PGValue::DoublePrecision(float) => params.push(float),
                     PGValue::Bytea(bytes) => params.push(bytes),
                     PGValue::Boolean(bool) => params.push(bool),
                 },

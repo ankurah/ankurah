@@ -9,18 +9,18 @@ pub fn derive_property_impl(input: TokenStream) -> TokenStream {
     // Generate the Property trait implementation
     let property_impl = quote! {
         impl ::ankurah::Property for #name {
-            fn into_value(&self) -> std::result::Result<Option<::ankurah::property::PropertyValue>, ::ankurah::property::PropertyError> {
+            fn into_value(&self) -> std::result::Result<Option<::ankurah::value::Value>, ::ankurah::property::PropertyError> {
                 let json_str = match ::ankurah::derive_deps::serde_json::to_string(self) {
                     Ok(s) => s,
                     Err(err) => return Err(::ankurah::property::PropertyError::SerializeError(Box::new(err))),
                 };
 
-                Ok(Some(::ankurah::property::PropertyValue::String(json_str)))
+                Ok(Some(::ankurah::value::Value::String(json_str)))
             }
 
-            fn from_value(value: Option<::ankurah::property::PropertyValue>) -> Result<Self, ::ankurah::property::PropertyError> {
+            fn from_value(value: Option<::ankurah::value::Value>) -> Result<Self, ::ankurah::property::PropertyError> {
                 match value {
-                    Some(::ankurah::property::PropertyValue::String(s)) => {
+                    Some(::ankurah::value::Value::String(s)) => {
                         match ::ankurah::derive_deps::serde_json::from_str(&s) {
                             Ok(value) => Ok(value),
                             Err(err) => Err(::ankurah::property::PropertyError::DeserializeError(Box::new(err))),

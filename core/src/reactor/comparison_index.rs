@@ -132,10 +132,10 @@ mod tests {
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::LessThan, sub0);
 
         // 8 should match nothing
-        assert_eq!(index.find_matching(Value::Integer(8)).collect::<Vec<_>>(), vec![]);
+        assert_eq!(index.find_matching(Value::I64(8)).collect::<Vec<_>>(), vec![]);
 
         // 7 should match sub0
-        assert_eq!(index.find_matching(Value::Integer(7)).collect::<Vec<_>>(), vec![sub0]);
+        assert_eq!(index.find_matching(Value::I64(7)).collect::<Vec<_>>(), vec![sub0]);
 
         let sub1 = proto::QueryId::test(1);
 
@@ -143,28 +143,28 @@ mod tests {
         index.add(ast::Literal::Integer(20), ast::ComparisonOperator::GreaterThan, sub1);
 
         // 20 should match nothing
-        assert_eq!(index.find_matching(Value::Integer(20)).collect::<Vec<_>>(), vec![]);
+        assert_eq!(index.find_matching(Value::I64(20)).collect::<Vec<_>>(), vec![]);
 
         // 21 should match sub1
-        assert_eq!(index.find_matching(Value::Integer(21)).collect::<Vec<_>>(), vec![sub1]);
+        assert_eq!(index.find_matching(Value::I64(21)).collect::<Vec<_>>(), vec![sub1]);
 
         // // Add subscriptions for various numeric comparisons
         index.add(ast::Literal::Integer(5), ast::ComparisonOperator::Equal, sub0);
 
         // // Test exact match (5)
-        assert_eq!(index.find_matching(Value::Integer(5)).collect::<Vec<_>>(), vec![sub0]);
+        assert_eq!(index.find_matching(Value::I64(5)).collect::<Vec<_>>(), vec![sub0]);
 
         // Less than 25 ------------------------------------------------------------
         index.add(ast::Literal::Integer(25), ast::ComparisonOperator::LessThan, sub0);
 
         // 22 should match sub0 (< 25) and sub1 (> 20)
-        assert_eq!(index.find_matching(Value::Integer(22)).collect::<Vec<_>>(), vec![sub0, sub1]);
+        assert_eq!(index.find_matching(Value::I64(22)).collect::<Vec<_>>(), vec![sub0, sub1]);
 
         // 25 should match sub1 because > 20
-        assert_eq!(index.find_matching(Value::Integer(25)).collect::<Vec<_>>(), vec![sub1]);
+        assert_eq!(index.find_matching(Value::I64(25)).collect::<Vec<_>>(), vec![sub1]);
 
         // 26 should match sub1 because > 20
-        assert_eq!(index.find_matching(Value::Integer(26)).collect::<Vec<_>>(), vec![sub1]);
+        assert_eq!(index.find_matching(Value::I64(26)).collect::<Vec<_>>(), vec![sub1]);
     }
 
     #[test]
@@ -174,7 +174,7 @@ mod tests {
         let sub0 = proto::QueryId::test(0);
         index.add(ast::Literal::Integer(8), ast::ComparisonOperator::NotEqual, sub0);
 
-        assert_eq!(index.find_matching(Value::Integer(8)).collect::<Vec<_>>(), vec![]);
-        assert_eq!(index.find_matching(Value::Integer(9)).collect::<Vec<_>>(), vec![sub0]);
+        assert_eq!(index.find_matching(Value::I64(8)).collect::<Vec<_>>(), vec![]);
+        assert_eq!(index.find_matching(Value::I64(9)).collect::<Vec<_>>(), vec![sub0]);
     }
 }

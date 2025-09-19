@@ -6,7 +6,7 @@ use ankurah_proto::{CollectionId, EntityId};
 pub struct MatEntity {
     pub(crate) id: EntityId,
     pub(crate) collection: CollectionId,
-    pub(crate) map: std::collections::BTreeMap<String, ankurah_core::property::PropertyValue>,
+    pub(crate) map: std::collections::BTreeMap<String, ankurah_core::value::Value>,
 }
 impl Filterable for MatEntity {
     fn collection(&self) -> &str { self.collection.as_str() }
@@ -15,12 +15,14 @@ impl Filterable for MatEntity {
             return Some(self.id.to_base64());
         }
         self.map.get(name).map(|v| match v {
-            ankurah_core::property::PropertyValue::String(s) => s.clone(),
-            ankurah_core::property::PropertyValue::I16(x) => x.to_string(),
-            ankurah_core::property::PropertyValue::I32(x) => x.to_string(),
-            ankurah_core::property::PropertyValue::I64(x) => x.to_string(),
-            ankurah_core::property::PropertyValue::Bool(b) => b.to_string(),
-            ankurah_core::property::PropertyValue::Object(bytes) | ankurah_core::property::PropertyValue::Binary(bytes) => {
+            ankurah_core::value::Value::String(s) => s.clone(),
+            ankurah_core::value::Value::I16(x) => x.to_string(),
+            ankurah_core::value::Value::I32(x) => x.to_string(),
+            ankurah_core::value::Value::I64(x) => x.to_string(),
+            ankurah_core::value::Value::F64(x) => x.to_string(),
+            ankurah_core::value::Value::Bool(b) => b.to_string(),
+            ankurah_core::value::Value::EntityId(entity_id) => entity_id.to_base64(),
+            ankurah_core::value::Value::Object(bytes) | ankurah_core::value::Value::Binary(bytes) => {
                 String::from_utf8_lossy(bytes).to_string()
             }
         })

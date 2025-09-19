@@ -1,8 +1,8 @@
 use crate::{CanonicalRange, Endpoint, KeyBounds, KeyDatum};
-use ankurah_core::property::PropertyValue;
+use ankurah_core::value::Value;
 
 /// Normalize IndexBounds to a CanonicalRange shape shared across KV engines
-pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<PropertyValue>) {
+pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<Value>) {
     let mut lower_tuple = Vec::new();
     let mut upper_tuple = Vec::new();
     let mut lower_open = false;

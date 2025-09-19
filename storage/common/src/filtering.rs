@@ -4,7 +4,7 @@ use ankql::selection::filter::Filterable;
 use crate::sorting::{LimitedStream, SortedStream, TopKStream};
 
 /// Stream of items that can provide property values for filtering, sorting, and limiting
-pub trait GetPropertyValueStream: Iterator + Sized
+pub trait ValueSetStream: Iterator + Sized
 where Self::Item: Filterable
 {
     /// Filter stream items using a predicate
@@ -23,7 +23,7 @@ where Self::Item: Filterable
     fn extract_ids(self) -> ExtractIdsStream<Self> { ExtractIdsStream::new(self) }
 }
 
-// Note: No blanket implementation - each concrete type implements GetPropertyValueStream individually
+// Note: No blanket implementation - each concrete type implements  ValueSetStream individually
 
 /// Wrapper for filtered streams - passes through items matching a predicate
 pub struct FilteredStream<I> {
@@ -56,21 +56,6 @@ where
     }
 }
 
-// FilteredStream should also implement GetPropertyValueStream for chaining
-// impl<I> GetPropertyValueStream for FilteredStream<I>
-// where
-//     I: Iterator,
-//     I::Item: Filterable,
-// {
-// }
-
-// impl<T, F> GetPropertyValueStream for T
-// where
-//     T: Iterator<Item = F>,
-//     F: Filterable,
-// {
-// }
-
 /// Wrapper for extracting entity IDs from materialized values
 pub struct ExtractIdsStream<I> {
     pub inner: I,
@@ -98,7 +83,7 @@ pub trait HasEntityId {
 // ExtractIdsStream implements EntityIdStream (via blanket impl) since it yields Result<EntityId, RetrievalError>
 
 // Blanket implementation for any Iterator with Filterable items
-impl<I> GetPropertyValueStream for I
+impl<I> ValueSetStream for I
 where
     I: Iterator,
     I::Item: Filterable,

@@ -1,4 +1,4 @@
-use ankurah_core::property::PropertyValue;
+use ankurah_core::value::Value;
 use ankurah_storage_common::{Endpoint, IndexDirection, IndexKeyPart, KeyBoundComponent, KeyBounds, KeySpec, ValueType};
 use ankurah_storage_sled::{error::IndexError, planner_integration::key_bounds_to_sled_range};
 
@@ -7,8 +7,8 @@ fn equality_bounds_use_prefix_guard_for_multi_key() -> Result<(), IndexError> {
     // name = "Alice" on a (name, age) index should use prefix guard
     let bounds = KeyBounds::new(vec![KeyBoundComponent {
         column: "name".to_string(),
-        low: Endpoint::incl(PropertyValue::String("Alice".to_string())),
-        high: Endpoint::incl(PropertyValue::String("Alice".to_string())),
+        low: Endpoint::incl(Value::String("Alice".to_string())),
+        high: Endpoint::incl(Value::String("Alice".to_string())),
     }]);
 
     let key_spec = KeySpec {
@@ -44,8 +44,8 @@ fn equality_bounds_use_tight_range_for_single_key() -> Result<(), IndexError> {
     // name = "Alice" on a single-key (name) index should use tight range
     let bounds = KeyBounds::new(vec![KeyBoundComponent {
         column: "name".to_string(),
-        low: Endpoint::incl(PropertyValue::String("Alice".to_string())),
-        high: Endpoint::incl(PropertyValue::String("Alice".to_string())),
+        low: Endpoint::incl(Value::String("Alice".to_string())),
+        high: Endpoint::incl(Value::String("Alice".to_string())),
     }]);
 
     let key_spec = KeySpec {
@@ -72,7 +72,7 @@ fn inequality_bounds_handle_desc_correctly() -> Result<(), IndexError> {
     // age > 25 on a DESC index should swap the bounds
     let bounds = KeyBounds::new(vec![KeyBoundComponent {
         column: "age".to_string(),
-        low: Endpoint::excl(PropertyValue::I32(25)),
+        low: Endpoint::excl(Value::I32(25)),
         high: Endpoint::UnboundedHigh(ankurah_storage_common::ValueType::I32),
     }]);
 
