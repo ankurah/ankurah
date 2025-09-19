@@ -129,6 +129,16 @@ impl SledStorageCollection {
             }
         }
 
+        // 2b) Read old materialization for index maintenance
+        let old_mat: Option<Vec<(u32, ankurah_core::property::PropertyValue)>> =
+            match self.tree.get(entity_id.to_bytes()).map_err(|e| MutationError::UpdateFailed(Box::new(e)))? {
+                Some(ivec) => Some(bincode::deserialize(&ivec)?),
+                None => None,
+            };
+
+        // 2c) Update indexes for this collection based on old/new mats
+        self.database.index_manager.update_indexes_for_entity(self.collection_id.as_str(), &entity_id, old_mat.as_deref(), &mat)?;
+
         let mat_bytes = bincode::serialize(&mat)?;
         self.tree.insert(entity_id.to_bytes(), mat_bytes).map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
 
