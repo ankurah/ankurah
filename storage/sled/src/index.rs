@@ -1,4 +1,7 @@
-use ankurah_core::{error::RetrievalError, property::PropertyValue};
+use ankurah_core::{
+    error::{MutationError, RetrievalError},
+    property::PropertyValue,
+};
 use ankurah_proto::EntityId;
 use ankurah_storage_common::{IndexDirection, IndexSpecMatch};
 use serde::{Deserialize, Serialize};
@@ -114,6 +117,43 @@ impl Index {
     pub fn name(&self) -> &str { &self.0.name }
     pub fn spec(&self) -> &ankurah_storage_common::KeySpec { &self.0.spec }
     pub fn created_at_unix_ms(&self) -> i64 { self.0.created_at_unix_ms }
+    /// Build the index key for an entity given a materialized property map.
+    /// Returns Ok(None) if any required key part is missing and the entity should not be indexed.
+    pub fn build_key(
+        &self,
+        eid: &EntityId,
+        properties: &[(u32, ankurah_core::property::PropertyValue)],
+    ) -> Result<Option<Vec<u8>>, IndexError> {
+        use std::collections::BTreeMap;
+
+        // Resolve pids using PropertyManager
+        let mut pids: Vec<u32> = Vec::with_capacity(self.0.spec.keyparts.len());
+        for kp in &self.0.spec.keyparts {
+            match self.0.property_manager.get_property_id(&kp.column) {
+                Ok(id) => pids.push(id),
+                Err(_e) => return Err(IndexError::PropertyNotFound(kp.column.clone())),
+            }
+        }
+
+        let map: BTreeMap<_, _> = properties.iter().cloned().collect();
+
+        // Build composite key using per-keypart direction from spec
+        let mut tuple_values: Vec<ankurah_core::property::PropertyValue> = Vec::with_capacity(self.0.spec.keyparts.len());
+        for pid in pids.iter() {
+            if let Some(val) = map.get(pid).cloned() {
+                tuple_values.push(val);
+            } else {
+                // Missing required value for this index
+                return Ok(None);
+            }
+        }
+
+        let mut key = encode_tuple_values_with_key_spec(&tuple_values, &self.0.spec)?;
+        // Tuple terminator to ensure composite < id boundary
+        key.push(0);
+        key.extend_from_slice(&eid.to_bytes());
+        Ok(Some(key))
+    }
     pub fn from_record(rec: IndexRecord, db: &Db, index_config_tree: Tree, property_manager: PropertyManager) -> Result<Self, IndexError> {
         Ok(Self(Arc::new(IndexInner {
             id: rec.id,
@@ -218,6 +258,55 @@ impl Index {
         self.backfill(db)?;
         self.set_status(BuildStatus::Ready);
         self.persist_snapshot()?;
+        Ok(())
+    }
+}
+
+impl IndexManager {
+    /// Update all indexes for a collection given an entity's old and new materializations.
+    /// - Removes old index entries that no longer apply
+    /// - Inserts new index entries that now apply
+    pub fn update_indexes_for_entity(
+        &self,
+        collection: &str,
+        eid: &EntityId,
+        old_mat: Option<&[(u32, ankurah_core::property::PropertyValue)]>,
+        new_mat: &[(u32, ankurah_core::property::PropertyValue)],
+    ) -> Result<(), MutationError> {
+        // Snapshot matching indexes
+        let indexes: Vec<Index> = {
+            let guard = self.indexes.read().unwrap();
+            guard.values().filter(|idx| idx.collection() == collection).cloned().collect()
+        };
+
+        for index in indexes.iter() {
+            let old_key = match old_mat {
+                Some(mat) => index.build_key(eid, mat)?,
+                None => None,
+            };
+            let new_key = index.build_key(eid, new_mat)?;
+
+            match (old_key.as_ref(), new_key.as_ref()) {
+                (Some(ok), Some(nk)) if ok == nk => {
+                    // No change for this index
+                }
+                (Some(ok), Some(nk)) => {
+                    // Key changed: remove old, insert new
+                    index.tree().remove(ok).map_err(IndexError::from)?;
+                    index.tree().insert(nk, &[]).map_err(IndexError::from)?;
+                }
+                (Some(ok), None) => {
+                    // No longer matches index
+                    index.tree().remove(ok).map_err(IndexError::from)?;
+                }
+                (None, Some(nk)) => {
+                    // Newly matches index
+                    index.tree().insert(nk, &[]).map_err(IndexError::from)?;
+                }
+                (None, None) => {}
+            }
+        }
+
         Ok(())
     }
 }
