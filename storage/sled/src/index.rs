@@ -1,9 +1,6 @@
-use ankurah_core::{
-    error::{MutationError, RetrievalError},
-    property::PropertyValue,
-};
+use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_proto::EntityId;
-use ankurah_storage_common::{IndexDirection, IndexSpecMatch};
+use ankurah_storage_common::IndexSpecMatch;
 use serde::{Deserialize, Serialize};
 use sled::{Db, Tree};
 use std::collections::HashMap;
@@ -125,7 +122,17 @@ impl Index {
         properties: &[(u32, ankurah_core::property::PropertyValue)],
     ) -> Result<Option<Vec<u8>>, IndexError> {
         use std::collections::BTreeMap;
+        let map: BTreeMap<_, _> = properties.iter().cloned().collect();
+        self.build_key_from_map(eid, &map)
+    }
 
+    /// Internal helper to build index key from a property map.
+    /// Shared between build_key and backfill to avoid duplication.
+    fn build_key_from_map(
+        &self,
+        eid: &EntityId,
+        property_map: &std::collections::BTreeMap<u32, ankurah_core::property::PropertyValue>,
+    ) -> Result<Option<Vec<u8>>, IndexError> {
         // Resolve pids using PropertyManager
         let mut pids: Vec<u32> = Vec::with_capacity(self.0.spec.keyparts.len());
         for kp in &self.0.spec.keyparts {
@@ -135,12 +142,10 @@ impl Index {
             }
         }
 
-        let map: BTreeMap<_, _> = properties.iter().cloned().collect();
-
         // Build composite key using per-keypart direction from spec
         let mut tuple_values: Vec<ankurah_core::property::PropertyValue> = Vec::with_capacity(self.0.spec.keyparts.len());
         for pid in pids.iter() {
-            if let Some(val) = map.get(pid).cloned() {
+            if let Some(val) = property_map.get(pid).cloned() {
                 tuple_values.push(val);
             } else {
                 // Missing required value for this index
@@ -194,38 +199,14 @@ impl Index {
     pub fn backfill(&self, db: &Db) -> Result<(), IndexError> {
         let coll_tree = db.open_tree(format!("collection_{}", &self.0.collection))?;
 
-        // Resolve pids using PropertyManager
-        let mut pids: Vec<u32> = Vec::with_capacity(self.0.spec.keyparts.len());
-        for kp in &self.0.spec.keyparts {
-            match self.0.property_manager.get_property_id(&kp.column) {
-                Ok(id) => pids.push(id),
-                Err(_e) => return Err(IndexError::PropertyNotFound(kp.column.clone())),
-            }
-        }
-
         for item in coll_tree.iter() {
             let (k, v) = item?;
             let eid = EntityId::from_bytes(k.as_ref().try_into().map_err(|_| IndexError::InvalidKeyLength)?);
             let mat: Vec<(u32, ankurah_core::property::PropertyValue)> = bincode::deserialize(&v)?;
             let map: std::collections::BTreeMap<_, _> = mat.into_iter().collect();
 
-            // Build composite key using per-keypart direction from spec
-            let mut tuple_parts_with_directions: Vec<(PropertyValue, IndexDirection)> = Vec::with_capacity(self.0.spec.keyparts.len());
-            for (i, pid) in pids.iter().enumerate() {
-                if let Some(val) = map.get(pid).cloned() {
-                    tuple_parts_with_directions.push((val, self.0.spec.keyparts[i].direction));
-                } else {
-                    // Missing a required keypart value; skip indexing this row
-                    tuple_parts_with_directions.clear();
-                    break;
-                }
-            }
-            if !tuple_parts_with_directions.is_empty() {
-                let values: Vec<PropertyValue> = tuple_parts_with_directions.iter().map(|(v, _)| v.clone()).collect();
-                let mut key = encode_tuple_values_with_key_spec(&values, &self.0.spec)?;
-                // Tuple terminator to ensure composite < id boundary
-                key.push(0);
-                key.extend_from_slice(&eid.to_bytes());
+            // Use shared key building logic
+            if let Some(key) = self.build_key_from_map(&eid, &map)? {
                 self.0.tree.insert(key, &[])?;
             }
         }
