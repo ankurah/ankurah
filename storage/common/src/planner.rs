@@ -1321,7 +1321,7 @@ mod tests {
                 plan!("__collection = 'album' AND age > 25 ORDER BY age DESC"),
                 vec![
                     Plan::Index {
-                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::I32)]),
+                        index_spec: KeySpec::new(vec![asc!("__collection", ValueType::String), asc!("age", ValueType::String)]),
                         scan_direction: ScanDirection::Reverse,
                         // from is excl because the inequality (age) is > 25
                         // to is incl because there is no age < ? in the predicate
