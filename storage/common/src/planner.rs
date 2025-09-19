@@ -1378,7 +1378,7 @@ mod tests {
                             asc!("__collection", ValueType::String),
                             asc!("name", ValueType::String),
                             desc!("year", ValueType::String),
-                            asc!("score", ValueType::I32)
+                            asc!("score", ValueType::String)
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
@@ -1638,7 +1638,7 @@ mod tests {
                         index_spec: KeySpec::new(vec![
                             asc!("__collection", ValueType::String),
                             asc!("age", ValueType::I32),
-                            asc!("score", ValueType::I32)
+                            asc!("score", ValueType::String)
                         ]), // equalities first, then inequalities, preserving order of appearance
                         scan_direction: ScanDirection::Forward,
                         // from is excl because the final inequality (score) is > 50
@@ -1802,7 +1802,7 @@ mod tests {
                             asc!("__collection", ValueType::String),
                             asc!("age", ValueType::I32),
                             asc!("name", ValueType::String),
-                            asc!("score", ValueType::I32)
+                            asc!("score", ValueType::String)
                         ]),
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album"), "age" => (30..=30)),
