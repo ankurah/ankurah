@@ -150,7 +150,8 @@ pub use ankurah_core::{
     policy::{self, PermissiveAgent},
     property::{self, Property},
     resultset::ResultSet,
-    storage, transaction,
+    storage, transaction, value,
+    value::{Value, ValueType},
 };
 
 // Re-export the derive macro

@@ -1,9 +1,9 @@
+use ankurah_core::value::ValueType;
 use ankurah_core::{
     error::{MutationError, RetrievalError},
     EntityId,
 };
 use ankurah_proto::EventId;
-use ankurah_storage_common::ValueType;
 use thiserror::Error;
 
 pub enum SledRetrievalError {

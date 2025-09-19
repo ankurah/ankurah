@@ -12,11 +12,11 @@ use crate::error::MutationError;
 use crate::error::RetrievalError;
 use crate::notice_info;
 use crate::policy::PolicyAgent;
-use crate::property::{backend::LWWBackend, PropertyValue};
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
 use crate::retrieval::LocalRetriever;
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
+use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
 
@@ -298,14 +298,14 @@ where
 }
 
 impl Property for proto::sys::Item {
-    fn into_value(&self) -> std::result::Result<Option<PropertyValue>, crate::property::PropertyError> {
-        Ok(Some(PropertyValue::String(
+    fn into_value(&self) -> std::result::Result<Option<Value>, crate::property::PropertyError> {
+        Ok(Some(Value::String(
             serde_json::to_string(self).map_err(|_| PropertyError::InvalidValue { value: "".to_string(), ty: "sys::Item".to_string() })?,
         )))
     }
 
-    fn from_value(value: Option<PropertyValue>) -> std::result::Result<Self, crate::property::PropertyError> {
-        if let Some(PropertyValue::String(string)) = value {
+    fn from_value(value: Option<Value>) -> std::result::Result<Self, crate::property::PropertyError> {
+        if let Some(Value::String(string)) = value {
             let item: proto::sys::Item = serde_json::from_str(&string)
                 .map_err(|_| PropertyError::InvalidValue { value: "".to_string(), ty: "sys::Item".to_string() })?;
             Ok(item)

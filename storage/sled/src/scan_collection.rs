@@ -1,8 +1,9 @@
 use crate::error::IndexError;
 use crate::planner_integration::{key_bounds_to_sled_range, SledRangeBounds};
 use crate::property::PropertyManager;
+use ankurah_core::value::ValueType;
 use ankurah_core::{error::RetrievalError, EntityId};
-use ankurah_storage_common::{traits::EntityIdStream, IndexDirection, IndexKeyPart, KeyBounds, KeySpec, ScanDirection, ValueType};
+use ankurah_storage_common::{traits::EntityIdStream, IndexDirection, IndexKeyPart, KeyBounds, KeySpec, ScanDirection};
 
 /// Scanner over a materialized collection tree yielding EntityId directly (for ID-only queries)
 pub struct SledCollectionKeyScanner<'a> {
@@ -136,7 +137,7 @@ impl<'a> Iterator for SledCollectionScanner<'a> {
         let entity_id = EntityId::from_bytes(key_bytes.as_ref().try_into().ok()?);
 
         // Decode materialized values from value
-        let property_values: Vec<(u32, ankurah_core::property::PropertyValue)> = match bincode::deserialize(&value_bytes) {
+        let property_values: Vec<(u32, ankurah_core::value::Value)> = match bincode::deserialize(&value_bytes) {
             Ok(values) => values,
             Err(_e) => return None, // Skip errors for now - TODO: proper error handling
         };
@@ -191,7 +192,7 @@ impl<S: EntityIdStream> Iterator for SledMaterializeIter<S> {
         };
 
         // Decode materialized values
-        let property_values: Vec<(u32, ankurah_core::property::PropertyValue)> = match bincode::deserialize(&value_bytes) {
+        let property_values: Vec<(u32, ankurah_core::value::Value)> = match bincode::deserialize(&value_bytes) {
             Ok(values) => values,
             Err(_e) => return None, // Skip errors for now - TODO: proper error handling
         };
@@ -216,6 +217,3 @@ impl<S: EntityIdStream> Iterator for SledMaterializeIter<S> {
         Some(crate::materialization::MatRow { id: entity_id, mat: mat_entity })
     }
 }
-
-// Implement GetPropertyValueStream for SledMaterializeIter so it can be used with filtering/sorting
-// impl<S: EntityIdStream> GetPropertyValueStream for SledMaterializeIter<S> {}

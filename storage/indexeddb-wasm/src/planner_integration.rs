@@ -1,11 +1,11 @@
-use ankurah_core::property::PropertyValue;
+use ankurah_core::value::Value;
 use ankurah_storage_common::{CanonicalRange, Endpoint, KeyBounds, KeyDatum, ScanDirection};
 use anyhow::Result;
 use wasm_bindgen::JsValue;
 
 /// Normalize IndexBounds to CanonicalRange following the playbook algorithm
 /// Returns (CanonicalRange, eq_prefix_len, eq_prefix_values)
-pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<PropertyValue>) {
+pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<Value>) {
     let mut lower_tuple = Vec::new();
     let mut upper_tuple = Vec::new();
     let mut lower_open = false;
@@ -124,16 +124,18 @@ pub fn to_idb_keyrange(canonical_range: &CanonicalRange) -> Result<(web_sys::Idb
 }
 
 /// Build JS key tuples from PropertyValue arrays (section 2.1 of playbook)
-fn idb_key_tuple(parts: &[PropertyValue]) -> Result<JsValue> {
+fn idb_key_tuple(parts: &[Value]) -> Result<JsValue> {
     let arr = js_sys::Array::new();
     for p in parts {
         let js_val = match p {
-            PropertyValue::I16(x) => JsValue::from_f64(*x as f64),
-            PropertyValue::I32(x) => JsValue::from_f64(*x as f64),
-            PropertyValue::I64(x) => encode_i64_for_idb(*x)?,
-            PropertyValue::Bool(b) => JsValue::from_f64(if *b { 1.0 } else { 0.0 }),
-            PropertyValue::String(s) => JsValue::from_str(s),
-            PropertyValue::Object(bytes) | PropertyValue::Binary(bytes) => {
+            Value::I16(x) => JsValue::from_f64(*x as f64),
+            Value::I32(x) => JsValue::from_f64(*x as f64),
+            Value::I64(x) => encode_i64_for_idb(*x)?,
+            Value::F64(x) => JsValue::from_f64(*x),
+            Value::Bool(b) => JsValue::from_f64(if *b { 1.0 } else { 0.0 }),
+            Value::String(s) => JsValue::from_str(s),
+            Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
+            Value::Object(bytes) | Value::Binary(bytes) => {
                 let u8_array = unsafe { js_sys::Uint8Array::view(bytes) };
                 u8_array.buffer().into()
             }
@@ -145,14 +147,14 @@ fn idb_key_tuple(parts: &[PropertyValue]) -> Result<JsValue> {
 
 /// Encode i64 for IndexedDB as order-preserving string (section 4.2 of playbook)
 fn encode_i64_for_idb(x: i64) -> Result<JsValue> {
-    const BIAS: i128 = (i64::MAX as i128) - (i64::MIN as i128);
+    // const BIAS: i128 = (i64::MAX as i128) - (i64::MIN as i128);
     let u = (x as i128) - (i64::MIN as i128); // [0 .. 2^64-1] as i128
     Ok(JsValue::from_str(&format!("{:020}", u))) // zero-padded => lex order == numeric
 }
 
 /// Convert Plan bounds to IndexedDB IdbKeyRange using the new IR pipeline
 /// Returns (IdbKeyRange, upper_open_ended_flag, eq_prefix_len, eq_prefix_values)
-pub fn plan_bounds_to_idb_range(bounds: &KeyBounds) -> Result<(web_sys::IdbKeyRange, bool, usize, Vec<PropertyValue>)> {
+pub fn plan_bounds_to_idb_range(bounds: &KeyBounds) -> Result<(web_sys::IdbKeyRange, bool, usize, Vec<Value>)> {
     // Step 1: Normalize IR to CanonicalRange
     let (canonical_range, eq_prefix_len, eq_prefix_values) = normalize(bounds);
 
@@ -174,7 +176,8 @@ pub fn scan_direction_to_cursor_direction(scan_direction: &ScanDirection) -> web
 mod tests {
     use super::*;
     use ankql::ast::Predicate;
-    use ankurah_storage_common::{IndexKeyPart, KeyBoundComponent, KeySpec, Plan, ValueType};
+    use ankurah_core::value::ValueType;
+    use ankurah_storage_common::{IndexKeyPart, KeyBoundComponent, KeySpec, Plan};
 
     #[test]
     fn test_plan_index_spec_name() {
@@ -213,25 +216,21 @@ mod tests {
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
                 column: "__collection".to_string(),
-                low: Endpoint::incl(PropertyValue::String("album".to_string())),
-                high: Endpoint::incl(PropertyValue::String("album".to_string())),
+                low: Endpoint::incl(Value::String("album".to_string())),
+                high: Endpoint::incl(Value::String("album".to_string())),
             },
-            KeyBoundComponent {
-                column: "age".to_string(),
-                low: Endpoint::incl(PropertyValue::I32(30)),
-                high: Endpoint::incl(PropertyValue::I32(30)),
-            },
+            KeyBoundComponent { column: "age".to_string(), low: Endpoint::incl(Value::I32(30)), high: Endpoint::incl(Value::I32(30)) },
         ]);
 
         let (canonical_range, eq_prefix_len, eq_prefix_values) = normalize(&bounds);
 
         // Should have both values in equality prefix
         assert_eq!(eq_prefix_len, 2);
-        assert_eq!(eq_prefix_values, vec![PropertyValue::String("album".to_string()), PropertyValue::I32(30)]);
+        assert_eq!(eq_prefix_values, vec![Value::String("album".to_string()), Value::I32(30)]);
 
         // Both lower and upper should be the same (exact match)
-        assert_eq!(canonical_range.lower, Some((vec![PropertyValue::String("album".to_string()), PropertyValue::I32(30)], false))); // closed bounds
-        assert_eq!(canonical_range.upper, Some((vec![PropertyValue::String("album".to_string()), PropertyValue::I32(30)], false)));
+        assert_eq!(canonical_range.lower, Some((vec![Value::String("album".to_string()), Value::I32(30)], false))); // closed bounds
+        assert_eq!(canonical_range.upper, Some((vec![Value::String("album".to_string()), Value::I32(30)], false)));
         // closed bounds
     }
 
@@ -241,12 +240,12 @@ mod tests {
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
                 column: "__collection".to_string(),
-                low: Endpoint::incl(PropertyValue::String("album".to_string())),
-                high: Endpoint::incl(PropertyValue::String("album".to_string())),
+                low: Endpoint::incl(Value::String("album".to_string())),
+                high: Endpoint::incl(Value::String("album".to_string())),
             },
             KeyBoundComponent {
                 column: "age".to_string(),
-                low: Endpoint::excl(PropertyValue::I32(25)),
+                low: Endpoint::excl(Value::I32(25)),
                 high: Endpoint::UnboundedHigh(ValueType::I32),
             },
         ]);
@@ -255,10 +254,10 @@ mod tests {
 
         // Should have one equality in prefix
         assert_eq!(eq_prefix_len, 1);
-        assert_eq!(eq_prefix_values, vec![PropertyValue::String("album".to_string())]);
+        assert_eq!(eq_prefix_values, vec![Value::String("album".to_string())]);
 
         // Lower bound should include equality + inequality
-        assert_eq!(canonical_range.lower, Some((vec![PropertyValue::String("album".to_string()), PropertyValue::I32(25)], true))); // open because > 25
+        assert_eq!(canonical_range.lower, Some((vec![Value::String("album".to_string()), Value::I32(25)], true))); // open because > 25
 
         // Upper bound should be None (open-ended)
         assert_eq!(canonical_range.upper, None);

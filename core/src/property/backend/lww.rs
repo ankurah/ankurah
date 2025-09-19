@@ -10,14 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
-    property::{backend::PropertyBackend, PropertyName, PropertyValue},
+    property::{backend::PropertyBackend, PropertyName, Value},
 };
 
 const LWW_DIFF_VERSION: u8 = 1;
 
 #[derive(Clone, Debug)]
 struct ValueEntry {
-    value: Option<PropertyValue>,
+    value: Option<Value>,
     committed: bool,
 }
 
@@ -41,12 +41,12 @@ impl Default for LWWBackend {
 impl LWWBackend {
     pub fn new() -> LWWBackend { Self { values: RwLock::new(BTreeMap::default()), field_broadcasts: Mutex::new(BTreeMap::new()) } }
 
-    pub fn set(&self, property_name: PropertyName, value: Option<PropertyValue>) {
+    pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
         let mut values = self.values.write().unwrap();
         values.insert(property_name, ValueEntry { value, committed: false });
     }
 
-    pub fn get(&self, property_name: &PropertyName) -> Option<PropertyValue> {
+    pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
         let values = self.values.read().unwrap();
         values.get(property_name).and_then(|entry| entry.value.clone())
     }
@@ -74,9 +74,9 @@ impl PropertyBackend for LWWBackend {
         values.keys().cloned().collect::<Vec<PropertyName>>()
     }
 
-    fn property_value(&self, property_name: &PropertyName) -> Option<PropertyValue> { self.get(property_name) }
+    fn property_value(&self, property_name: &PropertyName) -> Option<Value> { self.get(property_name) }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<PropertyValue>> {
+    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
         let values = self.values.read().unwrap();
         values.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect()
     }
@@ -91,7 +91,7 @@ impl PropertyBackend for LWWBackend {
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<PropertyValue>>>(state_buffer)?;
+        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
         let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
@@ -123,7 +123,7 @@ impl PropertyBackend for LWWBackend {
             let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
             match version {
                 1 => {
-                    let changes: BTreeMap<PropertyName, Option<PropertyValue>> = bincode::deserialize(&data)?;
+                    let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
 
                     let mut values = self.values.write().unwrap();
                     for (property_name, new_value) in changes {

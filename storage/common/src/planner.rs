@@ -5,7 +5,7 @@ use crate::{
     types::*,
 };
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Predicate};
-use ankurah_core::property::PropertyValue;
+use ankurah_core::value::{Value, ValueType};
 use indexmap::IndexMap;
 
 #[derive(Debug, Clone)]
@@ -126,8 +126,8 @@ impl Planner {
     // ORDER-FIRST: [EQ …] + maximal OB prefix (capability-aware). Bounds: EQ only.
     fn build_order_first_plan(
         &self,
-        equalities: &[(String, PropertyValue)],
-        inequalities: &IndexMap<String, Vec<(ComparisonOperator, PropertyValue)>>,
+        equalities: &[(String, Value)],
+        inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
         order_by: &[ankql::ast::OrderByItem],
         conjuncts: &[Predicate],
     ) -> Option<Plan> {
@@ -214,8 +214,8 @@ impl Planner {
     // INEQ-FIRST: [EQ …] + primary INEQ (bounded). Do NOT append ORDER BY columns; always spill them.
     fn build_ineq_first_plan(
         &self,
-        equalities: &[(String, PropertyValue)],
-        inequalities: &IndexMap<String, Vec<(ComparisonOperator, PropertyValue)>>,
+        equalities: &[(String, Value)],
+        inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
         order_by: &[ankql::ast::OrderByItem],
         conjuncts: &[Predicate],
     ) -> Option<Plan> {
@@ -233,7 +233,7 @@ impl Planner {
         // but it does not change correctness and the tests expect the simpler invariant-preserving form.
         let mut index_keyparts: Vec<IndexKeyPart> =
             equalities.iter().map(|(f, v)| IndexKeyPart::asc(f.clone(), ValueType::of(v))).collect();
-        let primary_value = &primary.1[0].1; // Get PropertyValue from first inequality
+        let primary_value = &primary.1[0].1; // Get Value from first inequality
         index_keyparts.push(IndexKeyPart::asc(primary.0.to_string(), ValueType::of(primary_value))); // Use actual primary key value type
 
         // Bounds: EQ + primary INEQ (most-restrictive)
@@ -275,9 +275,9 @@ impl Planner {
         &self,
         conjuncts: &[Predicate],
         primary_key: &str,
-    ) -> (Vec<(String, PropertyValue)>, IndexMap<String, Vec<(ComparisonOperator, PropertyValue)>>) {
+    ) -> (Vec<(String, Value)>, IndexMap<String, Vec<(ComparisonOperator, Value)>>) {
         let mut equalities = Vec::new();
-        let mut inequalities: IndexMap<String, Vec<(ComparisonOperator, PropertyValue)>> = IndexMap::new();
+        let mut inequalities: IndexMap<String, Vec<(ComparisonOperator, Value)>> = IndexMap::new();
 
         for conjunct in conjuncts {
             if let Some((field, op, value)) = self.extract_comparison(conjunct) {
@@ -308,7 +308,7 @@ impl Planner {
     }
 
     /// Extract field name, operator, and value from a comparison predicate
-    fn extract_comparison(&self, predicate: &Predicate) -> Option<(String, ComparisonOperator, PropertyValue)> {
+    fn extract_comparison(&self, predicate: &Predicate) -> Option<(String, ComparisonOperator, Value)> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 // Extract field name from left side
@@ -319,7 +319,7 @@ impl Planner {
 
                 // Extract value from right side
                 let value = match right.as_ref() {
-                    Expr::Literal(literal) => self.literal_to_property_value(literal)?,
+                    Expr::Literal(literal) => literal.into(),
                     _ => return None,
                 };
 
@@ -329,30 +329,13 @@ impl Planner {
         }
     }
 
-    /// Convert AST literal to PropertyValue
-    fn literal_to_property_value(&self, literal: &ankql::ast::Literal) -> Option<PropertyValue> {
-        match literal {
-            ankql::ast::Literal::String(s) => Some(PropertyValue::from(s.clone())),
-            ankql::ast::Literal::Integer(i) => {
-                // Convert i64 to i32 if it fits, otherwise use i64
-                if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
-                    Some(PropertyValue::from(*i as i32))
-                } else {
-                    Some(PropertyValue::from(*i))
-                }
-            }
-            ankql::ast::Literal::Float(f) => Some(PropertyValue::from(*f as i32)), // Convert f64 to i32
-            ankql::ast::Literal::Boolean(b) => Some(PropertyValue::from(*b)),
-        }
-    }
-
     // removed: legacy generate_order_by_plan (superseded by ORDER-FIRST/INEQ-FIRST)
 
     fn generate_inequality_plan_with_order_by(
         &self,
-        equalities: &[(String, PropertyValue)],
+        equalities: &[(String, Value)],
         inequality_field: &str,
-        inequalities: &IndexMap<String, Vec<(ComparisonOperator, PropertyValue)>>,
+        inequalities: &IndexMap<String, Vec<(ComparisonOperator, Value)>>,
         conjuncts: &[Predicate],
         order_by: Option<&[ankql::ast::OrderByItem]>,
     ) -> Option<Plan> {
@@ -364,7 +347,7 @@ impl Planner {
 
         // Add the inequality field
         let inequality_values = inequalities.get(inequality_field)?;
-        let first_inequality_value = &inequality_values[0].1; // Get PropertyValue from first inequality
+        let first_inequality_value = &inequality_values[0].1; // Get Value from first inequality
         index_keyparts.push(IndexKeyPart::asc(inequality_field.to_string(), ValueType::of(first_inequality_value)));
 
         // Build bounds
@@ -404,7 +387,7 @@ impl Planner {
     }
 
     /// Generate plan for equality-only queries
-    fn generate_equality_plan(&self, equalities: &[(String, PropertyValue)], conjuncts: &[Predicate]) -> Option<Plan> {
+    fn generate_equality_plan(&self, equalities: &[(String, Value)], conjuncts: &[Predicate]) -> Option<Plan> {
         // Add all equality fields
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
@@ -437,8 +420,8 @@ impl Planner {
     /// Build bounds based on equalities and optional inequality
     fn build_bounds(
         &self,
-        equalities: &[(String, PropertyValue)],
-        inequality: Option<(&str, &Vec<(ComparisonOperator, PropertyValue)>)>,
+        equalities: &[(String, Value)],
+        inequality: Option<(&str, &Vec<(ComparisonOperator, Value)>)>,
         index_keyparts: &[IndexKeyPart],
     ) -> Option<KeyBounds> {
         let mut keypart_bounds = Vec::new();
@@ -522,13 +505,14 @@ impl Planner {
             (Endpoint::Value { datum: cand_datum, inclusive: cand_incl }, Endpoint::Value { datum: curr_datum, inclusive: curr_incl }) => {
                 match (cand_datum, curr_datum) {
                     (KeyDatum::Val(cand_val), KeyDatum::Val(curr_val)) => {
-                        match cand_val.cmp(curr_val) {
-                            std::cmp::Ordering::Greater => true, // Higher value is more restrictive for lower bound
-                            std::cmp::Ordering::Equal => {
+                        match cand_val.partial_cmp(curr_val) {
+                            Some(std::cmp::Ordering::Greater) => true, // Higher value is more restrictive for lower bound
+                            Some(std::cmp::Ordering::Equal) => {
                                 // Same value: exclusive is more restrictive than inclusive for lower bound
                                 !cand_incl && *curr_incl
                             }
-                            std::cmp::Ordering::Less => false, // Lower value is less restrictive
+                            Some(std::cmp::Ordering::Less) => false, // Lower value is less restrictive
+                            None => false,                           // Incomparable values (e.g., NaN) - keep current
                         }
                     }
                     _ => false, // Don't handle infinity comparisons for now
@@ -553,13 +537,14 @@ impl Planner {
             (Endpoint::Value { datum: cand_datum, inclusive: cand_incl }, Endpoint::Value { datum: curr_datum, inclusive: curr_incl }) => {
                 match (cand_datum, curr_datum) {
                     (KeyDatum::Val(cand_val), KeyDatum::Val(curr_val)) => {
-                        match cand_val.cmp(curr_val) {
-                            std::cmp::Ordering::Less => true, // Lower value is more restrictive for upper bound
-                            std::cmp::Ordering::Equal => {
+                        match cand_val.partial_cmp(curr_val) {
+                            Some(std::cmp::Ordering::Less) => true, // Lower value is more restrictive for upper bound
+                            Some(std::cmp::Ordering::Equal) => {
                                 // Same value: exclusive is more restrictive than inclusive for upper bound
                                 !cand_incl && *curr_incl
                             }
-                            std::cmp::Ordering::Greater => false, // Higher value is less restrictive
+                            Some(std::cmp::Ordering::Greater) => false, // Higher value is less restrictive
+                            None => false,                              // Incomparable values (e.g., NaN) - keep current
                         }
                     }
                     _ => false, // Don't handle infinity comparisons for now
@@ -583,16 +568,17 @@ impl Planner {
                     // Both are concrete values - check if low > high
                     match (low_datum, high_datum) {
                         (KeyDatum::Val(low_val), KeyDatum::Val(high_val)) => {
-                            // Compare values using PropertyValue comparison
-                            match low_val.cmp(high_val) {
-                                std::cmp::Ordering::Greater => return true, // low > high = empty
-                                std::cmp::Ordering::Equal => {
+                            // Compare values using Value comparison
+                            match low_val.partial_cmp(high_val) {
+                                Some(std::cmp::Ordering::Greater) => return true, // low > high = empty
+                                Some(std::cmp::Ordering::Equal) => {
                                     // Equal values but both exclusive = empty
                                     if !low_incl && !high_incl {
                                         return true;
                                     }
                                 }
-                                std::cmp::Ordering::Less => {} // low < high = ok
+                                Some(std::cmp::Ordering::Less) => {} // low < high = ok
+                                None => {}                           // Incomparable values (e.g., NaN) - assume not empty
                             }
                         }
                         _ => {} // Mixed with infinities - not empty
@@ -608,7 +594,7 @@ impl Planner {
     fn calculate_remaining_predicate(
         &self,
         conjuncts: &[Predicate],
-        consumed_equalities: &[(String, PropertyValue)],
+        consumed_equalities: &[(String, Value)],
         consumed_inequality_field: Option<&str>,
     ) -> Predicate {
         let mut remaining_conjuncts = Vec::new();
@@ -760,10 +746,10 @@ impl Planner {
             // Check if this is a primary key comparison
             let (is_primary_key, value) = match (left.as_ref(), right.as_ref()) {
                 (Expr::Identifier(Identifier::Property(name)), Expr::Literal(literal)) if name == primary_key => {
-                    (true, self.literal_to_property_value(literal)?)
+                    (true, Value::from(literal))
                 }
                 (Expr::Literal(literal), Expr::Identifier(Identifier::Property(name))) if name == primary_key => {
-                    (true, self.literal_to_property_value(literal)?)
+                    (true, Value::from(literal))
                 }
                 _ => return None,
             };
@@ -920,7 +906,7 @@ impl Planner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_core::property::PropertyValue;
+    use ankurah_core::value::Value;
     use ankurah_derive::selection;
 
     // FIX_ME: rename to plan_indexeddb
@@ -965,58 +951,59 @@ mod tests {
         };
     }
 
-    use crate::{Endpoint, KeyBoundComponent, KeyBounds, KeyDatum, ValueType};
-    // ---- endpoint helpers (type-inferred via Into<PropertyValue>) ----
-    fn ge<T: Into<PropertyValue>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: true } }
-    fn gt<T: Into<PropertyValue>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: false } }
-    fn le<T: Into<PropertyValue>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: true } }
-    fn lt<T: Into<PropertyValue>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: false } }
+    use crate::{Endpoint, KeyBoundComponent, KeyBounds, KeyDatum};
+    use ankurah_core::value::ValueType;
+    // ---- endpoint helpers (type-inferred via Into<Value>) ----
+    fn ge<T: Into<Value>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: true } }
+    fn gt<T: Into<Value>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: false } }
+    fn le<T: Into<Value>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: true } }
+    fn lt<T: Into<Value>>(v: T) -> Endpoint { Endpoint::Value { datum: KeyDatum::Val(v.into()), inclusive: false } }
 
     // ---- per-column range parser (RHS captured as `tt` to allow `..` / `..=`) ----
     macro_rules! col_range {
         // fat arrow syntax (for bounds_list usage)
         ($col:expr => $lo:tt .. $hi:tt) => {{
-            let __lo: PropertyValue = ($lo).into();
-            let __hi: PropertyValue = ($hi).into();
+            let __lo: Value = ($lo).into();
+            let __hi: Value = ($hi).into();
             KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
         }};
         ($col:expr => $lo:tt ..= $hi:tt) => {{
-            let __lo: PropertyValue = ($lo).into();
-            let __hi: PropertyValue = ($hi).into();
+            let __lo: Value = ($lo).into();
+            let __hi: Value = ($hi).into();
             KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
         }};
         ($col:expr => .. $hi:tt) => {{
-            let __hi: PropertyValue = ($hi).into();
+            let __hi: Value = ($hi).into();
             KeyBoundComponent { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
         }};
         ($col:expr => $lo:tt ..) => {{
-            let __lo: PropertyValue = ($lo).into();
+            let __lo: Value = ($lo).into();
             KeyBoundComponent { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
         }};
 
         // parenthesized ranges (to avoid parsing conflicts in bounds! macro)
         ($col:expr, ($lo:tt .. $hi:tt)) => {{
-            let __lo: PropertyValue = ($lo).into();
-            let __hi: PropertyValue = ($hi).into();
+            let __lo: Value = ($lo).into();
+            let __hi: Value = ($hi).into();
             KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: lt(__hi) }
         }};
         ($col:expr, ($lo:tt ..= $hi:tt)) => {{
-            let __lo: PropertyValue = ($lo).into();
-            let __hi: PropertyValue = ($hi).into();
+            let __lo: Value = ($lo).into();
+            let __hi: Value = ($hi).into();
             KeyBoundComponent { column: $col.to_string(), low: ge(__lo), high: le(__hi) }
         }};
         ($col:expr, (.. $hi:tt)) => {{
-            let __hi: PropertyValue = ($hi).into();
+            let __hi: Value = ($hi).into();
             KeyBoundComponent { column: $col.to_string(), low: Endpoint::UnboundedLow(ValueType::of(&__hi)), high: lt(__hi) }
         }};
         ($col:expr, ($lo:tt ..)) => {{
-            let __lo: PropertyValue = ($lo).into();
+            let __lo: Value = ($lo).into();
             KeyBoundComponent { column: $col.to_string(), low: ge(__lo.clone()), high: Endpoint::UnboundedHigh(ValueType::of(&__lo)) }
         }};
 
         // explicit equality: = v   (clear and unambiguous)
         ($col:expr, = $v:tt) => {{
-            let __pv: PropertyValue = ($v).into();
+            let __pv: Value = ($v).into();
             KeyBoundComponent { column: $col.to_string(), low: ge(__pv.clone()), high: le(__pv) }
         }};
     }

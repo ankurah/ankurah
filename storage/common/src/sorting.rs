@@ -221,7 +221,7 @@ where
 }
 
 // All stream wrappers should implement GetPropertyValueStream for chaining
-use crate::filtering::GetPropertyValueStream;
+use crate::filtering::ValueSetStream;
 
 // impl<I> GetPropertyValueStream for SortedStream<I>
 // where

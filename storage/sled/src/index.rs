@@ -116,11 +116,7 @@ impl Index {
     pub fn created_at_unix_ms(&self) -> i64 { self.0.created_at_unix_ms }
     /// Build the index key for an entity given a materialized property map.
     /// Returns Ok(None) if any required key part is missing and the entity should not be indexed.
-    pub fn build_key(
-        &self,
-        eid: &EntityId,
-        properties: &[(u32, ankurah_core::property::PropertyValue)],
-    ) -> Result<Option<Vec<u8>>, IndexError> {
+    pub fn build_key(&self, eid: &EntityId, properties: &[(u32, ankurah_core::value::Value)]) -> Result<Option<Vec<u8>>, IndexError> {
         use std::collections::BTreeMap;
         let map: BTreeMap<_, _> = properties.iter().cloned().collect();
         self.build_key_from_map(eid, &map)
@@ -131,7 +127,7 @@ impl Index {
     fn build_key_from_map(
         &self,
         eid: &EntityId,
-        property_map: &std::collections::BTreeMap<u32, ankurah_core::property::PropertyValue>,
+        property_map: &std::collections::BTreeMap<u32, ankurah_core::value::Value>,
     ) -> Result<Option<Vec<u8>>, IndexError> {
         // Resolve pids using PropertyManager
         let mut pids: Vec<u32> = Vec::with_capacity(self.0.spec.keyparts.len());
@@ -143,7 +139,7 @@ impl Index {
         }
 
         // Build composite key using per-keypart direction from spec
-        let mut tuple_values: Vec<ankurah_core::property::PropertyValue> = Vec::with_capacity(self.0.spec.keyparts.len());
+        let mut tuple_values: Vec<ankurah_core::value::Value> = Vec::with_capacity(self.0.spec.keyparts.len());
         for pid in pids.iter() {
             if let Some(val) = property_map.get(pid).cloned() {
                 tuple_values.push(val);
@@ -202,7 +198,7 @@ impl Index {
         for item in coll_tree.iter() {
             let (k, v) = item?;
             let eid = EntityId::from_bytes(k.as_ref().try_into().map_err(|_| IndexError::InvalidKeyLength)?);
-            let mat: Vec<(u32, ankurah_core::property::PropertyValue)> = bincode::deserialize(&v)?;
+            let mat: Vec<(u32, ankurah_core::value::Value)> = bincode::deserialize(&v)?;
             let map: std::collections::BTreeMap<_, _> = mat.into_iter().collect();
 
             // Use shared key building logic
@@ -251,8 +247,8 @@ impl IndexManager {
         &self,
         collection: &str,
         eid: &EntityId,
-        old_mat: Option<&[(u32, ankurah_core::property::PropertyValue)]>,
-        new_mat: &[(u32, ankurah_core::property::PropertyValue)],
+        old_mat: Option<&[(u32, ankurah_core::value::Value)]>,
+        new_mat: &[(u32, ankurah_core::value::Value)],
     ) -> Result<(), MutationError> {
         // Snapshot matching indexes
         let indexes: Vec<Index> = {

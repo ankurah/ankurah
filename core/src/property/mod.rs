@@ -9,53 +9,25 @@ use ankurah_proto::EntityId;
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
 pub use value::YrsString;
 
-use crate::collation::Collatable;
-use serde::{Deserialize, Serialize};
+use crate::{collation::Collatable, value::Value};
 
 pub type PropertyName = String;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PropertyValue {
-    // Numbers
-    I16(i16),
-    I32(i32),
-    I64(i64),
-
-    Bool(bool),
-    String(String),
-    Object(Vec<u8>),
-    Binary(Vec<u8>),
-}
-
-impl Display for PropertyValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PropertyValue::I16(int) => write!(f, "{:?}", int),
-            PropertyValue::I32(int) => write!(f, "{:?}", int),
-            PropertyValue::I64(int) => write!(f, "{:?}", int),
-            PropertyValue::Bool(bool) => write!(f, "{:?}", bool),
-            PropertyValue::String(string) => write!(f, "{:?}", string),
-            PropertyValue::Object(object) => write!(f, "{:?}", object),
-            PropertyValue::Binary(binary) => write!(f, "{:?}", binary),
-        }
-    }
-}
-
 pub trait Property: Sized {
-    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError>;
-    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError>;
+    fn into_value(&self) -> Result<Option<Value>, PropertyError>;
+    fn from_value(value: Option<Value>) -> Result<Self, PropertyError>;
 }
 
 impl<T> Property for Option<T>
 where T: Property
 {
-    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> {
+    fn into_value(&self) -> Result<Option<Value>, PropertyError> {
         match self {
             Some(value) => Ok(<T as Property>::into_value(value)?),
             None => Ok(None),
         }
     }
-    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
+    fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
         match T::from_value(value) {
             Ok(value) => Ok(Some(value)),
             Err(PropertyError::Missing) => Ok(None),
@@ -67,17 +39,17 @@ where T: Property
 macro_rules! into {
     ($ty:ty => $variant:ident) => {
         impl Property for $ty {
-            fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::$variant(self.clone()))) }
-            fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
+            fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::$variant(self.clone()))) }
+            fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
                 match value {
-                    Some(PropertyValue::$variant(value)) => Ok(value),
+                    Some(Value::$variant(value)) => Ok(value),
                     Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
                     None => Err(PropertyError::Missing),
                 }
             }
         }
-        impl From<$ty> for PropertyValue {
-            fn from(value: $ty) -> Self { PropertyValue::$variant(value) }
+        impl From<$ty> for Value {
+            fn from(value: $ty) -> Self { Value::$variant(value) }
         }
     };
 }
@@ -86,231 +58,22 @@ into!(String => String);
 into!(i16 => I16);
 into!(i32 => I32);
 into!(i64 => I64);
+into!(f64 => F64);
 into!(bool => Bool);
+into!(EntityId => EntityId);
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
-    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_string()))) }
+    fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::String(self.to_string()))) }
 
-    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
+    fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
         match value {
-            Some(PropertyValue::String(value)) => Ok(value.into()),
+            Some(Value::String(value)) => Ok(value.into()),
             Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
             None => Err(PropertyError::Missing),
         }
     }
 }
 
-impl Property for EntityId {
-    fn into_value(&self) -> Result<Option<PropertyValue>, PropertyError> { Ok(Some(PropertyValue::String(self.to_base64()))) }
-    fn from_value(value: Option<PropertyValue>) -> Result<Self, PropertyError> {
-        match value {
-            Some(PropertyValue::String(value)) => Ok(EntityId::from_base64(&value).unwrap()),
-            Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: stringify!($ty).to_owned() }),
-            None => Err(PropertyError::Missing),
-        }
-    }
-}
-
-impl From<&str> for PropertyValue {
-    fn from(value: &str) -> Self { PropertyValue::String(value.to_string()) }
-}
-
-// Collation for PropertyValue (single value). Tuple framing (type tags/lengths) is handled by higher-level encoders.
-impl Collatable for PropertyValue {
-    fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            PropertyValue::String(s) => s.as_bytes().to_vec(),
-            // Use fixed-width big-endian encoding to preserve numeric order across widths
-            PropertyValue::I16(x) => (*x as i64).to_be_bytes().to_vec(),
-            PropertyValue::I32(x) => (*x as i64).to_be_bytes().to_vec(),
-            PropertyValue::I64(x) => x.to_be_bytes().to_vec(),
-            PropertyValue::Bool(b) => vec![*b as u8],
-            // For binary/object, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
-            PropertyValue::Object(bytes) | PropertyValue::Binary(bytes) => bytes.clone(),
-        }
-    }
-
-    fn successor_bytes(&self) -> Option<Vec<u8>> {
-        match self {
-            PropertyValue::String(s) => {
-                let mut bytes = s.as_bytes().to_vec();
-                bytes.push(0);
-                Some(bytes)
-            }
-            PropertyValue::I16(x) => {
-                if *x == i16::MAX {
-                    None
-                } else {
-                    Some(((*x as i64) + 1).to_be_bytes().to_vec())
-                }
-            }
-            PropertyValue::I32(x) => {
-                if *x == i32::MAX {
-                    None
-                } else {
-                    Some(((*x as i64) + 1).to_be_bytes().to_vec())
-                }
-            }
-            PropertyValue::I64(x) => {
-                if *x == i64::MAX {
-                    None
-                } else {
-                    Some((x + 1).to_be_bytes().to_vec())
-                }
-            }
-            PropertyValue::Bool(b) => {
-                if *b {
-                    None
-                } else {
-                    Some(vec![1])
-                }
-            }
-            PropertyValue::Object(_) | PropertyValue::Binary(_) => None,
-        }
-    }
-
-    fn predecessor_bytes(&self) -> Option<Vec<u8>> {
-        match self {
-            PropertyValue::String(s) => {
-                let bytes = s.as_bytes();
-                if bytes.is_empty() {
-                    None
-                } else {
-                    Some(bytes[..bytes.len() - 1].to_vec())
-                }
-            }
-            PropertyValue::I16(x) => {
-                if *x == i16::MIN {
-                    None
-                } else {
-                    Some(((*x as i64) - 1).to_be_bytes().to_vec())
-                }
-            }
-            PropertyValue::I32(x) => {
-                if *x == i32::MIN {
-                    None
-                } else {
-                    Some(((*x as i64) - 1).to_be_bytes().to_vec())
-                }
-            }
-            PropertyValue::I64(x) => {
-                if *x == i64::MIN {
-                    None
-                } else {
-                    Some((x - 1).to_be_bytes().to_vec())
-                }
-            }
-            PropertyValue::Bool(b) => {
-                if *b {
-                    Some(vec![0])
-                } else {
-                    None
-                }
-            }
-            PropertyValue::Object(_) | PropertyValue::Binary(_) => None,
-        }
-    }
-
-    fn is_minimum(&self) -> bool {
-        match self {
-            PropertyValue::String(s) => s.is_empty(),
-            PropertyValue::I16(x) => *x == i16::MIN,
-            PropertyValue::I32(x) => *x == i32::MIN,
-            PropertyValue::I64(x) => *x == i64::MIN,
-            PropertyValue::Bool(b) => !b,
-            PropertyValue::Object(_) | PropertyValue::Binary(_) => false,
-        }
-    }
-
-    fn is_maximum(&self) -> bool {
-        match self {
-            PropertyValue::String(_) => false,
-            PropertyValue::I16(x) => *x == i16::MAX,
-            PropertyValue::I32(x) => *x == i32::MAX,
-            PropertyValue::I64(x) => *x == i64::MAX,
-            PropertyValue::Bool(b) => *b,
-            PropertyValue::Object(_) | PropertyValue::Binary(_) => false,
-        }
-    }
-}
-
-// WASM JsValue conversions for IndexedDB
-#[cfg(feature = "wasm")]
-mod wasm_conversions {
-    use super::PropertyValue;
-    use wasm_bindgen::{JsCast, JsValue};
-
-    impl From<PropertyValue> for JsValue {
-        fn from(value: PropertyValue) -> Self {
-            match value {
-                PropertyValue::String(s) => JsValue::from_str(&s),
-                PropertyValue::I16(i) => JsValue::from_f64(i as f64),
-                PropertyValue::I32(i) => JsValue::from_f64(i as f64),
-                PropertyValue::I64(i) => JsValue::from_f64(i as f64),
-                PropertyValue::Bool(b) => JsValue::from_bool(b),
-                PropertyValue::Object(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
-                PropertyValue::Binary(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
-            }
-        }
-    }
-
-    impl From<&PropertyValue> for JsValue {
-        fn from(value: &PropertyValue) -> Self {
-            match value {
-                PropertyValue::String(s) => JsValue::from_str(s),
-                PropertyValue::I16(i) => JsValue::from_f64(*i as f64),
-                PropertyValue::I32(i) => JsValue::from_f64(*i as f64),
-                PropertyValue::I64(i) => JsValue::from_f64(*i as f64),
-                PropertyValue::Bool(b) => JsValue::from_bool(*b),
-                PropertyValue::Object(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
-                PropertyValue::Binary(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
-            }
-        }
-    }
-
-    impl TryFrom<JsValue> for PropertyValue {
-        type Error = JsValue;
-
-        fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-            if value.is_null() || value.is_undefined() {
-                return Err(value);
-            }
-
-            // Try string first
-            if let Some(s) = value.as_string() {
-                return Ok(PropertyValue::String(s));
-            }
-
-            // Try boolean
-            if let Some(b) = value.as_bool() {
-                return Ok(PropertyValue::Bool(b));
-            }
-
-            // Try number
-            if let Some(n) = value.as_f64() {
-                // Try to fit in smaller integer types first
-                if n.fract() == 0.0 {
-                    let n_int = n as i64;
-                    if n_int >= i16::MIN as i64 && n_int <= i16::MAX as i64 {
-                        return Ok(PropertyValue::I16(n_int as i16));
-                    } else if n_int >= i32::MIN as i64 && n_int <= i32::MAX as i64 {
-                        return Ok(PropertyValue::I32(n_int as i32));
-                    } else {
-                        return Ok(PropertyValue::I64(n_int));
-                    }
-                }
-            }
-
-            // Try Uint8Array (for binary data)
-            if value.is_instance_of::<js_sys::Uint8Array>() {
-                let array: js_sys::Uint8Array = value.unchecked_into();
-                let mut bytes = vec![0u8; array.length() as usize];
-                array.copy_to(&mut bytes);
-                return Ok(PropertyValue::Binary(bytes));
-            }
-
-            // If nothing matches, return error
-            Err(value)
-        }
-    }
+impl From<&str> for Value {
+    fn from(value: &str) -> Self { Value::String(value.to_string()) }
 }

@@ -2,10 +2,8 @@ use crate::lineage::{self, GetEvents, Retrieve};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
-    property::{
-        backend::{backend_from_string, PropertyBackend},
-        PropertyValue,
-    },
+    property::backend::{backend_from_string, PropertyBackend},
+    value::Value,
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
@@ -357,7 +355,7 @@ impl Entity {
         Ok(())
     }
 
-    pub fn values(&self) -> Vec<(String, Option<PropertyValue>)> {
+    pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let backends = self.backends.lock().expect("other thread panicked, panic here too");
         backends
             .values()
@@ -366,7 +364,7 @@ impl Entity {
                     .property_values()
                     .iter()
                     .map(|(name, value)| (name.to_string(), value.clone()))
-                    .collect::<Vec<(String, Option<PropertyValue>)>>()
+                    .collect::<Vec<(String, Option<Value>)>>()
             })
             .collect()
     }
@@ -392,13 +390,15 @@ impl Filterable for Entity {
             let backends = self.backends.lock().expect("other thread panicked, panic here too");
             backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
                 Some(value) => match value {
-                    PropertyValue::String(s) => Some(s),
-                    PropertyValue::I16(i) => Some(i.to_string()),
-                    PropertyValue::I32(i) => Some(i.to_string()),
-                    PropertyValue::I64(i) => Some(i.to_string()),
-                    PropertyValue::Bool(i) => Some(i.to_string()),
-                    PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                    PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    Value::String(s) => Some(s),
+                    Value::I16(i) => Some(i.to_string()),
+                    Value::I32(i) => Some(i.to_string()),
+                    Value::I64(i) => Some(i.to_string()),
+                    Value::F64(i) => Some(i.to_string()),
+                    Value::Bool(i) => Some(i.to_string()),
+                    Value::EntityId(entity_id) => Some(entity_id.to_base64()),
+                    Value::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    Value::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
                 },
                 None => None,
             })
@@ -425,7 +425,7 @@ impl TemporaryEntity {
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))
     }
-    pub fn values(&self) -> Vec<(String, Option<PropertyValue>)> {
+    pub fn values(&self) -> Vec<(String, Option<Value>)> {
         let backends = self.0.backends.lock().expect("other thread panicked, panic here too");
         backends.values().flat_map(|backend| backend.property_values()).collect()
     }
@@ -443,13 +443,15 @@ impl Filterable for TemporaryEntity {
             let backends = self.0.backends.lock().expect("other thread panicked, panic here too");
             backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
                 Some(value) => match value {
-                    PropertyValue::String(s) => Some(s),
-                    PropertyValue::I16(i) => Some(i.to_string()),
-                    PropertyValue::I32(i) => Some(i.to_string()),
-                    PropertyValue::I64(i) => Some(i.to_string()),
-                    PropertyValue::Bool(i) => Some(i.to_string()),
-                    PropertyValue::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                    PropertyValue::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    Value::String(s) => Some(s),
+                    Value::I16(i) => Some(i.to_string()),
+                    Value::I32(i) => Some(i.to_string()),
+                    Value::I64(i) => Some(i.to_string()),
+                    Value::F64(i) => Some(i.to_string()),
+                    Value::Bool(i) => Some(i.to_string()),
+                    Value::EntityId(entity_id) => Some(entity_id.to_base64()),
+                    Value::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
+                    Value::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
                 },
                 None => None,
             })

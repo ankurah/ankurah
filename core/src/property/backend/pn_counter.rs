@@ -12,8 +12,9 @@ use crate::{
     error::MutationError,
     property::{
         backend::{Operation, PropertyBackend},
-        PropertyName, PropertyValue,
+        PropertyName,
     },
+    value::Value,
     Node,
 };
 
@@ -63,11 +64,11 @@ impl PropertyBackend for PNBackend {
         values.keys().cloned().collect::<Vec<String>>()
     }
 
-    fn property_values(&self) -> BTreeMap<PropertyName, PropertyValue> {
+    fn property_values(&self) -> BTreeMap<PropertyName, Value> {
         let values = self.values.read().unwrap();
         let mut map = BTreeMap::new();
         for (property, data) in values.iter() {
-            map.insert(property.clone(), PropertyValue::Number(data.value));
+            map.insert(property.clone(), Value::Number(data.value));
         }
 
         map
@@ -152,11 +153,11 @@ macro_rules! pn_value {
             }
         }
 
-        impl<'a> Into<PropertyValue> for &'a PNValue {
-            fn into(self) -> PropertyValue {
+        impl<'a> Into<Value> for &'a PNValue {
+            fn into(self) -> Value {
                 match self {
                     $(
-                        PNValue::$variant { value, .. } => PropertyValue::$variant(*value),
+                        PNValue::$variant { value, .. } => Value::$variant(*value),
                     )*
                 }
             }

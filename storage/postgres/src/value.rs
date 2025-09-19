@@ -1,6 +1,6 @@
 // use tokio_postgres::types::ToSql;
 
-use ankurah_core::property::PropertyValue;
+use ankurah_core::value::Value;
 
 #[derive(Debug)]
 pub enum PGValue {
@@ -9,6 +9,7 @@ pub enum PGValue {
     SmallInt(i16),
     Integer(i32),
     BigInt(i64),
+    DoublePrecision(f64),
     Boolean(bool),
     // Text(String),
     // Timestamp(chrono::DateTime<chrono::Utc>),
@@ -21,22 +22,25 @@ impl PGValue {
             PGValue::SmallInt(_) => "int2",
             PGValue::Integer(_) => "int4",
             PGValue::BigInt(_) => "int8",
+            PGValue::DoublePrecision(_) => "float8",
             PGValue::Bytea(_) => "bytea",
             PGValue::Boolean(_) => "boolean",
         }
     }
 }
 
-impl From<PropertyValue> for PGValue {
-    fn from(property: PropertyValue) -> Self {
+impl From<Value> for PGValue {
+    fn from(property: Value) -> Self {
         match property {
-            PropertyValue::String(string) => PGValue::CharacterVarying(string),
-            PropertyValue::I16(integer) => PGValue::SmallInt(integer),
-            PropertyValue::I32(integer) => PGValue::Integer(integer),
-            PropertyValue::I64(integer) => PGValue::BigInt(integer),
-            PropertyValue::Bool(bool) => PGValue::Boolean(bool),
-            PropertyValue::Object(items) => PGValue::Bytea(items),
-            PropertyValue::Binary(items) => PGValue::Bytea(items),
+            Value::String(string) => PGValue::CharacterVarying(string),
+            Value::I16(integer) => PGValue::SmallInt(integer),
+            Value::I32(integer) => PGValue::Integer(integer),
+            Value::I64(integer) => PGValue::BigInt(integer),
+            Value::F64(float) => PGValue::DoublePrecision(float),
+            Value::Bool(bool) => PGValue::Boolean(bool),
+            Value::EntityId(entity_id) => PGValue::CharacterVarying(entity_id.to_base64()),
+            Value::Object(items) => PGValue::Bytea(items),
+            Value::Binary(items) => PGValue::Bytea(items),
         }
     }
 }

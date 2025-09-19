@@ -1,4 +1,4 @@
-use crate::ValueType;
+use ankurah_core::value::ValueType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
