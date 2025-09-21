@@ -2,14 +2,12 @@ pub mod backend;
 pub mod traits;
 pub mod value;
 
-use std::fmt::Display;
-
 use ankurah_proto::EntityId;
 
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
 pub use value::YrsString;
 
-use crate::{collation::Collatable, value::Value};
+use crate::value::Value;
 
 pub type PropertyName = String;
 
