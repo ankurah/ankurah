@@ -269,8 +269,8 @@ mod tests {
         // Test the full pipeline: IndexBounds → CanonicalRange → IdbKeyRange
         let bounds = KeyBounds::new(vec![KeyBoundComponent {
             column: "__collection".to_string(),
-            low: Endpoint::incl(PropertyValue::String("album".to_string())),
-            high: Endpoint::incl(PropertyValue::String("album".to_string())),
+            low: Endpoint::incl(Value::String("album".to_string())),
+            high: Endpoint::incl(Value::String("album".to_string())),
         }]);
 
         let result = plan_bounds_to_idb_range(&bounds);
@@ -281,6 +281,6 @@ mod tests {
         // Should be exact match (not open-ended)
         assert!(!upper_open_ended);
         assert_eq!(eq_prefix_len, 1);
-        assert_eq!(eq_prefix_values, vec![PropertyValue::String("album".to_string())]);
+        assert_eq!(eq_prefix_values, vec![Value::String("album".to_string())]);
     }
 }

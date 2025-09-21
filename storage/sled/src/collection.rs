@@ -2,9 +2,11 @@
 use std::sync::{atomic::AtomicBool, Arc};
 
 use ankql::ast::{OrderByItem, Predicate};
+use ankurah_core::value::cast_predicate::cast_predicate_types;
 use ankurah_core::{
     entity::TemporaryEntity,
     error::{MutationError, RetrievalError},
+    schema::CollectionSchema,
     storage::StorageCollection,
     EntityId,
 };
@@ -35,6 +37,34 @@ pub struct SledStorageCollectionInner {
 }
 
 pub struct SledStorageCollection(SledStorageCollectionInner);
+
+impl CollectionSchema for SledStorageCollectionInner {
+    fn field_type(
+        &self,
+        identifier: &ankql::ast::Identifier,
+    ) -> Result<ankurah_core::value::ValueType, ankurah_core::property::PropertyError> {
+        use ankql::ast::Identifier;
+        use ankurah_core::value::ValueType;
+
+        match identifier {
+            Identifier::Property(name) => {
+                match name.as_str() {
+                    "id" => Ok(ValueType::EntityId),
+                    // TODO: Add proper schema-based type resolution here
+                    // For now, we'll default to String for unknown fields
+                    _ => Ok(ValueType::String),
+                }
+            }
+            Identifier::CollectionProperty(_collection, property) => {
+                match property.as_str() {
+                    "id" => Ok(ValueType::EntityId),
+                    // TODO: Add proper schema-based type resolution here
+                    _ => Ok(ValueType::String),
+                }
+            }
+        }
+    }
+}
 
 impl SledStorageCollection {
     pub fn new(
@@ -116,18 +146,15 @@ impl SledStorageCollectionInner {
             }
         }
 
-        // 2b) Read old materialization for index maintenance
-        let old_mat: Option<Vec<(u32, ankurah_core::value::Value)>> =
-            match self.tree.get(entity_id.to_bytes()).map_err(|e| MutationError::UpdateFailed(Box::new(e)))? {
-                Some(ivec) => Some(bincode::deserialize(&ivec)?),
-                None => None,
-            };
+        let mat_bytes = bincode::serialize(&mat)?;
+        let old_mat_bytes = self.tree.insert(entity_id.to_bytes(), mat_bytes).map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
+        let old_mat = match old_mat_bytes {
+            Some(ivec) => Some(bincode::deserialize::<Vec<(u32, ankurah_core::value::Value)>>(&ivec)?),
+            None => None,
+        };
 
         // 2c) Update indexes for this collection based on old/new mats
         self.database.index_manager.update_indexes_for_entity(self.collection_id.as_str(), &entity_id, old_mat.as_deref(), &mat)?;
-
-        let mat_bytes = bincode::serialize(&mat)?;
-        self.tree.insert(entity_id.to_bytes(), mat_bytes).map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
 
         Ok(changed)
     }
@@ -155,6 +182,10 @@ impl SledStorageCollectionInner {
     // (and we need to make sure that both are using industry best practices for that sort of index -> record scan)
 
     fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+        // Cast all literals in the selection to their correct types based on field names
+        let cast_predicate = cast_predicate_types(selection.predicate, self)?;
+        let selection = ankql::ast::Selection { predicate: cast_predicate, order_by: selection.order_by, limit: selection.limit };
+
         // Generate query plans and choose the first non-empty one
         let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
 
@@ -307,7 +338,9 @@ impl SledStorageCollectionInner {
                 }
             }
             _ => {
-                let filtered = scanner.filter_predicate(&remaining_predicate);
+                let collection_items: Vec<_> = scanner.collect();
+                println!("collection_items: {:?}", collection_items);
+                let filtered = collection_items.into_iter().filter_predicate(&remaining_predicate);
                 match (sort, limit) {
                     // filter + order by + limit
                     (Some(sort), Some(limit)) => {

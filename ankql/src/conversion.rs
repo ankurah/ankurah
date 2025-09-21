@@ -32,8 +32,8 @@ impl TryFrom<ast::Expr> for Predicate {
         match value {
             ast::Expr::Predicate(p) => Ok(p),
             ast::Expr::Placeholder => Ok(Predicate::Placeholder),
-            ast::Expr::Literal(ast::Literal::Boolean(true)) => Ok(Predicate::True),
-            ast::Expr::Literal(ast::Literal::Boolean(false)) => Ok(Predicate::False),
+            ast::Expr::Literal(ast::Literal::Bool(true)) => Ok(Predicate::True),
+            ast::Expr::Literal(ast::Literal::Bool(false)) => Ok(Predicate::False),
             _ => Err(ParseError::InvalidPredicate("Expression is not a predicate".into())),
         }
     }

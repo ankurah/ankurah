@@ -33,6 +33,9 @@ impl EntityId {
         let value = self.to_base64();
         value[value.len() - 6..].to_string()
     }
+
+    pub fn to_ulid(&self) -> Ulid { self.0 }
+    pub fn from_ulid(ulid: Ulid) -> Self { EntityId(ulid) }
 }
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]

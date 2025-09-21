@@ -113,9 +113,14 @@ impl SqlBuilder {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => match lit {
                 Literal::String(s) => self.arg(s.to_owned()),
-                Literal::Integer(int) => self.arg(*int),
-                Literal::Float(float) => self.arg(*float),
-                Literal::Boolean(bool) => self.arg(*bool),
+                Literal::I64(int) => self.arg(*int),
+                Literal::F64(float) => self.arg(*float),
+                Literal::Bool(bool) => self.arg(*bool),
+                Literal::I16(i) => self.arg(*i),
+                Literal::I32(i) => self.arg(*i),
+                Literal::EntityId(ulid) => self.arg(ulid.to_string()),
+                Literal::Object(bytes) => self.arg(bytes.clone()),
+                Literal::Binary(bytes) => self.arg(bytes.clone()),
             },
             Expr::Identifier(id) => match id {
                 Identifier::Property(name) => {
@@ -140,9 +145,14 @@ impl SqlBuilder {
                         Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
                         Expr::Literal(lit) => match lit {
                             Literal::String(s) => self.arg(s.to_owned()),
-                            Literal::Integer(int) => self.arg(*int),
-                            Literal::Float(float) => self.arg(*float),
-                            Literal::Boolean(bool) => self.arg(*bool),
+                            Literal::I64(int) => self.arg(*int),
+                            Literal::F64(float) => self.arg(*float),
+                            Literal::Bool(bool) => self.arg(*bool),
+                            Literal::I16(i) => self.arg(*i),
+                            Literal::I32(i) => self.arg(*i),
+                            Literal::EntityId(ulid) => self.arg(ulid.to_string()),
+                            Literal::Object(bytes) => self.arg(bytes.clone()),
+                            Literal::Binary(bytes) => self.arg(bytes.clone()),
                         },
                         _ => {
                             return Err(SqlGenerationError::UnsupportedExpression(

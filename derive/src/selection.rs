@@ -478,14 +478,33 @@ fn generate_literal_code_with_replacements(
         ankql::ast::Literal::String(s) => {
             quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::String(#s.to_string())) }
         }
-        ankql::ast::Literal::Integer(i) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Integer(#i)) }
+        ankql::ast::Literal::I64(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I64(#i)) }
         }
-        ankql::ast::Literal::Float(f) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Float(#f)) }
+        ankql::ast::Literal::F64(f) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::F64(#f)) }
         }
-        ankql::ast::Literal::Boolean(b) => {
-            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Boolean(#b)) }
+        ankql::ast::Literal::Bool(b) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Bool(#b)) }
+        }
+        ankql::ast::Literal::I16(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I16(#i)) }
+        }
+        ankql::ast::Literal::I32(i) => {
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I32(#i)) }
+        }
+        ankql::ast::Literal::EntityId(ulid) => {
+            todo!("EntityId literals");
+            // let ulid =
+            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(#ulid.to_string())) }
+        }
+        ankql::ast::Literal::Object(items) => {
+            todo!("Object literals");
+            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Object(#items)) }
+        }
+        ankql::ast::Literal::Binary(items) => {
+            todo!("Binary literals");
+            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Binary(#items)) }
         }
     }
 }

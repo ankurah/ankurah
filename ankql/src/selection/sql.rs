@@ -1,5 +1,6 @@
 use crate::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
 use crate::error::SqlGenerationError;
+use base64::{engine::general_purpose, Engine as _};
 
 fn generate_expr_sql(
     expr: &Expr,
@@ -21,6 +22,21 @@ fn generate_expr_sql(
             buffer.push('?');
         }
         Expr::Literal(lit) => match lit {
+            Literal::I16(i) => {
+                buffer.push_str(&i.to_string());
+            }
+            Literal::I32(i) => {
+                buffer.push_str(&i.to_string());
+            }
+            Literal::I64(i) => {
+                buffer.push_str(&i.to_string());
+            }
+            Literal::F64(f) => {
+                buffer.push_str(&f.to_string());
+            }
+            Literal::Bool(b) => {
+                buffer.push_str(if *b { "true" } else { "false" });
+            }
             Literal::String(s) => {
                 buffer.push('\'');
                 // Escape problematic characters for SQL safety
@@ -37,14 +53,15 @@ fn generate_expr_sql(
                 }
                 buffer.push('\'');
             }
-            Literal::Integer(i) => {
-                buffer.push_str(&i.to_string());
+            Literal::EntityId(ulid) => {
+                buffer.push('\'');
+                buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()));
+                buffer.push('\'');
             }
-            Literal::Float(f) => {
-                buffer.push_str(&f.to_string());
-            }
-            Literal::Boolean(b) => {
-                buffer.push_str(if *b { "true" } else { "false" });
+            Literal::Object(bytes) | Literal::Binary(bytes) => {
+                buffer.push('\'');
+                buffer.push_str(&String::from_utf8_lossy(bytes));
+                buffer.push('\'');
             }
         },
         Expr::Identifier(id) => match id {
@@ -86,6 +103,18 @@ fn generate_expr_sql(
                         buffer.push('?');
                     }
                     Expr::Literal(lit) => match lit {
+                        Literal::I16(i) => {
+                            buffer.push_str(&i.to_string());
+                        }
+                        Literal::I32(i) => {
+                            buffer.push_str(&i.to_string());
+                        }
+                        Literal::I64(i) => {
+                            buffer.push_str(&i.to_string());
+                        }
+                        Literal::F64(f) => {
+                            buffer.push_str(&f.to_string());
+                        }
                         Literal::String(s) => {
                             buffer.push('\'');
                             // Escape problematic characters for SQL safety
@@ -102,14 +131,19 @@ fn generate_expr_sql(
                             }
                             buffer.push('\'');
                         }
-                        Literal::Integer(i) => {
-                            buffer.push_str(&i.to_string());
-                        }
-                        Literal::Float(f) => {
-                            buffer.push_str(&f.to_string());
-                        }
-                        Literal::Boolean(b) => {
+                        Literal::Bool(b) => {
                             buffer.push_str(if *b { "true" } else { "false" });
+                        }
+                        Literal::EntityId(ulid) => {
+                            buffer.push('\'');
+                            buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()));
+                            buffer.push('\'');
+                        }
+                        Literal::Object(bytes) | Literal::Binary(bytes) => {
+                            todo!("Object and Binary literals");
+                            // buffer.push('\'');
+                            // buffer.push_str(&String::from_utf8_lossy(bytes));
+                            // buffer.push('\'');
                         }
                     },
                     _ => {

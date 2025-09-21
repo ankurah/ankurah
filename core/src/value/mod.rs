@@ -1,4 +1,5 @@
 mod cast;
+pub mod cast_predicate;
 mod collatable;
 #[cfg(feature = "wasm")]
 mod wasm;
@@ -72,17 +73,15 @@ impl Display for Value {
 impl From<ankql::ast::Literal> for Value {
     fn from(literal: ankql::ast::Literal) -> Self {
         match literal {
+            ankql::ast::Literal::I16(i) => Value::I16(i),
+            ankql::ast::Literal::I32(i) => Value::I32(i),
+            ankql::ast::Literal::I64(i) => Value::I64(i),
+            ankql::ast::Literal::F64(f) => Value::F64(f),
+            ankql::ast::Literal::Bool(b) => Value::Bool(b),
             ankql::ast::Literal::String(s) => Value::String(s),
-            ankql::ast::Literal::Integer(i) => {
-                // Use I32 as default, only use I64 if value doesn't fit in I32
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    Value::I32(i as i32)
-                } else {
-                    Value::I64(i)
-                }
-            }
-            ankql::ast::Literal::Float(f) => Value::F64(f),
-            ankql::ast::Literal::Boolean(b) => Value::Bool(b),
+            ankql::ast::Literal::EntityId(ulid) => Value::EntityId(proto::EntityId::from_ulid(ulid)),
+            ankql::ast::Literal::Object(object) => Value::Object(object),
+            ankql::ast::Literal::Binary(binary) => Value::Binary(binary),
         }
     }
 }
@@ -90,17 +89,47 @@ impl From<ankql::ast::Literal> for Value {
 impl From<&ankql::ast::Literal> for Value {
     fn from(literal: &ankql::ast::Literal) -> Self {
         match literal {
+            ankql::ast::Literal::I16(i) => Value::I16(*i),
+            ankql::ast::Literal::I32(i) => Value::I32(*i),
+            ankql::ast::Literal::I64(i) => Value::I64(*i),
+            ankql::ast::Literal::F64(f) => Value::F64(*f),
+            ankql::ast::Literal::Bool(b) => Value::Bool(*b),
             ankql::ast::Literal::String(s) => Value::String(s.clone()),
-            ankql::ast::Literal::Integer(i) => {
-                // Use I32 as default, only use I64 if value doesn't fit in I32
-                if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
-                    Value::I32(*i as i32)
-                } else {
-                    Value::I64(*i)
-                }
-            }
-            ankql::ast::Literal::Float(f) => Value::F64(*f),
-            ankql::ast::Literal::Boolean(b) => Value::Bool(*b),
+            ankql::ast::Literal::EntityId(ulid) => Value::EntityId(proto::EntityId::from_ulid(*ulid)),
+            ankql::ast::Literal::Object(object) => Value::Object(object.clone()),
+            ankql::ast::Literal::Binary(binary) => Value::Binary(binary.clone()),
+        }
+    }
+}
+
+impl From<Value> for ankql::ast::Literal {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::I16(i) => ankql::ast::Literal::I16(i),
+            Value::I32(i) => ankql::ast::Literal::I32(i),
+            Value::I64(i) => ankql::ast::Literal::I64(i),
+            Value::F64(f) => ankql::ast::Literal::F64(f),
+            Value::Bool(b) => ankql::ast::Literal::Bool(b),
+            Value::String(s) => ankql::ast::Literal::String(s),
+            Value::EntityId(entity_id) => ankql::ast::Literal::EntityId(entity_id.to_ulid()),
+            Value::Object(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
+            Value::Binary(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
+        }
+    }
+}
+
+impl From<&Value> for ankql::ast::Literal {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::I16(i) => ankql::ast::Literal::I16(*i),
+            Value::I32(i) => ankql::ast::Literal::I32(*i),
+            Value::I64(i) => ankql::ast::Literal::I64(*i),
+            Value::F64(f) => ankql::ast::Literal::F64(*f),
+            Value::Bool(b) => ankql::ast::Literal::Bool(*b),
+            Value::String(s) => ankql::ast::Literal::String(s.clone()),
+            Value::EntityId(entity_id) => ankql::ast::Literal::EntityId(entity_id.to_ulid()),
+            Value::Object(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
+            Value::Binary(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
         }
     }
 }

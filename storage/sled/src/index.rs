@@ -150,8 +150,7 @@ impl Index {
         }
 
         let mut key = encode_tuple_values_with_key_spec(&tuple_values, &self.0.spec)?;
-        // Tuple terminator to ensure composite < id boundary
-        key.push(0);
+        // No separator needed - KeySpec provides structure info for parsing
         key.extend_from_slice(&eid.to_bytes());
         Ok(Some(key))
     }
