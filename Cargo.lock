@@ -285,6 +285,7 @@ dependencies = [
  "ankql",
  "ankurah",
  "ankurah-connector-local-process",
+ "ankurah-storage-common",
  "ankurah-storage-postgres",
  "ankurah-storage-sled",
  "ankurah-websocket-client",

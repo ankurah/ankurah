@@ -1,5 +1,4 @@
-mod common;
-use common::*;
+use super::common::*;
 
 #[tokio::test]
 async fn test_compound_indexes_and_pagination() -> Result<(), anyhow::Error> {

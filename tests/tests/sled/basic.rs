@@ -1,5 +1,4 @@
-mod common;
-use common::*;
+use super::common::*;
 
 #[tokio::test]
 async fn test_sled_basic_workflow() -> Result<(), anyhow::Error> {

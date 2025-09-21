@@ -1,5 +1,4 @@
-mod common;
-use common::*;
+use super::common::*;
 
 #[tokio::test]
 async fn test_comprehensive_set_inclusion_and_ordering() -> Result<(), anyhow::Error> {
