@@ -1,5 +1,5 @@
-use ankurah_core::value::Value;
-use ankurah_storage_common::{Endpoint, IndexDirection, IndexKeyPart, KeyBoundComponent, KeyBounds, KeySpec, ValueType};
+use ankurah::{Value, ValueType};
+use ankurah_storage_common::{Endpoint, IndexDirection, IndexKeyPart, KeyBoundComponent, KeyBounds, KeySpec};
 use ankurah_storage_sled::{error::IndexError, planner_integration::key_bounds_to_sled_range};
 
 #[test]
@@ -73,7 +73,7 @@ fn inequality_bounds_handle_desc_correctly() -> Result<(), IndexError> {
     let bounds = KeyBounds::new(vec![KeyBoundComponent {
         column: "age".to_string(),
         low: Endpoint::excl(Value::I32(25)),
-        high: Endpoint::UnboundedHigh(ankurah_storage_common::ValueType::I32),
+        high: Endpoint::UnboundedHigh(ValueType::I32),
     }]);
 
     let key_spec = KeySpec {

@@ -1,7 +1,6 @@
-mod common;
+use super::common::*;
 use ankurah::{policy::DEFAULT_CONTEXT, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
-use common::*;
 use std::sync::Arc;
 
 #[tokio::test]
