@@ -107,7 +107,6 @@ impl<'a> SledCollectionScanner<'a> {
         };
 
         let SledRangeBounds { start: start_key, end: end_key_opt, .. } = key_bounds_to_sled_range(bounds, &primary_key_spec)?;
-
         let iter = match direction {
             ScanDirection::Forward => match &end_key_opt {
                 Some(end_key) => SledCollectionIter::Forward(tree.range(start_key.clone()..end_key.clone())),

@@ -39,7 +39,13 @@ pub struct MatRow {
 
 impl Filterable for MatRow {
     fn collection(&self) -> &str { self.mat.collection() }
-    fn value(&self, name: &str) -> Option<String> { self.mat.value(name) }
+    fn value(&self, name: &str) -> Option<String> {
+        if name == "id" {
+            Some(self.id.to_base64())
+        } else {
+            self.mat.value(name)
+        }
+    }
 }
 
 impl ankurah_storage_common::filtering::HasEntityId for MatRow {

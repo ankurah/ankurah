@@ -1,4 +1,7 @@
-use crate::value::{Value, ValueType};
+use crate::{
+    property::PropertyError,
+    value::{Value, ValueType},
+};
 use ankurah_proto::EntityId;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +28,10 @@ impl std::fmt::Display for CastError {
             }
         }
     }
+}
+
+impl From<CastError> for PropertyError {
+    fn from(err: CastError) -> Self { PropertyError::CastError(err) }
 }
 
 impl std::error::Error for CastError {}

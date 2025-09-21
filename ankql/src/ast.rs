@@ -1,6 +1,7 @@
 use crate::error::ParseError;
 use crate::selection::sql::generate_selection_sql;
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
@@ -14,11 +15,15 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
     String(String),
-    Integer(i64),
-    Float(f64),
-    Boolean(bool),
-    // Id(EntityId), // TODO consolidate ast into proto crate so we can directly reference EntityId
+    EntityId(Ulid),
+    Object(Vec<u8>),
+    Binary(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -347,7 +352,7 @@ mod tests {
             Box::new(Predicate::Comparison {
                 left: Box::new(Expr::Identifier(Identifier::Property("age".to_string()))),
                 operator: ComparisonOperator::GreaterThan,
-                right: Box::new(Expr::Literal(Literal::Integer(25))),
+                right: Box::new(Expr::Literal(Literal::I64(25))),
             }),
             Box::new(Predicate::Comparison {
                 left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
@@ -388,11 +393,11 @@ mod tests {
             if let Predicate::And(inner_left, inner_right) = *left {
                 // Check boolean value
                 if let Predicate::Comparison { right: val, .. } = *inner_left {
-                    assert_eq!(*val, Expr::Literal(Literal::Boolean(true)));
+                    assert_eq!(*val, Expr::Literal(Literal::Bool(true)));
                 }
                 // Check float value
                 if let Predicate::Comparison { right: val, .. } = *inner_right {
-                    assert_eq!(*val, Expr::Literal(Literal::Float(95.5)));
+                    assert_eq!(*val, Expr::Literal(Literal::F64(95.5)));
                 }
             }
             // Check string value
@@ -440,15 +445,15 @@ impl From<&str> for Expr {
 }
 
 impl From<i64> for Expr {
-    fn from(i: i64) -> Expr { Expr::Literal(Literal::Integer(i)) }
+    fn from(i: i64) -> Expr { Expr::Literal(Literal::I64(i)) }
 }
 
 impl From<f64> for Expr {
-    fn from(f: f64) -> Expr { Expr::Literal(Literal::Float(f)) }
+    fn from(f: f64) -> Expr { Expr::Literal(Literal::F64(f)) }
 }
 
 impl From<bool> for Expr {
-    fn from(b: bool) -> Expr { Expr::Literal(Literal::Boolean(b)) }
+    fn from(b: bool) -> Expr { Expr::Literal(Literal::Bool(b)) }
 }
 
 impl From<Literal> for Expr {

@@ -83,20 +83,12 @@ fn convert_to_physical_bounds(
 
         if key_spec.keyparts.len() > eq_prefix_len {
             // Multi-key partial equality: use prefix guard
-            let mut start = encoded_prefix.clone();
-            start.push(0); // tuple terminator
+            let start = encoded_prefix.clone();
 
-            return Ok(SledRangeBounds {
-                start,
-                end: None,
-                upper_open_ended: true,
-                eq_prefix_guard: encoded_prefix, // No terminator in guard
-            });
+            return Ok(SledRangeBounds { start, end: None, upper_open_ended: true, eq_prefix_guard: encoded_prefix });
         } else {
             // Single-key or full equality: use tight range
-            let mut start = encoded_prefix.clone();
-            start.push(0);
-
+            let start = encoded_prefix.clone();
             let end = lex_successor(start.clone());
 
             return Ok(SledRangeBounds {
@@ -146,7 +138,6 @@ fn handle_desc_inequality(
                     end = s;
                 }
             }
-            end.push(0);
             (start, Some(end))
         }
         // x < U or x <= U
@@ -160,7 +151,6 @@ fn handle_desc_inequality(
                     start.clear();
                 }
             }
-            start.push(0);
             (start, None)
         }
         // L <= x <= U
@@ -171,7 +161,6 @@ fn handle_desc_inequality(
                     start = s;
                 }
             }
-            start.push(0);
 
             let mut end = encode_tuple_values_with_key_spec(&lower_tuple, key_spec)?;
             if !lower_open {
@@ -179,7 +168,6 @@ fn handle_desc_inequality(
                     end = s;
                 }
             }
-            end.push(0);
             (start, Some(end))
         }
         // No bounds
@@ -208,7 +196,6 @@ fn handle_general_bounds(
         if lower_open {
             start = lex_successor(start).unwrap_or_default();
         }
-        start.push(0);
         start
     } else {
         vec![0x00]
@@ -232,7 +219,6 @@ fn handle_general_bounds(
                 });
             }
         }
-        end.push(0);
         (Some(end), false)
     } else {
         (None, true)
@@ -411,18 +397,17 @@ pub fn encode_component_typed(value: &Value, expected_type: ValueType, descendin
             Ok(vec![if !descending { b } else { 0xFFu8.wrapping_sub(b) }])
         }
         (Value::EntityId(entity_id), ValueType::EntityId) => {
-            // EntityId is encoded as 16-byte binary
+            // Fixed-width EntityId: no terminator needed
             let bytes = entity_id.to_bytes();
             if !descending {
                 Ok(bytes.to_vec())
             } else {
-                // FIXME - validate this is the correct inversion
                 Ok(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)).collect())
             }
         }
         (Value::Object(bytes) | Value::Binary(bytes), ValueType::Binary) => {
             if !descending {
-                // ASC: [escaped bytes][0x00] - no type tag needed
+                // ASC: [escaped bytes][0x00] - terminator needed for variable-width
                 let mut out = Vec::with_capacity(bytes.len() + 1);
                 for &b in bytes.iter() {
                     if b == 0x00 {

@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::{entity::Entity, error::RetrievalError, property::PropertyName};
+use crate::{entity::Entity, error::RetrievalError, property::PropertyName, value::CastError};
 
 use thiserror::Error;
 
@@ -29,6 +29,9 @@ pub enum PropertyError {
     InvalidValue { value: String, ty: String },
     #[error("transaction is no longer alive")]
     TransactionClosed,
+
+    #[error("cast error: {0}")]
+    CastError(CastError),
 }
 
 impl PartialEq for PropertyError {

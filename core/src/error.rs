@@ -41,6 +41,12 @@ pub enum RetrievalError {
     StateError(StateError),
     #[error("Mutation error: {0}")]
     MutationError(Box<MutationError>),
+    #[error("Property error: {0}")]
+    PropertyError(Box<crate::property::PropertyError>),
+}
+
+impl From<crate::property::PropertyError> for RetrievalError {
+    fn from(err: crate::property::PropertyError) -> Self { RetrievalError::PropertyError(Box::new(err)) }
 }
 
 impl From<tokio::task::JoinError> for RetrievalError {

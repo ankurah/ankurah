@@ -199,8 +199,8 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
     match pair.as_rule() {
         grammar::Rule::IdentifierWithOptionalContinuation => parse_identifier(pair),
         grammar::Rule::SingleQuotedString => parse_string_literal(pair),
-        grammar::Rule::True => Ok(ast::Expr::Literal(ast::Literal::Boolean(true))),
-        grammar::Rule::False => Ok(ast::Expr::Literal(ast::Literal::Boolean(false))),
+        grammar::Rule::True => Ok(ast::Expr::Literal(ast::Literal::Bool(true))),
+        grammar::Rule::False => Ok(ast::Expr::Literal(ast::Literal::Bool(false))),
         grammar::Rule::Unsigned => parse_number(pair),
         grammar::Rule::QuestionParameter => Ok(ast::Expr::Placeholder),
         grammar::Rule::ExpressionInParentheses => {
@@ -281,7 +281,11 @@ fn parse_number(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
 
     let num = pair.as_str().trim().parse::<i64>().map_err(|e| ParseError::InvalidPredicate(format!("Failed to parse number: {}", e)))?;
 
-    Ok(ast::Expr::Literal(ast::Literal::Integer(num)))
+    if num < i32::MAX as i64 && num > i32::MIN as i64 {
+        return Ok(ast::Expr::Literal(ast::Literal::I32(num as i32)));
+    }
+
+    Ok(ast::Expr::Literal(ast::Literal::I64(num)))
 }
 
 /// Parse a LIMIT clause
@@ -392,7 +396,7 @@ mod tests {
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
-                        right: Box::new(ast::Expr::Literal(ast::Literal::Integer(123)))
+                        right: Box::new(ast::Expr::Literal(ast::Literal::I32(123)))
                     }),
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
@@ -417,12 +421,12 @@ mod tests {
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
-                        right: Box::new(ast::Expr::Literal(ast::Literal::Integer(123)))
+                        right: Box::new(ast::Expr::Literal(ast::Literal::I32(123)))
                     }),
                     Box::new(ast::Predicate::Comparison {
                         left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
-                        right: Box::new(ast::Expr::Literal(ast::Literal::Integer(456)))
+                        right: Box::new(ast::Expr::Literal(ast::Literal::I32(456)))
                     })
                 )),
                 Box::new(ast::Predicate::Comparison {
@@ -521,9 +525,9 @@ mod tests {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
                 operator: ast::ComparisonOperator::In,
                 right: Box::new(ast::Expr::ExprList(vec![
-                    ast::Expr::Literal(ast::Literal::Integer(1)),
-                    ast::Expr::Literal(ast::Literal::Integer(2)),
-                    ast::Expr::Literal(ast::Literal::Integer(3)),
+                    ast::Expr::Literal(ast::Literal::I32(1)),
+                    ast::Expr::Literal(ast::Literal::I32(2)),
+                    ast::Expr::Literal(ast::Literal::I32(3)),
                 ]))
             }
         );
@@ -538,7 +542,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::Boolean(true)))
+                right: Box::new(ast::Expr::Literal(ast::Literal::Bool(true)))
             }
         );
     }
@@ -552,7 +556,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::NotEqual,
-                right: Box::new(ast::Expr::Literal(ast::Literal::Boolean(false)))
+                right: Box::new(ast::Expr::Literal(ast::Literal::Bool(false)))
             }
         );
     }
@@ -564,7 +568,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Literal(ast::Literal::Boolean(false))),
+                left: Box::new(ast::Expr::Literal(ast::Literal::Bool(false))),
                 operator: ast::ComparisonOperator::NotEqual,
                 right: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string())))
             }
@@ -717,7 +721,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
                 operator: ast::ComparisonOperator::GreaterThan,
-                right: Box::new(ast::Expr::Literal(ast::Literal::Integer(100)))
+                right: Box::new(ast::Expr::Literal(ast::Literal::I32(100)))
             }
         );
         assert_eq!(
@@ -783,7 +787,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("limit".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::Integer(1)))
+                right: Box::new(ast::Expr::Literal(ast::Literal::I32(1)))
             }
         );
 
@@ -793,7 +797,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("order".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
-                right: Box::new(ast::Expr::Literal(ast::Literal::Integer(2)))
+                right: Box::new(ast::Expr::Literal(ast::Literal::I32(2)))
             }
         );
         assert_eq!(

@@ -22,6 +22,7 @@ pub mod util;
 pub mod value;
 
 pub mod collectionset;
+pub mod schema;
 pub use model::Model;
 pub use node::Node;
 

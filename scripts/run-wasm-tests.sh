@@ -86,6 +86,7 @@ run_wasm_tests() {
     print_status "Running WASM tests for $package_name..."
     
     cd "$package_dir"
+    echo "Running tests in $package_dir"
     
     # Check if the package has wasm tests
     if [ ! -f "Cargo.toml" ]; then

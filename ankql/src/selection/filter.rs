@@ -2,6 +2,7 @@
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
 use crate::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
+use base64::{engine::general_purpose, Engine as _};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -60,10 +61,15 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Stri
     match expr {
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(match lit {
+            Literal::I16(i) => i.to_string(),
+            Literal::I32(i) => i.to_string(),
+            Literal::I64(i) => i.to_string(),
+            Literal::F64(f) => f.to_string(),
+            Literal::Bool(b) => b.to_string(),
             Literal::String(s) => s.clone(),
-            Literal::Integer(i) => i.to_string(),
-            Literal::Float(f) => f.to_string(),
-            Literal::Boolean(b) => b.to_string(),
+            Literal::EntityId(ulid) => general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()),
+            Literal::Object(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Literal::Binary(bytes) => String::from_utf8_lossy(bytes).to_string(),
         })),
         Expr::Identifier(id) => match id {
             Identifier::Property(name) => Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone()))?)),

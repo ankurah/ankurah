@@ -51,8 +51,10 @@ impl Collatable for ast::Literal {
     fn to_bytes(&self) -> Vec<u8> {
         match self {
             ast::Literal::String(s) => s.as_bytes().to_vec(),
-            ast::Literal::Integer(i) => i.to_be_bytes().to_vec(),
-            ast::Literal::Float(f) => {
+            ast::Literal::I16(i) => i.to_be_bytes().to_vec(),
+            ast::Literal::I32(i) => i.to_be_bytes().to_vec(),
+            ast::Literal::I64(i) => i.to_be_bytes().to_vec(),
+            ast::Literal::F64(f) => {
                 let bits = if f.is_nan() {
                     u64::MAX // NaN sorts last
                 } else {
@@ -65,7 +67,10 @@ impl Collatable for ast::Literal {
                 };
                 bits.to_be_bytes().to_vec()
             }
-            ast::Literal::Boolean(b) => vec![*b as u8],
+            ast::Literal::Bool(b) => vec![*b as u8],
+            ast::Literal::EntityId(ulid) => ulid.to_bytes().to_vec(),
+            ast::Literal::Object(bytes) => bytes.clone(),
+            ast::Literal::Binary(bytes) => bytes.clone(),
         }
     }
 
@@ -85,14 +90,28 @@ impl Collatable for ast::Literal {
                     Some(bytes)
                 }
             }
-            ast::Literal::Integer(i) => {
+            ast::Literal::I16(i) => {
+                if *i == i16::MAX {
+                    None
+                } else {
+                    Some((i + 1).to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::I32(i) => {
+                if *i == i32::MAX {
+                    None
+                } else {
+                    Some((i + 1).to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::I64(i) => {
                 if *i == i64::MAX {
                     None
                 } else {
                     Some((i + 1).to_be_bytes().to_vec())
                 }
             }
-            ast::Literal::Float(f) => {
+            ast::Literal::F64(f) => {
                 if f.is_nan() || (f.is_infinite() && *f > 0.0) {
                     None
                 } else {
@@ -101,12 +120,44 @@ impl Collatable for ast::Literal {
                     Some(next_bits.to_be_bytes().to_vec())
                 }
             }
-            ast::Literal::Boolean(b) => {
+            ast::Literal::Bool(b) => {
                 if !b {
                     None
                 } else {
                     Some(vec![1])
                 }
+            }
+            ast::Literal::EntityId(ulid) => {
+                let mut bytes = ulid.to_bytes();
+                // Find the rightmost byte that can be incremented
+                for i in (0..bytes.len()).rev() {
+                    if bytes[i] < 255 {
+                        bytes[i] += 1;
+                        // Zero out all bytes to the right
+                        for j in (i + 1)..bytes.len() {
+                            bytes[j] = 0;
+                        }
+                        return Some(bytes.to_vec());
+                    }
+                }
+                None // All bytes are 255, no successor
+            }
+            ast::Literal::Object(bytes) | ast::Literal::Binary(bytes) => {
+                let mut bytes = bytes.clone();
+                // Find the rightmost byte that can be incremented
+                for i in (0..bytes.len()).rev() {
+                    if bytes[i] < 255 {
+                        bytes[i] += 1;
+                        // Zero out all bytes to the right
+                        for j in (i + 1)..bytes.len() {
+                            bytes[j] = 0;
+                        }
+                        return Some(bytes);
+                    }
+                }
+                // All bytes are 255, append a zero byte
+                bytes.push(0);
+                Some(bytes)
             }
         }
     }
@@ -121,14 +172,28 @@ impl Collatable for ast::Literal {
                     Some(bytes[..bytes.len() - 1].to_vec())
                 }
             }
-            ast::Literal::Integer(i) => {
+            ast::Literal::I16(i) => {
+                if *i == i16::MIN {
+                    None
+                } else {
+                    Some((i - 1).to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::I32(i) => {
+                if *i == i32::MIN {
+                    None
+                } else {
+                    Some((i - 1).to_be_bytes().to_vec())
+                }
+            }
+            ast::Literal::I64(i) => {
                 if *i == i64::MIN {
                     None
                 } else {
                     Some((i - 1).to_be_bytes().to_vec())
                 }
             }
-            ast::Literal::Float(f) => {
+            ast::Literal::F64(f) => {
                 if f.is_nan() || (f.is_infinite() && *f < 0.0) {
                     None
                 } else {
@@ -137,11 +202,51 @@ impl Collatable for ast::Literal {
                     Some(prev_bits.to_be_bytes().to_vec())
                 }
             }
-            ast::Literal::Boolean(b) => {
+            ast::Literal::Bool(b) => {
                 if *b {
                     Some(vec![0])
                 } else {
                     None
+                }
+            }
+            ast::Literal::EntityId(ulid) => {
+                let mut bytes = ulid.to_bytes();
+                // Find the rightmost byte that can be decremented
+                for i in (0..bytes.len()).rev() {
+                    if bytes[i] > 0 {
+                        bytes[i] -= 1;
+                        // Set all bytes to the right to 255
+                        for j in (i + 1)..bytes.len() {
+                            bytes[j] = 255;
+                        }
+                        return Some(bytes.to_vec());
+                    }
+                }
+                None // All bytes are 0, no predecessor
+            }
+            ast::Literal::Object(bytes) | ast::Literal::Binary(bytes) => {
+                if bytes.is_empty() {
+                    None
+                } else {
+                    let mut bytes = bytes.clone();
+                    // Find the rightmost byte that can be decremented
+                    for i in (0..bytes.len()).rev() {
+                        if bytes[i] > 0 {
+                            bytes[i] -= 1;
+                            // Set all bytes to the right to 255
+                            for j in (i + 1)..bytes.len() {
+                                bytes[j] = 255;
+                            }
+                            return Some(bytes);
+                        }
+                    }
+                    // All bytes are 0, remove the last byte
+                    if bytes.len() > 1 {
+                        bytes.pop();
+                        Some(bytes)
+                    } else {
+                        None
+                    }
                 }
             }
         }
@@ -150,18 +255,26 @@ impl Collatable for ast::Literal {
     fn is_minimum(&self) -> bool {
         match self {
             ast::Literal::String(s) => s.is_empty(),
-            ast::Literal::Integer(i) => *i == i64::MIN,
-            ast::Literal::Float(f) => *f == f64::NEG_INFINITY,
-            ast::Literal::Boolean(b) => !b,
+            ast::Literal::I16(i) => *i == i16::MIN,
+            ast::Literal::I32(i) => *i == i32::MIN,
+            ast::Literal::I64(i) => *i == i64::MIN,
+            ast::Literal::F64(f) => *f == f64::NEG_INFINITY,
+            ast::Literal::Bool(b) => !b,
+            ast::Literal::EntityId(ulid) => ulid.to_bytes().iter().all(|&b| b == 0),
+            ast::Literal::Object(bytes) | ast::Literal::Binary(bytes) => bytes.is_empty(),
         }
     }
 
     fn is_maximum(&self) -> bool {
         match self {
             ast::Literal::String(_) => false, // Strings have no theoretical maximum
-            ast::Literal::Integer(i) => *i == i64::MAX,
-            ast::Literal::Float(f) => *f == f64::INFINITY,
-            ast::Literal::Boolean(b) => *b,
+            ast::Literal::I16(i) => *i == i16::MAX,
+            ast::Literal::I32(i) => *i == i32::MAX,
+            ast::Literal::I64(i) => *i == i64::MAX,
+            ast::Literal::F64(f) => *f == f64::INFINITY,
+            ast::Literal::Bool(b) => *b,
+            ast::Literal::EntityId(ulid) => ulid.to_bytes().iter().all(|&b| b == 255),
+            ast::Literal::Object(_) | ast::Literal::Binary(_) => false, // No theoretical maximum
         }
     }
 }
@@ -399,5 +512,88 @@ mod tests {
         assert!(n.is_in_range(RangeBound::Unbounded, RangeBound::Included(&45)));
         assert!(n.is_in_range(RangeBound::Included(&40), RangeBound::Unbounded));
         assert!(n.is_in_range(RangeBound::Unbounded, RangeBound::Unbounded));
+    }
+
+    #[test]
+    fn test_literal_i16_collation() {
+        let lit = ast::Literal::I16(100);
+        assert!(lit.successor_bytes().unwrap() > lit.to_bytes());
+        assert!(lit.predecessor_bytes().unwrap() < lit.to_bytes());
+        assert!(!lit.is_minimum());
+        assert!(!lit.is_maximum());
+
+        let max_lit = ast::Literal::I16(i16::MAX);
+        let min_lit = ast::Literal::I16(i16::MIN);
+        assert!(max_lit.successor_bytes().is_none());
+        assert!(min_lit.predecessor_bytes().is_none());
+        assert!(max_lit.is_maximum());
+        assert!(min_lit.is_minimum());
+    }
+
+    #[test]
+    fn test_literal_i32_collation() {
+        let lit = ast::Literal::I32(1000);
+        assert!(lit.successor_bytes().unwrap() > lit.to_bytes());
+        assert!(lit.predecessor_bytes().unwrap() < lit.to_bytes());
+        assert!(!lit.is_minimum());
+        assert!(!lit.is_maximum());
+
+        let max_lit = ast::Literal::I32(i32::MAX);
+        let min_lit = ast::Literal::I32(i32::MIN);
+        assert!(max_lit.successor_bytes().is_none());
+        assert!(min_lit.predecessor_bytes().is_none());
+        assert!(max_lit.is_maximum());
+        assert!(min_lit.is_minimum());
+    }
+
+    #[test]
+    fn test_literal_entity_id_collation() {
+        use ulid::Ulid;
+        let ulid = Ulid::new();
+        let lit = ast::Literal::EntityId(ulid);
+
+        // Test basic operations
+        assert!(!lit.is_minimum());
+        assert!(!lit.is_maximum());
+
+        // Test minimum ULID (all zeros)
+        let min_ulid = Ulid::from_bytes([0; 16]);
+        let min_lit = ast::Literal::EntityId(min_ulid);
+        assert!(min_lit.is_minimum());
+        assert!(min_lit.predecessor_bytes().is_none());
+
+        // Test maximum ULID (all 255s)
+        let max_ulid = Ulid::from_bytes([255; 16]);
+        let max_lit = ast::Literal::EntityId(max_ulid);
+        assert!(max_lit.is_maximum());
+        assert!(max_lit.successor_bytes().is_none());
+    }
+
+    #[test]
+    fn test_literal_binary_collation() {
+        let lit = ast::Literal::Binary(vec![1, 2, 3]);
+        assert!(lit.successor_bytes().unwrap() > lit.to_bytes());
+        assert!(lit.predecessor_bytes().unwrap() < lit.to_bytes());
+        assert!(!lit.is_minimum());
+        assert!(!lit.is_maximum());
+
+        let empty_lit = ast::Literal::Binary(vec![]);
+        assert!(empty_lit.is_minimum());
+        assert!(empty_lit.predecessor_bytes().is_none());
+        assert!(!empty_lit.is_maximum());
+    }
+
+    #[test]
+    fn test_literal_object_collation() {
+        let lit = ast::Literal::Object(vec![10, 20, 30]);
+        assert!(lit.successor_bytes().unwrap() > lit.to_bytes());
+        assert!(lit.predecessor_bytes().unwrap() < lit.to_bytes());
+        assert!(!lit.is_minimum());
+        assert!(!lit.is_maximum());
+
+        let empty_lit = ast::Literal::Object(vec![]);
+        assert!(empty_lit.is_minimum());
+        assert!(empty_lit.predecessor_bytes().is_none());
+        assert!(!empty_lit.is_maximum());
     }
 }
