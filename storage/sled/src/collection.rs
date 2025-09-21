@@ -26,7 +26,7 @@ use crate::{
 use ankurah_storage_common::traits::{EntityIdStream, EntityStateStream};
 
 #[derive(Clone)]
-pub struct SledStorageCollection {
+pub struct SledStorageCollectionInner {
     pub collection_id: CollectionId,
     pub database: Arc<Database>,
     pub tree: sled::Tree,
@@ -34,77 +34,64 @@ pub struct SledStorageCollection {
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
 
+pub struct SledStorageCollection(SledStorageCollectionInner);
+
+impl SledStorageCollection {
+    pub fn new(
+        collection_id: CollectionId,
+        database: Arc<Database>,
+        tree: sled::Tree,
+        #[cfg(debug_assertions)] prefix_guard_disabled: Arc<AtomicBool>,
+    ) -> Self {
+        Self(SledStorageCollectionInner {
+            collection_id,
+            database,
+            tree,
+            #[cfg(debug_assertions)]
+            prefix_guard_disabled,
+        })
+    }
+}
+
 #[async_trait]
 impl StorageCollection for SledStorageCollection {
     // stub functions in the trait impl should all call out to their blocking counterparts
     // in order to keep this tidy
     async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
-        let me = self.clone();
+        let inner = self.0.clone();
         // Use spawn_blocking since sled operations are not async
-        Ok(task::spawn_blocking(move || me.set_state_blocking(state)).await??)
+        Ok(task::spawn_blocking(move || inner.set_state_blocking(state)).await??)
     }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
-        let me = self.clone();
-        Ok(task::spawn_blocking(move || me.get_state_blocking(id)).await??)
+        let inner = self.0.clone();
+        Ok(task::spawn_blocking(move || inner.get_state_blocking(id)).await??)
     }
 
     async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        let me = self.clone();
+        let inner = self.0.clone();
         let selection = selection.clone();
-        Ok(task::spawn_blocking(move || me.fetch_states_blocking(selection)).await??)
+        Ok(task::spawn_blocking(move || inner.fetch_states_blocking(selection)).await??)
     }
 
     async fn add_event(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
-        let binary_state = bincode::serialize(event)?;
-
-        // TODO implement self.add_event_blocking
-        let last = self
-            .database
-            .events_tree
-            .insert(event.payload.id().as_bytes(), binary_state.clone())
-            .map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
-
-        if let Some(last_bytes) = last {
-            Ok(last_bytes != binary_state)
-        } else {
-            Ok(true)
-        }
+        let inner = self.0.clone();
+        let event = event.clone();
+        Ok(task::spawn_blocking(move || inner.add_event_blocking(&event)).await??)
     }
 
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
-        // TODO implement self.get_events_blocking
-        let mut events = Vec::new();
-        for event_id in event_ids {
-            match self.database.events_tree.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
-                Some(event) => {
-                    let event: Attested<Event> = bincode::deserialize(&event)?;
-                    events.push(event);
-                }
-                None => continue,
-            }
-        }
-        Ok(events)
+        let inner = self.0.clone();
+        Ok(task::spawn_blocking(move || inner.get_events_blocking(event_ids)).await??)
     }
 
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
-        let mut events = Vec::new();
-
-        // TODO implement self.dump_entity_events_blocking
-        // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
-        for event_data in self.database.events_tree.iter() {
-            let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
-            let event: Attested<Event> = bincode::deserialize(&data)?;
-            if event.payload.entity_id == entity_id {
-                events.push(event);
-            }
-        }
-
-        Ok(events)
+        let inner = self.0.clone();
+        Ok(task::spawn_blocking(move || inner.dump_entity_events_blocking(entity_id)).await??)
     }
 }
 
-impl SledStorageCollection {
+impl SledStorageCollectionInner {
     // I think this one is done - did it myself
     fn set_state_blocking(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
         let (entity_id, collection, sfrag) = state.to_parts();
@@ -345,6 +332,51 @@ impl SledStorageCollection {
                     }
                 }
             }
+        }
+    }
+
+    fn get_events_blocking(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        let mut events = Vec::new();
+        for event_id in event_ids {
+            match self.database.events_tree.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
+                Some(event) => {
+                    let event: Attested<Event> = bincode::deserialize(&event)?;
+                    events.push(event);
+                }
+                None => continue,
+            }
+        }
+        Ok(events)
+    }
+
+    fn dump_entity_events_blocking(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        let mut events = Vec::new();
+
+        // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
+        for event_data in self.database.events_tree.iter() {
+            let (_key, data) = event_data.map_err(SledRetrievalError::StorageError)?;
+            let event: Attested<Event> = bincode::deserialize(&data)?;
+            if event.payload.entity_id == entity_id {
+                events.push(event);
+            }
+        }
+
+        Ok(events)
+    }
+
+    fn add_event_blocking(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
+        let binary_state = bincode::serialize(event)?;
+
+        let last = self
+            .database
+            .events_tree
+            .insert(event.payload.id().as_bytes(), binary_state.clone())
+            .map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
+
+        if let Some(last_bytes) = last {
+            Ok(last_bytes != binary_state)
+        } else {
+            Ok(true)
         }
     }
 }

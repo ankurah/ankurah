@@ -41,20 +41,16 @@ pub async fn test_edge_cases() -> Result<(), anyhow::Error> {
     // Test empty string handling
     assert_eq!(names(&ctx.fetch("name = ''").await?), vec![""]);
 
-    info!("MARK0");
     // Test special characters in queries (need to escape quotes)
     assert_eq!(names(&ctx.fetch("name = 'Special!@#$%'").await?), vec!["Special!@#$%"]);
 
-    info!("MARK0.1");
     // Test Unicode support
     assert_eq!(names(&ctx.fetch("name = 'Unicode: 你好'").await?), vec!["Unicode: 你好"]);
 
-    info!("MARK0.2");
     // Test case sensitivity
     assert_eq!(names(&ctx.fetch("name = 'UPPERCASE'").await?), vec!["UPPERCASE"]);
     assert_eq!(names(&ctx.fetch("name = 'lowercase'").await?), vec!["lowercase"]);
 
-    info!("MARK1");
     // Test complex AND/OR combinations
     assert_eq!(
         sort_names(&ctx.fetch("(name = 'UPPERCASE' OR name = 'lowercase') AND year >= '2004'").await?),
@@ -73,7 +69,6 @@ pub async fn test_edge_cases() -> Result<(), anyhow::Error> {
         vec!["Album with spaces", "Album-with-dashes", "Album_with_underscores", "MixedCase", "Special!@#$%"]
     );
 
-    info!("MARK2");
     // Cleanup
     IndexedDBStorageEngine::cleanup(&db_name).await?;
     Ok(())
