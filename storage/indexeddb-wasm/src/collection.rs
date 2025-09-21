@@ -416,7 +416,7 @@ impl IndexedDBBucket {
             let entity_obj = Object::new(step(cursor.value(), "get cursor value")?);
 
             // Create a wrapper that provides collection context for filtering
-            let filterable_entity = FilterableObject { object: &entity_obj, collection_id: collection_id };
+            let filterable_entity = FilterableObject { object: &entity_obj, collection_id };
 
             // Apply predicate filtering first (cheaper than entity conversion)
             if ankql::selection::filter::evaluate_predicate(&filterable_entity, predicate)
