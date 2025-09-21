@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 #[cfg(debug_assertions)]
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
+#[cfg(not(debug_assertions))]
+use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
     error::{MutationError, RetrievalError},
@@ -13,7 +15,7 @@ use sled::Config;
 use crate::{collection::SledStorageCollection, database::Database, error::SledRetrievalError};
 
 pub struct SledStorageEngine {
-    pub database: Arc<Database>,
+    pub database: Mutex<Arc<Database>>,
     #[cfg(debug_assertions)]
     pub prefix_guard_disabled: Arc<AtomicBool>,
 }
@@ -38,7 +40,7 @@ impl SledStorageEngine {
         let dbpath = path.join("sled");
         let db = sled::open(&dbpath)?;
         Ok(Self {
-            database: Arc::new(Database::open(db)?),
+            database: Mutex::new(Arc::new(Database::open(db)?)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
@@ -51,26 +53,26 @@ impl SledStorageEngine {
         let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
 
         Ok(Self {
-            database: Arc::new(Database::open(db)?),
+            database: Mutex::new(Arc::new(Database::open(db)?)),
             #[cfg(debug_assertions)]
             prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// List all collections in the storage engine by looking for trees that end in _state
+    /// List all collections in the storage engine by looking for trees that start with collection_
     pub fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
-        let collections: Vec<CollectionId> = self
-            .database
+        let database = self.database.lock().unwrap();
+        let collections: Vec<CollectionId> = database
             .db
             .tree_names()
             .into_iter()
             .filter_map(|name| {
                 // Convert &[u8] to String, skip if invalid UTF-8
                 let name_str = String::from_utf8(name.to_vec()).ok()?;
-                // Only include collections that end in _state
-                if name_str.ends_with("_state") {
-                    // Strip _state suffix and convert to CollectionId
-                    Some(name_str.strip_suffix("_state")?.to_string().into())
+                // Only include collections that start with collection_
+                if name_str.starts_with("collection_") {
+                    // Strip collection_ prefix and convert to CollectionId
+                    Some(name_str.strip_prefix("collection_")?.to_string().into())
                 } else {
                     None
                 }
@@ -86,33 +88,50 @@ impl StorageEngine for SledStorageEngine {
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
 
+        let database = self.database.lock().unwrap().clone();
         let collection_name = format!("collection_{id}");
-        let tree = self.database.db.open_tree(collection_name).map_err(SledRetrievalError::StorageError)?;
-        Ok(Arc::new(SledStorageCollection {
-            collection_id: id.to_owned(),
-            database: self.database.clone(),
+        let tree = database.db.open_tree(collection_name).map_err(SledRetrievalError::StorageError)?;
+        Ok(Arc::new(SledStorageCollection::new(
+            id.to_owned(),
+            database,
             tree,
             #[cfg(debug_assertions)]
-            prefix_guard_disabled: self.prefix_guard_disabled.clone(),
-        }))
+            self.prefix_guard_disabled.clone(),
+        )))
     }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         let mut any_deleted = false;
 
-        // Get all tree names
-        let tree_names = self.database.db.tree_names();
+        // Get all tree names and drop them
+        {
+            let database = self.database.lock().unwrap();
+            let tree_names = database.db.tree_names();
 
-        // Drop each tree
-        for name in tree_names {
-            if name == "__sled__default" {
-                continue;
+            // Drop each tree
+            for name in tree_names {
+                if name == "__sled__default" {
+                    continue;
+                }
+                println!("Dropping tree: {}", String::from_utf8_lossy(&name));
+                match database.db.drop_tree(&name) {
+                    Ok(true) => any_deleted = true,
+                    Ok(false) => {}
+                    Err(err) => {
+                        println!("Error dropping tree: {}", err);
+                        return Err(MutationError::General(Box::new(err)));
+                    }
+                }
             }
-            match self.database.db.drop_tree(&name) {
-                Ok(true) => any_deleted = true,
-                Ok(false) => {}
-                Err(err) => return Err(MutationError::General(Box::new(err))),
-            }
+        }
+
+        // Recreate the Database to ensure all tree references are fresh
+        {
+            let mut database_guard = self.database.lock().unwrap();
+            let old_database = database_guard.clone();
+            let new_database = Database::open(old_database.db.clone())
+                .map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
+            *database_guard = Arc::new(new_database);
         }
 
         Ok(any_deleted)
