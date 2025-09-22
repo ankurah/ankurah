@@ -2,6 +2,7 @@
 use std::sync::{atomic::AtomicBool, Arc};
 
 use ankql::ast::{OrderByItem, Predicate};
+use ankurah_core::indexing::KeySpec;
 use ankurah_core::value::cast_predicate::cast_predicate_types;
 use ankurah_core::{
     entity::TemporaryEntity,
@@ -11,7 +12,7 @@ use ankurah_core::{
     EntityId,
 };
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
-use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, KeySpec, Plan, Planner, PlannerConfig, ScanDirection};
+use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, Plan, Planner, PlannerConfig, ScanDirection};
 use async_trait::async_trait;
 
 use tokio::task;

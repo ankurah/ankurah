@@ -1,5 +1,5 @@
 use ankurah::value::ValueType;
-use ankurah_storage_common::{IndexKeyPart, KeySpec};
+use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_storage_sled::SledStorageEngine;
 
 #[tokio::test]

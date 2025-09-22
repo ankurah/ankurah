@@ -338,10 +338,10 @@ impl StorageCollection for IndexedDBBucket {
 
 /// Execute queries using index cursors (we always use indexes for fetch operations)
 /// Convert IndexDirection to IdbCursorDirection
-pub fn to_idb_cursor_direction(direction: ankurah_storage_common::index_spec::IndexDirection) -> web_sys::IdbCursorDirection {
+pub fn to_idb_cursor_direction(direction: ankurah_core::indexing::IndexDirection) -> web_sys::IdbCursorDirection {
     match direction {
-        ankurah_storage_common::index_spec::IndexDirection::Asc => web_sys::IdbCursorDirection::Next,
-        ankurah_storage_common::index_spec::IndexDirection::Desc => web_sys::IdbCursorDirection::Prev,
+        ankurah_core::indexing::IndexDirection::Asc => web_sys::IdbCursorDirection::Next,
+        ankurah_core::indexing::IndexDirection::Desc => web_sys::IdbCursorDirection::Prev,
     }
 }
 

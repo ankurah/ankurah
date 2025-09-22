@@ -61,7 +61,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     /// Add an entity to the result set
     pub fn add(&mut self, entity: E) -> bool {
         let guard = self.guard.as_mut().expect("write guard already dropped");
-        let id = entity.id();
+        let id = *entity.id();
         if guard.index.contains_key(&id) {
             return false; // Already present
         }
@@ -96,7 +96,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     /// Returns an iterator over (entity_id, entity) pairs
     pub fn iter_entities(&self) -> impl Iterator<Item = (proto::EntityId, &E)> {
         let guard = self.guard.as_ref().expect("write guard already dropped");
-        guard.order.iter().map(|entity| (entity.id(), entity))
+        guard.order.iter().map(|entity| (*entity.id(), entity))
     }
 }
 
@@ -107,7 +107,7 @@ impl<'a, E: AbstractEntity> ResultSetRead<'a, E> {
     /// Iterate over all entities
     /// Returns an iterator over (entity_id, entity) pairs
     pub fn iter_entities(&self) -> impl Iterator<Item = (proto::EntityId, &E)> {
-        self.guard.order.iter().map(|entity| (entity.id(), entity))
+        self.guard.order.iter().map(|entity| (*entity.id(), entity))
     }
 
     /// Get the number of entities
@@ -132,7 +132,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     pub fn from_vec(order: Vec<E>, loaded: bool) -> Self {
         let mut index = HashMap::new();
         for (i, entity) in order.iter().enumerate() {
-            index.insert(entity.id(), i);
+            index.insert(*entity.id(), i);
         }
         let state = State { order, index };
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(loaded), broadcast: Broadcast::new() }))
@@ -143,7 +143,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     }
     pub fn single(entity: E) -> Self {
         let mut state = State { order: Vec::new(), index: HashMap::new() };
-        state.index.insert(entity.id(), 0);
+        state.index.insert(*entity.id(), 0);
         state.order.push(entity);
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(false), broadcast: Broadcast::new() }))
     }
@@ -180,7 +180,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         st.order.clear();
         st.index.clear();
         for (i, entity) in entities.into_iter().enumerate() {
-            st.index.insert(AbstractEntity::id(&entity), i);
+            st.index.insert(*AbstractEntity::id(&entity), i);
             st.order.push(entity);
         }
         drop(st);
@@ -189,7 +189,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     /// Append entity to the end; returns false if already present.
     pub fn push(&self, entity: E) -> bool {
         let mut st = self.0.state.lock().unwrap();
-        let id = AbstractEntity::id(&entity);
+        let id = *AbstractEntity::id(&entity);
         if st.index.contains_key(&id) {
             return false;
         }
@@ -236,7 +236,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     /// Get an iterator over entity IDs without cloning entities
     pub fn keys(&self) -> EntityResultSetKeyIterator {
         let st = self.0.state.lock().unwrap();
-        let keys: Vec<proto::EntityId> = st.order.iter().map(|e| e.id()).collect();
+        let keys: Vec<proto::EntityId> = st.order.iter().map(|e| *e.id()).collect();
         EntityResultSetKeyIterator::new(keys)
     }
 
@@ -260,7 +260,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
 fn fix_from<E: AbstractEntity>(st: &mut State<E>, start: usize) {
     // Recompute indices for shifted tail
     for i in start..st.order.len() {
-        let id = st.order[i].id();
+        let id = *st.order[i].id();
         st.index.insert(id, i);
     }
 }

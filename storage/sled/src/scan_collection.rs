@@ -1,9 +1,10 @@
 use crate::error::IndexError;
 use crate::planner_integration::{key_bounds_to_sled_range, SledRangeBounds};
 use crate::property::PropertyManager;
+use ankurah_core::indexing::{IndexDirection, IndexKeyPart, KeySpec};
 use ankurah_core::value::ValueType;
 use ankurah_core::{error::RetrievalError, EntityId};
-use ankurah_storage_common::{traits::EntityIdStream, IndexDirection, IndexKeyPart, KeyBounds, KeySpec, ScanDirection};
+use ankurah_storage_common::{traits::EntityIdStream, KeyBounds, ScanDirection};
 
 /// Scanner over a materialized collection tree yielding EntityId directly (for ID-only queries)
 pub struct SledCollectionKeyScanner<'a> {

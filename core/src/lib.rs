@@ -4,6 +4,7 @@ pub mod connector;
 pub mod context;
 pub mod entity;
 pub mod error;
+pub mod indexing;
 pub mod lineage;
 pub mod livequery;
 pub mod model;

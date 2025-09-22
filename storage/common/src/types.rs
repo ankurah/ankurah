@@ -1,6 +1,6 @@
 use ankurah_core::value::{Value, ValueType};
 
-use crate::index_spec::KeySpec;
+use ankurah_core::indexing::KeySpec;
 
 // TODO
 // Build IndexBounds per keypart from WHERE/ORDER BY (like PG’s per-column ScanKey/IndexBounds).

@@ -1,6 +1,6 @@
 mod common;
 use ankurah_core::value::ValueType;
-use ankurah_storage_common::{IndexKeyPart, KeySpec};
+use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use common::*;
 
