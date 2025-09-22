@@ -1,5 +1,5 @@
-use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
 use ankurah_core::indexing::KeySpec;
+use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
 use anyhow::Result;
 use js_sys::Function;
 use send_wrapper::SendWrapper;

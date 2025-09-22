@@ -22,7 +22,7 @@ use std::{
 use tracing::debug;
 
 /// Trait for entities that can be used in reactor notifications
-pub trait AbstractEntity: ankql::selection::filter::Filterable + Clone + std::fmt::Debug {
+pub trait AbstractEntity: Clone + std::fmt::Debug {
     fn collection(&self) -> proto::CollectionId;
     fn id(&self) -> &proto::EntityId;
     fn value(&self, field: &str) -> Option<Value>;
@@ -62,9 +62,11 @@ impl ChangeNotification for EntityChange {
 }
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
-pub struct Reactor<E: AbstractEntity = Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(Arc<ReactorInner<E, Ev>>);
+pub struct Reactor<E: AbstractEntity + ankql::selection::filter::Filterable = Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(
+    Arc<ReactorInner<E, Ev>>,
+);
 
-struct ReactorInner<E: AbstractEntity, Ev> {
+struct ReactorInner<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
     subscriptions: Mutex<HashMap<ReactorSubscriptionId, SubscriptionState<E, Ev>>>,
     watcher_set: Mutex<WatcherSet>,
 }
@@ -97,7 +99,7 @@ struct WatcherSet {
 
 /// State for a single predicate within a subscription
 #[derive(Debug, Clone)]
-struct QueryState<E: AbstractEntity> {
+struct QueryState<E: AbstractEntity + ankql::selection::filter::Filterable> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
     pub(crate) collection_id: proto::CollectionId,
     pub(crate) selection: ankql::ast::Selection,
@@ -107,7 +109,7 @@ struct QueryState<E: AbstractEntity> {
     pub(crate) version: u32,
 }
 
-struct SubscriptionState<E: AbstractEntity, Ev> {
+struct SubscriptionState<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
     pub(crate) id: ReactorSubscriptionId,
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
     /// The set of entities that are subscribed to by this subscription
@@ -131,15 +133,15 @@ enum WatcherOp {
 }
 
 // don't require Clone SE or PA, because we have an Arc
-impl<E: AbstractEntity, Ev> Clone for Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity, Ev: Clone> Default for Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> Default for Reactor<E, Ev> {
     fn default() -> Self { Self::new() }
 }
 
-impl<E: AbstractEntity, Ev: Clone> Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> Reactor<E, Ev> {
     pub fn new() -> Self {
         Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
@@ -167,7 +169,7 @@ impl<E: AbstractEntity, Ev: Clone> Reactor<E, Ev> {
     }
 }
 
-impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Reactor<E, Ev> {
     /// Remove a subscription and all its predicates
     pub(crate) fn unsubscribe(&self, sub_id: ReactorSubscriptionId) -> Result<(), SubscriptionError> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
@@ -284,14 +286,14 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
                         query_id,
                         predicate_state.resultset.len()
                     );
-                    predicate_state.resultset.push(entity.clone());
+                    predicate_state.resultset.write().add(entity.clone());
                     subscription.entities.insert(entity_id.clone(), entity.clone());
                 }
                 (true, false) => {
                     tracing::info!("REMOVE entity {} from predicate resultset {}", entity_id, query_id);
                     // Entity no longer matches - remove from matching set
                     // (but keep in entity cache for now - it might still be needed by other predicates)
-                    predicate_state.resultset.remove(&entity_id);
+                    predicate_state.resultset.write().remove(*entity_id);
                 }
                 _ => {} // No change needed
             }
@@ -299,7 +301,7 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
     }
 }
 
-impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clone> Reactor<E, Ev> {
     /// Add a new predicate to a subscription (initial subscription only)
     /// Fails if query_id already exists - use update_query for updates
     /// The resultset must be pre-populated with entities that match the predicate
@@ -685,7 +687,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
     }
 }
 
-impl<E: AbstractEntity> std::fmt::Debug for Reactor<E> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable> std::fmt::Debug for Reactor<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let watcher_set = self.0.watcher_set.lock().unwrap();
         let subscriptions = self.0.subscriptions.lock().unwrap();
@@ -766,11 +768,11 @@ impl WatcherSet {
     }
 }
 
-impl<E: AbstractEntity, Ev: Clone> SubscriptionState<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> SubscriptionState<E, Ev> {
     fn notify(&self, update: ReactorUpdate<E, Ev>) { self.broadcast.send(update); }
 }
 
-impl<E: AbstractEntity, Ev> std::fmt::Debug for SubscriptionState<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> std::fmt::Debug for SubscriptionState<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Subscription {{ id: {:?}, predicates: {} }}", self.id, self.queries.len())
     }
