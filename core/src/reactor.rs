@@ -24,8 +24,8 @@ use tracing::debug;
 /// Trait for entities that can be used in reactor notifications
 pub trait AbstractEntity: ankql::selection::filter::Filterable + Clone + std::fmt::Debug {
     fn collection(&self) -> proto::CollectionId;
-    fn id(&self) -> proto::EntityId;
-    fn value(&self, field: &str) -> Option<String>;
+    fn id(&self) -> &proto::EntityId;
+    fn value(&self, field: &str) -> Option<Value>;
 }
 
 /// Trait for types that can be used in notify_change
@@ -40,9 +40,17 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
 impl AbstractEntity for Entity {
     fn collection(&self) -> proto::CollectionId { self.collection.clone() }
 
-    fn id(&self) -> proto::EntityId { self.id }
+    fn id(&self) -> &proto::EntityId { &self.id }
 
-    fn value(&self, field: &str) -> Option<String> { ankql::selection::filter::Filterable::value(self, field) }
+    fn value(&self, field: &str) -> Option<crate::value::Value> {
+        if field == "id" {
+            Some(crate::value::Value::EntityId(self.id))
+        } else {
+            // Iterate through backends to find one that has this property
+            let backends = self.backends.lock().expect("other thread panicked, panic here too");
+            backends.values().find_map(|backend| backend.property_value(&field.into()))
+        }
+    }
 }
 
 // Implement the trait for EntityChange
@@ -277,7 +285,7 @@ impl<E: AbstractEntity, Ev> Reactor<E, Ev> {
                         predicate_state.resultset.len()
                     );
                     predicate_state.resultset.push(entity.clone());
-                    subscription.entities.insert(entity_id, entity.clone());
+                    subscription.entities.insert(entity_id.clone(), entity.clone());
                 }
                 (true, false) => {
                     tracing::info!("REMOVE entity {} from predicate resultset {}", entity_id, query_id);
@@ -418,11 +426,11 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                     rw_resultset.add(entity.clone());
 
                     // Add to subscription entities map
-                    subscription.entities.insert(entity_id, entity.clone());
+                    subscription.entities.insert(entity_id.clone(), entity.clone());
 
                     // Set up entity watchers
-                    subscription.entity_subscriptions.insert(entity_id);
-                    let entity_watcher = watcher_state.entity_watchers.entry(entity_id).or_default();
+                    subscription.entity_subscriptions.insert(entity_id.clone());
+                    let entity_watcher = watcher_state.entity_watchers.entry(entity_id.clone()).or_default();
                     entity_watcher.insert(EntityWatcherId::Subscription(subscription_id));
                     entity_watcher.insert(EntityWatcherId::Predicate(subscription_id, query_id));
 
@@ -517,7 +525,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                 // Get the field value from the entity
                 if *collection_id == AbstractEntity::collection(&entity) {
                     if let Some(field_value) = AbstractEntity::value(&entity, &field_id.0) {
-                        possibly_interested_watchers.extend(index_ref.find_matching(Value::String(field_value)));
+                        possibly_interested_watchers.extend(index_ref.find_matching(field_value));
                     }
                 }
             }
@@ -579,7 +587,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                         AbstractEntity::value(&entity, "status")
                     );
 
-                    let entity_watcher = watcher_set.entity_watchers.entry(entity.id()).or_default();
+                    let entity_watcher = watcher_set.entity_watchers.entry(entity.id().clone()).or_default();
                     if matches {
                         // Entity subscriptions are implicit / sticky...
                         // Register one for the predicate that gets removed when the predicate no longer matches
@@ -603,7 +611,7 @@ impl<E: AbstractEntity + 'static, Ev: Clone> Reactor<E, Ev> {
                     let entity_subscribed = entity_subscribed.contains(&query_id);
                     if membership_change.is_some() || entity_subscribed {
                         tracing::info!("Reactor SENDING UPDATE to subscription {}", subscription_id);
-                        match sub_entities.entry(AbstractEntity::id(&entity)) {
+                        match sub_entities.entry(AbstractEntity::id(&entity).clone()) {
                             indexmap::map::Entry::Vacant(v) => {
                                 v.insert(ReactorUpdateItem {
                                     entity: entity.clone(),
@@ -826,8 +834,10 @@ mod tests {
     }
     impl AbstractEntity for TestEntity {
         fn collection(&self) -> proto::CollectionId { self.collection.clone() }
-        fn id(&self) -> proto::EntityId { self.id }
-        fn value(&self, field: &str) -> Option<String> { self.state.lock().unwrap().get(field).cloned() }
+        fn id(&self) -> &proto::EntityId { &self.id }
+        fn value(&self, field: &str) -> Option<crate::value::Value> {
+            self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
+        }
     }
 
     /// Test that once a predicate matches an entity, that entity continues to be watched

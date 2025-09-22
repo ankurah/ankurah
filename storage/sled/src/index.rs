@@ -1,6 +1,6 @@
 use ankurah_core::error::{MutationError, RetrievalError};
+use ankurah_core::indexing::IndexSpecMatch;
 use ankurah_proto::EntityId;
-use ankurah_storage_common::IndexSpecMatch;
 use serde::{Deserialize, Serialize};
 use sled::{Db, Tree};
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ pub struct IndexRecord {
     pub id: u32,
     pub collection: String,
     pub name: String,
-    pub spec: ankurah_storage_common::KeySpec,
+    pub spec: ankurah_core::indexing::KeySpec,
     pub created_at_unix_ms: i64,
     pub build_status: BuildStatus,
 }
@@ -34,7 +34,7 @@ struct IndexInner {
     pub id: u32,
     pub collection: String,
     pub name: String,
-    pub spec: ankurah_storage_common::KeySpec,
+    pub spec: ankurah_core::indexing::KeySpec,
     pub created_at_unix_ms: i64,
     build_status: Mutex<BuildStatus>,
     pub build_lock: Mutex<()>,
@@ -75,7 +75,7 @@ impl IndexManager {
     pub fn assure_index_exists(
         &self,
         collection: &str,
-        spec: &ankurah_storage_common::KeySpec,
+        spec: &ankurah_core::indexing::KeySpec,
         db: &Db,
         property_manager: &PropertyManager,
     ) -> Result<(Index, IndexSpecMatch), RetrievalError> {
@@ -103,7 +103,7 @@ impl IndexManager {
         };
 
         index.build_if_needed(db)?;
-        Ok((index, ankurah_storage_common::index_spec::IndexSpecMatch::Match))
+        Ok((index, ankurah_core::indexing::IndexSpecMatch::Match))
     }
 }
 
@@ -112,7 +112,7 @@ impl Index {
     pub fn id(&self) -> u32 { self.0.id }
     pub fn collection(&self) -> &str { &self.0.collection }
     pub fn name(&self) -> &str { &self.0.name }
-    pub fn spec(&self) -> &ankurah_storage_common::KeySpec { &self.0.spec }
+    pub fn spec(&self) -> &ankurah_core::indexing::KeySpec { &self.0.spec }
     pub fn created_at_unix_ms(&self) -> i64 { self.0.created_at_unix_ms }
     /// Build the index key for an entity given a materialized property map.
     /// Returns Ok(None) if any required key part is missing and the entity should not be indexed.
@@ -171,7 +171,7 @@ impl Index {
 
     pub fn new_from_spec(
         collection: &str,
-        spec: ankurah_storage_common::KeySpec,
+        spec: ankurah_core::indexing::KeySpec,
         db: &Db,
         id: u32,
         index_config_tree: Tree,

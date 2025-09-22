@@ -2,8 +2,9 @@ use crate::{
     error::IndexError,
     planner_integration::{key_bounds_to_sled_range, SledRangeBounds},
 };
+use ankurah_core::indexing::IndexSpecMatch;
 use ankurah_core::{error::RetrievalError, EntityId};
-use ankurah_storage_common::{IndexSpecMatch, KeyBounds, ScanDirection};
+use ankurah_storage_common::{KeyBounds, ScanDirection};
 
 use crate::index::Index;
 

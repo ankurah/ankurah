@@ -1,5 +1,6 @@
 use ankurah::{Value, ValueType};
-use ankurah_storage_common::{Endpoint, IndexDirection, IndexKeyPart, KeyBoundComponent, KeyBounds, KeySpec};
+use ankurah_core::indexing::{IndexDirection, IndexKeyPart, KeySpec};
+use ankurah_storage_common::{Endpoint, KeyBoundComponent, KeyBounds};
 use ankurah_storage_sled::{error::IndexError, planner_integration::key_bounds_to_sled_range};
 
 #[test]

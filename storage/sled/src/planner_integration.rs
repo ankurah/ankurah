@@ -1,8 +1,9 @@
 // Refactored planner integration - cleaner and more cohesive
 
+use ankurah_core::indexing::KeySpec;
 use ankurah_core::value::ValueType;
 use ankurah_core::{collation::Collatable, value::Value};
-use ankurah_storage_common::{Endpoint, KeyBounds, KeyDatum, KeySpec};
+use ankurah_storage_common::{Endpoint, KeyBounds, KeyDatum};
 
 use crate::error::IndexError;
 
@@ -346,97 +347,16 @@ pub fn encode_component_for_sled(value: &Value, descending: bool) -> Vec<u8> {
 }
 
 /// Type-aware component encoding without type tags - requires KeySpec for type validation
+/// Delegates to core encoding for consistency
 pub fn encode_component_typed(value: &Value, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
-    // Cast value to expected type (short-circuits if types already match)
-    let value = value.cast_to(expected_type).map_err(|_| IndexError::TypeMismatch(expected_type, ValueType::of(value)))?;
-
-    match (&value, expected_type) {
-        (Value::String(s), ValueType::String) => {
-            if !descending {
-                // ASC: [escaped UTF-8][0x00] - no type tag needed
-                let mut out = Vec::with_capacity(s.len() + 1);
-                for &b in s.as_bytes() {
-                    if b == 0x00 {
-                        out.push(0x00);
-                        out.push(0xFF);
-                    } else {
-                        out.push(b);
-                    }
-                }
-                out.push(0x00);
-                Ok(out)
-            } else {
-                // DESC: [inv(payload) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
-                let mut out = Vec::with_capacity(s.len() + 2);
-                for &b in s.as_bytes() {
-                    let inv = 0xFFu8.wrapping_sub(b);
-                    if inv == 0xFF {
-                        out.push(0xFF);
-                        out.push(0x00);
-                    } else {
-                        out.push(inv);
-                    }
-                }
-                out.push(0xFF);
-                out.push(0xFF);
-                Ok(out)
+    match ankurah_core::indexing::encode_component_typed(value, expected_type, descending) {
+        Ok(bytes) => Ok(bytes),
+        Err(core_err) => {
+            // Convert core IndexError to sled IndexError
+            match core_err {
+                ankurah_core::indexing::IndexError::TypeMismatch(expected, got) => Err(IndexError::TypeMismatch(expected, got)),
             }
         }
-        (Value::I16(_) | Value::I32(_) | Value::I64(_), ValueType::I16 | ValueType::I32 | ValueType::I64) => {
-            // Integers are encoded big-endian (order-preserving). DESC: invert payload bytes.
-            let bytes = value.to_bytes();
-            if !descending {
-                Ok(bytes)
-            } else {
-                Ok(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)).collect())
-            }
-        }
-        (Value::Bool(_), ValueType::Bool) => {
-            // ASC: false(0) < true(1). DESC: invert payload to flip order.
-            let b = value.to_bytes()[0];
-            Ok(vec![if !descending { b } else { 0xFFu8.wrapping_sub(b) }])
-        }
-        (Value::EntityId(entity_id), ValueType::EntityId) => {
-            // Fixed-width EntityId: no terminator needed
-            let bytes = entity_id.to_bytes();
-            if !descending {
-                Ok(bytes.to_vec())
-            } else {
-                Ok(bytes.into_iter().map(|b| 0xFFu8.wrapping_sub(b)).collect())
-            }
-        }
-        (Value::Object(bytes) | Value::Binary(bytes), ValueType::Binary) => {
-            if !descending {
-                // ASC: [escaped bytes][0x00] - terminator needed for variable-width
-                let mut out = Vec::with_capacity(bytes.len() + 1);
-                for &b in bytes.iter() {
-                    if b == 0x00 {
-                        out.push(0x00);
-                        out.push(0xFF);
-                    } else {
-                        out.push(b);
-                    }
-                }
-                out.push(0x00);
-                Ok(out)
-            } else {
-                // DESC: [inv(bytes) with 0xFF escaped as 0xFF 0x00][0xFF 0xFF]
-                let mut out = Vec::with_capacity(bytes.len() + 2);
-                for &b in bytes.iter() {
-                    let inv = 0xFFu8.wrapping_sub(b);
-                    if inv == 0xFF {
-                        out.push(0xFF);
-                        out.push(0x00);
-                    } else {
-                        out.push(inv);
-                    }
-                }
-                out.push(0xFF);
-                out.push(0xFF);
-                Ok(out)
-            }
-        }
-        _ => Err(IndexError::TypeMismatch(expected_type, ValueType::of(&value))),
     }
 }
 
@@ -470,19 +390,14 @@ pub fn lex_successor(mut key: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// Type-aware encoding using KeySpec for validation and optimization
+/// Delegates to core encoding for consistency
 pub fn encode_tuple_values_with_key_spec(values: &[Value], key_spec: &KeySpec) -> Result<Vec<u8>, IndexError> {
-    let mut out = Vec::new();
-    for (i, v) in values.iter().enumerate() {
-        if i >= key_spec.keyparts.len() {
-            break; // Don't encode more values than key spec defines
-        }
-        let keypart = &key_spec.keyparts[i];
-
-        // Use type-aware encoding without type tags
-        let bytes = encode_component_typed(v, keypart.value_type, keypart.direction.is_desc())?;
-        out.extend_from_slice(&bytes);
+    match ankurah_core::indexing::encode_tuple_values_with_key_spec(values, key_spec) {
+        Ok(bytes) => Ok(bytes),
+        Err(core_err) => match core_err {
+            ankurah_core::indexing::IndexError::TypeMismatch(expected, got) => Err(IndexError::TypeMismatch(expected, got)),
+        },
     }
-    Ok(out)
 }
 
 #[cfg(test)]

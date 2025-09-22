@@ -1,10 +1,6 @@
-use crate::{
-    KeyBounds,
-    index_spec::{IndexKeyPart, KeySpec},
-    predicate::ConjunctFinder,
-    types::*,
-};
+use crate::{KeyBounds, predicate::ConjunctFinder, types::*};
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Predicate};
+use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_core::value::{Value, ValueType};
 use indexmap::IndexMap;
 

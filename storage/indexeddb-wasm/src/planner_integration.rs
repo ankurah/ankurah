@@ -176,8 +176,9 @@ pub fn scan_direction_to_cursor_direction(scan_direction: &ScanDirection) -> web
 mod tests {
     use super::*;
     use ankql::ast::Predicate;
+    use ankurah_core::indexing::{IndexKeyPart, KeySpec};
     use ankurah_core::value::ValueType;
-    use ankurah_storage_common::{IndexKeyPart, KeyBoundComponent, KeySpec, Plan};
+    use ankurah_storage_common::{KeyBoundComponent, Plan};
 
     #[test]
     fn test_plan_index_spec_name() {

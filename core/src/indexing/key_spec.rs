@@ -1,4 +1,4 @@
-use ankurah_core::value::ValueType;
+use crate::value::ValueType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,7 +69,11 @@ impl KeySpec {
             })
             .collect();
 
-        if prefix.is_empty() { fields.join(delim) } else { format!("{}{}{}", prefix, delim, fields.join(delim)) }
+        if prefix.is_empty() {
+            fields.join(delim)
+        } else {
+            format!("{}{}{}", prefix, delim, fields.join(delim))
+        }
     }
 
     /// Checks if this IndexSpec can be satisfied by another IndexSpec
