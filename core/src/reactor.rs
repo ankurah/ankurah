@@ -1,4 +1,5 @@
 mod comparison_index;
+mod fetch_gap;
 mod subscription;
 mod update;
 
@@ -8,12 +9,23 @@ pub(crate) use self::{
     update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
 };
 
+// Re-export fetch_gap items for when we implement the functionality
+#[allow(unused_imports)]
+pub(crate) use self::fetch_gap::{build_gap_predicate, infer_value_type_for_field, GapFetcher};
+
 use crate::{
-    changes::EntityChange, entity::Entity, error::SubscriptionError, reactor::subscription::ReactorSubInner, resultset::EntityResultSet,
-    value::Value,
+    changes::EntityChange,
+    entity::Entity,
+    error::SubscriptionError,
+    indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
+    node::ContextData,
+    reactor::subscription::ReactorSubInner,
+    resultset::EntityResultSet,
+    value::{Value, ValueType},
 };
 use ankurah_proto::{self as proto};
 use indexmap::IndexMap;
+use std::any::Any;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -98,15 +110,17 @@ struct WatcherSet {
 }
 
 /// State for a single predicate within a subscription
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct QueryState<E: AbstractEntity + ankql::selection::filter::Filterable> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
     pub(crate) collection_id: proto::CollectionId,
     pub(crate) selection: ankql::ast::Selection,
+    pub(crate) cdata: Box<dyn std::any::Any + Send + Sync>, // Type-erased ContextData
     // I think we need to move these out of PredicateState and into WatcherState
     pub(crate) paused: bool, // When true, skip notifications (used during initialization and updates)
     pub(crate) resultset: EntityResultSet<E>,
     pub(crate) version: u32,
+    pub(crate) gap_dirty: bool, // Set when we remove an item causing it to no longer saturate the limit
 }
 
 struct SubscriptionState<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
@@ -301,17 +315,46 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Reactor<E, Ev
     }
 }
 
+/// Build KeySpec from Selection's ORDER BY clause with type inference from sample entities
+fn build_key_spec_from_selection<E: AbstractEntity>(
+    order_by: &[ankql::ast::OrderByItem],
+    resultset: &EntityResultSet<E>,
+) -> anyhow::Result<KeySpec> {
+    let mut keyparts = Vec::new();
+
+    let read = resultset.read();
+    for item in order_by {
+        let column = match &item.identifier {
+            ankql::ast::Identifier::Property(name) => name.clone(),
+            _ => return Err(anyhow::anyhow!("Collection properties not supported in ORDER BY")),
+        };
+
+        // Infer type from first non-null value in resultset entities
+        let value_type = read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
+
+        let direction: IndexDirection = match item.direction {
+            ankql::ast::OrderDirection::Asc => IndexDirection::Asc,
+            ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
+        };
+
+        keyparts.push(IndexKeyPart { column, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
+    }
+
+    Ok(KeySpec { keyparts })
+}
+
 impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clone> Reactor<E, Ev> {
     /// Add a new predicate to a subscription (initial subscription only)
     /// Fails if query_id already exists - use update_query for updates
     /// The resultset must be pre-populated with entities that match the predicate
-    pub fn add_query(
+    pub fn add_query<CD: ContextData>(
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         selection: ankql::ast::Selection,
         resultset: EntityResultSet<E>,
+        cdata: &CD,
     ) -> anyhow::Result<()> {
         let mut reactor_update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
@@ -326,12 +369,19 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
             Entry::Vacant(v) => v.insert(QueryState {
                 collection_id: collection_id.clone(),
                 selection: selection.clone(),
+                cdata: Box::new(cdata.clone()),
                 paused: false,
                 resultset: resultset.clone(),
                 version: 0,
+                gap_dirty: false,
             }),
             Entry::Occupied(_) => return Err(anyhow::anyhow!("Predicate {:?} already exists", query_id)),
         };
+
+        pred_state
+            .resultset
+            .order_by(selection.order_by.map(|ob| build_key_spec_from_selection(ob.as_slice(), &pred_state.resultset)).transpose()?);
+        pred_state.resultset.limit(selection.limit.map(|l| l as usize));
 
         // Set up predicate watchers
         let mut watcher_state = self.0.watcher_set.lock().unwrap();
@@ -404,6 +454,15 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
         let old_query = query_state.selection.clone();
         query_state.selection = selection.clone();
 
+        query_state
+            .resultset
+            .order_by(selection.order_by.map(|ob| build_key_spec_from_selection(ob.as_slice(), &query_state.resultset)).transpose()?);
+
+        // Check if LIMIT changed
+        if old_query.limit != selection.limit {
+            query_state.resultset.limit(selection.limit.map(|l| l as usize));
+        }
+
         // Update index watchers if predicate changed
         let watcher_id = (subscription_id, query_id);
         watcher_state.recurse_predicate_watchers(&collection_id, &old_query.predicate, watcher_id, WatcherOp::Remove);
@@ -412,6 +471,9 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
         // Create write guard for atomic updates
         let mut rw_resultset = query_state.resultset.write();
         let mut reactor_update_items = Vec::new();
+
+        // Mark all entities dirty for re-evaluation on every update_query
+        rw_resultset.mark_all_dirty();
 
         // Process included entities (only truly new ones from remote)
         for entity in included_entities {
@@ -447,50 +509,43 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
             }
         }
 
-        // Remove entities that no longer match the new predicate
-        let mut to_remove = Vec::new();
-        for (entity_id, entity) in rw_resultset.iter_entities() {
-            // same quest as above for wisdom of calling this here in the case of an orderby/limit scenario
-            // versus updating LiveQuery to re-query the local storage after all relevant events/states have been applied
-            if !ankql::selection::filter::evaluate_predicate(entity, &selection.predicate).unwrap_or(false) {
-                tracing::debug!("Entity {:?} no longer matches predicate", entity_id);
+        // Remove entities that were not covered by the included_entities and no longer match the new predicate using retain_dirty
+        rw_resultset.retain_dirty(|entity| {
+            if let Ok(true) = ankql::selection::filter::evaluate_predicate(entity, &selection.predicate) {
+                return true;
+            };
+            let entity_id = entity.id();
+            tracing::debug!("Entity {:?} no longer matches predicate", entity_id);
 
-                // If emit_removes is true, create a Remove event for local subscriptions
-                if emit_removes {
-                    tracing::debug!("Creating Remove event for entity {:?}", entity_id);
-                    reactor_update_items.push(ReactorUpdateItem {
-                        entity: entity.clone(),
-                        events: vec![],
-                        entity_subscribed: false,
-                        predicate_relevance: vec![(query_id, MembershipChange::Remove)],
-                    });
-                }
-
-                to_remove.push(entity_id);
+            // If emit_removes is true, create a Remove event for local subscriptions
+            if emit_removes {
+                tracing::debug!("Creating Remove event for entity {:?}", entity_id);
+                reactor_update_items.push(ReactorUpdateItem {
+                    entity: entity.clone(),
+                    events: vec![],
+                    entity_subscribed: false,
+                    predicate_relevance: vec![(query_id, MembershipChange::Remove)],
+                });
             }
-        }
-        tracing::info!("Removing {} entities that no longer match", to_remove.len());
-
-        // Remove non-matching entities from the resultset and clean up watchers
-        for entity_id in to_remove {
-            rw_resultset.remove(entity_id);
 
             // Clean up entity predicate watcher (but keep subscription watcher)
-            if let Some(entity_watcher) = watcher_state.entity_watchers.get_mut(&entity_id) {
+            if let Some(entity_watcher) = watcher_state.entity_watchers.get_mut(entity_id) {
                 entity_watcher.remove(&EntityWatcherId::Predicate(subscription_id, query_id));
 
                 // TODO: Investigate if subscription.entities is being correctly populated and used
                 // If no more predicates are watching this entity, remove it from subscription.entities
                 // (but only if it's not explicitly subscribed)
-                if !subscription.entity_subscriptions.contains(&entity_id) {
+                if !subscription.entity_subscriptions.contains(entity_id) {
                     let has_other_predicates =
                         entity_watcher.iter().any(|w| matches!(w, EntityWatcherId::Predicate(sub_id, _) if *sub_id == subscription_id));
                     if !has_other_predicates {
-                        subscription.entities.remove(&entity_id);
+                        subscription.entities.remove(entity_id);
                     }
                 }
             }
-        }
+
+            false
+        });
 
         // Unpause now that update is complete
         query_state.paused = false;
@@ -687,7 +742,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
     }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable> std::fmt::Debug for Reactor<E> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> std::fmt::Debug for Reactor<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let watcher_set = self.0.watcher_set.lock().unwrap();
         let subscriptions = self.0.subscriptions.lock().unwrap();
@@ -858,7 +913,7 @@ mod tests {
         let selection = "status = 'pending'".try_into().unwrap();
         let entity1 = TestEntity::new("Test Album", "pending");
         let resultset = EntityResultSet::single(entity1.clone());
-        reactor.add_query(rsub.id(), query_id, collection_id, selection, resultset).unwrap();
+        reactor.add_query(rsub.id(), query_id, collection_id, selection, resultset, &crate::policy::DEFAULT_CONTEXT).unwrap();
 
         // something like this
         assert_eq!(

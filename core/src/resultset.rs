@@ -406,19 +406,23 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     }
 
     /// Configure ordering for this result set
-    pub fn order_by(&self, key_spec: KeySpec) {
+    pub fn order_by(&self, key_spec: Option<KeySpec>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the key spec actually changed
-        if st.key_spec.as_ref() == Some(&key_spec) {
+        if st.key_spec == key_spec {
             return; // No change, no-op
         }
 
-        st.key_spec = Some(key_spec.clone());
+        st.key_spec = key_spec.clone();
 
         // Recompute sort keys for all entries
         for entry in &mut st.order {
-            entry.sort_key = Some(ResultSetWrite::compute_sort_key(&entry.entity, &key_spec));
+            entry.sort_key = if let Some(ref ks) = key_spec {
+                Some(ResultSetWrite::compute_sort_key(&entry.entity, ks))
+            } else {
+                None // No ORDER BY, sort by entity ID only
+            };
         }
 
         // Sort by the new keys
@@ -574,7 +578,7 @@ mod tests {
                 value_type: ValueType::String,
             }],
         };
-        resultset.order_by(key_spec);
+        resultset.order_by(Some(key_spec));
 
         let mut write = resultset.write();
         write.add(entity2.clone());

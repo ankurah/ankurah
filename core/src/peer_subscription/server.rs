@@ -104,7 +104,7 @@ impl SubscriptionHandler {
 
         if version == 0 {
             let resultset = EntityResultSet::from_vec(initial_entities, true);
-            node.reactor.add_query(self.subscription.id(), query_id, collection_id, selection, resultset)?;
+            node.reactor.add_query(self.subscription.id(), query_id, collection_id, selection, resultset, cdata)?;
         } else {
             node.reactor.update_query(
                 self.subscription.id(),

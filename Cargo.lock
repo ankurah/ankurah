@@ -103,6 +103,7 @@ dependencies = [
  "indexmap 2.11.3",
  "itertools",
  "js-sys",
+ "maplit",
  "rand 0.8.5",
  "serde",
  "serde-wasm-bindgen",
