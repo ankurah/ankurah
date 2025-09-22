@@ -111,7 +111,6 @@ where PA: PolicyAgent
 
 /// Represents the user session - or whatever other context the PolicyAgent
 /// Needs to perform it's evaluation.
-#[async_trait]
 pub trait ContextData: Send + Sync + Clone + Hash + Eq + 'static {}
 
 pub struct NodeInner<SE, PA>

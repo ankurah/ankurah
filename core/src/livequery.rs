@@ -157,7 +157,14 @@ impl EntityLiveQuery {
         debug!("LiveQuery.initialize() calling reactor.set_predicate with {} entities for predicate {}", initial_entities.len(), query_id);
         // Pre-populate the resultset with initial entities
         self.0.resultset.write().replace_all(initial_entities);
-        node.reactor.add_query(self.0.subscription.id(), query_id, collection_id, args.selection, self.0.resultset.clone())?;
+        node.reactor.add_query(
+            self.0.subscription.id(),
+            query_id,
+            collection_id,
+            args.selection,
+            self.0.resultset.clone(),
+            &crate::policy::DEFAULT_CONTEXT,
+        )?;
 
         Ok(())
     }
