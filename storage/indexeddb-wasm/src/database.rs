@@ -30,7 +30,7 @@ struct Connection {
 
 impl Database {
     pub async fn open(db_name: &str) -> anyhow::Result<Self> {
-        let connection = Connection::open(db_name, 1).await?;
+        let connection = Connection::open(db_name, 0).await?;
 
         Ok(Self(Arc::new(Inner {
             connection: Arc::new(tokio::sync::Mutex::new(connection)),
@@ -170,7 +170,8 @@ impl Connection {
             .map_err(|e| anyhow::anyhow!("IndexedDB error: {:?}", e))?
             .ok_or_else(|| anyhow::anyhow!("IndexedDB not available"))?;
 
-        let open_request: IdbOpenDbRequest = idb.open_with_u32(db_name, 1).map_err(|e| anyhow::anyhow!("Failed to open DB: {:?}", e))?;
+        // Open without specifying version to get current version, or let IndexedDB handle it
+        let open_request: IdbOpenDbRequest = idb.open(db_name).map_err(|e| anyhow::anyhow!("Failed to open DB: {:?}", e))?;
 
         let mut callbacks: Vec<Box<dyn Any>> = Vec::new();
         let promise = js_sys::Promise::new(&mut |resolve: Function, reject: Function| {
