@@ -29,13 +29,15 @@ impl std::fmt::Display for ReactorSubscriptionId {
 }
 
 /// Inner state for ReactorSubscription
-pub(super) struct ReactorSubInner<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
+pub(super) struct ReactorSubInner<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> {
     pub(super) subscription_id: ReactorSubscriptionId,
     pub(super) reactor: Reactor<E, Ev>,
     pub(super) broadcast: Broadcast<ReactorUpdate<E, Ev>>,
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Drop for ReactorSubInner<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Drop
+    for ReactorSubInner<E, Ev>
+{
     fn drop(&mut self) {
         // Automatically unsubscribe when the ReactorSubscription is dropped
         let _ = self.reactor.unsubscribe(self.subscription_id);
@@ -44,11 +46,11 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Drop for Reac
 
 /// A handle to a reactor subscription that automatically cleans up on drop
 pub struct ReactorSubscription<
-    E: AbstractEntity + ankql::selection::filter::Filterable = crate::entity::Entity,
-    Ev = ankurah_proto::Attested<ankurah_proto::Event>,
+    E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static = crate::entity::Entity,
+    Ev: Clone + Send + 'static = ankurah_proto::Attested<ankurah_proto::Event>,
 >(pub(super) Arc<ReactorSubInner<E, Ev>>);
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> ReactorSubscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
@@ -75,12 +77,14 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> Reacto
     }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Clone for ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone
+    for ReactorSubscription<E, Ev>
+{
     fn clone(&self) -> Self { ReactorSubscription(self.0.clone()) }
 }
 
 // Implement Subscribe trait for ReactorUpdate
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clone + 'static> Subscribe<ReactorUpdate<E, Ev>>
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Subscribe<ReactorUpdate<E, Ev>>
     for ReactorSubscription<E, Ev>
 {
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard

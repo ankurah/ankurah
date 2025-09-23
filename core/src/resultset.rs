@@ -68,6 +68,7 @@ struct State<E: AbstractEntity> {
     // Ordering configuration
     key_spec: Option<KeySpec>,
     limit: Option<usize>,
+    gap_dirty: bool, // Set when we remove entities and go from =LIMIT to < LIMIT
 }
 
 #[derive(Debug, Clone)]
@@ -153,10 +154,16 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     pub fn remove(&mut self, id: proto::EntityId) -> bool {
         let guard = self.guard.as_mut().expect("write guard already dropped");
         if let Some(idx) = guard.index.remove(&id) {
+            // Check if we were at limit before removal
+            if guard.limit.map_or(false, |limit| guard.order.len() == limit) {
+                guard.gap_dirty = true;
+            }
+
             guard.order.remove(idx);
             if idx < guard.order.len() {
                 fix_from(guard, idx);
             }
+
             self.changed = true;
             true
         } else {
@@ -192,6 +199,9 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         let mut removed_ids = Vec::new();
         let mut i = 0;
 
+        // Check if we were at limit before any removals
+        let was_at_limit = guard.limit.map_or(false, |limit| guard.order.len() == limit);
+
         while i < guard.order.len() {
             if guard.order[i].dirty {
                 let should_keep = should_retain(&guard.order[i].entity);
@@ -225,6 +235,11 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
 
         if !removed_ids.is_empty() {
             self.changed = true;
+
+            // Set gap_dirty if we went from LIMIT to < LIMIT
+            if (!guard.gap_dirty) && was_at_limit && guard.limit.map_or(false, |limit| guard.order.len() < limit) {
+                guard.gap_dirty = true;
+            }
         }
 
         removed_ids
@@ -341,16 +356,16 @@ impl<E: AbstractEntity> EntityResultSet<E> {
             order.push(EntityEntry { entity, sort_key: None, dirty: false });
         }
 
-        let state = State { order, index, key_spec: None, limit: None };
+        let state = State { order, index, key_spec: None, limit: None, gap_dirty: false };
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(loaded), broadcast: Broadcast::new() }))
     }
     pub fn empty() -> Self {
-        let state = State { order: Vec::new(), index: HashMap::new(), key_spec: None, limit: None };
+        let state = State { order: Vec::new(), index: HashMap::new(), key_spec: None, limit: None, gap_dirty: false };
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(false), broadcast: Broadcast::new() }))
     }
     pub fn single(entity: E) -> Self {
         let entry = EntityEntry { entity: entity.clone(), sort_key: None, dirty: false };
-        let mut state = State { order: vec![entry], index: HashMap::new(), key_spec: None, limit: None };
+        let mut state = State { order: vec![entry], index: HashMap::new(), key_spec: None, limit: None, gap_dirty: false };
         state.index.insert(*entity.id(), 0);
         Self(Arc::new(Inner { state: std::sync::Mutex::new(state), loaded: AtomicBool::new(false), broadcast: Broadcast::new() }))
     }
@@ -403,6 +418,30 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     pub fn len(&self) -> usize {
         let st = self.0.state.lock().unwrap();
         st.order.len()
+    }
+
+    /// Check if this result set needs gap filling
+    pub fn is_gap_dirty(&self) -> bool {
+        let st = self.0.state.lock().unwrap();
+        st.gap_dirty
+    }
+
+    /// Clear the gap_dirty flag (called after gap filling is complete)
+    pub fn clear_gap_dirty(&self) {
+        let mut st = self.0.state.lock().unwrap();
+        st.gap_dirty = false;
+    }
+
+    /// Get the current limit for this result set
+    pub fn get_limit(&self) -> Option<usize> {
+        let st = self.0.state.lock().unwrap();
+        st.limit
+    }
+
+    /// Get the last entity for gap filling continuation
+    pub fn last_entity(&self) -> Option<E> {
+        let st = self.0.state.lock().unwrap();
+        st.order.last().map(|entry| entry.entity.clone())
     }
 
     /// Configure ordering for this result set

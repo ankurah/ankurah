@@ -2,10 +2,11 @@ use tracing::Level;
 
 use ankurah::{
     changes::{ChangeKind, ChangeSet},
+    error::MutationError,
     model::View,
     proto,
     signals::{broadcast::IntoListener, subscribe::IntoSubscribeListener},
-    Model,
+    Context, EntityId, LiveQuery, Model,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -200,3 +201,18 @@ macro_rules! sortby_t0 {
         vec
     }};
 }
+
+#[allow(unused)]
+pub async fn create_albums(ctx: &Context, years: impl IntoIterator<Item = u32>) -> Result<Vec<EntityId>, MutationError> {
+    let trx = ctx.begin();
+    let mut ids = Vec::new();
+    for year in years {
+        let album = trx.create(&Album { name: format!("Album {}", year), year: year.to_string() }).await?;
+        ids.push(album.id());
+    }
+    trx.commit().await?;
+    Ok(ids)
+}
+use ankurah::signals::Peek;
+#[allow(unused)]
+pub fn years(query: &LiveQuery<AlbumView>) -> Vec<String> { query.peek().iter().map(|a| a.year().unwrap_or_default()).collect() }

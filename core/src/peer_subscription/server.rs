@@ -104,7 +104,8 @@ impl SubscriptionHandler {
 
         if version == 0 {
             let resultset = EntityResultSet::from_vec(initial_entities, true);
-            node.reactor.add_query(self.subscription.id(), query_id, collection_id, selection, resultset, cdata)?;
+            let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::new(&node, cdata.clone()));
+            node.reactor.add_query(self.subscription.id(), query_id, collection_id, selection, resultset, gap_fetcher)?;
         } else {
             node.reactor.update_query(
                 self.subscription.id(),

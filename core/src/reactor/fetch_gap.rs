@@ -1,14 +1,19 @@
 use crate::{
+    context::NodeAndContext,
     error::RetrievalError,
+    node::{MatchArgs, Node, NodeInner},
+    policy::PolicyAgent,
     reactor::AbstractEntity,
+    storage::StorageEngine,
     value::{Value, ValueType},
 };
 use ankurah_proto as proto;
 use async_trait::async_trait;
+use std::sync::{Arc, Weak};
 
 /// Trait for fetching entities to fill gaps when LIMIT causes entities to be evicted
 #[async_trait]
-pub trait GapFetcher<E: AbstractEntity>: Send + Sync + Clone + 'static {
+pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
     /// Fetch entities to fill a gap in a limited result set
     ///
     /// # Arguments
@@ -26,6 +31,72 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + Clone + 'static {
         last_entity: Option<&E>,
         gap_size: usize,
     ) -> Result<Vec<E>, RetrievalError>;
+}
+
+/// Concrete implementation of GapFetcher using a WeakNode and typed ContextData
+#[derive(Clone)]
+pub struct QueryGapFetcher<SE, PA>
+where
+    SE: StorageEngine,
+    PA: PolicyAgent,
+{
+    weak_node: Weak<NodeInner<SE, PA>>,
+    cdata: PA::ContextData,
+}
+
+impl<SE, PA> QueryGapFetcher<SE, PA>
+where
+    SE: StorageEngine,
+    PA: PolicyAgent,
+{
+    pub fn new(node: &Node<SE, PA>, cdata: PA::ContextData) -> Self { Self { weak_node: Arc::downgrade(&node.0), cdata } }
+}
+
+#[async_trait]
+impl<SE, PA> GapFetcher<crate::entity::Entity> for QueryGapFetcher<SE, PA>
+where
+    SE: StorageEngine + 'static,
+    PA: PolicyAgent + 'static,
+{
+    async fn fetch_gap(
+        &self,
+        collection_id: &proto::CollectionId,
+        selection: &ankql::ast::Selection,
+        last_entity: Option<&crate::entity::Entity>,
+        gap_size: usize,
+    ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
+        // Try to upgrade the weak reference to the node
+        let node_inner = self
+            .weak_node
+            .upgrade()
+            .ok_or_else(|| RetrievalError::storage(std::io::Error::other("Node has been dropped, cannot fill gap")))?;
+
+        // Create a Node wrapper and NodeAndContext
+        let node = Node(node_inner);
+        let node_context = NodeAndContext { node, cdata: self.cdata.clone() };
+
+        // Build gap predicate if we have a last entity
+        let gap_selection = if let Some(last) = last_entity {
+            let gap_predicate = if let Some(ref order_by) = selection.order_by {
+                build_gap_predicate(&selection.predicate, order_by, last).map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?
+            } else {
+                selection.predicate.clone()
+            };
+
+            ankql::ast::Selection { predicate: gap_predicate, order_by: selection.order_by.clone(), limit: Some(gap_size as u64) }
+        } else {
+            // No last entity, just use original selection with gap_size limit
+            ankql::ast::Selection {
+                predicate: selection.predicate.clone(),
+                order_by: selection.order_by.clone(),
+                limit: Some(gap_size as u64),
+            }
+        };
+
+        let match_args = MatchArgs { selection: gap_selection, cached: false };
+
+        node_context.fetch_entities(collection_id, match_args).await
+    }
 }
 
 /// Build a supplemental predicate to fetch entities after the last entity in sort order
@@ -111,7 +182,7 @@ pub fn infer_value_type_for_field<E: AbstractEntity>(entities: &[E], field_name:
 mod tests {
     use super::*;
     use crate::value::Value;
-    use ankql::ast::{Identifier, OrderByItem, OrderDirection, Predicate};
+    use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, OrderByItem, OrderDirection, Predicate};
     use ankurah_proto as proto;
     use maplit::hashmap;
     use std::collections::HashMap;
@@ -154,8 +225,23 @@ mod tests {
         let gap_predicate = build_gap_predicate(&original_predicate, &order_by, &entity).unwrap();
 
         // Should create: true AND name >= "John" AND NOT (id = entity.id)
-        // We can't easily test the exact structure, but we can verify it's not the original
-        assert_ne!(format!("{:?}", gap_predicate), format!("{:?}", original_predicate));
+        let expected = Predicate::And(
+            Box::new(Predicate::And(
+                Box::new(Predicate::True),
+                Box::new(Predicate::Comparison {
+                    left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
+                    operator: ComparisonOperator::GreaterThanOrEqual,
+                    right: Box::new(Expr::Literal(Literal::String("John".to_string()))),
+                }),
+            )),
+            Box::new(Predicate::Not(Box::new(Predicate::Comparison {
+                left: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::EntityId(entity.id().clone().into()))),
+            }))),
+        );
+
+        assert_eq!(gap_predicate, expected);
     }
 
     #[test]
