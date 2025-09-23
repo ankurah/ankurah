@@ -494,9 +494,8 @@ fn generate_literal_code_with_replacements(
             quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::I32(#i)) }
         }
         ankql::ast::Literal::EntityId(ulid) => {
-            todo!("EntityId literals");
-            // let ulid =
-            // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(#ulid.to_string())) }
+            let ulid_u128 = ulid.0;
+            quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(::ulid::Ulid(#ulid_u128))) }
         }
         ankql::ast::Literal::Object(items) => {
             todo!("Object literals");

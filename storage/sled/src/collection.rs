@@ -191,7 +191,6 @@ impl SledStorageCollectionInner {
         let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
 
         let plan = plans.into_iter().next().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
-        tracing::info!("fetch_states_blocking: plan={:#?}", plan);
 
         // Execute the chosen plan using streaming pipeline architecture
         match plan {
