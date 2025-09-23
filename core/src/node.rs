@@ -1,7 +1,6 @@
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
 
-use async_trait::async_trait;
 use rand::prelude::*;
 use std::{
     fmt,

@@ -156,7 +156,7 @@ pub fn build_continuation_predicate<E: AbstractEntity>(
     let id_exclusion = Predicate::Comparison {
         left: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
         operator: ComparisonOperator::NotEqual,
-        right: Box::new(Expr::Literal(Literal::EntityId(last_entity.id().clone().into()))),
+        right: Box::new(Expr::Literal(Literal::EntityId((*last_entity.id()).into()))),
     };
     gap_conditions.push(id_exclusion);
 
