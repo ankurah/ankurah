@@ -72,7 +72,7 @@ impl EntityLiveQuery {
         let subscription = node.reactor.subscribe();
 
         let query_id = proto::QueryId::new();
-        let rx = node.subscribe_remote_query(query_id, collection_id.clone(), args.selection.clone(), cdata, 0);
+        let rx = node.subscribe_remote_query(query_id, collection_id.clone(), args.selection.clone(), cdata.clone(), 0);
 
         let me = Self(Arc::new(Inner {
             query_id,
@@ -95,7 +95,7 @@ impl EntityLiveQuery {
         debug!("LiveQuery::new() spawning initialization task for predicate {}", query_id);
         crate::task::spawn(async move {
             debug!("LiveQuery initialization task starting for predicate {}", query_id);
-            if let Err(e) = me2.initialize(node, collection_id, query_id, args, rx).await {
+            if let Err(e) = me2.initialize(node, collection_id, query_id, args, rx, cdata).await {
                 debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
                 me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
                 *me2.0.error.lock().unwrap() = Some(e);
@@ -130,6 +130,7 @@ impl EntityLiveQuery {
         query_id: proto::QueryId,
         args: MatchArgs,
         rx: Option<tokio::sync::oneshot::Receiver<Vec<Entity>>>,
+        cdata: PA::ContextData,
     ) -> Result<(), RetrievalError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -157,14 +158,8 @@ impl EntityLiveQuery {
         debug!("LiveQuery.initialize() calling reactor.set_predicate with {} entities for predicate {}", initial_entities.len(), query_id);
         // Pre-populate the resultset with initial entities
         self.0.resultset.write().replace_all(initial_entities);
-        node.reactor.add_query(
-            self.0.subscription.id(),
-            query_id,
-            collection_id,
-            args.selection,
-            self.0.resultset.clone(),
-            &crate::policy::DEFAULT_CONTEXT,
-        )?;
+        let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::new(&node, cdata.clone()));
+        node.reactor.add_query(self.0.subscription.id(), query_id, collection_id, args.selection, self.0.resultset.clone(), gap_fetcher)?;
 
         Ok(())
     }

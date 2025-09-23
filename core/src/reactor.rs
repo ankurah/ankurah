@@ -1,5 +1,5 @@
 mod comparison_index;
-mod fetch_gap;
+pub mod fetch_gap;
 mod subscription;
 mod update;
 
@@ -9,23 +9,20 @@ pub(crate) use self::{
     update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
 };
 
-// Re-export fetch_gap items for when we implement the functionality
-#[allow(unused_imports)]
-pub(crate) use self::fetch_gap::{build_gap_predicate, infer_value_type_for_field, GapFetcher};
+// Re-export fetch_gap items
+pub(crate) use self::fetch_gap::GapFetcher;
 
 use crate::{
     changes::EntityChange,
     entity::Entity,
     error::SubscriptionError,
     indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
-    node::ContextData,
     reactor::subscription::ReactorSubInner,
     resultset::EntityResultSet,
     value::{Value, ValueType},
 };
 use ankurah_proto::{self as proto};
 use indexmap::IndexMap;
-use std::any::Any;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -74,9 +71,10 @@ impl ChangeNotification for EntityChange {
 }
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
-pub struct Reactor<E: AbstractEntity + ankql::selection::filter::Filterable = Entity, Ev = ankurah_proto::Attested<ankurah_proto::Event>>(
-    Arc<ReactorInner<E, Ev>>,
-);
+pub struct Reactor<
+    E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static = Entity,
+    Ev: Clone + Send + 'static = ankurah_proto::Attested<ankurah_proto::Event>,
+>(Arc<ReactorInner<E, Ev>>);
 
 struct ReactorInner<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
     subscriptions: Mutex<HashMap<ReactorSubscriptionId, SubscriptionState<E, Ev>>>,
@@ -110,17 +108,15 @@ struct WatcherSet {
 }
 
 /// State for a single predicate within a subscription
-#[derive(Debug)]
 struct QueryState<E: AbstractEntity + ankql::selection::filter::Filterable> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
     pub(crate) collection_id: proto::CollectionId,
     pub(crate) selection: ankql::ast::Selection,
-    pub(crate) cdata: Box<dyn std::any::Any + Send + Sync>, // Type-erased ContextData
+    pub(crate) gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>, // For filling gaps when LIMIT is applied
     // I think we need to move these out of PredicateState and into WatcherState
     pub(crate) paused: bool, // When true, skip notifications (used during initialization and updates)
     pub(crate) resultset: EntityResultSet<E>,
     pub(crate) version: u32,
-    pub(crate) gap_dirty: bool, // Set when we remove an item causing it to no longer saturate the limit
 }
 
 struct SubscriptionState<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
@@ -147,15 +143,15 @@ enum WatcherOp {
 }
 
 // don't require Clone SE or PA, because we have an Arc
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Clone for Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> Default for Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Default for Reactor<E, Ev> {
     fn default() -> Self { Self::new() }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
     pub fn new() -> Self {
         Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
@@ -183,7 +179,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> Reacto
     }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
     /// Remove a subscription and all its predicates
     pub(crate) fn unsubscribe(&self, sub_id: ReactorSubscriptionId) -> Result<(), SubscriptionError> {
         let mut subscriptions = self.0.subscriptions.lock().unwrap();
@@ -343,18 +339,18 @@ fn build_key_spec_from_selection<E: AbstractEntity>(
     Ok(KeySpec { keyparts })
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clone> Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
     /// Add a new predicate to a subscription (initial subscription only)
     /// Fails if query_id already exists - use update_query for updates
     /// The resultset must be pre-populated with entities that match the predicate
-    pub fn add_query<CD: ContextData>(
+    pub fn add_query(
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         selection: ankql::ast::Selection,
         resultset: EntityResultSet<E>,
-        cdata: &CD,
+        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
     ) -> anyhow::Result<()> {
         let mut reactor_update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
@@ -369,11 +365,10 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
             Entry::Vacant(v) => v.insert(QueryState {
                 collection_id: collection_id.clone(),
                 selection: selection.clone(),
-                cdata: Box::new(cdata.clone()),
+                gap_fetcher,
                 paused: false,
                 resultset: resultset.clone(),
                 version: 0,
-                gap_dirty: false,
             }),
             Entry::Occupied(_) => return Err(anyhow::anyhow!("Predicate {:?} already exists", query_id)),
         };
@@ -691,6 +686,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
         for (sub_id, sub_items) in items {
             if let Some(subscription) = self.0.subscriptions.lock().unwrap().get(&sub_id) {
                 subscription.notify(ReactorUpdate { items: sub_items.into_values().collect(), initialized_query: None });
+                subscription.fill_gaps();
             }
         }
     }
@@ -742,7 +738,9 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + 'static, Ev: Clo
     }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> std::fmt::Debug for Reactor<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug
+    for Reactor<E, Ev>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let watcher_set = self.0.watcher_set.lock().unwrap();
         let subscriptions = self.0.subscriptions.lock().unwrap();
@@ -823,11 +821,94 @@ impl WatcherSet {
     }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev: Clone> SubscriptionState<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> SubscriptionState<E, Ev> {
     fn notify(&self, update: ReactorUpdate<E, Ev>) { self.broadcast.send(update); }
+
+    /// Fill gaps for any queries that have gap_dirty set and are under their limit
+    fn fill_gaps(&self) {
+        for (query_id, query_state) in &self.queries {
+            let resultset = &query_state.resultset;
+
+            // Check if this query needs gap filling
+            if !resultset.is_gap_dirty() {
+                continue;
+            }
+
+            let limit = match resultset.get_limit() {
+                Some(limit) => limit,
+                None => continue, // No limit, no gap filling needed
+            };
+
+            let current_len = resultset.len();
+            if current_len >= limit {
+                // Already at or over limit, clear gap_dirty and continue
+                resultset.clear_gap_dirty();
+                continue;
+            }
+
+            let gap_size = limit - current_len;
+            let last_entity = resultset.last_entity();
+
+            // Clone data needed for the spawned task
+            let gap_fetcher = query_state.gap_fetcher.clone();
+            let collection_id = query_state.collection_id.clone();
+            let selection = query_state.selection.clone();
+            let query_id = *query_id;
+            let resultset = resultset.clone();
+            let broadcast = self.broadcast.clone();
+
+            // Clear gap_dirty flag immediately to prevent duplicate gap filling
+            resultset.clear_gap_dirty();
+
+            tracing::debug!("Gap filling needed for query {} - spawning background task", query_id);
+
+            // Spawn background task to fill the gap
+            crate::task::spawn(async move {
+                tracing::debug!("Gap filling task started for query {} - need {} entities", query_id, gap_size);
+
+                match gap_fetcher.fetch_gap(&collection_id, &selection, last_entity.as_ref(), gap_size).await {
+                    Ok(gap_entities) => {
+                        if !gap_entities.is_empty() {
+                            tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
+
+                            // Add the gap entities to the result set
+                            let mut write = resultset.write();
+                            let mut reactor_update_items = Vec::new();
+
+                            for entity in gap_entities {
+                                if write.add(entity.clone()) {
+                                    reactor_update_items.push(ReactorUpdateItem {
+                                        entity,
+                                        events: vec![],
+                                        entity_subscribed: false, // Gap entities are not explicitly subscribed
+                                        predicate_relevance: vec![(query_id, MembershipChange::Add)],
+                                    });
+                                }
+                            }
+
+                            drop(write);
+
+                            // Send reactor update for the new entities
+                            if !reactor_update_items.is_empty() {
+                                tracing::debug!("Gap filling sending {} new entities for query {}", reactor_update_items.len(), query_id);
+                                broadcast.send(ReactorUpdate { items: reactor_update_items, initialized_query: None });
+                            }
+                        } else {
+                            tracing::debug!("Gap filling found no entities for query {}", query_id);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Gap filling failed for query {}: {}", query_id, e);
+                    }
+                }
+            });
+        }
+    }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> std::fmt::Debug for SubscriptionState<E, Ev> {
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug
+    for SubscriptionState<E, Ev>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Subscription {{ id: {:?}, predicates: {} }}", self.id, self.queries.len())
     }
@@ -839,6 +920,7 @@ mod tests {
     use ankql::selection::filter::Filterable;
     use ankurah_signals::Subscribe;
     use proto::{CollectionId, QueryId};
+    use std::sync::Arc;
 
     pub fn watcher<T: Clone + Send + 'static>() -> (Box<dyn Fn(T) + Send + Sync>, Box<dyn Fn() -> Vec<T> + Send + Sync>) {
         let values = Arc::new(Mutex::new(Vec::new()));
@@ -897,6 +979,31 @@ mod tests {
         }
     }
 
+    /// Mock gap fetcher for testing
+    struct MockGapFetcher {
+        entities: Vec<TestEntity>,
+    }
+
+    impl MockGapFetcher {
+        fn new() -> Self { Self { entities: Vec::new() } }
+
+        fn with_entities(entities: Vec<TestEntity>) -> Self { Self { entities } }
+    }
+
+    #[async_trait::async_trait]
+    impl GapFetcher<TestEntity> for MockGapFetcher {
+        async fn fetch_gap(
+            &self,
+            _collection_id: &proto::CollectionId,
+            _selection: &ankql::ast::Selection,
+            _last_entity: Option<&TestEntity>,
+            _gap_size: usize,
+        ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
+            // For testing, just return the pre-configured entities
+            Ok(self.entities.clone())
+        }
+    }
+
     /// Test that once a predicate matches an entity, that entity continues to be watched
     /// by the ReactorSubscriptionId until the user explicitly unwatches it
     #[test]
@@ -913,7 +1020,8 @@ mod tests {
         let selection = "status = 'pending'".try_into().unwrap();
         let entity1 = TestEntity::new("Test Album", "pending");
         let resultset = EntityResultSet::single(entity1.clone());
-        reactor.add_query(rsub.id(), query_id, collection_id, selection, resultset, &crate::policy::DEFAULT_CONTEXT).unwrap();
+        let mock_gap_fetcher = Arc::new(MockGapFetcher::new());
+        reactor.add_query(rsub.id(), query_id, collection_id, selection, resultset, mock_gap_fetcher).unwrap();
 
         // something like this
         assert_eq!(
