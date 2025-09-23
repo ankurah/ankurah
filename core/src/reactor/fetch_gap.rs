@@ -78,7 +78,8 @@ where
         // Build gap predicate if we have a last entity
         let gap_selection = if let Some(last) = last_entity {
             let gap_predicate = if let Some(ref order_by) = selection.order_by {
-                build_gap_predicate(&selection.predicate, order_by, last).map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?
+                build_continuation_predicate(&selection.predicate, order_by, last)
+                    .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?
             } else {
                 selection.predicate.clone()
             };
@@ -103,7 +104,7 @@ where
 ///
 /// For ORDER BY a ASC, b DESC with last entity having a=5, b=10:
 /// Returns: a >= 5 AND b <= 10 AND NOT (id = last_entity.id)
-pub fn build_gap_predicate<E: AbstractEntity>(
+pub fn build_continuation_predicate<E: AbstractEntity>(
     original_predicate: &ankql::ast::Predicate,
     order_by: &[ankql::ast::OrderByItem],
     last_entity: &E,
@@ -152,11 +153,11 @@ pub fn build_gap_predicate<E: AbstractEntity>(
     }
 
     // Add entity ID exclusion to avoid fetching the last entity again
-    let id_exclusion = Predicate::Not(Box::new(Predicate::Comparison {
+    let id_exclusion = Predicate::Comparison {
         left: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
-        operator: ComparisonOperator::Equal,
+        operator: ComparisonOperator::NotEqual,
         right: Box::new(Expr::Literal(Literal::EntityId(last_entity.id().clone().into()))),
-    }));
+    };
     gap_conditions.push(id_exclusion);
 
     // Combine all conditions with AND
@@ -182,7 +183,8 @@ pub fn infer_value_type_for_field<E: AbstractEntity>(entities: &[E], field_name:
 mod tests {
     use super::*;
     use crate::value::Value;
-    use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, OrderByItem, OrderDirection, Predicate};
+    use ankql::ast::{Identifier, OrderByItem, OrderDirection, Predicate};
+    use ankurah_derive::selection;
     use ankurah_proto as proto;
     use maplit::hashmap;
     use std::collections::HashMap;
@@ -222,24 +224,8 @@ mod tests {
         let original_predicate = Predicate::True;
         let order_by = vec![OrderByItem { identifier: Identifier::Property("name".to_string()), direction: OrderDirection::Asc }];
 
-        let gap_predicate = build_gap_predicate(&original_predicate, &order_by, &entity).unwrap();
-
-        // Should create: true AND name >= "John" AND NOT (id = entity.id)
-        let expected = Predicate::And(
-            Box::new(Predicate::And(
-                Box::new(Predicate::True),
-                Box::new(Predicate::Comparison {
-                    left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
-                    operator: ComparisonOperator::GreaterThanOrEqual,
-                    right: Box::new(Expr::Literal(Literal::String("John".to_string()))),
-                }),
-            )),
-            Box::new(Predicate::Not(Box::new(Predicate::Comparison {
-                left: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
-                operator: ComparisonOperator::Equal,
-                right: Box::new(Expr::Literal(Literal::EntityId(entity.id().clone().into()))),
-            }))),
-        );
+        let gap_predicate = build_continuation_predicate(&original_predicate, &order_by, &entity).unwrap();
+        let expected = ankurah_derive::selection!("true AND name >= 'John' AND id != {}", entity.id()).predicate;
 
         assert_eq!(gap_predicate, expected);
     }
@@ -255,10 +241,10 @@ mod tests {
             OrderByItem { identifier: Identifier::Property("age".to_string()), direction: OrderDirection::Desc },
         ];
 
-        let gap_predicate = build_gap_predicate(&original_predicate, &order_by, &entity).unwrap();
+        let gap_predicate = build_continuation_predicate(&original_predicate, &order_by, &entity).unwrap();
+        let expected = selection!("true AND name >= 'John' AND age <= 30 AND id != {}", entity.id()).predicate;
 
-        // Should create: true AND name >= "John" AND age <= 30 AND NOT (id = entity.id)
-        assert_ne!(format!("{:?}", gap_predicate), format!("{:?}", original_predicate));
+        assert_eq!(gap_predicate, expected);
     }
 
     #[test]

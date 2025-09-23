@@ -148,9 +148,9 @@ mod tests {
 // EntityId support for predicates
 
 impl From<EntityId> for ankql::ast::Expr {
-    fn from(id: EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::String(id.to_base64())) }
+    fn from(id: EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_ulid())) }
 }
 
 impl From<&EntityId> for ankql::ast::Expr {
-    fn from(id: &EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::String(id.to_base64())) }
+    fn from(id: &EntityId) -> ankql::ast::Expr { ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_ulid())) }
 }
