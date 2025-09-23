@@ -105,7 +105,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         }
 
         // Compute sort key if ordering is configured
-        let sort_key = if let Some(ref key_spec) = guard.key_spec { Some(Self::compute_sort_key(&entity, key_spec)) } else { None };
+        let sort_key = guard.key_spec.as_ref().map(|key_spec| Self::compute_sort_key(&entity, key_spec));
 
         let entry = EntityEntry { entity, sort_key, dirty: false };
 
@@ -155,7 +155,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         let guard = self.guard.as_mut().expect("write guard already dropped");
         if let Some(idx) = guard.index.remove(&id) {
             // Check if we were at limit before removal
-            if guard.limit.map_or(false, |limit| guard.order.len() == limit) {
+            if guard.limit.is_some_and(|limit| guard.order.len() == limit) {
                 guard.gap_dirty = true;
             }
 
@@ -200,7 +200,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         let mut i = 0;
 
         // Check if we were at limit before any removals
-        let was_at_limit = guard.limit.map_or(false, |limit| guard.order.len() == limit);
+        let was_at_limit = guard.limit.is_some_and(|limit| guard.order.len() == limit);
 
         while i < guard.order.len() {
             if guard.order[i].dirty {
@@ -237,7 +237,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
             self.changed = true;
 
             // Set gap_dirty if we went from LIMIT to < LIMIT
-            if (!guard.gap_dirty) && was_at_limit && guard.limit.map_or(false, |limit| guard.order.len() < limit) {
+            if (!guard.gap_dirty) && was_at_limit && guard.limit.is_some_and(|limit| guard.order.len() < limit) {
                 guard.gap_dirty = true;
             }
         }
@@ -256,7 +256,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         // Add all entities with proper sorting
         for entity in entities {
             // Compute sort key if ordering is configured
-            let sort_key = if let Some(ref key_spec) = guard.key_spec { Some(Self::compute_sort_key(&entity, key_spec)) } else { None };
+            let sort_key = guard.key_spec.as_ref().map(|key_spec| Self::compute_sort_key(&entity, key_spec));
 
             let entry = EntityEntry { entity, sort_key, dirty: false };
             guard.order.push(entry);

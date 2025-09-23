@@ -267,7 +267,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
     fn update_query_matching_entities(subscription: &mut SubscriptionState<E, Ev>, query_id: proto::QueryId, entity: &E, matching: bool) {
         if let Some(predicate_state) = subscription.queries.get_mut(&query_id) {
             let entity_id = AbstractEntity::id(entity);
-            let did_match = predicate_state.resultset.contains_key(&entity_id);
+            let did_match = predicate_state.resultset.contains_key(entity_id);
 
             match (did_match, matching) {
                 (false, true) => {
@@ -279,7 +279,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                         predicate_state.resultset.len()
                     );
                     predicate_state.resultset.write().add(entity.clone());
-                    subscription.entities.insert(entity_id.clone(), entity.clone());
+                    subscription.entities.insert(*entity_id, entity.clone());
                 }
                 (true, false) => {
                     tracing::info!("REMOVE entity {} from predicate resultset {}", entity_id, query_id);
@@ -462,16 +462,16 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                 let entity_id = AbstractEntity::id(&entity);
 
                 // Check if this is truly new to the resultset
-                if !rw_resultset.contains(&entity_id) {
+                if !rw_resultset.contains(entity_id) {
                     // Add to write guard
                     rw_resultset.add(entity.clone());
 
                     // Add to subscription entities map
-                    subscription.entities.insert(entity_id.clone(), entity.clone());
+                    subscription.entities.insert(*entity_id, entity.clone());
 
                     // Set up entity watchers
-                    subscription.entity_subscriptions.insert(entity_id.clone());
-                    let entity_watcher = watcher_state.entity_watchers.entry(entity_id.clone()).or_default();
+                    subscription.entity_subscriptions.insert(*entity_id);
+                    let entity_watcher = watcher_state.entity_watchers.entry(*entity_id).or_default();
                     entity_watcher.insert(EntityWatcherId::Subscription(subscription_id));
                     entity_watcher.insert(EntityWatcherId::Predicate(subscription_id, query_id));
 
@@ -575,7 +575,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
             // We'll need to expand these to all predicates for the subscription
 
             let mut entity_subscribed = HashSet::new();
-            if let Some(subscription_ids) = watcher_set.entity_watchers.get(&AbstractEntity::id(&entity)) {
+            if let Some(subscription_ids) = watcher_set.entity_watchers.get(AbstractEntity::id(&entity)) {
                 for sub_id in subscription_ids.iter() {
                     // Get all predicates for this subscription
                     if let Some(sub) = self.0.subscriptions.lock().unwrap().get(&sub_id.subscription_id()) {
@@ -607,7 +607,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                             // This is the hardest part to do right.
                             let matches =
                                 ankql::selection::filter::evaluate_predicate(&entity, &query_state.selection.predicate).unwrap_or(false);
-                            let did_match = query_state.resultset.contains_key(&AbstractEntity::id(&entity));
+                            let did_match = query_state.resultset.contains_key(AbstractEntity::id(&entity));
 
                             (did_match, matches)
                         } else {
@@ -621,7 +621,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                         AbstractEntity::value(&entity, "status")
                     );
 
-                    let entity_watcher = watcher_set.entity_watchers.entry(entity.id().clone()).or_default();
+                    let entity_watcher = watcher_set.entity_watchers.entry(*entity.id()).or_default();
                     if matches {
                         // Entity subscriptions are implicit / sticky...
                         // Register one for the predicate that gets removed when the predicate no longer matches
@@ -645,7 +645,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                     let entity_subscribed = entity_subscribed.contains(&query_id);
                     if membership_change.is_some() || entity_subscribed {
                         tracing::info!("Reactor SENDING UPDATE to subscription {}", subscription_id);
-                        match sub_entities.entry(AbstractEntity::id(&entity).clone()) {
+                        match sub_entities.entry(*AbstractEntity::id(&entity)) {
                             indexmap::map::Entry::Vacant(v) => {
                                 v.insert(ReactorUpdateItem {
                                     entity: entity.clone(),
