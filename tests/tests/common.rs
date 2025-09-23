@@ -1,12 +1,19 @@
+#[allow(unused)]
+pub use ankurah::signals::{Peek, Subscribe};
+#[allow(unused)]
+pub use ankurah_connector_local_process::LocalProcessConnection;
+use ankurah_storage_sled::SledStorageEngine;
 use tracing::Level;
 
-use ankurah::{
+#[allow(unused)]
+pub use ankurah::{
     changes::{ChangeKind, ChangeSet},
     error::MutationError,
     model::View,
+    policy::DEFAULT_CONTEXT,
     proto,
     signals::{broadcast::IntoListener, subscribe::IntoSubscribeListener},
-    Context, EntityId, LiveQuery, Model,
+    Context, EntityId, LiveQuery, Model, Node, PermissiveAgent,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -213,6 +220,18 @@ pub async fn create_albums(ctx: &Context, years: impl IntoIterator<Item = u32>) 
     trx.commit().await?;
     Ok(ids)
 }
-use ankurah::signals::Peek;
 #[allow(unused)]
 pub fn years(query: &LiveQuery<AlbumView>) -> Vec<String> { query.peek().iter().map(|a| a.year().unwrap_or_default()).collect() }
+
+#[allow(unused)]
+pub async fn durable_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAgent>, anyhow::Error> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    node.system.create().await?;
+    Ok(node)
+}
+
+#[allow(unused)]
+pub async fn ephemeral_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAgent>, anyhow::Error> {
+    let node = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    Ok(node)
+}

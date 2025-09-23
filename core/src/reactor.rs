@@ -1,6 +1,7 @@
 mod comparison_index;
 pub mod fetch_gap;
 mod subscription;
+mod subscription_state;
 mod update;
 
 pub(crate) use self::{
@@ -17,7 +18,10 @@ use crate::{
     entity::Entity,
     error::SubscriptionError,
     indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
-    reactor::subscription::ReactorSubInner,
+    reactor::{
+        subscription::ReactorSubInner,
+        subscription_state::{QueryState, SubscriptionState},
+    },
     resultset::EntityResultSet,
     value::{Value, ValueType},
 };
@@ -105,28 +109,6 @@ struct WatcherSet {
     /// This is used to quickly find all subscriptions that need to be notified when an entity changes.
     /// We have to maintain this to add and remove subscriptions when their matching state changes.
     entity_watchers: HashMap<ankurah_proto::EntityId, HashSet<EntityWatcherId>>,
-}
-
-/// State for a single predicate within a subscription
-struct QueryState<E: AbstractEntity + ankql::selection::filter::Filterable> {
-    // TODO make this a clonable PredicateSubscription and store it instead of the channel?
-    pub(crate) collection_id: proto::CollectionId,
-    pub(crate) selection: ankql::ast::Selection,
-    pub(crate) gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>, // For filling gaps when LIMIT is applied
-    // I think we need to move these out of PredicateState and into WatcherState
-    pub(crate) paused: bool, // When true, skip notifications (used during initialization and updates)
-    pub(crate) resultset: EntityResultSet<E>,
-    pub(crate) version: u32,
-}
-
-struct SubscriptionState<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
-    pub(crate) id: ReactorSubscriptionId,
-    pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
-    /// The set of entities that are subscribed to by this subscription
-    pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
-    // not sure if we actually need this
-    pub(crate) entities: HashMap<proto::EntityId, E>,
-    pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -686,7 +668,6 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         for (sub_id, sub_items) in items {
             if let Some(subscription) = self.0.subscriptions.lock().unwrap().get(&sub_id) {
                 subscription.notify(ReactorUpdate { items: sub_items.into_values().collect(), initialized_query: None });
-                subscription.fill_gaps();
             }
         }
     }
@@ -817,91 +798,6 @@ impl WatcherSet {
                 // before being used in subscriptions
                 unimplemented!("Placeholder should be transformed before reactor processing")
             }
-        }
-    }
-}
-
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> SubscriptionState<E, Ev> {
-    fn notify(&self, update: ReactorUpdate<E, Ev>) { self.broadcast.send(update); }
-
-    /// Fill gaps for any queries that have gap_dirty set and are under their limit
-    fn fill_gaps(&self) {
-        for (query_id, query_state) in &self.queries {
-            let resultset = &query_state.resultset;
-
-            // Check if this query needs gap filling
-            if !resultset.is_gap_dirty() {
-                continue;
-            }
-
-            let limit = match resultset.get_limit() {
-                Some(limit) => limit,
-                None => continue, // No limit, no gap filling needed
-            };
-
-            let current_len = resultset.len();
-            if current_len >= limit {
-                // Already at or over limit, clear gap_dirty and continue
-                resultset.clear_gap_dirty();
-                continue;
-            }
-
-            let gap_size = limit - current_len;
-            let last_entity = resultset.last_entity();
-
-            // Clone data needed for the spawned task
-            let gap_fetcher = query_state.gap_fetcher.clone();
-            let collection_id = query_state.collection_id.clone();
-            let selection = query_state.selection.clone();
-            let query_id = *query_id;
-            let resultset = resultset.clone();
-            let broadcast = self.broadcast.clone();
-
-            // Clear gap_dirty flag immediately to prevent duplicate gap filling
-            resultset.clear_gap_dirty();
-
-            tracing::debug!("Gap filling needed for query {} - spawning background task", query_id);
-
-            // Spawn background task to fill the gap
-            crate::task::spawn(async move {
-                tracing::debug!("Gap filling task started for query {} - need {} entities", query_id, gap_size);
-
-                match gap_fetcher.fetch_gap(&collection_id, &selection, last_entity.as_ref(), gap_size).await {
-                    Ok(gap_entities) => {
-                        if !gap_entities.is_empty() {
-                            tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
-
-                            // Add the gap entities to the result set
-                            let mut write = resultset.write();
-                            let mut reactor_update_items = Vec::new();
-
-                            for entity in gap_entities {
-                                if write.add(entity.clone()) {
-                                    reactor_update_items.push(ReactorUpdateItem {
-                                        entity,
-                                        events: vec![],
-                                        entity_subscribed: false, // Gap entities are not explicitly subscribed
-                                        predicate_relevance: vec![(query_id, MembershipChange::Add)],
-                                    });
-                                }
-                            }
-
-                            drop(write);
-
-                            // Send reactor update for the new entities
-                            if !reactor_update_items.is_empty() {
-                                tracing::debug!("Gap filling sending {} new entities for query {}", reactor_update_items.len(), query_id);
-                                broadcast.send(ReactorUpdate { items: reactor_update_items, initialized_query: None });
-                            }
-                        } else {
-                            tracing::debug!("Gap filling found no entities for query {}", query_id);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Gap filling failed for query {}: {}", query_id, e);
-                    }
-                }
-            });
         }
     }
 }
