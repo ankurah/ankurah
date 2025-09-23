@@ -145,7 +145,7 @@ class ScrollController {
     if (!scrollContainer) return null;
 
     // Find the spacer row (first tbody > tr with only one td)
-    const spacerRow = scrollContainer.querySelector('tbody tr:first-child');
+    const spacerRow = scrollContainer.querySelector("tbody tr:first-child");
     return spacerRow as HTMLElement;
   };
 
@@ -153,7 +153,7 @@ class ScrollController {
   setTopPadding = (paddingPx: number): void => {
     const spacerElement = this.getSpacerElement();
     if (spacerElement) {
-      const cell = spacerElement.querySelector('td');
+      const cell = spacerElement.querySelector("td");
       if (cell) {
         (cell as HTMLElement).style.height = `${paddingPx}px`;
         this.currentTopPadPx = paddingPx;
@@ -172,7 +172,9 @@ class ScrollController {
     const scrollContainer = this.scrollContainerRef.current;
     if (scrollContainer) {
       scrollContainer.scrollTop += delta;
-      console.log(`Applied scroll delta: ${delta}px, new scrollTop: ${scrollContainer.scrollTop}`);
+      console.log(
+        `Applied scroll delta: ${delta}px, new scrollTop: ${scrollContainer.scrollTop}`,
+      );
     }
   };
 
@@ -186,10 +188,21 @@ class ScrollController {
     const beforeClientHeight = scrollContainer.clientHeight;
     const beforePadding = this.getTopPadding();
 
-    console.log('=== BUTTON PRESS TEST ===');
-    console.log('BEFORE: scrollTop =', beforeScroll, 'scrollHeight =', beforeHeight, 'clientHeight =', beforeClientHeight);
-    console.log('BEFORE: padding =', beforePadding);
-    console.log('BEFORE: scroll position as %:', (beforeScroll / (beforeHeight - beforeClientHeight) * 100).toFixed(2) + '%');
+    console.log("=== BUTTON PRESS TEST ===");
+    console.log(
+      "BEFORE: scrollTop =",
+      beforeScroll,
+      "scrollHeight =",
+      beforeHeight,
+      "clientHeight =",
+      beforeClientHeight,
+    );
+    console.log("BEFORE: padding =", beforePadding);
+    console.log(
+      "BEFORE: scroll position as %:",
+      ((beforeScroll / (beforeHeight - beforeClientHeight)) * 100).toFixed(2) +
+        "%",
+    );
 
     // Set new padding directly via DOM
     const newPadding = beforePadding + 100;
@@ -198,7 +211,12 @@ class ScrollController {
     // Measure actual height change immediately (no async timing issues)
     const afterHeight = scrollContainer.scrollHeight;
     const actualDelta = afterHeight - beforeHeight;
-    console.log('AFTER PADDING: scrollHeight =', afterHeight, 'actual delta =', actualDelta);
+    console.log(
+      "AFTER PADDING: scrollHeight =",
+      afterHeight,
+      "actual delta =",
+      actualDelta,
+    );
 
     // Apply scroll adjustment based on actual measured change
     const beforeScrollAdjust = scrollContainer.scrollTop;
@@ -209,12 +227,38 @@ class ScrollController {
     const finalHeight = scrollContainer.scrollHeight;
     const finalClientHeight = scrollContainer.clientHeight;
 
-    console.log('SCROLL ADJUSTMENT: from', beforeScrollAdjust, 'to', afterScrollAdjust, 'delta applied:', actualDelta);
-    console.log('FINAL: scrollTop =', finalScroll, 'scrollHeight =', finalHeight, 'clientHeight =', finalClientHeight);
-    console.log('FINAL: scroll position as %:', (finalScroll / (finalHeight - finalClientHeight) * 100).toFixed(2) + '%');
-    console.log('Net scroll change:', finalScroll - beforeScroll, '(should be 0)');
-    console.log('Visual position change:', (finalScroll - beforeScroll) - actualDelta, '(should be 0)');
-    console.log('========================');
+    console.log(
+      "SCROLL ADJUSTMENT: from",
+      beforeScrollAdjust,
+      "to",
+      afterScrollAdjust,
+      "delta applied:",
+      actualDelta,
+    );
+    console.log(
+      "FINAL: scrollTop =",
+      finalScroll,
+      "scrollHeight =",
+      finalHeight,
+      "clientHeight =",
+      finalClientHeight,
+    );
+    console.log(
+      "FINAL: scroll position as %:",
+      ((finalScroll / (finalHeight - finalClientHeight)) * 100).toFixed(2) +
+        "%",
+    );
+    console.log(
+      "Net scroll change:",
+      finalScroll - beforeScroll,
+      "(should be 0)",
+    );
+    console.log(
+      "Visual position change:",
+      finalScroll - beforeScroll - actualDelta,
+      "(should be 0)",
+    );
+    console.log("========================");
   };
 
   constructor(
@@ -228,7 +272,7 @@ class ScrollController {
     refs: {
       scrollContainerRef: React.RefObject<HTMLDivElement>;
       selectionBaseRef: React.MutableRefObject<string>;
-    }
+    },
   ) {
     this.logs = logs;
     this.setIsLoadingMore = setters.setIsLoadingMore;
@@ -247,12 +291,15 @@ class ScrollController {
     return Math.max(20, dynamicLimit); // Minimum of 20 rows
   };
 
-  loadOlderLogs = async (logEntries: any[], isLoadingMore: boolean): Promise<void> => {
+  loadOlderLogs = async (
+    logEntries: any[],
+    isLoadingMore: boolean,
+  ): Promise<void> => {
     if (isLoadingMore || logEntries.length === 0) {
-      console.log('loadOlderLogs: skipping due to loading or no entries');
+      console.log("loadOlderLogs: skipping due to loading or no entries");
       return;
     }
-    console.log('loadOlderLogs: starting...');
+    console.log("loadOlderLogs: starting...");
     this.setIsLoadingMore(true);
     // Don't set isLiveMode(false) until after update_selection succeeds
     try {
@@ -286,12 +333,15 @@ class ScrollController {
     }
   };
 
-  loadNewerLogs = async (logEntries: any[], isLoadingMore: boolean): Promise<void> => {
+  loadNewerLogs = async (
+    logEntries: any[],
+    isLoadingMore: boolean,
+  ): Promise<void> => {
     if (isLoadingMore || logEntries.length === 0) {
-      console.log('loadNewerLogs: skipping due to loading or no entries');
+      console.log("loadNewerLogs: skipping due to loading or no entries");
       return;
     }
-    console.log('loadNewerLogs: starting...');
+    console.log("loadNewerLogs: starting...");
     this.setIsLoadingMore(true);
     try {
       const k = Math.floor(logEntries.length * 0.5);
@@ -336,7 +386,11 @@ class ScrollController {
 
   private scrollTimeout: number | null = null;
 
-  handleScroll = (logEntries: any[], isLoadingMore: boolean, isLiveMode: boolean): void => {
+  handleScroll = (
+    logEntries: any[],
+    isLoadingMore: boolean,
+    isLiveMode: boolean,
+  ): void => {
     // Debounce scroll events to prevent busy loop
     if (this.scrollTimeout) {
       clearTimeout(this.scrollTimeout);
@@ -345,7 +399,7 @@ class ScrollController {
     this.scrollTimeout = setTimeout(() => {
       const scrollContainer = this.scrollContainerRef.current;
       if (!scrollContainer || isLoadingMore || this.isOperationInProgress) {
-        console.log('Scroll: skipping due to loading or operation in progress');
+        console.log("Scroll: skipping due to loading or operation in progress");
         return;
       }
 
@@ -356,23 +410,31 @@ class ScrollController {
       const nearBottom = scrollTop + clientHeight >= scrollHeight - 100;
       const nearTop = scrollTop <= 50;
 
-      console.log('Scroll check:', { scrollTop, scrollHeight, clientHeight, nearTop, nearBottom, isLiveMode, logCount: logEntries.length });
+      console.log("Scroll check:", {
+        scrollTop,
+        scrollHeight,
+        clientHeight,
+        nearTop,
+        nearBottom,
+        isLiveMode,
+        logCount: logEntries.length,
+      });
 
       if (nearBottom && logEntries.length > 0) {
-        console.log('Loading older logs...');
+        console.log("Loading older logs...");
         this.isOperationInProgress = true;
         this.loadOlderLogs(logEntries, isLoadingMore).finally(() => {
           this.isOperationInProgress = false;
         });
       } else if (nearTop && !isLiveMode) {
         if (logEntries.length < (this.logs.resultset.limit || 20)) {
-          console.log('Returning to live mode (short of limit)...');
+          console.log("Returning to live mode (short of limit)...");
           this.isOperationInProgress = true;
           this.returnToLiveMode().finally(() => {
             this.isOperationInProgress = false;
           });
         } else {
-          console.log('Loading newer logs...');
+          console.log("Loading newer logs...");
           this.isOperationInProgress = true;
           this.loadNewerLogs(logEntries, isLoadingMore).finally(() => {
             this.isOperationInProgress = false;
@@ -391,7 +453,10 @@ class ScrollController {
     const nearTop = scrollTop <= 50;
 
     // Calculate pixels until next pagination trigger
-    const pixelsUntilLoadOlder = Math.max(0, (scrollHeight - 100) - (scrollTop + clientHeight));
+    const pixelsUntilLoadOlder = Math.max(
+      0,
+      scrollHeight - 100 - (scrollTop + clientHeight),
+    );
     const pixelsUntilLoadNewer = Math.max(0, 50 - scrollTop);
 
     const newScrollDebug = {
@@ -402,16 +467,21 @@ class ScrollController {
       clientHeight,
       pixelsUntilLoadOlder,
       pixelsUntilLoadNewer,
-      isLiveMode: this.selectionBaseRef.current === "true ORDER BY timestamp DESC",
-      logCount: 0 // Will be updated by caller
+      isLiveMode:
+        this.selectionBaseRef.current === "true ORDER BY timestamp DESC",
+      logCount: 0, // Will be updated by caller
     };
 
     // Only update if values actually changed
-    if (this.lastScrollDebug &&
+    if (
+      this.lastScrollDebug &&
       this.lastScrollDebug.scrollTop === newScrollDebug.scrollTop &&
       this.lastScrollDebug.scrollHeight === newScrollDebug.scrollHeight &&
-      this.lastScrollDebug.pixelsUntilLoadOlder === newScrollDebug.pixelsUntilLoadOlder &&
-      this.lastScrollDebug.pixelsUntilLoadNewer === newScrollDebug.pixelsUntilLoadNewer) {
+      this.lastScrollDebug.pixelsUntilLoadOlder ===
+        newScrollDebug.pixelsUntilLoadOlder &&
+      this.lastScrollDebug.pixelsUntilLoadNewer ===
+        newScrollDebug.pixelsUntilLoadNewer
+    ) {
       return; // No change, skip update
     }
 
@@ -421,14 +491,14 @@ class ScrollController {
 
   updateLimit = (): void => {
     if (this.isOperationInProgress) {
-      console.log('updateLimit: skipping due to operation in progress');
+      console.log("updateLimit: skipping due to operation in progress");
       return;
     }
     const limit = this.computeLimit();
 
     // Only update if limit actually changed
     if (limit === this.lastLimit) {
-      console.log('updateLimit: skipping, limit unchanged:', limit);
+      console.log("updateLimit: skipping, limit unchanged:", limit);
       // Still update scroll debug even if limit unchanged
       this.updateScrollDebug();
       return;
@@ -437,9 +507,9 @@ class ScrollController {
     this.lastLimit = limit;
     const base = this.selectionBaseRef.current;
     const fullPredicate = `${base} LIMIT ${limit}`;
-    console.log('updateLimit: updating with new limit:', { base, limit });
+    console.log("updateLimit: updating with new limit:", { base, limit });
     this.setLastPredicate(fullPredicate);
-    this.logs.update_selection(fullPredicate).catch(() => { });
+    this.logs.update_selection(fullPredicate).catch(() => {});
     // Update scroll debug after selection update
     setTimeout(() => this.updateScrollDebug(), 50);
   };
@@ -462,14 +532,16 @@ const App: React.FC = signalObserver(() => {
   // Pagination state
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [isLiveMode, setIsLiveMode] = useState(true);
-  const [lastPredicate, setLastPredicate] = useState("true ORDER BY timestamp DESC LIMIT 20");
+  const [lastPredicate, setLastPredicate] = useState(
+    "true ORDER BY timestamp DESC LIMIT 20",
+  );
   const [scrollDebug, setScrollDebug] = useState({
     nearTop: false,
     nearBottom: false,
     scrollTop: 0,
     scrollHeight: 0,
     pixelsUntilLoadOlder: 0,
-    pixelsUntilLoadNewer: 0
+    pixelsUntilLoadNewer: 0,
   });
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const selectionBaseRef = useRef<string>("true ORDER BY timestamp DESC");
@@ -480,8 +552,13 @@ const App: React.FC = signalObserver(() => {
     [],
   );
 
-  const generateLogsFlag = flags.resultset.items.find((flag: { name: string; value: boolean }) => flag.name === "generate_logs");
-  const logEntries = useMemo(() => logs.resultset.items || [], [logs.resultset.items]);
+  const generateLogsFlag = flags.resultset.items.find(
+    (flag: { name: string; value: boolean }) => flag.name === "generate_logs",
+  );
+  const logEntries = useMemo(
+    () => logs.resultset.items || [],
+    [logs.resultset.items],
+  );
 
   // Determine live mode based on actual query predicate rather than state
   const actualIsLiveMode = useMemo(() => {
@@ -489,11 +566,15 @@ const App: React.FC = signalObserver(() => {
   }, []); // Run once on mount
 
   // Create scroll controller
-  const controller = useMemo(() => new ScrollController(
-    logs,
-    { setIsLoadingMore, setIsLiveMode, setLastPredicate, setScrollDebug },
-    { scrollContainerRef, selectionBaseRef }
-  ), [logs]);
+  const controller = useMemo(
+    () =>
+      new ScrollController(
+        logs,
+        { setIsLoadingMore, setIsLiveMode, setLastPredicate, setScrollDebug },
+        { scrollContainerRef, selectionBaseRef },
+      ),
+    [logs],
+  );
 
   // Initial scroll debug update
   useEffect(() => {
@@ -536,11 +617,11 @@ const App: React.FC = signalObserver(() => {
         controller.handleScroll(logEntries, isLoadingMore, isLiveMode);
       }, 100);
     };
-    el.addEventListener('scroll', handleScroll, { passive: true });
+    el.addEventListener("scroll", handleScroll, { passive: true });
 
     return () => {
       ro.disconnect();
-      el.removeEventListener('scroll', handleScroll);
+      el.removeEventListener("scroll", handleScroll);
       if (resizeTimeout) clearTimeout(resizeTimeout);
       if (scrollTimeout) clearTimeout(scrollTimeout);
     };
@@ -602,40 +683,62 @@ const App: React.FC = signalObserver(() => {
         </div>
 
         {/* Debug info in top right corner */}
-        <div style={{
-          position: "absolute",
-          top: "10px",
-          right: "10px",
-          fontSize: "11px",
-          color: "#666",
-          backgroundColor: "rgba(255,255,255,0.9)",
-          padding: "8px",
-          borderRadius: "4px",
-          border: "1px solid #ddd",
-          textAlign: "left",
-          minWidth: "600px"
-        }}>
-          <div style={{ display: "flex", alignItems: "center", marginBottom: "4px" }}>
+        <div
+          style={{
+            position: "absolute",
+            top: "10px",
+            right: "10px",
+            fontSize: "11px",
+            color: "#666",
+            backgroundColor: "rgba(255,255,255,0.9)",
+            padding: "8px",
+            borderRadius: "4px",
+            border: "1px solid #ddd",
+            textAlign: "left",
+            minWidth: "600px",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              marginBottom: "4px",
+            }}
+          >
             <strong>Query:</strong>
-            <div style={{
-              width: "8px",
-              height: "8px",
-              borderRadius: "50%",
-              backgroundColor: isLoadingMore ? "#22c55e" : "#e5e7eb",
-              marginLeft: "8px",
-              transition: "background-color 0.2s"
-            }} />
+            <div
+              style={{
+                width: "8px",
+                height: "8px",
+                borderRadius: "50%",
+                backgroundColor: isLoadingMore ? "#22c55e" : "#e5e7eb",
+                marginLeft: "8px",
+                transition: "background-color 0.2s",
+              }}
+            />
           </div>
-          <div style={{ fontSize: "10px", marginBottom: "4px" }}>{lastPredicate}</div>
-          <div><strong>Next Page Triggers:</strong></div>
+          <div style={{ fontSize: "10px", marginBottom: "4px" }}>
+            {lastPredicate}
+          </div>
+          <div>
+            <strong>Next Page Triggers:</strong>
+          </div>
           <div style={{ marginLeft: "10px" }}>
             • Load Older: {scrollDebug.pixelsUntilLoadOlder || 0}px remaining
           </div>
           <div style={{ marginLeft: "10px" }}>
-            • Load Newer: {actualIsLiveMode ? "live" : `${scrollDebug.pixelsUntilLoadNewer || 0}px remaining`}
+            • Load Newer:{" "}
+            {actualIsLiveMode
+              ? "live"
+              : `${scrollDebug.pixelsUntilLoadNewer || 0}px remaining`}
           </div>
-          <div><strong>Current Set:</strong> {logEntries.length} rows</div>
-          <div><strong>Virtual Padding:</strong> {controller.getTopPadding()}px ({Math.round(controller.getTopPadding() / 30)} rows above)</div>
+          <div>
+            <strong>Current Set:</strong> {logEntries.length} rows
+          </div>
+          <div>
+            <strong>Virtual Padding:</strong> {controller.getTopPadding()}px (
+            {Math.round(controller.getTopPadding() / 30)} rows above)
+          </div>
           <button
             onClick={() => controller.testPaddingScrollAlignment()}
             style={{
@@ -645,7 +748,7 @@ const App: React.FC = signalObserver(() => {
               backgroundColor: "#f0f0f0",
               border: "1px solid #ccc",
               borderRadius: "3px",
-              cursor: "pointer"
+              cursor: "pointer",
             }}
           >
             Test +100px Padding/Scroll
@@ -690,7 +793,8 @@ const App: React.FC = signalObserver(() => {
           style={{ textAlign: "center", marginBottom: "10px", flexShrink: 0 }}
         >
           <h3 style={{ margin: "10px 0 5px 0" }}>
-            {actualIsLiveMode ? "Showing latest logs" : "Historical view"} (ordered by timestamp)
+            {actualIsLiveMode ? "Showing latest logs" : "Historical view"}{" "}
+            (ordered by timestamp)
           </h3>
         </div>
 
@@ -704,7 +808,9 @@ const App: React.FC = signalObserver(() => {
           }}
         >
           <Table>
-            <thead style={{ backgroundColor: "#f8f9fa", position: "sticky", top: 0 }}>
+            <thead
+              style={{ backgroundColor: "#f8f9fa", position: "sticky", top: 0 }}
+            >
               <tr>
                 <Th>Timestamp</Th>
                 <Th>Level</Th>
@@ -765,7 +871,6 @@ interface LogEntryRowProps {
 }
 
 const LogEntryRow: React.FC<LogEntryRowProps> = signalObserver(({ entry }) => {
-
   const handleEntryClick = async () => {
     try {
       // Create a new transaction
@@ -801,7 +906,11 @@ const LogEntryRow: React.FC<LogEntryRowProps> = signalObserver(({ entry }) => {
   const formatPayload = (payload: unknown) => {
     if (typeof payload === "object" && payload !== null && "Text" in payload) {
       return (payload as { Text: string }).Text;
-    } else if (typeof payload === "object" && payload !== null && "Json" in payload) {
+    } else if (
+      typeof payload === "object" &&
+      payload !== null &&
+      "Json" in payload
+    ) {
       return JSON.stringify((payload as { Json: unknown }).Json);
     }
     return JSON.stringify(payload);

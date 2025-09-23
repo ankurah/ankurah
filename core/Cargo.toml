@@ -52,5 +52,5 @@ itertools            = "0.14.0"
 indexmap             = "2.0"
 
 [dev-dependencies]
-maplit = "1.0"
+maplit         = "1.0"
 ankurah-derive = { path = "../derive", version = "^0.5.4" }
