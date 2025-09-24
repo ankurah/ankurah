@@ -112,6 +112,10 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             pub fn resultset(&self) -> #resultset_name {
                 #resultset_name(self.0.resultset())
             }
+            #[wasm_bindgen(getter)]
+            pub fn value(&self) -> #resultset_name {
+                #resultset_name(self.0.resultset())
+            }
             // #[wasm_bindgen(getter)]
             // pub fn error(&self) -> Option<String> {
             //     self.0.error()
@@ -163,9 +167,9 @@ pub fn wasm_model_namespace(
         /** Get a single {name} by ID  */
         static get(context: Context, id: EntityId): Promise<{view_name}>;
         /** Fetch all {name}s that match the predicate */
-        static fetch(context: Context, predicate: string): Promise<{view_name}[]>;
+        static fetch(context: Context, selection: string, ...substitution_values: any): Promise<{view_name}[]>;
         /** Subscribe to the set of {name}s that match the predicate */
-        static query(context: Context, predicate: string): {livequery_name};
+        static query(context: Context, selection: string, ...substitution_values: any): {livequery_name};
         /** Create a new {name} */
         static create(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
         /** Create a new {name} within an automatically created and committed transaction. */
@@ -187,13 +191,36 @@ pub fn wasm_model_namespace(
                 context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
             }
 
-            pub async fn fetch (context: &::ankurah::core::context::Context, predicate: &str) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
-                let items = context.fetch(predicate).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+            #[wasm_bindgen(variadic)]
+            pub async fn fetch (
+                context: &::ankurah::core::context::Context,
+                selection: String,
+                substitution_values: &JsValue
+            ) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
+                let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
+
+                // Convert the variadic JsValue (which is an array) and pass directly to populate
+                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
+                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                selection.predicate = selection.predicate.populate(args_array)?;
+
+                let items = context
+                    .fetch::<#view_name>(selection)
+                    .await
+                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(items)
             }
 
-            pub fn query (context: &ankurah::core::context::Context, predicate: String) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
-                let livequery = context.query::<#view_name>(predicate.as_str())
+            // #[wasm_bindgen(variadic)]
+            pub fn query (context: &ankurah::core::context::Context, selection: String, substitution_values: &JsValue) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
+                let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
+
+                // Convert the variadic JsValue (which is an array) and pass directly to populate
+                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
+                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                selection.predicate = selection.predicate.populate(args_array)?;
+
+                let livequery = context.query::<#view_name>(selection)
                     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(#livequery_name(livequery))
             }
