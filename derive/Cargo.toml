@@ -10,7 +10,7 @@ repository    = "https://github.com/ankurah/ankurah"
 
 [features]
 default = []
-wasm    = []
+wasm    = ["ankql/wasm"]
 js      = [] # Do not use - to be removed when we removed the vendored tsify internals
 
 [lib]

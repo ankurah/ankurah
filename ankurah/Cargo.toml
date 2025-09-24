@@ -19,6 +19,7 @@ wasm = [
     "ankurah-core/wasm",
     "ankurah-proto/wasm",
     "ankurah-signals/wasm",
+    "ankql/wasm",
     "dep:send_wrapper",
 ]
 react = ["wasm", "ankurah-signals/react"]

@@ -204,10 +204,11 @@ impl Predicate {
     }
 
     /// Populate placeholders in the predicate with actual values
-    pub fn populate<I, V>(self, values: I) -> Result<Predicate, ParseError>
+    pub fn populate<I, V, E>(self, values: I) -> Result<Predicate, ParseError>
     where
         I: IntoIterator<Item = V>,
-        V: Into<Expr>,
+        V: TryInto<Expr, Error = E>,
+        E: Into<ParseError>,
     {
         let mut values_iter = values.into_iter();
         let result = self.populate_recursive(&mut values_iter)?;
@@ -220,10 +221,11 @@ impl Predicate {
         Ok(result)
     }
 
-    fn populate_recursive<I, V>(self, values: &mut I) -> Result<Predicate, ParseError>
+    fn populate_recursive<I, V, E>(self, values: &mut I) -> Result<Predicate, ParseError>
     where
         I: Iterator<Item = V>,
-        V: Into<Expr>,
+        V: TryInto<Expr, Error = E>,
+        E: Into<ParseError>,
     {
         match self {
             Predicate::Comparison { left, operator, right } => Ok(Predicate::Comparison {
@@ -248,14 +250,15 @@ impl Predicate {
 }
 
 impl Expr {
-    fn populate_recursive<I, V>(self, values: &mut I) -> Result<Expr, ParseError>
+    fn populate_recursive<I, V, E>(self, values: &mut I) -> Result<Expr, ParseError>
     where
         I: Iterator<Item = V>,
-        V: Into<Expr>,
+        V: TryInto<Expr, Error = E>,
+        E: Into<ParseError>,
     {
         match self {
             Expr::Placeholder => match values.next() {
-                Some(value) => Ok(value.into()),
+                Some(value) => Ok(value.try_into().map_err(|e| e.into())?),
                 None => Err(ParseError::InvalidPredicate("Not enough values provided for placeholders".to_string())),
             },
             Expr::Literal(lit) => Ok(Expr::Literal(lit)),
