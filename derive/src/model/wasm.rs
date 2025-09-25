@@ -211,7 +211,7 @@ pub fn wasm_model_namespace(
                 Ok(items)
             }
 
-            // #[wasm_bindgen(variadic)]
+            #[wasm_bindgen(variadic)]
             pub fn query (context: &ankurah::core::context::Context, selection: String, substitution_values: &JsValue) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
 
