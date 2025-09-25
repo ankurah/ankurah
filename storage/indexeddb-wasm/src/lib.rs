@@ -1,4 +1,5 @@
 mod cb_future;
+mod cb_race;
 mod cb_stream;
 mod collection;
 pub mod database;
