@@ -10,7 +10,7 @@ use web_sys::{Event, EventTarget};
 
 /// Adds event listeners to the target for the given events, and returns a future that resolves when one of the events are triggered.
 pub fn cb_future<'a, T: AsRef<EventTarget>, S: Into<EventNames<'a>>, E: Into<EventNames<'a>>>(
-    target: &T,
+    target: T,
     success_events: S,
     error_events: E,
 ) -> CBFuture {
@@ -22,6 +22,11 @@ pub struct CBFuture {
     receiver: oneshot::Receiver<Result<(), Event>>,
     _callbacks: Vec<(Closure<dyn FnMut(Event)>, EventTarget)>, // Store target to prevent early drop
 }
+
+// SAFETY: CBFuture is Send because it's used in single-threaded WASM contexts where
+// JavaScript objects (EventTarget, Closure) are safe to move between "threads"
+// (which are actually just different execution contexts in the same thread)
+unsafe impl Send for CBFuture {}
 
 #[derive(Clone)]
 pub enum EventNames<'a> {
@@ -50,7 +55,7 @@ impl<'a, const N: usize> From<&'a [&'a str; N]> for EventNames<'a> {
 
 impl CBFuture {
     pub fn new<'a, T: AsRef<EventTarget>, S: Into<EventNames<'a>>, E: Into<EventNames<'a>>>(
-        target: &T,
+        target: T,
         success_events: S,
         error_events: E,
     ) -> Self {

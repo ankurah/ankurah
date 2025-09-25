@@ -2,12 +2,11 @@ use ankurah_core::indexing::KeySpec;
 use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
 use anyhow::{anyhow, Result};
 use send_wrapper::SendWrapper;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 use wasm_bindgen::{prelude::*, JsCast};
-use web_sys::{window, DomException, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent};
+use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChangeEvent};
 
-use crate::cb_future::CBFuture;
-use crate::cb_race::CBRace;
+use crate::{cb_future::CBFuture, cb_race::CBRace, require::Require};
 
 #[derive(Debug, Clone)]
 pub struct Database(Arc<Inner>);
@@ -22,7 +21,7 @@ struct Inner {
 }
 
 #[derive(Debug)]
-struct Connection {
+pub struct Connection {
     db: SendWrapper<IdbDatabase>,
     // _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
 }
@@ -42,27 +41,33 @@ impl Database {
     /// Get a clone of the current database connection
     pub async fn get_connection(&self) -> SendWrapper<IdbDatabase> { self.0.connection.lock().await.db.clone() }
 
+    /// Close the database connection
+    pub async fn close(&self) { self.0.connection.lock().await.close(); }
+
     /// Ensure an index exists, creating it if necessary via database version upgrade
     pub async fn assure_index_exists(&self, index_spec: &KeySpec) -> Result<(), RetrievalError> {
         let name = index_spec.name_with("", "__");
 
         // Check cache first
-        // if self.0.index_cache.contains(&name) {
-        //     return Ok(());
-        // }
+        if self.0.index_cache.contains(&name) {
+            return Ok(());
+        }
 
         let mut connection_guard = self.0.connection.lock().await;
 
-        // Double-check cache after acquiring lock (in case another thread added it)
-        // if self.0.index_cache.contains(&name) {
-        //     return Ok(());
-        // }
-
         // Check if index already exists in database
-        // if self.index_exists(&connection_guard.db, &name)? {
-        //     self.0.index_cache.insert(name);
-        //     return Ok(());
-        // }
+        if connection_guard
+            .db
+            .transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readonly)
+            .require("get transaction")?
+            .object_store("entities")
+            .require("get object store")?
+            .index_names()
+            .contains(name.as_str())
+        {
+            self.0.index_cache.insert(name);
+            return Ok(());
+        }
 
         // Index doesn't exist, need to create it via version upgrade
         let current_version = connection_guard.db.version() as u32;
@@ -82,15 +87,20 @@ impl Database {
 
     /// Cleanup database (delete it entirely)
     pub async fn cleanup(db_name: &str) -> anyhow::Result<()> {
-        let window = window().require("get window")?;
-        let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
-        let request = idb.delete_database(db_name).require("delete database")?;
-        CBFuture::new(&request, &["success", "blocked"], "error").await.map_err(|e| anyhow!("await delete request: {:?}", e))?;
+        let request = {
+            let window = window().require("get window")?;
+            let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
+            idb.delete_database(db_name).require("delete database")?
+        };
+        CBFuture::new(request, &["success", "blocked"], "error").await.require("await delete request")?;
         Ok(())
     }
 }
 
 impl Connection {
+    /// Close the database connection
+    pub fn close(&self) { self.db.close(); }
+
     /// Open or create a new database connection with default schema
     pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
         notice_info!("Database.open({})", db_name);
@@ -98,13 +108,12 @@ impl Connection {
             return Err(anyhow!("Database name cannot be empty").into());
         }
 
-        let window = window().require("get window")?;
-        let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
-        let open_request = idb.open(db_name).require("open database")?; // open the current version of the database
+        let open_request = SendWrapper::new({
+            let window = window().require("get window")?;
+            let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
+            idb.open(db_name).require("open database")? // open the current version of the database
+        });
 
-        let race = CBRace::new();
-
-        let upgrade_error = Arc::new(Mutex::new(None));
         let onupgradeneeded = move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
             let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
             let transaction = open_request.transaction().require("get upgrade transaction")?;
@@ -112,7 +121,7 @@ impl Connection {
             // Create entities store if it doesn't exist
             if let Err(_) = transaction.object_store("entities") {
                 // TODO check if this is the error type we are expecting
-                let db: IdbDatabase = open_request.result().require("get database result")?.unchecked_into();
+                let db: IdbDatabase = transaction.db();
                 let store = db.create_object_store("entities").require("create entities store")?;
 
                 let key_path = js_sys::Array::of2(&"__collection".into(), &"id".into());
@@ -124,21 +133,13 @@ impl Connection {
             Ok(())
         };
 
-        open_request.set_onupgradeneeded(Some(
-            Closure::new(move |e| match onupgradeneeded(e) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    *upgrade_error.lock().unwrap() = Some(e);
-                    Err(e)
-                }
-            })
-            .as_ref()
-            .unchecked_ref(),
-        ));
-        CBFuture::new(&open_request, "success", "error").await.map_err(|e| anyhow!("await open request: {:?}", e))?;
+        let race = CBRace::new();
+        let closure = SendWrapper::new(race.wrap(onupgradeneeded));
+        open_request.set_onupgradeneeded(Some(closure.as_ref().unchecked_ref()));
 
-        // Wait for one of the callbacks to complete
-        race.recv().await?;
+        CBFuture::new(&*open_request, "success", "error").await.require("IndexedDB open failed")?;
+
+        race.take_err()??; // if the callback was called and returned an error, bail out with that error
 
         // Get the database from the request result
         let db = open_request.result().require("get database result")?.unchecked_into::<IdbDatabase>();
@@ -149,9 +150,11 @@ impl Connection {
     pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec) -> Result<Self, RetrievalError> {
         let index_name = index_spec.name_with("", "__");
 
-        let window = window().require("get window")?;
-        let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
-        let open_request = idb.open_with_u32(db_name, version).require("open database")?;
+        let open_request = SendWrapper::new({
+            let window = window().require("get window")?;
+            let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
+            idb.open_with_u32(db_name, version).require("open database")?
+        });
 
         let onupgradeneeded = move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
             let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
@@ -162,66 +165,16 @@ impl Connection {
             Ok(())
         };
 
-        let upgrade_error = Arc::new(Mutex::new(None));
-        open_request.set_onupgradeneeded(Some(
-            Closure::new(move |e| match onupgradeneeded(e) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    *upgrade_error.lock().unwrap() = Some(e);
-                    Err(e)
-                }
-            })
-            .as_ref()
-            .unchecked_ref(),
-        ));
-        let db = CBFuture::new(&open_request, "success", "error").await.map_err(|e| anyhow!("await open request: {:?}", e))?;
+        let race = CBRace::new();
+        let closure = SendWrapper::new(race.wrap(onupgradeneeded));
+        open_request.set_onupgradeneeded(Some(closure.as_ref().unchecked_ref()));
 
-        upgrade_error.lock().unwrap().ok_or(anyhow!("upgrade error"))?;
+        CBFuture::new(&*open_request, "success", "error").await.require("IndexedDB open failed")?;
+
+        race.take_err()??;
         // Get the database from the request result
         let db = open_request.result().require("get database result")?.unchecked_into::<IdbDatabase>();
         // don't need to store callbacks, because they should be mutually exclusive
         Ok(Self { db: SendWrapper::new(db) })
-    }
-}
-
-// fn req_ok<T>(res: Result<T, JsValue>, msg: &'static str) -> Result<T, RetrievalError> {
-//     res.map_err(|e| RetrievalError::StorageError(anyhow!("{}: {:?}", msg, e).into()))
-// }
-
-// fn req_some<T>(res: Option<T>, msg: &'static str) -> Result<T, RetrievalError> {
-//     res.ok_or(RetrievalError::StorageError(anyhow!("{} is None", msg).into()))
-// }
-// fn req_oksome<T>(res: Result<Option<T>, JsValue>, err: &'static str) -> Result<T, RetrievalError> {
-//     match res {
-//         Ok(Some(res)) => Ok(res),
-//         Ok(None) => Err(RetrievalError::StorageError(anyhow!("{} is None", err).into())),
-//         Err(e) => Err(RetrievalError::StorageError(anyhow!("{} Err: {:?}", err, e).into())),
-//     }
-// }
-
-fn require<I, T>(res: I, err: &'static str) -> Result<T, RetrievalError>
-where I: CastReq<T> {
-    res.require(err)
-}
-trait CastReq<T> {
-    fn require(self, err: &'static str) -> Result<T, RetrievalError>;
-}
-impl<T> CastReq<T> for Result<T, JsValue> {
-    fn require(self, err: &'static str) -> Result<T, RetrievalError> {
-        Ok(self.map_err(|e| RetrievalError::StorageError(anyhow!("{} Err: {:?}", err, e).into()))?)
-    }
-}
-impl<T> CastReq<T> for Option<T> {
-    fn require(self, err: &'static str) -> Result<T, RetrievalError> {
-        Ok(self.ok_or(RetrievalError::StorageError(anyhow!("{} is None", err).into()))?)
-    }
-}
-impl<T> CastReq<T> for Result<Option<T>, JsValue> {
-    fn require(self, err: &'static str) -> Result<T, RetrievalError> {
-        match self {
-            Ok(Some(res)) => Ok(res),
-            Ok(None) => Err(RetrievalError::StorageError(anyhow!("{} is None", err).into())),
-            Err(e) => Err(RetrievalError::StorageError(anyhow!("{} Err: {:?}", err, e).into())),
-        }
     }
 }
