@@ -53,6 +53,10 @@ impl<R: View> Deref for ResultSet<R> {
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
+impl<R: View> ResultSet<R> {
+    pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(|e| R::from_entity(e)) }
+}
+
 #[derive(Debug)]
 struct Inner<E: AbstractEntity> {
     // Order preserving set of entities
