@@ -6,6 +6,7 @@ pub mod database;
 mod engine;
 mod object;
 mod planner_integration;
+mod require;
 mod statics;
 
 pub use collection::{to_idb_cursor_direction, IndexedDBBucket};
