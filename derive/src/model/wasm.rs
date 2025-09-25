@@ -53,9 +53,8 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
                 self.0.get()
             }
             pub fn by_id(&self, id: ::ankurah::proto::EntityId) -> Option<#view_name> {
-                // ::ankurah::signals::CurrentObserver::track(&self);
-                // self.0.by_id(&id)
-                unimplemented!("by_id is not supported for wasm")
+                ::ankurah::signals::CurrentObserver::track(&self);
+                self.0.by_id(&id)
             }
             #[wasm_bindgen(getter)]
             pub fn loaded(&self) -> bool {
@@ -68,17 +67,15 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
         }
 
         // not sure if we actually need this
-        // impl ankurah::signals::Signal for #resultset_name {
-        //     fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
-        //         // self.0.listen(listener)
-        //         unimplemented!("listen is not supported for wasm")
-        //     }
-        //     fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
-        //         // use ::ankurah::signals::Signal;
-        //         // self.0.broadcast_id()
-        //         unimplemented!("broadcast_id is not supported for wasm")
-        //     }
-        // }
+        impl ankurah::signals::Signal for #resultset_name {
+            fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
+                self.0.listen(listener)
+            }
+            fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
+                use ::ankurah::signals::Signal;
+                self.0.broadcast_id()
+            }
+        }
     }
 }
 

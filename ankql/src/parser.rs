@@ -174,7 +174,7 @@ fn create_logical_op(
                         grammar::Rule::Lt => ast::ComparisonOperator::LessThan,
                         grammar::Rule::NotEq => ast::ComparisonOperator::NotEqual,
                         grammar::Rule::In => ast::ComparisonOperator::In,
-                        _ => unreachable!(),
+                        _ => unimplemented!("rule not implemented: {:?}", next_op.as_rule()),
                     },
                     right: Box::new(next_right_expr),
                 }
@@ -190,7 +190,7 @@ fn create_logical_op(
     Ok(ast::Expr::Predicate(match op {
         grammar::Rule::And => ast::Predicate::And(Box::new(left_pred), Box::new(right_pred)),
         grammar::Rule::Or => ast::Predicate::Or(Box::new(left_pred), Box::new(right_pred)),
-        _ => unreachable!(),
+        _ => unimplemented!("rule not implemented: {:?}", op),
     }))
 }
 
