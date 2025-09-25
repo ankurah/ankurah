@@ -41,3 +41,11 @@ pub trait Peek<T: 'static> {
 pub trait GetReadCell<T: 'static> {
     fn get_readcell(&self) -> crate::value::ReadValueCell<T>;
 }
+
+impl<T> Signal for &T
+where T: Signal
+{
+    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> { Signal::listen(*self, listener) }
+
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId { Signal::broadcast_id(*self) }
+}

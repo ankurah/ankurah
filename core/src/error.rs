@@ -74,7 +74,7 @@ impl From<anyhow::Error> for RetrievalError {
 }
 
 impl From<Infallible> for RetrievalError {
-    fn from(_: Infallible) -> Self { unreachable!() }
+    fn from(_: Infallible) -> Self { unreachable!("Infallible can never be constructed") }
 }
 
 #[derive(Error, Debug)]
