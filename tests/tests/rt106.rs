@@ -1,4 +1,3 @@
-use ankurah::changes::{ChangeKind, ChangeSet, ItemChange};
 use ankurah::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
@@ -6,9 +5,7 @@ use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
 mod common;
-use common::{Album, AlbumView};
-
-use crate::common::TestWatcher;
+use crate::common::*;
 
 #[tokio::test]
 async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -37,7 +34,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_collection.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client
-    let client_query = client_ctx.query_wait::<AlbumView>("name = 'Test Album'").await?;
+    let client_query = client_ctx.query_wait::<AlbumView>(nocache("name = 'Test Album'")?).await?;
 
     //But the livequery should have the album
     use ankurah::signals::Peek;
@@ -71,7 +68,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Resubscribe on the client
     // in the repro, it's failling here rather than on the arrival of the StateFragment
-    let client_query2 = client_ctx.query_wait::<AlbumView>("name = 'Test Album'").await?;
+    let client_query2 = client_ctx.query_wait::<AlbumView>(nocache("name = 'Test Album'")?).await?;
 
     // Update: We don't need to subscribe to the livequery or wait for this test anymore, because the LiveQuery is already initialized
     // and we can just inspect the LiveQuery directly
