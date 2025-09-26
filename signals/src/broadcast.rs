@@ -7,6 +7,13 @@ use std::sync::{Arc, Weak};
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BroadcastId(usize);
 
+impl Into<usize> for BroadcastId {
+    fn into(self) -> usize { self.0 }
+}
+impl std::fmt::Display for BroadcastId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+}
+
 /// A listener that can be called when broadcast notifications are sent.
 pub type Listener<T = ()> = Arc<dyn Fn(T) + Send + Sync + 'static>;
 

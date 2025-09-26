@@ -1,5 +1,5 @@
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, OrderByItem, OrderDirection, Predicate, Selection};
-use ankurah_core::error::RetrievalError;
+use ankurah_core::{error::RetrievalError, EntityId};
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
@@ -118,7 +118,7 @@ impl SqlBuilder {
                 Literal::Bool(bool) => self.arg(*bool),
                 Literal::I16(i) => self.arg(*i),
                 Literal::I32(i) => self.arg(*i),
-                Literal::EntityId(ulid) => self.arg(ulid.to_string()),
+                Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
                 Literal::Object(bytes) => self.arg(bytes.clone()),
                 Literal::Binary(bytes) => self.arg(bytes.clone()),
             },
@@ -150,7 +150,7 @@ impl SqlBuilder {
                             Literal::Bool(bool) => self.arg(*bool),
                             Literal::I16(i) => self.arg(*i),
                             Literal::I32(i) => self.arg(*i),
-                            Literal::EntityId(ulid) => self.arg(ulid.to_string()),
+                            Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
                             Literal::Object(bytes) => self.arg(bytes.clone()),
                             Literal::Binary(bytes) => self.arg(bytes.clone()),
                         },

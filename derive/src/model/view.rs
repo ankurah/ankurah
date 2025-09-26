@@ -56,6 +56,12 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 )*
             }
 
+            impl From<#view_name> for ::ankurah::ankql::ast::Expr {
+                fn from(view: #view_name) -> ::ankurah::ankql::ast::Expr {
+                    view.entity.id().into()
+                }
+            }
+
             impl ::ankurah::model::View for #view_name {
                 type Model = #name;
                 type Mutable = #mutable_name;

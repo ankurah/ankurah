@@ -247,6 +247,7 @@ impl EntityLiveQuery {
 
         Ok(())
     }
+    pub fn error(&self) -> Option<RetrievalError> { self.0.error.lock().unwrap().take() }
 }
 
 impl Drop for Inner {
