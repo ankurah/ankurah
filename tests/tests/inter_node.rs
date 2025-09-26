@@ -1,7 +1,8 @@
 mod common;
 
+use ankurah::core::node::nocache;
 use ankurah::signals::Subscribe;
-use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent, ResultSet};
+use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -103,7 +104,12 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Set up subscription on node2
     let client_watcher = TestWatcher::changeset();
-    let client_query = client.query_wait::<PetView>("name = 'Rex' OR (age > 2 and age < 5)").await?;
+    let pred = "name = 'Rex' OR (age > 2 and age < 5)";
+    // Cached behavior: subscribe before remote initialization
+    let cached_watcher = TestWatcher::changeset();
+    let _cached_handle = client.query::<PetView>(pred)?.subscribe(&cached_watcher);
+    // Main LiveQuery uses nocache to await remote initialization
+    let client_query = client.query_wait::<PetView>(nocache(pred)?).await?;
     let _client_handle = client_query.subscribe(&client_watcher);
 
     // watcher should not have any changes yet because we waited for the LiveQuery to be initialized before subscribing to eliminate race conditions
@@ -118,6 +124,8 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Wait for and verify the update notification
     assert_eq!(client_watcher.take_one().await, vec![(rex.id(), ChangeKind::Update)]); // Rex still matches the predicate, but the age has changed
+                                                                                       // Cached watcher: empty init, Add for initial arrival, then Update for age change
+    assert_eq!(cached_watcher.take(3).await, vec![vec![], vec![(rex.id(), ChangeKind::Add)], vec![(rex.id(), ChangeKind::Update)]]);
 
     // Update Snuffy's age to 3 on node1
     {
@@ -251,9 +259,15 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Set up query subscription on client that matches our pet
     let lq_watcher = TestWatcher::changeset();
+
+    // Also exercise cached behavior by subscribing to a LiveQuery that uses cached initialization
+    let cached_watcher = TestWatcher::changeset();
+    let _cached_guard = client.query::<PetView>("name = 'Buddy'")?.subscribe(&cached_watcher);
+
     // This is the actual livequery, which has a predicate subscription with the server because the client node is ephemeral.
     // Using query_wait ensures the LiveQuery is fully initialized before we subscribe to it.
-    let client_livequery = client.query_wait::<PetView>("name = 'Buddy'").await?;
+
+    let client_livequery = client.query_wait::<PetView>(nocache("name = 'Buddy'")?).await?;
     // LOCALLY subscribe to notifications from the livequery. This is a different kind of subscription than above
     // the guard does keep the livequery alive, but dropping it does not necessarily drop the LiveQuery and unsubscribe from the server.
     let lq_subguard = client_livequery.subscribe(&lq_watcher);
@@ -271,6 +285,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // The view subscription is a good example of this, because there's no such thing as an uninitialized view
     assert_eq!(view_watcher.quiesce().await, 0);
+    assert_eq!(client_pet.age().unwrap(), "3");
 
     // Make an edit on the server
     {
@@ -282,6 +297,17 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 
     // Wait for and verify the update notification
     assert_eq!(lq_watcher.take_one().await, vec![(pet_id, ChangeKind::Update)]); // Buddy's age changed to 4 - still matches the query
+
+    // Check the cached watcher only after the above - to avoid screwing with the lq_watcher timing, which would happen if we checked before now
+    // it gets two additional notifications:
+    // - first a blank one because cached_livequery.subscribe happens before initialization,
+    // - then an Add when the entity arrives from the server, and then an Update when the age is updated
+    // The nocache watcher only receives one ::Update because the record is already arrived from the server before the signal subscribe
+    // due to a combination of using query_wait and nocache(). if the cached version used query_wait instead, it should have
+    // received only ::Add and ::Update - not the blank initial notification
+    assert_eq!(cached_watcher.take(3).await, vec![vec![], vec![(pet_id, ChangeKind::Add)], vec![(pet_id, ChangeKind::Update)]]);
+    // Drop cached subscription before testing later lifecycle expectations
+    drop(_cached_guard);
 
     // Verify that View/field subscriptions received the update
     assert_eq!(view_watcher.take_one().await, client_pet.clone());

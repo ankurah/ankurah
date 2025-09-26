@@ -1,17 +1,11 @@
 mod common;
-use crate::common::TestWatcher;
-use ankurah::changes::ChangeKind;
-use ankurah::signals::Subscribe;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use ankurah_connector_local_process::LocalProcessConnection;
-use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use std::sync::Arc;
 
+use common::*;
+
 #[tokio::test]
 async fn test_predicate_update() -> Result<()> {
-    use common::*;
-
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
 
@@ -19,7 +13,7 @@ async fn test_predicate_update() -> Result<()> {
     node.system.create().await?;
 
     // Get context after system is ready
-    let context = node.context_async(c).await;
+    let context = node.context_async(DEFAULT_CONTEXT).await;
 
     // Create some test albums
     let trx = context.begin();
@@ -58,8 +52,6 @@ async fn test_predicate_update() -> Result<()> {
 
 #[tokio::test]
 async fn test_predicate_update_inter_node() -> Result<()> {
-    use common::*;
-
     // Create server (durable) and client (ephemeral) nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     server.system.create().await?;
@@ -69,8 +61,8 @@ async fn test_predicate_update_inter_node() -> Result<()> {
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
-    let server_ctx = server.context(c)?;
-    let client_ctx = client.context(c)?;
+    let server_ctx = server.context(DEFAULT_CONTEXT)?;
+    let client_ctx = client.context(DEFAULT_CONTEXT)?;
 
     // Create some test albums on the server
     let (a_id, b_id, c_id) = {
@@ -86,7 +78,7 @@ async fn test_predicate_update_inter_node() -> Result<()> {
     };
 
     // Create LiveQuery on client with initial predicate
-    let albums = client_ctx.query_wait::<AlbumView>("year > 2020").await?;
+    let albums = client_ctx.query_wait::<AlbumView>(nocache("year > 2020")?).await?;
 
     let watcher = TestWatcher::changeset();
     let _guard = albums.subscribe(&watcher);

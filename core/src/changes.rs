@@ -88,7 +88,7 @@ impl std::fmt::Display for EntityChange {
 
 use crate::resultset::ResultSet;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChangeSet<R: View> {
     pub resultset: ResultSet<R>,
     pub changes: Vec<ItemChange<R>>,

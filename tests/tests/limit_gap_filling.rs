@@ -85,7 +85,7 @@ async fn test_inter_node_gap_filling() -> Result<(), Box<dyn std::error::Error +
     let ids = create_albums(&server, 2020..=2025).await?;
 
     let watcher = TestWatcher::changeset();
-    let query = client.query_wait::<AlbumView>("year >= '2020' ORDER BY year ASC LIMIT 3").await?;
+    let query = client.query_wait::<AlbumView>(nocache("year >= '2020' ORDER BY year ASC LIMIT 3")?).await?;
     let _handle = query.subscribe(&watcher);
 
     // Initial state should have the first 3 albums (2020, 2021, 2022)
@@ -116,7 +116,7 @@ async fn test_inter_node_gap_filling_desc() -> Result<(), Box<dyn std::error::Er
     let ids = create_albums(&server, 2020..=2027).await?;
 
     let watcher = TestWatcher::changeset();
-    let query = client.query_wait::<AlbumView>("year >= '2020' ORDER BY year DESC LIMIT 4").await?;
+    let query = client.query_wait::<AlbumView>(nocache("year >= '2020' ORDER BY year DESC LIMIT 4")?).await?;
     let _handle = query.subscribe(&watcher);
 
     assert_eq!(watcher.quiesce().await, 0);
