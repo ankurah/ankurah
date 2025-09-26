@@ -7,6 +7,10 @@ use std::task::{Context, Poll};
 use wasm_bindgen::prelude::*;
 use web_sys::{Event, EventTarget};
 
+pub fn cb_stream<T: AsRef<EventTarget>>(target: &T, success_event: &str, error_event: &str) -> CBStream {
+    CBStream::new(target, success_event, error_event)
+}
+
 pub struct CBStream {
     receiver: mpsc::UnboundedReceiver<Result<JsValue, Event>>,
     _callbacks: Vec<(Closure<dyn FnMut(Event)>, EventTarget)>,

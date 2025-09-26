@@ -9,7 +9,11 @@ use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
-use crate::{collection::IndexedDBBucket, database::Database};
+use crate::{
+    collection::IndexedDBBucket,
+    database::Database,
+    util::{cb_future::cb_future, require::WBGRequire},
+};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -60,31 +64,25 @@ impl StorageEngine for IndexedDBStorageEngine {
     }
 
     async fn delete_all_collections(&self) -> Result<bool, MutationError> {
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, MutationError> {
-            res.map_err(|e| MutationError::FailedStep(msg, e.into().as_string().unwrap_or_default()))
-        }
-
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
             // Clear entities store
-            let entities_transaction = step(
-                db_connection.transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readwrite),
-                "create entities transaction",
-            )?;
-            let entities_store = step(entities_transaction.object_store("entities"), "get entities store")?;
-            let entities_request = step(entities_store.clear(), "clear entities store")?;
-            step(crate::cb_future::CBFuture::new(&entities_request, "success", "error").await, "await entities clear")?;
-            step(crate::cb_future::CBFuture::new(&entities_transaction, "complete", "error").await, "complete entities transaction")?;
+            let entities_transaction = db_connection
+                .transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readwrite)
+                .require("create entities transaction")?;
+            let entities_store = entities_transaction.object_store("entities").require("get entities store")?;
+            let entities_request = entities_store.clear().require("clear entities store")?;
+            cb_future(&entities_request, "success", "error").await.require("await entities clear")?;
+            cb_future(&entities_transaction, "complete", "error").await.require("complete entities transaction")?;
 
             // Clear events store
-            let events_transaction = step(
-                db_connection.transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite),
-                "create events transaction",
-            )?;
-            let events_store = step(events_transaction.object_store("events"), "get events store")?;
-            let events_request = step(events_store.clear(), "clear events store")?;
-            step(crate::cb_future::CBFuture::new(&events_request, "success", "error").await, "await events clear")?;
-            step(crate::cb_future::CBFuture::new(&events_transaction, "complete", "error").await, "complete events transaction")?;
+            let events_transaction = db_connection
+                .transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite)
+                .require("create events transaction")?;
+            let events_store = events_transaction.object_store("events").require("get events store")?;
+            let events_request = events_store.clear().require("clear events store")?;
+            cb_future(&events_request, "success", "error").await.require("await events clear")?;
+            cb_future(&events_transaction, "complete", "error").await.require("complete events transaction")?;
 
             // Return true since we cleared everything
             Ok(true)
