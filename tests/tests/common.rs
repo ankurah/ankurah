@@ -8,6 +8,7 @@ use tracing::Level;
 #[allow(unused)]
 pub use ankurah::{
     changes::{ChangeKind, ChangeSet},
+    core::node::nocache,
     error::MutationError,
     model::View,
     policy::DEFAULT_CONTEXT,
@@ -164,6 +165,12 @@ impl<T, U> TestWatcher<T, U> {
             },
         }
     }
+}
+
+impl<T, U> TestWatcher<T, U>
+where T: Clone
+{
+    pub fn peek(&self) -> Vec<U> { self.changes.lock().unwrap().iter().map(|item| (self.transform)(item.clone())).collect() }
 }
 
 impl<T: Send + 'static, U> IntoListener<T> for &TestWatcher<T, U> {

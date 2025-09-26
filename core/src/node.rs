@@ -52,29 +52,37 @@ pub struct MatchArgs {
 
 impl TryInto<MatchArgs> for &str {
     type Error = ankql::error::ParseError;
-    fn try_into(self) -> Result<MatchArgs, Self::Error> {
-        Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: false })
-    }
+    fn try_into(self) -> Result<MatchArgs, Self::Error> { Ok(MatchArgs { selection: ankql::parser::parse_selection(self)?, cached: true }) }
 }
 impl TryInto<MatchArgs> for String {
     type Error = ankql::error::ParseError;
     fn try_into(self) -> Result<MatchArgs, Self::Error> {
-        Ok(MatchArgs { selection: ankql::parser::parse_selection(&self)?, cached: false })
+        Ok(MatchArgs { selection: ankql::parser::parse_selection(&self)?, cached: true })
     }
 }
 
 impl From<ankql::ast::Predicate> for MatchArgs {
     fn from(val: ankql::ast::Predicate) -> Self {
-        MatchArgs { selection: ankql::ast::Selection { predicate: val, order_by: None, limit: None }, cached: false }
+        MatchArgs { selection: ankql::ast::Selection { predicate: val, order_by: None, limit: None }, cached: true }
     }
 }
 
 impl From<ankql::ast::Selection> for MatchArgs {
-    fn from(val: ankql::ast::Selection) -> Self { MatchArgs { selection: val, cached: false } }
+    fn from(val: ankql::ast::Selection) -> Self { MatchArgs { selection: val, cached: true } }
 }
 
 impl From<ankql::error::ParseError> for RetrievalError {
     fn from(e: ankql::error::ParseError) -> Self { RetrievalError::ParseError(e) }
+}
+
+pub fn nocache<T: TryInto<ankql::ast::Selection, Error = ankql::error::ParseError>>(s: T) -> Result<MatchArgs, ankql::error::ParseError> {
+    MatchArgs::nocache(s)
+}
+impl MatchArgs {
+    pub fn nocache<T>(s: T) -> Result<Self, ankql::error::ParseError>
+    where T: TryInto<ankql::ast::Selection, Error = ankql::error::ParseError> {
+        Ok(Self { selection: s.try_into()?, cached: false })
+    }
 }
 
 /// A participant in the Ankurah network, and primary place where queries are initiated

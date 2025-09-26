@@ -18,7 +18,7 @@ use crate::{
 use ankurah_storage_common::Plan;
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
-use tracing::{debug, info};
+use tracing::debug;
 
 #[derive(Debug)]
 pub struct IndexedDBBucket {
@@ -147,8 +147,6 @@ impl StorageCollection for IndexedDBBucket {
                     .assure_index_exists(index_spec)
                     .await
                     .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
-
-                info!("LOOK fetching with bounds: {:?}", bounds);
 
                 // Step 6: Execute the query using the plan
                 let db_connection = self.db.get_connection().await;
