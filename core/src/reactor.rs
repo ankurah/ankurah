@@ -388,6 +388,9 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         drop(subscriptions); // Drop subscriptions lock
 
         resultset.set_loaded(true);
+        use ankurah_signals::Signal;
+        let id: usize = resultset.broadcast_id().into();
+        tracing::info!("Reactor.add_query({}) sending update", id);
         broadcast.send(ReactorUpdate { items: reactor_update_items, initialized_query: Some((query_id, 0)) });
 
         Ok(())

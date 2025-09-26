@@ -4,7 +4,7 @@ use ankurah_proto as proto;
 use ankurah_signals::{
     broadcast::{Broadcast, BroadcastId, Listener, ListenerGuard},
     subscribe::IntoSubscribeListener,
-    Get, Peek, Signal, Subscribe, SubscriptionGuard,
+    CurrentObserver, Get, Peek, Signal, Subscribe, SubscriptionGuard,
 };
 use std::{
     collections::HashMap,
@@ -391,7 +391,10 @@ impl<E: AbstractEntity> EntityResultSet<E> {
         self.0.loaded.store(loaded, Ordering::Relaxed);
         self.0.broadcast.send(());
     }
-    pub fn is_loaded(&self) -> bool { self.0.loaded.load(Ordering::Relaxed) }
+    pub fn is_loaded(&self) -> bool {
+        CurrentObserver::track(&self);
+        self.0.loaded.load(Ordering::Relaxed)
+    }
 
     pub fn clear(&self) {
         let mut st = self.0.state.lock().unwrap();
@@ -403,6 +406,8 @@ impl<E: AbstractEntity> EntityResultSet<E> {
 
     /// Get an iterator over entity IDs without cloning entities
     pub fn keys(&self) -> EntityResultSetKeyIterator {
+        // TODO make a signal trait for tracked keys
+        CurrentObserver::track(&self);
         let st = self.0.state.lock().unwrap();
         let keys: Vec<proto::EntityId> = st.order.iter().map(|e| *e.entity.id()).collect();
         EntityResultSetKeyIterator::new(keys)
@@ -410,28 +415,33 @@ impl<E: AbstractEntity> EntityResultSet<E> {
 
     /// Check if an entity with the given ID exists
     pub fn contains_key(&self, id: &proto::EntityId) -> bool {
+        // TODO make a signal trait for tracked contains_key
+        CurrentObserver::track(&self);
         let st = self.0.state.lock().unwrap();
         st.index.contains_key(id)
     }
 
     pub fn by_id(&self, id: &proto::EntityId) -> Option<E> {
+        // TODO make a signal trait for tracked by_id
+        CurrentObserver::track(self);
         let st = self.0.state.lock().unwrap();
         st.index.get(id).map(|&i| st.order[i].entity.clone())
     }
 
     pub fn len(&self) -> usize {
+        CurrentObserver::track(&self);
         let st = self.0.state.lock().unwrap();
         st.order.len()
     }
 
     /// Check if this result set needs gap filling
-    pub fn is_gap_dirty(&self) -> bool {
+    pub(crate) fn is_gap_dirty(&self) -> bool {
         let st = self.0.state.lock().unwrap();
         st.gap_dirty
     }
 
     /// Clear the gap_dirty flag (called after gap filling is complete)
-    pub fn clear_gap_dirty(&self) {
+    pub(crate) fn clear_gap_dirty(&self) {
         let mut st = self.0.state.lock().unwrap();
         st.gap_dirty = false;
     }
@@ -443,13 +453,13 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     }
 
     /// Get the last entity for gap filling continuation
-    pub fn last_entity(&self) -> Option<E> {
+    pub(crate) fn last_entity(&self) -> Option<E> {
         let st = self.0.state.lock().unwrap();
         st.order.last().map(|entry| entry.entity.clone())
     }
 
     /// Configure ordering for this result set
-    pub fn order_by(&self, key_spec: Option<KeySpec>) {
+    pub(crate) fn order_by(&self, key_spec: Option<KeySpec>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the key spec actually changed
@@ -496,7 +506,7 @@ impl<E: AbstractEntity> EntityResultSet<E> {
     }
 
     /// Set the limit for this result set
-    pub fn limit(&self, limit: Option<usize>) {
+    pub(crate) fn limit(&self, limit: Option<usize>) {
         let mut st = self.0.state.lock().unwrap();
 
         // Check if the limit actually changed
