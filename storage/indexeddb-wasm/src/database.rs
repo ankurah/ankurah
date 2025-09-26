@@ -161,6 +161,8 @@ impl Connection {
     /// Open database connection with a specific index to be created
     pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec) -> Result<Self, RetrievalError> {
         let index_name = index_spec.name_with("", "__");
+        notice_info!("creating index {db_name}.entities.{index_name} -> {:?}", index_spec.keyparts);
+
         Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
             let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
             let transaction = open_request.transaction().require("get upgrade transaction")?;
