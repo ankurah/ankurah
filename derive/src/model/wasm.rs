@@ -58,6 +58,7 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
             }
             #[wasm_bindgen(getter)]
             pub fn loaded(&self) -> bool {
+                ::ankurah::signals::CurrentObserver::track(&self);
                 self.0.is_loaded()
             }
             /// Call the provided callback on each item in the resultset, returning a new array of the results
@@ -87,8 +88,15 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 
         #[wasm_bindgen]
         impl #livequery_name {
-            pub fn results(&self) -> #resultset_name {
-                #resultset_name(self.0.resultset())
+            #[wasm_bindgen(getter)]
+            pub fn items(&self) -> Vec<#view_name> {
+                use ::ankurah::signals::Get;
+                self.0.resultset().get()
+            }
+            #[wasm_bindgen(getter)]
+            pub fn signal_id(&self) -> usize {
+                use ::ankurah::signals::Signal;
+                self.0.broadcast_id().into()
             }
             pub fn map(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::derive_deps::js_sys::Array {
                 ::ankurah::core::model::js_resultset_map(&self.0.resultset(), &callback)
@@ -101,22 +109,21 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             }
 
             #[wasm_bindgen(getter)]
-            pub fn loaded(&self) -> bool {
-                self.0.loaded()
-            }
+            pub fn loaded(&self) -> bool { self.0.loaded() }
 
             #[wasm_bindgen(getter)]
             pub fn resultset(&self) -> #resultset_name {
                 #resultset_name(self.0.resultset())
             }
+            /// DEPREDCATED - use resultset() instead
             #[wasm_bindgen(getter)]
             pub fn value(&self) -> #resultset_name {
                 #resultset_name(self.0.resultset())
             }
-            // #[wasm_bindgen(getter)]
-            // pub fn error(&self) -> Option<String> {
-            //     self.0.error()
-            // }
+            #[wasm_bindgen(getter)]
+            pub fn error(&self) -> Option<String> {
+                self.0.error().map(|e| e.to_string())
+            }
 
             pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
                 use ::ankurah::signals::Subscribe;
