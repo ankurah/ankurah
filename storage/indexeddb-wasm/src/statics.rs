@@ -1,5 +1,5 @@
 // Cache the property keys so we only have to create the js values once
-use crate::object::Property;
+use crate::util::object::Property;
 use lazy_static::lazy_static;
 
 lazy_static! {
