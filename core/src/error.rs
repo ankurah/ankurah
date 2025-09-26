@@ -145,10 +145,16 @@ pub enum MutationError {
     PropertyError(crate::property::PropertyError),
     #[error("future join: {0}")]
     FutureJoin(tokio::task::JoinError),
+    #[error("anyhow error: {0}")]
+    Anyhow(anyhow::Error),
 }
 
 impl From<tokio::task::JoinError> for MutationError {
     fn from(err: tokio::task::JoinError) -> Self { MutationError::FutureJoin(err) }
+}
+
+impl From<anyhow::Error> for MutationError {
+    fn from(err: anyhow::Error) -> Self { MutationError::Anyhow(err) }
 }
 
 #[derive(Error, Debug)]

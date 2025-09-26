@@ -23,6 +23,35 @@ pub async fn test_open_database() {
 
     IndexedDBStorageEngine::cleanup(&db_name).await.expect("Failed to cleanup database");
 }
+#[wasm_bindgen_test]
+pub async fn test_multi_connection_versionchange_reconnect() {
+    setup();
+
+    let db_name = format!("test_db_multi_conn_{}", ulid::Ulid::new());
+
+    // Open two logical connections via engine wrappers
+    let engine1 = IndexedDBStorageEngine::open(&db_name).await.expect("open engine1");
+    let engine2 = IndexedDBStorageEngine::open(&db_name).await.expect("open engine2");
+
+    let db1 = Database::open(&db_name).await.expect("open db1");
+    let version_before = db1.get_connection().await.version() as u32;
+
+    // Trigger an upgrade via open_with_index on a new index
+    let index_spec = KeySpec::new(vec![IndexKeyPart::asc("multi_conn_field", ValueType::String)]);
+    ankurah_storage_indexeddb_wasm::database::Connection::open_with_index(&db_name, version_before + 1, index_spec)
+        .await
+        .expect("upgrade with index");
+
+    // Other connections should have received versionchange and closed; lazy reconnect should yield newer version
+    let db2 = Database::open(&db_name).await.expect("open db2 for check");
+    let v1 = db1.get_connection().await.version() as u32;
+    let v2 = db2.get_connection().await.version() as u32;
+    assert!(v1 >= version_before + 1, "db1 should reopen to at least upgraded version");
+    assert!(v2 >= version_before + 1, "db2 should open at upgraded version");
+
+    drop(engine1);
+    drop(engine2);
+}
 
 #[wasm_bindgen_test]
 pub async fn test_duplicate_index_creation_error_handling() -> Result<(), anyhow::Error> {

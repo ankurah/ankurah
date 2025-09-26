@@ -10,7 +10,11 @@ use async_trait::async_trait;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::{JsCast, JsValue};
 
-use crate::{cb_future::CBFuture, cb_stream::CBStream, database::Database, object::Object, statics::*};
+use crate::{
+    database::Database,
+    statics::*,
+    util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, require::WBGRequire},
+};
 use ankurah_storage_common::Plan;
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
@@ -33,10 +37,6 @@ impl std::fmt::Display for IndexedDBBucket {
 #[async_trait]
 impl StorageCollection for IndexedDBBucket {
     async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, MutationError> {
-            res.map_err(|e| MutationError::FailedStep(msg, e.into().as_string().unwrap_or_default()))
-        }
-
         self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Lock the mutex to prevent concurrent updates
         let _lock = self.mutex.lock().await;
@@ -46,13 +46,13 @@ impl StorageCollection for IndexedDBBucket {
             use web_sys::IdbTransactionMode::Readwrite;
             action_debug!(self, "set_state {}", "{}", &self.collection_id);
             // Get the old entity if it exists to check for changes
-            let transaction = step(db_connection.transaction_with_str_and_mode("entities", Readwrite), "create transaction")?;
-            let store = step(transaction.object_store("entities"), "get object store")?;
-            let old_request = step(store.get(&state.payload.entity_id.to_string().into()), "get old entity")?;
-            let foo = CBFuture::new(&old_request, "success", "error").await;
-            let _: () = step(foo, "get old entity")?;
+            let transaction = db_connection.transaction_with_str_and_mode("entities", Readwrite).require("create transaction")?;
+            let store = transaction.object_store("entities").require("get object store")?;
+            let old_request = store.get(&state.payload.entity_id.to_string().into()).require("get old entity")?;
+            let foo = cb_future(&old_request, "success", "error").await;
+            let _: () = foo.require("get old entity")?;
 
-            let old_entity: JsValue = step(old_request.result(), "get old entity result")?;
+            let old_entity: JsValue = old_request.result().require("get old entity result")?;
 
             // Check if the entity changed
             if !old_entity.is_undefined() && !old_entity.is_null() {
@@ -80,10 +80,10 @@ impl StorageCollection for IndexedDBBucket {
             extract_all_fields(&entity, &state.payload)?;
 
             // Put the entity in the store
-            let request = step(store.put_with_key(&entity, &state.payload.entity_id.to_string().into()), "put entity in store")?;
+            let request = store.put_with_key(&entity, &state.payload.entity_id.to_string().into()).require("put entity in store")?;
 
-            step(CBFuture::new(&request, "success", "error").await, "put entity in store")?;
-            step(CBFuture::new(&transaction, "complete", "error").await, "complete transaction")?;
+            cb_future(&request, "success", "error").await.require("put entity in store")?;
+            cb_future(&transaction, "complete", "error").await.require("complete transaction")?;
 
             Ok(true) // It was updated
         })
@@ -91,20 +91,16 @@ impl StorageCollection for IndexedDBBucket {
     }
 
     async fn get_state(&self, id: proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
-            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
-        }
-
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
             // Create transaction and get object store
-            let transaction = step(db_connection.transaction_with_str("entities"), "create transaction")?;
-            let store = step(transaction.object_store("entities"), "get object store")?;
-            let request = step(store.get(&id.to_string().into()), "get entity")?;
+            let transaction = db_connection.transaction_with_str("entities").require("create transaction")?;
+            let store = transaction.object_store("entities").require("get object store")?;
+            let request = store.get(&id.to_string().into()).require("get entity")?;
 
-            step(CBFuture::new(&request, "success", "error").await, "await request")?;
+            cb_future(&request, "success", "error").await.require("await request")?;
 
-            let result = step(request.result(), "get result")?;
+            let result = request.result().require("get result")?;
 
             // Check if the entity exists
             if result.is_undefined() || result.is_null() {
@@ -126,10 +122,6 @@ impl StorageCollection for IndexedDBBucket {
     }
 
     async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
-            res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
-        }
-
         let _invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _lock = self.mutex.lock().await; // TODO why are we locking here?
 
@@ -164,11 +156,11 @@ impl StorageCollection for IndexedDBBucket {
                 let limit = selection.limit;
 
                 SendWrapper::new(async move {
-                    let transaction = step(db_connection.transaction_with_str("entities"), "create transaction")?;
-                    let store = step(transaction.object_store("entities"), "get object store")?;
+                    let transaction = db_connection.transaction_with_str("entities").require("create transaction")?;
+                    let store = transaction.object_store("entities").require("get object store")?;
 
                     // Get the index specified by the plan
-                    let index = step(store.index(&index_spec.name_with("", "__")), "get index")?;
+                    let index = store.index(&index_spec.name_with("", "__")).require("get index")?;
 
                     // Convert plan bounds to IndexedDB key range using new pipeline
                     let (key_range, upper_open_ended, eq_prefix_len, eq_prefix_values) =
@@ -205,10 +197,6 @@ impl StorageCollection for IndexedDBBucket {
     }
 
     async fn add_event(&self, attested_event: &Attested<ankurah_proto::Event>) -> Result<bool, MutationError> {
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, MutationError> {
-            res.map_err(|e| MutationError::FailedStep(msg, e.into().as_string().unwrap_or_default()))
-        }
-
         let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("IndexedDBBucket({}).add_event({})", self.collection_id, invocation);
         let _lock = self.mutex.lock().await;
@@ -216,10 +204,11 @@ impl StorageCollection for IndexedDBBucket {
 
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
-            let transaction =
-                step(db_connection.transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite), "create transaction")?;
+            let transaction = db_connection
+                .transaction_with_str_and_mode("events", web_sys::IdbTransactionMode::Readwrite)
+                .require("create transaction")?;
 
-            let store = step(transaction.object_store("events"), "get object store")?;
+            let store = transaction.object_store("events").require("get object store")?;
 
             // Create a JS object to store the event data
             let event_obj = Object::new(js_sys::Object::new().into());
@@ -230,10 +219,10 @@ impl StorageCollection for IndexedDBBucket {
             event_obj.set(&*ATTESTATIONS_KEY, &attested_event.attestations)?;
             event_obj.set(&*PARENT_KEY, &payload.parent)?;
 
-            let request = step(store.put_with_key(&event_obj, &(&payload.id()).into()), "put event in store")?;
+            let request = store.put_with_key(&event_obj, &(&payload.id()).into()).require("put event in store")?;
 
-            step(CBFuture::new(&request, "success", "error").await, "await request")?;
-            step(CBFuture::new(&transaction, "complete", "error").await, "complete transaction")?;
+            cb_future(&request, "success", "error").await.require("await request")?;
+            cb_future(&transaction, "complete", "error").await.require("complete transaction")?;
 
             Ok(true)
         })
@@ -245,21 +234,17 @@ impl StorageCollection for IndexedDBBucket {
             return Ok(Vec::new());
         }
 
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
-            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
-        }
-
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
-            let transaction = step(db_connection.transaction_with_str("events"), "create transaction")?;
-            let store = step(transaction.object_store("events"), "get object store")?;
+            let transaction = db_connection.transaction_with_str("events").require("create transaction")?;
+            let store = transaction.object_store("events").require("get object store")?;
 
             // TODO - do we want to use a cursor? The id space is pretty sparse, so we would probably need benchmarks to see if it's worth it
             let mut events = Vec::new();
             for event_id in event_ids {
-                let request = step(store.get(&event_id.to_base64().into()), "get event")?;
-                step(CBFuture::new(&request, "success", "error").await, "await event request")?;
-                let result = step(request.result(), "get result")?;
+                let request = store.get(&event_id.to_base64().into()).require("get event")?;
+                cb_future(&request, "success", "error").await.require("await event request")?;
+                let result = request.result().require("get result")?;
 
                 // Skip if event not found
                 if result.is_undefined() || result.is_null() {
@@ -286,31 +271,27 @@ impl StorageCollection for IndexedDBBucket {
     }
 
     async fn dump_entity_events(&self, id: ankurah_proto::EntityId) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
-            res.map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
-        }
-
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
-            let transaction = step(db_connection.transaction_with_str("events"), "create transaction")?;
-            let store = step(transaction.object_store("events"), "get object store")?;
-            let index = step(store.index("by_entity_id"), "get entity_id index")?;
-            let key_range = step(web_sys::IdbKeyRange::only(&id.into()), "create key range")?;
-            let request = step(index.open_cursor_with_range(&key_range), "open cursor")?;
+            let transaction = db_connection.transaction_with_str("events").require("create transaction")?;
+            let store = transaction.object_store("events").require("get object store")?;
+            let index = store.index("by_entity_id").require("get entity_id index")?;
+            let key_range = web_sys::IdbKeyRange::only(&id.into()).require("create key range")?;
+            let request = index.open_cursor_with_range(&key_range).require("open cursor")?;
 
             let mut events = Vec::new();
-            let mut stream = crate::cb_stream::CBStream::new(&request, "success", "error");
+            let mut stream = cb_stream(&request, "success", "error");
 
             while let Some(result) = stream.next().await {
-                let cursor_result = step(result, "Cursor error")?;
+                let cursor_result = result.require("Cursor error")?;
 
                 // Check if we've reached the end
                 if cursor_result.is_null() || cursor_result.is_undefined() {
                     break;
                 }
 
-                let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
-                let event_obj = Object::new(step(cursor.value(), "get cursor value")?);
+                let cursor = cursor_result.dyn_into::<web_sys::IdbCursorWithValue>().require("cast cursor")?;
+                let event_obj = Object::new(cursor.value().require("get cursor value")?);
 
                 let event = Attested {
                     payload: ankurah_proto::Event {
@@ -324,7 +305,7 @@ impl StorageCollection for IndexedDBBucket {
                 };
                 events.push(event);
 
-                step(cursor.continue_(), "Failed to advance cursor")?;
+                cursor.continue_().require("Failed to advance cursor")?;
             }
 
             Ok(events)
@@ -338,12 +319,12 @@ impl StorageCollection for IndexedDBBucket {
 
 /// Execute queries using index cursors (we always use indexes for fetch operations)
 /// Convert IndexDirection to IdbCursorDirection
-pub fn to_idb_cursor_direction(direction: ankurah_core::indexing::IndexDirection) -> web_sys::IdbCursorDirection {
-    match direction {
-        ankurah_core::indexing::IndexDirection::Asc => web_sys::IdbCursorDirection::Next,
-        ankurah_core::indexing::IndexDirection::Desc => web_sys::IdbCursorDirection::Prev,
-    }
-}
+// pub fn to_idb_cursor_direction(direction: ankurah_core::indexing::IndexDirection) -> web_sys::IdbCursorDirection {
+//     match direction {
+//         ankurah_core::indexing::IndexDirection::Asc => web_sys::IdbCursorDirection::Next,
+//         ankurah_core::indexing::IndexDirection::Desc => web_sys::IdbCursorDirection::Prev,
+//     }
+// }
 
 impl IndexedDBBucket {
     async fn execute_plan_query(
@@ -358,28 +339,22 @@ impl IndexedDBBucket {
         eq_prefix_len: usize,
         eq_prefix_values: Vec<ankurah_core::value::Value>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        fn step<T, E: Into<JsValue>>(res: Result<T, E>, msg: &'static str) -> Result<T, RetrievalError> {
-            res.map_err(|e| RetrievalError::StorageError(format!("{}: {}", msg, e.into().as_string().unwrap_or_default()).into()))
-        }
-
         // cursor_direction is already provided as parameter
 
         // Open index cursor with optional key range and direction
         // Convert IdbKeyRange to JsValue for the API call
         let cursor_request = if let Some(range) = &key_range {
-            step(
-                index.open_cursor_with_range_and_direction(range.as_ref(), cursor_direction),
-                "open index cursor with range and direction",
-            )?
+            index
+                .open_cursor_with_range_and_direction(range.as_ref(), cursor_direction)
+                .require("open index cursor with range and direction")?
         } else {
-            step(
-                index.open_cursor_with_range_and_direction(&wasm_bindgen::JsValue::NULL, cursor_direction),
-                "open index cursor with direction only",
-            )?
+            index
+                .open_cursor_with_range_and_direction(&wasm_bindgen::JsValue::NULL, cursor_direction)
+                .require("open index cursor with direction only")?
         };
 
         let mut results = Vec::new();
-        let mut stream = CBStream::new(&cursor_request, "success", "error");
+        let mut stream = cb_stream(&cursor_request, "success", "error");
         let mut count = 0u64;
 
         // Equality-prefix guard: enabled when scanning open-ended ranges with a non-empty equality prefix
@@ -393,15 +368,15 @@ impl IndexedDBBucket {
             if use_prefix_guard { eq_prefix_values.iter().map(propertyvalue_to_js).collect() } else { Vec::new() };
 
         'scan: while let Some(result) = stream.next().await {
-            let cursor_result = step(result, "cursor error")?;
+            let cursor_result = result.require("cursor error")?;
             if cursor_result.is_null() || cursor_result.is_undefined() {
                 break;
             }
 
-            let cursor: web_sys::IdbCursorWithValue = step(cursor_result.dyn_into(), "cast cursor")?;
+            let cursor = cursor_result.dyn_into::<web_sys::IdbCursorWithValue>().require("cast cursor")?;
 
             if use_prefix_guard {
-                let key_js = step(cursor.key(), "get cursor key")?;
+                let key_js = cursor.key().require("get cursor key")?;
                 if !key_js.is_undefined() && !key_js.is_null() {
                     let key_arr = js_sys::Array::from(&key_js);
                     for i in 0..(eq_prefix_len as u32) {
@@ -413,7 +388,7 @@ impl IndexedDBBucket {
                     }
                 }
             }
-            let entity_obj = Object::new(step(cursor.value(), "get cursor value")?);
+            let entity_obj = Object::new(cursor.value().require("get cursor value")?);
 
             // Create a wrapper that provides collection context for filtering
             let filterable_entity = FilterableObject { object: &entity_obj, collection_id };
@@ -435,7 +410,7 @@ impl IndexedDBBucket {
                 }
             }
 
-            step(cursor.continue_(), "advance cursor")?;
+            cursor.continue_().require("advance cursor")?;
         }
 
         Ok(results)

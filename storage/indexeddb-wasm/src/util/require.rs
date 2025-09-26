@@ -1,16 +1,20 @@
 use anyhow::anyhow;
 use wasm_bindgen::{JsCast, JsValue};
 
-pub trait Require<T> {
+/// Helper trait a bit like expect, except it's tailored for wasm-bindgen use cases
+/// This helps eliminate a lot of boilerplate code associated with error type conversions
+pub trait WBGRequire<T> {
     fn require(self, err: &'static str) -> anyhow::Result<T>;
 }
-impl<T> Require<T> for Result<T, JsValue> {
-    fn require(self, err: &'static str) -> anyhow::Result<T> { Ok(self.map_err(|e| anyhow!("{} - {}", err, extract_message(e)))?) }
+impl<T> WBGRequire<T> for Result<T, JsValue> {
+    fn require(self, err: &'static str) -> anyhow::Result<T> {
+        Ok(self.map_err(|e| anyhow!("{} - {}", err, crate::error::extract_message(e)))?)
+    }
 }
-impl<T> Require<T> for Option<T> {
+impl<T> WBGRequire<T> for Option<T> {
     fn require(self, err: &'static str) -> anyhow::Result<T> { Ok(self.ok_or(anyhow!("{} is None", err))?) }
 }
-impl<T> Require<T> for Result<Option<T>, JsValue> {
+impl<T> WBGRequire<T> for Result<Option<T>, JsValue> {
     fn require(self, err: &'static str) -> anyhow::Result<T> {
         match self {
             Ok(Some(res)) => Ok(res),
@@ -19,7 +23,7 @@ impl<T> Require<T> for Result<Option<T>, JsValue> {
         }
     }
 }
-impl<T> Require<T> for Result<T, web_sys::Event> {
+impl<T> WBGRequire<T> for Result<T, web_sys::Event> {
     fn require(self, err: &'static str) -> anyhow::Result<T> {
         self.map_err(|e| {
             // Try to extract more detailed error information
@@ -42,18 +46,4 @@ impl<T> Require<T> for Result<T, web_sys::Event> {
             }
         })
     }
-}
-fn extract_message(err: JsValue) -> String {
-    // If it's a JS Error object, grab its `message`
-    if let Some(e) = err.dyn_ref::<js_sys::Error>() {
-        return format!("{}: {}", e.name(), e.message());
-    }
-
-    // If it's already a string, convert directly
-    if let Some(s) = err.as_string() {
-        return s;
-    }
-
-    // Fallback: stringify the value
-    js_sys::JSON::stringify(&err).ok().and_then(|s| s.as_string()).unwrap_or_else(|| format!("{:?}", err))
 }
