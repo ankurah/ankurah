@@ -49,23 +49,6 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
     fn into_parts(self) -> (Self::Entity, Vec<Self::Event>);
 }
 
-// Implement ReactorEntity for Entity
-impl AbstractEntity for Entity {
-    fn collection(&self) -> proto::CollectionId { self.collection.clone() }
-
-    fn id(&self) -> &proto::EntityId { &self.id }
-
-    fn value(&self, field: &str) -> Option<crate::value::Value> {
-        if field == "id" {
-            Some(crate::value::Value::EntityId(self.id))
-        } else {
-            // Iterate through backends to find one that has this property
-            let backends = self.backends.lock().expect("other thread panicked, panic here too");
-            backends.values().find_map(|backend| backend.property_value(&field.into()))
-        }
-    }
-}
-
 // Implement the trait for EntityChange
 impl ChangeNotification for EntityChange {
     type Entity = Entity;
