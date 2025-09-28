@@ -214,7 +214,7 @@ impl Entity {
         let mut head = self.head();
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;
-        let budget = 100;
+        let budget = 10;
 
         for attempt in 0..MAX_RETRIES {
             match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
@@ -320,7 +320,7 @@ impl Entity {
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
-        let budget = 100;
+        let budget = 10;
 
         match crate::lineage::compare(getter, &new_head, &head, budget).await? {
             lineage::Ordering::Equal => {
