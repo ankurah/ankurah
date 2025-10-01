@@ -136,6 +136,15 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// Check if a context can edit an entity
     fn check_write(&self, data: &Self::ContextData, entity: &Entity, event: Option<&proto::Event>) -> Result<(), AccessDenied>;
 
+    /// Validate a lineage attestation from a peer
+    /// This validates that the relation attestation correctly describes the lineage between two entity heads
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        node: &Node<SE, Self>,
+        peer_id: &proto::EntityId,
+        head_relation: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied>;
+
     // fn check_write_event(&self, data: &Self::ContextData, entity: &Entity, event: &proto::Event) -> Result<(), AccessDenied>;
 
     // // For checking if a context can subscribe to changes
@@ -254,6 +263,16 @@ impl PolicyAgent for PermissiveAgent {
     }
 
     fn check_write(&self, _context: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _peer_id: &proto::EntityId,
+        _head_relation: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied> {
+        // PermissiveAgent trusts all causal assertions
         Ok(())
     }
 

@@ -33,12 +33,7 @@ impl SubscriptionHandler {
 
         // Subscribe to changes on this subscription
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
-            tracing::debug!(
-                "SubscriptionHandler[{}] received reactor update with {} items, initialized_predicate: {:?}",
-                peer_id,
-                update.items.len(),
-                update.initialized_query
-            );
+            tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
 
             if let Some(node) = weak_node.upgrade() {
                 tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
@@ -46,7 +41,6 @@ impl SubscriptionHandler {
                     peer_id,
                     proto::NodeUpdateBody::SubscriptionUpdate {
                         items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
-                        initialized_query: update.initialized_query, // Now includes (PredicateId, u32)
                     },
                 );
             }
@@ -76,6 +70,7 @@ impl SubscriptionHandler {
         mut selection: ankql::ast::Selection,
         cdata: &PA::ContextData,
         version: u32,
+        known_matches: Vec<proto::KnownEntity>,
     ) -> anyhow::Result<proto::NodeResponseBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -95,6 +90,10 @@ impl SubscriptionHandler {
             initial_entities.push(entity);
         }
 
+        // Clone entities for initial response before moving them to reactor
+        let entities_for_initial = initial_entities.clone();
+        let collection_for_initial = collection_id.clone();
+
         if version == 0 {
             let resultset = EntityResultSet::from_vec(initial_entities, true);
             let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::new(node, cdata.clone()));
@@ -111,7 +110,27 @@ impl SubscriptionHandler {
             )?;
         }
 
-        Ok(proto::NodeResponseBody::QuerySubscribed { query_id })
+        // FIXME 1: call lineage::compare here and decide between which DeltaContent to use based on the result
+        // FIXME 2: ensure we are including state for non-matching entities present in the known_matches
+
+        // TODO: Implement proper lineage attestation logic here
+        // For now, just wrap all initial entities as StateSnapshot
+        let initial = entities_for_initial
+            .into_iter()
+            .map(|entity| {
+                let state = entity.to_state().map_err(|e| anyhow::anyhow!("Failed to convert entity to state: {}", e))?;
+                let entity_state = proto::EntityState { entity_id: entity.id(), collection: collection_for_initial.clone(), state };
+                let attestation = node.policy_agent.attest_state(node, &entity_state);
+                let attested_state = proto::Attested::opt(entity_state, attestation);
+                Ok(proto::EntityDelta {
+                    entity_id: entity.id(),
+                    collection: collection_for_initial.clone(),
+                    content: proto::DeltaContent::StateSnapshot { state: attested_state.into() },
+                })
+            })
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+
+        Ok(proto::NodeResponseBody::QuerySubscribed { query_id, initial })
     }
 }
 
@@ -141,11 +160,7 @@ where
     let attested_events = item.events;
 
     // Determine content based on whether we have events
-    let content = if attested_events.is_empty() {
-        proto::UpdateContent::StateOnly(attested_state.into())
-    } else {
-        proto::UpdateContent::StateAndEvent(attested_state.into(), attested_events.into_iter().map(|e| e.into()).collect())
-    };
+    let content = proto::UpdateContent::StateAndEvent(attested_state.into(), attested_events.into_iter().map(|e| e.into()).collect());
 
     // Convert predicate relevance from reactor types to proto types
     let predicate_relevance = item

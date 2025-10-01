@@ -12,7 +12,6 @@ impl UpdateApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-        initialized_query: Option<(proto::QueryId, u32)>,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -30,49 +29,14 @@ impl UpdateApplier {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
         }
 
-        // only call the initialization channel if the version matches what we expect
-        let notify_initial_set = if let Some((query_id, received_version)) = initialized_query {
-            let mut pending_subs = node.pending_predicate_subs.lock().unwrap();
-            match pending_subs.entry(query_id) {
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    let (expected_version, _) = entry.get();
-                    if received_version == *expected_version {
-                        Some((entry.remove().1, query_id, received_version))
-                    } else {
-                        // Stale response - ignore it but keep the entry
-                        tracing::warn!("Received stale predicate update v{} but expecting v{}", received_version, expected_version);
-                        None
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(_) => None,
-            }
-        } else {
-            None
-        };
-
-        if let Some((tx, query_id, version)) = notify_initial_set {
-            let mut changes = Vec::new();
-            let mut entities = Vec::new();
-            for update in items {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
-                Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut entities).await?;
-            }
-
-            // Turns out we actually shouldn't call reactor.notify_change here, because this update is special - it's not actually a change, it's an initial set for a query
-            // This is going away anyway with PR140, which moves the initial set to the SubscribeQuery response
-
-            // Send entities (we already verified this is the expected version)
-            let _ = tx.send(entities); // Ignore if receiver was dropped
-        } else {
-            // Use unit type to avoid accumulation
-            let mut changes = Vec::new();
-            for update in items {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
-                Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
-            }
-
-            node.reactor.notify_change(changes);
+        // Apply all updates and notify reactor
+        let mut changes = Vec::new();
+        for update in items {
+            let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
+            Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
         }
+
+        node.reactor.notify_change(changes);
 
         Ok(())
     }
@@ -96,21 +60,6 @@ impl UpdateApplier {
         let collection = node.collections.get(&collection_id).await?;
 
         match content {
-            // StateOnly: equivalent to old SubscriptionItem::Initial
-            proto::UpdateContent::StateOnly(state_fragment) => {
-                let state = (entity_id, collection_id, state_fragment).into();
-                node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
-
-                let (changed, entity) =
-                    node.entities.with_state(retriever, state.payload.entity_id, state.payload.collection, state.payload.state).await?;
-                entities.push(entity.clone());
-
-                if matches!(changed, Some(true) | None) {
-                    Self::save_state(node, &entity, &collection).await?;
-                    changes.push(EntityChange::new(entity, vec![])?);
-                }
-            }
-
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
                 let events = Self::save_events(node, from_peer_id, entity_id, &collection_id, event_fragments, &collection).await?;

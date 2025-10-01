@@ -366,15 +366,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         drop(read_guard);
 
         // pred_state.paused = false; // Unpause now that initialization is complete
-
-        let broadcast = subscription.broadcast.clone(); // clone the broadcast to eliminate the potential deadlock
         drop(subscriptions); // Drop subscriptions lock
-
-        resultset.set_loaded(true);
-        use ankurah_signals::Signal;
-        let id: usize = resultset.broadcast_id().into();
-        tracing::info!("Reactor.add_query({}) sending update", id);
-        broadcast.send(ReactorUpdate { items: reactor_update_items, initialized_query: Some((query_id, 0)) });
 
         Ok(())
     }
@@ -519,8 +511,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         drop(rw_resultset);
 
         // Send reactor update
-        let reactor_update = ReactorUpdate::<E, Ev> { items: reactor_update_items, initialized_query: Some((query_id, version)) };
-        subscription.notify(reactor_update);
+        // No initial broadcast - initialization is handled in the response
 
         Ok(())
     }
@@ -668,7 +659,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
 
         for (sub_id, sub_items) in items {
             if let Some(subscription) = self.0.subscriptions.lock().unwrap().get(&sub_id) {
-                subscription.notify(ReactorUpdate { items: sub_items.into_values().collect(), initialized_query: None });
+                subscription.notify(ReactorUpdate { items: sub_items.into_values().collect() });
             }
         }
     }
@@ -713,7 +704,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
 
             // Send the notification if there were any updates
             if !update_items.is_empty() {
-                let reactor_update = ReactorUpdate { items: update_items, initialized_query: None };
+                let reactor_update = ReactorUpdate { items: update_items };
                 subscription_state.notify(reactor_update);
             }
         }
@@ -930,7 +921,6 @@ mod tests {
                     entity_subscribed: true,
                     predicate_relevance: vec![(query_id, MembershipChange::Initial)],
                 }],
-                initialized_query: Some((query_id, 0)),
             }]
         );
 
