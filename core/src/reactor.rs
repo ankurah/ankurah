@@ -425,7 +425,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
 
         // Create write guard for atomic updates
         let mut rw_resultset = query_state.resultset.write();
-        let mut reactor_update_items = Vec::new();
+        let mut reactor_update_items: Vec<ReactorUpdateItem<E, Ev>> = Vec::new();
 
         // Mark all entities dirty for re-evaluation on every update_query
         rw_resultset.mark_all_dirty();
