@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::DecodeError, EventId};
 
-/// S set of event ids which create a dag of events
+/// Set of event ids which represents a head in a DAG of events
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct Clock(pub(crate) Vec<EventId>);
 
