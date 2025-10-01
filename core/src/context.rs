@@ -219,23 +219,23 @@ where
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
 
         // TODO implement cached: true
-        let states = if !self.node.durable {
+        if !self.node.durable {
             // Fetch from peers and commit first response
-            self.node.fetch_from_peer(collection_id, args.selection, &self.cdata).await?
+            Ok(self.fetch_from_peer(collection_id, args.selection).await?)
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
-            storage_collection.fetch_states(&args.selection).await?
-        };
+            let states = storage_collection.fetch_states(&args.selection).await?;
 
-        // Convert states to entities
-        let mut entities = Vec::new();
-        for state in states {
-            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
-            let (_, entity) =
-                self.node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
-            entities.push(entity);
+            // Convert states to entities
+            let mut entities = Vec::new();
+            for state in states {
+                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
+                let (_, entity) =
+                    self.node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+                entities.push(entity);
+            }
+            Ok(entities)
         }
-        Ok(entities)
     }
 
     /// Does all the things necessary to commit a local transaction
@@ -285,5 +285,69 @@ where
         // Notify reactor of ALL changes
         self.node.reactor.notify_change(changes);
         Ok(())
+    }
+
+    /// Fetch entities from the first available durable peer with known_matches support
+    async fn fetch_from_peer(
+        &self,
+        collection_id: &proto::CollectionId,
+        selection: ankql::ast::Selection,
+    ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
+        let peer_id = self.node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+
+        // 1. Pre-fetch known_matches from local storage
+        let known_matched_entities = self.node.fetch_entities_from_local(collection_id, &selection).await?;
+
+        // Build hashmap for efficient lookup during lineage validation
+        let known_entities_map: std::collections::HashMap<proto::EntityId, crate::entity::Entity> =
+            known_matched_entities.iter().map(|entity| (entity.id(), entity.clone())).collect();
+
+        let known_matches = known_matched_entities
+            .iter()
+            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
+            .collect();
+
+        // 2. Send fetch request with known_matches
+        let selection_clone = selection.clone();
+        match self
+            .node
+            .request(peer_id, &self.cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
+            .await?
+        {
+            proto::NodeResponseBody::Fetch(deltas) => {
+                let collection = self.node.collections.get(collection_id).await?;
+
+                // 3. Apply deltas to local storage
+                for delta in deltas {
+                    match delta.content {
+                        proto::DeltaContent::StateSnapshot { state } => {
+                            let attested_state = (delta.entity_id, delta.collection, state).into();
+                            self.node.policy_agent.validate_received_state(&self.node, &peer_id, &attested_state)?;
+                            self.node.apply_state(&self.cdata, &peer_id, &delta.entity_id, &delta.collection, state).await?;
+                        }
+                        proto::DeltaContent::EventBridge { events } => {
+                            self.node.apply_events(&self.cdata, &peer_id, &delta.entity_id, &delta.collection, events).await?;
+                        }
+                        proto::DeltaContent::StateAndRelation { state, relation } => {
+                            // TODO: later we will need to assemble the CausalAssertion, and validate the attestation with the policy agent
+                            // then inject that into the CausalNavigator (currently called GetEvents) and call node.entities.with_state(...)
+                            unimplemented!("Node is not yet emitting StateAndRelation deltas");
+                        }
+                    }
+                }
+
+                // 4. Re-fetch entities from local storage after applying deltas
+                // TODO: Consider mutating known_matched_entities in-place instead of re-fetching
+                self.node.fetch_entities_from_local(collection_id, &selection_clone).await
+            }
+            proto::NodeResponseBody::Error(e) => {
+                tracing::debug!("Error from peer fetch: {}", e);
+                Err(RetrievalError::Other(format!("{:?}", e)))
+            }
+            _ => {
+                tracing::debug!("Unexpected response type from peer fetch");
+                Err(RetrievalError::Other("Unexpected response type".to_string()))
+            }
+        }
     }
 }

@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
+use crate::entity::Entity;
 use crate::error::RequestError;
 use crate::node::ContextData;
+use crate::resultset::EntityResultSet;
 use crate::util::safeset::SafeSet;
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,7 @@ pub struct SubscriptionState<CD: ContextData> {
     pub content: Arc<Content<CD>>,
     pub status: Status,
     pub last_error: Option<RequestError>,
+    pub resultset: EntityResultSet<Entity>,
 }
 
 struct SubscriptionRelayInner<CD: ContextData> {
@@ -105,6 +108,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
     pub fn subscribe_query(
         &self,
         query_id: proto::QueryId,
+        resultset: EntityResultSet<Entity>,
         collection_id: CollectionId,
         selection: ankql::ast::Selection,
         context_data: CD,
@@ -118,6 +122,7 @@ impl<CD: ContextData> SubscriptionRelay<CD> {
                     content: Arc::new(Content { collection_id, selection, context_data, query_id, version }),
                     status: Status::PendingRemote,
                     last_error: None,
+                    resultset,
                 },
             );
         }
@@ -436,15 +441,44 @@ where
     ) -> Result<(), RequestError> {
         let node = self.upgrade().ok_or(RequestError::InternalChannelClosed)?;
 
+        // 1. Pre-fetch known_matches from local storage
+        let known_matches = match node.fetch_entities_from_local(&collection_id, &selection).await {
+            Ok(entities) => entities
+                .into_iter()
+                .map(|entity| ankurah_proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
+                .collect(),
+            Err(_) => vec![], // If local fetch fails, send empty known_matches
+        };
+
+        // 2. Send subscribe request with known_matches
         match node
             .request(
                 peer_id,
                 context_data,
-                ankurah_proto::NodeRequestBody::SubscribeQuery { query_id, collection: collection_id, selection, version },
+                ankurah_proto::NodeRequestBody::SubscribeQuery {
+                    query_id,
+                    collection: collection_id.clone(),
+                    selection: selection.clone(),
+                    version,
+                    known_matches,
+                },
             )
             .await?
         {
-            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _ } => Ok(()),
+            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _, initial } => {
+                // 3. Get the resultset for this query
+                let resultset = {
+                    let subscriptions = self.inner.subscriptions.lock().unwrap();
+                    subscriptions.get(&query_id).map(|state| state.resultset.clone())
+                };
+
+                // 4. Apply initial deltas to local node and resultset
+                if let Some(resultset) = resultset {
+                    apply_initial_deltas(&node, &resultset, initial).await.map_err(|e| RequestError::ServerError(e.to_string()))?;
+                }
+
+                Ok(())
+            }
             ankurah_proto::NodeResponseBody::Error(e) => Err(RequestError::ServerError(e)),
             other => Err(RequestError::UnexpectedResponse(other)),
         }
@@ -458,6 +492,58 @@ where
 
         Ok(())
     }
+}
+
+/// Apply initial deltas from QuerySubscribed response to local node and resultset
+async fn apply_initial_deltas<SE, PA>(
+    node: &crate::node::Node<SE, PA>,
+    resultset: &EntityResultSet<Entity>,
+    initial: Vec<ankurah_proto::EntityDelta>,
+) -> Result<(), anyhow::Error>
+where
+    SE: crate::storage::StorageEngine + Send + Sync + 'static,
+    PA: crate::policy::PolicyAgent + Send + Sync + 'static,
+{
+    // TODO: Implement proper delta application with lineage validation
+    // For now, this is a placeholder that applies StateSnapshot deltas
+
+    // Collect entities to add to resultset
+    let mut entities_to_add = Vec::new();
+
+    for delta in initial {
+        match delta.content {
+            ankurah_proto::DeltaContent::StateSnapshot { state } => {
+                let collection = node.collections.get(&delta.collection).await?;
+                let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
+                node.policy_agent.validate_received_state(node, &delta.entity_id, &attested_state)?;
+                let retriever = crate::retrieval::LocalRetriever::new(collection);
+                let (_, entity) = node.entities.with_state(&retriever, delta.entity_id, delta.collection.clone(), state).await?;
+                entities_to_add.push(entity);
+            }
+            ankurah_proto::DeltaContent::EventBridge { events: _ } => {
+                // FIXME: get the entity from resultset and apply them, and store them in the collection
+                // do this by abstracting the logic in applier::apply_update match arm UpdateContent::EventOnly, and save_events - updating both this and applier to use them
+                // oh wait, Node::apply_events might already do this. Have to audit it for correctness
+
+                unimplemented!("::EventBridge not yet implemented");
+            }
+            ankurah_proto::DeltaContent::StateAndRelation { state, relation: _ } => {
+                unimplemented!("Node is not yet emitting StateAndRelation deltas");
+                // when we get to this later, we need to assemble the CausalAssertion, and validate the attestation
+                // then inject that into the CausalNavigator (currently called GetEvents) and call node.entities.with_state(...)
+            }
+        }
+    }
+
+    // Update resultset with new entities
+    if !entities_to_add.is_empty() {
+        let mut write = resultset.write();
+        for entity in entities_to_add {
+            write.add(entity);
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -571,7 +657,8 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Notify of new subscription
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
+        let resultset = EntityResultSet::empty();
+        relay.subscribe_query(query_id, resultset, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
 
         // Check initial state - subscription should immediately go to Requested state since peer is connected
         assert!(matches!(relay.get_status(query_id), Some(Status::Requested(_, _))));
@@ -605,7 +692,8 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Setup established subscription by going through the full flow
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0);
+        let resultset = EntityResultSet::empty();
+        relay.subscribe_query(query_id, resultset, collection_id.clone(), predicate, collection_id.clone(), 0);
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -631,7 +719,8 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add pending subscription (no peers connected yet)
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
+        let resultset = EntityResultSet::empty();
+        relay.subscribe_query(query_id, resultset, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
 
         // Clear any previous requests
@@ -666,7 +755,8 @@ mod tests {
 
         // Connect peer and add subscription (should succeed initially)
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
+        let resultset = EntityResultSet::empty();
+        relay.subscribe_query(query_id, resultset, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -712,8 +802,10 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Add subscriptions
-        relay.subscribe_query(retryable_query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
-        relay.subscribe_query(non_retryable_query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
+        let resultset1 = EntityResultSet::empty();
+        relay.subscribe_query(retryable_query_id, resultset1, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
+        let resultset2 = EntityResultSet::empty();
+        relay.subscribe_query(non_retryable_query_id, resultset2, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
 
         // Manually set different failure types - retryable goes back to pending, non-retryable stays failed
         {
@@ -757,7 +849,8 @@ mod tests {
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0);
+        let resultset = EntityResultSet::empty();
+        relay.subscribe_query(query_id, resultset, collection_id.clone(), predicate, collection_id.clone(), 0);
 
         // Give async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -794,7 +887,8 @@ mod tests {
         let peer_id = EntityId::new();
 
         // Test setup without message sender - should not crash
-        relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
+        let resultset = EntityResultSet::empty();
+        relay.subscribe_query(query_id, resultset, collection_id.clone(), predicate.clone(), collection_id.clone(), 0);
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
@@ -830,7 +924,8 @@ mod tests {
         let predicate = create_test_selection();
 
         // Add subscription but don't establish it
-        relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0);
+        let resultset = EntityResultSet::empty();
+        relay.subscribe_query(query_id, resultset, collection_id.clone(), predicate, collection_id.clone(), 0);
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
 
         // Unsubscribe from pending subscription
