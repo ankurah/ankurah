@@ -133,11 +133,6 @@ where PA: PolicyAgent
 
     pub(crate) predicate_context: SafeMap<proto::QueryId, PA::ContextData>,
 
-    // Pending subscriptions waiting for first remote update
-    // Maps PredicateId to (version, channel) - only one pending version per predicate at a time
-    pub(crate) pending_predicate_subs:
-        std::sync::Mutex<std::collections::HashMap<proto::QueryId, (u32, tokio::sync::oneshot::Sender<Vec<Entity>>)>>,
-
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
@@ -175,7 +170,6 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
-            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }));
 
         // Set up the message sender for the subscription relay
@@ -209,7 +203,6 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay: None,
-            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
