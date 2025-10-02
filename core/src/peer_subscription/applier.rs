@@ -57,14 +57,9 @@ impl UpdateApplier {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
                 Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut entities).await?;
             }
-            // Pause the predicate if this is an update (v>0)
-            if version > 0 {
-                // TODO - figure out if this version check is actually necessary
-                node.reactor.pause_query(query_id);
-            }
 
-            // Always notify the reactor about entity changes
-            node.reactor.notify_change(changes);
+            // Turns out we actually shouldn't call reactor.notify_change here, because this update is special - it's not actually a change, it's an initial set for a query
+            // This is going away anyway with PR140, which moves the initial set to the SubscribeQuery response
 
             // Send entities (we already verified this is the expected version)
             let _ = tx.send(entities); // Ignore if receiver was dropped
