@@ -1,6 +1,8 @@
-use crate::lineage::{self, GetEvents, Retrieve};
+use crate::event_dag::CausalNavigator;
+use crate::retrieval::Retrieve;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
+    event_dag::AbstractCausalRelation,
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
@@ -190,7 +192,7 @@ impl Entity {
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
-    where G: GetEvents<Id = EventId, Event = Event> {
+    where G: CausalNavigator<EID = EventId, Event = Event> {
         debug!("apply_event head: {event} to {self}");
 
         // Check for entity creation under the mutex to avoid TOCTOU race
@@ -217,12 +219,12 @@ impl Entity {
         let budget = 10;
 
         for attempt in 0..MAX_RETRIES {
-            match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
-                lineage::Ordering::Equal => {
+            match crate::event_dag::compare_unstored_event(getter, event, &head, budget).await? {
+                AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
                     return Ok(false);
                 }
-                lineage::Ordering::Descends => {
+                AbstractCausalRelation::StrictDescends => {
                     debug!("Descends - apply (attempt {})", attempt + 1);
                     let new_head = event.id().into();
                     // Atomic update: apply operations and set head under single lock
@@ -263,7 +265,7 @@ impl Entity {
                     self.broadcast.send(());
                     return Ok(true);
                 }
-                lineage::Ordering::NotDescends { meet: _ } => {
+                AbstractCausalRelation::NotDescends { meet: _ } => {
                     // TODOs:
                     // [ ] we should probably have some rules about when a non-descending (concurrent) event is allowed. In a way, this is the same question as Descends with a gap, as discussed above
                     // [ ] update LWW backend determine which value to keep based on its deterministic last write win strategy. (just lexicographic winner, I think?)
@@ -289,17 +291,17 @@ impl Entity {
                     }
                     return Ok(false);
                 }
-                lineage::Ordering::Incomparable => {
+                AbstractCausalRelation::Incomparable => {
                     // total apples and oranges - take a hike buddy
                     return Err(LineageError::Incomparable.into());
                 }
-                lineage::Ordering::PartiallyDescends { meet } => {
+                AbstractCausalRelation::PartiallyDescends { meet } => {
                     error!("PartiallyDescends - skipping this event, but we should probably be handling this");
                     // TODO - figure out how to handle this. I don't think we need to materialize a new event
                     // but it requires that we update the propertybackends to support this
                     return Err(LineageError::PartiallyDescends { meet }.into());
                 }
-                lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                AbstractCausalRelation::BudgetExceeded { subject_frontier, other_frontier } => {
                     return Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into());
                 }
             }
@@ -315,19 +317,19 @@ impl Entity {
     }
 
     pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
-    where G: GetEvents<Id = EventId, Event = Event> {
+    where G: CausalNavigator<EID = EventId, Event = Event> {
         let head = self.head();
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
         let budget = 10;
 
-        match crate::lineage::compare(getter, &new_head, &head, budget).await? {
-            lineage::Ordering::Equal => {
+        match crate::event_dag::compare(getter, &new_head, &head, budget).await? {
+            AbstractCausalRelation::Equal => {
                 debug!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
             }
-            lineage::Ordering::Descends => {
+            AbstractCausalRelation::StrictDescends => {
                 debug!("{self} apply_state - new head descends from current, applying");
                 // TODO: Consider playing forward the event lineage instead of overwriting backends.
                 // Current approach has a security vulnerability: a malicious peer could send a state
@@ -347,22 +349,22 @@ impl Entity {
                 self.broadcast.send(());
                 Ok(true)
             }
-            lineage::Ordering::NotDescends { meet } => {
+            AbstractCausalRelation::NotDescends { meet } => {
                 warn!("{self} apply_state - new head {new_head} does not descend {head}, meet: {meet:?}");
                 Ok(false)
             }
-            lineage::Ordering::Incomparable => {
+            AbstractCausalRelation::Incomparable => {
                 error!("{self} apply_state - heads are incomparable");
                 // total apples and oranges - take a hike buddy
                 Err(LineageError::Incomparable.into())
             }
-            lineage::Ordering::PartiallyDescends { meet } => {
+            AbstractCausalRelation::PartiallyDescends { meet } => {
                 error!("{self} apply_state - heads partially descend, meet: {meet:?}");
                 // TODO - figure out how to handle this. I don't think we need to materialize a new event
                 // but it requires that we update the propertybackends to support this
                 Err(LineageError::PartiallyDescends { meet }.into())
             }
-            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+            AbstractCausalRelation::BudgetExceeded { subject_frontier, other_frontier } => {
                 tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
                 Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
             }
@@ -556,7 +558,7 @@ impl WeakEntitySet {
         id: &EntityId,
     ) -> Result<Option<Entity>, RetrievalError>
     where
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
     {
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get(id) {
@@ -581,7 +583,7 @@ impl WeakEntitySet {
         id: &EntityId,
     ) -> Result<Entity, RetrievalError>
     where
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
     {
         match self.get_or_retrieve(retriever, collection_id, id).await? {
             Some(entity) => Ok(entity),
@@ -619,7 +621,7 @@ impl WeakEntitySet {
         state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where
-        R: Retrieve<Id = EventId, Event = Event>,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event>,
     {
         let entity = {
             let mut entities = self.0.write().unwrap();
