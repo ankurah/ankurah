@@ -139,7 +139,7 @@ fn generate_expr_sql(
                             buffer.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()));
                             buffer.push('\'');
                         }
-                        Literal::Object(bytes) | Literal::Binary(bytes) => {
+                        Literal::Object(_bytes) | Literal::Binary(_bytes) => {
                             todo!("Object and Binary literals");
                             // buffer.push('\'');
                             // buffer.push_str(&String::from_utf8_lossy(bytes));

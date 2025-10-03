@@ -36,6 +36,8 @@ impl Clock {
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
     pub fn iter(&self) -> impl Iterator<Item = &EventId> { self.0.iter() }
+
+    pub fn to_vec(&self) -> Vec<EventId> { self.0.clone() }
 }
 
 impl From<Vec<EventId>> for Clock {

@@ -1,14 +1,18 @@
+use crate::util::navigator_lock::NavigatorLock;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
-use anyhow::Result;
-use js_sys::Function;
+use anyhow::{anyhow, Result};
 use send_wrapper::SendWrapper;
-use std::{any::Any, sync::Arc};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tracing::warn;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{prelude::*, JsCast};
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbRequest, IdbVersionChangeEvent};
+use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChangeEvent};
 
-use crate::cb_future::CBFuture;
+use crate::util::{cb_future::CBFuture, cb_race::CBRace, require::WBGRequire};
 
 #[derive(Debug, Clone)]
 pub struct Database(Arc<Inner>);
@@ -17,121 +21,81 @@ pub struct Database(Arc<Inner>);
 struct Inner {
     connection: Arc<tokio::sync::Mutex<Connection>>,
     db_name: String,
-    _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
+    // _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
     /// Cache of existing index names to avoid repeated checks
     index_cache: SafeSet<String>,
 }
 
 #[derive(Debug)]
-struct Connection {
+pub struct Connection {
     db: SendWrapper<IdbDatabase>,
-    _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
+    // _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
+    /// Keep onversionchange handler alive for the lifetime of the connection
+    onversionchange: Option<SendWrapper<Closure<dyn FnMut(IdbVersionChangeEvent)>>>,
+    /// Mark connection as stale when a versionchange occurs; triggers lazy reopen
+    stale: Arc<AtomicBool>,
 }
 
 impl Database {
-    pub async fn open(db_name: &str) -> anyhow::Result<Self> {
-        let connection = Connection::open(db_name, 0).await?;
+    pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
+        let connection = Connection::open(db_name).await?;
 
         Ok(Self(Arc::new(Inner {
             connection: Arc::new(tokio::sync::Mutex::new(connection)),
             db_name: db_name.to_string(),
-            _callbacks: SendWrapper::new(Vec::new()), // Callbacks are now stored in Connection
+            // _callbacks: SendWrapper::new(Vec::new()), // Callbacks are now stored in Connection
             index_cache: SafeSet::new(),
         })))
     }
 
-    /// Get a clone of the current database connection
-    pub async fn get_connection(&self) -> SendWrapper<IdbDatabase> { self.0.connection.lock().await.db.clone() }
+    /// Get a clone of the current database connection; lazily re-open if stale
+    pub async fn get_connection(&self) -> SendWrapper<IdbDatabase> {
+        let mut conn = self.0.connection.lock().await;
+        if conn.is_stale() {
+            let reopened = Connection::open(&self.0.db_name).await.expect("reopen IndexedDB after versionchange");
+            *conn = reopened;
+        }
+        conn.db.clone()
+    }
+
+    /// Close the database connection
+    pub async fn close(&self) { self.0.connection.lock().await.close(); }
 
     /// Ensure an index exists, creating it if necessary via database version upgrade
     pub async fn assure_index_exists(&self, index_spec: &KeySpec) -> Result<(), RetrievalError> {
         let name = index_spec.name_with("", "__");
-        tracing::info!("assure_index_exists: Starting for index {}", &name);
-
-        // Check cache first
         if self.0.index_cache.contains(&name) {
-            tracing::debug!("assure_index_exists: Index {} found in cache, returning", &name);
             return Ok(());
         }
-
-        let mut connection_guard = self.0.connection.lock().await;
-        tracing::info!("assure_index_exists: Acquired connection lock");
-
-        // Double-check cache after acquiring lock (in case another thread added it)
-        if self.0.index_cache.contains(&name) {
-            tracing::debug!("assure_index_exists: Index {} found in cache after lock, returning", &name);
-            return Ok(());
-        }
-
-        // Check if index already exists in database
-        tracing::info!("assure_index_exists: Checking if index exists in database");
-        if self.index_exists(&connection_guard.db, &name)? {
-            tracing::info!("assure_index_exists: Index already exists in database, adding to cache");
-            // Add to cache
+        if self.0.connection.lock().await.has_index(&name)? {
             self.0.index_cache.insert(name);
             return Ok(());
         }
 
-        tracing::info!("Creating index: {} for keyparts: {:?}", &name, index_spec.keyparts);
+        let lock_name = format!("ankurah-idb-upgrade-{}", self.0.db_name);
+        let inner = self.0.clone();
+        let spec = index_spec.clone();
 
-        // Get current version before closing
-        let current_version = connection_guard.db.version() as u32;
-        tracing::info!("assure_index_exists: Current version: {}", current_version);
-
-        // Close current connection
-        tracing::info!("assure_index_exists: Closing current connection");
-        connection_guard.db.close();
-
-        // Create new connection with index
-        tracing::info!("assure_index_exists: Creating new connection with version {}", current_version + 1);
-        let new_connection = Connection::open_with_index(&self.0.db_name, current_version + 1, index_spec).await?;
-        tracing::info!("assure_index_exists: New connection created successfully");
-
-        // Replace the entire connection
-        tracing::info!("assure_index_exists: Replacing connection");
-        *connection_guard = new_connection;
-
-        tracing::info!("Successfully created index: {}", &name);
-
-        // Add to cache
-        self.0.index_cache.insert(name);
+        NavigatorLock::with(&lock_name, async move || {
+            let name = spec.name_with("", "__");
+            if inner.index_cache.contains(&name) {
+                return Ok(());
+            }
+            let mut connection = inner.connection.lock().await;
+            if connection.has_index(&name)? {
+                inner.index_cache.insert(name);
+                return Ok(());
+            }
+            let current_version = connection.version();
+            connection.close();
+            let new_connection = Connection::open_with_index(&inner.db_name, current_version + 1, spec.clone()).await?;
+            *connection = new_connection;
+            inner.index_cache.insert(name);
+            Ok(())
+        })
+        .await?;
 
         Ok(())
-    }
-
-    /// Check if an index exists in the entities object store
-    fn index_exists(&self, db: &IdbDatabase, index_name: &str) -> Result<bool, RetrievalError> {
-        // Check if index exists by trying to access the index directly
-        // If the object store doesn't exist, the index definitely doesn't exist
-        let transaction = match db.transaction_with_str_and_mode("albums", web_sys::IdbTransactionMode::Readonly) {
-            Ok(tx) => tx,
-            Err(_) => {
-                // Object store doesn't exist, so index doesn't exist either
-                tracing::debug!("Object store 'albums' doesn't exist, so index {} doesn't exist", index_name);
-                return Ok(false);
-            }
-        };
-
-        let store = match transaction.object_store("albums") {
-            Ok(store) => store,
-            Err(_) => {
-                // Object store doesn't exist, so index doesn't exist either
-                tracing::debug!("Failed to get object store 'albums', so index {} doesn't exist", index_name);
-                return Ok(false);
-            }
-        };
-
-        // Try to access the index - if it exists, this will succeed; if not, it will throw
-        match store.index(index_name) {
-            Ok(_) => {
-                tracing::debug!("Index {} exists", index_name);
-                Ok(true)
-            }
-            Err(_) => {
-                tracing::debug!("Index {} doesn't exist", index_name);
-                Ok(false)
-            }
-        }
     }
 
     /// Get database name
@@ -139,215 +103,108 @@ impl Database {
 
     /// Cleanup database (delete it entirely)
     pub async fn cleanup(db_name: &str) -> anyhow::Result<()> {
-        let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("No window found"))?;
-        let idb = window
-            .indexed_db()
-            .map_err(|e| anyhow::anyhow!("IndexedDB error: {:?}", e))?
-            .ok_or_else(|| anyhow::anyhow!("IndexedDB not available"))?;
-
-        let delete_request = idb.delete_database(db_name).map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
-
-        let future = CBFuture::new(&delete_request, &["success", "blocked"], "error");
-        future.await.map_err(|e| anyhow::anyhow!("Failed to delete database: {:?}", e))?;
-
+        let request = {
+            let window = window().require("get window")?;
+            let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
+            idb.delete_database(db_name).require("delete database")?
+        };
+        CBFuture::new(request, &["success", "blocked"], "error").await.require("await delete request")?;
         Ok(())
     }
 }
 
 impl Connection {
+    pub fn is_stale(&self) -> bool { self.stale.load(Ordering::SeqCst) }
+
+    pub fn version(&self) -> u32 { self.db.version() as u32 }
+
+    /// Check whether the `entities` store already has an index with the given name
+    pub fn has_index(&self, index_name: &str) -> Result<bool, RetrievalError> {
+        let tx = self.db.transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readonly).require("get transaction")?;
+        let store = tx.object_store("entities").require("get object store")?;
+        Ok(store.index_names().contains(index_name))
+    }
+
+    /// Close the database connection
+    pub fn close(&self) {
+        // Remove handler and close DB
+        self.db.set_onversionchange(None);
+        self.db.close();
+        // Drop closure by clearing the field (if we had &mut self); retained for lifetime otherwise
+    }
+
     /// Open or create a new database connection with default schema
-    pub async fn open(db_name: &str, _version: u32) -> anyhow::Result<Self> {
+    pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
         notice_info!("Database.open({})", db_name);
-
-        // Validate database name
         if db_name.is_empty() {
-            return Err(anyhow::anyhow!("Database name cannot be empty"));
+            return Err(anyhow!("Database name cannot be empty").into());
         }
+        Self::new(db_name, None, move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
+            let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
+            let transaction = open_request.transaction().require("get upgrade transaction")?;
 
-        let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("No window found"))?;
-        let idb: IdbFactory = window
-            .indexed_db()
-            .map_err(|e| anyhow::anyhow!("IndexedDB error: {:?}", e))?
-            .ok_or_else(|| anyhow::anyhow!("IndexedDB not available"))?;
+            if let Err(_) = transaction.object_store("entities") {
+                let db: IdbDatabase = transaction.db();
+                let store = db.create_object_store("entities").require("create entities store")?;
 
-        // Open without specifying version to get current version, or let IndexedDB handle it
-        let open_request: IdbOpenDbRequest = idb.open(db_name).map_err(|e| anyhow::anyhow!("Failed to open DB: {:?}", e))?;
+                let key_path = js_sys::Array::of2(&"__collection".into(), &"id".into());
+                store.create_index_with_str_sequence("__collection__id", &key_path).require("create collection index")?;
 
-        let mut callbacks: Vec<Box<dyn Any>> = Vec::new();
-        let promise = js_sys::Promise::new(&mut |resolve: Function, reject: Function| {
-            let onupgradeneeded = Closure::wrap(Box::new(move |event: IdbVersionChangeEvent| {
-                let target: IdbRequest = event.target().unwrap().unchecked_into();
-                let db: SendWrapper<IdbDatabase> = SendWrapper::new(target.result().unwrap().unchecked_into());
-
-                // Create entities store
-                let store = match db.create_object_store("entities") {
-                    Ok(store) => store,
-                    Err(e) => {
-                        tracing::warn!("Error creating store (may already exist): {:?}", e);
-                        return;
-                    }
-                };
-
-                // Create default indexes
-                // Default index on collection + id (IndexedDB naming: __collection__id)
-                if let Err(e) =
-                    store.create_index_with_str_sequence("__collection__id", &js_sys::Array::of2(&"__collection".into(), &"id".into()))
-                {
-                    tracing::error!("Failed to create collection+id index: {:?}", e);
-                }
-
-                // Create events store
-                let events_store = match db.create_object_store("events") {
-                    Ok(store) => store,
-                    Err(e) => {
-                        tracing::warn!("Error creating events store (may already exist): {:?}", e);
-                        return;
-                    }
-                };
-
-                // Create index on entity_id field for efficient event lookups
-                if let Err(e) = events_store.create_index_with_str("by_entity_id", "__entity_id") {
-                    tracing::error!("Failed to create entity_id index: {:?}", e);
-                }
-            }) as Box<dyn FnMut(_)>);
-
-            let onsuccess = Closure::wrap(Box::new(move |event: web_sys::Event| {
-                let target: IdbRequest = event.target().unwrap().unchecked_into();
-                let db: IdbDatabase = target.result().unwrap().unchecked_into();
-                resolve.call1(&JsValue::NULL, &JsValue::from(db)).unwrap();
-            }) as Box<dyn FnMut(_)>);
-
-            let onerror = Closure::wrap(Box::new(move |event: web_sys::Event| {
-                let target: IdbRequest = event.target().unwrap().unchecked_into();
-                let error = target.error().unwrap();
-                reject.call1(&JsValue::NULL, &error.into()).unwrap();
-            }) as Box<dyn FnMut(_)>);
-
-            open_request.set_onupgradeneeded(Some(onupgradeneeded.as_ref().unchecked_ref()));
-            open_request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
-            open_request.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-
-            // Keep closures alive
-            callbacks.push(Box::new(onupgradeneeded));
-            callbacks.push(Box::new(onsuccess));
-            callbacks.push(Box::new(onerror));
-        });
-
-        let db = SendWrapper::new(
-            JsFuture::from(promise).await.map_err(|e| anyhow::anyhow!("Failed to open database: {:?}", e))?.unchecked_into::<IdbDatabase>(),
-        );
-
-        Ok(Self { db, _callbacks: SendWrapper::new(callbacks) })
+                let events_store = db.create_object_store("events").require("create events store")?;
+                events_store.create_index_with_str("by_entity_id", "__entity_id").require("create entity_id index")?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Open database connection with a specific index to be created
-    pub async fn open_with_index(db_name: &str, version: u32, index_spec: &KeySpec) -> Result<Self, RetrievalError> {
-        tracing::info!("Connection::open_with_index: Starting for {} v{}", db_name, version);
-        let index_spec_clone = index_spec.clone();
+    pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec) -> Result<Self, RetrievalError> {
+        let index_name = index_spec.name_with("", "__");
+        notice_info!("creating index {db_name}.entities.{index_name} -> {:?}", index_spec.keyparts);
 
-        SendWrapper::new(async move {
-            tracing::info!("Connection::open_with_index: Inside SendWrapper");
-            let window = web_sys::window().ok_or_else(|| RetrievalError::StorageError(anyhow::anyhow!("No window found").into()))?;
-
-            let idb: IdbFactory = window
-                .indexed_db()
-                .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("IndexedDB error: {:?}", e).into()))?
-                .ok_or_else(|| RetrievalError::StorageError(anyhow::anyhow!("IndexedDB not available").into()))?;
-
-            let open_request: IdbOpenDbRequest = idb
-                .open_with_u32(db_name, version)
-                .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Failed to open DB: {:?}", e).into()))?;
-
-            tracing::info!("Connection::open_with_index: Created open request");
-
-            let mut callbacks: Vec<Box<dyn Any>> = Vec::new();
-            let promise = js_sys::Promise::new(&mut |resolve: Function, reject: Function| {
-                tracing::info!("Connection::open_with_index: Setting up promise callbacks");
-                let index_spec_for_closure = index_spec_clone.clone();
-                // Set up upgrade handler
-                let onupgradeneeded = Closure::wrap(Box::new(move |event: IdbVersionChangeEvent| {
-                    tracing::info!("Connection::open_with_index: Upgrade needed event triggered");
-                    let target: IdbRequest = event.target().unwrap().unchecked_into();
-                    let _db: IdbDatabase = target.result().unwrap().unchecked_into();
-
-                    // During upgrade, get the upgrade transaction
-                    let open_request: IdbOpenDbRequest = target.unchecked_into();
-                    let transaction = match open_request.transaction() {
-                        Some(tx) => tx,
-                        None => {
-                            tracing::error!("Failed to get upgrade transaction");
-                            return;
-                        }
-                    };
-
-                    let store = match transaction.object_store("entities") {
-                        Ok(store) => store,
-                        Err(e) => {
-                            tracing::error!("Failed to get entities store during upgrade: {:?}", e);
-                            return;
-                        }
-                    };
-
-                    // Create the index
-                    let key_path: js_sys::Array = js_sys::Array::new();
-                    for field in &index_spec_for_closure.keyparts {
-                        key_path.push(&JsValue::from_str(&field.column));
-                    }
-
-                    tracing::info!("Connection::open_with_index: Creating index with key_path");
-                    match store.create_index_with_str_sequence(&index_spec_for_closure.name_with("", "__"), &key_path) {
-                        Ok(_) => {
-                            tracing::info!("Successfully created index in upgrade handler: {}", index_spec_for_closure.name_with("", "__"));
-                        }
-                        Err(e) => {
-                            // Check if it's a "ConstraintError" indicating the index already exists
-                            let error_string = format!("{:?}", e);
-                            if error_string.contains("ConstraintError") && error_string.contains("already exists") {
-                                tracing::debug!("Index {} already exists, skipping creation", index_spec_for_closure.name_with("", "__"));
-                            } else {
-                                tracing::error!("Failed to create index {}: {:?}", index_spec_for_closure.name_with("", "__"), e);
-                            }
-                        }
-                    }
-                }) as Box<dyn FnMut(_)>);
-
-                let onsuccess = Closure::wrap(Box::new(move |event: web_sys::Event| {
-                    tracing::info!("Connection::open_with_index: Success event triggered");
-                    let target: IdbRequest = event.target().unwrap().unchecked_into();
-                    let db: IdbDatabase = target.result().unwrap().unchecked_into();
-                    resolve.call1(&JsValue::NULL, &JsValue::from(db)).unwrap();
-                }) as Box<dyn FnMut(_)>);
-
-                let onerror = Closure::wrap(Box::new(move |event: web_sys::Event| {
-                    tracing::error!("Connection::open_with_index: Error event triggered");
-                    let target: IdbRequest = event.target().unwrap().unchecked_into();
-                    let error = target.error().unwrap();
-                    reject.call1(&JsValue::NULL, &error.into()).unwrap();
-                }) as Box<dyn FnMut(_)>);
-
-                tracing::info!("Connection::open_with_index: Setting event handlers");
-                open_request.set_onupgradeneeded(Some(onupgradeneeded.as_ref().unchecked_ref()));
-                open_request.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
-                open_request.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-                tracing::info!("Connection::open_with_index: Event handlers set");
-
-                // Keep closures alive
-                callbacks.push(Box::new(onupgradeneeded));
-                callbacks.push(Box::new(onsuccess));
-                callbacks.push(Box::new(onerror));
-            });
-
-            tracing::info!("Connection::open_with_index: Waiting for promise to resolve");
-            let db = SendWrapper::new(
-                JsFuture::from(promise)
-                    .await
-                    .map_err(|e| RetrievalError::StorageError(anyhow::anyhow!("Database upgrade failed: {:?}", e).into()))?
-                    .unchecked_into::<IdbDatabase>(),
-            );
-            tracing::info!("Connection::open_with_index: Promise resolved successfully");
-
-            Ok(Self { db, _callbacks: SendWrapper::new(callbacks) })
+        Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
+            let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
+            let transaction = open_request.transaction().require("get upgrade transaction")?;
+            let store = transaction.object_store("entities").require("get entities store during upgrade")?;
+            let key_path: Vec<JsValue> = index_spec.keyparts.iter().map(|kp| (&kp.column).into()).collect();
+            store.create_index_with_str_sequence(&index_name, &key_path.into()).require("create index")?;
+            Ok(())
         })
         .await
+    }
+
+    async fn new<F>(db_name: &str, version: Option<u32>, onupgradeneeded: F) -> Result<Self, RetrievalError>
+    where F: 'static + Fn(IdbVersionChangeEvent) -> Result<(), RetrievalError> {
+        let open_request = SendWrapper::new({
+            let window = window().require("get window")?;
+            let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;
+            match version {
+                Some(v) => idb.open_with_u32(db_name, v).require("open database")?,
+                None => idb.open(db_name).require("open database")?,
+            }
+        });
+
+        let race = CBRace::new();
+        let closure = SendWrapper::new(race.wrap(onupgradeneeded));
+        open_request.set_onupgradeneeded(Some(closure.as_ref().unchecked_ref()));
+
+        CBFuture::new(&*open_request, "success", "error").await.require("IndexedDB open failed")?;
+        race.take_err()??;
+
+        let db = open_request.result().require("get database result")?.unchecked_into::<IdbDatabase>();
+
+        let stale = Arc::new(AtomicBool::new(false));
+        let stale_for_cb = stale.clone();
+        let onversionchange = Closure::wrap(Box::new(move |event: IdbVersionChangeEvent| {
+            stale_for_cb.store(true, Ordering::SeqCst);
+            if let Some(target) = event.target() {
+                warn!("Version change event received - closing database");
+                let db: IdbDatabase = target.unchecked_into();
+                db.close();
+            }
+        }) as Box<dyn FnMut(IdbVersionChangeEvent)>);
+        db.set_onversionchange(Some(onversionchange.as_ref().unchecked_ref()));
+        Ok(Self { db: SendWrapper::new(db), onversionchange: Some(SendWrapper::new(onversionchange)), stale })
     }
 }

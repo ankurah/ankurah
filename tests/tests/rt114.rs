@@ -1,4 +1,3 @@
-use ankurah::changes::ChangeSet;
 use ankurah::storage::StorageEngine;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
@@ -6,9 +5,7 @@ use ankurah_storage_sled::SledStorageEngine;
 use std::sync::Arc;
 
 mod common;
-use common::{Album, AlbumView};
-
-use crate::common::TestWatcher;
+use crate::common::*;
 
 #[tokio::test]
 async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -41,7 +38,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client with predicate year >= 2020
-    let client_query = client_ctx.query_wait::<AlbumView>("year >= '2020'").await?;
+    let client_query = client_ctx.query_wait::<AlbumView>(nocache("year >= '2020'")?).await?;
     use ankurah::signals::Peek;
     assert_eq!(client_query.peek().iter().map(|p| p.year().unwrap_or_default()).collect::<Vec<_>>(), vec!["2020", "2020"]);
 
@@ -73,7 +70,7 @@ async fn rt114() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Resubscribe on the client
     // in the repro, it's failling here rather than on the arrival of the StateFragment
-    let client_query = client_ctx.query_wait::<AlbumView>("year >= '2020'").await?;
+    let client_query = client_ctx.query_wait::<AlbumView>(nocache("year >= '2020'")?).await?;
 
     // The client should receive only album1 with the correct state (year = "2020")
     // Album2 should not be returned since it no longer matches (year = "2019")
@@ -119,7 +116,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_collection.dump_entity_events(album2_id.clone()).await?.len()); // before fetch
 
     // Fetch on the client with predicate year >= 2020
-    let initial_fetch = client_ctx.fetch::<AlbumView>("year >= '2020'").await?;
+    let initial_fetch = client_ctx.fetch::<AlbumView>(nocache("year >= '2020'")?).await?;
     let initial_years: Vec<String> = initial_fetch.iter().map(|album| album.year().unwrap_or_default()).collect();
     assert_eq!(vec!["2020", "2020"], initial_years);
 
@@ -142,7 +139,7 @@ async fn rt114_b() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Fetch again on the client
-    let refetch = client_ctx.fetch::<AlbumView>("year >= '2020'").await?;
+    let refetch = client_ctx.fetch::<AlbumView>(nocache("year >= '2020'")?).await?;
     let refetch_years: Vec<String> = refetch.iter().map(|album| album.year().unwrap_or_default()).collect();
 
     // The client should receive only album1 with the correct state (year = "2020")
