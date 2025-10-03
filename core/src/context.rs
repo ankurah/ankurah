@@ -316,28 +316,14 @@ where
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let collection = self.node.collections.get(collection_id).await?;
+                let retriever = crate::retrieval::LocalRetriever::new(collection);
 
-                // 3. Apply deltas to local storage
+                // 3. Apply deltas to local storage using NodeApplier
                 for delta in deltas {
-                    match delta.content {
-                        proto::DeltaContent::StateSnapshot { state } => {
-                            let attested_state = (delta.entity_id, delta.collection, state).into();
-                            self.node.policy_agent.validate_received_state(&self.node, &peer_id, &attested_state)?;
-                            self.node.apply_state(&self.cdata, &peer_id, &delta.entity_id, &delta.collection, state).await?;
-                        }
-                        proto::DeltaContent::EventBridge { events } => {
-                            self.node.apply_events(&self.cdata, &peer_id, &delta.entity_id, &delta.collection, events).await?;
-                        }
-                        proto::DeltaContent::StateAndRelation { state, relation } => {
-                            // TODO: later we will need to assemble the CausalAssertion, and validate the attestation with the policy agent
-                            // then inject that into the CausalNavigator (currently called GetEvents) and call node.entities.with_state(...)
-                            unimplemented!("Node is not yet emitting StateAndRelation deltas");
-                        }
-                    }
+                    crate::node_applier::NodeApplier::apply_delta(&self.node, &peer_id, delta, &retriever).await?;
                 }
 
                 // 4. Re-fetch entities from local storage after applying deltas
-                // TODO: Consider mutating known_matched_entities in-place instead of re-fetching
                 self.node.fetch_entities_from_local(collection_id, &selection_clone).await
             }
             proto::NodeResponseBody::Error(e) => {

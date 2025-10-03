@@ -81,7 +81,10 @@ impl SubscriptionHandler {
         let storage_collection = node.collections.get(&collection_id).await?;
 
         let initial_states = storage_collection.fetch_states(&selection).await?;
-        let retriever = LocalRetriever::new(storage_collection);
+        let retriever = LocalRetriever::new(storage_collection.clone());
+
+        // Clone states for initial response before reconstructing entities for reactor
+        let states_for_initial = initial_states.clone();
 
         let mut initial_entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
@@ -89,10 +92,6 @@ impl SubscriptionHandler {
                 node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
             initial_entities.push(entity);
         }
-
-        // Clone entities for initial response before moving them to reactor
-        let entities_for_initial = initial_entities.clone();
-        let collection_for_initial = collection_id.clone();
 
         if version == 0 {
             let resultset = EntityResultSet::from_vec(initial_entities, true);
@@ -110,25 +109,17 @@ impl SubscriptionHandler {
             )?;
         }
 
-        // FIXME 1: call lineage::compare here and decide between which DeltaContent to use based on the result
-        // FIXME 2: ensure we are including state for non-matching entities present in the known_matches
+        // Build known_matches map for quick lookup
+        let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
 
-        // TODO: Implement proper lineage attestation logic here
-        // For now, just wrap all initial entities as StateSnapshot
-        let initial = entities_for_initial
-            .into_iter()
-            .map(|entity| {
-                let state = entity.to_state().map_err(|e| anyhow::anyhow!("Failed to convert entity to state: {}", e))?;
-                let entity_state = proto::EntityState { entity_id: entity.id(), collection: collection_for_initial.clone(), state };
-                let attestation = node.policy_agent.attest_state(node, &entity_state);
-                let attested_state = proto::Attested::opt(entity_state, attestation);
-                Ok(proto::EntityDelta {
-                    entity_id: entity.id(),
-                    collection: collection_for_initial.clone(),
-                    content: proto::DeltaContent::StateSnapshot { state: attested_state.into() },
-                })
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        // Generate deltas based on known_matches - use states directly, no need to reconstruct entities
+        let mut initial = Vec::with_capacity(states_for_initial.len());
+        for state in states_for_initial {
+            // Only include delta if heads differ (None means heads are equal)
+            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection).await? {
+                initial.push(delta);
+            }
+        }
 
         Ok(proto::NodeResponseBody::QuerySubscribed { query_id, initial })
     }

@@ -423,18 +423,20 @@ where
                 let storage_collection = self.collections.get(&collection).await?;
                 selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
 
-                // FIXME: 1. return ::StateSnapshot for entities present in the fetch_states output, but not present in known_matches
-                // FIXME: 2. omit entities present in known_matches and the fetch_states output with heads equal
-                // FIXME: 3. return ::EventBridge with some event gap - (we need to add something in @lineage to compute the missing events)
-                // NON GOAL - do not return ::StateAndRelation right now. that's reserved for a future enhancement
+                let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
+
+                let states = storage_collection.fetch_states(&selection).await?;
+
                 let mut deltas = Vec::new();
-                for state in storage_collection.fetch_states(&selection).await? {
-                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
-                        deltas.push(proto::EntityDelta {
-                            entity_id: state.payload.entity_id,
-                            collection: collection.clone(),
-                            content: proto::DeltaContent::StateSnapshot { state: state.into() },
-                        });
+                for state in states {
+                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_err() {
+                        continue;
+                    }
+
+                    // Generate delta based on known_matches (returns None if heads are equal)
+                    // No need to reconstruct Entity - work directly with EntityState
+                    if let Some(delta) = self.generate_entity_delta(&known_map, state, &storage_collection).await? {
+                        deltas.push(delta);
                     }
                 }
                 Ok(proto::NodeResponseBody::Fetch(deltas))
@@ -491,7 +493,7 @@ where
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::info!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                crate::peer_subscription::UpdateApplier::apply_updates(self, &notification.from, items).await?;
+                crate::node_applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
                 Ok(())
             }
         }
@@ -561,16 +563,99 @@ where
         Ok(())
     }
 
-    // FIXME: move this into applier::UpdateApplier::apply_state
-    pub async fn apply_state(
+    /// Generate EntityDelta for an entity state, using known_matches to decide between StateSnapshot and EventBridge
+    /// Returns None if the entity is in known_matches with equal heads (client already has current state)
+    pub(crate) async fn generate_entity_delta(
         &self,
-        cdata: &PA::ContextData,
-        peer_id: &proto::EntityId,
-        entity_id: &proto::EntityId,
-        collection_id: &proto::CollectionId,
-        state: proto::State,
-    ) -> Result<(), MutationError> {
-        unimplemented!("Node::apply_state not yet implemented");
+        known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
+        entity_state: proto::Attested<proto::EntityState>,
+        storage_collection: &crate::storage::StorageCollectionWrapper,
+    ) -> anyhow::Result<Option<proto::EntityDelta>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        // Destructure to take ownership and avoid clones
+        let proto::Attested { payload: proto::EntityState { entity_id, collection, state }, attestations } = entity_state;
+        let current_head = &state.head;
+
+        // Entity is in known_matches - try to optimize the response
+        if let Some(known_head) = known_map.get(&entity_id) {
+            // Case 1: Heads equal → return None (omit entity, client already has current state) ✓
+            if known_head == current_head {
+                return Ok(None);
+            }
+
+            // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
+            match self.collect_event_bridge(storage_collection, known_head, current_head).await {
+                Ok(attested_events) if !attested_events.is_empty() => {
+                    // Convert Attested<Event> to EventFragments (strips entity_id and collection)
+                    let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
+
+                    return Ok(Some(proto::EntityDelta {
+                        entity_id,
+                        collection,
+                        content: proto::DeltaContent::EventBridge { events: event_fragments },
+                    }));
+                }
+                _ => {
+                    // Fall through to StateSnapshot if bridge building failed or returned empty
+                }
+            }
+        }
+
+        // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
+        let state_fragment = proto::StateFragment { state, attestations };
+        Ok(Some(proto::EntityDelta { entity_id, collection, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
+    }
+
+    /// Collect events between known_head and current_head using lineage comparison
+    pub(crate) async fn collect_event_bridge(
+        &self,
+        storage_collection: &crate::storage::StorageCollectionWrapper,
+        known_head: &proto::Clock,
+        current_head: &proto::Clock,
+    ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        use crate::lineage::{EventAccumulator, Ordering};
+        use crate::retrieval::LocalRetriever;
+
+        let retriever = LocalRetriever::new(storage_collection.clone());
+        let accumulator = EventAccumulator::new(None); // No limit for Phase 1
+        let mut comparison = crate::lineage::Comparison::new_with_accumulator(
+            &retriever,
+            current_head,
+            known_head,
+            1000, // TODO: make budget configurable
+            Some(accumulator),
+        );
+
+        // Run comparison
+        loop {
+            match comparison.step().await? {
+                Some(Ordering::Descends) => {
+                    // Current descends from known - perfect for event bridge
+                    break;
+                }
+                Some(Ordering::Equal) => {
+                    // Heads are equal - no events needed
+                    break;
+                }
+                Some(_) => {
+                    // Other relationships (NotDescends, Incomparable, etc.) - can't build bridge
+                    return Ok(vec![]);
+                }
+                None => {
+                    // Continue stepping
+                }
+            }
+        }
+
+        // Extract accumulated events
+        Ok(comparison.take_accumulated_events().unwrap_or_default())
     }
 
     /// Apply a sequence of events to entities, similar to commit_remote_transaction but without transaction semantics

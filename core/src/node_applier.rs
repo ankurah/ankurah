@@ -1,11 +1,11 @@
-use crate::{
-    action_info, changes::EntityChange, error::MutationError, lineage::Retrieve, node::Node, policy::PolicyAgent, storage::StorageEngine,
-};
+use crate::{changes::EntityChange, error::MutationError, lineage::Retrieve, node::Node, policy::PolicyAgent, storage::StorageEngine};
 use ankurah_proto::{self as proto, Event, EventId};
 
-pub struct UpdateApplier;
+/// Consolidates all logic for applying remote updates to a node
+/// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
+pub struct NodeApplier;
 
-impl UpdateApplier {
+impl NodeApplier {
     /// Similar to commit_transaction, except that we check event attestations instead of checking write permissions
     /// we also don't need to fan events out to peers because we're receiving them from a peer
     pub(crate) async fn apply_updates<SE, PA>(
@@ -144,6 +144,60 @@ impl UpdateApplier {
         let attested = proto::Attested::opt(entity_state, attestation);
         collection_wrapper.set_state(attested).await?;
         Ok(())
+    }
+
+    /// Apply EntityDelta from Fetch or QuerySubscribed responses
+    /// Returns the updated entity for resultset refresh
+    pub(crate) async fn apply_delta<SE, PA, R>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        delta: proto::EntityDelta,
+        retriever: &R,
+    ) -> Result<crate::entity::Entity, MutationError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+    {
+        let collection = node.collections.get(&delta.collection).await?;
+
+        match delta.content {
+            proto::DeltaContent::StateSnapshot { state } => {
+                let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
+                node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
+
+                let (_, entity) =
+                    node.entities.with_state(retriever, delta.entity_id, delta.collection, attested_state.payload.state).await?;
+
+                // Save state to storage
+                Self::save_state(node, &entity, &collection).await?;
+
+                Ok(entity)
+            }
+
+            proto::DeltaContent::EventBridge { events } => {
+                // Get or create entity
+                let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
+
+                // Save and apply events
+                let attested_events =
+                    Self::save_events(node, from_peer_id, delta.entity_id, &delta.collection, events, &collection).await?;
+
+                for event in attested_events {
+                    entity.apply_event(retriever, &event.payload).await?;
+                }
+
+                // Save updated state
+                Self::save_state(node, &entity, &collection).await?;
+
+                Ok(entity)
+            }
+
+            proto::DeltaContent::StateAndRelation { state: _, relation: _ } => {
+                // Phase 2: Will validate causal assertion and apply state
+                unimplemented!("StateAndRelation not yet implemented in Phase 1")
+            }
+        }
     }
 }
 

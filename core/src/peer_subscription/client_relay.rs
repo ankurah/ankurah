@@ -466,15 +466,15 @@ where
             .await?
         {
             ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _, initial } => {
-                // 3. Get the resultset for this query
-                let resultset = {
-                    let subscriptions = self.inner.subscriptions.lock().unwrap();
-                    subscriptions.get(&query_id).map(|state| state.resultset.clone())
-                };
+                // 3. Apply initial deltas to local node using NodeApplier
+                let collection = node.collections.get(&collection_id).await.map_err(|e| RequestError::ServerError(e.to_string()))?;
+                let retriever = crate::retrieval::LocalRetriever::new(collection);
 
-                // 4. Apply initial deltas to local node and resultset
-                if let Some(resultset) = resultset {
-                    apply_initial_deltas(&node, &resultset, initial).await.map_err(|e| RequestError::ServerError(e.to_string()))?;
+                // Apply all deltas to local storage using NodeApplier
+                for delta in initial {
+                    crate::node_applier::NodeApplier::apply_delta(&node, &peer_id, delta, &retriever)
+                        .await
+                        .map_err(|e| RequestError::ServerError(e.to_string()))?;
                 }
 
                 Ok(())
@@ -492,58 +492,6 @@ where
 
         Ok(())
     }
-}
-
-/// Apply initial deltas from QuerySubscribed response to local node and resultset
-async fn apply_initial_deltas<SE, PA>(
-    node: &crate::node::Node<SE, PA>,
-    resultset: &EntityResultSet<Entity>,
-    initial: Vec<ankurah_proto::EntityDelta>,
-) -> Result<(), anyhow::Error>
-where
-    SE: crate::storage::StorageEngine + Send + Sync + 'static,
-    PA: crate::policy::PolicyAgent + Send + Sync + 'static,
-{
-    // TODO: Implement proper delta application with lineage validation
-    // For now, this is a placeholder that applies StateSnapshot deltas
-
-    // Collect entities to add to resultset
-    let mut entities_to_add = Vec::new();
-
-    for delta in initial {
-        match delta.content {
-            ankurah_proto::DeltaContent::StateSnapshot { state } => {
-                let collection = node.collections.get(&delta.collection).await?;
-                let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
-                node.policy_agent.validate_received_state(node, &delta.entity_id, &attested_state)?;
-                let retriever = crate::retrieval::LocalRetriever::new(collection);
-                let (_, entity) = node.entities.with_state(&retriever, delta.entity_id, delta.collection.clone(), state).await?;
-                entities_to_add.push(entity);
-            }
-            ankurah_proto::DeltaContent::EventBridge { events: _ } => {
-                // FIXME: get the entity from resultset and apply them, and store them in the collection
-                // do this by abstracting the logic in applier::apply_update match arm UpdateContent::EventOnly, and save_events - updating both this and applier to use them
-                // oh wait, Node::apply_events might already do this. Have to audit it for correctness
-
-                unimplemented!("::EventBridge not yet implemented");
-            }
-            ankurah_proto::DeltaContent::StateAndRelation { state, relation: _ } => {
-                unimplemented!("Node is not yet emitting StateAndRelation deltas");
-                // when we get to this later, we need to assemble the CausalAssertion, and validate the attestation
-                // then inject that into the CausalNavigator (currently called GetEvents) and call node.entities.with_state(...)
-            }
-        }
-    }
-
-    // Update resultset with new entities
-    if !entities_to_add.is_empty() {
-        let mut write = resultset.write();
-        for entity in entities_to_add {
-            write.add(entity);
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
