@@ -84,7 +84,6 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
     fn spawn_gap_filling_task(&self, update: ReactorUpdate<E, Ev>, gaps_to_fill: Vec<GapFillData<E>>) {
         let broadcast = self.broadcast.clone();
         let initial_items = update.items;
-        let initialized_query = update.initialized_query;
 
         crate::task::spawn(async move {
             let mut all_items = initial_items;
@@ -107,7 +106,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                 all_items.extend(gap_items);
             }
 
-            broadcast.send(ReactorUpdate { items: all_items, initialized_query });
+            broadcast.send(ReactorUpdate { items: all_items });
         });
     }
 

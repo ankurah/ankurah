@@ -380,6 +380,58 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_lineage_budget_exceeded_current_behavior() -> Result<()> {
+    // This test demonstrates the current BudgetExceeded problem that lineage attestation should solve
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    // Connect the nodes
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let server = server.context(c)?;
+    let client = client.context(c)?;
+
+    // Create initial entity on server
+    let pet_id = {
+        let trx = server.begin();
+        let pet = trx.create(&Pet { name: "BudgetTest".to_string(), age: "1".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    // Client gets the entity (no subscription established)
+    let client_pet = client.get::<PetView>(pet_id).await?;
+    assert_eq!(client_pet.age().unwrap(), "1");
+
+    // Server makes 11 changes (exceeds budget of 10)
+    for i in 2..=12 {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace(&i.to_string())?;
+        trx.commit().await?;
+    }
+
+    // Client tries to fetch - should currently fail with BudgetExceeded
+    let fetch_result = client.fetch::<PetView>("name = 'BudgetTest'").await;
+
+    // This should currently fail with RetrievalError(MutationError(LineageError(BudgetExceeded)))
+    // Once we're done with the lineage-attestation spec, this should succeed without error
+    match fetch_result {
+        Err(e) => {
+            let error_string = e.to_string();
+            info!("Expected BudgetExceeded error: {}", error_string);
+            assert!(error_string.contains("budget exceeded"), "Expected BudgetExceeded error, got: {}", error_string);
+        }
+        Ok(_) => panic!("Expected BudgetExceeded error, but fetch succeeded"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
     // Create server (durable) and client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

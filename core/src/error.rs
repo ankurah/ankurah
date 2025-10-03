@@ -43,6 +43,12 @@ pub enum RetrievalError {
     MutationError(Box<MutationError>),
     #[error("Property error: {0}")]
     PropertyError(Box<crate::property::PropertyError>),
+    #[error("Request error: {0}")]
+    RequestError(RequestError),
+}
+
+impl From<RequestError> for RetrievalError {
+    fn from(err: RequestError) -> Self { RetrievalError::RequestError(err) }
 }
 
 impl From<crate::property::PropertyError> for RetrievalError {

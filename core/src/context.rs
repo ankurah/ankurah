@@ -219,23 +219,23 @@ where
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
 
         // TODO implement cached: true
-        let states = if !self.node.durable {
+        if !self.node.durable {
             // Fetch from peers and commit first response
-            self.node.fetch_from_peer(collection_id, args.selection, &self.cdata).await?
+            Ok(self.fetch_from_peer(collection_id, args.selection).await?)
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
-            storage_collection.fetch_states(&args.selection).await?
-        };
+            let states = storage_collection.fetch_states(&args.selection).await?;
 
-        // Convert states to entities
-        let mut entities = Vec::new();
-        for state in states {
-            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
-            let (_, entity) =
-                self.node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
-            entities.push(entity);
+            // Convert states to entities
+            let mut entities = Vec::new();
+            for state in states {
+                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
+                let (_, entity) =
+                    self.node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+                entities.push(entity);
+            }
+            Ok(entities)
         }
-        Ok(entities)
     }
 
     /// Does all the things necessary to commit a local transaction
@@ -285,5 +285,55 @@ where
         // Notify reactor of ALL changes
         self.node.reactor.notify_change(changes);
         Ok(())
+    }
+
+    /// Fetch entities from the first available durable peer with known_matches support
+    async fn fetch_from_peer(
+        &self,
+        collection_id: &proto::CollectionId,
+        selection: ankql::ast::Selection,
+    ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
+        let peer_id = self.node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+
+        // 1. Pre-fetch known_matches from local storage
+        let known_matched_entities = self.node.fetch_entities_from_local(collection_id, &selection).await?;
+
+        // Build hashmap for efficient lookup during lineage validation
+        let known_entities_map: std::collections::HashMap<proto::EntityId, crate::entity::Entity> =
+            known_matched_entities.iter().map(|entity| (entity.id(), entity.clone())).collect();
+
+        let known_matches = known_matched_entities
+            .iter()
+            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
+            .collect();
+
+        // 2. Send fetch request with known_matches
+        let selection_clone = selection.clone();
+        match self
+            .node
+            .request(peer_id, &self.cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
+            .await?
+        {
+            proto::NodeResponseBody::Fetch(deltas) => {
+                let collection = self.node.collections.get(collection_id).await?;
+                let retriever = crate::retrieval::LocalRetriever::new(collection);
+
+                // 3. Apply deltas to local storage using NodeApplier
+                for delta in deltas {
+                    crate::node_applier::NodeApplier::apply_delta(&self.node, &peer_id, delta, &retriever).await?;
+                }
+
+                // 4. Re-fetch entities from local storage after applying deltas
+                self.node.fetch_entities_from_local(collection_id, &selection_clone).await
+            }
+            proto::NodeResponseBody::Error(e) => {
+                tracing::debug!("Error from peer fetch: {}", e);
+                Err(RetrievalError::Other(format!("{:?}", e)))
+            }
+            _ => {
+                tracing::debug!("Unexpected response type from peer fetch");
+                Err(RetrievalError::Other("Unexpected response type".to_string()))
+            }
+        }
     }
 }
