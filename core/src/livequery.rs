@@ -248,6 +248,7 @@ impl EntityLiveQuery {
         Ok(())
     }
     pub fn error(&self) -> Option<RetrievalError> { self.0.error.lock().unwrap().take() }
+    pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
 }
 
 impl Drop for Inner {

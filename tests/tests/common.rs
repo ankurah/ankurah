@@ -75,6 +75,29 @@ impl<R: View + Send + Sync + 'static> TestWatcher<ChangeSet<R>, Vec<(proto::Enti
             transform: Arc::new(|changeset: ChangeSet<R>| changeset.changes.iter().map(|c| (c.entity().id(), c.into())).collect()),
         }
     }
+    pub fn changeset_with_event_ids() -> TestWatcher<ChangeSet<R>, Vec<(proto::EntityId, ChangeKind, Vec<proto::EventId>)>> {
+        TestWatcher {
+            changes: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+            transform: Arc::new(|changeset: ChangeSet<R>| {
+                changeset.changes.iter().map(|c| (c.entity().id(), c.into(), c.events().iter().map(|e| e.payload.id()).collect())).collect()
+            }),
+        }
+    }
+    pub fn changeset_with_event_ids_and_initialized_query(
+    ) -> TestWatcher<ChangeSet<R>, Vec<(proto::EntityId, ChangeKind, Vec<proto::EventId>, Option<(ankurah::proto::QueryId, u32)>)>> {
+        TestWatcher {
+            changes: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+            transform: Arc::new(|changeset: ChangeSet<R>| {
+                changeset
+                    .changes
+                    .iter()
+                    .map(|c| (c.entity().id(), c.into(), c.events().iter().map(|e| e.payload.id()).collect(), changeset.initialized_query))
+                    .collect()
+            }),
+        }
+    }
 
     /// Drains and returns all accumulated changesets, sorting each changeset by the first element of the tuple
     /// Importantly, this does not sort the list of changesets, only the items within each changeset
@@ -96,10 +119,12 @@ impl<T, U> TestWatcher<T, U> {
     pub fn drain(&self) -> Vec<U> { self.changes.lock().unwrap().drain(..).map(|item| (self.transform)(item)).collect() }
 
     /// Waits for exactly `count` items to accumulate, then drains and returns them
-    pub async fn take(&self, count: usize) -> Vec<U> {
-        self.wait_for_count(count, Some(Duration::from_secs(10))).await;
+    pub async fn take(&self, count: usize) -> Result<Vec<U>, anyhow::Error> {
+        if !self.wait_for_count(count, Some(Duration::from_secs(10))).await {
+            return Err(anyhow::anyhow!("take({}) timed out waiting for items (waited 10 seconds, got {} items)", count, self.count()));
+        }
         let mut changes = self.changes.lock().unwrap();
-        changes.drain(0..count).map(|item| (self.transform)(item)).collect()
+        Ok(changes.drain(0..count).map(|item| (self.transform)(item)).collect())
     }
 
     /// Returns the current number of accumulated changesets without draining them

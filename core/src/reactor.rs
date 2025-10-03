@@ -255,12 +255,12 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
             match (did_match, matching) {
                 (false, true) => {
                     // Entity now matches - add to matching set and cache the entity
-                    tracing::info!(
-                        "PUSH entity {} to predicate resultset {} len: {}",
-                        entity_id,
-                        query_id,
-                        predicate_state.resultset.len()
-                    );
+                    // tracing::info!(
+                    //     "PUSH entity {} to predicate resultset {} len: {}",
+                    //     entity_id,
+                    //     query_id,
+                    //     predicate_state.resultset.len()
+                    // );
                     predicate_state.resultset.write().add(entity.clone());
                     subscription.entities.insert(*entity_id, entity.clone());
                 }
@@ -601,11 +601,11 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                         }
                     };
 
-                    tracing::info!(
-                        "\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}",
-                        AbstractEntity::id(&entity),
-                        AbstractEntity::value(&entity, "status")
-                    );
+                    // tracing::debug!(
+                    //     "\tnotify_change matches: {matches} did_match: {did_match} {}: {:?}",
+                    //     AbstractEntity::id(&entity),
+                    //     AbstractEntity::value(&entity, "status")
+                    // );
 
                     let entity_watcher = watcher_set.entity_watchers.entry(*entity.id()).or_default();
                     if matches {
@@ -630,9 +630,16 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
 
                     let entity_subscribed = entity_subscribed.contains(&query_id);
                     if membership_change.is_some() || entity_subscribed {
-                        tracing::info!("Reactor SENDING UPDATE to subscription {}", subscription_id);
                         match sub_entities.entry(*AbstractEntity::id(&entity)) {
                             indexmap::map::Entry::Vacant(v) => {
+                                tracing::info!(
+                                    "Reactor ADD    UPDATE to subscription {} entity: {} - query_id: {} membership_change: {:?} age: {:?}",
+                                    query_id,
+                                    subscription_id,
+                                    entity.id(),
+                                    membership_change,
+                                    AbstractEntity::value(&entity, "age")
+                                );
                                 v.insert(ReactorUpdateItem {
                                     entity: entity.clone(),
                                     events: events.clone(),
@@ -641,6 +648,14 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
                                 });
                             }
                             indexmap::map::Entry::Occupied(mut o) => {
+                                tracing::info!(
+                                    "Reactor ATTACH UPDATE to subscription {} entity: {} - query_id: {} membership_change: {:?} age: {:?}",
+                                    query_id,
+                                    subscription_id,
+                                    entity.id(),
+                                    membership_change,
+                                    AbstractEntity::value(&entity, "age")
+                                );
                                 if let Some(mc) = membership_change {
                                     o.get_mut().predicate_relevance.push((query_id, mc));
                                 }
