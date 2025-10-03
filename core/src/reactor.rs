@@ -48,6 +48,16 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
     fn events(&self) -> &[Self::Event];
 }
 
+/// Hook trait for performing actions before notification is sent
+pub trait PreNotifyHook {
+    fn pre_notify(&self, version: u32);
+}
+
+/// No-op implementation for unit type
+impl PreNotifyHook for () {
+    fn pre_notify(&self, _version: u32) {}
+}
+
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<
     E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static = Entity,
@@ -56,8 +66,8 @@ pub struct Reactor<
 
 struct ReactorInner<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
     subscriptions: std::sync::Mutex<HashMap<ReactorSubscriptionId, Subscription<E, Ev>>>,
-    // TODO: per-entity locking would be better than a global lock
-    watcher_set: std::sync::Mutex<WatcherSet>,
+    // Shared with all subscriptions to allow them to manage their own watchers
+    watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
     /// Serializes notify_change invocations to ensure consistent watcher state
     notify_lock: tokio::sync::Mutex<()>,
 }
@@ -74,7 +84,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
     pub fn new() -> Self {
         Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
-            watcher_set: Mutex::new(WatcherSet::new()),
+            watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
             notify_lock: tokio::sync::Mutex::new(()),
         }))
     }
@@ -82,7 +92,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
     /// Create a new subscription container
     pub fn subscribe(&self) -> ReactorSubscription<E, Ev> {
         let broadcast = ankurah_signals::broadcast::Broadcast::new();
-        let subscription = Subscription::new(broadcast.clone());
+        let subscription = Subscription::new(broadcast.clone(), self.0.watcher_set.clone());
         let subscription_id = subscription.id();
         self.0.subscriptions.lock().unwrap().insert(subscription_id, subscription);
         ReactorSubscription(Arc::new(ReactorSubInner { subscription_id, reactor: self.clone(), broadcast }))
@@ -101,13 +111,15 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         // Remove all predicates from watchers
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
         for (query_id, query_state) in queries {
-            // Remove from index watcher
-            watcher_set.recurse_predicate_watchers(
-                &query_state.collection_id,
-                &query_state.selection.predicate,
-                (sub_id, query_id),
-                WatcherOp::Remove,
-            );
+            // Remove from index watcher (only if selection was set)
+            if let Some(selection) = &query_state.selection {
+                watcher_set.recurse_predicate_watchers(
+                    &query_state.collection_id,
+                    &selection.predicate,
+                    (sub_id, query_id),
+                    WatcherOp::Remove,
+                );
+            }
 
             // Remove from entity watchers using predicate's matching entities
             let entity_ids: Vec<_> = query_state.resultset.keys().collect();
@@ -127,10 +139,12 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         // Remove the query from the subscription
         let query_state = subscription.remove_query(query_id).ok_or(SubscriptionError::PredicateNotFound)?;
 
-        // Remove from watchers
-        let mut watcher_set = self.0.watcher_set.lock().unwrap();
-        let watcher_id = (subscription_id, query_id);
-        watcher_set.recurse_predicate_watchers(&query_state.collection_id, &query_state.selection.predicate, watcher_id, WatcherOp::Remove);
+        // Remove from watchers (only if selection was set)
+        if let Some(selection) = &query_state.selection {
+            let mut watcher_set = self.0.watcher_set.lock().unwrap();
+            let watcher_id = (subscription_id, query_id);
+            watcher_set.recurse_predicate_watchers(&query_state.collection_id, &selection.predicate, watcher_id, WatcherOp::Remove);
+        }
 
         Ok(())
     }
@@ -207,15 +221,55 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
 impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
     /// Add a new predicate to a subscription (initial subscription only)
     /// Fails if query_id already exists - use update_query for updates
-    /// The resultset must be pre-populated with entities that match the predicate
-    pub fn add_query(
+    ///
+    /// The resultset should be empty - this method will populate it with all matching entities
+    /// Returns all entities (initial + gap-filled) that match the predicate
+    pub async fn add_query(
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         selection: ankql::ast::Selection,
+        node: &dyn crate::node::TNodeErased<E>,
         resultset: EntityResultSet<E>,
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+    ) -> anyhow::Result<Vec<E>> {
+        // Get subscription reference
+        let subscription = {
+            let subscriptions = self.0.subscriptions.lock().unwrap();
+            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
+        };
+
+        // Fetch initial entities from local storage (do this first to avoid holding locks across await)
+        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
+
+        // Register empty query state with subscription (will be populated by update_query)
+        subscription.register_query(query_id, collection_id.clone(), resultset.clone(), gap_fetcher)?;
+
+        // Update query - watcher management (predicate + entity) is handled internally
+        let mut all_entities = subscription.update_query(query_id, collection_id, selection, included_entities, 1, &mut ())?;
+
+        // Fill gaps if needed (also registers entity watchers)
+        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
+
+        resultset.set_loaded(true);
+
+        Ok(all_entities)
+    }
+
+    /// Add a query and send initialization notification (for local subscriptions)
+    /// Collects ReactorUpdateItems and sends them
+    /// pre_notify_hook is called before sending notification (e.g., to mark LiveQuery initialized)
+    pub async fn add_query_and_notify<H: PreNotifyHook>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        collection_id: proto::CollectionId,
+        selection: ankql::ast::Selection,
+        node: &dyn crate::node::TNodeErased<E>,
+        resultset: EntityResultSet<E>,
+        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+        pre_notify_hook: H,
     ) -> anyhow::Result<()> {
         // Get subscription reference
         let subscription = {
@@ -223,74 +277,114 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
             subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
         };
 
-        // Add query to subscription and get entities for watcher setup
-        let entities = subscription.add_query(query_id, collection_id.clone(), selection.clone(), resultset, gap_fetcher)?;
+        // Fetch initial entities from local storage (do this first to avoid holding locks across await)
+        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
 
-        // Set up watchers
-        let mut watcher_set = self.0.watcher_set.lock().unwrap();
-        let watcher_id = (subscription_id, query_id);
-        watcher_set.recurse_predicate_watchers(&collection_id, &selection.predicate, watcher_id, WatcherOp::Add);
-        watcher_set.add_predicate_entity_watchers(subscription_id, query_id, entities.iter().map(|(id, _)| *id));
-        drop(watcher_set);
+        // Register empty query state with subscription (will be populated by update_query)
+        subscription.register_query(query_id, collection_id.clone(), resultset.clone(), gap_fetcher)?;
 
-        // Send initialization update
-        subscription.send_add_query_update(query_id, entities);
+        // Populate the resultset and collect ReactorUpdateItems
+        // update_query now handles all watcher management internally (predicate + entity)
+        let mut reactor_update_items = Vec::new();
+        let _newly_added = subscription.update_query(
+            query_id,
+            collection_id.clone(),
+            selection.clone(),
+            included_entities,
+            1, // version 1 for initial add
+            &mut reactor_update_items,
+        )?;
+
+        // Fill gaps if needed for this specific query
+        // fill_gaps_for_query also registers entity watchers and pushes items internally
+        subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
+
+        // Mark as loaded
+        resultset.set_loaded(true);
+
+        // Call pre-notify hook (e.g., mark LiveQuery as initialized) with version 1
+        pre_notify_hook.pre_notify(1);
+
+        // Send the notification with collected items. We always notify because we're initializing the query.
+        subscription.send_update(reactor_update_items);
 
         Ok(())
     }
 
-    /// Pause a predicate from receiving notifications - gets unpaused by update_query
-    // fn pause_query(&self, query_id: proto::QueryId) {
-    //     // is this actually used?
-    //     let subscriptions = self.0.subscriptions.lock().unwrap();
-    //     // Find the subscription that has this predicate and pause it
-    //     for subscription in subscriptions.values() {
-    //         if subscription.pause_query(query_id) {
-    //             break;
-    //         }
-    //     }
-    // }
-
-    /// Update an existing predicate (v>0)
+    /// Update an existing predicate (v>0) - does NOT send notifications
     /// Does diffing against the current resultset
-    pub fn update_query(
+    /// Used by server-side remote subscriptions
+    /// Returns all entities that currently match the updated predicate (for delta generation)
+    pub async fn update_query(
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
         collection_id: proto::CollectionId,
         selection: ankql::ast::Selection,
-        included_entities: Vec<E>,
+        node: &dyn crate::node::TNodeErased<E>,
         version: u32,
-        emit_removes: bool, // Whether to emit Remove events for entities that no longer match
-    ) -> anyhow::Result<()> {
-        // Get subscription reference
+    ) -> anyhow::Result<Vec<E>> {
+        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
+
         let subscription = {
             let subscriptions = self.0.subscriptions.lock().unwrap();
             subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
         };
 
-        // Update query and get results
-        let (old_predicate, newly_added, removed_entities, reactor_update_items) =
-            subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, emit_removes)?;
+        // Update query - watcher management is handled internally
+        let mut all_entities =
+            subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, &mut ())?;
 
-        // Update watchers
-        let mut watcher_set = self.0.watcher_set.lock().unwrap();
-        let watcher_id = (subscription_id, query_id);
+        // Fill gaps if needed for this specific query (also registers entity watchers)
+        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
 
-        // Update index watchers if predicate changed
-        watcher_set.recurse_predicate_watchers(&collection_id, &old_predicate, watcher_id, WatcherOp::Remove);
-        watcher_set.recurse_predicate_watchers(&collection_id, &selection.predicate, watcher_id, WatcherOp::Add);
+        // Return all entities (newly added + gap-filled)
+        Ok(all_entities)
+    }
 
-        // Add watchers for newly added entities
-        watcher_set.add_predicate_entity_watchers(subscription_id, query_id, newly_added.iter().map(|(id, _)| *id));
+    /// Update an existing predicate (v>0) and send notifications
+    /// Does diffing against the current resultset
+    /// Used by local LiveQuery updates
+    /// pre_notify_hook is called before sending notification (e.g., to mark LiveQuery initialized)
+    pub async fn update_query_and_notify<H: PreNotifyHook>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        collection_id: proto::CollectionId,
+        selection: ankql::ast::Selection,
+        node: &dyn crate::node::TNodeErased<E>,
+        version: u32,
+        pre_notify_hook: H,
+    ) -> anyhow::Result<()> {
+        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
 
-        // Clean up watchers for removed entities
-        watcher_set.cleanup_removed_predicate_watchers(subscription_id, query_id, &removed_entities);
+        let subscription = {
+            let subscriptions = self.0.subscriptions.lock().unwrap();
+            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
+        };
 
-        drop(watcher_set);
+        let mut reactor_update_items = Vec::new();
+        // Update query - watcher management is handled internally
+        let _newly_added = subscription.update_query(
+            query_id,
+            collection_id.clone(),
+            selection.clone(),
+            included_entities,
+            version,
+            &mut reactor_update_items,
+        )?;
+
+        // Fill gaps if needed for this specific query
+        // fill_gaps_for_query also registers entity watchers and pushes items internally
+        subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
+
+        // Call pre-notify hook (e.g., mark LiveQuery as initialized)
+        pre_notify_hook.pre_notify(version);
 
         // Send reactor update
-        subscription.send_update_query_update(query_id, version, reactor_update_items);
+        if !reactor_update_items.is_empty() {
+            subscription.send_update(reactor_update_items);
+        }
 
         Ok(())
     }
@@ -466,24 +560,57 @@ mod tests {
         }
     }
 
+    /// Mock node for testing
+    struct MockNode {
+        entities: Vec<TestEntity>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::node::TNodeErased<TestEntity> for MockNode {
+        fn unsubscribe_remote_predicate(&self, _query_id: proto::QueryId) {}
+        fn update_remote_query(
+            &self,
+            _query_id: proto::QueryId,
+            _selection: ankql::ast::Selection,
+            _version: u32,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        async fn fetch_entities_from_local(
+            &self,
+            _collection_id: &proto::CollectionId,
+            _selection: &ankql::ast::Selection,
+        ) -> Result<Vec<TestEntity>, crate::error::RetrievalError> {
+            Ok(self.entities.clone())
+        }
+        fn reactor(&self) -> &Reactor<TestEntity> { panic!("MockNode::reactor() should not be called in this test") }
+        fn has_subscription_relay(&self) -> bool { false }
+    }
+
     /// Test that once a predicate matches an entity, that entity continues to be watched
     /// by the ReactorSubscriptionId until the user explicitly unwatches it
-    #[test]
-    fn test_entity_remains_watched_after_predicate_stops_matching() {
+    #[tokio::test]
+    async fn test_entity_remains_watched_after_predicate_stops_matching() {
         let reactor = Reactor::<TestEntity, TestEvent>::new();
 
         // Set up a subscription with a predicate that matches status="pending"
         let rsub = reactor.subscribe();
         let (w, check) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
-        let _guard = rsub.subscribe(w); // ReactorSubscription needs to implement ankurah_signals::Subscribe
+        let _guard = rsub.subscribe(w);
 
         let query_id = QueryId::new();
         let collection_id = CollectionId::fixed_name("album");
-        let selection = "status = 'pending'".try_into().unwrap();
+        let selection: ankql::ast::Selection = "status = 'pending'".try_into().unwrap();
         let entity1 = TestEntity::new("Test Album", "pending");
-        let resultset = EntityResultSet::single(entity1.clone());
+        let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
         let mock_gap_fetcher = Arc::new(MockGapFetcher::new());
-        reactor.add_query(rsub.id(), query_id, collection_id, selection, resultset, mock_gap_fetcher).unwrap();
+        let mock_node = MockNode { entities: vec![entity1.clone()] };
+
+        // Add query using the reactor - this should send Initial notification
+        reactor
+            .add_query_and_notify(rsub.id(), query_id, collection_id, selection, &mock_node, resultset, mock_gap_fetcher, ())
+            .await
+            .unwrap();
 
         // something like this
         assert_eq!(
@@ -492,10 +619,8 @@ mod tests {
                 items: vec![ReactorUpdateItem {
                     entity: entity1.clone(),
                     events: vec![],
-                    entity_subscribed: true,
                     predicate_relevance: vec![(query_id, MembershipChange::Initial)],
                 }],
-                initialized_query: Some((query_id, 0)),
             }]
         );
 

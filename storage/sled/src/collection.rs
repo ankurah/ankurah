@@ -339,7 +339,6 @@ impl SledStorageCollectionInner {
             }
             _ => {
                 let collection_items: Vec<_> = scanner.collect();
-                println!("collection_items: {:?}", collection_items);
                 let filtered = collection_items.into_iter().filter_predicate(&remaining_predicate);
                 match (sort, limit) {
                     // filter + order by + limit

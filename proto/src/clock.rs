@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::DecodeError, EventId};
 
-/// S set of event ids which create a dag of events
+/// Set of event ids which represents a head in a DAG of events
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct Clock(pub(crate) Vec<EventId>);
 
@@ -14,6 +14,8 @@ impl Clock {
     pub fn to_strings(&self) -> Vec<String> { self.0.iter().map(|id| id.to_base64()).collect() }
 
     pub fn to_base64_short(&self) -> String { format!("[{}]", self.0.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(",")) }
+
+    pub fn to_base64(&self) -> String { format!("[{}]", self.0.iter().map(|id| id.to_base64()).collect::<Vec<_>>().join(",")) }
 
     pub fn from_strings(strings: Vec<String>) -> Result<Self, DecodeError> {
         let mut ids = strings.into_iter().map(|s| s.try_into()).collect::<Result<Vec<_>, _>>()?;
@@ -36,6 +38,8 @@ impl Clock {
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
     pub fn iter(&self) -> impl Iterator<Item = &EventId> { self.0.iter() }
+
+    pub fn to_vec(&self) -> Vec<EventId> { self.0.clone() }
 }
 
 impl From<Vec<EventId>> for Clock {
@@ -63,5 +67,11 @@ impl From<EventId> for Clock {
 }
 
 impl std::fmt::Display for Clock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.to_base64_short()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{}", self.to_base64_short())
+        } else {
+            write!(f, "{}", self.to_base64())
+        }
+    }
 }

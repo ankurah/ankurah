@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Weak},
 };
 
 use ankurah_proto::{self as proto, CollectionId};
@@ -19,7 +19,10 @@ use crate::{
     model::View,
     node::{MatchArgs, TNodeErased},
     policy::PolicyAgent,
-    reactor::{ReactorSubscription, ReactorUpdate},
+    reactor::{
+        fetch_gap::{GapFetcher, QueryGapFetcher},
+        ReactorSubscription, ReactorUpdate,
+    },
     resultset::{EntityResultSet, ResultSet},
     storage::StorageEngine,
     Node,
@@ -38,13 +41,27 @@ struct Inner {
     pub(crate) has_error: AtomicBool,
     pub(crate) error: std::sync::Mutex<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
-    pub(crate) is_initialized: std::sync::atomic::AtomicBool,
+    pub(crate) initialized_version: std::sync::atomic::AtomicU32,
     // Version tracking for predicate updates
     pub(crate) current_version: std::sync::atomic::AtomicU32,
-    // TODO: Is the selection pending in a version 0 case? I think it might be
-    pub(crate) pending_selection: std::sync::Mutex<Option<(ankql::ast::Selection, u32)>>,
+    // Store selection with its version (starts with version 1, updated on selection changes)
+    // This represents user intent (client-side state), separate from reactor's QueryState.selection (reactor-side state)
+    pub(crate) selection: std::sync::Mutex<(ankql::ast::Selection, u32)>,
     // Store collection_id for selection updates
     pub(crate) collection_id: CollectionId,
+    // Gap fetcher for reactor.add_query (type-erased)
+    pub(crate) gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>>,
+}
+
+/// Weak reference to EntityLiveQuery for breaking circular dependencies
+pub struct WeakEntityLiveQuery(Weak<Inner>);
+
+impl WeakEntityLiveQuery {
+    pub fn upgrade(&self) -> Option<EntityLiveQuery> { self.0.upgrade().map(EntityLiveQuery) }
+}
+
+impl Clone for WeakEntityLiveQuery {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
 #[derive(Clone)]
@@ -53,6 +70,13 @@ pub struct LiveQuery<R: View>(EntityLiveQuery, PhantomData<R>);
 impl<R: View> std::ops::Deref for LiveQuery<R> {
     type Target = EntityLiveQuery;
     fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl crate::reactor::PreNotifyHook for &EntityLiveQuery {
+    fn pre_notify(&self, version: u32) {
+        // Mark as initialized before notification is sent
+        self.mark_initialized(version);
+    }
 }
 
 impl EntityLiveQuery {
@@ -71,42 +95,50 @@ impl EntityLiveQuery {
 
         let subscription = node.reactor.subscribe();
 
+        let resultset = EntityResultSet::empty();
         let query_id = proto::QueryId::new();
-        let rx = node.subscribe_remote_query(query_id, collection_id.clone(), args.selection.clone(), cdata.clone(), 0);
+        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(&node, cdata.clone()));
 
         let me = Self(Arc::new(Inner {
             query_id,
             node: Box::new(node.clone()),
             subscription,
-            resultset: EntityResultSet::empty(),
+            resultset: resultset.clone(),
             has_error: AtomicBool::new(false),
             error: std::sync::Mutex::new(None),
             initialized: tokio::sync::Notify::new(),
-            is_initialized: std::sync::atomic::AtomicBool::new(false),
-            current_version: std::sync::atomic::AtomicU32::new(0),
-            // TODO: Even for version 0, predicate is "pending" until remote confirms (unless cached:true)
-            pending_selection: std::sync::Mutex::new(None),
+            initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
+            current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
+            selection: std::sync::Mutex::new((args.selection.clone(), 1)), // Start with version 1
             collection_id: collection_id.clone(),
+            gap_fetcher,
         }));
 
-        let me2 = me.clone();
-        let node = node.clone(); // initialize needs the typed node. Drop only needs the erased node.
+        // Check if this is a durable node (no relay) or ephemeral node (has relay)
+        let has_relay = node.subscription_relay.is_some();
 
-        debug!("LiveQuery::new() spawning initialization task for predicate {}", query_id);
-        crate::task::spawn(async move {
-            debug!("LiveQuery initialization task starting for predicate {}", query_id);
-            if let Err(e) = me2.initialize(node, collection_id, query_id, args, rx, cdata).await {
-                debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
-                me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                *me2.0.error.lock().unwrap() = Some(e);
-            } else {
-                debug!("LiveQuery initialization completed for predicate {}", query_id);
-            }
+        if args.cached || !has_relay {
+            // Durable node: spawn initialization task directly (no remote subscription needed)
+            let me2 = me.clone();
 
-            // Signal that initialization is complete (success or failure)
-            me2.0.is_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
-            me2.0.initialized.notify_waiters();
-        });
+            debug!("LiveQuery::new() spawning initialization task for durable node predicate {}", query_id);
+            crate::task::spawn(async move {
+                debug!("LiveQuery initialization task starting for predicate {}", query_id);
+                if let Err(e) = me2.activate(1).await {
+                    debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
+                    me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *me2.0.error.lock().unwrap() = Some(e);
+                } else {
+                    debug!("LiveQuery initialization completed for predicate {}", query_id);
+                }
+            });
+        }
+
+        // Ephemeral node: register with relay for remote subscription
+        // Remote will call activate() after applying deltas via subscription_established
+        if has_relay {
+            node.subscribe_remote_query(query_id, collection_id.clone(), args.selection.clone(), cdata.clone(), 1, me.weak());
+        }
 
         Ok(me)
     }
@@ -115,53 +147,14 @@ impl EntityLiveQuery {
     /// Wait for the LiveQuery to be fully initialized with initial states
     pub async fn wait_initialized(&self) {
         // If already initialized, return immediately
-        if self.0.is_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.0.initialized_version.load(std::sync::atomic::Ordering::Relaxed)
+            >= self.0.current_version.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
 
         // Otherwise wait for the notification
         self.0.initialized.notified().await;
-    }
-
-    async fn initialize<SE, PA>(
-        &self,
-        node: Node<SE, PA>,
-        collection_id: CollectionId,
-        query_id: proto::QueryId,
-        args: MatchArgs,
-        rx: Option<tokio::sync::oneshot::Receiver<Vec<Entity>>>,
-        cdata: PA::ContextData,
-    ) -> Result<(), RetrievalError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        // Get initial entities from remote or local storage
-        let initial_entities = match rx {
-            Some(rx) if !args.cached => match rx.await {
-                Ok(entities) => entities,
-                Err(_) => {
-                    warn!("Failed to receive first remote update for subscription {}", query_id);
-                    node.fetch_entities_from_local(&collection_id, &args.selection).await?
-                }
-            },
-            _ => node.fetch_entities_from_local(&collection_id, &args.selection).await?,
-        };
-
-        debug!(
-            "LiveQuery.initialize() fetched {} initial entities for predicate {} with filter {:?}",
-            initial_entities.len(),
-            query_id,
-            args.selection
-        );
-
-        debug!("LiveQuery.initialize() calling reactor.set_predicate with {} entities for predicate {}", initial_entities.len(), query_id);
-        // Pre-populate the resultset with initial entities
-        self.0.resultset.write().replace_all(initial_entities);
-        let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::new(&node, cdata.clone()));
-        node.reactor.add_query(self.0.subscription.id(), query_id, collection_id, args.selection, self.0.resultset.clone(), gap_fetcher)?;
-
-        Ok(())
     }
 
     pub fn update_selection(
@@ -170,34 +163,31 @@ impl EntityLiveQuery {
     ) -> Result<(), RetrievalError> {
         let new_selection = new_selection.try_into().map_err(|e| e.into())?;
 
-        // 1. Increment current_version atomically and get the new version number
+        // Increment current_version atomically and get the new version number
         let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
-        // 2. Set is_initialized to false (query results are stale until update completes)
-        self.0.is_initialized.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Store new selection and version in pending_selection mutex
+        *self.0.selection.lock().unwrap() = (new_selection.clone(), new_version);
 
-        // 3. Store new selection and version in pending_predicate mutex
-        *self.0.pending_selection.lock().unwrap() = Some((new_selection.clone(), new_version));
+        // Check if this node has a relay (ephemeral) or not (durable)
+        let has_relay = self.0.node.has_subscription_relay();
 
-        // 4. Call node.update_remote_predicate (synchronous)
-        let rx = self.0.node.update_remote_query(self.0.query_id, new_selection.clone(), new_version)?;
+        if has_relay {
+            // Ephemeral node: delegate to relay, which will call update_selection_init after applying deltas
+            self.0.node.update_remote_query(self.0.query_id, new_selection.clone(), new_version)?;
+        } else {
+            // Durable node: spawn task to call update_selection_init directly
+            let me2 = self.clone();
+            let query_id = self.0.query_id;
 
-        // Spawn task to handle async update (similar to ::new pattern)
-        let me2 = self.clone();
-        let collection_id = self.0.collection_id.clone();
-        let query_id = self.0.query_id;
-
-        crate::task::spawn(async move {
-            if let Err(e) = me2.update_selection_init(collection_id, new_selection, new_version, rx).await {
-                tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
-                me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                *me2.0.error.lock().unwrap() = Some(e);
-            }
-
-            // Signal that update is complete (success or failure)
-            me2.0.is_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
-            me2.0.initialized.notify_waiters();
-        });
+            crate::task::spawn(async move {
+                if let Err(e) = me2.activate(new_version).await {
+                    tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
+                    me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *me2.0.error.lock().unwrap() = Some(e);
+                }
+            });
+        }
 
         Ok(())
     }
@@ -211,47 +201,104 @@ impl EntityLiveQuery {
         Ok(())
     }
 
-    async fn update_selection_init(
-        &self,
-        collection_id: CollectionId,
-        new_selection: ankql::ast::Selection,
-        new_version: u32,
-        rx: Option<tokio::sync::oneshot::Receiver<Vec<Entity>>>,
-    ) -> Result<(), RetrievalError> {
-        // Get entities from remote or local storage (follow initialize pattern)
-        let included_entities = match rx {
-            Some(rx) => match rx.await {
-                Ok(entities) => entities,
-                Err(_) => {
-                    warn!("Failed to receive remote update for predicate {}, falling back to local", self.0.query_id);
-                    self.0.node.fetch_entities_from_local(&collection_id, &new_selection).await?
-                }
-            },
-            None => self.0.node.fetch_entities_from_local(&collection_id, &new_selection).await?,
-        };
+    /// Activate the LiveQuery by fetching entities and calling reactor.add_query or reactor.update_query
+    /// Called after deltas have been applied for both initial subscription and selection updates
+    /// Gets all parameters from self.0 (collection_id, query_id, selection)
+    /// Marks initialization as complete regardless of success/failure
+    /// Rejects activation if the version is older than the current selection to prevent regression
+    async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
+        // Get the current selection and its version
+        let (selection, stored_version) = self.0.selection.lock().unwrap().clone();
 
-        // Call reactor.update_query via the trait
-        self.0
-            .node
-            .reactor()
-            .update_query(
-                self.0.subscription.id(),
-                self.0.query_id,
-                collection_id,
-                new_selection,
-                included_entities,
-                new_version,
-                true, // emit_removes: true for local subscriptions
-            )
-            .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?;
+        // Reject activation if this is an older version than what's currently stored
+        // This prevents out-of-order activations from regressing the state
+        if version < stored_version {
+            warn!("LiveQuery - Dropped stale activation request for version {} (current version is {})", version, stored_version);
+            return Ok(());
+        }
+
+        debug!("LiveQuery.activate() for predicate {} (version {})", self.0.query_id, version);
+
+        let reactor = self.0.node.reactor();
+        let initialized_version = self.0.initialized_version.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Determine if this is the first activation (query not yet in reactor)
+        if initialized_version == 0 {
+            // First activation ever: call reactor.add_query_and_notify which will populate the resultset
+            // Pass self as pre_notify_hook to mark initialized before notification
+            reactor
+                .add_query_and_notify(
+                    self.0.subscription.id(),
+                    self.0.query_id,
+                    self.0.collection_id.clone(),
+                    selection,
+                    &*self.0.node,
+                    self.0.resultset.clone(),
+                    self.0.gap_fetcher.clone(),
+                    self,
+                )
+                .await?
+        } else {
+            // Subsequent activation (including cached re-initialization or selection update): use update_query_and_notify
+            // This handles both: (1) cached queries re-activating after remote deltas, and (2) selection updates
+            reactor
+                .update_query_and_notify(
+                    self.0.subscription.id(),
+                    self.0.query_id,
+                    self.0.collection_id.clone(),
+                    selection,
+                    &*self.0.node,
+                    version,
+                    self,
+                )
+                .await?;
+        };
 
         Ok(())
     }
     pub fn error(&self) -> Option<RetrievalError> { self.0.error.lock().unwrap().take() }
+    pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
+
+    /// Create a weak reference to this LiveQuery
+    pub fn weak(&self) -> WeakEntityLiveQuery { WeakEntityLiveQuery(Arc::downgrade(&self.0)) }
+
+    /// Mark initialization as complete for a given version
+    pub fn mark_initialized(&self, version: u32) {
+        // TASK: Serialize or coalesce concurrent activations to prevent version regression https://github.com/ankurah/ankurah/issues/146
+        self.0.initialized_version.store(version, std::sync::atomic::Ordering::Relaxed);
+        self.0.initialized.notify_waiters();
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) { self.node.unsubscribe_remote_predicate(self.query_id); }
+}
+
+// Implement RemoteQuerySubscriber for WeakEntityLiveQuery to break circular dependencies
+#[async_trait::async_trait]
+impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
+    async fn subscription_established(&self, version: u32) {
+        // Try to upgrade the weak reference
+        if let Some(livequery) = self.upgrade() {
+            // Activate the query (fetch entities, call reactor, and mark initialized)
+            // Handle errors internally by setting last_error
+            if let Err(e) = livequery.activate(version).await {
+                tracing::error!("Failed to activate subscription for query {}: {}", livequery.0.query_id, e);
+                livequery.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                *livequery.0.error.lock().unwrap() = Some(e);
+            }
+        }
+        // If upgrade fails, the LiveQuery was already dropped - nothing to do
+    }
+
+    fn set_last_error(&self, error: RetrievalError) {
+        // Try to upgrade the weak reference
+        if let Some(livequery) = self.upgrade() {
+            livequery.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
+            *livequery.0.error.lock().unwrap() = Some(error);
+        }
+        // If upgrade fails, the LiveQuery was already dropped - nothing to do
+    }
 }
 
 impl<R: View> LiveQuery<R> {

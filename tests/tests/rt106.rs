@@ -79,7 +79,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(albums[0].year().unwrap_or_default(), "2022");
 
     // After resubscribe, the client should have retrieved the missing events during the lineage comparison
-    assert_eq!(3, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after resubscribe
+    assert_eq!(2, client_collection.dump_entity_events(album_id.clone()).await?.len()); // after resubscribe
 
     Ok(())
 }

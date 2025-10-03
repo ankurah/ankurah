@@ -45,8 +45,8 @@ impl TryFrom<wasm_bindgen::JsValue> for ast::Expr {
 
     fn try_from(value: wasm_bindgen::JsValue) -> Result<Self, Self::Error> {
         if value.is_null() || value.is_undefined() {
-            // FIXME / HACK - we should probably have a NULL literal
-            return Ok(ast::Expr::Literal(ast::Literal::String("NULL_IMPROBLE_VALUE".to_string())));
+            // TASK: Add NULL literal to ankql AST https://github.com/ankurah/ankurah/issues/143
+            return Ok(ast::Expr::Literal(ast::Literal::String("NULL_IMPROBABLE_VALUE".to_string())));
         }
 
         // Try string first

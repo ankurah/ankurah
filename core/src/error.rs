@@ -43,6 +43,14 @@ pub enum RetrievalError {
     MutationError(Box<MutationError>),
     #[error("Property error: {0}")]
     PropertyError(Box<crate::property::PropertyError>),
+    #[error("Request error: {0}")]
+    RequestError(RequestError),
+    #[error("Apply error: {0}")]
+    ApplyError(ApplyError),
+}
+
+impl From<RequestError> for RetrievalError {
+    fn from(err: RequestError) -> Self { RetrievalError::RequestError(err) }
 }
 
 impl From<crate::property::PropertyError> for RetrievalError {
@@ -157,15 +165,32 @@ impl From<anyhow::Error> for MutationError {
     fn from(err: anyhow::Error) -> Self { MutationError::Anyhow(err) }
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum LineageError {
-    #[error("incomparable")]
     Incomparable,
-    #[error("partially descends: {meet:?}")]
     PartiallyDescends { meet: Vec<EventId> },
-    #[error("budget exceeded: {subject_frontier:?} {other_frontier:?}")]
     BudgetExceeded { original_budget: usize, subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
 }
+
+impl std::fmt::Display for LineageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineageError::Incomparable => write!(f, "incomparable"),
+            LineageError::PartiallyDescends { meet } => {
+                write!(f, "partially descends: [")?;
+                let meets: Vec<_> = meet.iter().map(|id| id.to_base64_short()).collect();
+                write!(f, "{}]", meets.join(", "))
+            }
+            LineageError::BudgetExceeded { original_budget, subject_frontier, other_frontier } => {
+                let subject: Vec<_> = subject_frontier.iter().map(|id| id.to_base64_short()).collect();
+                let other: Vec<_> = other_frontier.iter().map(|id| id.to_base64_short()).collect();
+                write!(f, "budget exceeded ({}): subject[{}] other[{}]", original_budget, subject.join(", "), other.join(", "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for LineageError {}
 
 impl From<LineageError> for MutationError {
     fn from(err: LineageError) -> Self { MutationError::LineageError(err) }
@@ -244,4 +269,66 @@ pub enum ValidationError {
     Serialization(String),
     #[error("Rejected: {0}")]
     Rejected(&'static str),
+}
+
+/// Error type for NodeApplier operations (applying remote deltas)
+#[derive(Debug)]
+pub enum ApplyError {
+    Items(Vec<ApplyErrorItem>),
+    CollectionNotFound(CollectionId),
+    RetrievalError(Box<RetrievalError>),
+    MutationError(Box<MutationError>),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyError::Items(errors) => {
+                write!(f, "Failed to apply {} delta(s)", errors.len())?;
+                for (i, err) in errors.iter().enumerate() {
+                    write!(f, "\n  [{}] {}", i + 1, err)?;
+                }
+                Ok(())
+            }
+            ApplyError::CollectionNotFound(id) => write!(f, "Collection not found: {}", id),
+            ApplyError::RetrievalError(e) => write!(f, "Retrieval error: {}", e),
+            ApplyError::MutationError(e) => write!(f, "Mutation error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ApplyError::RetrievalError(e) => Some(e),
+            ApplyError::MutationError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Error applying a specific delta
+#[derive(Debug)]
+pub struct ApplyErrorItem {
+    pub entity_id: EntityId,
+    pub collection: CollectionId,
+    pub cause: MutationError,
+}
+
+impl std::fmt::Display for ApplyErrorItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed to apply delta for entity {} in collection {}: {}", self.entity_id.to_base64_short(), self.collection, self.cause)
+    }
+}
+
+impl From<RetrievalError> for ApplyError {
+    fn from(err: RetrievalError) -> Self { ApplyError::RetrievalError(Box::new(err)) }
+}
+
+impl From<MutationError> for ApplyError {
+    fn from(err: MutationError) -> Self { ApplyError::MutationError(Box::new(err)) }
+}
+
+impl From<ApplyError> for RetrievalError {
+    fn from(err: ApplyError) -> Self { RetrievalError::ApplyError(err) }
 }

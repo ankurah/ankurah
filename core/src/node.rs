@@ -1,3 +1,4 @@
+use ankql::selection::filter::Filterable;
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
 
@@ -21,7 +22,7 @@ use crate::{
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
-    reactor::Reactor,
+    reactor::{AbstractEntity, Reactor},
     retrieval::LocalRetriever,
     storage::StorageEngine,
     system::SystemManager,
@@ -133,17 +134,12 @@ where PA: PolicyAgent
 
     pub(crate) predicate_context: SafeMap<proto::QueryId, PA::ContextData>,
 
-    // Pending subscriptions waiting for first remote update
-    // Maps PredicateId to (version, channel) - only one pending version per predicate at a time
-    pub(crate) pending_predicate_subs:
-        std::sync::Mutex<std::collections::HashMap<proto::QueryId, (u32, tokio::sync::oneshot::Sender<Vec<Entity>>)>>,
-
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData>>,
+    pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -175,13 +171,12 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
-            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }));
 
         // Set up the message sender for the subscription relay
         if let Some(ref relay) = node.subscription_relay {
             let weak_node = node.weak();
-            if relay.set_message_sender(Arc::new(weak_node)).is_err() {
+            if relay.set_node(Arc::new(weak_node)).is_err() {
                 warn!("Failed to set message sender for subscription relay");
             }
         }
@@ -209,7 +204,6 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay: None,
-            pending_predicate_subs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -424,18 +418,34 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::Fetch { collection, mut selection } => {
+            proto::NodeRequestBody::Fetch { collection, mut selection, known_matches } => {
                 self.policy_agent.can_access_collection(cdata, &collection)?;
                 let storage_collection = self.collections.get(&collection).await?;
                 selection.predicate = self.policy_agent.filter_predicate(cdata, &collection, selection.predicate)?;
 
-                let mut states = Vec::new();
-                for state in storage_collection.fetch_states(&selection).await? {
-                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_ok() {
-                        states.push(state);
+                // Expand initial_states to include entities from known_matches that weren't in the predicate results
+                let expanded_states = crate::util::expand_states::expand_states(
+                    storage_collection.fetch_states(&selection).await?,
+                    known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
+                    &storage_collection,
+                )
+                .await?;
+
+                let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
+
+                let mut deltas = Vec::new();
+                for state in expanded_states {
+                    if self.policy_agent.check_read(cdata, &state.payload.entity_id, &collection, &state.payload.state).is_err() {
+                        continue;
+                    }
+
+                    // Generate delta based on known_matches (returns None if heads are equal)
+                    // No need to reconstruct Entity - work directly with EntityState
+                    if let Some(delta) = self.generate_entity_delta(&known_map, state, &storage_collection).await? {
+                        deltas.push(delta);
                     }
                 }
-                Ok(proto::NodeResponseBody::Fetch(states))
+                Ok(proto::NodeResponseBody::Fetch(deltas))
             }
             proto::NodeRequestBody::Get { collection, ids } => {
                 self.policy_agent.can_access_collection(cdata, &collection)?;
@@ -471,12 +481,12 @@ where
 
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
-            proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version } => {
+            proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // only one cdata is permitted for SubscribePredicate
                 use itertools::Itertools;
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribePredicate"))?;
-                peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version).await
+                peer_state.subscription_handler.subscribe_query(self, query_id, collection, selection, cdata, version, known_matches).await
             }
         }
     }
@@ -487,9 +497,9 @@ where
         };
 
         match notification.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { items, initialized_query: initialized_predicate } => {
+            proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::info!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                crate::peer_subscription::UpdateApplier::apply_updates(self, &notification.from, items, initialized_predicate).await?;
+                crate::node_applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
                 Ok(())
             }
         }
@@ -559,6 +569,101 @@ where
         Ok(())
     }
 
+    /// Generate EntityDelta for an entity state, using known_matches to decide between StateSnapshot and EventBridge
+    /// Returns None if the entity is in known_matches with equal heads (client already has current state)
+    pub(crate) async fn generate_entity_delta(
+        &self,
+        known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
+        entity_state: proto::Attested<proto::EntityState>,
+        storage_collection: &crate::storage::StorageCollectionWrapper,
+    ) -> anyhow::Result<Option<proto::EntityDelta>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        // Destructure to take ownership and avoid clones
+        let proto::Attested { payload: proto::EntityState { entity_id, collection, state }, attestations } = entity_state;
+        let current_head = &state.head;
+
+        // Entity is in known_matches - try to optimize the response
+        if let Some(known_head) = known_map.get(&entity_id) {
+            // Case 1: Heads equal → return None (omit entity, client already has current state) ✓
+            if known_head == current_head {
+                return Ok(None);
+            }
+
+            // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
+            match self.collect_event_bridge(storage_collection, known_head, current_head).await {
+                Ok(attested_events) if !attested_events.is_empty() => {
+                    // Convert Attested<Event> to EventFragments (strips entity_id and collection)
+                    let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
+
+                    return Ok(Some(proto::EntityDelta {
+                        entity_id,
+                        collection,
+                        content: proto::DeltaContent::EventBridge { events: event_fragments },
+                    }));
+                }
+                _ => {
+                    // Fall through to StateSnapshot if bridge building failed or returned empty
+                }
+            }
+        }
+
+        // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
+        let state_fragment = proto::StateFragment { state, attestations };
+        Ok(Some(proto::EntityDelta { entity_id, collection, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
+    }
+
+    /// Collect events between known_head and current_head using lineage comparison
+    pub(crate) async fn collect_event_bridge(
+        &self,
+        storage_collection: &crate::storage::StorageCollectionWrapper,
+        known_head: &proto::Clock,
+        current_head: &proto::Clock,
+    ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        use crate::lineage::{EventAccumulator, Ordering};
+        use crate::retrieval::LocalRetriever;
+
+        let retriever = LocalRetriever::new(storage_collection.clone());
+        let accumulator = EventAccumulator::new(None); // No limit for Phase 1
+        let mut comparison = crate::lineage::Comparison::new_with_accumulator(
+            &retriever,
+            current_head,
+            known_head,
+            100000, // TODO: make budget configurable
+            Some(accumulator),
+        );
+
+        // Run comparison
+        loop {
+            match comparison.step().await? {
+                Some(Ordering::Descends) => {
+                    // Current descends from known - perfect for event bridge
+                    break;
+                }
+                Some(Ordering::Equal) => {
+                    // Heads are equal - no events needed
+                    break;
+                }
+                Some(_) => {
+                    // Other relationships (NotDescends, Incomparable, etc.) - can't build bridge
+                    return Ok(vec![]);
+                }
+                None => {
+                    // Continue stepping
+                }
+            }
+        }
+
+        // Extract accumulated events
+        Ok(comparison.take_accumulated_events().unwrap_or_default())
+    }
+
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }
 
     pub fn context(&self, data: PA::ContextData) -> Result<Context, anyhow::Error> {
@@ -571,44 +676,6 @@ where
     pub async fn context_async(&self, data: PA::ContextData) -> Context {
         self.system.wait_system_ready().await;
         Context::new(Node::clone(self), data)
-    }
-
-    /// Fetch entities from the first available durable peer.
-    pub(crate) async fn fetch_from_peer<'a, C>(
-        &self,
-        collection_id: &CollectionId,
-        selection: ankql::ast::Selection,
-        cdata: &C,
-    ) -> anyhow::Result<Vec<Attested<EntityState>>, RetrievalError>
-    where
-        C: Iterable<PA::ContextData>,
-    {
-        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
-
-        match self
-            .request(peer_id, cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection })
-            .await
-            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
-        {
-            proto::NodeResponseBody::Fetch(states) => {
-                let collection = self.collections.get(collection_id).await?;
-                // do we have the ability to merge states?
-                // because that's what we have to do I think
-                for state in states.iter() {
-                    self.policy_agent.validate_received_state(self, &peer_id, state)?;
-                    collection.set_state(state.clone()).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
-                }
-                Ok(states)
-            }
-            proto::NodeResponseBody::Error(e) => {
-                debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
-            }
-            _ => {
-                debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
-            }
-        }
     }
 
     pub(crate) async fn get_from_peer(
@@ -696,19 +763,11 @@ where
         selection: ankql::ast::Selection,
         cdata: PA::ContextData,
         version: u32,
-    ) -> Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>> {
-        match self.subscription_relay {
-            Some(ref relay) => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                self.predicate_context.insert(query_id, cdata.clone());
-                {
-                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
-                    pending_subs.insert(query_id, (version, tx));
-                }
-                relay.subscribe_query(query_id, collection_id, selection, cdata, version);
-                Some(rx)
-            }
-            None => None,
+        livequery: crate::livequery::WeakEntityLiveQuery,
+    ) {
+        if let Some(ref relay) = self.subscription_relay {
+            self.predicate_context.insert(query_id, cdata.clone());
+            relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
         }
     }
 
@@ -730,24 +789,20 @@ where
     }
 }
 #[async_trait::async_trait]
-pub trait TNodeErased: Send + Sync + 'static {
+pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>: Send + Sync + 'static {
     fn unsubscribe_remote_predicate(&self, query_id: proto::QueryId);
-    fn update_remote_query(
-        &self,
-        query_id: proto::QueryId,
-        selection: ankql::ast::Selection,
-        version: u32,
-    ) -> Result<Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>, anyhow::Error>;
+    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error>;
     async fn fetch_entities_from_local(
         &self,
         collection_id: &CollectionId,
         selection: &ankql::ast::Selection,
-    ) -> Result<Vec<Entity>, RetrievalError>;
-    fn reactor(&self) -> &Reactor;
+    ) -> Result<Vec<E>, RetrievalError>;
+    fn reactor(&self) -> &Reactor<E>;
+    fn has_subscription_relay(&self) -> bool;
 }
 
 #[async_trait::async_trait]
-impl<SE, PA> TNodeErased for Node<SE, PA>
+impl<SE, PA> TNodeErased<Entity> for Node<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -756,36 +811,17 @@ where
         // Clean up subscription context
         self.predicate_context.remove(&query_id);
 
-        // Clean up any pending oneshot channel for this predicate
-        {
-            self.pending_predicate_subs.lock().unwrap().remove(&query_id);
-        }
         // Notify subscription relay for remote cleanup
         if let Some(ref relay) = self.subscription_relay {
             relay.unsubscribe_predicate(query_id);
         }
     }
 
-    fn update_remote_query(
-        &self,
-        query_id: proto::QueryId,
-        selection: ankql::ast::Selection,
-        version: u32,
-    ) -> Result<Option<tokio::sync::oneshot::Receiver<Vec<crate::entity::Entity>>>, anyhow::Error> {
-        match self.subscription_relay {
-            Some(ref relay) => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                // no need to insert into predicate_context
-                {
-                    // update the version
-                    let mut pending_subs = self.pending_predicate_subs.lock().unwrap();
-                    pending_subs.insert(query_id, (version, tx));
-                }
-                relay.update_query(query_id, selection, version)?;
-                Ok(Some(rx))
-            }
-            None => Ok(None),
+    fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
+        if let Some(ref relay) = self.subscription_relay {
+            relay.update_query(query_id, selection, version)?;
         }
+        Ok(())
     }
 
     async fn fetch_entities_from_local(
@@ -796,7 +832,9 @@ where
         Node::fetch_entities_from_local(self, collection_id, selection).await
     }
 
-    fn reactor(&self) -> &Reactor { &self.0.reactor }
+    fn reactor(&self) -> &Reactor<Entity> { &self.0.reactor }
+
+    fn has_subscription_relay(&self) -> bool { self.subscription_relay.is_some() }
 }
 
 impl<SE, PA> fmt::Display for Node<SE, PA>

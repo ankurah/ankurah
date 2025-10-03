@@ -31,7 +31,7 @@ pub struct Connection {
     db: SendWrapper<IdbDatabase>,
     // _callbacks: SendWrapper<Vec<Box<dyn Any>>>,
     /// Keep onversionchange handler alive for the lifetime of the connection
-    onversionchange: Option<SendWrapper<Closure<dyn FnMut(IdbVersionChangeEvent)>>>,
+    _onversionchange: Option<SendWrapper<Closure<dyn FnMut(IdbVersionChangeEvent)>>>,
     /// Mark connection as stale when a versionchange occurs; triggers lazy reopen
     stale: Arc<AtomicBool>,
 }
@@ -205,6 +205,6 @@ impl Connection {
             }
         }) as Box<dyn FnMut(IdbVersionChangeEvent)>);
         db.set_onversionchange(Some(onversionchange.as_ref().unchecked_ref()));
-        Ok(Self { db: SendWrapper::new(db), onversionchange: Some(SendWrapper::new(onversionchange)), stale })
+        Ok(Self { db: SendWrapper::new(db), _onversionchange: Some(SendWrapper::new(onversionchange)), stale })
     }
 }
