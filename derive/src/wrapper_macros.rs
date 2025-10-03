@@ -105,11 +105,3 @@ pub fn impl_wrapper_type_impl(custom_type: &syn::Type) -> syn::Result<TokenStrea
         pub use #hygiene_module::*;
     })
 }
-
-/// Generate materialized type name by substituting the concrete type
-/// Vec<u8> -> VecU8, HashMap<String, i32> -> HashMap_String_i32, etc.
-fn generate_materialized_name(pattern: &str, concrete_type: &str) -> String {
-    // Convert complex types to valid identifiers with underscores
-    let sanitized_type = concrete_type.replace("<", "_").replace(">", "").replace(" ", "").replace(",", "_").replace("::", "");
-    pattern.replace("{T}", &sanitized_type)
-}

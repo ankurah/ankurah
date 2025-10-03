@@ -19,9 +19,6 @@ pub enum MembershipChange {
 pub struct ReactorUpdate<E = Entity, Ev = Attested<Event>> {
     /// All entities that changed, with their relevance information
     pub items: Vec<ReactorUpdateItem<E, Ev>>,
-    /// A this update contains initial records for this update (with version)
-    /// If this is a predicate update, the the items list may contain only those records which were NOT present in the previous update
-    pub initialized_query: Option<(proto::QueryId, u32)>,
 }
 
 /// A single entity update with all relevance information
@@ -31,19 +28,13 @@ pub struct ReactorUpdateItem<E = Entity, Ev = Attested<Event>> {
     pub entity: E,
     /// Events that caused this update
     pub events: Vec<Ev>,
-    /// Whether this entity is explicitly subscribed (entity-level subscription)
-    pub entity_subscribed: bool,
-    /// Which predicates this update is relevant to and how
-    /// Empty if only relevant due to entity_subscribed
+    /// Which predicates this update is relevant to (if any) and how
     pub predicate_relevance: Vec<(proto::QueryId, MembershipChange)>,
 }
 
 impl<E, Ev: Clone> ReactorUpdateItem<E, Ev> {
     /// Check if this item represents any membership change
     pub fn has_membership_change(&self) -> bool { !self.predicate_relevance.is_empty() }
-
-    /// Check if this is purely an entity subscription update
-    pub fn is_entity_only(&self) -> bool { self.entity_subscribed && self.predicate_relevance.is_empty() }
 }
 
 // Note: ReactorUpdate to ChangeSet<Entity> conversion removed since Entity doesn't implement View

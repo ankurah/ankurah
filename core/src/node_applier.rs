@@ -1,24 +1,33 @@
 use crate::{
-    action_info, changes::EntityChange, error::MutationError, lineage::Retrieve, node::Node, policy::PolicyAgent, storage::StorageEngine,
+    changes::EntityChange,
+    error::{ApplyError, ApplyErrorItem, MutationError},
+    lineage::Retrieve,
+    node::Node,
+    policy::PolicyAgent,
+    storage::StorageEngine,
+    util::ready_chunks::ReadyChunks,
 };
 use ankurah_proto::{self as proto, Event, EventId};
+use futures::stream::StreamExt;
+use proto::Attested;
 
-pub struct UpdateApplier;
+/// Consolidates all logic for applying remote updates to a node
+/// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
+pub struct NodeApplier;
 
-impl UpdateApplier {
+impl NodeApplier {
     /// Similar to commit_transaction, except that we check event attestations instead of checking write permissions
     /// we also don't need to fan events out to peers because we're receiving them from a peer
     pub(crate) async fn apply_updates<SE, PA>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-        initialized_query: Option<(proto::QueryId, u32)>,
     ) -> Result<(), MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        action_info!(node, "received subscription update for {} items", "{}", items.len());
+        tracing::info!("received subscription update for {} items", items.len());
 
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
         // but this feels brittle, because failure to apply this event would affect the other contexts on this node.
@@ -30,49 +39,15 @@ impl UpdateApplier {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
         }
 
-        // only call the initialization channel if the version matches what we expect
-        let notify_initial_set = if let Some((query_id, received_version)) = initialized_query {
-            let mut pending_subs = node.pending_predicate_subs.lock().unwrap();
-            match pending_subs.entry(query_id) {
-                std::collections::hash_map::Entry::Occupied(entry) => {
-                    let (expected_version, _) = entry.get();
-                    if received_version == *expected_version {
-                        Some((entry.remove().1, query_id, received_version))
-                    } else {
-                        // Stale response - ignore it but keep the entry
-                        tracing::warn!("Received stale predicate update v{} but expecting v{}", received_version, expected_version);
-                        None
-                    }
-                }
-                std::collections::hash_map::Entry::Vacant(_) => None,
-            }
-        } else {
-            None
-        };
-
-        if let Some((tx, query_id, version)) = notify_initial_set {
-            let mut changes = Vec::new();
-            let mut entities = Vec::new();
-            for update in items {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
-                Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut entities).await?;
-            }
-
-            // Turns out we actually shouldn't call reactor.notify_change here, because this update is special - it's not actually a change, it's an initial set for a query
-            // This is going away anyway with PR140, which moves the initial set to the SubscribeQuery response
-
-            // Send entities (we already verified this is the expected version)
-            let _ = tx.send(entities); // Ignore if receiver was dropped
-        } else {
-            // Use unit type to avoid accumulation
-            let mut changes = Vec::new();
-            for update in items {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
-                Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
-            }
-
-            node.reactor.notify_change(changes).await;
+        // Apply all updates and notify reactor
+        let mut changes = Vec::new();
+        for update in items {
+            let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
+            Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
+            retriever.store_used_events().await?;
         }
+
+        node.reactor.notify_change(changes).await;
 
         Ok(())
     }
@@ -90,27 +65,11 @@ impl UpdateApplier {
         PA: PolicyAgent + Send + Sync + 'static,
         R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
     {
-        // TODO: do we actually need predicate_relevance and entity_subscribed?
-        let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _, entity_subscribed: _ } =
-            update;
+        // TODO: do we actually need predicate_relevance?
+        let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _ } = update;
         let collection = node.collections.get(&collection_id).await?;
 
         match content {
-            // StateOnly: equivalent to old SubscriptionItem::Initial
-            proto::UpdateContent::StateOnly(state_fragment) => {
-                let state = (entity_id, collection_id, state_fragment).into();
-                node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
-
-                let (changed, entity) =
-                    node.entities.with_state(retriever, state.payload.entity_id, state.payload.collection, state.payload.state).await?;
-                entities.push(entity.clone());
-
-                if matches!(changed, Some(true) | None) {
-                    Self::save_state(node, &entity, &collection).await?;
-                    changes.push(EntityChange::new(entity, vec![])?);
-                }
-            }
-
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
                 let events = Self::save_events(node, from_peer_id, entity_id, &collection_id, event_fragments, &collection).await?;
@@ -162,7 +121,7 @@ impl UpdateApplier {
         collection_id: &proto::CollectionId,
         fragments: Vec<proto::EventFragment>,
         collection: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<Vec<proto::Attested<proto::Event>>, MutationError>
+    ) -> Result<Vec<Attested<proto::Event>>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -192,9 +151,132 @@ impl UpdateApplier {
         let state = entity.to_state()?;
         let entity_state = proto::EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
         let attestation = node.policy_agent.attest_state(node, &entity_state);
-        let attested = proto::Attested::opt(entity_state, attestation);
+        let attested = Attested::opt(entity_state, attestation);
         collection_wrapper.set_state(attested).await?;
         Ok(())
+    }
+
+    /// Apply multiple EntityDeltas in parallel with batched reactor notification
+    /// Drains all ready futures per wake and calls reactor.notify_change for each batch
+    /// Collects all errors and returns them at the end - caller decides whether to fail or log
+    pub(crate) async fn apply_deltas<SE, PA, R>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        deltas: Vec<proto::EntityDelta>,
+        retriever: &R,
+    ) -> Result<(), ApplyError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+    {
+        // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
+        // if there are stragglers, they will be picked up on the next wake
+        // this should in theory be deterministic for eventbridge cases where all events are immediately available
+        let mut ready_chunks = ReadyChunks::new(deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, retriever)));
+
+        let mut all_errors = Vec::new();
+
+        while let Some(results) = ready_chunks.next().await {
+            let mut batch = Vec::new();
+
+            for result in results {
+                match result {
+                    Ok(Some(change)) => batch.push(change),
+                    Ok(None) => {} // No change, continue
+                    Err(error_item) => {
+                        all_errors.push(error_item);
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                node.reactor.notify_change(batch).await;
+            }
+        }
+
+        if !all_errors.is_empty() {
+            return Err(ApplyError::Items(all_errors));
+        }
+
+        Ok(())
+    }
+
+    /// Apply EntityDelta from Fetch or QuerySubscribed responses
+    /// Returns Some(EntityChange) if the delta resulted in a change, None otherwise
+    async fn apply_delta<SE, PA, R>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        delta: proto::EntityDelta,
+        retriever: &R,
+    ) -> Result<Option<EntityChange>, ApplyErrorItem>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+    {
+        let entity_id = delta.entity_id;
+        let collection = delta.collection.clone();
+
+        let result = Self::apply_delta_inner(node, from_peer_id, delta, retriever).await;
+        result.map_err(|cause| ApplyErrorItem { entity_id, collection, cause })
+    }
+
+    async fn apply_delta_inner<SE, PA, R>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        delta: proto::EntityDelta,
+        retriever: &R,
+    ) -> Result<Option<EntityChange>, MutationError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+    {
+        let collection = node.collections.get(&delta.collection).await?;
+
+        match delta.content {
+            proto::DeltaContent::StateSnapshot { state } => {
+                let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
+                node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
+
+                let (_, entity) =
+                    node.entities.with_state(retriever, delta.entity_id, delta.collection, attested_state.payload.state).await?;
+
+                // Save state to storage
+                Self::save_state(node, &entity, &collection).await?;
+
+                // Phase 1: Return EntityChange with empty events
+                Ok(Some(EntityChange::new(entity, Vec::new())?))
+            }
+
+            proto::DeltaContent::EventBridge { events } => {
+                let attested_events: Vec<Attested<proto::Event>> =
+                    events.into_iter().map(|f| (delta.entity_id, delta.collection.clone(), f).into()).collect();
+
+                retriever.stage_events(attested_events.clone());
+                // Get or create entity
+                let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
+
+                // HACK - applying events in reverse order to avoid triggering the NotDescends bug
+                // in apply_event where the event is wrongly made concurrent
+                for event in attested_events.into_iter().rev() {
+                    entity.apply_event(retriever, &event.payload).await?;
+                    retriever.mark_event_used(&event.payload.id());
+                }
+
+                // Save updated state
+                Self::save_state(node, &entity, &collection).await?;
+
+                // Phase 1: Return EntityChange with empty events
+                Ok(Some(EntityChange::new(entity, Vec::new())?))
+            }
+
+            proto::DeltaContent::StateAndRelation { state: _, relation: _ } => {
+                // Phase 2: Will validate causal assertion and apply state
+                unimplemented!("StateAndRelation not yet implemented in Phase 1")
+            }
+        }
     }
 }
 

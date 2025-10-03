@@ -37,7 +37,9 @@ impl<T: 'static> CBRace<T> {
     }
 
     /// Receive the result from the callback
+    #[allow(unused)]
     pub async fn recv(self) -> T { self.receiver.await.expect("receiver await failed") }
+    #[allow(unused)]
     pub async fn take(mut self) -> Result<Option<T>, TakeError> {
         match self.receiver.try_recv() {
             Ok(result) => Ok(Some(result)),

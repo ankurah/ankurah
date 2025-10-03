@@ -29,17 +29,13 @@ async fn test_edge_cases() -> Result<(), anyhow::Error> {
 
     assert_eq!(names(&fetch(&ctx, "name = ''").await?), vec![""]);
 
-    info!("MARK0");
     assert_eq!(names(&fetch(&ctx, "name = 'Special!@#$%'").await?), vec!["Special!@#$%"]);
 
-    info!("MARK0.1");
     assert_eq!(names(&fetch(&ctx, "name = 'Unicode: 你好'").await?), vec!["Unicode: 你好"]);
 
-    info!("MARK0.2");
     assert_eq!(names(&fetch(&ctx, "name = 'UPPERCASE'").await?), vec!["UPPERCASE"]);
     assert_eq!(names(&fetch(&ctx, "name = 'lowercase'").await?), vec!["lowercase"]);
 
-    info!("MARK1");
     assert_eq!(
         sort_names(&fetch(&ctx, "(name = 'UPPERCASE' OR name = 'lowercase') AND year >= '2004'").await?),
         vec!["UPPERCASE", "lowercase"]

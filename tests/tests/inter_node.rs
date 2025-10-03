@@ -11,7 +11,7 @@ use tracing::info;
 
 use common::{Album, AlbumView, Pet, PetView};
 
-use crate::common::TestWatcher;
+use crate::common::*;
 
 pub fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap_or_default()).collect::<Vec<String>>() }
 
@@ -100,32 +100,47 @@ async fn server_edits_subscription() -> Result<()> {
     };
 
     info!("rex: {}, snuffy: {}, jasper: {}", rex.entity(), snuffy.entity(), jasper.entity());
-    // assert_eq!(check_server(), vec![vec![(rex.id(), ChangeKind::Add)]]);
 
     // Set up subscription on node2
-    let client_watcher = TestWatcher::changeset();
-    let pred = "name = 'Rex' OR (age > 2 and age < 5)";
-    // Cached behavior: subscribe before remote initialization
+    let client_watcher = TestWatcher::changeset_with_event_ids();
     let cached_watcher = TestWatcher::changeset();
-    let _cached_handle = client.query::<PetView>(pred)?.subscribe(&cached_watcher);
-    // Main LiveQuery uses nocache to await remote initialization
-    let client_query = client.query_wait::<PetView>(nocache(pred)?).await?;
-    let _client_handle = client_query.subscribe(&client_watcher);
+    let pred = "name = 'Rex' OR (age > 2 and age < 5)";
 
-    // watcher should not have any changes yet because we waited for the LiveQuery to be initialized before subscribing to eliminate race conditions
-    assert_eq!(client_watcher.count(), 0);
+    let cached_query = client.query::<PetView>(pred)?; // Cached behavior: subscribe before remote initialization
+    assert_eq!(cached_query.ids(), vec![]); // didn't wait for initialization AND the client cache is empty, so should be empty for two reasons
+    let _cached_handle = cached_query.subscribe(&cached_watcher);
+    assert_eq!(cached_watcher.count(), 0); // we don't notify on subscribe so there should be no changes yet
+
+    // Use nocache - so we have to call the server before it's considered initialized
+    let client_query = client.query_wait::<PetView>(nocache(pred)?).await?;
+    assert_eq!(client_query.ids(), vec![rex.id()]); // client query should immediately include rex because we awaited initialization
+    let _client_handle = client_query.subscribe(&client_watcher);
+    assert_eq!(client_watcher.count(), 0); // we don't notify on subscribe so there should be no changes yet
+
+    info!("cached_query: {}, client_query: {}", cached_query.query_id(), client_query.query_id()); // for debugging
 
     // Update Rex's age to 7 on node1
     {
         let trx = server.begin();
         rex.edit(&trx)?.age().overwrite(0, 1, "7")?;
+        info!("COMMITING REX UPDATE");
         trx.commit().await?;
     }
 
-    // Wait for and verify the update notification
-    assert_eq!(client_watcher.take_one().await, vec![(rex.id(), ChangeKind::Update)]); // Rex still matches the predicate, but the age has changed
-                                                                                       // Cached watcher: empty init, Add for initial arrival, then Update for age change
-    assert_eq!(cached_watcher.take(3).await, vec![vec![], vec![(rex.id(), ChangeKind::Add)], vec![(rex.id(), ChangeKind::Update)]]);
+    // Client watcher doesn't get an ::Initial notification because we waited for initialization to be completed before subscribing
+    assert_eq!(client_watcher.take_one().await, vec![(rex.id(), ChangeKind::Update, rex.entity().head().to_vec())]);
+    assert_eq!(client_query.ids(), vec![rex.id()]);
+    assert_eq!(client_query.peek().iter().map(|r| r.age().unwrap_or_default()).collect::<Vec<String>>(), vec!["7"]);
+    assert_eq!(client_query.loaded(), true);
+
+    // Cached watcher subscribes before initialization, so should have an initial [], then Add when the server deltas arrive, then an Update when the age is updated
+    assert_eq!(cached_watcher.take(3).await?, vec![vec![], vec![(rex.id(), ChangeKind::Add)], vec![(rex.id(), ChangeKind::Update)]]);
+    assert_eq!(cached_query.ids(), vec![rex.id()]);
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert_eq!(cached_query.peek().get(0).unwrap().id(), client_query.peek().get(0).unwrap().id());
+    assert_eq!(cached_query.peek().get(0).unwrap(), client_query.peek().get(0).unwrap());
+    assert_eq!(cached_query.peek().iter().map(|r| r.age().unwrap_or_default()).collect::<Vec<String>>(), vec!["7"]);
+    println!("cached_query loaded: {}", cached_query.loaded());
 
     // Update Snuffy's age to 3 on node1
     {
@@ -137,7 +152,8 @@ async fn server_edits_subscription() -> Result<()> {
     }
 
     // Wait for and verify Snuffy being added (now matches age > 2 and age < 5)
-    assert_eq!(client_watcher.take_one().await, vec![(snuffy.id(), ChangeKind::Add)]);
+    assert_eq!(client_watcher.take_one().await, vec![(snuffy.id(), ChangeKind::Add, snuffy.entity().head().to_vec())]);
+    // assert_eq!(one.into_iter().map(|(e, k, _)| (e, k)).collect::<Vec<(EntityId, ChangeKind)>>(), vec![(snuffy.id(), ChangeKind::Add)]);
 
     // Ensure no additional unexpected changes
     assert_eq!(client_watcher.quiesce().await, 0);
@@ -305,7 +321,7 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     // The nocache watcher only receives one ::Update because the record is already arrived from the server before the signal subscribe
     // due to a combination of using query_wait and nocache(). if the cached version used query_wait instead, it should have
     // received only ::Add and ::Update - not the blank initial notification
-    assert_eq!(cached_watcher.take(3).await, vec![vec![], vec![(pet_id, ChangeKind::Add)], vec![(pet_id, ChangeKind::Update)]]);
+    assert_eq!(cached_watcher.take(3).await?, vec![vec![], vec![(pet_id, ChangeKind::Add)], vec![(pet_id, ChangeKind::Update)]]);
     // Drop cached subscription before testing later lifecycle expectations
     drop(_cached_guard);
 
@@ -323,7 +339,11 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     }
 
     // Verify that subscriptions did NOT receive the update after being dropped
-    assert_eq!(lq_watcher.quiesce().await, 0, "subscription to LiveQuery signal should not receive updates after dropping lq_subguard");
+    assert_eq!(
+        lq_watcher.quiesce_drain().await,
+        vec![] as Vec<Vec<(EntityId, ChangeKind)>>,
+        "subscription to LiveQuery signal should not receive updates after dropping lq_subguard"
+    );
     assert_eq!(
         view_watcher.take_one().await,
         client_pet.clone(),
@@ -331,6 +351,8 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     );
 
     drop(client_livequery);
+    // give the server time to apply the unsubscribe
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     {
         let trx = server.begin();
@@ -353,6 +375,52 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     // tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for propagation to client
     // assert_eq!(pet.age(), "6"); // Updates to the underlying entity should continue even after everything (other than the Entity itself) is dropped
     // assert_eq!(check_view_changes(), vec![],"But the subscription to the View signal should be dead with the dropping of the view_subguard"
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_lineage_event_bridge() -> Result<()> {
+    // Tests that EventBridge efficiently handles cases where the client is missing many intermediate events.
+    // The server sends all needed events in the EventBridge response rather than requiring recursive fetches.
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    // Connect the nodes
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let server = server.context(c)?;
+    let client = client.context(c)?;
+
+    // Create initial entity on server
+    let pet_id = {
+        let trx = server.begin();
+        let pet = trx.create(&Pet { name: "BudgetTest".to_string(), age: "1".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    // Client gets the entity (no subscription established)
+    let client_pet = client.get::<PetView>(pet_id).await?;
+    assert_eq!(client_pet.age().unwrap(), "1");
+
+    // Server makes 11 changes (exceeds retrieval budget of 10)
+    for i in 2..=12 {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace(&i.to_string())?;
+        trx.commit().await?;
+    }
+
+    // Client fetches - EventBridge provides all missing events efficiently
+    let results = client.fetch::<PetView>("name = 'BudgetTest'").await?;
+
+    assert_eq!(results.len(), 1);
+    let client_pet = &results[0];
+    assert_eq!(client_pet.age().unwrap(), "12", "Client should have final state after EventBridge");
 
     Ok(())
 }

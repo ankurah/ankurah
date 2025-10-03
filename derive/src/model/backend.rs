@@ -105,11 +105,13 @@ impl ActiveTypeDesc {
     }
 
     /// Get the wrapper type for WASM bindings
+    #[allow(unused)]
     pub fn wrapper_type(&self) -> syn::Result<syn::Type> {
         let wrapper_name = self.wrapper_type_name();
         syn::parse_str(&wrapper_name)
     }
 
+    #[allow(unused)]
     pub fn rust_type_name(&self) -> String {
         let rust_type = self.rust_type().unwrap();
         quote!(#rust_type).to_string()

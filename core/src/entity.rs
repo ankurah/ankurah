@@ -8,11 +8,10 @@ use crate::{
 };
 use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
-use anyhow::anyhow;
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -76,10 +75,7 @@ impl std::ops::Deref for TemporaryEntity {
 }
 
 impl PartialEq for Entity {
-    fn eq(&self, other: &Self) -> bool {
-        // Compare entities by their ID - two entities are equal if they have the same ID
-        self.id == other.id
-    }
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }
 
 /// A weak reference to an entity
@@ -214,16 +210,16 @@ impl Entity {
         let mut head = self.head();
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;
-        let budget = 100;
+        let budget = 10;
 
         for attempt in 0..MAX_RETRIES {
             match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
                 lineage::Ordering::Equal => {
-                    debug!("Equal - skip");
+                    info!("Equal - skip");
                     return Ok(false);
                 }
                 lineage::Ordering::Descends => {
-                    debug!("Descends - apply (attempt {})", attempt + 1);
+                    info!("Descends - apply (attempt {})", attempt + 1);
                     let new_head = event.id().into();
                     // Atomic update: apply operations and set head under single lock
                     {
@@ -264,12 +260,8 @@ impl Entity {
                     return Ok(true);
                 }
                 lineage::Ordering::NotDescends { meet: _ } => {
-                    // TODOs:
-                    // [ ] we should probably have some rules about when a non-descending (concurrent) event is allowed. In a way, this is the same question as Descends with a gap, as discussed above
-                    // [ ] update LWW backend determine which value to keep based on its deterministic last write win strategy. (just lexicographic winner, I think?)
-                    // [ ] differentiate NotDescends into Ascends and Concurrent. we should ignore the former, and apply the latter
-                    // just doing the needful for now
-                    debug!("NotDescends - applying (attempt {})", attempt + 1);
+                    // HACK - this is totally wrong, and should be handled by the Visitor discussed in concurrent-updates/spec.md
+                    info!("NotDescends - applying (attempt {})", attempt + 1);
                     // Atomic update: apply operations and augment head under single lock
                     {
                         let mut state = self.state.write().unwrap();
@@ -291,6 +283,7 @@ impl Entity {
                 }
                 lineage::Ordering::Incomparable => {
                     // total apples and oranges - take a hike buddy
+                    error!("{self} apply_event - Incomparable. This should essentially never happen among good actors.");
                     return Err(LineageError::Incomparable.into());
                 }
                 lineage::Ordering::PartiallyDescends { meet } => {
@@ -300,6 +293,7 @@ impl Entity {
                     return Err(LineageError::PartiallyDescends { meet }.into());
                 }
                 lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                    error!("BudgetExceeded");
                     return Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into());
                 }
             }
@@ -320,7 +314,7 @@ impl Entity {
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
-        let budget = 100;
+        let budget = 10;
 
         match crate::lineage::compare(getter, &new_head, &head, budget).await? {
             lineage::Ordering::Equal => {
@@ -352,7 +346,7 @@ impl Entity {
                 Ok(false)
             }
             lineage::Ordering::Incomparable => {
-                error!("{self} apply_state - heads are incomparable");
+                error!("{self} apply_state - heads are incomparable. This should essentially never happen among good actors.");
                 // total apples and oranges - take a hike buddy
                 Err(LineageError::Incomparable.into())
             }
@@ -442,7 +436,7 @@ impl AbstractEntity for Entity {
 
 impl std::fmt::Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Entity({}/{} {})", self.collection, self.id.to_base64_short(), self.head())
+        write!(f, "Entity({}/{} {:#})", self.collection, self.id.to_base64_short(), self.head())
     }
 }
 
@@ -608,6 +602,21 @@ impl WeakEntitySet {
         entity
     }
 
+    /// Get or create entity after async operations, checking for race conditions
+    /// Returns (existed, entity) where existed is true if the entity was already present
+    fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
+        let mut entities = self.0.write().unwrap();
+        if let Some(existing_weak) = entities.get(&id) {
+            if let Some(existing_entity) = existing_weak.upgrade() {
+                debug!("Entity {id} was created by another thread during async work, using that one");
+                return Ok((true, existing_entity));
+            }
+        }
+        let entity = Entity::from_state(id, collection_id.to_owned(), state)?;
+        entities.insert(id, entity.weak());
+        Ok((false, entity))
+    }
+
     /// Returns a tuple of (changed, entity)
     /// changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
     /// None if the entity was not previously on the local node (either in the WeakEntitySet or in storage)
@@ -621,49 +630,24 @@ impl WeakEntitySet {
     where
         R: Retrieve<Id = EventId, Event = Event>,
     {
-        let entity = {
-            let mut entities = self.0.write().unwrap();
-            match entities.entry(id) {
-                Entry::Vacant(_) => None,
-                Entry::Occupied(o) => match o.get().upgrade() {
-                    Some(entity) => {
-                        debug!("Entity {id} was resident");
-                        if entity.collection != collection_id {
-                            return Err(RetrievalError::Anyhow(anyhow!("collection mismatch {} {collection_id}", entity.collection)));
+        let entity = match self.get(&id) {
+            Some(entity) => entity, // already resident
+            None => {
+                // not yet resident. We have to retrieve our baseline state before applying the new state
+                if let Some(stored_state) = retriever.get_state(id).await? {
+                    // get a resident entity for this retrieved state. It's possible somebody frontran us to create it
+                    // but we don't actually care, so we ignore the created flag
+                    self.private_get_or_create(id, &collection_id, &stored_state.payload.state)?.1
+                } else {
+                    // no stored state, so we can use the given state directly
+                    match self.private_get_or_create(id, &collection_id, &state)? {
+                        (true, entity) => entity, // some body frontran us to create it, so we have to apply the new state
+                        (false, entity) => {
+                            // we just created it with the given state, so there's nothing to apply. early return
+                            return Ok((None, entity));
                         }
-                        Some(entity)
                     }
-                    None => {
-                        debug!("Entity {id} was deallocated");
-                        None
-                    }
-                },
-            }
-        };
-
-        // Handle the case where entity is not resident (either vacant or deallocated)
-        let Some(entity) = entity else {
-            // Check if there's existing state in storage before creating a new entity
-            if let Some(existing_state) = retriever.get_state(id).await? {
-                debug!("Found existing state in storage for {id}");
-                let entity = Entity::from_state(id, collection_id.to_owned(), &existing_state.payload.state)?;
-
-                {
-                    self.0.write().unwrap().insert(id, entity.weak());
                 }
-
-                // We need to apply the new state to check lineage
-                let changed = entity.apply_state(retriever, &state).await?;
-                return Ok((Some(changed), entity));
-            } else {
-                debug!("No existing state in storage for {id}");
-                let entity = Entity::from_state(id, collection_id.to_owned(), &state)?;
-
-                {
-                    self.0.write().unwrap().insert(id, entity.weak());
-                }
-
-                return Ok((None, entity));
             }
         };
 

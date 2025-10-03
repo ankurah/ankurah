@@ -75,6 +75,15 @@ impl<R: View + Send + Sync + 'static> TestWatcher<ChangeSet<R>, Vec<(proto::Enti
             transform: Arc::new(|changeset: ChangeSet<R>| changeset.changes.iter().map(|c| (c.entity().id(), c.into())).collect()),
         }
     }
+    pub fn changeset_with_event_ids() -> TestWatcher<ChangeSet<R>, Vec<(proto::EntityId, ChangeKind, Vec<proto::EventId>)>> {
+        TestWatcher {
+            changes: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+            transform: Arc::new(|changeset: ChangeSet<R>| {
+                changeset.changes.iter().map(|c| (c.entity().id(), c.into(), c.events().iter().map(|e| e.payload.id()).collect())).collect()
+            }),
+        }
+    }
 
     /// Drains and returns all accumulated changesets, sorting each changeset by the first element of the tuple
     /// Importantly, this does not sort the list of changesets, only the items within each changeset
@@ -96,10 +105,12 @@ impl<T, U> TestWatcher<T, U> {
     pub fn drain(&self) -> Vec<U> { self.changes.lock().unwrap().drain(..).map(|item| (self.transform)(item)).collect() }
 
     /// Waits for exactly `count` items to accumulate, then drains and returns them
-    pub async fn take(&self, count: usize) -> Vec<U> {
-        self.wait_for_count(count, Some(Duration::from_secs(10))).await;
+    pub async fn take(&self, count: usize) -> Result<Vec<U>, anyhow::Error> {
+        if !self.wait_for_count(count, Some(Duration::from_secs(10))).await {
+            return Err(anyhow::anyhow!("take({}) timed out waiting for items (waited 10 seconds, got {} items)", count, self.count()));
+        }
         let mut changes = self.changes.lock().unwrap();
-        changes.drain(0..count).map(|item| (self.transform)(item)).collect()
+        Ok(changes.drain(0..count).map(|item| (self.transform)(item)).collect())
     }
 
     /// Returns the current number of accumulated changesets without draining them
@@ -111,11 +122,18 @@ impl<T, U> TestWatcher<T, U> {
     /// Waits for at least 1 item, then takes and returns exactly the first one
     #[track_caller]
     pub fn take_one(&self) -> impl std::future::Future<Output = U> + '_ {
+        let caller = std::panic::Location::caller();
         async move {
             let _success = self.wait_for_count(1, Some(Duration::from_secs(10))).await;
             let mut changes = self.changes.lock().unwrap();
             if changes.is_empty() {
-                panic!("take_one() timed out waiting for items (waited 10 seconds, got {} items)", changes.len());
+                panic!(
+                    "take_one() timed out waiting for items (waited 10 seconds, got {} items) at {}:{}:{}",
+                    changes.len(),
+                    caller.file(),
+                    caller.line(),
+                    caller.column()
+                );
             }
             let item = changes.remove(0);
             (self.transform)(item)
@@ -126,6 +144,10 @@ impl<T, U> TestWatcher<T, U> {
     pub async fn quiesce(&self) -> usize {
         tokio::time::sleep(Duration::from_millis(100)).await;
         self.count()
+    }
+    pub async fn quiesce_drain(&self) -> Vec<U> {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.drain()
     }
 
     /// Wait for at least `count` items to accumulate, then drain and return all items
