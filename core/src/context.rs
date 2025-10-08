@@ -283,7 +283,7 @@ where
         }
 
         // Notify reactor of ALL changes
-        self.node.reactor.notify_change(changes);
+        self.node.reactor.notify_change(changes).await;
         Ok(())
     }
 }

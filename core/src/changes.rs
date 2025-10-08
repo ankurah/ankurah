@@ -1,10 +1,20 @@
-use crate::{entity::Entity, error::MutationError, model::View};
+use crate::{entity::Entity, error::MutationError, model::View, reactor::ChangeNotification};
 use ankurah_proto::{Attested, Event};
 
 #[derive(Debug, Clone)]
 pub struct EntityChange {
     entity: Entity,
     events: Vec<Attested<Event>>,
+}
+
+// Implement the trait for EntityChange
+impl ChangeNotification for EntityChange {
+    type Entity = Entity;
+    type Event = ankurah_proto::Attested<Event>;
+
+    fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { (self.entity, self.events) }
+    fn entity(&self) -> &Self::Entity { &self.entity }
+    fn events(&self) -> &[Self::Event] { &self.events }
 }
 
 // TODO consider a flattened version of EntityChange that includes the entity and Vec<(operations, parent, attestations)> rather than a Vec<Attested<Event>>
@@ -23,8 +33,6 @@ impl EntityChange {
         }
         Ok(Self { entity, events })
     }
-    pub fn entity(&self) -> &Entity { &self.entity }
-    pub fn events(&self) -> &[Attested<Event>] { &self.events }
     pub fn into_parts(self) -> (Entity, Vec<Attested<Event>>) { (self.entity, self.events) }
 }
 

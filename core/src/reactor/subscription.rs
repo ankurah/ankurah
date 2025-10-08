@@ -50,6 +50,8 @@ pub struct ReactorSubscription<
     Ev: Clone + Send + 'static = ankurah_proto::Attested<ankurah_proto::Event>,
 >(pub(super) Arc<ReactorSubInner<E, Ev>>);
 
+// TODO Consider adding a weak ref and combining this with subscription_state::Subscription
+
 impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> ReactorSubscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
@@ -60,7 +62,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
 
     /// Remove a predicate from this subscription
     pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
-        self.0.reactor.remove_predicate(self.0.subscription_id, query_id)?;
+        self.0.reactor.remove_query(self.0.subscription_id, query_id)?;
         Ok(())
     }
 

@@ -3,15 +3,13 @@ use crate::common::TestWatcher;
 use ankurah::changes::ChangeKind;
 use ankurah::signals::Subscribe;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
+use common::*;
 use std::sync::Arc;
 
 #[tokio::test]
 async fn test_predicate_update() -> Result<()> {
-    use common::*;
-
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
 

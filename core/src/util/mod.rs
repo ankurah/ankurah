@@ -1,7 +1,9 @@
 pub mod iterable;
+pub mod ivec;
 pub mod safemap;
 pub mod safeset;
 pub use iterable::Iterable;
+pub use ivec::IVec;
 
 /// Formats an action log with consistent styling.
 /// First argument is always a "thing" that performed the action (in bold blue)

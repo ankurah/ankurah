@@ -546,7 +546,7 @@ where
             }
         }
 
-        self.reactor.notify_change(changes);
+        self.reactor.notify_change(changes).await;
 
         Ok(())
     }

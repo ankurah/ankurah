@@ -71,7 +71,7 @@ impl UpdateApplier {
                 Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
             }
 
-            node.reactor.notify_change(changes);
+            node.reactor.notify_change(changes).await;
         }
 
         Ok(())
