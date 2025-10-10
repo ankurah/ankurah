@@ -247,6 +247,8 @@ where
     /* enum-decision flags */
     unseen_other_heads: usize,
     head_overlap: bool,
+    // True when the initial head sets are identical; allows early Equal
+    initial_heads_equal: bool,
     any_common: bool,
 
     /* event accumulator for building event bridges */
@@ -274,6 +276,10 @@ where
         let other: BTreeSet<_> = other.members().iter().cloned().collect();
         let original_other_events = other.clone();
 
+        // Early signal: if initial head sets are identical, we can short-circuit Equal
+        let initial_heads_equal = subject_frontier == other;
+        let head_overlap = initial_heads_equal;
+
         Self {
             getter,
 
@@ -284,7 +290,8 @@ where
             remaining_budget: budget,
             original_other_events,
 
-            head_overlap: false,
+            head_overlap,
+            initial_heads_equal,
             any_common: false,
 
             states: HashMap::new(),
@@ -300,6 +307,15 @@ where
 
     // runs one step of the comparison, returning Some(ordering) if a conclusive determination can be made, or None if it needs more steps
     pub async fn step(&mut self) -> Result<Option<Ordering<G::Id>>, RetrievalError> {
+        // Early short-circuit: if the initial head sets are identical, we are Equal.
+        // IMPORTANT: We only use the initial-heads predicate here; we intentionally
+        // do NOT short-circuit on incidental frontier equality mid-traversal, because
+        // in Descends scenarios both traversals can temporarily land on the same
+        // ancestors (frontiers match) before the subject continues past them.
+        if self.initial_heads_equal {
+            return Ok(Some(Ordering::Equal));
+        }
+
         // look up events in both frontiers
         let ids: Vec<G::Id> = self.subject_frontier.union(&self.other_frontier).cloned().collect();
         // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
@@ -330,19 +346,22 @@ where
         let from_subject = self.subject_frontier.remove(&id);
         let from_other = self.other_frontier.remove(&id);
 
-        // Accumulate events from the subject side for event bridge building
-        // Only accumulate events from subject that are NOT in the original other set (known heads)
-        // Probably a better way to fix the overshoot than checking original other events
-        if from_subject && !self.original_other_events.contains(&id) {
-            if let Some(ref mut accumulator) = self.subject_event_accumulator {
-                accumulator.add(&event); // Accumulate the full Attested<Event>
-            }
-        }
-
         // Process the current node and capture relevant state
+        // We do this BEFORE accumulation to track seen_from state
         let (is_common, origins) = {
             let node_state = self.states.entry(id.clone()).or_default();
             node_state.mark_seen_from(from_subject, from_other);
+
+            // Accumulate events from the subject side for event bridge building
+            // Only accumulate events that are:
+            // 1. Currently being processed from subject side
+            // 2. NOT in the original other heads (we don't need to send the known heads)
+            // 3. NOT common (haven't been seen from both sides at any point)
+            if from_subject && !self.original_other_events.contains(&id) && !node_state.is_common() {
+                if let Some(ref mut accumulator) = self.subject_event_accumulator {
+                    accumulator.add(&event); // Accumulate the full Attested<Event>
+                }
+            }
 
             // Handle origins for "other" heads
             if from_other && self.original_other_events.contains(&id) {
@@ -383,7 +402,7 @@ where
             self.subject_frontier.extend(parents.iter().cloned());
 
             if self.original_other_events.contains(&id) {
-                self.unseen_other_heads -= 1;
+                self.unseen_other_heads = self.unseen_other_heads.saturating_sub(1);
                 self.head_overlap = true;
             }
         }
@@ -393,12 +412,24 @@ where
     }
 
     fn check_result(&mut self) -> Option<Ordering<G::Id>> {
-        if self.unseen_other_heads == 0 {
-            return Some(Ordering::Descends);
-        }
-
+        // Decision is only sound when either:
+        //  - both frontiers are exhausted (we fully explored the necessary ancestry), or
+        //  - budget exhausted (explicit BudgetExceeded), otherwise we need more steps.
+        // We no longer treat `unseen_other_heads == 0` alone as Descends, because Equal
+        // also satisfies that predicate. Requiring empty frontiers prevents premature
+        // Descends when the clocks are actually Equal.
         if self.subject_frontier.is_empty() && self.other_frontier.is_empty() {
-            // prune to minimal common ancestors
+            // All of other's heads seen from subject side?
+            if self.unseen_other_heads == 0 {
+                // Equal iff the initial head sets were identical; otherwise Descends.
+                // Rationale: when initial heads match, the only consistent outcome after
+                // exhausting both frontiers is Equal. When they do not, subject has walked
+                // through all of other's heads and (with both frontiers empty) therefore
+                // strictly Descends.
+                return if self.initial_heads_equal { Some(Ordering::Equal) } else { Some(Ordering::Descends) };
+            }
+
+            // Haven't seen all of other's heads - compute meet for partial/not descends
             let meet: Vec<_> = self
                 .meet_candidates
                 .iter()
@@ -428,6 +459,7 @@ where
 #[cfg(test)]
 mod tests {
     use ankurah_proto::{AttestationSet, Attested};
+    use itertools::Itertools;
 
     use super::*;
     use async_trait::async_trait;
@@ -837,18 +869,9 @@ mod tests {
 
         // Extract accumulated events
         let events = comparison.take_accumulated_events().unwrap();
-        let event_ids: Vec<TestId> = events.iter().map(|e| e.payload.id()).collect();
-
         // Should have accumulated events 5, 4, 3 (traversing from current back to known)
-        // Note: The order depends on traversal order, but should contain these events
-        assert_eq!(event_ids.len(), 3);
-        assert!(event_ids.contains(&5));
-        assert!(event_ids.contains(&4));
-        assert!(event_ids.contains(&3));
-        // Should NOT contain event 2 (that's the known head)
-        assert!(!event_ids.contains(&2));
-        // Should NOT contain event 1
-        assert!(!event_ids.contains(&1));
+        // Should NOT contain event 2 (that's the known head) or event 1 (common ancestor)
+        assert_eq!(events.iter().map(|e| e.payload.id()).sorted().collect::<Vec<_>>(), vec![3, 4, 5]);
     }
 
     #[tokio::test]
@@ -901,7 +924,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // FIXME: Ordering::Equal should absolutely work. why doesn't it?
     async fn test_event_accumulator_equal_clocks() {
         let mut store = MockEventStore::new();
 
@@ -924,7 +946,7 @@ mod tests {
         }
 
         let events = comparison.take_accumulated_events().unwrap();
-        // Should have no events accumulated since clocks are equal
+        // Equal clocks short-circuit immediately, no events traversed or accumulated
         assert_eq!(events.len(), 0);
     }
 
