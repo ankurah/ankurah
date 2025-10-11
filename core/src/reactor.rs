@@ -397,7 +397,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         // Wrap changes in Arc for sharing across subscriptions
         let changes: Arc<Vec<C>> = Arc::from(changes);
 
-        tracing::info!("Reactor.notify_change({} changes)", changes.len());
+        tracing::debug!("Reactor.notify_change({} changes)", changes.len());
 
         // Build per-subscription candidate accumulators (first lock of watcher_set)
         let mut candidates_by_sub: HashMap<ReactorSubscriptionId, CandidateChanges<C>> = HashMap::new();
