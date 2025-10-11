@@ -4,10 +4,10 @@ ankql
 # Tier 2: Core infrastructure (depends only on ankql)
 ankurah-proto
 ankurah-derive
+ankurah-signals
 
 # Tier 3: Core functionality (depends on tier 1 & 2)
 ankurah-core
-ankurah-signals
 
 # Tier 4: Main API crate (depends on all above)
 ankurah
