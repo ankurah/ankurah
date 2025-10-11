@@ -13,6 +13,7 @@ ankurah-core
 ankurah
 
 # Tier 5: Storage and connector crates (depends on core tiers)
+ankurah-storage-common
 ankurah-storage-sled
 ankurah-connector-local-process
 ankurah-websocket-server
