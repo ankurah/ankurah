@@ -14,12 +14,12 @@ impl BackendRegistry {
         let mut configs = Vec::new();
 
         // Load built-in configs in order of precedence (YrsString before LWW)
-        let yrs_bytes = include_bytes!("../../../core/src/property/value/yrs.ron");
+        let yrs_bytes = include_bytes!("../../default_backends/yrs.ron");
         let yrs_config: BackendConfig = ron::de::from_bytes(yrs_bytes)
             .map_err(|e| syn::Error::new(proc_macro2::Span::call_site(), format!("Failed to parse yrs.ron: {}", e)))?;
         configs.push(yrs_config);
 
-        let lww_bytes = include_bytes!("../../../core/src/property/value/lww.ron");
+        let lww_bytes = include_bytes!("../../default_backends/lww.ron");
         let lww_config: BackendConfig = ron::de::from_bytes(lww_bytes)
             .map_err(|e| syn::Error::new(proc_macro2::Span::call_site(), format!("Failed to parse lww.ron: {}", e)))?;
         configs.push(lww_config);
