@@ -1,3 +1,4 @@
+0.6.0  Subscription deltas with known_matches and event bridges
 0.5.4  Complete migration to ankurah-signals
 0.5.3  Release ankurah-websocket-client
 0.5.2  Handle exceptions from react hooks, restore react feature flag differentiation vs wasm flag, revert erroneous edit to react extern binding

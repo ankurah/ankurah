@@ -1,13 +1,13 @@
 [package]
 name    = "ankurah-example-server"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 publish = false
 
 [dependencies]
-ankurah                  = { path = "../../ankurah", version = "^0.5.4" }
-ankurah-websocket-server = { path = "../../connectors/websocket-server", version = "^0.5.4" }
-ankurah-storage-sled     = { path = "../../storage/sled", version = "^0.5.4" }
+ankurah                  = { path = "../../ankurah", version = "^0.6.0" }
+ankurah-websocket-server = { path = "../../connectors/websocket-server", version = "^0.6.0" }
+ankurah-storage-sled     = { path = "../../storage/sled", version = "^0.6.0" }
 example-model            = { path = "../model" }
 tracing                  = "0.1"
 tracing-subscriber       = "0.3"
