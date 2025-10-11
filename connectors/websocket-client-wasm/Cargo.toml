@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-websocket-client-wasm"
-version       = "0.5.4"
+version       = "0.6.0"
 authors       = ["Daniel Norman <daniel@danielnorman.net>"]
 edition       = "2021"
 description   = "Ankurah WebSocket Client - A WebSocket client for Ankurah"
@@ -16,10 +16,10 @@ crate-type = ["cdylib", "rlib"]
 default = []
 
 [dependencies]
-ankurah            = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.5.4" }
-ankurah-core       = { path = "../../core", version = "^0.5.4" }
-ankurah-proto      = { path = "../../proto", version = "^0.5.4", features = ["wasm"] }
-ankurah-derive     = { path = "../../derive", version = "^0.5.4" }
+ankurah            = { path = "../../ankurah", features = ["derive", "wasm"], version = "^0.6.0" }
+ankurah-core       = { path = "../../core", version = "^0.6.0" }
+ankurah-proto      = { path = "../../proto", version = "^0.6.0", features = ["wasm"] }
+ankurah-derive     = { path = "../../derive", version = "^0.6.0" }
 serde              = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 
