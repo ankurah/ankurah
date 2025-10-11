@@ -293,7 +293,11 @@ impl Entity {
                     return Err(LineageError::PartiallyDescends { meet }.into());
                 }
                 lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                    error!("BudgetExceeded");
+                    error!(
+                        "BudgetExceeded subject_frontier: {}, other_frontier: {}",
+                        subject_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", "),
+                        other_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", ")
+                    );
                     return Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into());
                 }
             }

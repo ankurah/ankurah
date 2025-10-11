@@ -412,46 +412,55 @@ where
     }
 
     fn check_result(&mut self) -> Option<Ordering<G::Id>> {
-        // Decision is only sound when either:
-        //  - both frontiers are exhausted (we fully explored the necessary ancestry), or
-        //  - budget exhausted (explicit BudgetExceeded), otherwise we need more steps.
-        // We no longer treat `unseen_other_heads == 0` alone as Descends, because Equal
-        // also satisfies that predicate. Requiring empty frontiers prevents premature
-        // Descends when the clocks are actually Equal.
+        // Budget exhausted - can't continue
+        if self.remaining_budget == 0 {
+            return Some(Ordering::BudgetExceeded {
+                subject_frontier: self.subject_frontier.clone(),
+                other_frontier: self.other_frontier.clone(),
+            });
+        }
+
+        // Both frontiers exhausted - we have complete information
         if self.subject_frontier.is_empty() && self.other_frontier.is_empty() {
-            // All of other's heads seen from subject side?
-            if self.unseen_other_heads == 0 {
-                // Equal iff the initial head sets were identical; otherwise Descends.
-                // Rationale: when initial heads match, the only consistent outcome after
-                // exhausting both frontiers is Equal. When they do not, subject has walked
-                // through all of other's heads and (with both frontiers empty) therefore
-                // strictly Descends.
-                return if self.initial_heads_equal { Some(Ordering::Equal) } else { Some(Ordering::Descends) };
-            }
+            return Some(self.determine_final_ordering());
+        }
 
-            // Haven't seen all of other's heads - compute meet for partial/not descends
-            let meet: Vec<_> = self
-                .meet_candidates
-                .iter()
-                .filter(|id| self.states.get(*id).map_or(0, |state| state.common_child_count) == 0)
-                .cloned()
-                .collect();
+        // Early determination: if we've found the meet and all other heads are accounted for,
+        // we can determine NotDescends/PartiallyDescends without traversing to root
+        if self.any_common && self.outstanding_heads.is_empty() && self.unseen_other_heads > 0 {
+            return Some(self.compute_not_descends_ordering());
+        }
 
-            if !self.any_common {
-                return Some(Ordering::Incomparable);
-            }
-            if !self.outstanding_heads.is_empty() {
-                return Some(Ordering::Incomparable); // ≥ 1 head stayed isolated
-            }
-            if self.head_overlap {
-                Some(Ordering::PartiallyDescends { meet })
-            } else {
-                Some(Ordering::NotDescends { meet })
-            }
-        } else if self.remaining_budget == 0 {
-            Some(Ordering::BudgetExceeded { subject_frontier: self.subject_frontier.clone(), other_frontier: self.other_frontier.clone() })
+        // Need more steps
+        None
+    }
+
+    fn determine_final_ordering(&self) -> Ordering<G::Id> {
+        // Subject has seen all of other's heads
+        if self.unseen_other_heads == 0 {
+            return if self.initial_heads_equal { Ordering::Equal } else { Ordering::Descends };
+        }
+
+        // Subject hasn't seen all of other's heads - check for common ancestors
+        if !self.any_common || !self.outstanding_heads.is_empty() {
+            return Ordering::Incomparable;
+        }
+
+        self.compute_not_descends_ordering()
+    }
+
+    fn compute_not_descends_ordering(&self) -> Ordering<G::Id> {
+        let meet: Vec<_> = self
+            .meet_candidates
+            .iter()
+            .filter(|id| self.states.get(*id).map_or(0, |state| state.common_child_count) == 0)
+            .cloned()
+            .collect();
+
+        if self.head_overlap {
+            Ordering::PartiallyDescends { meet }
         } else {
-            None
+            Ordering::NotDescends { meet }
         }
     }
 }
