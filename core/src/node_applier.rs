@@ -1,9 +1,9 @@
 use crate::{
     changes::EntityChange,
     error::{ApplyError, ApplyErrorItem, MutationError},
-    lineage::Retrieve,
     node::Node,
     policy::PolicyAgent,
+    retrieval::Retrieve,
     storage::StorageEngine,
     util::ready_chunks::ReadyChunks,
 };

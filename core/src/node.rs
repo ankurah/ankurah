@@ -626,12 +626,12 @@ where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        use crate::lineage::{EventAccumulator, Ordering};
+        use crate::causal_dag::{misc::EventAccumulator, CausalRelation};
         use crate::retrieval::LocalRetriever;
 
         let retriever = LocalRetriever::new(storage_collection.clone());
         let accumulator = EventAccumulator::new(None); // No limit for Phase 1
-        let mut comparison = crate::lineage::Comparison::new_with_accumulator(
+        let mut comparison = crate::causal_dag::Comparison::new_with_accumulator(
             &retriever,
             current_head,
             known_head,
@@ -642,16 +642,16 @@ where
         // Run comparison
         loop {
             match comparison.step().await? {
-                Some(Ordering::Descends) => {
+                Some(CausalRelation::StrictDescends) => {
                     // Current descends from known - perfect for event bridge
                     break;
                 }
-                Some(Ordering::Equal) => {
+                Some(CausalRelation::Equal) => {
                     // Heads are equal - no events needed
                     break;
                 }
                 Some(_) => {
-                    // Other relationships (NotDescends, Incomparable, etc.) - can't build bridge
+                    // Other relationships (DivergedSince, Disjoint, etc.) - can't build bridge
                     return Ok(vec![]);
                 }
                 None => {

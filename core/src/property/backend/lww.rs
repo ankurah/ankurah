@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::Operation;
+use ankurah_proto::{EventId, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,16 +15,32 @@ use crate::{
 
 const LWW_DIFF_VERSION: u8 = 1;
 
+/// In memory value register - not to be serialized
 #[derive(Clone, Debug)]
-struct ValueEntry {
+struct ValueRegister {
+    // event_id: EventId, // TODO uncomment when wiring up CausalLWWState
     value: Option<Value>,
-    committed: bool,
+    committed: bool, // NOTE: this is used for Mutables which will emit events, not for event application
+}
+
+// This is what we serialize/deserialize
+#[derive(Serialize, Deserialize)]
+pub struct CausalLWWState {
+    // a list of event ids pertinent to the current register values in this state. Max length is 2**16
+    events: Vec<EventId>,
+    // Registers
+    registers: BTreeMap<PropertyName, ValueRegisterWire>,
+}
+#[derive(Serialize, Deserialize)]
+pub struct ValueRegisterWire {
+    entity_id_offset: u16, // offset in `events` list
+    value: Option<Value>,  // tombstone
 }
 
 #[derive(Debug)]
 pub struct LWWBackend {
     // TODO - can this be safely combined with the values map?
-    values: RwLock<BTreeMap<PropertyName, ValueEntry>>,
+    values: RwLock<BTreeMap<PropertyName, ValueRegister>>,
     field_broadcasts: Mutex<BTreeMap<PropertyName, ankurah_signals::broadcast::Broadcast>>,
 }
 
@@ -43,7 +59,7 @@ impl LWWBackend {
 
     pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
         let mut values = self.values.write().unwrap();
-        values.insert(property_name, ValueEntry { value, committed: false });
+        values.insert(property_name, ValueRegister { value, committed: false });
     }
 
     pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
@@ -84,6 +100,7 @@ impl PropertyBackend for LWWBackend {
     fn property_backend_name() -> String { "lww".to_owned() }
 
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
+        // TODO stop using property_values and start using
         let property_values = self.property_values();
         let state_buffer = bincode::serialize(&property_values)?;
         Ok(state_buffer)
@@ -92,7 +109,7 @@ impl PropertyBackend for LWWBackend {
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
         let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
-        let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true })).collect();
+        let map = raw_map.into_iter().map(|(k, v)| (k, ValueRegister { value: v, committed: true })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
@@ -128,7 +145,7 @@ impl PropertyBackend for LWWBackend {
                     let mut values = self.values.write().unwrap();
                     for (property_name, new_value) in changes {
                         // Insert as committed entry since this came from an operation
-                        values.insert(property_name.clone(), ValueEntry { value: new_value, committed: true });
+                        values.insert(property_name.clone(), ValueRegister { value: new_value, committed: true });
                         changed_fields.push(property_name);
                     }
                 }

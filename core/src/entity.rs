@@ -1,4 +1,5 @@
-use crate::lineage::{self, GetEvents, Retrieve};
+use crate::causal_dag::{self as lineage};
+use crate::retrieval::{GetEvents, Retrieve, TEvent};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
@@ -183,6 +184,40 @@ impl Entity {
         }
     }
 
+    /// Apply events from the forward chain in causal order (oldest → newest).
+    /// Returns the new head after applying all events.
+    fn apply_forward_chain<G>(
+        &self,
+        getter: &G,
+        forward_chain: &[ankurah_proto::Attested<Event>],
+        base_head: &Clock,
+    ) -> Result<Clock, MutationError>
+    where
+        G: GetEvents<Id = EventId, Event = Event>,
+    {
+        let mut state = self.state.write().unwrap();
+
+        // Verify head hasn't changed (CAS check)
+        if state.head != *base_head {
+            return Err(MutationError::LineageError(LineageError::HeadChanged { expected: base_head.clone(), actual: state.head.clone() }));
+        }
+
+        // Apply each event in the forward chain
+        for attested_event in forward_chain {
+            let event = &attested_event.payload;
+            for (backend_name, operations) in event.operations.iter() {
+                state.apply_operations(backend_name.clone(), operations)?;
+            }
+        }
+
+        // Update head to the last event in the chain
+        if let Some(last_event) = forward_chain.last() {
+            state.head = last_event.payload.id().into();
+        }
+
+        Ok(state.head.clone())
+    }
+
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
@@ -213,55 +248,76 @@ impl Entity {
         let budget = 10;
 
         for attempt in 0..MAX_RETRIES {
-            match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
-                lineage::Ordering::Equal => {
-                    info!("Equal - skip");
+            // Compare the event's parent clock with the current head to get forward chain
+            let result = crate::causal_dag::compare_unstored_event(getter, event, &head, budget).await?;
+
+            match result.relation {
+                lineage::CausalRelation::Equal => {
+                    // Redundant delivery - event already applied
+                    info!("Equal - skip redundant delivery");
                     return Ok(false);
                 }
-                lineage::Ordering::Descends => {
-                    info!("Descends - apply (attempt {})", attempt + 1);
-                    let new_head = event.id().into();
-                    // Atomic update: apply operations and set head under single lock
-                    {
-                        let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
-                        if state.head != head {
-                            debug!("Head changed during lineage comparison, retrying...");
-                            let current_head = state.head.clone();
-                            drop(state);
-                            head = current_head;
-                            continue;
+                lineage::CausalRelation::StrictDescends => {
+                    if result.forward_chain.is_empty() {
+                        // Event's parent equals current head, so just apply this event
+                        info!("Descends - apply single event (attempt {})", attempt + 1);
+                        let new_head = event.id().into();
+                        {
+                            let mut state = self.state.write().unwrap();
+                            // Re-check that head hasn't changed since lineage comparison
+                            if state.head != head {
+                                debug!("Head changed during lineage comparison, retrying...");
+                                let current_head = state.head.clone();
+                                drop(state);
+                                head = current_head;
+                                continue;
+                            }
+                            for (backend_name, operations) in event.operations.iter() {
+                                state.apply_operations(backend_name.clone(), operations)?;
+                            }
+                            state.head = new_head;
                         }
-                        for (backend_name, operations) in event.operations.iter() {
-                            // IMPORTANT TODO - we might descend the entity head by more than one event,
-                            // therefore we need to play forward events one by one, not just the latest
-                            // set operations, the current head and the parent of that.
-                            // We have to play forward all events from the current entity/backend state
-                            // to the latest event. At this point we know this lineage is connected,
-                            // else we would get back an Ordering::Incomparable.
-                            // So we just need to fiure out how to scan through those events here.
-                            // Probably the easiest thing would be to update Ordering::Descends to provide
-                            // the list of events to play forward, but ideally we'd do it on a streaming
-                            // basis instead. of materializing what could potentially be a large number
-                            // of events in some cases.
-                            // we can't do this in the lineage comparison, because its looking backwards
-                            // not forwards - and we need to replay the events in order.
-                            // Maybe the best approach is to have Descends return the list of event ids
-                            // connecting the current head to the new event, and use a modest LRU cache
-                            // on the event geter (which needs to abstract storage collection anyway,
-                            // due to the need for remote event retrieval)
-                            // ...so we get a cache hit in the most common cases, and it can paginate the rest.
-                            state.apply_operations(backend_name.clone(), operations)?;
+                        // Notify Signal subscribers about the change
+                        self.broadcast.send(());
+                        return Ok(true);
+                    } else {
+                        // Event's parent descends from current head - need to replay the chain
+                        info!("Descends - apply forward chain with {} events (attempt {})", result.forward_chain.len() + 1, attempt + 1);
+
+                        // Apply the forward chain (from current head to event's parent)
+                        match self.apply_forward_chain(getter, &result.forward_chain, &head) {
+                            Ok(_) => {
+                                // Now apply the incoming event itself
+                                let mut state = self.state.write().unwrap();
+                                for (backend_name, operations) in event.operations.iter() {
+                                    state.apply_operations(backend_name.clone(), operations)?;
+                                }
+                                state.head = event.id().into();
+                                drop(state);
+
+                                // Notify Signal subscribers about the change
+                                self.broadcast.send(());
+                                return Ok(true);
+                            }
+                            Err(MutationError::LineageError(LineageError::HeadChanged { .. })) => {
+                                // Head changed, retry
+                                warn!("Head changed during forward chain application, retrying...");
+                                head = self.head();
+                                continue;
+                            }
+                            Err(e) => return Err(e),
                         }
-                        state.head = new_head;
                     }
-                    // Notify Signal subscribers about the change
-                    self.broadcast.send(());
-                    return Ok(true);
                 }
-                lineage::Ordering::NotDescends { meet: _ } => {
-                    // HACK - this is totally wrong, and should be handled by the Visitor discussed in concurrent-updates/spec.md
-                    info!("NotDescends - applying (attempt {})", attempt + 1);
+                lineage::CausalRelation::StrictAscends => {
+                    // Event is older than our current head - ignore it
+                    info!("StrictAscends - ignoring old event");
+                    return Ok(false);
+                }
+                lineage::CausalRelation::DivergedSince { .. } => {
+                    // TODO: Use LWWResolver for deterministic conflict resolution (concurrent-updates/spec.md)
+                    // For now, naively augment head with concurrent event
+                    info!("DivergedSince/NotDescends - applying concurrent event (attempt {})", attempt + 1);
                     // Atomic update: apply operations and augment head under single lock
                     {
                         let mut state = self.state.write().unwrap();
@@ -281,24 +337,20 @@ impl Entity {
                     }
                     return Ok(false);
                 }
-                lineage::Ordering::Incomparable => {
+                lineage::CausalRelation::Disjoint { .. } => {
                     // total apples and oranges - take a hike buddy
                     error!("{self} apply_event - Incomparable. This should essentially never happen among good actors.");
                     return Err(LineageError::Incomparable.into());
                 }
-                lineage::Ordering::PartiallyDescends { meet } => {
-                    error!("PartiallyDescends - skipping this event, but we should probably be handling this");
-                    // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                    // but it requires that we update the propertybackends to support this
-                    return Err(LineageError::PartiallyDescends { meet }.into());
-                }
-                lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                lineage::CausalRelation::BudgetExceeded { subject, other } => {
                     error!(
                         "BudgetExceeded subject_frontier: {}, other_frontier: {}",
-                        subject_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", "),
-                        other_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", ")
+                        subject.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", "),
+                        other.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", ")
                     );
-                    return Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into());
+                    return Err(
+                        LineageError::BudgetExceeded { original_budget: budget, subject_frontier: subject, other_frontier: other }.into()
+                    );
                 }
             }
         }
@@ -320,12 +372,12 @@ impl Entity {
         debug!("{self} apply_state - new head: {new_head}");
         let budget = 100;
 
-        match crate::lineage::compare(getter, &new_head, &head, budget).await? {
-            lineage::Ordering::Equal => {
+        match crate::causal_dag::compare(getter, &new_head, &head, budget).await?.relation {
+            lineage::CausalRelation::Equal => {
                 debug!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
             }
-            lineage::Ordering::Descends => {
+            lineage::CausalRelation::StrictDescends => {
                 debug!("{self} apply_state - new head descends from current, applying");
                 // TODO: Consider playing forward the event lineage instead of overwriting backends.
                 // Current approach has a security vulnerability: a malicious peer could send a state
@@ -345,24 +397,24 @@ impl Entity {
                 self.broadcast.send(());
                 Ok(true)
             }
-            lineage::Ordering::NotDescends { meet } => {
-                warn!("{self} apply_state - new head {new_head} does not descend {head}, meet: {meet:?}");
+            lineage::CausalRelation::StrictAscends => {
+                warn!("{self} apply_state - new head {new_head} is older than current {head}, ignoring");
                 Ok(false)
             }
-            lineage::Ordering::Incomparable => {
-                error!("{self} apply_state - heads are incomparable. This should essentially never happen among good actors.");
-                // total apples and oranges - take a hike buddy
+            lineage::CausalRelation::DivergedSince { meet, .. } => {
+                warn!("{self} apply_state - new head {new_head} has diverged from current {head}, meet: {meet:?}");
+                // TODO: Use forward chain to resolve concurrency properly
+                Ok(false)
+            }
+            lineage::CausalRelation::Disjoint { .. } => {
+                error!(
+                    "{self} apply_state - heads are disjoint (different genesis). This should essentially never happen among good actors."
+                );
                 Err(LineageError::Incomparable.into())
             }
-            lineage::Ordering::PartiallyDescends { meet } => {
-                error!("{self} apply_state - heads partially descend, meet: {meet:?}");
-                // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                // but it requires that we update the propertybackends to support this
-                Err(LineageError::PartiallyDescends { meet }.into())
-            }
-            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
-                Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
+            lineage::CausalRelation::BudgetExceeded { subject, other } => {
+                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject:?}, other: {other:?}");
+                Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier: subject, other_frontier: other }.into())
             }
         }
     }
