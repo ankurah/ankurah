@@ -55,6 +55,8 @@ impl ModelDescription {
     pub fn resultset_name(&self) -> Ident { format_ident!("{}ResultSet", self.name) }
     #[cfg(feature = "wasm")]
     pub fn livequery_name(&self) -> Ident { format_ident!("{}LiveQuery", self.name) }
+    #[cfg(feature = "wasm")]
+    pub fn changeset_name(&self) -> Ident { format_ident!("{}ChangeSet", self.name) }
 
     // Computed accessors for active fields
     pub fn active_fields(&self) -> &[syn::Field] { &self.active_fields }

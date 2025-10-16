@@ -212,7 +212,7 @@ impl StorageCollection for IndexedDBBucket {
             let event_obj = Object::new(js_sys::Object::new().into());
             let payload = &attested_event.payload;
             event_obj.set(&*ID_KEY, &payload.id())?;
-            event_obj.set(&*ENTITY_ID_KEY, payload.entity_id)?;
+            event_obj.set(&*ENTITY_ID_KEY, payload.entity_id.to_base64())?;
             event_obj.set(&*OPERATIONS_KEY, &payload.operations)?;
             event_obj.set(&*ATTESTATIONS_KEY, &attested_event.attestations)?;
             event_obj.set(&*PARENT_KEY, &payload.parent)?;

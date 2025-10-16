@@ -102,6 +102,43 @@ pub struct ChangeSet<R: View> {
     pub changes: Vec<ItemChange<R>>,
 }
 
+impl<R: View> ChangeSet<R>
+where R: Clone
+{
+    /// Returns all items that were added or now match the query
+    pub fn adds(&self) -> Vec<R> {
+        self.changes
+            .iter()
+            .filter_map(|change| match change {
+                ItemChange::Add { item, .. } | ItemChange::Initial { item } => Some(item.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns all items that were removed or no longer match the query
+    pub fn removes(&self) -> Vec<R> {
+        self.changes
+            .iter()
+            .filter_map(|change| match change {
+                ItemChange::Remove { item, .. } => Some(item.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns all items that were updated but still match the query
+    pub fn updates(&self) -> Vec<R> {
+        self.changes
+            .iter()
+            .filter_map(|change| match change {
+                ItemChange::Update { item, .. } => Some(item.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 impl<I> std::fmt::Display for ChangeSet<I>
 where I: View + Clone + 'static
 {

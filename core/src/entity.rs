@@ -318,7 +318,7 @@ impl Entity {
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
-        let budget = 10;
+        let budget = 100;
 
         match crate::lineage::compare(getter, &new_head, &head, budget).await? {
             lineage::Ordering::Equal => {

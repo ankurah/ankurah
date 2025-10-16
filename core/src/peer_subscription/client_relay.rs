@@ -415,10 +415,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     fn start_retry_task(&self, mut shutdown_rx: tokio::sync::mpsc::Receiver<()>) {
         let me = self.clone();
         crate::task::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
+                let delay = futures_timer::Delay::new(std::time::Duration::from_secs(5));
                 tokio::select! {
-                    _ = interval.tick() => {
+                    _ = delay => {
                         // Attempt to setup any pending subscriptions
                         me.setup_remote_subscriptions();
                     }
@@ -688,7 +688,7 @@ mod tests {
         assert!(matches!(relay.get_status(query_id), Some(Status::Requested(_, _))));
 
         // Give async task time to complete (setup should happen automatically)
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify request was sent
         let sent_requests = mock_sender.get_sent_requests();
@@ -720,7 +720,7 @@ mod tests {
         relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0, MockLiveQuery);
 
         // Give async task time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
 
@@ -753,7 +753,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Give async task time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify request was sent
         let sent_requests = mock_sender.get_sent_requests();
@@ -781,7 +781,7 @@ mod tests {
         relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
 
         // Give async task time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify subscription is marked as established (since no error was set)
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
@@ -801,7 +801,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Give async task time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify retry was attempted (the error gets consumed)
         let sent_requests = mock_sender.get_sent_requests();
@@ -842,7 +842,7 @@ mod tests {
         relay.notify_peer_connected(peer_id);
 
         // Give async task time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify only the retryable subscription was attempted
         let sent_requests = mock_sender.get_sent_requests();
@@ -872,7 +872,7 @@ mod tests {
         relay.subscribe_query(query_id, collection_id.clone(), predicate, collection_id.clone(), 0, MockLiveQuery);
 
         // Give async task time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
 
@@ -883,7 +883,7 @@ mod tests {
         relay.unsubscribe_predicate(query_id);
 
         // Give async task time to complete
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify unsubscribe message was sent
         let sent_requests = mock_sender.get_sent_requests();
@@ -907,14 +907,14 @@ mod tests {
 
         // Test setup without message sender - should not crash
         relay.subscribe_query(query_id, collection_id.clone(), predicate.clone(), collection_id.clone(), 0, MockLiveQuery);
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no sender
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
 
         // Now set sender and test with no connected peers
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should still be pending since no peers available
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
@@ -924,7 +924,7 @@ mod tests {
 
         // Now connect a peer (should trigger automatic setup)
         relay.notify_peer_connected(peer_id);
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should now be established
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
@@ -949,7 +949,7 @@ mod tests {
         relay.unsubscribe_predicate(query_id);
 
         // Give async task time to complete (though no request should be sent)
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify no unsubscribe message was sent (since it wasn't established)
         let sent_requests = mock_sender.get_sent_requests();
