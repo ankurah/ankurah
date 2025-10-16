@@ -18,7 +18,9 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
     let namespace_class =
         wasm_model_namespace(&namespace_struct, model.name(), &model.view_name(), &model.livequery_name(), &pojo_interface);
     let resultset_wrapper = wasm_resultset_wrapper(&model.resultset_name(), &model.view_name());
-    let livequery_wrapper = wasm_livequery_wrapper(&model.livequery_name(), &model.view_name(), &model.resultset_name());
+    let changeset_wrapper = wasm_changeset_wrapper(&model.changeset_name(), &model.view_name(), &model.resultset_name());
+    let livequery_wrapper =
+        wasm_livequery_wrapper(&model.livequery_name(), &model.view_name(), &model.resultset_name(), &model.changeset_name());
 
     quote! {
         #tsify_impl
@@ -31,6 +33,9 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
 
             // Generate ResultSet wrapper
             #resultset_wrapper
+
+            // Generate ChangeSet wrapper
+            #changeset_wrapper
 
             // Generate LiveQuery wrapper
             #livequery_wrapper
@@ -80,9 +85,50 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
     }
 }
 
-/// FooLiveQuery(LiveQuery<FooView>)
-pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, resultset_name: &Ident) -> TokenStream {
+/// FooChangeSet(ChangeSet<FooView>)
+pub fn wasm_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, resultset_name: &Ident) -> TokenStream {
     quote! {
+        #[wasm_bindgen]
+        pub struct #changeset_name(::ankurah::core::changes::ChangeSet<#view_name>);
+
+        #[wasm_bindgen]
+        impl #changeset_name {
+            #[wasm_bindgen(getter)]
+            pub fn resultset(&self) -> #resultset_name {
+                #resultset_name(self.0.resultset.wrap())
+            }
+
+            #[wasm_bindgen(getter)]
+            pub fn adds(&self) -> Vec<#view_name> {
+                self.0.adds()
+            }
+
+            #[wasm_bindgen(getter)]
+            pub fn removes(&self) -> Vec<#view_name> {
+                self.0.removes()
+            }
+
+            #[wasm_bindgen(getter)]
+            pub fn updates(&self) -> Vec<#view_name> {
+                self.0.updates()
+            }
+        }
+    }
+}
+
+/// FooLiveQuery(LiveQuery<FooView>)
+pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, resultset_name: &Ident, changeset_name: &Ident) -> TokenStream {
+    // Generate custom TypeScript for the subscribe method with proper callback typing
+    let subscribe_ts = format!(
+        r#"export interface {livequery_name} {{
+    subscribe(callback: (changeset: {changeset_name}) => void, immediate?: boolean): SubscriptionGuard;
+}}"#
+    );
+
+    quote! {
+        #[wasm_bindgen(typescript_custom_section)]
+        const TS_APPEND_CONTENT: &'static str = #subscribe_ts;
+
         #[wasm_bindgen]
         pub struct #livequery_name(::ankurah::LiveQuery<#view_name>);
 
@@ -120,24 +166,25 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             pub fn value(&self) -> #resultset_name {
                 #resultset_name(self.0.resultset())
             }
+
+            /// reading this will track the error signal, so updates will cause the (React)Observer to be notified
             #[wasm_bindgen(getter)]
             pub fn error(&self) -> Option<String> {
-                self.0.error().map(|e| e.to_string())
+                use ::ankurah::signals::Get;
+                // TODO maybe don't make a new map signal each time this is called?
+                // doing this for now because we need the signal broadcast to be tracked by the current observer
+                self.0.error().map(|e| e.as_ref().map(|e| e.to_string())).get()
+
             }
 
-            pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
-                use ::ankurah::signals::Subscribe;
-                let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
-
-                self.0.subscribe(move |changeset: ::ankurah::core::changes::ChangeSet<#view_name>| {
-                    // The ChangeSet already contains a ResultSet<View>, just wrap it
-                    let resultset = #resultset_name(changeset.resultset.wrap());
-
-                    let _ = callback.call1(
-                        &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
-                        &resultset.into()
-                    );
-                })
+            #[wasm_bindgen(skip_typescript)]
+            pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function, immediate: Option<bool>) -> ::ankurah::signals::SubscriptionGuard {
+                ::ankurah::core::model::js_livequery_subscribe(
+                    &self.0,
+                    callback,
+                    immediate.unwrap_or(true),
+                    #changeset_name
+                )
             }
 
             /// Update the predicate for this query and return a promise that resolves when complete

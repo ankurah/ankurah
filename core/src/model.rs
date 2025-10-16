@@ -93,7 +93,7 @@ pub trait Mutable {
 // Helper function for Subscribe implementations in generated Views
 // don't document this
 #[doc(hidden)]
-pub fn js_view_subscribe<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
+pub fn view_subscribe<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
 where
     V: ankurah_signals::Signal + View + Clone + Send + Sync + 'static,
     F: ankurah_signals::subscribe::IntoSubscribeListener<V>,
@@ -103,6 +103,19 @@ where
     let subscription = view.listen(Arc::new(move |_| {
         // Call the listener with the current view when the broadcast fires
         listener(view_clone.clone());
+    }));
+    ankurah_signals::SubscriptionGuard::new(subscription)
+}
+
+#[doc(hidden)]
+pub fn view_subscribe_no_clone<V, F>(view: &V, listener: F) -> ankurah_signals::SubscriptionGuard
+where
+    V: ankurah_signals::Signal + View + Send + Sync + 'static,
+    F: ankurah_signals::subscribe::IntoSubscribeListener<()>,
+{
+    let listener = listener.into_subscribe_listener();
+    let subscription = view.listen(Arc::new(move |_| {
+        listener(());
     }));
     ankurah_signals::SubscriptionGuard::new(subscription)
 }
@@ -125,4 +138,37 @@ where V: View + Clone + 'static + Into<wasm_bindgen::JsValue> {
     }
 
     result_array
+}
+
+// Helper function for subscribe implementations in generated WASM LiveQuery wrappers
+#[doc(hidden)]
+#[cfg(feature = "wasm")]
+pub fn js_livequery_subscribe<V, W, F>(
+    livequery: &crate::livequery::LiveQuery<V>,
+    callback: js_sys::Function,
+    immediate: bool,
+    wrap_changeset: F,
+) -> ankurah_signals::SubscriptionGuard
+where
+    V: View + Clone + Send + Sync + 'static,
+    W: Into<wasm_bindgen::JsValue>,
+    F: Fn(crate::changes::ChangeSet<V>) -> W + Send + Sync + 'static,
+{
+    use ankurah_signals::{Peek, Subscribe};
+
+    // If immediate, call the callback with current state first
+    if immediate {
+        let current_items = livequery.peek();
+        let changes = current_items.into_iter().map(|item| crate::changes::ItemChange::Add { item, events: vec![] }).collect();
+        let initial_changeset = crate::changes::ChangeSet { resultset: livequery.resultset(), changes };
+        let wrapped = wrap_changeset(initial_changeset);
+        let _ = callback.call1(&wasm_bindgen::JsValue::NULL, &wrapped.into());
+    }
+
+    // Set up the subscription for future changes
+    let callback = ::send_wrapper::SendWrapper::new(callback);
+    livequery.subscribe(move |changeset: crate::changes::ChangeSet<V>| {
+        let wrapped_changeset = wrap_changeset(changeset);
+        let _ = callback.call1(&wasm_bindgen::JsValue::NULL, &wrapped_changeset.into());
+    })
 }

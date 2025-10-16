@@ -19,11 +19,20 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     let active_field_name_strs = model.active_field_name_strs();
 
     let (struct_attributes, impl_attributes, getter_attributes, wasm_edit_impl) = if cfg!(feature = "wasm") {
+        let subscribe_ts = format!(
+            r#"export interface {view_name} {{
+    subscribe(callback: () => void): SubscriptionGuard;
+}}"#
+        );
+
         (
             quote! { #[wasm_bindgen] },
             quote! { #[wasm_bindgen] },
             quote! { #[wasm_bindgen(getter)] },
             quote! {
+                #[wasm_bindgen(typescript_custom_section)]
+                const TS_VIEW_SUBSCRIBE: &'static str = #subscribe_ts;
+
                 #[wasm_bindgen]
                 impl #view_name {
                     /// Edit this entity in a transaction (WASM version - returns owned Mutable)
@@ -37,6 +46,17 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                             }
                             Err(e) => Err(::wasm_bindgen::JsValue::from(e.to_string()))
                         }
+                    }
+
+                    #[wasm_bindgen(skip_typescript, js_name = "subscribe")]
+                    pub fn subscribe_wasm(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
+
+                        let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
+                        ::ankurah::core::model::view_subscribe_no_clone(self, move |_| {
+                            let _ = callback.call0(
+                                &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
+                            );
+                        })
                     }
                 }
             },
@@ -106,7 +126,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 where
                     F: ::ankurah::signals::subscribe::IntoSubscribeListener<#view_name>,
                 {
-                    ::ankurah::core::model::js_view_subscribe(self, listener)
+                    ::ankurah::core::model::view_subscribe(self, listener)
                 }
             }
 

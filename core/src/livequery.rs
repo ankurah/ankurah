@@ -8,7 +8,7 @@ use ankurah_proto::{self as proto, CollectionId};
 use ankurah_signals::{
     broadcast::{BroadcastId, Listener, ListenerGuard},
     porcelain::subscribe::{IntoSubscribeListener, SubscriptionGuard},
-    Get, Peek, Signal, Subscribe,
+    Get, Mut, Peek, Read, Signal, Subscribe,
 };
 use tracing::{debug, warn};
 
@@ -38,8 +38,7 @@ struct Inner {
     // Store the actual subscription - now non-generic!
     pub(crate) subscription: ReactorSubscription,
     pub(crate) resultset: EntityResultSet,
-    pub(crate) has_error: AtomicBool,
-    pub(crate) error: std::sync::Mutex<Option<RetrievalError>>,
+    pub(crate) error: Mut<Option<RetrievalError>>,
     pub(crate) initialized: tokio::sync::Notify,
     pub(crate) initialized_version: std::sync::atomic::AtomicU32,
     // Version tracking for predicate updates
@@ -104,8 +103,7 @@ impl EntityLiveQuery {
             node: Box::new(node.clone()),
             subscription,
             resultset: resultset.clone(),
-            has_error: AtomicBool::new(false),
-            error: std::sync::Mutex::new(None),
+            error: Mut::new(None),
             initialized: tokio::sync::Notify::new(),
             initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
             current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
@@ -126,8 +124,8 @@ impl EntityLiveQuery {
                 debug!("LiveQuery initialization task starting for predicate {}", query_id);
                 if let Err(e) = me2.activate(1).await {
                     debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
-                    me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                    *me2.0.error.lock().unwrap() = Some(e);
+
+                    me2.0.error.set(Some(e));
                 } else {
                     debug!("LiveQuery initialization completed for predicate {}", query_id);
                 }
@@ -183,8 +181,7 @@ impl EntityLiveQuery {
             crate::task::spawn(async move {
                 if let Err(e) = me2.activate(new_version).await {
                     tracing::error!("LiveQuery update failed for predicate {}: {}", query_id, e);
-                    me2.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                    *me2.0.error.lock().unwrap() = Some(e);
+                    me2.0.error.set(Some(e));
                 }
             });
         }
@@ -256,7 +253,7 @@ impl EntityLiveQuery {
 
         Ok(())
     }
-    pub fn error(&self) -> Option<RetrievalError> { self.0.error.lock().unwrap().take() }
+    pub fn error(&self) -> Read<Option<RetrievalError>> { self.0.error.read() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
 
     /// Create a weak reference to this LiveQuery
@@ -284,8 +281,7 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
             // Handle errors internally by setting last_error
             if let Err(e) = livequery.activate(version).await {
                 tracing::error!("Failed to activate subscription for query {}: {}", livequery.0.query_id, e);
-                livequery.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
-                *livequery.0.error.lock().unwrap() = Some(e);
+                livequery.0.error.set(Some(e));
             }
         }
         // If upgrade fails, the LiveQuery was already dropped - nothing to do
@@ -294,8 +290,8 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
     fn set_last_error(&self, error: RetrievalError) {
         // Try to upgrade the weak reference
         if let Some(livequery) = self.upgrade() {
-            livequery.0.has_error.store(true, std::sync::atomic::Ordering::Relaxed);
-            *livequery.0.error.lock().unwrap() = Some(error);
+            tracing::info!("Setting last error for LiveQuery {}: {}", livequery.0.query_id, error);
+            livequery.0.error.set(Some(error));
         }
         // If upgrade fails, the LiveQuery was already dropped - nothing to do
     }
