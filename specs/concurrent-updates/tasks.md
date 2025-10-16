@@ -10,25 +10,50 @@
    - ✅ `build_forward_chain` using Kahn's algorithm (topological sort).
    - ✅ `EventAccumulator` injected via `new_with_accumulator`.
 
-2. **Server-side EventBridge**:
+2. **ForwardView and ReadySet streaming**:
 
-   - ✅ `Node::collect_event_bridge` uses `EventAccumulator` to collect gap events.
+   - ✅ `ForwardView<E: TEvent>` type implemented with closed set filtering.
+   - ✅ `ReadySet<E>` with `EventRole` tagging (Primary vs Concurrency).
+   - ✅ `ReadySetIterator` using Kahn's algorithm for topological layering.
+   - ✅ `compute_primary_path()` reverse-BFS from subject_head to meet for Primary tagging.
+   - ✅ Unit tests: 7 tests covering linear history, divergence, merges, empty views.
+   - ✅ `Comparison` caches `events_by_id` and `parents_by_id` during traversal.
+   - ✅ `Comparison::build_forward_view()` filters to closed set (meet → {subject, other}).
+   - ✅ `compare()` and `compare_unstored_event()` return `ForwardView` in `RelationAndChain`.
+
+3. **Backend transaction protocol**:
+
+   - ✅ `PropertyTransaction<E: TEvent>` trait defined (generic over Event type).
+   - ✅ Methods: `apply_ready_set(&ReadySet<E>)`, `commit(&mut self)`, `rollback(&mut self)`.
+   - ✅ `PropertyBackend::begin() -> Box<dyn PropertyTransaction<Event>>` for object safety.
+   - ✅ `LWWTransaction` stub with `base_registers` and `pending_winners`.
+   - ✅ `YrsTransaction` implemented (applies all ops, commits via backend.apply_operations).
+   - ✅ `ValueRegister::last_writer_event_id` field added for causal tiebreaking.
+
+4. **Entity application**:
+
+   - ✅ `Entity::apply_event` handles `Equal` (no-op), `StrictAscends` (no-op).
+   - ✅ `Entity::apply_event` handles `StrictDescends` via `apply_forward_chain`.
+   - ✅ `Entity::apply_forward_chain` replays events oldest→newest.
+   - ✅ `Entity::apply_event` handles `DivergedSince` via ForwardView + backend transactions.
+   - ✅ Atomic transaction commit with CAS head check.
+   - ✅ Legacy augment fallback (to be removed after LWW implementation).
+
+5. **Server-side EventBridge**:
+
+   - ✅ `Node::collect_event_bridge` uses ForwardView ReadySets (Primary-only).
    - ✅ Integrated in Fetch and SubscribeQuery paths via `generate_entity_delta`.
    - ✅ Smart delta generation: omit if heads equal, else EventBridge, else StateSnapshot.
 
-3. **Client-side application**:
+6. **Client-side application**:
 
    - ✅ `NodeApplier::apply_deltas` applies bridges and snapshots in parallel batches.
    - ✅ Batch reactor notification via `reactor.notify_change`.
    - ✅ Ephemeral event staging and persistence via `store_used_events`.
 
-4. **Entity application (partial)**:
-
-   - ✅ `Entity::apply_event` handles `Equal` (no-op), `StrictAscends` (no-op).
-   - ✅ `Entity::apply_event` handles `StrictDescends` via `apply_forward_chain`.
-   - ✅ `Entity::apply_forward_chain` replays events oldest→newest.
-
-5. **Tests**:
+7. **Tests**:
+   - ✅ `causal_dag::forward_view::tests`: 7 unit tests for ReadySet streaming, Primary/Concurrency tagging.
+   - ✅ `causal_dag::tests::test_forward_view_*`: 4 integration tests exercising ForwardView with Comparison.
    - ✅ `lineage::tests::test_forward_chain_*`: Kahn topological sort correctness.
    - ✅ `lineage::tests::test_event_accumulator`: Bridge event collection.
    - ✅ `lineage::tests::test_empty_clocks`: Empty clock classification.
@@ -37,92 +62,62 @@
 
 #### High Priority (Core Functionality)
 
-1. **Wire LineageVisitor into Comparison** [NOT STARTED]:
+1. **Implement LWWTransaction apply_ready_set logic** [IN PROGRESS]:
 
-   - Accept optional `visitor: Option<Box<dyn LineageVisitor>>` in `Comparison::new`.
-   - After meet discovery, invoke `visitor.on_forward(meet, forward_chain, descendants, ctx)`.
-   - Return visitor result alongside `CausalRelation`.
+   - Causal LWW tiebreaking per ReadySet:
+     - For each property touched by events in the ReadySet:
+       - Get current winner from `base_registers.last_writer_event_id`
+       - Collect all candidate events (Primary + Concurrency) that touch this property
+       - Tiebreak: lineage precedence first, then lexicographic on EventId
+       - Update `pending_winners` if best_id differs from current winner
+   - Primary events are for comparison only (DO NOT re-apply their operations)
 
-2. **Implement ForwardView and ReadySet streaming** [NOT STARTED]:
+2. **Implement LWWTransaction commit logic** [NOT STARTED]:
 
-   - Replace `build_forward_chain() -> Vec<Event>` with `ForwardView` generator.
-   - `ForwardView` streams `ReadySets` (topological layers from Kahn).
-   - Tag each event as `Primary` (on subject path) or `Concurrency` (sibling).
-   - Update `RelationAndChain` to hold `ForwardView` handle instead of `Vec<Event>`.
+   - Diff `pending_winners` vs `base_registers` to find changed properties
+   - Build `events: Vec<EventId>` from unique winner EventIds
+   - Create `entity_id_offset` mapping for each changed register
+   - Merge `pending_winners` into backend's `ValueRegisters` (update value and last_writer_event_id)
+   - Mark registers as committed
+   - Serialize changed registers via `to_state_buffer()` with events table
 
-3. **Backend transaction protocol** [NOT STARTED]:
+3. **Unit tests: LWWTransaction** [NOT STARTED]:
 
-   - Define `PropertyBackend::begin() -> BackendTransaction`.
-   - Define `BackendTransaction::apply_ready_set(&ReadySetView)` and `commit()/rollback()`.
-   - Implement for LWW: maintain in-memory per-property champions; persist diffs on `commit()`.
-   - Implement for Yrs: apply unseen ops; commit/rollback accordingly.
+   - Primary-only ReadySets produce no changes (comparison-only)
+   - Single concurrency event wins over existing register
+   - Concurrent siblings → lexicographic tiebreak
+   - Multiple ReadySets revise winners across layers
+   - Lineage precedence: later events beat earlier events
+   - Events table construction at commit: offsets stable and deduplicated
 
-4. **Update Entity::apply_event for DivergedSince** [NOT STARTED]:
+4. **Remove reverse-apply hack in NodeApplier** [BLOCKED]:
 
-   - For `DivergedSince`, construct `ForwardView` from meet to union of heads.
-   - Call `backend.begin()` for each backend; stream `ReadySets` via `tx.apply_ready_set`.
-   - On success: `tx.commit()` all backends, update heads per pruning logic.
-   - On error: `tx.rollback()` all backends.
-   - Remove head-augmentation fallback.
+   - Once LWW is fully implemented and tested, remove `.rev()` in `apply_delta_inner`
+   - Verify no regressions in integration tests
 
-5. **Remove reverse-apply hack in NodeApplier** [BLOCKED on #4]:
+5. **Consider removing EventAccumulator** [LOW PRIORITY]:
 
-   - Once `Entity::apply_event` handles all cases correctly, remove `.rev()` in `apply_delta_inner`.
-
-6. **Implement LWWTransaction** [NOT STARTED]:
-
-   - Structure: `base_registers`, `pending_winners` (EventId, Value).
-   - Logic: snapshotless per-ReadySet tiebreak using Primary for comparison only; update winners.
-   - Commit: diff `pending_winners` vs `base_registers`; build `events` and `entity_id_offset` on-the-fly; serialize only changed registers via `to_state_buffer()`.
-   - Rollback: drop pending.
-
-7. **Unit tests: LWWTransaction** [NOT STARTED]:
-
-   - Primary-only ReadySets produce no changes.
-   - Single concurrency event wins over existing register.
-   - Concurrent siblings tie → lexicographic tiebreak.
-   - Multiple ReadySets revise winners across layers.
-   - No-meet-snapshot correctness: outcomes match applying from meet with ideal snapshot.
-   - Events table construction at commit: offsets stable and deduplicated across changed registers.
-
-8. **Backend: ValueRegister last-writer** [NOT STARTED]:
-   - Add `last_writer_event_id: EventId` to `ValueRegister`.
-   - Update load/save paths to preserve it via state buffers.
-   - Ensure `to_state_buffer()` emits diffs with `events[]` and `entity_id_offset` derived from changed registers.
+   - EventBridge now uses ForwardView ReadySets directly
+   - EventAccumulator conditional logic during traversal is complex and potentially over-collecting
+   - Can be removed if no other use cases remain
 
 #### Medium Priority (Polish & Conversions)
 
-8. **Add proto::CausalRelation conversions** [NOT STARTED]:
+6. **Add proto::CausalRelation conversions** [NOT STARTED]:
 
    - Implement `From<lineage::CausalRelation<EventId>>` for `proto::CausalRelation`.
    - Implement `TryFrom<proto::CausalRelation>` for `lineage::CausalRelation<EventId>`.
 
-9. **TOCTOU protection in Entity::apply_event** [NOT STARTED]:
+7. **Integration tests for DivergedSince** [NOT STARTED]:
 
-   - Plan phase (no lock): compute relation, prepare ForwardView.
-   - Apply phase (with lock): recheck head unchanged, then apply.
-   - On head mismatch: release lock, recompute plan.
+   - End-to-end tests with real Entity and backends
+   - Deterministic LWW resolution (lineage + lexicographic tiebreak)
+   - No spurious multi-heads for linear histories
+   - Verify state convergence across different event orderings
 
-#### Testing
+8. **Budget/resumption tests** [NOT STARTED]:
 
-10. **Unit tests for ForwardView/ReadySet** [NOT STARTED]:
-
-- ReadySet streaming with concurrent branches.
-- Primary vs Concurrency tagging.
-
-11. **Unit tests for backend transactions** [NOT STARTED]:
-
-- LWW commit/rollback behavior.
-- Yrs commit/rollback behavior.
-
-12. **Integration tests for DivergedSince** [NOT STARTED]:
-
-- Deterministic LWW resolution (lineage + lexicographic tiebreak).
-- No spurious multi-heads for linear histories.
-
-13. **Budget/resumption tests** [NOT STARTED]:
-
-- `BudgetExceeded` return and resumable frontiers.
+   - `BudgetExceeded` return and resumable frontiers
 
 #### Documentation
 
@@ -137,8 +132,10 @@
 
 ### Notes
 
-- **EventAccumulator = BridgeCollector**: No separate type needed; injected accumulator is the implementation.
-- **Single traversal engine**: `lineage::Comparison` is the authoritative reverse BFS; avoid duplicating traversal logic.
-- **Temporary hack**: `.rev()` in `NodeApplier` exists to work around legacy `NotDescends` issue; remove after #4/#5.
-- **ForwardView design**: Should be memory-efficient; avoid materializing entire DAG when possible (streaming/iterator-based).
-- **Backend contract**: Atomic commit/abort across all backends in the apply phase critical section.
+- **ForwardView closed set**: Contains exactly the events between meet → {subject, other}. Built via reverse-walk after meet is known.
+- **EventAccumulator**: Now potentially redundant (EventBridge uses ForwardView ReadySets). Consider removal.
+- **Comparison caching**: All fetched events stored in `events_by_id` + `parents_by_id` for post-meet ForwardView construction.
+- **Object safety**: `PropertyBackend` remains object-safe by returning `Box<dyn PropertyTransaction<Event>>` from `begin()`.
+- **Transaction lifetime**: `commit()` and `rollback()` take `&mut self` (not `self`) for trait object compatibility.
+- **Temporary hack**: `.rev()` in `NodeApplier` exists to work around legacy issue; remove after LWW implementation verified.
+- **Backend contract**: Atomic commit/abort across all backends in the apply phase critical section with CAS head check.

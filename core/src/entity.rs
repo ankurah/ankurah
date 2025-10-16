@@ -1,5 +1,5 @@
 use crate::causal_dag::{self as lineage};
-use crate::retrieval::{GetEvents, Retrieve, TEvent};
+use crate::retrieval::{GetEvents, Retrieve};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
@@ -188,7 +188,7 @@ impl Entity {
     /// Returns the new head after applying all events.
     fn apply_forward_chain<G>(
         &self,
-        getter: &G,
+        _getter: &G,
         forward_chain: &[ankurah_proto::Attested<Event>],
         base_head: &Clock,
     ) -> Result<Clock, MutationError>
@@ -314,14 +314,65 @@ impl Entity {
                     info!("StrictAscends - ignoring old event");
                     return Ok(false);
                 }
-                lineage::CausalRelation::DivergedSince { .. } => {
-                    // TODO: Use LWWResolver for deterministic conflict resolution (concurrent-updates/spec.md)
-                    // For now, naively augment head with concurrent event
-                    info!("DivergedSince/NotDescends - applying concurrent event (attempt {})", attempt + 1);
-                    // Atomic update: apply operations and augment head under single lock
-                    {
+                lineage::CausalRelation::DivergedSince { meet: _, subject, other: _ } => {
+                    info!("DivergedSince - deterministic conflict resolution via ForwardView (attempt {})", attempt + 1);
+
+                    // Use ForwardView for deterministic conflict resolution
+                    if let Some(forward_view) = result.forward_view {
+                        // Begin transactions for all backends
+                        let state = self.state.read().unwrap();
+                        let mut transactions: std::collections::BTreeMap<
+                            String,
+                            Box<dyn crate::property::backend::PropertyTransaction<ankurah_proto::Event>>,
+                        > = std::collections::BTreeMap::new();
+
+                        for (backend_name, backend) in state.backends.iter() {
+                            let tx = backend.begin()?;
+                            transactions.insert(backend_name.clone(), tx);
+                        }
+                        drop(state);
+
+                        // Apply ReadySets through transactions
+                        for ready_set in forward_view.iter_ready_sets() {
+                            for (_backend_name, tx) in transactions.iter_mut() {
+                                tx.apply_ready_set(&ready_set)?;
+                            }
+                        }
+
+                        // Commit all transactions under write lock
+                        {
+                            let mut state = self.state.write().unwrap();
+
+                            // Re-check that head hasn't changed since lineage comparison
+                            if state.head != head {
+                                warn!("Head changed during lineage comparison, rolling back and retrying...");
+                                for (_name, mut tx) in transactions {
+                                    let _ = tx.rollback(); // Best effort rollback, ignore errors
+                                }
+                                let current_head = state.head.clone();
+                                drop(state);
+                                head = current_head;
+                                continue;
+                            }
+
+                            // Commit all transactions
+                            for (_name, mut tx) in transactions {
+                                tx.commit()?;
+                            }
+
+                            // Update head to the union of subject and other (resolved via deterministic tiebreak)
+                            // For now, we set head to the subject head since that's what the Primary path represents
+                            state.head = subject.into();
+                        }
+
+                        // Notify Signal subscribers about the change
+                        self.broadcast.send(());
+                        return Ok(true);
+                    } else {
+                        // FIXME - this should be a fatal error - DivergedSince without ForwardView should never happen
+                        // Fallback: naively augment head with concurrent event (legacy behavior)
+                        warn!("DivergedSince without ForwardView - using legacy augment behavior");
                         let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
                         if state.head != head {
                             warn!("Head changed during lineage comparison, retrying...");
                             let current_head = state.head.clone();
@@ -332,10 +383,10 @@ impl Entity {
                         for (backend_name, operations) in event.operations.iter() {
                             state.apply_operations(backend_name.clone(), operations)?;
                         }
-                        // concurrent - so augment the head
                         state.head.insert(event.id());
+
+                        return Ok(false);
                     }
-                    return Ok(false);
                 }
                 lineage::CausalRelation::Disjoint { .. } => {
                     // total apples and oranges - take a hike buddy

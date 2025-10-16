@@ -626,42 +626,41 @@ where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        use crate::causal_dag::{misc::EventAccumulator, CausalRelation};
         use crate::retrieval::LocalRetriever;
 
         let retriever = LocalRetriever::new(storage_collection.clone());
-        let accumulator = EventAccumulator::new(None); // No limit for Phase 1
-        let mut comparison = crate::causal_dag::Comparison::new_with_accumulator(
-            &retriever,
-            current_head,
-            known_head,
-            100000, // TODO: make budget configurable
-            Some(accumulator),
-        );
 
-        // Run comparison
-        loop {
-            match comparison.step().await? {
-                Some(CausalRelation::StrictDescends) => {
-                    // Current descends from known - perfect for event bridge
-                    break;
-                }
-                Some(CausalRelation::Equal) => {
-                    // Heads are equal - no events needed
-                    break;
-                }
-                Some(_) => {
-                    // Other relationships (DivergedSince, Disjoint, etc.) - can't build bridge
-                    return Ok(vec![]);
-                }
-                None => {
-                    // Continue stepping
+        // Compare known_head (other) with current_head (subject)
+        let result = crate::causal_dag::compare(&retriever, current_head, known_head, 100000).await?;
+
+        match result.relation {
+            crate::causal_dag::CausalRelation::StrictDescends => {
+                // Current descends from known - collect Primary events from ForwardView
+                if let Some(forward_view) = result.forward_view {
+                    let mut events = Vec::new();
+
+                    // Iterate through ReadySets and collect only Primary events (subject-side)
+                    for ready_set in forward_view.iter_ready_sets() {
+                        for event in ready_set.primary_events() {
+                            events.push(event.clone());
+                        }
+                    }
+
+                    Ok(events)
+                } else {
+                    // Fallback to legacy forward_chain if ForwardView not available
+                    Ok(result.forward_chain)
                 }
             }
+            crate::causal_dag::CausalRelation::Equal => {
+                // Heads are equal - no events needed
+                Ok(vec![])
+            }
+            _ => {
+                // Other relationships (DivergedSince, Disjoint, etc.) - can't build bridge
+                Ok(vec![])
+            }
         }
-
-        // Extract accumulated events
-        Ok(comparison.take_accumulated_events().unwrap_or_default())
     }
 
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }

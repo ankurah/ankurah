@@ -6,20 +6,30 @@ use super::relation::CausalRelation;
 use crate::causal_dag::misc::EventAccumulator;
 use crate::error::RetrievalError;
 use crate::retrieval::{GetEvents, TClock, TEvent};
-/// Causal relation with forward replay chain
+/// Causal relation with forward replay chain and ForwardView
 #[derive(Debug)]
 pub struct RelationAndChain<Event: TEvent> {
     pub relation: CausalRelation<Event::Id>,
-    /// Forward chain from meet to subject (oldest → newest), if applicable
+    /// Forward chain from meet to subject (oldest → newest), if applicable (legacy)
     pub forward_chain: Vec<ankurah_proto::Attested<Event>>,
+    /// ForwardView for iterating through ReadySets (new API)
+    pub forward_view: Option<crate::causal_dag::forward_view::ForwardView<Event>>,
 }
 
 impl<Event: TEvent> RelationAndChain<Event> {
     pub fn new(relation: CausalRelation<Event::Id>, forward_chain: Vec<ankurah_proto::Attested<Event>>) -> Self {
-        Self { relation, forward_chain }
+        Self { relation, forward_chain, forward_view: None }
     }
 
-    pub fn simple(relation: CausalRelation<Event::Id>) -> Self { Self { relation, forward_chain: Vec::new() } }
+    pub fn with_view(
+        relation: CausalRelation<Event::Id>,
+        forward_chain: Vec<ankurah_proto::Attested<Event>>,
+        forward_view: crate::causal_dag::forward_view::ForwardView<Event>,
+    ) -> Self {
+        Self { relation, forward_chain, forward_view: Some(forward_view) }
+    }
+
+    pub fn simple(relation: CausalRelation<Event::Id>) -> Self { Self { relation, forward_chain: Vec::new(), forward_view: None } }
 }
 
 /// Compares an unstored event against a stored clock by starting the comparison
@@ -62,8 +72,24 @@ where
     // Otherwise, the relationship is the same as between parent and other
     let result = compare(getter, subject_parent, other, budget).await?;
     Ok(match result.relation {
-        CausalRelation::Equal => RelationAndChain::new(CausalRelation::StrictDescends, result.forward_chain),
-        other => RelationAndChain::new(other, result.forward_chain),
+        CausalRelation::Equal => {
+            // Parent equals other, so subject strictly descends from other
+            // Forward view is empty since parent is already at other head
+            // Caller must apply the subject event itself
+            if let Some(fv) = result.forward_view {
+                RelationAndChain::with_view(CausalRelation::StrictDescends, result.forward_chain, fv)
+            } else {
+                RelationAndChain::new(CausalRelation::StrictDescends, result.forward_chain)
+            }
+        }
+        other_relation => {
+            // Relation between parent and other is the same as between subject and other
+            if let Some(fv) = result.forward_view {
+                RelationAndChain::with_view(other_relation, result.forward_chain, fv)
+            } else {
+                RelationAndChain::new(other_relation, result.forward_chain)
+            }
+        }
     })
 }
 
@@ -110,21 +136,28 @@ where
 
     loop {
         if let Some(ordering) = comparison.step().await? {
-            // Build forward chain if applicable
-            let forward_chain = match &ordering {
-                CausalRelation::StrictDescends | CausalRelation::StrictAscends | CausalRelation::DivergedSince { .. } => {
-                    let meet = match &ordering {
-                        CausalRelation::StrictDescends => other.members(),
-                        CausalRelation::DivergedSince { meet, .. } => meet.as_slice(),
-                        CausalRelation::StrictAscends => &[], // No forward chain needed for ascends
-                        _ => &[],
-                    };
-                    comparison.build_forward_chain(meet, &subject_head)
+            // Build forward chain (legacy) and ForwardView (new)
+            let (forward_chain, forward_view) = match &ordering {
+                CausalRelation::StrictDescends => {
+                    let meet = other.members();
+                    let chain = comparison.build_forward_chain(meet, &subject_head);
+                    let view = comparison.build_forward_view(meet, &subject_head, other.members());
+                    (chain, Some(view))
                 }
-                _ => Vec::new(),
+                CausalRelation::DivergedSince { meet, subject, other } => {
+                    let chain = comparison.build_forward_chain(meet, &subject_head);
+                    let view = comparison.build_forward_view(meet, subject, other);
+                    (chain, Some(view))
+                }
+                CausalRelation::StrictAscends => (Vec::new(), None), // No forward chain or view for ascends
+                _ => (Vec::new(), None),
             };
 
-            return Ok(RelationAndChain::new(ordering, forward_chain));
+            return Ok(if let Some(view) = forward_view {
+                RelationAndChain::with_view(ordering, forward_chain, view)
+            } else {
+                RelationAndChain::new(ordering, forward_chain)
+            });
         }
     }
 }
@@ -184,6 +217,7 @@ where Id: Clone + PartialEq
     }
 }
 
+// FIXME - rename to CausalTraversal or something like that
 pub(crate) struct Comparison<'a, G>
 where
     G: GetEvents + 'a,
@@ -226,9 +260,11 @@ where
     /* event accumulator for building event bridges */
     subject_event_accumulator: Option<EventAccumulator<ankurah_proto::Attested<G::Event>>>,
 
-    /* forward chain tracking for replay */
-    /// Maps event ID to its full event for forward replay
-    subject_events: HashMap<G::Id, ankurah_proto::Attested<G::Event>>,
+    /* cached events for ForwardView construction */
+    /// All fetched events (both subject and other sides) for building ForwardView after meet is known
+    events_by_id: HashMap<G::Id, ankurah_proto::Attested<G::Event>>,
+    /// Cached parent relationships for efficient reverse/forward walks
+    parents_by_id: HashMap<G::Id, SmallVec<[G::Id; 4]>>,
 }
 
 impl<'a, G> Comparison<'a, G>
@@ -279,7 +315,8 @@ where
             meet_candidates: BTreeSet::new(),
             outstanding_heads: other,
             subject_event_accumulator,
-            subject_events: HashMap::new(),
+            events_by_id: HashMap::new(),
+            parents_by_id: HashMap::new(),
         }
     }
 
@@ -302,10 +339,10 @@ where
                 continue;
             }
 
-            if let Some(event) = self.subject_events.get(&id) {
+            if let Some(parents) = self.parents_by_id.get(&id) {
                 reachable.insert(id.clone());
-                for parent_id in event.payload.parent().members() {
-                    if self.subject_events.contains_key(parent_id) {
+                for parent_id in parents.iter() {
+                    if self.events_by_id.contains_key(parent_id) {
                         stack.push(parent_id.clone());
                     }
                 }
@@ -324,8 +361,8 @@ where
 
         // Count in-degrees and build children map
         for id in &reachable {
-            if let Some(event) = self.subject_events.get(id) {
-                for parent_id in event.payload.parent().members() {
+            if let Some(parents) = self.parents_by_id.get(id) {
+                for parent_id in parents.iter() {
                     if reachable.contains(parent_id) {
                         *in_degree.get_mut(id).unwrap() += 1;
                         children.entry(parent_id.clone()).or_default().push(id.clone());
@@ -341,7 +378,7 @@ where
 
         // Process events in topological order
         while let Some(id) = queue.pop() {
-            if let Some(event) = self.subject_events.get(&id) {
+            if let Some(event) = self.events_by_id.get(&id) {
                 result.push(event.clone());
 
                 // Reduce in-degree of children
@@ -359,6 +396,43 @@ where
         }
 
         result
+    }
+
+    /// Filter events to the closed set between meet → {subject, other} and build ForwardView
+    pub fn build_forward_view(
+        &self,
+        meet: &[G::Id],
+        subject_head: &[G::Id],
+        other_head: &[G::Id],
+    ) -> crate::causal_dag::forward_view::ForwardView<G::Event>
+    where
+        G::Id: std::hash::Hash + Eq + Clone,
+    {
+        // Reverse-walk from both heads back to meet to find the closed set
+        let meet_set: HashSet<_> = meet.iter().cloned().collect();
+        let mut closed_set = HashSet::new();
+        let mut stack: Vec<G::Id> = subject_head.iter().chain(other_head.iter()).cloned().collect();
+
+        while let Some(id) = stack.pop() {
+            if meet_set.contains(&id) || closed_set.contains(&id) {
+                continue;
+            }
+
+            if let Some(parents) = self.parents_by_id.get(&id) {
+                closed_set.insert(id.clone());
+                for parent_id in parents.iter() {
+                    if self.events_by_id.contains_key(parent_id) {
+                        stack.push(parent_id.clone());
+                    }
+                }
+            }
+        }
+
+        // Build the events map for ForwardView (only events in the closed set)
+        let events_map: HashMap<G::Id, ankurah_proto::Attested<G::Event>> =
+            closed_set.iter().filter_map(|id| self.events_by_id.get(id).map(|e| (id.clone(), e.clone()))).collect();
+
+        crate::causal_dag::forward_view::ForwardView::new(meet.to_vec(), subject_head.to_vec(), other_head.to_vec(), events_map)
     }
 
     // runs one step of the comparison, returning Some(ordering) if a conclusive determination can be made, or None if it needs more steps
@@ -398,14 +472,15 @@ where
     }
     fn process_event(&mut self, event: &ankurah_proto::Attested<G::Event>) {
         let id = event.payload.id();
-        let parents = event.payload.parent().members();
         let from_subject = self.subject_frontier.remove(&id);
         let from_other = self.other_frontier.remove(&id);
 
-        // Store subject-side events for forward chain reconstruction
-        if from_subject {
-            self.subject_events.insert(id.clone(), event.clone());
-        }
+        // Cache all events (both subject and other sides) for ForwardView construction
+        self.events_by_id.insert(id.clone(), event.clone());
+
+        // Cache parent relationships for efficient traversal
+        let parents: SmallVec<[G::Id; 4]> = event.payload.parent().members().iter().cloned().collect();
+        self.parents_by_id.insert(id.clone(), parents.clone());
 
         // Process the current node and capture relevant state
         // We do this BEFORE accumulation to track seen_from state
@@ -443,7 +518,7 @@ where
             }
 
             // Update common child count and propagate origins in one pass over parents
-            for p in parents {
+            for p in &parents {
                 let parent_state = self.states.entry(p.clone()).or_default();
                 if from_other {
                     parent_state.origins.augment(&origins);
@@ -452,7 +527,7 @@ where
             }
         } else if from_other {
             // Just propagate origins if not a common node
-            for p in parents {
+            for p in &parents {
                 let parent_state = self.states.entry(p.clone()).or_default();
                 parent_state.origins.augment(&origins);
             }

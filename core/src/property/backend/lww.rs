@@ -9,8 +9,12 @@ use ankurah_proto::{EventId, Operation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    causal_dag::forward_view::ReadySet,
     error::{MutationError, StateError},
-    property::{backend::PropertyBackend, PropertyName, Value},
+    property::{
+        backend::{PropertyBackend, PropertyTransaction},
+        PropertyName, Value,
+    },
 };
 
 const LWW_DIFF_VERSION: u8 = 1;
@@ -18,7 +22,8 @@ const LWW_DIFF_VERSION: u8 = 1;
 /// In memory value register - not to be serialized
 #[derive(Clone, Debug)]
 struct ValueRegister {
-    // event_id: EventId, // TODO uncomment when wiring up CausalLWWState
+    #[allow(dead_code)] // Will be used in step 5 for causal LWW tiebreaking
+    last_writer_event_id: Option<EventId>,
     value: Option<Value>,
     committed: bool, // NOTE: this is used for Mutables which will emit events, not for event application
 }
@@ -59,7 +64,7 @@ impl LWWBackend {
 
     pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
         let mut values = self.values.write().unwrap();
-        values.insert(property_name, ValueRegister { value, committed: false });
+        values.insert(property_name, ValueRegister { last_writer_event_id: None, value, committed: false });
     }
 
     pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
@@ -109,7 +114,7 @@ impl PropertyBackend for LWWBackend {
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
         let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
-        let map = raw_map.into_iter().map(|(k, v)| (k, ValueRegister { value: v, committed: true })).collect();
+        let map = raw_map.into_iter().map(|(k, v)| (k, ValueRegister { last_writer_event_id: None, value: v, committed: true })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
@@ -145,7 +150,8 @@ impl PropertyBackend for LWWBackend {
                     let mut values = self.values.write().unwrap();
                     for (property_name, new_value) in changes {
                         // Insert as committed entry since this came from an operation
-                        values.insert(property_name.clone(), ValueRegister { value: new_value, committed: true });
+                        values
+                            .insert(property_name.clone(), ValueRegister { last_writer_event_id: None, value: new_value, committed: true });
                         changed_fields.push(property_name);
                     }
                 }
@@ -176,6 +182,13 @@ impl PropertyBackend for LWWBackend {
         // Subscribe to the broadcast and return the guard
         broadcast.reference().listen(listener)
     }
+
+    fn begin(&self) -> Result<Box<dyn PropertyTransaction<ankurah_proto::Event>>, MutationError> {
+        let values = self.values.read().unwrap();
+        let base_registers = values.clone();
+
+        Ok(Box::new(LWWTransaction { base_registers, pending_winners: BTreeMap::new() }))
+    }
 }
 
 impl LWWBackend {
@@ -184,6 +197,44 @@ impl LWWBackend {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
         let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
         broadcast.id()
+    }
+}
+
+/// Transaction for applying concurrent updates to LWW backend
+pub struct LWWTransaction {
+    /// Snapshot of registers at transaction start (reflects Primary head)
+    #[allow(dead_code)] // Will be used in step 5 for causal LWW tiebreaking
+    base_registers: BTreeMap<PropertyName, ValueRegister>,
+    /// Proposed winners after ReadySet processing: (event_id, value)
+    #[allow(dead_code)] // Will be used in step 5 for causal LWW tiebreaking
+    pending_winners: BTreeMap<PropertyName, (EventId, Option<Value>)>,
+}
+
+impl PropertyTransaction<ankurah_proto::Event> for LWWTransaction {
+    fn apply_ready_set(&mut self, _ready_set: &ReadySet<ankurah_proto::Event>) -> Result<(), MutationError> {
+        // TODO: Implement causal LWW tiebreaking
+        // Per ReadySet procedure:
+        // 1. Determine Primary event ID for this layer (if any) - do NOT apply it
+        // 2. For each property mentioned by any event in {Primary ∪ Concurrency}:
+        //    - Get current_winner_id from base_registers (if exists)
+        //    - Compute best_id using lineage + lexicographic tiebreak
+        //    - If best_id != current_winner_id, update pending_winners
+        // 3. Repeat for each ReadySet
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<(), MutationError> {
+        // TODO: Implement commit
+        // 1. Compute diffs: pending_winners vs base_registers
+        // 2. Build events: Vec<EventId> and entity_id_offset from changed winners
+        // 3. Merge winners into backend's ValueRegisters
+        // 4. to_state_buffer() serializes only changed registers (diff)
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), MutationError> {
+        // Drop pending state
+        Ok(())
     }
 }
 

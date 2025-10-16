@@ -2,6 +2,8 @@ use ankurah_proto::{AttestationSet, Attested};
 use itertools::Itertools;
 
 use super::*;
+use crate::error::RetrievalError;
+use crate::retrieval::{GetEvents, TClock, TEvent};
 use async_trait::async_trait;
 use std::collections::HashMap;
 
@@ -670,4 +672,163 @@ async fn test_forward_chain_with_branching() {
 
     // Event 7 should be last since it depends on everything else
     assert_eq!(chain_ids.last(), Some(&7));
+}
+
+#[tokio::test]
+async fn test_forward_view_from_strict_descends() {
+    // Test: ForwardView construction from StrictDescends comparison
+    // Subject: 1 -> 2 -> 3
+    // Other: 1
+    // Expected: ForwardView from 1 to 3, all events Primary
+
+    let mut store = MockEventStore::new();
+    store.add(1, &[]);
+    store.add(2, &[1]);
+    store.add(3, &[2]);
+
+    let subject = TestClock { members: vec![3] };
+    let other = TestClock { members: vec![1] };
+
+    let result = compare(&store, &subject, &other, 100).await.unwrap();
+    assert!(matches!(result.relation, CausalRelation::StrictDescends));
+
+    // Build ForwardView from comparison result
+    use crate::causal_dag::forward_view::ForwardView;
+    let events_map = result.forward_chain.iter().map(|e| (e.payload.id(), e.clone())).collect();
+
+    let view = ForwardView::new(vec![1], vec![3], vec![1], events_map);
+
+    // Verify ReadySets
+    let ready_sets: Vec<_> = view.iter_ready_sets().collect();
+    assert_eq!(ready_sets.len(), 2, "Should have 2 ReadySets (events 2 and 3)");
+
+    // All events should be Primary (no concurrency)
+    for rs in &ready_sets {
+        assert!(rs.concurrency_events().count() == 0, "No concurrent events in StrictDescends");
+        assert!(rs.primary_events().count() > 0, "All events should be Primary");
+    }
+}
+
+#[tokio::test]
+async fn test_forward_view_from_diverged() {
+    // Test: ForwardView construction from DivergedSince comparison
+    // Subject: 1 -> 2 -> 4
+    // Other:   1 -> 3 -> 5
+    // Meet: 1
+    // Expected: ForwardView shows 2,4 as Primary and 3,5 as Concurrency
+
+    let mut store = MockEventStore::new();
+    store.add(1, &[]);
+    store.add(2, &[1]);
+    store.add(3, &[1]);
+    store.add(4, &[2]);
+    store.add(5, &[3]);
+
+    let subject = TestClock { members: vec![4] };
+    let other = TestClock { members: vec![5] };
+
+    let result = compare(&store, &subject, &other, 100).await.unwrap();
+    let meet = match result.relation {
+        CausalRelation::DivergedSince { meet, .. } => meet,
+        other => panic!("Expected DivergedSince, got {:?}", other),
+    };
+
+    // Build event map from forward_chain
+    // Note: forward_chain only contains subject-side events (2, 4) per current compare() implementation
+    // We need to fetch other-side events (3, 5) separately for full ForwardView
+    let other_events = store.retrieve_event(vec![3, 5]).await.unwrap().1;
+
+    let mut events_map: HashMap<TestId, _> = result.forward_chain.iter().map(|e| (e.payload.id(), e.clone())).collect();
+    for e in other_events {
+        events_map.insert(e.payload.id(), e);
+    }
+
+    use crate::causal_dag::forward_view::ForwardView;
+    let view = ForwardView::new(meet.clone(), vec![4], vec![5], events_map);
+
+    // Verify ReadySets
+    let ready_sets: Vec<_> = view.iter_ready_sets().collect();
+    assert!(ready_sets.len() >= 2, "Should have at least 2 layers");
+
+    // Verify Primary vs Concurrency tagging
+    let all_primary: Vec<_> = ready_sets.iter().flat_map(|rs| rs.primary_events().map(|e| e.payload.id())).collect();
+    let all_concurrency: Vec<_> = ready_sets.iter().flat_map(|rs| rs.concurrency_events().map(|e| e.payload.id())).collect();
+
+    assert!(all_primary.contains(&2), "Event 2 should be Primary (on subject path)");
+    assert!(all_primary.contains(&4), "Event 4 should be Primary (on subject path)");
+    assert!(all_concurrency.contains(&3), "Event 3 should be Concurrency (on other path)");
+    assert!(all_concurrency.contains(&5), "Event 5 should be Concurrency (on other path)");
+}
+
+#[tokio::test]
+async fn test_forward_view_with_complex_merge() {
+    // Test: ForwardView with merge point
+    // Subject: 1 -> 2 -> 4 (merge of 2 and 3)
+    // Other:   1 -> 3
+    // Meet: 1
+    // Expected: 2 and 3 in layer 1, 4 in layer 2
+
+    let mut store = MockEventStore::new();
+    store.add(1, &[]);
+    store.add(2, &[1]);
+    store.add(3, &[1]);
+    store.add(4, &[2, 3]); // merges both branches
+
+    let subject = TestClock { members: vec![4] };
+    let other = TestClock { members: vec![3] };
+
+    let result = compare(&store, &subject, &other, 100).await.unwrap();
+    let meet = match result.relation {
+        CausalRelation::DivergedSince { meet, .. } => meet,
+        CausalRelation::StrictDescends => vec![3], // if other is ancestor, meet is other
+        other => panic!("Unexpected relation: {:?}", other),
+    };
+
+    // Build event map
+    let mut events_map: HashMap<TestId, _> = result.forward_chain.iter().map(|e| (e.payload.id(), e.clone())).collect();
+
+    // Fetch event 3 if not in forward_chain
+    if !events_map.contains_key(&3) {
+        let e3 = store.retrieve_event(vec![3]).await.unwrap().1;
+        for e in e3 {
+            events_map.insert(e.payload.id(), e);
+        }
+    }
+
+    use crate::causal_dag::forward_view::ForwardView;
+    let view = ForwardView::new(meet, vec![4], vec![3], events_map);
+
+    // Verify ReadySets structure
+    let ready_sets: Vec<_> = view.iter_ready_sets().collect();
+    assert!(ready_sets.len() > 0, "Should have at least 1 ReadySet");
+
+    // Verify all events are present
+    let all_event_ids: Vec<_> = ready_sets.iter().flat_map(|rs| rs.all_events().map(|e| e.payload.id())).collect();
+    assert!(all_event_ids.contains(&2) || all_event_ids.contains(&4), "Subject-side events should be present");
+}
+
+#[tokio::test]
+async fn test_forward_view_empty_for_equal() {
+    // Test: ForwardView is empty when clocks are Equal
+    // Subject: 1 -> 2
+    // Other: 1 -> 2
+    // Expected: Equal relation, empty ForwardView
+
+    let mut store = MockEventStore::new();
+    store.add(1, &[]);
+    store.add(2, &[1]);
+
+    let subject = TestClock { members: vec![2] };
+    let other = TestClock { members: vec![2] };
+
+    let result = compare(&store, &subject, &other, 100).await.unwrap();
+    assert!(matches!(result.relation, CausalRelation::Equal));
+    assert_eq!(result.forward_chain.len(), 0, "forward_chain should be empty for Equal");
+
+    // ForwardView with empty events
+    use crate::causal_dag::forward_view::ForwardView;
+    let view: ForwardView<TestEvent> = ForwardView::new(vec![2], vec![2], vec![2], HashMap::new());
+
+    let ready_sets: Vec<_> = view.iter_ready_sets().collect();
+    assert_eq!(ready_sets.len(), 0, "No ReadySets when clocks are equal");
 }
