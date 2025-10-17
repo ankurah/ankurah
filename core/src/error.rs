@@ -170,6 +170,7 @@ pub enum LineageError {
     Incomparable,
     PartiallyDescends { meet: Vec<EventId> },
     BudgetExceeded { original_budget: usize, subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
+    HeadChanged { expected: ankurah_proto::Clock, actual: ankurah_proto::Clock },
 }
 
 impl std::fmt::Display for LineageError {
@@ -185,6 +186,9 @@ impl std::fmt::Display for LineageError {
                 let subject: Vec<_> = subject_frontier.iter().map(|id| id.to_base64_short()).collect();
                 let other: Vec<_> = other_frontier.iter().map(|id| id.to_base64_short()).collect();
                 write!(f, "budget exceeded ({}): subject[{}] other[{}]", original_budget, subject.join(", "), other.join(", "))
+            }
+            LineageError::HeadChanged { expected, actual } => {
+                write!(f, "head changed during comparison: expected {:?}, got {:?}", expected, actual)
             }
         }
     }
