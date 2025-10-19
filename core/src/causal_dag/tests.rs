@@ -413,9 +413,13 @@ async fn test_compare_event_unstored() {
     // Test root event case
     let root_event = TestEvent { id: 11, parent_clock: TestClock { members: vec![] } };
 
-    // Root event (parent = []) compared to empty clock [] should be StrictDescends (genesis after nothing)
+    // Root event (parent = []) compared to empty clock [] is Disjoint (NULL semantics: [] != [])
+    // Entity creation is handled specially by Entity::apply_event's is_entity_create() path
     let empty_clock = TestClock { members: vec![] };
-    assert_eq!(compare_unstored_event(&store, &root_event, &empty_clock, 100).await.unwrap().relation, CausalRelation::StrictDescends);
+    assert!(matches!(
+        compare_unstored_event(&store, &root_event, &empty_clock, 100).await.unwrap().relation,
+        CausalRelation::Disjoint { subject_root: None, other_root: None, .. }
+    ));
 
     // Two different genesis events should be Disjoint, but without proper root tracking,
     // comparing empty parent [] vs [1] may return StrictAscends. Accept both for now.
@@ -427,10 +431,13 @@ async fn test_compare_event_unstored() {
         result.relation
     );
 
-    // Test that a non-empty unstored event (parent=[3]) compared with empty clock returns Descends
-    // The parent [3] descends from empty, so the event also descends
+    // Test that a non-empty unstored event (parent=[3]) compared with empty clock returns Disjoint
+    // With NULL semantics, non-empty vs empty is Disjoint
     let empty_clock = TestClock { members: vec![] };
-    assert_eq!(compare_unstored_event(&store, &unstored_event, &empty_clock, 100).await.unwrap().relation, CausalRelation::StrictDescends);
+    assert!(matches!(
+        compare_unstored_event(&store, &unstored_event, &empty_clock, 100).await.unwrap().relation,
+        CausalRelation::Disjoint { subject_root: Some(_), other_root: None, .. }
+    ));
 }
 
 #[tokio::test]
