@@ -6,10 +6,12 @@ use std::{collections::BTreeMap, sync::Arc};
 
 pub mod lww;
 //pub mod pn_counter;
+pub mod transaction;
 pub mod yrs;
 use crate::error::{MutationError, RetrievalError, StateError};
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
+pub use transaction::PropertyTransaction;
 pub use yrs::YrsBackend;
 
 use super::{PropertyName, Value};
@@ -51,6 +53,11 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
         field_name: &PropertyName,
         listener: ankurah_signals::broadcast::Listener,
     ) -> ankurah_signals::broadcast::ListenerGuard;
+
+    /// Begin a transaction for applying concurrent updates.
+    ///
+    /// Returns a boxed PropertyTransaction that can apply ReadySets and commit/rollback atomically.
+    fn begin(&self) -> Result<Box<dyn PropertyTransaction<ankurah_proto::Event>>, MutationError>;
 }
 
 // This is where this gets a bit tough.

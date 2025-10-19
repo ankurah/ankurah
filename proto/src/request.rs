@@ -64,15 +64,16 @@ pub enum CausalRelation {
         other: Clock,
     },
 
-    /// Proven different genesis events (single-root invariant).
+    /// Proven different genesis events (single-root invariant) or empty clocks.
+    /// Empty clocks (like SQL NULL) are always Disjoint from everything.
     /// Optional `gca` records any common non-minimal ancestors discovered en route.
     Disjoint {
         /// Optional non-minimal common ancestors (if any were found).
         gca: Option<Clock>,
-        /// Proven genesis of subject.
-        subject_root: EventId,
-        /// Proven genesis of other.
-        other_root: EventId,
+        /// Proven genesis of subject (None if subject is empty clock).
+        subject_root: Option<EventId>,
+        /// Proven genesis of other (None if other is empty clock).
+        other_root: Option<EventId>,
     },
 
     /// Traversal could not complete under budget; return current frontiers to resume.

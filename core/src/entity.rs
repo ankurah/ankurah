@@ -1,4 +1,8 @@
-use crate::lineage::{self, GetEvents, Retrieve};
+mod transaction;
+pub use transaction::{CommitState, EntityTransaction};
+
+use crate::causal_dag::{self as lineage};
+use crate::retrieval::{GetEvents, Retrieve};
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
@@ -28,6 +32,12 @@ struct EntityInnerState {
     head: Clock,
     // TODO: remove interior mutability from backends; make mutation methods take &mut self
     backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
+    /// Commit state for uncommitted entities (Some = uncommitted, None = committed)
+    ///
+    /// For now: Only prevents visibility for genesis (empty head) entities.
+    /// TODO: Implement full transaction isolation - prevent concurrent state updates (Might replace CAS for head?)
+    /// for non-genesis entities while transaction is active.
+    commit_state: Option<Arc<CommitState>>,
 }
 
 impl EntityInnerState {
@@ -58,8 +68,8 @@ pub struct EntityInner {
 
 #[derive(Debug)]
 pub enum EntityKind {
-    Primary,                                                     // New or resident entity - TODO delineate these
-    Transacted { trx_alive: Arc<AtomicBool>, upstream: Entity }, // Transaction fork with liveness tracking
+    Primary,                                                 // Normal entity (committed or uncommitted based on state.trx)
+    Branch { trx_alive: Arc<AtomicBool>, upstream: Entity }, // Transaction fork for isolated editing
 }
 
 impl std::ops::Deref for Entity {
@@ -95,12 +105,26 @@ impl Entity {
 
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
 
-    /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
-    pub fn is_writable(&self) -> bool {
+    /// Check if this entity is writable (i.e., it's uncommitted or a Branch entity)
+    pub fn is_user_writable(&self) -> bool {
         match &self.kind {
-            EntityKind::Primary => false, // Primary entities are read-only
-            EntityKind::Transacted { trx_alive, .. } => trx_alive.load(Ordering::Acquire),
+            EntityKind::Primary => {
+                // Primary entities with uncommitted state are writable
+                // This is counterintuitive - but actually kind of correct, because a newly created Entity in a Transaction will use
+                // ::Primary instead of ::Branch. and other attempts to retrieve that entity should be blocked until the EntityTransaction is committed.
+                // There's probably a more elegant way to signal/organize this. A better way to think about it is that this record is locked, and its
+                // my lock, so I can write to it. It's just a little too implicit that
+                //  Primary + uncommitted + non retrievability of uncommitted entities means it's my lock
+                self.is_uncommitted()
+            }
+            EntityKind::Branch { trx_alive, .. } => trx_alive.load(Ordering::Acquire),
         }
+    }
+
+    /// Returns true if this entity has uncommitted state (not yet persisted)
+    fn is_uncommitted(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.commit_state.as_ref().map_or(false, |cs| !cs.is_committed())
     }
 
     pub fn to_state(&self) -> Result<State, StateError> {
@@ -119,12 +143,17 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
     }
 
-    // used by the Model macro
-    pub fn create(id: EntityId, collection: CollectionId) -> Self {
+    // Create a new entity (uncommitted)
+    fn create(id: EntityId, collection: CollectionId, commit_state: Arc<CommitState>) -> Self {
+        eprintln!("MARK Entity::create creating NEW entity={:#} collection={:#}", id, collection);
         Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: Clock::default(), backends: BTreeMap::default() }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: Clock::default(),
+                backends: BTreeMap::default(),
+                commit_state: Some(commit_state), // Uncommitted
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
@@ -141,7 +170,11 @@ impl Entity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                backends,
+                commit_state: None, // Entities from storage are committed
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))
@@ -183,27 +216,81 @@ impl Entity {
         }
     }
 
+    /// Apply events from the forward chain in causal order (oldest → newest).
+    /// Returns the new head after applying all events.
+    fn apply_forward_chain<G>(
+        &self,
+        _getter: &G,
+        forward_chain: &[ankurah_proto::Attested<Event>],
+        base_head: &Clock,
+    ) -> Result<Clock, MutationError>
+    where
+        G: GetEvents<Id = EventId, Event = Event>,
+    {
+        let mut state = self.state.write().unwrap();
+
+        // Verify head hasn't changed (CAS check)
+        if state.head != *base_head {
+            return Err(MutationError::LineageError(LineageError::HeadChanged { expected: base_head.clone(), actual: state.head.clone() }));
+        }
+
+        // Apply each event in the forward chain
+        for attested_event in forward_chain {
+            let event = &attested_event.payload;
+            for (backend_name, operations) in event.operations.iter() {
+                state.apply_operations(backend_name.clone(), operations)?;
+            }
+        }
+
+        // Update head to the last event in the chain
+        if let Some(last_event) = forward_chain.last() {
+            state.head = last_event.payload.id().into();
+        }
+
+        Ok(state.head.clone())
+    }
+
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
     where G: GetEvents<Id = EventId, Event = Event> {
+        let kind_str = match &self.kind {
+            EntityKind::Primary => "Primary",
+            EntityKind::Branch { .. } => "Branch",
+        };
+        let ptr_str = format!("{:p}", Arc::as_ptr(&self.0));
+        eprintln!("MARK Entity.apply_event START entity={:#} event={:#} kind={} ptr={}", self.id, event.id(), kind_str, ptr_str);
         debug!("apply_event head: {event} to {self}");
 
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
             let mut state = self.state.write().unwrap();
+            eprintln!(
+                "MARK Entity.apply_event entity={:#} event={:#} is_entity_create, head.is_empty()={}",
+                self.id,
+                event.id(),
+                state.head.is_empty()
+            );
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
+                eprintln!("MARK Entity.apply_event entity={:#} event={:#} head IS empty, applying as creation", self.id, event.id());
                 // this is the creation event for a new entity, so we simply accept it
                 for (backend_name, operations) in event.operations.iter() {
                     state.apply_operations(backend_name.clone(), operations)?;
                 }
                 state.head = event.id().into();
+                eprintln!("MARK Entity.apply_event entity={:#} event={:#} HEAD UPDATED to {:?}", self.id, event.id(), state.head);
                 drop(state); // Release lock before broadcast
                              // Notify Signal subscribers about the change
+                eprintln!("MARK Entity.apply_state broadcasting");
                 self.broadcast.send(());
                 return Ok(true);
             }
+            eprintln!(
+                "MARK Entity.apply_event entity={:#} event={:#} head NOT empty, falling through to lineage comparison",
+                self.id,
+                event.id()
+            );
             // If head is no longer empty, fall through to normal lineage comparison
         }
 
@@ -213,59 +300,144 @@ impl Entity {
         let budget = 10;
 
         for attempt in 0..MAX_RETRIES {
-            match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
-                lineage::Ordering::Equal => {
-                    info!("Equal - skip");
+            // Compare the event's parent clock with the current head to get forward chain
+            let result = crate::causal_dag::compare_unstored_event(getter, event, &head, budget).await?;
+
+            eprintln!("MARK Entity.apply_event entity={:#} event={:#} relation={:?}", self.id, event.id(), result.relation);
+
+            match result.relation {
+                lineage::CausalRelation::Equal => {
+                    // Redundant delivery - event already applied
+                    info!("Equal - skip redundant delivery");
                     return Ok(false);
                 }
-                lineage::Ordering::Descends => {
-                    info!("Descends - apply (attempt {})", attempt + 1);
-                    let new_head = event.id().into();
-                    // Atomic update: apply operations and set head under single lock
-                    {
-                        let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
-                        if state.head != head {
-                            debug!("Head changed during lineage comparison, retrying...");
-                            let current_head = state.head.clone();
-                            drop(state);
-                            head = current_head;
-                            continue;
+                lineage::CausalRelation::StrictDescends => {
+                    if result.forward_chain.is_empty() {
+                        // Event's parent equals current head, so just apply this event
+                        info!("Descends - apply single event (attempt {})", attempt + 1);
+                        let new_head = event.id().into();
+                        {
+                            let mut state = self.state.write().unwrap();
+                            // Re-check that head hasn't changed since lineage comparison
+                            if state.head != head {
+                                debug!("Head changed during lineage comparison, retrying...");
+                                let current_head = state.head.clone();
+                                drop(state);
+                                head = current_head;
+                                continue;
+                            }
+                            for (backend_name, operations) in event.operations.iter() {
+                                state.apply_operations(backend_name.clone(), operations)?;
+                            }
+                            state.head = new_head;
                         }
-                        for (backend_name, operations) in event.operations.iter() {
-                            // IMPORTANT TODO - we might descend the entity head by more than one event,
-                            // therefore we need to play forward events one by one, not just the latest
-                            // set operations, the current head and the parent of that.
-                            // We have to play forward all events from the current entity/backend state
-                            // to the latest event. At this point we know this lineage is connected,
-                            // else we would get back an Ordering::Incomparable.
-                            // So we just need to fiure out how to scan through those events here.
-                            // Probably the easiest thing would be to update Ordering::Descends to provide
-                            // the list of events to play forward, but ideally we'd do it on a streaming
-                            // basis instead. of materializing what could potentially be a large number
-                            // of events in some cases.
-                            // we can't do this in the lineage comparison, because its looking backwards
-                            // not forwards - and we need to replay the events in order.
-                            // Maybe the best approach is to have Descends return the list of event ids
-                            // connecting the current head to the new event, and use a modest LRU cache
-                            // on the event geter (which needs to abstract storage collection anyway,
-                            // due to the need for remote event retrieval)
-                            // ...so we get a cache hit in the most common cases, and it can paginate the rest.
-                            state.apply_operations(backend_name.clone(), operations)?;
+                        // Notify Signal subscribers about the change
+                        eprintln!("MARK Entity.apply_event entity={:#} event={:#} broadcasting after DivergedSince", self.id, event.id());
+                        self.broadcast.send(());
+                        return Ok(true);
+                    } else {
+                        // Event's parent descends from current head - need to replay the chain
+                        info!("Descends - apply forward chain with {} events (attempt {})", result.forward_chain.len() + 1, attempt + 1);
+
+                        // Apply the forward chain (from current head to event's parent)
+                        match self.apply_forward_chain(getter, &result.forward_chain, &head) {
+                            Ok(_) => {
+                                // Now apply the incoming event itself
+                                let mut state = self.state.write().unwrap();
+                                for (backend_name, operations) in event.operations.iter() {
+                                    state.apply_operations(backend_name.clone(), operations)?;
+                                }
+                                state.head = event.id().into();
+                                drop(state);
+
+                                // Notify Signal subscribers about the change
+                                eprintln!(
+                                    "MARK Entity.apply_event entity={:#} event={:#} broadcasting after Descends (forward chain)",
+                                    self.id,
+                                    event.id()
+                                );
+                                self.broadcast.send(());
+                                return Ok(true);
+                            }
+                            Err(MutationError::LineageError(LineageError::HeadChanged { .. })) => {
+                                // Head changed, retry
+                                warn!("Head changed during forward chain application, retrying...");
+                                head = self.head();
+                                continue;
+                            }
+                            Err(e) => return Err(e),
                         }
-                        state.head = new_head;
                     }
-                    // Notify Signal subscribers about the change
-                    self.broadcast.send(());
-                    return Ok(true);
                 }
-                lineage::Ordering::NotDescends { meet: _ } => {
-                    // HACK - this is totally wrong, and should be handled by the Visitor discussed in concurrent-updates/spec.md
-                    info!("NotDescends - applying (attempt {})", attempt + 1);
-                    // Atomic update: apply operations and augment head under single lock
-                    {
+                lineage::CausalRelation::StrictAscends => {
+                    // Event is older than our current head - ignore it
+                    info!("StrictAscends - ignoring old event");
+                    return Ok(false);
+                }
+                lineage::CausalRelation::DivergedSince { meet, subject, other } => {
+                    info!("DivergedSince - deterministic conflict resolution via ForwardView (attempt {})", attempt + 1);
+
+                    // Use ForwardView for deterministic conflict resolution
+                    if let Some(forward_view) = result.forward_view {
+                        // Begin transactions for all backends
+                        let state = self.state.read().unwrap();
+                        let mut transactions: std::collections::BTreeMap<
+                            String,
+                            Box<dyn crate::property::backend::PropertyTransaction<ankurah_proto::Event>>,
+                        > = std::collections::BTreeMap::new();
+
+                        for (backend_name, backend) in state.backends.iter() {
+                            let tx = backend.begin()?;
+                            transactions.insert(backend_name.clone(), tx);
+                        }
+                        drop(state);
+
+                        // Apply ReadySets through transactions
+                        for ready_set in forward_view.iter_ready_sets() {
+                            for (_backend_name, tx) in transactions.iter_mut() {
+                                tx.apply_ready_set(&ready_set)?;
+                            }
+                        }
+
+                        // Commit all transactions under write lock
+                        {
+                            let mut state = self.state.write().unwrap();
+
+                            // Re-check that head hasn't changed since lineage comparison
+                            if state.head != head {
+                                warn!("Head changed during lineage comparison, rolling back and retrying...");
+                                for (_name, mut tx) in transactions {
+                                    let _ = tx.rollback(); // Best effort rollback, ignore errors
+                                }
+                                let current_head = state.head.clone();
+                                drop(state);
+                                head = current_head;
+                                continue;
+                            }
+
+                            // Commit all transactions
+                            for (_name, mut tx) in transactions {
+                                tx.commit()?;
+                            }
+
+                            // Update head to the resolved head from ForwardView
+                            state.head = subject.into();
+
+                            // Apply the incoming event itself (ForwardView only contains stored events)
+                            for (backend_name, operations) in event.operations.iter() {
+                                state.apply_operations(backend_name.clone(), operations)?;
+                            }
+                            state.head.insert(event.id());
+                        }
+
+                        // Notify Signal subscribers about the change
+                        self.broadcast.send(());
+                        return Ok(true);
+                    } else {
+                        // FIXME - this should be a fatal error - DivergedSince without ForwardView should never happen
+                        // Fallback: naively augment head with concurrent event (legacy behavior)
+                        warn!("DivergedSince without ForwardView - using legacy augment behavior");
                         let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
                         if state.head != head {
                             warn!("Head changed during lineage comparison, retrying...");
                             let current_head = state.head.clone();
@@ -276,29 +448,25 @@ impl Entity {
                         for (backend_name, operations) in event.operations.iter() {
                             state.apply_operations(backend_name.clone(), operations)?;
                         }
-                        // concurrent - so augment the head
                         state.head.insert(event.id());
+
+                        return Ok(false);
                     }
-                    return Ok(false);
                 }
-                lineage::Ordering::Incomparable => {
+                lineage::CausalRelation::Disjoint { .. } => {
                     // total apples and oranges - take a hike buddy
                     error!("{self} apply_event - Incomparable. This should essentially never happen among good actors.");
                     return Err(LineageError::Incomparable.into());
                 }
-                lineage::Ordering::PartiallyDescends { meet } => {
-                    error!("PartiallyDescends - skipping this event, but we should probably be handling this");
-                    // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                    // but it requires that we update the propertybackends to support this
-                    return Err(LineageError::PartiallyDescends { meet }.into());
-                }
-                lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                lineage::CausalRelation::BudgetExceeded { subject, other } => {
                     error!(
                         "BudgetExceeded subject_frontier: {}, other_frontier: {}",
-                        subject_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", "),
-                        other_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", ")
+                        subject.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", "),
+                        other.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", ")
                     );
-                    return Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into());
+                    return Err(
+                        LineageError::BudgetExceeded { original_budget: budget, subject_frontier: subject, other_frontier: other }.into()
+                    );
                 }
             }
         }
@@ -320,12 +488,12 @@ impl Entity {
         debug!("{self} apply_state - new head: {new_head}");
         let budget = 100;
 
-        match crate::lineage::compare(getter, &new_head, &head, budget).await? {
-            lineage::Ordering::Equal => {
+        match crate::causal_dag::compare(getter, &new_head, &head, budget).await?.relation {
+            lineage::CausalRelation::Equal => {
                 debug!("{self} apply_state - heads are equal, skipping");
                 Ok(false)
             }
-            lineage::Ordering::Descends => {
+            lineage::CausalRelation::StrictDescends => {
                 debug!("{self} apply_state - new head descends from current, applying");
                 // TODO: Consider playing forward the event lineage instead of overwriting backends.
                 // Current approach has a security vulnerability: a malicious peer could send a state
@@ -345,31 +513,31 @@ impl Entity {
                 self.broadcast.send(());
                 Ok(true)
             }
-            lineage::Ordering::NotDescends { meet } => {
-                warn!("{self} apply_state - new head {new_head} does not descend {head}, meet: {meet:?}");
+            lineage::CausalRelation::StrictAscends => {
+                warn!("{self} apply_state - new head {new_head} is older than current {head}, ignoring");
                 Ok(false)
             }
-            lineage::Ordering::Incomparable => {
-                error!("{self} apply_state - heads are incomparable. This should essentially never happen among good actors.");
-                // total apples and oranges - take a hike buddy
+            lineage::CausalRelation::DivergedSince { meet, .. } => {
+                warn!("{self} apply_state - new head {new_head} has diverged from current {head}, meet: {meet:?}");
+                // TODO: Use forward chain to resolve concurrency properly
+                Ok(false)
+            }
+            lineage::CausalRelation::Disjoint { .. } => {
+                error!(
+                    "{self} apply_state - heads are disjoint (different genesis). This should essentially never happen among good actors."
+                );
                 Err(LineageError::Incomparable.into())
             }
-            lineage::Ordering::PartiallyDescends { meet } => {
-                error!("{self} apply_state - heads partially descend, meet: {meet:?}");
-                // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                // but it requires that we update the propertybackends to support this
-                Err(LineageError::PartiallyDescends { meet }.into())
-            }
-            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
-                Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
+            lineage::CausalRelation::BudgetExceeded { subject, other } => {
+                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject:?}, other: {other:?}");
+                Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier: subject, other_frontier: other }.into())
             }
         }
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
     /// The trx_alive parameter tracks whether the transaction that owns this snapshot is still alive
-    pub fn snapshot(&self, trx_alive: Arc<AtomicBool>) -> Self {
+    pub fn branch(&self, trx_alive: Arc<AtomicBool>) -> Self {
         // Inline fork logic
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut forked = BTreeMap::new();
@@ -380,8 +548,8 @@ impl Entity {
         Self(Arc::new(EntityInner {
             id: self.id,
             collection: self.collection.clone(),
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked }),
-            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
+            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked, commit_state: None }),
+            kind: EntityKind::Branch { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
     }
@@ -486,7 +654,7 @@ impl TemporaryEntity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends, commit_state: None }),
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -537,11 +705,20 @@ impl std::fmt::Display for TemporaryEntity {
 #[derive(Clone, Default)]
 pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
 impl WeakEntitySet {
+    pub fn transact(&self) -> EntityTransaction { EntityTransaction::new(self.clone()) }
+    /// Get an entity, filtering out uncommitted entities (invisible to external operations)
     pub fn get(&self, id: &EntityId) -> Option<Entity> {
         let entities = self.0.read().unwrap();
         // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(id) {
-            entity.upgrade()
+        if let Some(weak) = entities.get(id) {
+            if let Some(entity) = weak.upgrade() {
+                if entity.is_uncommitted() {
+                    return None; // Uncommitted - invisible to other operations
+                }
+                Some(entity)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -572,37 +749,87 @@ impl WeakEntitySet {
         }
     }
     /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
+    /// If creating, automatically adds to the provided EntityTransaction
     pub async fn get_retrieve_or_create<R>(
         &self,
         retriever: &R,
         collection_id: &CollectionId,
         id: &EntityId,
+        entity_trx: &mut EntityTransaction,
     ) -> Result<Entity, RetrievalError>
     where
         R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
     {
         match self.get_or_retrieve(retriever, collection_id, id).await? {
-            Some(entity) => Ok(entity),
-            None => {
-                let mut entities = self.0.write().unwrap();
-                // TODO: call policy agent with cdata
-                if let Some(entity) = entities.get(id) {
-                    if let Some(entity) = entity.upgrade() {
-                        return Ok(entity);
-                    }
-                }
-                let entity = Entity::create(*id, collection_id.to_owned());
-                entities.insert(*id, entity.weak());
+            Some(entity) => {
+                eprintln!("MARK get_retrieve_or_create found entity={:#} via get_or_retrieve", id);
                 Ok(entity)
+            }
+            None => {
+                // Check if entity exists (possibly uncommitted from local transaction)
+                let maybe_uncommitted = {
+                    let entities = self.0.read().unwrap();
+                    eprintln!("MARK get_retrieve_or_create double-checking for entity={:#}", id);
+                    let has_weak = entities.contains_key(id);
+                    eprintln!("MARK get_retrieve_or_create entity={:#} has_weak={}", id, has_weak);
+                    if let Some(weak) = entities.get(id) {
+                        let upgraded = weak.upgrade();
+                        eprintln!("MARK get_retrieve_or_create entity={:#} weak.upgrade()={}", id, upgraded.is_some());
+                        upgraded
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(entity) = maybe_uncommitted {
+                    // Found entity - check if uncommitted
+                    let commit_state = {
+                        let state = entity.state.read().unwrap();
+                        state.commit_state.clone()
+                    };
+
+                    if let Some(cs) = commit_state {
+                        // Entity is uncommitted - await commit/rollback
+                        eprintln!("MARK get_retrieve_or_create found UNCOMMITTED entity={:#}, awaiting...", id);
+                        let committed = cs.await_completion().await;
+
+                        if committed {
+                            eprintln!("MARK get_retrieve_or_create entity={:#} was COMMITTED", id);
+                            Ok(entity)
+                        } else {
+                            eprintln!("MARK get_retrieve_or_create entity={:#} was ROLLED BACK, recreating", id);
+                            // Rolled back - create new one
+                            let mut entities = self.0.write().unwrap();
+                            let entity = Entity::create(*id, collection_id.to_owned(), entity_trx.commit_state());
+                            entities.insert(*id, entity.weak());
+                            entity_trx.add_created_entity_id(entity.id());
+                            Ok(entity)
+                        }
+                    } else {
+                        // Already committed
+                        eprintln!("MARK get_retrieve_or_create found committed entity={:#} via double-check", id);
+                        Ok(entity)
+                    }
+                } else {
+                    // Not found - create new
+                    eprintln!("MARK get_retrieve_or_create creating NEW uncommitted entity for entity={:#}", id);
+                    let mut entities = self.0.write().unwrap();
+                    let entity = Entity::create(*id, collection_id.to_owned(), entity_trx.commit_state());
+                    entities.insert(*id, entity.weak());
+                    entity_trx.add_created_entity_id(entity.id());
+                    Ok(entity)
+                }
             }
         }
     }
-    /// Create a brand new entity, and add it to the set
-    pub fn create(&self, collection: CollectionId) -> Entity {
+    /// Create a brand new entity (uncommitted), and add it to the set
+    /// Automatically adds to the provided EntityTransaction
+    pub fn create(&self, collection: CollectionId, entity_trx: &mut EntityTransaction) -> Entity {
         let mut entities = self.0.write().unwrap();
         let id = EntityId::new();
-        let entity = Entity::create(id, collection);
+        let entity = Entity::create(id, collection, entity_trx.commit_state());
         entities.insert(id, entity.weak());
+        entity_trx.add_created_entity_id(entity.id());
         entity
     }
 

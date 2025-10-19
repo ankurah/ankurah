@@ -1,9 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ankurah_proto::Event;
 use ankurah_proto::{self as proto, EntityId};
 
+use crate::entity::EntityTransaction;
 use crate::error::RetrievalError;
 use crate::policy::AccessDenied;
 use crate::{
@@ -27,6 +28,7 @@ pub struct Transaction {
     id: proto::TransactionId,
     entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
+    pub(crate) entity_trx: Mutex<Option<EntityTransaction>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -41,12 +43,13 @@ impl Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
+    pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>, weak_entity_set: crate::entity::WeakEntitySet) -> Self {
         Self {
             dyncontext: Some(dyncontext),
             id: proto::TransactionId::new(),
             entities: AppendOnlyVec::new(),
             alive: Arc::new(AtomicBool::new(true)),
+            entity_trx: Mutex::new(Some(EntityTransaction::new(weak_entity_set))),
         }
     }
 
@@ -56,19 +59,22 @@ impl Transaction {
     }
 
     /// Consumes the transaction and returns the transaction id and a list of entities and events to be committed
-    pub(crate) fn into_parts(self) -> Result<(proto::TransactionId, Vec<(Entity, Event)>), MutationError> {
+    pub(crate) fn into_parts(mut self) -> Result<(proto::TransactionId, Vec<(Entity, Event)>, EntityTransaction), MutationError> {
         let mut events = Vec::new();
         for entity in self.entities.iter() {
             if let Some(event) = entity.generate_commit_event()? {
                 events.push((entity.clone(), event));
             }
         }
-        Ok((self.id.clone(), events))
+        let entity_trx = self.entity_trx.get_mut().unwrap().take().expect("EntityTransaction already taken");
+        Ok((self.id.clone(), events, entity_trx))
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let context = self.dyncontext.as_ref().expect("Transaction already consumed");
-        let entity = context.create_entity(M::collection(), self.alive.clone());
+        let mut entity_trx_guard = self.entity_trx.lock().unwrap();
+        let entity_trx = entity_trx_guard.as_mut().expect("EntityTransaction already consumed");
+        let entity = context.create_entity(M::collection(), entity_trx);
         model.initialize_new_entity(&entity);
         context.check_write(&entity)?;
 
@@ -90,7 +96,7 @@ impl Transaction {
                     // and we should leave it that way to honor the consistency model
                     Ok(MutableBorrow::new(entity))
                 } else {
-                    Ok(MutableBorrow::new(self.add_entity(retrieved_entity.snapshot(self.alive.clone()))))
+                    Ok(MutableBorrow::new(self.add_entity(retrieved_entity.branch(self.alive.clone()))))
                 }
             }
         }
@@ -101,7 +107,7 @@ impl Transaction {
         }
         self.dyncontext.as_ref().expect("Transaction already consumed").check_write(entity)?;
 
-        Ok(MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()))))
+        Ok(MutableBorrow::new(self.add_entity(entity.branch(self.alive.clone()))))
     }
 
     #[must_use]

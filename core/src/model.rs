@@ -80,9 +80,9 @@ pub trait Mutable {
         let inner = self.entity();
 
         let new_inner = match &inner.kind {
-            // If there is an upstream, use it
-            crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
-            // Else we're a new Entity, and we have to rely on the commit to add this to the node
+            // If this is a Branch (forked entity), use the upstream Primary
+            crate::entity::EntityKind::Branch { upstream, .. } => upstream.clone(),
+            // Primary entities ARE the canonical instance
             crate::entity::EntityKind::Primary => inner.clone(),
         };
 
