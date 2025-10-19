@@ -1,5 +1,5 @@
 #[cfg(debug_assertions)]
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::atomic::AtomicBool;
 
 use ankql::ast::{OrderByItem, Predicate};
 use ankurah_core::indexing::KeySpec;
@@ -14,6 +14,7 @@ use ankurah_core::{
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
 use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, Plan, Planner, PlannerConfig, ScanDirection};
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use tokio::task;
 
