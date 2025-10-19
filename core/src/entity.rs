@@ -314,7 +314,7 @@ impl Entity {
                     info!("StrictAscends - ignoring old event");
                     return Ok(false);
                 }
-                lineage::CausalRelation::DivergedSince { meet: _, subject, other: _ } => {
+                lineage::CausalRelation::DivergedSince { meet, subject, other } => {
                     info!("DivergedSince - deterministic conflict resolution via ForwardView (attempt {})", attempt + 1);
 
                     // Use ForwardView for deterministic conflict resolution
@@ -360,9 +360,14 @@ impl Entity {
                                 tx.commit()?;
                             }
 
-                            // Update head to the union of subject and other (resolved via deterministic tiebreak)
-                            // For now, we set head to the subject head since that's what the Primary path represents
+                            // Update head to the resolved head from ForwardView
                             state.head = subject.into();
+
+                            // Apply the incoming event itself (ForwardView only contains stored events)
+                            for (backend_name, operations) in event.operations.iter() {
+                                state.apply_operations(backend_name.clone(), operations)?;
+                            }
+                            state.head.insert(event.id());
                         }
 
                         // Notify Signal subscribers about the change

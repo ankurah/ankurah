@@ -92,14 +92,8 @@ async fn test_linear_history() {
     // descendant descends from ancestor
     assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap().relation, CausalRelation::StrictDescends);
 
-    // ancestor does not descend from descendant - they diverged
-    let result = compare(&store, &ancestor, &descendant, 100).await.unwrap();
-    match result.relation {
-        CausalRelation::DivergedSince { meet, .. } => {
-            assert_eq!(meet, vec![1]);
-        }
-        other => panic!("Expected DivergedSince, got {:?}", other),
-    }
+    // ancestor compared to descendant should be StrictAscends (ancestor is older)
+    assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap().relation, CausalRelation::StrictAscends);
 }
 
 #[tokio::test]
@@ -127,14 +121,8 @@ async fn test_concurrent_history() {
         let ancestor = TestClock { members: vec![1] };
         let descendant = TestClock { members: vec![5] };
         assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap().relation, CausalRelation::StrictDescends);
-        // a is the common ancestor of this comparison. They are comparable, but a does not descend from b
-        let result = compare(&store, &ancestor, &descendant, 100).await.unwrap();
-        match result.relation {
-            CausalRelation::DivergedSince { meet, .. } => {
-                assert_eq!(meet, vec![1]);
-            }
-            other => panic!("Expected DivergedSince, got {:?}", other),
-        }
+        // ancestor compared to descendant should be StrictAscends
+        assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap().relation, CausalRelation::StrictAscends);
     }
     {
         // this ancestor clock has internal concurrency, but is fully descended by the descendant clock
@@ -142,13 +130,8 @@ async fn test_concurrent_history() {
         let descendant = TestClock { members: vec![5] };
 
         assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap().relation, CausalRelation::StrictDescends);
-        let result = compare(&store, &ancestor, &descendant, 100).await.unwrap();
-        match result.relation {
-            CausalRelation::DivergedSince { meet, .. } => {
-                assert!(meet == vec![2, 3] || meet == vec![3, 2]);
-            }
-            other => panic!("Expected DivergedSince, got {:?}", other),
-        }
+        // ancestor compared to descendant should be StrictAscends
+        assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap().relation, CausalRelation::StrictAscends);
     }
 
     {
@@ -226,6 +209,33 @@ async fn test_incomparable() {
         assert!(matches!(compare(&store, &a, &b, 100).await.unwrap().relation, CausalRelation::Disjoint { .. }));
         // line 509 - the assertions above are passing
     }
+}
+
+#[tokio::test]
+async fn test_strict_ascends_linear_chain() {
+    // Regression test for .rev() bug: comparing ancestor with descendant should return StrictAscends
+    let mut store = MockEventStore::new();
+
+    // Create a linear chain: 1 <- 2 <- 3 <- 4 <- 5
+    store.add(1, &[]);
+    store.add(2, &[1]);
+    store.add(3, &[2]);
+    store.add(4, &[3]);
+    store.add(5, &[4]);
+
+    // Comparing ancestor [2] with descendant [5]: ancestor is OLDER, should be StrictAscends
+    let ancestor = TestClock { members: vec![2] };
+    let descendant = TestClock { members: vec![5] };
+
+    let result = compare(&store, &ancestor, &descendant, 100).await.unwrap();
+    assert_eq!(
+        result.relation,
+        CausalRelation::StrictAscends,
+        "Ancestor [2] compared with descendant [5] should be StrictAscends (ancestor is older)"
+    );
+
+    // The opposite direction should be StrictDescends
+    assert_eq!(compare(&store, &descendant, &ancestor, 100).await.unwrap().relation, CausalRelation::StrictDescends);
 }
 
 #[tokio::test]
@@ -347,9 +357,9 @@ async fn multiple_roots() {
     // 8 descends from all heads in big_other via 7
     assert_eq!(compare(&store, &subject, &big_other, 1_000).await.unwrap().relation, CausalRelation::StrictDescends);
 
-    // In the opposite direction, none of the heads descend from 8, but they diverged
+    // In the opposite direction, big_other is an ancestor of subject, so StrictAscends
     let rel = compare(&store, &big_other, &subject, 1_000).await.unwrap().relation;
-    assert!(matches!(rel, CausalRelation::DivergedSince { ref meet, .. } if *meet == vec![1, 2, 3, 4, 5, 6]));
+    assert_eq!(rel, CausalRelation::StrictAscends);
 }
 
 #[tokio::test]

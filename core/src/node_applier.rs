@@ -258,9 +258,8 @@ impl NodeApplier {
                 // Get or create entity
                 let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
 
-                // HACK - applying events in reverse order to avoid triggering the NotDescends bug
-                // in apply_event where the event is wrongly made concurrent
-                for event in attested_events.into_iter().rev() {
+                // Apply events in forward (causal) order
+                for event in attested_events.into_iter() {
                     entity.apply_event(retriever, &event.payload).await?;
                     retriever.mark_event_used(&event.payload.id());
                 }

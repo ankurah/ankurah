@@ -1,5 +1,6 @@
 #[cfg(debug_assertions)]
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use ankql::ast::{OrderByItem, Predicate};
 use ankurah_core::indexing::KeySpec;

@@ -82,6 +82,37 @@ where
                 RelationAndChain::new(CausalRelation::StrictDescends, result.forward_chain)
             }
         }
+        CausalRelation::StrictAscends => {
+            // Parent is older than other (parent is an ancestor of other)
+            // Special case: if parent is empty (root event), pass through StrictAscends
+            // (root events should be handled as Disjoint by the caller if they're independent)
+            if subject_parent.members().is_empty() {
+                if let Some(fv) = result.forward_view {
+                    RelationAndChain::with_view(CausalRelation::StrictAscends, result.forward_chain, fv)
+                } else {
+                    RelationAndChain::new(CausalRelation::StrictAscends, result.forward_chain)
+                }
+            } else {
+                // The incoming event forks from that ancestor, creating divergence
+                // We need to return DivergedSince with the parent as the meet
+                let meet = subject_parent.members().to_vec();
+                let subject_head = vec![subject.id()];
+                let other_head = other.members().to_vec();
+
+                if let Some(fv) = result.forward_view {
+                    RelationAndChain::with_view(
+                        CausalRelation::DivergedSince { meet, subject: subject_head, other: other_head },
+                        result.forward_chain,
+                        fv,
+                    )
+                } else {
+                    RelationAndChain::new(
+                        CausalRelation::DivergedSince { meet, subject: subject_head, other: other_head },
+                        result.forward_chain,
+                    )
+                }
+            }
+        }
         other_relation => {
             // Relation between parent and other is the same as between subject and other
             if let Some(fv) = result.forward_view {
@@ -630,18 +661,26 @@ where
 
         // Classify as DivergedSince (true concurrency) if there's a meet,
         // indicating both sides have changes the other doesn't
-        // TODO: Populate subject/other frontiers after meet
-        let subject = self.subject_frontier.iter().cloned().collect();
-        let other = self.other_frontier.iter().cloned().collect();
+        // Use the initial heads (where we started), not the traversal frontiers (which are now empty)
+        let subject: Vec<_> = self.initial_subject_heads.clone();
+        let other: Vec<_> = self.initial_other_heads.clone();
 
         if self.head_overlap {
             CausalRelation::DivergedSince { meet, subject, other }
         } else {
             // No overlap means subject doesn't have other's changes
-            // This could be StrictAscends (other descends from subject) or DivergedSince
-            // For now, conservatively return DivergedSince - refinement to StrictAscends
-            // requires additional traversal to check if other descends from subject
-            CausalRelation::DivergedSince { meet, subject, other }
+            // Check if meet == subject, which means subject is entirely in other's history
+            // This indicates StrictAscends (other descended from subject, subject is older)
+            let meet_set: std::collections::HashSet<_> = meet.iter().collect();
+            let subject_set: std::collections::HashSet<_> = subject.iter().collect();
+
+            if meet_set == subject_set {
+                // Subject is fully contained in the meet, meaning other descended from subject
+                CausalRelation::StrictAscends
+            } else {
+                // True divergence: both have changes the other doesn't
+                CausalRelation::DivergedSince { meet, subject, other }
+            }
         }
     }
 }
