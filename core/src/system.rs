@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 use tracing::{error, warn};
 
 use crate::collectionset::CollectionSet;
-use crate::entity::{Entity, WeakEntitySet};
+use crate::entity::{Entity, EntityTransaction, WeakEntitySet};
 use crate::error::MutationError;
 use crate::error::RetrievalError;
 use crate::notice_info;
@@ -121,7 +121,8 @@ where
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
 
-        let system_entity = self.0.entities.create(collection_id.clone());
+        let mut entity_trx = self.0.entities.transact();
+        let system_entity = self.0.entities.create(collection_id.clone(), &mut entity_trx);
 
         let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
@@ -134,9 +135,13 @@ where
 
         // Update the entity's head clock
         system_entity.commit_head(root.clone());
+
         // Now get the entity state after the head is updated
         let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
         storage.set_state(attested_state.clone()).await?;
+
+        // Mark entities as committed
+        entity_trx.commit();
 
         // Update our system state
         let mut items = self.0.items.write().unwrap();

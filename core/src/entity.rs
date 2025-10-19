@@ -1,3 +1,6 @@
+mod transaction;
+pub use transaction::{CommitState, EntityTransaction};
+
 use crate::causal_dag::{self as lineage};
 use crate::retrieval::{GetEvents, Retrieve};
 use crate::{
@@ -29,6 +32,12 @@ struct EntityInnerState {
     head: Clock,
     // TODO: remove interior mutability from backends; make mutation methods take &mut self
     backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
+    /// Commit state for uncommitted entities (Some = uncommitted, None = committed)
+    ///
+    /// For now: Only prevents visibility for genesis (empty head) entities.
+    /// TODO: Implement full transaction isolation - prevent concurrent state updates (Might replace CAS for head?)
+    /// for non-genesis entities while transaction is active.
+    commit_state: Option<Arc<CommitState>>,
 }
 
 impl EntityInnerState {
@@ -59,8 +68,8 @@ pub struct EntityInner {
 
 #[derive(Debug)]
 pub enum EntityKind {
-    Primary,                                                     // New or resident entity - TODO delineate these
-    Transacted { trx_alive: Arc<AtomicBool>, upstream: Entity }, // Transaction fork with liveness tracking
+    Primary,                                                 // Normal entity (committed or uncommitted based on state.trx)
+    Branch { trx_alive: Arc<AtomicBool>, upstream: Entity }, // Transaction fork for isolated editing
 }
 
 impl std::ops::Deref for Entity {
@@ -96,12 +105,26 @@ impl Entity {
 
     pub fn head(&self) -> Clock { self.state.read().unwrap().head.clone() }
 
-    /// Check if this entity is writable (i.e., it's a transaction fork that's still alive)
-    pub fn is_writable(&self) -> bool {
+    /// Check if this entity is writable (i.e., it's uncommitted or a Branch entity)
+    pub fn is_user_writable(&self) -> bool {
         match &self.kind {
-            EntityKind::Primary => false, // Primary entities are read-only
-            EntityKind::Transacted { trx_alive, .. } => trx_alive.load(Ordering::Acquire),
+            EntityKind::Primary => {
+                // Primary entities with uncommitted state are writable
+                // This is counterintuitive - but actually kind of correct, because a newly created Entity in a Transaction will use
+                // ::Primary instead of ::Branch. and other attempts to retrieve that entity should be blocked until the EntityTransaction is committed.
+                // There's probably a more elegant way to signal/organize this. A better way to think about it is that this record is locked, and its
+                // my lock, so I can write to it. It's just a little too implicit that
+                //  Primary + uncommitted + non retrievability of uncommitted entities means it's my lock
+                self.is_uncommitted()
+            }
+            EntityKind::Branch { trx_alive, .. } => trx_alive.load(Ordering::Acquire),
         }
+    }
+
+    /// Returns true if this entity has uncommitted state (not yet persisted)
+    fn is_uncommitted(&self) -> bool {
+        let state = self.state.read().unwrap();
+        state.commit_state.as_ref().map_or(false, |cs| !cs.is_committed())
     }
 
     pub fn to_state(&self) -> Result<State, StateError> {
@@ -120,12 +143,17 @@ impl Entity {
         Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
     }
 
-    // used by the Model macro
-    pub fn create(id: EntityId, collection: CollectionId) -> Self {
+    // Create a new entity (uncommitted)
+    fn create(id: EntityId, collection: CollectionId, commit_state: Arc<CommitState>) -> Self {
+        eprintln!("MARK Entity::create creating NEW entity={:#} collection={:#}", id, collection);
         Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: Clock::default(), backends: BTreeMap::default() }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: Clock::default(),
+                backends: BTreeMap::default(),
+                commit_state: Some(commit_state), // Uncommitted
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
@@ -142,7 +170,11 @@ impl Entity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: state.head.clone(),
+                backends,
+                commit_state: None, // Entities from storage are committed
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         })))
@@ -222,23 +254,43 @@ impl Entity {
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
     where G: GetEvents<Id = EventId, Event = Event> {
+        let kind_str = match &self.kind {
+            EntityKind::Primary => "Primary",
+            EntityKind::Branch { .. } => "Branch",
+        };
+        let ptr_str = format!("{:p}", Arc::as_ptr(&self.0));
+        eprintln!("MARK Entity.apply_event START entity={:#} event={:#} kind={} ptr={}", self.id, event.id(), kind_str, ptr_str);
         debug!("apply_event head: {event} to {self}");
 
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
             let mut state = self.state.write().unwrap();
+            eprintln!(
+                "MARK Entity.apply_event entity={:#} event={:#} is_entity_create, head.is_empty()={}",
+                self.id,
+                event.id(),
+                state.head.is_empty()
+            );
             // Re-check if head is still empty now that we hold the lock
             if state.head.is_empty() {
+                eprintln!("MARK Entity.apply_event entity={:#} event={:#} head IS empty, applying as creation", self.id, event.id());
                 // this is the creation event for a new entity, so we simply accept it
                 for (backend_name, operations) in event.operations.iter() {
                     state.apply_operations(backend_name.clone(), operations)?;
                 }
                 state.head = event.id().into();
+                eprintln!("MARK Entity.apply_event entity={:#} event={:#} HEAD UPDATED to {:?}", self.id, event.id(), state.head);
                 drop(state); // Release lock before broadcast
                              // Notify Signal subscribers about the change
+                eprintln!("MARK Entity.apply_state broadcasting");
                 self.broadcast.send(());
                 return Ok(true);
             }
+            eprintln!(
+                "MARK Entity.apply_event entity={:#} event={:#} head NOT empty, falling through to lineage comparison",
+                self.id,
+                event.id()
+            );
             // If head is no longer empty, fall through to normal lineage comparison
         }
 
@@ -250,6 +302,8 @@ impl Entity {
         for attempt in 0..MAX_RETRIES {
             // Compare the event's parent clock with the current head to get forward chain
             let result = crate::causal_dag::compare_unstored_event(getter, event, &head, budget).await?;
+
+            eprintln!("MARK Entity.apply_event entity={:#} event={:#} relation={:?}", self.id, event.id(), result.relation);
 
             match result.relation {
                 lineage::CausalRelation::Equal => {
@@ -278,6 +332,7 @@ impl Entity {
                             state.head = new_head;
                         }
                         // Notify Signal subscribers about the change
+                        eprintln!("MARK Entity.apply_event entity={:#} event={:#} broadcasting after DivergedSince", self.id, event.id());
                         self.broadcast.send(());
                         return Ok(true);
                     } else {
@@ -296,6 +351,11 @@ impl Entity {
                                 drop(state);
 
                                 // Notify Signal subscribers about the change
+                                eprintln!(
+                                    "MARK Entity.apply_event entity={:#} event={:#} broadcasting after Descends (forward chain)",
+                                    self.id,
+                                    event.id()
+                                );
                                 self.broadcast.send(());
                                 return Ok(true);
                             }
@@ -477,7 +537,7 @@ impl Entity {
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
     /// The trx_alive parameter tracks whether the transaction that owns this snapshot is still alive
-    pub fn snapshot(&self, trx_alive: Arc<AtomicBool>) -> Self {
+    pub fn branch(&self, trx_alive: Arc<AtomicBool>) -> Self {
         // Inline fork logic
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut forked = BTreeMap::new();
@@ -488,8 +548,8 @@ impl Entity {
         Self(Arc::new(EntityInner {
             id: self.id,
             collection: self.collection.clone(),
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked }),
-            kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
+            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked, commit_state: None }),
+            kind: EntityKind::Branch { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
         }))
     }
@@ -594,7 +654,7 @@ impl TemporaryEntity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends, commit_state: None }),
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -645,11 +705,20 @@ impl std::fmt::Display for TemporaryEntity {
 #[derive(Clone, Default)]
 pub struct WeakEntitySet(Arc<std::sync::RwLock<BTreeMap<EntityId, WeakEntity>>>);
 impl WeakEntitySet {
+    pub fn transact(&self) -> EntityTransaction { EntityTransaction::new(self.clone()) }
+    /// Get an entity, filtering out uncommitted entities (invisible to external operations)
     pub fn get(&self, id: &EntityId) -> Option<Entity> {
         let entities = self.0.read().unwrap();
         // TODO: call policy agent with cdata
-        if let Some(entity) = entities.get(id) {
-            entity.upgrade()
+        if let Some(weak) = entities.get(id) {
+            if let Some(entity) = weak.upgrade() {
+                if entity.is_uncommitted() {
+                    return None; // Uncommitted - invisible to other operations
+                }
+                Some(entity)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -680,37 +749,87 @@ impl WeakEntitySet {
         }
     }
     /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
+    /// If creating, automatically adds to the provided EntityTransaction
     pub async fn get_retrieve_or_create<R>(
         &self,
         retriever: &R,
         collection_id: &CollectionId,
         id: &EntityId,
+        entity_trx: &mut EntityTransaction,
     ) -> Result<Entity, RetrievalError>
     where
         R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
     {
         match self.get_or_retrieve(retriever, collection_id, id).await? {
-            Some(entity) => Ok(entity),
-            None => {
-                let mut entities = self.0.write().unwrap();
-                // TODO: call policy agent with cdata
-                if let Some(entity) = entities.get(id) {
-                    if let Some(entity) = entity.upgrade() {
-                        return Ok(entity);
-                    }
-                }
-                let entity = Entity::create(*id, collection_id.to_owned());
-                entities.insert(*id, entity.weak());
+            Some(entity) => {
+                eprintln!("MARK get_retrieve_or_create found entity={:#} via get_or_retrieve", id);
                 Ok(entity)
+            }
+            None => {
+                // Check if entity exists (possibly uncommitted from local transaction)
+                let maybe_uncommitted = {
+                    let entities = self.0.read().unwrap();
+                    eprintln!("MARK get_retrieve_or_create double-checking for entity={:#}", id);
+                    let has_weak = entities.contains_key(id);
+                    eprintln!("MARK get_retrieve_or_create entity={:#} has_weak={}", id, has_weak);
+                    if let Some(weak) = entities.get(id) {
+                        let upgraded = weak.upgrade();
+                        eprintln!("MARK get_retrieve_or_create entity={:#} weak.upgrade()={}", id, upgraded.is_some());
+                        upgraded
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(entity) = maybe_uncommitted {
+                    // Found entity - check if uncommitted
+                    let commit_state = {
+                        let state = entity.state.read().unwrap();
+                        state.commit_state.clone()
+                    };
+
+                    if let Some(cs) = commit_state {
+                        // Entity is uncommitted - await commit/rollback
+                        eprintln!("MARK get_retrieve_or_create found UNCOMMITTED entity={:#}, awaiting...", id);
+                        let committed = cs.await_completion().await;
+
+                        if committed {
+                            eprintln!("MARK get_retrieve_or_create entity={:#} was COMMITTED", id);
+                            Ok(entity)
+                        } else {
+                            eprintln!("MARK get_retrieve_or_create entity={:#} was ROLLED BACK, recreating", id);
+                            // Rolled back - create new one
+                            let mut entities = self.0.write().unwrap();
+                            let entity = Entity::create(*id, collection_id.to_owned(), entity_trx.commit_state());
+                            entities.insert(*id, entity.weak());
+                            entity_trx.add_created_entity_id(entity.id());
+                            Ok(entity)
+                        }
+                    } else {
+                        // Already committed
+                        eprintln!("MARK get_retrieve_or_create found committed entity={:#} via double-check", id);
+                        Ok(entity)
+                    }
+                } else {
+                    // Not found - create new
+                    eprintln!("MARK get_retrieve_or_create creating NEW uncommitted entity for entity={:#}", id);
+                    let mut entities = self.0.write().unwrap();
+                    let entity = Entity::create(*id, collection_id.to_owned(), entity_trx.commit_state());
+                    entities.insert(*id, entity.weak());
+                    entity_trx.add_created_entity_id(entity.id());
+                    Ok(entity)
+                }
             }
         }
     }
-    /// Create a brand new entity, and add it to the set
-    pub fn create(&self, collection: CollectionId) -> Entity {
+    /// Create a brand new entity (uncommitted), and add it to the set
+    /// Automatically adds to the provided EntityTransaction
+    pub fn create(&self, collection: CollectionId, entity_trx: &mut EntityTransaction) -> Entity {
         let mut entities = self.0.write().unwrap();
         let id = EntityId::new();
-        let entity = Entity::create(id, collection);
+        let entity = Entity::create(id, collection, entity_trx.commit_state());
         entities.insert(id, entity.weak());
+        entity_trx.add_created_entity_id(entity.id());
         entity
     }
 

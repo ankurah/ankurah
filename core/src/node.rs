@@ -541,12 +541,18 @@ where
         debug!("{self} commiting transaction {id} with {} events", events.len());
         let mut changes = Vec::new();
 
+        // Transaction for any entities created during this remote transaction
+        let mut entity_trx = self.entities.transact();
+
         for event in events.iter_mut() {
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage
             let retriever = LocalRetriever::new(collection.clone());
-            let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
+            let entity = self
+                .entities
+                .get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id, &mut entity_trx)
+                .await?;
 
             // we have the entity, so we can check access, optionally atteste, and apply/save the event;
             if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
@@ -563,6 +569,9 @@ where
                 changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
             }
         }
+
+        // Commit any entities created during this transaction
+        entity_trx.commit();
 
         self.reactor.notify_change(changes).await;
 

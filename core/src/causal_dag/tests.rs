@@ -247,14 +247,23 @@ async fn test_empty_clocks() {
     let empty = TestClock { members: vec![] };
     let non_empty = TestClock { members: vec![1] };
 
-    // Empty vs empty is Equal (same empty state)
-    assert_eq!(compare(&store, &empty, &empty, 100).await.unwrap().relation, CausalRelation::Equal);
+    // Empty vs empty is Disjoint (like SQL NULL != NULL)
+    assert!(matches!(
+        compare(&store, &empty, &empty, 100).await.unwrap().relation,
+        CausalRelation::Disjoint { subject_root: None, other_root: None, .. }
+    ));
 
-    // Non-empty [1] vs empty []: Event 1 descends from "nothing" / empty state
-    assert_eq!(compare(&store, &non_empty, &empty, 100).await.unwrap().relation, CausalRelation::StrictDescends);
+    // Non-empty [1] vs empty []: Empty is incomparable with anything
+    assert!(matches!(
+        compare(&store, &non_empty, &empty, 100).await.unwrap().relation,
+        CausalRelation::Disjoint { subject_root: Some(_), other_root: None, .. }
+    ));
 
-    // Empty [] vs non-empty [1]: Empty came before event 1
-    assert_eq!(compare(&store, &empty, &non_empty, 100).await.unwrap().relation, CausalRelation::StrictAscends);
+    // Empty [] vs non-empty [1]: Empty is incomparable with anything
+    assert!(matches!(
+        compare(&store, &empty, &non_empty, 100).await.unwrap().relation,
+        CausalRelation::Disjoint { subject_root: None, other_root: Some(_), .. }
+    ));
 }
 
 #[tokio::test]

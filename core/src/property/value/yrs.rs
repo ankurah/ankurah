@@ -36,19 +36,19 @@ impl<Projected> YrsString<Projected> {
     }
     pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property_name) }
     pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
+        if !self.entity.is_user_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
         self.backend.insert(&self.property_name, index, value)
     }
     pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
+        if !self.entity.is_user_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
         self.backend.delete(&self.property_name, index, length)
     }
     pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
+        if !self.entity.is_user_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
         self.backend.delete(&self.property_name, start, length)?;
@@ -56,7 +56,7 @@ impl<Projected> YrsString<Projected> {
         Ok(())
     }
     pub fn replace(&self, value: &str) -> Result<(), MutationError> {
-        if !self.entity.is_writable() {
+        if !self.entity.is_user_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
         self.backend.delete(&self.property_name, 0, self.value().unwrap_or_default().len() as u32)?;

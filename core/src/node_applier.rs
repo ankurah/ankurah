@@ -1,5 +1,6 @@
 use crate::{
     changes::EntityChange,
+    entity::EntityTransaction,
     error::{ApplyError, ApplyErrorItem, MutationError},
     node::Node,
     policy::PolicyAgent,
@@ -69,6 +70,9 @@ impl NodeApplier {
         let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _ } = update;
         let collection = node.collections.get(&collection_id).await?;
 
+        // Transaction for any entities created during this update
+        let mut entity_trx = node.entities.transact();
+
         match content {
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
@@ -76,7 +80,7 @@ impl NodeApplier {
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
                 // TODO update the retriever to support bulk retrieval for multiple entities at once
                 // this will require a queuing phase and a batch retrieval phase
-                let entity = node.entities.get_retrieve_or_create(retriever, &collection_id, &entity_id).await?;
+                let entity = node.entities.get_retrieve_or_create(retriever, &collection_id, &entity_id, &mut entity_trx).await?;
                 entities.push(entity.clone());
 
                 let mut applied_events = Vec::new();
@@ -109,6 +113,9 @@ impl NodeApplier {
                 }
             }
         }
+
+        // Commit any entities created during this update
+        entity_trx.commit();
 
         Ok(())
     }
@@ -235,6 +242,9 @@ impl NodeApplier {
     {
         let collection = node.collections.get(&delta.collection).await?;
 
+        // Transaction for any entities created during this delta
+        let mut entity_trx = node.entities.transact();
+
         match delta.content {
             proto::DeltaContent::StateSnapshot { state } => {
                 let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
@@ -246,6 +256,9 @@ impl NodeApplier {
                 // Save state to storage
                 Self::save_state(node, &entity, &collection).await?;
 
+                // Commit any entities created
+                entity_trx.commit();
+
                 // Phase 1: Return EntityChange with empty events
                 Ok(Some(EntityChange::new(entity, Vec::new())?))
             }
@@ -256,7 +269,7 @@ impl NodeApplier {
 
                 retriever.stage_events(attested_events.clone());
                 // Get or create entity
-                let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
+                let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id, &mut entity_trx).await?;
 
                 // Apply events in forward (causal) order
                 for event in attested_events.into_iter() {
@@ -266,6 +279,9 @@ impl NodeApplier {
 
                 // Save updated state
                 Self::save_state(node, &entity, &collection).await?;
+
+                // Commit any entities created
+                entity_trx.commit();
 
                 // Phase 1: Return EntityChange with empty events
                 Ok(Some(EntityChange::new(entity, Vec::new())?))

@@ -157,6 +157,19 @@ where
     C: TClock<Id = G::Id>,
     G::Id: std::hash::Hash + Ord + std::fmt::Display,
 {
+    // Empty clocks are like NULL in SQL - always Disjoint (NULL != NULL)
+    let subject_empty = subject.members().is_empty();
+    let other_empty = other.members().is_empty();
+
+    if subject_empty || other_empty {
+        // Empty clock is incomparable with anything (including another empty clock)
+        return Ok(RelationAndChain::simple(CausalRelation::Disjoint {
+            gca: None,
+            subject_root: if subject_empty { None } else { subject.members().first().cloned() },
+            other_root: if other_empty { None } else { other.members().first().cloned() },
+        }));
+    }
+
     // bail out right away for the obvious case
     if subject.members() == other.members() {
         return Ok(RelationAndChain::simple(CausalRelation::Equal));
@@ -624,8 +637,8 @@ where
 
             return CausalRelation::Disjoint {
                 gca: if self.any_common { Some(self.meet_candidates.iter().cloned().collect()) } else { None },
-                subject_root,
-                other_root,
+                subject_root: Some(subject_root),
+                other_root: Some(other_root),
             };
         }
 
@@ -656,7 +669,7 @@ where
                 .cloned()
                 .unwrap_or_else(|| self.original_other_events.iter().next().cloned().unwrap());
 
-            return CausalRelation::Disjoint { gca: None, subject_root, other_root };
+            return CausalRelation::Disjoint { gca: None, subject_root: Some(subject_root), other_root: Some(other_root) };
         }
 
         // Classify as DivergedSince (true concurrency) if there's a meet,

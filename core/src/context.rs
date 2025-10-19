@@ -1,6 +1,6 @@
 use crate::{
     changes::EntityChange,
-    entity::Entity,
+    entity::{Entity, EntityTransaction},
     error::{MutationError, RetrievalError},
     livequery::{EntityLiveQuery, LiveQuery},
     model::View,
@@ -11,7 +11,7 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use async_trait::async_trait;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 use tracing::debug;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
@@ -37,10 +37,11 @@ where
 #[async_trait]
 pub trait TContext {
     fn node_id(&self) -> proto::EntityId;
+    fn weak_entity_set(&self) -> crate::entity::WeakEntitySet;
     /// Create a brand new entity for a transaction, and add it to the WeakEntitySet
     /// Note that this does not actually persist the entity to the storage engine
     /// It merely ensures that there are no duplicate entities with the same ID (except forked entities)
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity;
+    fn create_entity(&self, collection: ankurah_proto::CollectionId, entity_trx: &mut EntityTransaction) -> Entity;
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
@@ -53,9 +54,10 @@ pub trait TContext {
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
-    fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
-        let primary_entity = self.node.entities.create(collection);
-        primary_entity.snapshot(trx_alive)
+    fn weak_entity_set(&self) -> crate::entity::WeakEntitySet { self.node.entities.clone() }
+    fn create_entity(&self, collection: ankurah_proto::CollectionId, entity_trx: &mut EntityTransaction) -> Entity {
+        // Create uncommitted entity (automatically added to transaction)
+        self.node.entities.create(collection, entity_trx)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError> {
@@ -86,7 +88,7 @@ impl Context {
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 impl Context {
     /// Begin a transaction.
-    pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone()) }
+    pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone(), self.0.weak_entity_set()) }
 }
 
 impl Context {
@@ -241,7 +243,7 @@ where
     /// Does all the things necessary to commit a local transaction
     /// notably, the application of events to Entities works differently versus remote transactions
     pub async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> {
-        let (trx_id, entity_events) = trx.into_parts()?;
+        let (trx_id, entity_events, mut entity_trx) = trx.into_parts()?;
         let mut attested_events = Vec::new();
         let mut entity_attested_events = Vec::new();
 
@@ -253,27 +255,33 @@ where
             entity_attested_events.push((entity, attested));
         }
 
-        // Relay to peers and wait for confirmation
+        // PHASE 1: Update local entity heads BEFORE relaying (makes entities visible to server echo)
+        eprintln!("MARK commit_local_trx PHASE 1: updating local heads");
+        for (entity, attested_event) in &entity_attested_events {
+            entity.commit_head(Clock::new([attested_event.payload.id()]));
+            eprintln!("MARK commit_local_trx committed head entity={:#} event={:#}", entity.id(), attested_event.payload.id());
+
+            // If this entity has an upstream (Branch), propagate the changes
+            if let crate::entity::EntityKind::Branch { upstream, .. } = &entity.kind {
+                let collection_id = &attested_event.payload.collection;
+                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
+                upstream.apply_event(&retriever, &attested_event.payload).await?;
+                eprintln!("MARK commit_local_trx applied to upstream Primary entity={:#}", entity.id());
+            }
+        }
+
+        // PHASE 2: Relay to peers and wait for confirmation
+        eprintln!("MARK commit_local_trx PHASE 2: relaying to peers");
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
 
-        // All peers confirmed, now we can update local state
+        // PHASE 3: Persist to storage (all peers confirmed)
+        eprintln!("MARK commit_local_trx PHASE 3: persisting to storage");
         let mut changes: Vec<EntityChange> = Vec::new();
         for (entity, attested_event) in entity_attested_events {
             let collection = self.node.collections.get(&attested_event.payload.collection).await?;
             collection.add_event(&attested_event).await?;
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
-
-            let collection_id = &attested_event.payload.collection;
-            // If this entity has an upstream, propagate the changes
-            if let crate::entity::EntityKind::Transacted { upstream, .. } = &entity.kind {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
-                upstream.apply_event(&retriever, &attested_event.payload).await?;
-            }
-
-            // Persist
 
             let state = entity.to_state()?;
-
             let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
             let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
@@ -282,8 +290,15 @@ where
             changes.push(EntityChange::new(entity.clone(), vec![attested_event])?);
         }
 
-        // Notify reactor of ALL changes
+        // PHASE 4: Commit EntityTransaction (marks all entities as committed)
+        eprintln!("MARK commit_local_trx PHASE 4: committing EntityTransaction");
+        entity_trx.commit();
+
+        // PHASE 5: Notify reactor (broadcast changes)
+        eprintln!("MARK commit_local_trx PHASE 5: notifying reactor with {} changes", changes.len());
         self.node.reactor.notify_change(changes).await;
+        eprintln!("MARK commit_local_trx DONE");
+
         Ok(())
     }
 

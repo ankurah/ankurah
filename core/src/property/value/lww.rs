@@ -27,7 +27,7 @@ impl<T: Property> std::fmt::Debug for LWW<T> {
 
 impl<T: Property> LWW<T> {
     pub fn set(&self, value: &T) -> Result<(), PropertyError> {
-        if !self.entity.is_writable() {
+        if !self.entity.is_user_writable() {
             return Err(PropertyError::TransactionClosed);
         }
         let value = value.into_value()?;

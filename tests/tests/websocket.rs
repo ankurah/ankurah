@@ -193,15 +193,15 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
 
     // Subscribe to pets with age > 5
     use ankurah::signals::Subscribe;
-    let server_livequery = server_ctx.query_wait::<PetView>("age > 5").await?;
-    let client_livequery = client_ctx.query_wait::<PetView>("age > 5").await?;
+    let server_livequery = server_ctx.query_wait::<PetView>(nocache("age > 5")?).await?;
+    let client_livequery = client_ctx.query_wait::<PetView>(nocache("age > 5")?).await?;
 
     let _server_sub = server_livequery.subscribe(&server_watcher);
     let _client_sub = client_livequery.subscribe(&client_watcher);
 
     // No notifications because we intentionally waited for the LiveQueries to be initialized before subscribing
-    assert_eq!(server_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
-    assert_eq!(client_watcher.drain(), vec![] as Vec<Vec<(EntityId, ChangeKind)>>);
+    assert_eq!(server_watcher.quiesce().await, 0);
+    assert_eq!(client_watcher.quiesce().await, 0);
 
     // Create pet on server
     let rex_id = {
@@ -213,21 +213,23 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     };
 
     // Wait for propagation and check changes
-    assert_eq!(server_watcher.take_one().await, vec![(rex_id, ChangeKind::Add)]);
-    assert_eq!(client_watcher.take_one().await, vec![(rex_id, ChangeKind::Add)]);
+    assert_eq!(server_watcher.quiesce_drain().await, vec![vec![(rex_id, ChangeKind::Add)]]);
+    assert_eq!(client_watcher.quiesce_drain().await, vec![vec![(rex_id, ChangeKind::Add)]]);
 
     // Create pet on client
     let buddy_id = {
         let trx = client_ctx.begin();
         let pet = trx.create(&Pet { name: "Buddy".to_string(), age: "8".to_string() }).await?;
         let id = pet.id();
+        eprintln!("MARK commit client START pet={:#}", id);
         trx.commit().await?;
+        eprintln!("MARK commit client DONE pet={:#}", id);
         id
     };
 
     // Wait for propagation and check changes
-    assert_eq!(server_watcher.take_one().await, vec![(buddy_id, ChangeKind::Add)]);
-    assert_eq!(client_watcher.take_one().await, vec![(buddy_id, ChangeKind::Add)]);
+    assert_eq!(server_watcher.quiesce_drain().await, vec![vec![(buddy_id, ChangeKind::Add)]]);
+    assert_eq!(client_watcher.quiesce_drain().await, vec![vec![(buddy_id, ChangeKind::Add)]]);
 
     use ankurah::signals::Peek;
     let server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
@@ -240,8 +242,8 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     // Ensure no additional unexpected changes
     // Note: With proper DivergedSince handling, we may get 1 extra notification
     // when the client applies the server's event (which triggers a re-evaluation)
-    assert!(server_watcher.quiesce().await <= 1, "Server should have at most 1 additional change");
-    assert!(client_watcher.quiesce().await <= 1, "Client should have at most 1 additional change");
+    assert_eq!(server_watcher.quiesce().await, 0, "Server should have no additional changes");
+    assert_eq!(client_watcher.quiesce().await, 0, "Client should have no additional changes");
 
     info!("Bidirectional subscription test passed");
 

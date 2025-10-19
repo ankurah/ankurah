@@ -32,14 +32,15 @@ pub enum CausalRelation<Id> {
         other: Vec<Id>,
     },
 
-    /// No common ancestor whatsoever (different genesis events)
+    /// No common ancestor whatsoever (different genesis events or empty clocks)
+    /// Empty clocks (like SQL NULL) are always Disjoint from everything, including other empty clocks.
     Disjoint {
         /// Optional non-minimal common ancestors (if any were found during traversal)
         gca: Option<Vec<Id>>,
-        /// Proven genesis of subject
-        subject_root: Id,
-        /// Proven genesis of other
-        other_root: Id,
+        /// Proven genesis of subject (None if subject is empty clock)
+        subject_root: Option<Id>,
+        /// Proven genesis of other (None if other is empty clock)
+        other_root: Option<Id>,
     },
 
     /// Recursion budget was exceeded before a determination could be made
