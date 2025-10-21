@@ -186,14 +186,14 @@ impl PropertyBackend for YrsBackend {
     fn listen_field(
         &self,
         field_name: &PropertyName,
-        listener: ankurah_signals::broadcast::Listener,
-    ) -> ankurah_signals::broadcast::ListenerGuard {
+        listener: ankurah_signals::signal::Listener,
+    ) -> ankurah_signals::signal::ListenerGuard {
         // Get or create the broadcast for this field
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
         let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
 
         // Subscribe to the broadcast and return the guard
-        broadcast.reference().listen(listener)
+        broadcast.reference().listen(listener).into()
     }
 }
 

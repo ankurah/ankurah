@@ -6,6 +6,7 @@ use std::{
 };
 
 use ankurah_proto::Operation;
+use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -147,17 +148,13 @@ impl PropertyBackend for LWWBackend {
         Ok(())
     }
 
-    fn listen_field(
-        &self,
-        field_name: &PropertyName,
-        listener: ankurah_signals::broadcast::Listener,
-    ) -> ankurah_signals::broadcast::ListenerGuard {
+    fn listen_field(&self, field_name: &PropertyName, listener: Listener) -> ankurah_signals::signal::ListenerGuard {
         // Get or create the broadcast for this field
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
         let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
 
         // Subscribe to the broadcast and return the guard
-        broadcast.reference().listen(listener)
+        broadcast.reference().listen(listener).into()
     }
 }
 

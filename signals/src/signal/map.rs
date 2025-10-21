@@ -4,7 +4,7 @@ use crate::{
     Peek,
     context::CurrentObserver,
     porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
-    signal::{Get, Signal, With},
+    signal::{Get, Listener, ListenerGuard, Signal, With},
 };
 
 /// A signal that transforms values from another signal on-demand without storing the transformed values
@@ -35,7 +35,7 @@ where
 impl<Upstream, Input, Output, Transform> Signal for Map<Upstream, Input, Output, Transform>
 where Upstream: Signal
 {
-    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> { self.source.listen(listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.source.listen(listener) }
 
     fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.source.broadcast_id() }
 }

@@ -2,7 +2,8 @@ use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
 use crate::{entity::Entity, model::View, reactor::AbstractEntity};
 use ankurah_proto as proto;
 use ankurah_signals::{
-    broadcast::{Broadcast, BroadcastId, Listener, ListenerGuard},
+    broadcast::{Broadcast, BroadcastId},
+    signal::{Listener, ListenerGuard},
     subscribe::IntoSubscribeListener,
     CurrentObserver, Get, Peek, Signal, Subscribe, SubscriptionGuard,
 };
@@ -799,12 +800,12 @@ impl<E: View> Default for ResultSet<E> {
 }
 
 impl<E: AbstractEntity> Signal for EntityResultSet<E> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.0.broadcast.reference().listen(listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard { ListenerGuard::new(self.0.broadcast.reference().listen(listener)) }
     fn broadcast_id(&self) -> BroadcastId { self.0.broadcast.id() }
 }
 
 impl<R: View> Signal for ResultSet<R> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.0 .0.broadcast.reference().listen(listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard { ListenerGuard::new(self.0 .0.broadcast.reference().listen(listener)) }
 
     fn broadcast_id(&self) -> BroadcastId { self.0 .0.broadcast.id() }
 }
@@ -826,11 +827,11 @@ impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
     where F: IntoSubscribeListener<Vec<E>> {
         let listener = listener.into_subscribe_listener();
         let me = self.clone();
-        let guard: ListenerGuard<()> = self.0 .0.broadcast.reference().listen(move |_| {
+        let guard: ankurah_signals::broadcast::ListenerGuard<()> = self.0 .0.broadcast.reference().listen(move |_| {
             let entities: Vec<E> = me.0 .0.state.lock().unwrap().order.iter().map(|e| E::from_entity(e.entity.clone())).collect();
             listener(entities);
         });
-        SubscriptionGuard::new(guard)
+        SubscriptionGuard::new(ListenerGuard::new(guard))
     }
 }
 

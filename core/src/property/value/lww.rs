@@ -9,7 +9,10 @@ use crate::{
     },
 };
 
-use ankurah_signals::Signal;
+use ankurah_signals::{
+    signal::{Listener, ListenerGuard},
+    Signal,
+};
 
 #[derive(Clone)]
 pub struct LWW<T: Property> {
@@ -66,9 +69,7 @@ impl<T: Property> InitializeWith<T> for LWW<T> {
 }
 
 impl<T: Property> ankurah_signals::Signal for LWW<T> {
-    fn listen(&self, listener: ankurah_signals::broadcast::Listener<()>) -> ankurah_signals::broadcast::ListenerGuard<()> {
-        self.backend.listen_field(&self.property_name, listener)
-    }
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property_name, listener) }
 
     fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
 }
@@ -80,7 +81,7 @@ where T: Clone + Send + Sync + 'static
     where F: ankurah_signals::subscribe::IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let lww = self.clone();
-        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move |_| {
+        let subscription = self.listen(Arc::new(move |_| {
             // Get current value when the broadcast fires
             if let Ok(current_value) = lww.get() {
                 listener(current_value);

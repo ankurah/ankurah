@@ -6,8 +6,9 @@ use std::{
 use ankurah_proto::{self as proto, CollectionId};
 
 use ankurah_signals::{
-    broadcast::{BroadcastId, Listener, ListenerGuard},
+    broadcast::BroadcastId,
     porcelain::subscribe::{IntoSubscribeListener, SubscriptionGuard},
+    signal::{Listener, ListenerGuard},
     Get, Mut, Peek, Read, Signal, Subscribe,
 };
 use tracing::{debug, warn};
@@ -313,16 +314,21 @@ impl<R: View> LiveQuery<R> {
     }
 }
 
-// Implement Signal trait - delegate to the resultset
+// Implement Signal trait - delegate to the subscription (not resultset)
+// This ensures that LiveQuery tracking fires on ALL entity changes, not just membership changes
 impl<R: View> Signal for LiveQuery<R> {
-    fn listen(&self, listener: Listener) -> ListenerGuard { self.0 .0.resultset.listen(listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.0 .0.subscription.listen(listener) }
 
-    fn broadcast_id(&self) -> BroadcastId { self.0 .0.resultset.broadcast_id() }
+    fn broadcast_id(&self) -> BroadcastId { self.0 .0.subscription.broadcast_id() }
 }
 
 // Implement Get trait - delegate to ResultSet<R>
 impl<R: View + Clone + 'static> Get<Vec<R>> for LiveQuery<R> {
-    fn get(&self) -> Vec<R> { self.0 .0.resultset.wrap::<R>().get() }
+    fn get(&self) -> Vec<R> {
+        use ankurah_signals::CurrentObserver;
+        CurrentObserver::track(&self);
+        self.0 .0.resultset.wrap::<R>().peek()
+    }
 }
 
 // Implement Peek trait - delegate to ResultSet<R>

@@ -10,7 +10,10 @@ use crate::{
     },
 };
 
-use ankurah_signals::Signal;
+use ankurah_signals::{
+    signal::{Listener, ListenerGuard},
+    Signal,
+};
 
 #[derive(Debug, Clone)]
 pub struct YrsString<Projected> {
@@ -119,9 +122,7 @@ impl<Projected> InitializeWith<Option<String>> for YrsString<Projected> {
 }
 
 impl<Projected> ankurah_signals::Signal for YrsString<Projected> {
-    fn listen(&self, listener: ankurah_signals::broadcast::Listener<()>) -> ankurah_signals::broadcast::ListenerGuard<()> {
-        self.backend.listen_field(&self.property_name, listener)
-    }
+    fn listen(&self, listener: Listener) -> ListenerGuard { self.backend.listen_field(&self.property_name, listener) }
 
     // TODO: determine if we should cache this or not.
     fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.backend.field_broadcast_id(&self.property_name) }
@@ -134,7 +135,7 @@ where Projected: Clone + Send + Sync + 'static
     where F: ankurah_signals::subscribe::IntoSubscribeListener<String> {
         let listener = listener.into_subscribe_listener();
         let yrs_string = self.clone();
-        let subscription = self.listen(ankurah_signals::broadcast::IntoListener::into_listener(move |_| {
+        let subscription = self.listen(Arc::new(move |_| {
             // Get current value when the broadcast fires
             if let Some(current_value) = yrs_string.value() {
                 listener(current_value);

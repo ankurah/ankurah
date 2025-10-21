@@ -13,7 +13,10 @@ pub use ankurah::{
     model::View,
     policy::DEFAULT_CONTEXT,
     proto,
-    signals::{broadcast::IntoListener, subscribe::IntoSubscribeListener},
+    signals::{
+        broadcast::{BroadcastListener, IntoBroadcastListener},
+        subscribe::IntoSubscribeListener,
+    },
     Context, EntityId, LiveQuery, Model, Node, PermissiveAgent,
 };
 use serde::{Deserialize, Serialize};
@@ -195,14 +198,14 @@ where T: Clone
     pub fn peek(&self) -> Vec<U> { self.changes.lock().unwrap().iter().map(|item| (self.transform)(item.clone())).collect() }
 }
 
-impl<T: Send + 'static, U> IntoListener<T> for &TestWatcher<T, U> {
-    fn into_listener(self) -> Arc<dyn Fn(T) + Send + Sync> {
+impl<T: Send + 'static, U> IntoBroadcastListener<T> for &TestWatcher<T, U> {
+    fn into_broadcast_listener(self) -> BroadcastListener<T> {
         let changes = self.changes.clone();
         let notify = self.notify.clone();
-        Arc::new(move |item: T| {
+        BroadcastListener::Payload(Arc::new(move |item: T| {
             changes.lock().unwrap().push(item);
             notify.notify_waiters();
-        })
+        }))
     }
 }
 
