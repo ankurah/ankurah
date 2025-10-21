@@ -4,7 +4,7 @@ use crate::{
     broadcast::Broadcast,
     context::CurrentObserver,
     porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
-    signal::{Get, GetReadCell, Signal, With, read::Read},
+    signal::{Get, GetReadCell, Listener, ListenerGuard, Signal, With, read::Read},
     value::{ReadValueCell, ValueCell},
 };
 
@@ -57,9 +57,7 @@ impl<T: 'static> GetReadCell<T> for Mut<T> {
 }
 
 impl<T> Signal for Mut<T> {
-    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> {
-        self.broadcast.reference().listen(listener)
-    }
+    fn listen(&self, listener: Listener) -> ListenerGuard { ListenerGuard::new(self.broadcast.reference().listen(listener)) }
 
     fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.broadcast.id() }
 }

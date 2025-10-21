@@ -8,17 +8,15 @@ use wasm_bindgen::prelude::*;
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
+#[cfg(debug_assertions)]
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{
-    CurrentObserver, Signal,
-    broadcast::{BroadcastId, ListenerGuard},
-    observer::Observer,
-};
+use crate::{CurrentObserver, Signal, broadcast::BroadcastId, observer::Observer, signal::ListenerGuard};
 
 #[wasm_bindgen(module = "react")]
 extern "C" {
@@ -33,7 +31,7 @@ extern "C" {
 }
 
 struct ListenerEntry {
-    _guard: ListenerGuard<()>,
+    _guard: ListenerGuard,
     marked_for_removal: bool,
 }
 
@@ -45,7 +43,8 @@ pub struct ReactObserver(Arc<Inner>);
 struct ReactObserverWeak(Weak<Inner>);
 
 pub struct Inner {
-    _human_readable_id: usize,
+    #[cfg(debug_assertions)]
+    name: OnceLock<Option<String>>,
     entries: std::sync::RwLock<HashMap<BroadcastId, ListenerEntry>>,
     /// This function gets called when a change is observed
     trigger_render: Arc<SendWrapper<OnceCell<js_sys::Function>>>,
@@ -63,15 +62,12 @@ pub struct Inner {
     version: Arc<AtomicUsize>,
 }
 
-static HUMAN_READABLE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 impl ReactObserverWeak {
     fn upgrade(&self) -> Option<ReactObserver> { self.0.upgrade().map(ReactObserver) }
 }
 
 impl ReactObserver {
     fn new() -> Self {
-        let react_observer_id = HUMAN_READABLE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         // Version counter for React's useSyncExternalStore
         let version = Arc::new(AtomicUsize::new(0));
 
@@ -91,14 +87,12 @@ impl ReactObserver {
         // Create snapshot function for useSyncExternalStore
         let get_snapshot = {
             let version = version.clone();
-            Closure::wrap(Box::new(move || {
-                let version = version.load(Ordering::Relaxed);
-                JsValue::from(version)
-            }) as Box<dyn Fn() -> JsValue>)
+            Closure::wrap(Box::new(move || JsValue::from(version.load(Ordering::Relaxed))) as Box<dyn Fn() -> JsValue>)
         };
 
         Self(Arc::new(Inner {
-            _human_readable_id: react_observer_id,
+            #[cfg(debug_assertions)]
+            name: OnceLock::new(),
             version,
             entries: std::sync::RwLock::new(HashMap::new()),
             trigger_render,
@@ -121,6 +115,37 @@ impl ReactObserver {
         let mut entries = self.0.entries.write().expect("entries lock is poisoned");
         entries.retain(|_, entry| !entry.marked_for_removal);
     }
+
+    /// Get the number of signals currently being observed (excluding those marked for removal)
+    #[cfg(debug_assertions)]
+    pub fn signal_count(&self) -> usize {
+        self.0.entries.read().expect("entries lock is poisoned").values().filter(|e| !e.marked_for_removal).count()
+    }
+
+    /// Get the observer name (only available in debug builds)
+    #[cfg(debug_assertions)]
+    pub fn name(&self) -> Option<String> { self.0.name.get().and_then(|opt| opt.clone()) }
+
+    /// Set the observer name (debug builds only, can only be set once)
+    /// Throws an error if the name has already been set to a different value
+    #[cfg(debug_assertions)]
+    pub fn set_name(&self, name: String) -> Result<(), JsValue> {
+        // Check if a name is already set
+        if let Some(existing) = self.0.name.get() {
+            // If it's the same name, that's fine
+            if existing.as_ref() == Some(&name) {
+                return Ok(());
+            }
+            // Different name - error
+            return Err(JsValue::from_str(&format!(
+                "Observer name already set to '{}', cannot change to '{}'",
+                existing.as_ref().unwrap_or(&"<none>".to_string()),
+                name
+            )));
+        }
+        // No name set yet, set it
+        self.0.name.set(Some(name)).map_err(|_| JsValue::from_str("Failed to set observer name"))
+    }
 }
 
 #[allow(unused)]
@@ -134,6 +159,16 @@ impl ReactObserver {
         self.sweep_marked_listeners();
         CurrentObserver::remove(self as &dyn Observer);
     }
+
+    /// Get the number of signals currently being observed by this observer (debug builds only)
+    #[cfg(debug_assertions)]
+    #[wasm_bindgen(js_name = signalCount, getter)]
+    pub fn js_signal_count(&self) -> usize { self.signal_count() }
+
+    /// Get the observer name (debug builds only)
+    #[cfg(debug_assertions)]
+    #[wasm_bindgen(js_name = name, getter)]
+    pub fn js_name(&self) -> Option<String> { self.name() }
 }
 
 /// React hook for observing signals within a component
@@ -144,6 +179,19 @@ impl ReactObserver {
 /// The hook must be used with a try-finally pattern to ensure proper cleanup.
 /// Call .get() on signals within the try block to register subscriptions.
 /// Always call observer.finish() in the finally block.
+///
+/// # Example
+/// ```javascript
+/// const observer = useObserve();
+/// try {
+///   const items = query.get();
+///   return <div>...</div>;
+/// } finally {
+///   observer.finish();
+/// }
+/// ```
+///
+/// For diagnostics, use `useObserveDiag` instead to set a name and access stats.
 #[wasm_bindgen(js_name = useObserve)]
 pub fn use_observe() -> Result<ReactObserver, JsValue> {
     let ref_value = useRef()?;
@@ -186,6 +234,44 @@ pub fn use_observe() -> Result<ReactObserver, JsValue> {
     }
 }
 
+/// React hook for diagnostics: gets the current observer and sets its name
+///
+/// This hook retrieves the current ReactObserver (created by `useObserve`)
+/// and sets its name for debugging purposes. Does NOT create a new observer
+/// or affect the observer stack.
+///
+/// **Only available in debug builds** - will not be exported in release builds.
+///
+/// # Example
+/// ```javascript
+/// function MyComponent() {
+///   const observer = useObserve();
+///   try {
+///     const diag = useObserveDiag("MyComponent"); // Sets name for profiling
+///     const items = query.get();
+///
+///     console.log(`Observing ${diag.signalCount()} signals`);
+///     return <div>...</div>;
+///   } finally {
+///     observer.finish();
+///   }
+/// }
+/// ```
+#[cfg(debug_assertions)]
+#[wasm_bindgen(js_name = useObserveDiag)]
+pub fn use_observe_diag(name: String) -> Result<ReactObserver, JsValue> {
+    // Get the current observer from the context (set by useObserve)
+    let current = CurrentObserver::current().ok_or_else(|| JsValue::from_str("No active observer"))?;
+
+    // Downcast to ReactObserver
+    let react_observer =
+        current.as_any().downcast_ref::<ReactObserver>().ok_or_else(|| JsValue::from_str("Current observer is not a ReactObserver"))?;
+
+    // Set the name (OnceLock ensures it can only be set once)
+    react_observer.set_name(name)?;
+
+    Ok((*react_observer).clone())
+}
 // Observer implementation for ReactObserver
 impl Observer for ReactObserver {
     fn observe(&self, signal: &dyn Signal) {
@@ -224,4 +310,7 @@ impl Observer for ReactObserver {
         // Use the pointer address of one of the Arc fields as a unique identifier
         Arc::as_ptr(&self.0) as *const _ as usize
     }
+
+    #[doc(hidden)]
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }

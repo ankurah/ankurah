@@ -113,8 +113,8 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
             }
 
             impl ::ankurah::signals::Signal for #view_name {
-                fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
-                    self.entity.broadcast().reference().listen(listener)
+                fn listen(&self, listener: ::ankurah::signals::signal::Listener) -> ::ankurah::signals::signal::ListenerGuard {
+                    self.entity.broadcast().reference().listen(listener).into()
                 }
                 fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
                     self.entity.broadcast().id()

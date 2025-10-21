@@ -1,8 +1,5 @@
 use super::Observer;
-use crate::{
-    CurrentObserver, Signal,
-    broadcast::{BroadcastId, ListenerGuard},
-};
+use crate::{CurrentObserver, Signal, broadcast::BroadcastId, signal::ListenerGuard};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
@@ -11,7 +8,7 @@ use std::sync::{Arc, Weak};
 #[derive(Clone)]
 pub struct CallbackObserver(Arc<Inner>);
 struct SubscriptionEntry {
-    _guard: ListenerGuard<()>,
+    _guard: ListenerGuard,
     marked_for_removal: bool,
 }
 
@@ -101,4 +98,7 @@ impl Observer for CallbackObserver {
     }
 
     fn observer_id(&self) -> usize { Arc::as_ptr(&self.0) as *const _ as usize }
+
+    #[doc(hidden)]
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }

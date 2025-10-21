@@ -1,7 +1,7 @@
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::{Get, Peek, broadcast::ListenerGuard};
+use crate::{Get, Peek, signal::ListenerGuard};
 
 /// Type alias for subscribe listeners with conditional thread safety bounds
 pub type SubscribeListener<T> = Box<dyn Fn(T) + Send + Sync + 'static>;
@@ -38,7 +38,7 @@ pub struct SubscriptionGuard {
 }
 
 impl SubscriptionGuard {
-    pub fn new<T: 'static>(lguard: ListenerGuard<T>) -> Self { Self { _listenerguard: Box::new(lguard) } }
+    pub fn new(lguard: ListenerGuard) -> Self { Self { _listenerguard: Box::new(lguard) } }
 }
 
 // IntoSubscribeListener implementation for std::sync::mpsc channels

@@ -9,4 +9,8 @@ pub trait Observer {
 
     /// Get a unique identifier for this observer (for equality comparison)
     fn observer_id(&self) -> usize;
+
+    /// Downcast support for trait objects (used internally for diagnostics)
+    #[doc(hidden)]
+    fn as_any(&self) -> &dyn std::any::Any;
 }

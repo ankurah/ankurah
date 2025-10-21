@@ -74,8 +74,8 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
 
         // not sure if we actually need this
         impl ankurah::signals::Signal for #resultset_name {
-            fn listen(&self, listener: ::ankurah::signals::broadcast::Listener) -> ::ankurah::signals::broadcast::ListenerGuard {
-                self.0.listen(listener)
+            fn listen(&self, listener: ::ankurah::signals::signal::Listener) -> ::ankurah::signals::signal::ListenerGuard {
+                self.0.listen(listener).into()
             }
             fn broadcast_id(&self) -> ::ankurah::signals::broadcast::BroadcastId {
                 use ::ankurah::signals::Signal;
@@ -137,7 +137,7 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             #[wasm_bindgen(getter)]
             pub fn items(&self) -> Vec<#view_name> {
                 use ::ankurah::signals::Get;
-                self.0.resultset().get()
+                self.0.get()
             }
             #[wasm_bindgen(getter)]
             pub fn signal_id(&self) -> usize {

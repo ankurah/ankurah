@@ -7,6 +7,23 @@ pub use map::*;
 pub use mutable::*;
 pub use read::*;
 
+pub type Listener = std::sync::Arc<dyn Fn(()) + Send + Sync + 'static>;
+
+/// Wraps any broadcast::ListenerGuard<T> in a type-erased container
+pub struct ListenerGuard(Box<dyn crate::broadcast::TListenerGuard + Send + Sync + 'static>);
+
+impl ListenerGuard {
+    /// Wrap any broadcast::ListenerGuard<T>
+    pub fn new<T: 'static>(guard: crate::broadcast::ListenerGuard<T>) -> Self { Self(Box::new(guard)) }
+
+    /// Get the broadcast ID that this guard is subscribed to
+    pub fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.0.broadcast_id() }
+}
+
+impl<T: 'static> From<crate::broadcast::ListenerGuard<T>> for ListenerGuard {
+    fn from(guard: crate::broadcast::ListenerGuard<T>) -> Self { Self(Box::new(guard)) }
+}
+
 /// Core trait for signals - provides observation capability without regard to a payload value
 /// The sole purpose of this trait is to provide a way to listen to changes to a signal.
 ///
@@ -14,7 +31,8 @@ pub use read::*;
 /// This is intentional and allows observers to deduplicate subscriptions efficiently.
 pub trait Signal {
     /// Listen to changes to this signal with a listener function
-    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()>;
+    /// Takes an Arc-wrapped closure for efficiency - wrap your closure with Arc::new(|| { ... })
+    fn listen(&self, listener: Listener) -> ListenerGuard;
 
     /// Get the broadcast identifier for this signal.
     /// Multiple signals may return the same broadcast_id if they share a broadcast.
@@ -45,7 +63,7 @@ pub trait GetReadCell<T: 'static> {
 impl<T> Signal for &T
 where T: Signal
 {
-    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> { Signal::listen(*self, listener) }
+    fn listen(&self, listener: Listener) -> ListenerGuard { Signal::listen(*self, listener) }
 
     fn broadcast_id(&self) -> crate::broadcast::BroadcastId { Signal::broadcast_id(*self) }
 }

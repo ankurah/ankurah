@@ -15,12 +15,19 @@ impl std::fmt::Display for BroadcastId {
 }
 
 /// A listener that can be called when broadcast notifications are sent.
-pub type Listener<T = ()> = Arc<dyn Fn(T) + Send + Sync + 'static>;
+/// Supports both full listeners (receive value) and unit listeners (notification only).
+#[derive(Clone)]
+pub enum BroadcastListener<T = ()> {
+    /// Full listener receives the broadcast value
+    Payload(Arc<dyn Fn(T) + Send + Sync + 'static>),
+    /// Unit listener only receives notification, ignores the value
+    NotifyOnly(Arc<dyn Fn() + Send + Sync + 'static>),
+}
 
 /// Trait for types that can be converted into broadcast listeners.
-pub trait IntoListener<T> {
+pub trait IntoBroadcastListener<T> {
     /// Convert this type into a listener function that can be called on notifications.
-    fn into_listener(self) -> Listener<T>;
+    fn into_broadcast_listener(self) -> BroadcastListener<T>;
 }
 
 /// A broadcast sender that notifies multiple subscribers without payload data.
@@ -29,7 +36,7 @@ pub trait IntoListener<T> {
 pub struct Broadcast<T = ()>(Arc<Inner<T>>);
 
 struct Inner<T> {
-    listeners: std::sync::RwLock<HashMap<usize, Listener<T>>>,
+    listeners: std::sync::RwLock<HashMap<usize, BroadcastListener<T>>>,
     next_id: AtomicUsize,
 }
 
@@ -41,6 +48,11 @@ impl<T> std::fmt::Debug for Broadcast<T> {
 
 /// A listen-only reference to a broadcast
 pub struct Ref<'a, T>(&'a Broadcast<T>);
+
+/// Trait for abstractly representing any ListenerGuard<T>
+pub trait TListenerGuard {
+    fn broadcast_id(&self) -> BroadcastId;
+}
 
 /// A subscription handle that can be used to unsubscribe from notifications.
 pub struct ListenerGuard<T = ()> {
@@ -58,6 +70,10 @@ impl<T> ListenerGuard<T> {
         // provide a unqique id for removing the correct listener.
         BroadcastId(self.inner.as_ptr() as usize)
     }
+}
+
+impl<T> TListenerGuard for ListenerGuard<T> {
+    fn broadcast_id(&self) -> BroadcastId { self.broadcast_id() }
 }
 
 impl<T> Default for Broadcast<T>
@@ -88,9 +104,15 @@ where T: Clone
         // clone the value for each subscriber except the last one
         if let Some((last, rest)) = subscribers.split_last() {
             for callback in rest {
-                callback(value.clone());
+                match callback {
+                    BroadcastListener::Payload(callback) => callback(value.clone()),
+                    BroadcastListener::NotifyOnly(callback) => callback(),
+                }
             }
-            last(value); // take ownership for the last one
+            match last {
+                BroadcastListener::Payload(callback) => callback(value),
+                BroadcastListener::NotifyOnly(callback) => callback(),
+            }
         }
     }
 
@@ -102,9 +124,9 @@ where T: Clone
 impl<'a, T> Ref<'a, T> {
     /// Subscribe to notifications from the associated sender.
     pub fn listen<L>(&self, listener: L) -> ListenerGuard<T>
-    where L: IntoListener<T> {
+    where L: IntoBroadcastListener<T> {
         let id = self.0.0.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.0.0.listeners.write().unwrap().insert(id, listener.into_listener());
+        self.0.0.listeners.write().unwrap().insert(id, listener.into_broadcast_listener());
         ListenerGuard { inner: Arc::downgrade(&self.0.0), id }
     }
 
@@ -124,35 +146,46 @@ impl<T> Drop for ListenerGuard<T> {
 // IntoListener implementations for various types
 
 // Implementation for function types - multi-threaded
-impl<F, T> IntoListener<T> for F
+impl<F, T> IntoBroadcastListener<T> for F
 where F: Fn(T) + Send + Sync + 'static
 {
-    fn into_listener(self) -> Listener<T> { Arc::new(self) }
+    fn into_broadcast_listener(self) -> BroadcastListener<T> { BroadcastListener::Payload(Arc::new(self)) }
 }
 
-// Implementation for Listener itself (Arc<dyn Fn() + Send + Sync + 'static>)
-impl<T> IntoListener<T> for Listener<T> {
-    fn into_listener(self) -> Listener<T> { self }
+// Implementation for Listener itself
+impl<T> IntoBroadcastListener<T> for BroadcastListener<T> {
+    fn into_broadcast_listener(self) -> BroadcastListener<T> { self }
+}
+
+// Implementation for Arc<dyn Fn(T)> - wrap in Full variant
+impl<T> IntoBroadcastListener<T> for Arc<dyn Fn(T) + Send + Sync + 'static> {
+    fn into_broadcast_listener(self) -> BroadcastListener<T> { BroadcastListener::Payload(self) }
+}
+
+// Implementation for Arc<dyn Fn()> - wrap in Unit variant for any T
+// This allows unit-type listeners (e.g., from Signal trait) to work with any broadcast type
+impl<T> IntoBroadcastListener<T> for Arc<dyn Fn() + Send + Sync + 'static> {
+    fn into_broadcast_listener(self) -> BroadcastListener<T> { BroadcastListener::NotifyOnly(self) }
 }
 
 #[cfg(feature = "tokio")]
-impl<T> IntoListener<T> for tokio::sync::mpsc::UnboundedSender<T>
+impl<T> IntoBroadcastListener<T> for tokio::sync::mpsc::UnboundedSender<T>
 where T: Send + Sync + 'static
 {
-    fn into_listener(self) -> Listener<T> {
-        Arc::new(move |value| {
+    fn into_broadcast_listener(self) -> BroadcastListener<T> {
+        BroadcastListener::Payload(Arc::new(move |value| {
             let _ = self.send(value); // Ignore send errors
-        })
+        }))
     }
 }
 
-impl<T> IntoListener<T> for std::sync::mpsc::Sender<T>
+impl<T> IntoBroadcastListener<T> for std::sync::mpsc::Sender<T>
 where T: Send + Sync + 'static
 {
-    fn into_listener(self) -> Listener<T> {
-        Arc::new(move |value| {
+    fn into_broadcast_listener(self) -> BroadcastListener<T> {
+        BroadcastListener::Payload(Arc::new(move |value| {
             let _ = self.send(value); // Ignore send errors
-        })
+        }))
     }
 }
 

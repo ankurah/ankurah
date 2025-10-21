@@ -148,3 +148,87 @@ async fn complex_local_subscription() -> Result<(), Box<dyn std::error::Error + 
     assert_eq!(watcher.drain(), vec![vec![(rex.id(), ChangeKind::Remove)]]);
     Ok(())
 }
+
+/// Demonstrates the difference between ResultSet Signal and LiveQuery Signal notification semantics:
+/// - ResultSet Signal fires only on membership changes (entities entering/leaving the query)
+/// - LiveQuery Signal fires on all entity changes (including property updates for entities already in the query)
+#[tokio::test]
+async fn resultset_vs_livequery_signal_semantics() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    node.system.create().await?;
+    let ctx = node.context(c)?;
+
+    // Create initial entities
+    let (album_a, album_b) = {
+        let trx = ctx.begin();
+        let a = trx.create(&Album { name: "Album A".into(), year: "2020".into() }).await?.read();
+        let b = trx.create(&Album { name: "Album B".into(), year: "2015".into() }).await?.read();
+        trx.commit().await?;
+        (a, b)
+    };
+
+    // Set up query for albums where year >= 2020
+    let predicate = ankql::parser::parse_selection("year >= '2020'").unwrap();
+    let query = ctx.query_wait::<AlbumView>(predicate).await?;
+
+    // Set up watchers for ResultSet Signal vs LiveQuery Signal
+    let resultset_watcher = TestWatcher::new();
+    let livequery_watcher = TestWatcher::new();
+
+    use ankurah::signals::Signal;
+    let _resultset_guard = {
+        let watcher = resultset_watcher.clone();
+        query.resultset().listen(Arc::new(move |()| watcher.notify(())))
+    };
+    let _livequery_guard = {
+        let watcher = livequery_watcher.clone();
+        query.listen(Arc::new(move |()| watcher.notify(())))
+    };
+
+    // Initial state - no notifications yet
+    assert_eq!(resultset_watcher.drain().len(), 0);
+    assert_eq!(livequery_watcher.drain().len(), 0);
+
+    // Test 1: Property update (no membership change)
+    // album_a is in the query, and stays in the query
+    {
+        let trx = ctx.begin();
+        let album = album_a.edit(&trx)?;
+        album.name().overwrite(0, 7, "Album A Updated")?;
+        trx.commit().await?;
+    }
+
+    // ResultSet Signal should NOT fire (no membership change)
+    // LiveQuery Signal SHOULD fire (entity property changed)
+    assert_eq!(resultset_watcher.drain().len(), 0, "ResultSet signal should not fire on property updates within query");
+    assert_eq!(livequery_watcher.drain().len(), 1, "LiveQuery signal should fire on property updates");
+
+    // Test 2: Entity enters the query (membership change)
+    {
+        let trx = ctx.begin();
+        let album = album_b.edit(&trx)?;
+        album.year().overwrite(0, 4, "2021")?; // Now year >= 2020, so it enters the query
+        trx.commit().await?;
+    }
+
+    // Both signals should fire (membership changed)
+    let resultset_count = resultset_watcher.drain().len();
+    let livequery_count = livequery_watcher.drain().len();
+    assert!(resultset_count >= 1, "ResultSet signal should fire on membership change (got {})", resultset_count);
+    assert!(livequery_count >= 1, "LiveQuery signal should fire on membership change (got {})", livequery_count);
+
+    // Test 3: Another property update (no membership change)
+    {
+        let trx = ctx.begin();
+        let album = album_a.edit(&trx)?;
+        album.name().overwrite(0, 15, "Album A Changed Again")?;
+        trx.commit().await?;
+    }
+
+    // ResultSet Signal should NOT fire (no membership change)
+    // LiveQuery Signal SHOULD fire (entity property changed)
+    assert_eq!(resultset_watcher.drain().len(), 0, "ResultSet signal should not fire on property updates within query");
+    assert_eq!(livequery_watcher.drain().len(), 1, "LiveQuery signal should fire on property updates");
+
+    Ok(())
+}

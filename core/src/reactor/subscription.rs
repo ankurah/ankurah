@@ -7,6 +7,8 @@ use ankurah_proto::{self as proto};
 use ankurah_signals::{
     broadcast::Broadcast,
     porcelain::subscribe::{IntoSubscribeListener, Subscribe, SubscriptionGuard},
+    signal::ListenerGuard,
+    Signal,
 };
 use std::sync::Arc;
 use ulid::Ulid;
@@ -92,7 +94,20 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<ReactorUpdate<E, Ev>> {
         let listener = listener.into_subscribe_listener();
-        let guard: ankurah_signals::broadcast::ListenerGuard<ReactorUpdate<E, Ev>> = self.0.broadcast.reference().listen(listener);
-        SubscriptionGuard::new(guard)
+        let guard = self.0.broadcast.reference().listen(listener);
+        SubscriptionGuard::new(guard.into())
     }
+}
+
+// Implement Signal trait - Listener<()> is automatically converted to Listener::Unit
+// This allows ReactorSubscription to be tracked by React observers without cloning ReactorUpdate
+impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Signal
+    for ReactorSubscription<E, Ev>
+{
+    fn listen(&self, listener: ankurah_signals::signal::Listener) -> ListenerGuard {
+        use ankurah_signals::broadcast::BroadcastListener;
+        self.0.broadcast.reference().listen(BroadcastListener::NotifyOnly(Arc::new(move || listener(())))).into()
+    }
+
+    fn broadcast_id(&self) -> ankurah_signals::broadcast::BroadcastId { self.0.broadcast.id() }
 }

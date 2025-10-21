@@ -49,8 +49,8 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn listen_field(
         &self,
         field_name: &PropertyName,
-        listener: ankurah_signals::broadcast::Listener,
-    ) -> ankurah_signals::broadcast::ListenerGuard;
+        listener: ankurah_signals::signal::Listener,
+    ) -> ankurah_signals::signal::ListenerGuard;
 }
 
 // This is where this gets a bit tough.

@@ -50,7 +50,7 @@ pub mod broadcast;
 mod context;
 pub mod observer;
 pub mod porcelain;
-mod signal;
+pub mod signal;
 mod value;
 
 #[cfg(feature = "react")]

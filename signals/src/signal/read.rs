@@ -5,7 +5,7 @@ use crate::{
     broadcast::Broadcast,
     context::CurrentObserver,
     porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
-    signal::{Get, GetReadCell, Signal, With, map::Map},
+    signal::{Get, GetReadCell, Listener, ListenerGuard, Signal, With, map::Map},
     value::{ReadValueCell, ValueCell},
 };
 
@@ -63,8 +63,10 @@ impl<T: 'static> GetReadCell<T> for Read<T> {
 }
 
 impl<T> Signal for Read<T> {
-    fn listen(&self, listener: crate::broadcast::Listener<()>) -> crate::broadcast::ListenerGuard<()> {
-        self.broadcast.reference().listen(listener)
+    fn listen(&self, listener: Listener) -> ListenerGuard {
+        ListenerGuard::new(
+            self.broadcast.reference().listen(crate::broadcast::BroadcastListener::NotifyOnly(Arc::new(move || listener(())))),
+        )
     }
 
     fn broadcast_id(&self) -> crate::broadcast::BroadcastId { self.broadcast.id() }
@@ -94,11 +96,11 @@ where T: Clone + Send + Sync + 'static
     where F: IntoSubscribeListener<T> {
         let listener = listener.into_subscribe_listener();
         let ro_value = self.get_readcell(); // Get read-only value handle
-        let subscription = self.listen(Arc::new(move |_| {
+        let sig_lguard = self.listen(Arc::new(move |_| {
             // Get current value when the broadcast fires
             let current_value = ro_value.value();
             listener(current_value);
         }));
-        SubscriptionGuard::new(subscription)
+        SubscriptionGuard::new(sig_lguard)
     }
 }
