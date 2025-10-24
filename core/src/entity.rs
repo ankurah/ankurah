@@ -279,7 +279,16 @@ impl Entity {
                         // concurrent - so augment the head
                         state.head.insert(event.id());
                     }
-                    return Ok(false);
+
+                    // We were previously passing false here, which was causing a knock-on error of the event being appliked to the entity
+                    // but not being stored. To be clear, This NotDescends logic is bad and wrong. The concurrency branch should fully address
+                    // the correctness issue with the way apply_operations is implemented above.
+                    //Taking the low road for now by returning true so the event gets stored by the caller
+                    // TODO - Think about whether we need to create a much stronger guarantee that the event is stored before
+                    // we actually apply it to the entity - or at least to the stored entity state. It's conceivable that we might
+                    // apply it to the entity on the hot path and background the storage of the event, but we would need some way to roll this
+                    // back if so, and I don't know if that's worth the complexity.
+                    return Ok(true);
                 }
                 lineage::Ordering::Incomparable => {
                     // total apples and oranges - take a hike buddy
