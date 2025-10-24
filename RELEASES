@@ -1,3 +1,4 @@
+0.6.3  Fix LiveQuery::Signal to fire on entity changes, not just membership changes 
 0.6.2  Conditional compilation bugfix
 0.6.1  Misc bugfixes
 0.6.0  Subscription deltas with known_matches and event bridges
