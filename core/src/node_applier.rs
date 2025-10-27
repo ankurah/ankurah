@@ -27,7 +27,7 @@ impl NodeApplier {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        tracing::info!("received subscription update for {} items", items.len());
+        tracing::debug!("received subscription update for {} items", items.len());
 
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
         // but this feels brittle, because failure to apply this event would affect the other contexts on this node.

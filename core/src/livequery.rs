@@ -152,6 +152,7 @@ impl EntityLiveQuery {
             return;
         }
 
+        // FIXME - this should be waiting for the correct version, not any version
         // Otherwise wait for the notification
         self.0.initialized.notified().await;
     }
@@ -280,6 +281,7 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
         if let Some(livequery) = self.upgrade() {
             // Activate the query (fetch entities, call reactor, and mark initialized)
             // Handle errors internally by setting last_error
+            tracing::debug!("Subscription established for query {}: {}", livequery.0.query_id, version);
             if let Err(e) = livequery.activate(version).await {
                 tracing::error!("Failed to activate subscription for query {}: {}", livequery.0.query_id, e);
                 livequery.0.error.set(Some(e));

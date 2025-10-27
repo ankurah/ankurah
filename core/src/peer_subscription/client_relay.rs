@@ -539,6 +539,12 @@ where
             other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
         };
 
+        tracing::debug!(
+            "Node.remote_subscribe: query_id: {}, collection_id: {}, received deltas: {}",
+            query_id,
+            collection_id,
+            deltas.len()
+        );
         // 3. Apply deltas to local node using NodeApplier
         let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id, &node, context_data);
         let apply_result = crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &retriever).await;
