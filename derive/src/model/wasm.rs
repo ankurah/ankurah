@@ -188,6 +188,7 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             }
 
             /// Update the predicate for this query and return a promise that resolves when complete
+            #[wasm_bindgen(js_name = updateSelection)]
             pub async fn update_selection(&self, new_selection: &str) -> Result<(), ::wasm_bindgen::JsValue> {
                 self.0.update_selection_wait(new_selection)
                     .await
