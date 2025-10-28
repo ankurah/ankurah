@@ -16,6 +16,7 @@ pub mod property;
 pub mod reactor;
 pub mod resultset;
 pub mod retrieval;
+pub mod selection;
 pub mod storage;
 pub mod system;
 pub mod task;
