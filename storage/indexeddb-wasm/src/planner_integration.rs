@@ -164,6 +164,113 @@ pub fn plan_bounds_to_idb_range(bounds: &KeyBounds) -> Result<(web_sys::IdbKeyRa
     Ok((idb_range, upper_open_ended, eq_prefix_len, eq_prefix_values))
 }
 
+#[allow(unused)]
+pub fn plan_bounds_to_idb_range_syntax(bounds: &KeyBounds) -> Result<String> {
+    use std::fmt::Write;
+
+    // Get the normalized range and encoding info
+    let (canonical_range, eq_prefix_len, eq_prefix_values) = normalize(bounds);
+
+    // For debugging, let's trace the input bounds
+    tracing::info!("plan_bounds_to_idb_range_syntax input: {:?}", bounds);
+    tracing::info!("Normalized canonical_range: {:?}", canonical_range);
+    tracing::info!("eq_prefix_len: {}, eq_prefix_values: {:?}", eq_prefix_len, eq_prefix_values);
+
+    let mut js_code = String::new();
+
+    match (&canonical_range.lower, &canonical_range.upper) {
+        (Some((lower_tuple, lower_open)), Some((upper_tuple, upper_open))) => {
+            // Both bounds exist - use bound()
+            write!(js_code, "IDBKeyRange.bound(")?;
+            write!(js_code, "{}", values_to_js_array(lower_tuple)?)?;
+            write!(js_code, ", ")?;
+            write!(js_code, "{}", values_to_js_array(upper_tuple)?)?;
+            write!(js_code, ", {}, {}", lower_open, upper_open)?;
+            write!(js_code, ")")?;
+        }
+        (Some((lower_tuple, lower_open)), None) => {
+            // Only lower bound - use lowerBound()
+            write!(js_code, "IDBKeyRange.lowerBound(")?;
+            write!(js_code, "{}", values_to_js_array(lower_tuple)?)?;
+            write!(js_code, ", {})", lower_open)?;
+        }
+        (None, Some((upper_tuple, upper_open))) => {
+            // Only upper bound - use upperBound()
+            write!(js_code, "IDBKeyRange.upperBound(")?;
+            write!(js_code, "{}", values_to_js_array(upper_tuple)?)?;
+            write!(js_code, ", {})", upper_open)?;
+        }
+        (None, None) => {
+            return Err(anyhow::anyhow!("Cannot generate syntax for completely unbounded range"));
+        }
+    }
+
+    tracing::info!("Generated IDBKeyRange syntax: {}", js_code);
+
+    Ok(js_code)
+}
+
+/// Convert Value array to JavaScript array syntax
+/// This replicates the encoding logic from idb_key_tuple() but generates string syntax
+/// Note: Uses IndexedDB key encoding (i64 as raw numbers, bool as 0/1)
+fn values_to_js_array(values: &[Value]) -> Result<String> {
+    let mut result = String::from("[");
+
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            result.push_str(", ");
+        }
+
+        match value {
+            Value::String(s) => {
+                // Same as: JsValue::from_str(s)
+                result.push('"');
+                result.push_str(&s.replace("\\", "\\\\").replace("\"", "\\\""));
+                result.push('"');
+            }
+            Value::I64(x) => {
+                // Same as: JsValue::from_f64(*x as f64) - use raw number
+                result.push_str(&x.to_string());
+            }
+            Value::I32(x) => {
+                // Same as: JsValue::from_f64(*x as f64)
+                result.push_str(&x.to_string());
+            }
+            Value::I16(x) => {
+                // Same as: JsValue::from_f64(*x as f64)
+                result.push_str(&x.to_string());
+            }
+            Value::F64(x) => {
+                // Same as: JsValue::from_f64(*x)
+                if x.fract() == 0.0 {
+                    result.push_str(&format!("{:.0}", x));
+                } else {
+                    result.push_str(&x.to_string());
+                }
+            }
+            Value::Bool(b) => {
+                // Same as: JsValue::from_f64(if *b { 1.0 } else { 0.0 })
+                // IndexedDB keys don't support boolean, use 0/1
+                result.push_str(if *b { "1" } else { "0" });
+            }
+            Value::EntityId(entity_id) => {
+                // Same as: JsValue::from_str(&entity_id.to_base64())
+                result.push('"');
+                result.push_str(&entity_id.to_base64());
+                result.push('"');
+            }
+            Value::Object(_) | Value::Binary(_) => {
+                // Same as idb_key_tuple: converts to ArrayBuffer
+                // For syntax generation, we can't easily represent this
+                return Err(anyhow::anyhow!("Object and Binary values not supported in key syntax generation: {:?}", value));
+            }
+        }
+    }
+
+    result.push(']');
+    Ok(result)
+}
+
 /// Convert scan direction to IndexedDB cursor direction
 pub fn scan_direction_to_cursor_direction(scan_direction: &ScanDirection) -> web_sys::IdbCursorDirection {
     match scan_direction {
@@ -283,5 +390,94 @@ mod tests {
         assert!(!upper_open_ended);
         assert_eq!(eq_prefix_len, 1);
         assert_eq!(eq_prefix_values, vec![Value::String("album".to_string())]);
+    }
+
+    #[test]
+    fn test_plan_bounds_to_idb_range_syntax() {
+        // Test the syntax generation for your exact bounds from the debug print
+        let bounds = KeyBounds::new(vec![
+            KeyBoundComponent {
+                column: "__collection".to_string(),
+                low: Endpoint::incl(Value::String("connectionevent".to_string())),
+                high: Endpoint::incl(Value::String("connectionevent".to_string())),
+            },
+            KeyBoundComponent {
+                column: "user_id".to_string(),
+                low: Endpoint::incl(Value::String("AZoegTHj_4vcBoJ5FfY-Xw".to_string())),
+                high: Endpoint::incl(Value::String("AZoegTHj_4vcBoJ5FfY-Xw".to_string())),
+            },
+            KeyBoundComponent {
+                column: "timestamp".to_string(),
+                low: Endpoint::excl(Value::I64(1761455267792)),
+                high: Endpoint::excl(Value::I64(1761456167793)),
+            },
+        ]);
+
+        let result = plan_bounds_to_idb_range_syntax(&bounds);
+        assert!(result.is_ok());
+
+        let js_syntax = result.unwrap();
+        println!("Generated JavaScript syntax: {}", js_syntax);
+
+        // Should generate IDBKeyRange.bound with raw i64 numbers (matches From<&Value>)
+        assert!(js_syntax.contains("IDBKeyRange.bound"));
+        assert!(js_syntax.contains("\"connectionevent\""));
+        assert!(js_syntax.contains("\"AZoegTHj_4vcBoJ5FfY-Xw\""));
+        // i64 values as raw numbers (not encoded strings)
+        assert!(js_syntax.contains("1761455267792")); // Lower bound as raw number
+        assert!(js_syntax.contains("1761456167793")); // Upper bound as raw number
+        assert!(js_syntax.contains("true, true")); // Both bounds are exclusive
+    }
+
+    #[test]
+    fn test_plan_bounds_to_idb_range_syntax_equality_only() {
+        // Test with equality-only bounds on a single column
+        // Per normalize() line 71-72: single equality becomes open-ended upper bound
+        let bounds = KeyBounds::new(vec![KeyBoundComponent {
+            column: "__collection".to_string(),
+            low: Endpoint::incl(Value::String("album".to_string())),
+            high: Endpoint::incl(Value::String("album".to_string())),
+        }]);
+
+        let result = plan_bounds_to_idb_range_syntax(&bounds);
+        assert!(result.is_ok());
+
+        let js_syntax = result.unwrap();
+        println!("Generated JavaScript syntax for single equality: {}", js_syntax);
+
+        // Single equality becomes lowerBound (open-ended) per normalize() logic
+        assert!(js_syntax.contains("IDBKeyRange.lowerBound"));
+        assert!(js_syntax.contains("\"album\""));
+        assert!(js_syntax.contains("false)")); // Inclusive lower bound
+    }
+
+    #[test]
+    fn test_plan_bounds_to_idb_range_syntax_multi_equality() {
+        // Test with equality on multiple columns
+        // Per normalize() line 71-72: multiple equalities use exact closed range
+        let bounds = KeyBounds::new(vec![
+            KeyBoundComponent {
+                column: "__collection".to_string(),
+                low: Endpoint::incl(Value::String("album".to_string())),
+                high: Endpoint::incl(Value::String("album".to_string())),
+            },
+            KeyBoundComponent {
+                column: "year".to_string(),
+                low: Endpoint::incl(Value::String("2000".to_string())),
+                high: Endpoint::incl(Value::String("2000".to_string())),
+            },
+        ]);
+
+        let result = plan_bounds_to_idb_range_syntax(&bounds);
+        assert!(result.is_ok());
+
+        let js_syntax = result.unwrap();
+        println!("Generated JavaScript syntax for multi-equality: {}", js_syntax);
+
+        // Multiple equalities use bound() with exact match
+        assert!(js_syntax.contains("IDBKeyRange.bound"));
+        assert!(js_syntax.contains("\"album\""));
+        assert!(js_syntax.contains("\"2000\""));
+        assert!(js_syntax.contains("false, false")); // Both bounds inclusive (closed)
     }
 }
