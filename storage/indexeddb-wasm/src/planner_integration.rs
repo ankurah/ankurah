@@ -124,32 +124,14 @@ pub fn to_idb_keyrange(canonical_range: &CanonicalRange) -> Result<(web_sys::Idb
 }
 
 /// Build JS key tuples from PropertyValue arrays (section 2.1 of playbook)
+/// Uses canonical IdbValue encoding for symmetric handling across storage, ranges, and guards
 fn idb_key_tuple(parts: &[Value]) -> Result<JsValue> {
     let arr = js_sys::Array::new();
     for p in parts {
-        let js_val = match p {
-            Value::I16(x) => JsValue::from_f64(*x as f64),
-            Value::I32(x) => JsValue::from_f64(*x as f64),
-            Value::I64(x) => encode_i64_for_idb(*x)?,
-            Value::F64(x) => JsValue::from_f64(*x),
-            Value::Bool(b) => JsValue::from_f64(if *b { 1.0 } else { 0.0 }),
-            Value::String(s) => JsValue::from_str(s),
-            Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
-            Value::Object(bytes) | Value::Binary(bytes) => {
-                let u8_array = unsafe { js_sys::Uint8Array::view(bytes) };
-                u8_array.buffer().into()
-            }
-        };
+        let js_val: JsValue = crate::idb_value::IdbValue::from(p).into();
         arr.push(&js_val);
     }
     Ok(arr.into())
-}
-
-/// Encode i64 for IndexedDB as order-preserving string (section 4.2 of playbook)
-fn encode_i64_for_idb(x: i64) -> Result<JsValue> {
-    // const BIAS: i128 = (i64::MAX as i128) - (i64::MIN as i128);
-    let u = (x as i128) - (i64::MIN as i128); // [0 .. 2^64-1] as i128
-    Ok(JsValue::from_str(&format!("{:020}", u))) // zero-padded => lex order == numeric
 }
 
 /// Convert Plan bounds to IndexedDB IdbKeyRange using the new IR pipeline

@@ -1,4 +1,4 @@
-use ankql::selection::filter::Filterable;
+use ankurah_core::selection::filter::Filterable;
 use ankurah_proto::{CollectionId, EntityId};
 
 // Lightweight filterable over materialized values
@@ -10,22 +10,11 @@ pub struct MatEntity {
 }
 impl Filterable for MatEntity {
     fn collection(&self) -> &str { self.collection.as_str() }
-    fn value(&self, name: &str) -> Option<String> {
+    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
         if name == "id" {
-            return Some(self.id.to_base64());
+            return Some(ankurah_core::value::Value::EntityId(self.id));
         }
-        self.map.get(name).map(|v| match v {
-            ankurah_core::value::Value::String(s) => s.clone(),
-            ankurah_core::value::Value::I16(x) => x.to_string(),
-            ankurah_core::value::Value::I32(x) => x.to_string(),
-            ankurah_core::value::Value::I64(x) => x.to_string(),
-            ankurah_core::value::Value::F64(x) => x.to_string(),
-            ankurah_core::value::Value::Bool(b) => b.to_string(),
-            ankurah_core::value::Value::EntityId(entity_id) => entity_id.to_base64(),
-            ankurah_core::value::Value::Object(bytes) | ankurah_core::value::Value::Binary(bytes) => {
-                String::from_utf8_lossy(bytes).to_string()
-            }
-        })
+        self.map.get(name).cloned()
     }
 }
 
@@ -39,9 +28,9 @@ pub struct MatRow {
 
 impl Filterable for MatRow {
     fn collection(&self) -> &str { self.mat.collection() }
-    fn value(&self, name: &str) -> Option<String> {
+    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
         if name == "id" {
-            Some(self.id.to_base64())
+            Some(ankurah_core::value::Value::EntityId(self.id))
         } else {
             self.mat.value(name)
         }

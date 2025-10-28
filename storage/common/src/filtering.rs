@@ -1,5 +1,5 @@
 use ankql::ast::{OrderByItem, Predicate};
-use ankql::selection::filter::Filterable;
+use ankurah_core::selection::filter::{Filterable, evaluate_predicate};
 
 use crate::sorting::{LimitedStream, SortedStream, TopKStream};
 
@@ -47,7 +47,7 @@ where
             let item = self.inner.next()?;
 
             // Evaluate predicate against the item
-            match ankql::selection::filter::evaluate_predicate(&item, &self.predicate) {
+            match evaluate_predicate(&item, &self.predicate) {
                 Ok(true) => return Some(item), // Item passes filter
                 Ok(false) => continue,         // Item doesn't match, try next
                 Err(_) => continue,            // Error evaluating, skip item (TODO: proper error handling)

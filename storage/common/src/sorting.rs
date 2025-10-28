@@ -1,4 +1,4 @@
-use ankql::selection::filter::Filterable;
+use ankurah_core::selection::filter::Filterable;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -11,12 +11,16 @@ fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::O
                 ankql::ast::Identifier::CollectionProperty(_, name) => name,
             };
 
-            let a_val = a.value(property_name).unwrap_or_default();
-            let b_val = b.value(property_name).unwrap_or_default();
+            let a_val = a.value(property_name);
+            let b_val = b.value(property_name);
 
-            let cmp = match order_item.direction {
-                ankql::ast::OrderDirection::Asc => a_val.cmp(&b_val),
-                ankql::ast::OrderDirection::Desc => b_val.cmp(&a_val),
+            // Handle None values: None sorts before Some
+            let cmp = match (a_val, b_val, &order_item.direction) {
+                (None, None, _) => Ordering::Equal,
+                (None, Some(_), _) => Ordering::Less,
+                (Some(_), None, _) => Ordering::Greater,
+                (Some(a), Some(b), ankql::ast::OrderDirection::Asc) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+                (Some(a), Some(b), ankql::ast::OrderDirection::Desc) => b.partial_cmp(&a).unwrap_or(Ordering::Equal),
             };
 
             if cmp != Ordering::Equal {
@@ -165,12 +169,16 @@ impl<T: Filterable> Ord for HeapItem<T> {
                 ankql::ast::Identifier::CollectionProperty(_, name) => name,
             };
 
-            let self_val = self.item.value(property_name).unwrap_or_default();
-            let other_val = other.item.value(property_name).unwrap_or_default();
+            let self_val = self.item.value(property_name);
+            let other_val = other.item.value(property_name);
 
-            let cmp = match order_item.direction {
-                ankql::ast::OrderDirection::Asc => other_val.cmp(&self_val), // Reversed for min-heap
-                ankql::ast::OrderDirection::Desc => self_val.cmp(&other_val), // Reversed for min-heap
+            // Handle None values: None sorts before Some (reversed for min-heap)
+            let cmp = match (self_val, other_val, &order_item.direction) {
+                (None, None, _) => Ordering::Equal,
+                (None, Some(_), _) => Ordering::Greater, // Reversed for min-heap
+                (Some(_), None, _) => Ordering::Less,    // Reversed for min-heap
+                (Some(s), Some(o), ankql::ast::OrderDirection::Asc) => o.partial_cmp(&s).unwrap_or(Ordering::Equal), // Reversed
+                (Some(s), Some(o), ankql::ast::OrderDirection::Desc) => s.partial_cmp(&o).unwrap_or(Ordering::Equal), // Reversed
             };
 
             if cmp != Ordering::Equal {

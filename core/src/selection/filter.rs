@@ -1,7 +1,8 @@
 //! Filter items based on a predicate. This is necessary for cases where we are scanning over a set of data
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
-use crate::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
+use crate::value::Value;
+use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
 use base64::{engine::general_purpose, Engine as _};
 use thiserror::Error;
 
@@ -40,37 +41,22 @@ impl<T: PartialEq> ExprOutput<T> {
     }
 }
 
-impl ExprOutput<String> {
-    fn is_none(&self) -> bool {
-        match self {
-            ExprOutput::None => true,
-            _ => false,
-        }
-    }
+impl ExprOutput<Value> {
+    fn is_none(&self) -> bool { matches!(self, ExprOutput::None) }
 }
 
-// Just to make this fast, lets assume all values are strings.
+/// Trait for items that can be filtered by predicate evaluation
+///
+/// Returns typed Values to enable proper comparison with casting
 pub trait Filterable {
     fn collection(&self) -> &str;
-    // TODO figure out how to make this generic so we can perform typecast eligibity checking
-    // and perform the actual typecast for comparisons
-    fn value(&self, name: &str) -> Option<String>;
+    fn value(&self, name: &str) -> Option<Value>;
 }
 
-fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<String>, Error> {
+fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Value>, Error> {
     match expr {
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
-        Expr::Literal(lit) => Ok(ExprOutput::Value(match lit {
-            Literal::I16(i) => i.to_string(),
-            Literal::I32(i) => i.to_string(),
-            Literal::I64(i) => i.to_string(),
-            Literal::F64(f) => f.to_string(),
-            Literal::Bool(b) => b.to_string(),
-            Literal::String(s) => s.clone(),
-            Literal::EntityId(ulid) => general_purpose::URL_SAFE_NO_PAD.encode(ulid.to_bytes()),
-            Literal::Object(bytes) => String::from_utf8_lossy(bytes).to_string(),
-            Literal::Binary(bytes) => String::from_utf8_lossy(bytes).to_string(),
-        })),
+        Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone().into())),
         Expr::Identifier(id) => match id {
             Identifier::Property(name) => Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.clone()))?)),
             Identifier::CollectionProperty(collection, name) => {
@@ -91,6 +77,30 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Stri
     }
 }
 
+/// Compare two values with automatic casting
+/// If types don't match, attempts to cast right to left's type
+fn compare_values_with_cast(left: &Value, right: &Value, op: impl Fn(&Value, &Value) -> bool) -> bool {
+    use crate::value::ValueType;
+
+    // If types match, compare directly
+    if ValueType::of(left) == ValueType::of(right) {
+        return op(left, right);
+    }
+
+    // Try casting right to left's type
+    if let Ok(casted_right) = right.cast_to(ValueType::of(left)) {
+        return op(left, &casted_right);
+    }
+
+    // Try casting left to right's type
+    if let Ok(casted_left) = left.cast_to(ValueType::of(right)) {
+        return op(&casted_left, right);
+    }
+
+    // No valid cast, types incompatible
+    false
+}
+
 pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Result<bool, Error> {
     match predicate {
         Predicate::Comparison { left, operator, right } => {
@@ -98,19 +108,41 @@ pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Res
             let right_val = evaluate_expr(item, right)?;
 
             Ok(match operator {
-                ComparisonOperator::Equal => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l == r).unwrap_or(false),
-                ComparisonOperator::NotEqual => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l != r).unwrap_or(false),
-                ComparisonOperator::GreaterThan => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l > r).unwrap_or(false),
-                ComparisonOperator::GreaterThanOrEqual => {
-                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l >= r).unwrap_or(false)
-                }
-                ComparisonOperator::LessThan => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l < r).unwrap_or(false),
-                ComparisonOperator::LessThanOrEqual => left_val.as_value().zip(right_val.as_value()).map(|(l, r)| l <= r).unwrap_or(false),
+                ComparisonOperator::Equal => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a == b))
+                    .unwrap_or(false),
+                ComparisonOperator::NotEqual => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a != b))
+                    .unwrap_or(false),
+                ComparisonOperator::GreaterThan => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a > b))
+                    .unwrap_or(false),
+                ComparisonOperator::GreaterThanOrEqual => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a >= b))
+                    .unwrap_or(false),
+                ComparisonOperator::LessThan => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a < b))
+                    .unwrap_or(false),
+                ComparisonOperator::LessThanOrEqual => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a <= b))
+                    .unwrap_or(false),
                 ComparisonOperator::In => {
                     let value =
                         left_val.as_value().ok_or_else(|| Error::PropertyNotFound("Expected single value for IN left operand".into()))?;
                     let list = right_val.as_list().ok_or_else(|| Error::PropertyNotFound("Expected list for IN right operand".into()))?;
-                    list.iter().any(|item| item.as_value().map(|v| v == value).unwrap_or(false))
+                    list.iter().any(|item| item.as_value().map(|v| compare_values_with_cast(value, v, |a, b| a == b)).unwrap_or(false))
                 }
                 ComparisonOperator::Between => return Err(Error::UnsupportedOperator("BETWEEN operator not yet supported")),
             })
@@ -165,7 +197,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_selection;
+    use ankql::parser::parse_selection;
 
     #[derive(Debug, Clone, PartialEq)]
     struct TestItem {
@@ -176,10 +208,10 @@ mod tests {
     impl Filterable for TestItem {
         fn collection(&self) -> &str { "users" }
 
-        fn value(&self, name: &str) -> Option<String> {
+        fn value(&self, name: &str) -> Option<Value> {
             match name {
-                "name" => Some(self.name.clone()),
-                "age" => Some(self.age.clone()),
+                "name" => Some(Value::String(self.name.clone())),
+                "age" => Some(Value::String(self.age.clone())),
                 _ => None,
             }
         }

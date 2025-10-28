@@ -30,7 +30,7 @@ pub enum RetrievalError {
     #[error("bucket name must only contain valid characters")]
     InvalidBucketName,
     #[error("ankql filter: {0}")]
-    AnkqlFilter(ankql::selection::filter::Error),
+    AnkqlFilter(crate::selection::filter::Error),
     #[error("Future join: {0}")]
     FutureJoin(tokio::task::JoinError),
     #[error("{0}")]
@@ -73,8 +73,8 @@ impl From<bincode::Error> for RetrievalError {
     fn from(e: bincode::Error) -> Self { RetrievalError::DeserializationError(e) }
 }
 
-impl From<ankql::selection::filter::Error> for RetrievalError {
-    fn from(err: ankql::selection::filter::Error) -> Self { RetrievalError::AnkqlFilter(err) }
+impl From<crate::selection::filter::Error> for RetrievalError {
+    fn from(err: crate::selection::filter::Error) -> Self { RetrievalError::AnkqlFilter(err) }
 }
 
 impl From<anyhow::Error> for RetrievalError {

@@ -1,4 +1,5 @@
 use crate::lineage::{self, GetEvents, Retrieve};
+use crate::selection::filter::Filterable;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
     model::View,
@@ -6,7 +7,6 @@ use crate::{
     reactor::AbstractEntity,
     value::Value,
 };
-use ankql::selection::filter::Filterable;
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -456,29 +456,13 @@ impl std::fmt::Display for Entity {
 impl Filterable for Entity {
     fn collection(&self) -> &str { self.collection.as_str() }
 
-    /// TODO Implement this as a typecasted value. eg value<T> -> Option<Result<T>>
-    /// where None is returned if the property is not found, and Err is returned if the property is found but is not able to be typecasted
-    /// to the requested type. (need to think about the rust type system here more)
-    fn value(&self, name: &str) -> Option<String> {
+    fn value(&self, name: &str) -> Option<Value> {
         if name == "id" {
-            Some(self.id.to_base64())
+            Some(Value::EntityId(self.id))
         } else {
             // Iterate through backends to find one that has this property
             let state = self.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
-                Some(value) => match value {
-                    Value::String(s) => Some(s),
-                    Value::I16(i) => Some(i.to_string()),
-                    Value::I32(i) => Some(i.to_string()),
-                    Value::I64(i) => Some(i.to_string()),
-                    Value::F64(i) => Some(i.to_string()),
-                    Value::Bool(i) => Some(i.to_string()),
-                    Value::EntityId(entity_id) => Some(entity_id.to_base64()),
-                    Value::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                    Value::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                },
-                None => None,
-            })
+            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
         }
     }
 }
@@ -511,26 +495,13 @@ impl TemporaryEntity {
 impl Filterable for TemporaryEntity {
     fn collection(&self) -> &str { self.0.collection.as_str() }
 
-    fn value(&self, name: &str) -> Option<String> {
+    fn value(&self, name: &str) -> Option<Value> {
         if name == "id" {
-            Some(self.0.id.to_base64())
+            Some(Value::EntityId(self.0.id))
         } else {
             // Iterate through backends to find one that has this property
             let state = self.0.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| match backend.property_value(&name.to_owned()) {
-                Some(value) => match value {
-                    Value::String(s) => Some(s),
-                    Value::I16(i) => Some(i.to_string()),
-                    Value::I32(i) => Some(i.to_string()),
-                    Value::I64(i) => Some(i.to_string()),
-                    Value::F64(i) => Some(i.to_string()),
-                    Value::Bool(i) => Some(i.to_string()),
-                    Value::EntityId(entity_id) => Some(entity_id.to_base64()),
-                    Value::Object(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                    Value::Binary(items) => Some(String::from_utf8_lossy(&items).to_string()),
-                },
-                None => None,
-            })
+            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
         }
     }
 }
