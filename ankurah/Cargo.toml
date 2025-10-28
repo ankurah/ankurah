@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah"
-version       = "0.6.3"
+version       = "0.6.4"
 edition       = "2021"
 description   = "Observable, event-driven state management for native and web"
 license       = "MIT OR Apache-2.0"
@@ -27,11 +27,11 @@ derive = ["dep:ankurah-derive"]
 instrument = ["ankurah-core/instrument"]
 
 [dependencies]
-ankurah-core    = { path = "../core", version = "^0.6.3" }
-ankurah-proto   = { path = "../proto", version = "^0.6.3" }
-ankurah-derive  = { path = "../derive", version = "^0.6.3", optional = true }
-ankurah-signals = { path = "../signals", version = "^0.6.3" }
-ankql           = { path = "../ankql", version = "^0.6.3" }
+ankurah-core    = { path = "../core", version = "^0.6.4" }
+ankurah-proto   = { path = "../proto", version = "^0.6.4" }
+ankurah-derive  = { path = "../derive", version = "^0.6.4", optional = true }
+ankurah-signals = { path = "../signals", version = "^0.6.4" }
+ankql           = { path = "../ankql", version = "^0.6.4" }
 serde_json      = { version = "1.0" }
 serde           = { version = "1.0" }
 tracing         = { version = "0.1.40" }

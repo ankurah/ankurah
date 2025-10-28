@@ -1,3 +1,4 @@
+0.6.4  Fix IndexedDB range scanning and residual predicate bug affecting integers/bools
 0.6.3  Fix LiveQuery::Signal to fire on entity changes, not just membership changes 
 0.6.2  Conditional compilation bugfix
 0.6.1  Misc bugfixes
