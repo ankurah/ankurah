@@ -21,6 +21,16 @@ pub struct Book {
     pub year: String,
 }
 
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Event {
+    #[active_type(LWW)]
+    pub name: String,
+    #[active_type(LWW)]
+    pub timestamp: i64,
+    #[active_type(LWW)]
+    pub active: bool,
+}
+
 wasm_bindgen_test_configure!(run_in_browser);
 
 #[allow(unused)]
@@ -90,6 +100,17 @@ pub async fn create_books(ctx: &Context, vec: Vec<(&'static str, &'static str)>)
     for (name, year) in vec {
         let book = Book { name: name.to_owned(), year: year.to_owned() };
         let _book = trx.create(&book).await?;
+    }
+    trx.commit().await?;
+    Ok(())
+}
+
+#[allow(unused)]
+pub async fn create_events(ctx: &Context, vec: Vec<(&'static str, i64, bool)>) -> Result<(), MutationError> {
+    let trx = ctx.begin();
+    for (name, timestamp, active) in vec {
+        let event = Event { name: name.to_owned(), timestamp, active };
+        let _event = trx.create(&event).await?;
     }
     trx.commit().await?;
     Ok(())

@@ -1,3 +1,4 @@
+use ankurah_core::selection::filter::Filterable;
 use ankurah_proto::CollectionId;
 use ankurah_storage_common::filtering::{HasEntityId, ValueSetStream};
 use ankurah_storage_common::traits::EntityIdStream;
@@ -59,7 +60,7 @@ pub trait SledEntityExt: EntityIdStream + Sized {
 
 /// Trait that provides a convenient `.entities()` combinator for materialized value streams
 pub trait SledEntityExtFromMats: ValueSetStream + Sized
-where Self::Item: HasEntityId + ankql::selection::filter::Filterable
+where Self::Item: HasEntityId + Filterable
 {
     /// Extract EntityIds and hydrate into EntityStates using the sled entities tree
     fn entities(self, entities_tree: &sled::Tree, collection_id: &CollectionId) -> SledEntityLookup<impl EntityIdStream> {
@@ -75,6 +76,6 @@ impl<S: EntityIdStream> SledEntityExt for S {}
 impl<S> SledEntityExtFromMats for S
 where
     S: Iterator + ValueSetStream,
-    S::Item: HasEntityId + ankql::selection::filter::Filterable,
+    S::Item: HasEntityId + Filterable,
 {
 }

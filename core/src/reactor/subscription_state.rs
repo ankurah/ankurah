@@ -4,8 +4,8 @@ use crate::{
         WatcherChange,
     },
     resultset::EntityResultSet,
+    selection::filter::{evaluate_predicate, Filterable},
 };
-use ankql::selection::filter::evaluate_predicate;
 use ankurah_proto::{self as proto};
 use futures::future;
 use indexmap::IndexMap;
@@ -55,7 +55,7 @@ type GapFillData<E> = (
 );
 
 /// State for a single predicate within a subscription
-pub struct QueryState<E: AbstractEntity + ankql::selection::filter::Filterable> {
+pub struct QueryState<E: AbstractEntity + Filterable> {
     // TODO make this a clonable PredicateSubscription and store it instead of the channel?
     pub(crate) collection_id: proto::CollectionId,
     /// Selection is None until first update_query call (after register_query)
@@ -69,28 +69,28 @@ pub struct QueryState<E: AbstractEntity + ankql::selection::filter::Filterable> 
 
 // We would call this ReactorSubscription, but that name is reserved for the public API
 // so instead we will call it Subscription and just scope it to the reactor package
-pub(super) struct Subscription<E: AbstractEntity + ankql::selection::filter::Filterable, Ev>(Arc<Inner<E, Ev>>);
+pub(super) struct Subscription<E: AbstractEntity + Filterable, Ev>(Arc<Inner<E, Ev>>);
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Clone for Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable, Ev> Clone for Subscription<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> std::ops::Deref for Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable, Ev> std::ops::Deref for Subscription<E, Ev> {
     type Target = Inner<E, Ev>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable, Ev> Subscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.id }
 }
 
-pub(super) struct Inner<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
+pub(super) struct Inner<E: AbstractEntity + Filterable, Ev> {
     pub(super) id: ReactorSubscriptionId,
     state: std::sync::Mutex<State<E, Ev>>,
     watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
 }
-struct State<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
+struct State<E: AbstractEntity + Filterable, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
     /// The set of entities that are subscribed to by this subscription
     pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
@@ -99,7 +99,7 @@ struct State<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Subscription<E, Ev> {
     pub fn new(
         broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
         watcher_set: Arc<std::sync::Mutex<crate::reactor::watcherset::WatcherSet>>,
@@ -269,7 +269,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
 
         // Process included entities (only truly new ones from remote)
         for entity in included_entities {
-            if ankql::selection::filter::evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) {
+            if evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) {
                 let entity_id = *AbstractEntity::id(&entity);
 
                 // Check if this is truly new to the resultset
@@ -286,7 +286,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
         // Remove entities that no longer match the new predicate
         let mut removed_entities = Vec::new();
         rw_resultset.retain_dirty(|entity| {
-            if let Ok(true) = ankql::selection::filter::evaluate_predicate(entity, &selection.predicate) {
+            if let Ok(true) = evaluate_predicate(entity, &selection.predicate) {
                 return true;
             };
             let entity_id = *entity.id();

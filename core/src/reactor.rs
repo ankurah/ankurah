@@ -22,6 +22,7 @@ use crate::{
     indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
     reactor::{subscription::ReactorSubInner, subscription_state::Subscription, watcherset::WatcherOp},
     resultset::EntityResultSet,
+    selection::filter::Filterable,
     value::{Value, ValueType},
 };
 use ankurah_proto::{self as proto};
@@ -60,11 +61,11 @@ impl PreNotifyHook for () {
 
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<
-    E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static = Entity,
+    E: AbstractEntity + Filterable + Send + 'static = Entity,
     Ev: Clone + Send + 'static = ankurah_proto::Attested<ankurah_proto::Event>,
 >(Arc<ReactorInner<E, Ev>>);
 
-struct ReactorInner<E: AbstractEntity + ankql::selection::filter::Filterable, Ev> {
+struct ReactorInner<E: AbstractEntity + Filterable, Ev> {
     subscriptions: std::sync::Mutex<HashMap<ReactorSubscriptionId, Subscription<E, Ev>>>,
     // Shared with all subscriptions to allow them to manage their own watchers
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
@@ -72,15 +73,15 @@ struct ReactorInner<E: AbstractEntity + ankql::selection::filter::Filterable, Ev
     notify_lock: tokio::sync::Mutex<()>,
 }
 // don't require Clone SE or PA, because we have an Arc
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Default for Reactor<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Default for Reactor<E, Ev> {
     fn default() -> Self { Self::new() }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
     pub fn new() -> Self {
         Self(Arc::new(ReactorInner {
             subscriptions: Mutex::new(HashMap::new()),
@@ -218,7 +219,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     Ok(KeySpec { keyparts })
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
     /// Add a new predicate to a subscription (initial subscription only)
     /// Fails if query_id already exists - use update_query for updates
     ///
@@ -447,9 +448,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
     }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug
-    for Reactor<E, Ev>
-{
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug for Reactor<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let watcher_set = self.0.watcher_set.lock().unwrap();
         let subscriptions = self.0.subscriptions.lock().unwrap();
@@ -462,9 +461,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
     }
 }
 
-impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug
-    for Subscription<E, Ev>
-{
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug for Subscription<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Subscription {{ id: {:?}, queries: {} }}", self.id(), self.queries_len())
     }
@@ -473,7 +470,7 @@ impl<E: AbstractEntity + ankql::selection::filter::Filterable + Send + 'static, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankql::selection::filter::Filterable;
+    use crate::selection::filter::Filterable;
     use ankurah_signals::Subscribe;
     use proto::{CollectionId, QueryId};
     use std::sync::Arc;
@@ -525,7 +522,9 @@ mod tests {
     }
     impl Filterable for TestEntity {
         fn collection(&self) -> &str { self.collection.as_str() }
-        fn value(&self, field: &str) -> Option<String> { self.state.lock().unwrap().get(field).cloned() }
+        fn value(&self, field: &str) -> Option<crate::value::Value> {
+            self.state.lock().unwrap().get(field).cloned().map(crate::value::Value::String)
+        }
     }
     impl AbstractEntity for TestEntity {
         fn collection(&self) -> proto::CollectionId { self.collection.clone() }

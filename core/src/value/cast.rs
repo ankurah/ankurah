@@ -139,6 +139,18 @@ impl Value {
             (Value::F64(n), ValueType::String) => Ok(Value::String(n.to_string())),
             (Value::Bool(b), ValueType::String) => Ok(Value::String(b.to_string())),
 
+            // Bool to numeric conversions (for IndexedDB compatibility where bool stored as 0/1)
+            (Value::Bool(b), ValueType::I16) => Ok(Value::I16(if *b { 1 } else { 0 })),
+            (Value::Bool(b), ValueType::I32) => Ok(Value::I32(if *b { 1 } else { 0 })),
+            (Value::Bool(b), ValueType::I64) => Ok(Value::I64(if *b { 1 } else { 0 })),
+            (Value::Bool(b), ValueType::F64) => Ok(Value::F64(if *b { 1.0 } else { 0.0 })),
+
+            // Numeric to bool conversions (0 = false, non-zero = true)
+            (Value::I16(n), ValueType::Bool) => Ok(Value::Bool(*n != 0)),
+            (Value::I32(n), ValueType::Bool) => Ok(Value::Bool(*n != 0)),
+            (Value::I64(n), ValueType::Bool) => Ok(Value::Bool(*n != 0)),
+            (Value::F64(f), ValueType::Bool) => Ok(Value::Bool(*f != 0.0)),
+
             // All other combinations are incompatible
             _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
         }
@@ -225,7 +237,8 @@ mod tests {
 
     #[test]
     fn test_incompatible_types() {
-        let value = Value::Bool(true);
+        // Binary to I32 is truly incompatible
+        let value = Value::Binary(vec![1, 2, 3]);
         let result = value.cast_to(ValueType::I32);
 
         assert!(matches!(result, Err(CastError::IncompatibleTypes { .. })));

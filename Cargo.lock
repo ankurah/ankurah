@@ -96,6 +96,7 @@ dependencies = [
  "anyhow",
  "append-only-vec",
  "async-trait",
+ "base64 0.22.1",
  "bincode",
  "chrono",
  "futures",

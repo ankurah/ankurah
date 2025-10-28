@@ -1,4 +1,4 @@
-use ankql::selection::filter::Filterable;
+use crate::selection::filter::Filterable;
 use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
 

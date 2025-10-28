@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicUsize;
 use ankurah_core::{
     action_debug,
     error::{MutationError, RetrievalError},
+    selection::filter::{evaluate_predicate, Filterable},
     storage::StorageCollection,
 };
 use ankurah_proto::{self as proto, Attested, EntityState, EventId, State};
@@ -164,7 +165,6 @@ impl StorageCollection for IndexedDBBucket {
                     let (key_range, upper_open_ended, eq_prefix_len, eq_prefix_values) =
                         crate::planner_integration::plan_bounds_to_idb_range(bounds)
                             .map_err(|e| RetrievalError::StorageError(format!("bounds conversion: {}", e).into()))?;
-
                     // Convert scan direction to cursor direction
                     let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(scan_direction);
 
@@ -362,8 +362,17 @@ impl IndexedDBBucket {
         #[cfg(not(debug_assertions))]
         let use_prefix_guard = upper_open_ended && eq_prefix_len > 0;
 
-        let eq_prefix_js: Vec<JsValue> =
-            if use_prefix_guard { eq_prefix_values.iter().map(propertyvalue_to_js).collect() } else { Vec::new() };
+        let eq_prefix_js: Vec<JsValue> = if use_prefix_guard {
+            eq_prefix_values
+                .iter()
+                .map(|v| {
+                    let js_val: JsValue = crate::idb_value::IdbValue::from(v).into();
+                    js_val
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         'scan: while let Some(result) = stream.next().await {
             let cursor_result = result.require("cursor error")?;
@@ -392,7 +401,7 @@ impl IndexedDBBucket {
             let filterable_entity = FilterableObject { object: &entity_obj, collection_id };
 
             // Apply predicate filtering first (cheaper than entity conversion)
-            if ankql::selection::filter::evaluate_predicate(&filterable_entity, predicate)
+            if evaluate_predicate(&filterable_entity, predicate)
                 .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
             {
                 // Only convert to EntityState if predicate matches
@@ -413,44 +422,6 @@ impl IndexedDBBucket {
 
         Ok(results)
     }
-}
-// NOTE: This differs from core's Into<JsValue> impl - this version uses IndexedDB key encoding:
-// - i64: Order-preserving string encoding (for values > ±2^53)
-// - bool: 0/1 numbers (IndexedDB doesn't support boolean keys)
-// - Binary: ArrayBuffer (for lexicographic byte ordering)
-// Convert PropertyValue to JsValue using IndexedDB-compatible key encoding
-//
-// TODO: Implement remaining IndexedDB playbook optimizations:
-// - Add offset support via cursor.advance(k) for OFFSET queries
-// - Implement IDBKeyRange.only() optimization for exact matches
-// - Add openKeyCursor support for key-only pre-filtering
-// - Enhanced type mismatch error handling and assertions
-fn propertyvalue_to_js(p: &ankurah_core::value::Value) -> JsValue {
-    match p {
-        ankurah_core::value::Value::I16(x) => JsValue::from_f64(*x as f64),
-        ankurah_core::value::Value::I32(x) => JsValue::from_f64(*x as f64),
-        ankurah_core::value::Value::I64(x) => {
-            // Order-preserving string encoding for i64 (matches planner_integration)
-            let u = (*x as i128) - (i64::MIN as i128);
-            JsValue::from_str(&format!("{:020}", u))
-        }
-        ankurah_core::value::Value::F64(x) => JsValue::from_f64(*x),
-        ankurah_core::value::Value::Bool(b) => JsValue::from_f64(if *b { 1.0 } else { 0.0 }),
-        ankurah_core::value::Value::String(s) => JsValue::from_str(s),
-        ankurah_core::value::Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
-        ankurah_core::value::Value::Object(bytes) | ankurah_core::value::Value::Binary(bytes) => {
-            let u8_array = unsafe { js_sys::Uint8Array::view(bytes) };
-            u8_array.buffer().into()
-        }
-    }
-}
-
-/// Extract ID range from predicate for primary key queries
-fn extract_id_range(predicate: &ankql::ast::Predicate) -> Option<web_sys::IdbKeyRange> {
-    // TODO: Implement proper ID range extraction from predicate
-    // For now, return None to scan all records
-    let _ = predicate;
-    None
 }
 
 /// Convert JS object to EntityState using the correct field extraction
@@ -494,8 +465,12 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
             }
 
             // Set field directly on entity object (no prefix - they become the primary fields)
+            // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)
             let js_value = match value {
-                Some(ref prop_value) => JsValue::from(prop_value),
+                Some(ref prop_value) => {
+                    let js_val: JsValue = crate::idb_value::IdbValue::from(prop_value).into();
+                    js_val
+                }
                 None => JsValue::NULL,
             };
             entity_obj.set(&field_name, js_value)?;
@@ -512,10 +487,14 @@ struct FilterableObject<'a> {
 }
 
 /// Implement Filterable for FilterableObject to enable direct predicate evaluation on JS objects
-impl<'a> ankql::selection::filter::Filterable for FilterableObject<'a> {
+impl<'a> Filterable for FilterableObject<'a> {
     fn collection(&self) -> &str { self.collection_id.as_str() }
 
-    fn value(&self, name: &str) -> Option<String> { self.object.get_opt::<String>(&name.into()).unwrap_or(None) }
+    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
+        // Get JsValue, convert through IdbValue to typed Value
+        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&name.into()).ok()??;
+        Some(idb_val.into_value())
+    }
 }
 
 /// Amend a selection with __collection = 'value' comparison
