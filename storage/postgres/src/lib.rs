@@ -476,7 +476,8 @@ impl StorageCollection for PostgresBucket {
         let attestations = bincode::serialize(&entity_event.attestations)?;
 
         let query = format!(
-            r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent", "attestations") VALUES($1, $2, $3, $4, $5)"#,
+            r#"INSERT INTO "{0}"("id", "entity_id", "operations", "parent", "attestations") VALUES($1, $2, $3, $4, $5)
+               ON CONFLICT ("id") DO NOTHING"#,
             self.event_table(),
         );
 
