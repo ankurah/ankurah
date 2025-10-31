@@ -33,6 +33,13 @@ impl Clock {
         }
     }
 
+    /// Creates a clone of the clock with the given event inserted
+    pub fn with_event(&self, id: EventId) -> Self {
+        let mut n = self.clone();
+        n.insert(id);
+        n
+    }
+
     pub fn len(&self) -> usize { self.0.len() }
 
     pub fn is_empty(&self) -> bool { self.0.is_empty() }

@@ -11,7 +11,7 @@ use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -175,6 +175,25 @@ impl Entity {
         self.state.write().unwrap().head = new_head;
     }
 
+    /// Attempts to mutate the entity state if the head matches the expected value.
+    ///
+    /// This provides TOCTOU protection: grabs the write lock, checks that `state.head == expected_head`,
+    /// and only then runs the closure. If the head changed, updates `expected_head` to the current value
+    /// and returns `Ok(false)` so the caller can retry with fresh lineage info.
+    ///
+    /// Returns `Ok(true)` if the mutation succeeded, `Ok(false)` if the head moved (retry needed),
+    /// or `Err` if the closure returned an error.
+    fn try_mutate<F, E>(&self, expected_head: &mut Clock, body: F) -> Result<bool, E>
+    where F: FnOnce(&mut EntityInnerState) -> Result<(), E> {
+        let mut state = self.state.write().unwrap();
+        if &state.head != expected_head {
+            *expected_head = state.head.clone();
+            return Ok(false);
+        }
+        body(&mut state)?;
+        Ok(true)
+    }
+
     pub fn view<V: View>(&self) -> Option<V> {
         if self.collection() != &V::collection() {
             None
@@ -210,170 +229,91 @@ impl Entity {
         let mut head = self.head();
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;
-        let budget = 10;
+        let budget = 100;
 
         for attempt in 0..MAX_RETRIES {
-            match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
-                lineage::Ordering::Equal => {
-                    info!("Equal - skip");
-                    return Ok(false);
-                }
-                lineage::Ordering::Descends => {
-                    info!("Descends - apply (attempt {})", attempt + 1);
-                    let new_head = event.id().into();
-                    // Atomic update: apply operations and set head under single lock
-                    {
-                        let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
-                        if state.head != head {
-                            debug!("Head changed during lineage comparison, retrying...");
-                            let current_head = state.head.clone();
-                            drop(state);
-                            head = current_head;
-                            continue;
-                        }
-                        for (backend_name, operations) in event.operations.iter() {
-                            // IMPORTANT TODO - we might descend the entity head by more than one event,
-                            // therefore we need to play forward events one by one, not just the latest
-                            // set operations, the current head and the parent of that.
-                            // We have to play forward all events from the current entity/backend state
-                            // to the latest event. At this point we know this lineage is connected,
-                            // else we would get back an Ordering::Incomparable.
-                            // So we just need to fiure out how to scan through those events here.
-                            // Probably the easiest thing would be to update Ordering::Descends to provide
-                            // the list of events to play forward, but ideally we'd do it on a streaming
-                            // basis instead. of materializing what could potentially be a large number
-                            // of events in some cases.
-                            // we can't do this in the lineage comparison, because its looking backwards
-                            // not forwards - and we need to replay the events in order.
-                            // Maybe the best approach is to have Descends return the list of event ids
-                            // connecting the current head to the new event, and use a modest LRU cache
-                            // on the event geter (which needs to abstract storage collection anyway,
-                            // due to the need for remote event retrieval)
-                            // ...so we get a cache hit in the most common cases, and it can paginate the rest.
-                            state.apply_operations(backend_name.clone(), operations)?;
-                        }
-                        state.head = new_head;
-                    }
-                    // Notify Signal subscribers about the change
-                    self.broadcast.send(());
-                    return Ok(true);
-                }
+            let new_head: Clock = match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
+                lineage::Ordering::Equal => return Ok(false),
+                lineage::Ordering::Descends => event.id().into(),
                 lineage::Ordering::NotDescends { meet: _ } => {
-                    // HACK - this is totally wrong, and should be handled by the Visitor discussed in concurrent-updates/spec.md
-                    info!("NotDescends - applying (attempt {})", attempt + 1);
-                    // Atomic update: apply operations and augment head under single lock
-                    {
-                        let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
-                        if state.head != head {
-                            warn!("Head changed during lineage comparison, retrying...");
-                            let current_head = state.head.clone();
-                            drop(state);
-                            head = current_head;
-                            continue;
-                        }
-                        for (backend_name, operations) in event.operations.iter() {
-                            state.apply_operations(backend_name.clone(), operations)?;
-                        }
-                        // concurrent - so augment the head
-                        state.head.insert(event.id());
-                    }
-
-                    // We were previously passing false here, which was causing a knock-on error of the event being appliked to the entity
-                    // but not being stored. To be clear, This NotDescends logic is bad and wrong. The concurrency branch should fully address
-                    // the correctness issue with the way apply_operations is implemented above.
-                    //Taking the low road for now by returning true so the event gets stored by the caller
-                    // TODO - Think about whether we need to create a much stronger guarantee that the event is stored before
-                    // we actually apply it to the entity - or at least to the stored entity state. It's conceivable that we might
-                    // apply it to the entity on the hot path and background the storage of the event, but we would need some way to roll this
-                    // back if so, and I don't know if that's worth the complexity.
-                    return Ok(true);
+                    warn!("NotDescends - HACK - applying (attempt {})", attempt + 1);
+                    head.with_event(event.id())
                 }
                 lineage::Ordering::Incomparable => {
-                    // total apples and oranges - take a hike buddy
-                    error!("{self} apply_event - Incomparable. This should essentially never happen among good actors.");
                     return Err(LineageError::Incomparable.into());
                 }
                 lineage::Ordering::PartiallyDescends { meet } => {
-                    error!("PartiallyDescends - skipping this event, but we should probably be handling this");
-                    // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                    // but it requires that we update the propertybackends to support this
                     return Err(LineageError::PartiallyDescends { meet }.into());
                 }
                 lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                    error!(
-                        "BudgetExceeded subject_frontier: {}, other_frontier: {}",
+                    warn!(
+                        "apply_event budget exhausted after {budget} events. Assuming Descends. subject_frontier: {}, other_frontier: {}",
                         subject_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", "),
                         other_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", ")
                     );
-                    return Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into());
+                    event.id().into()
                 }
+            };
+
+            if self.try_mutate(&mut head, move |state| -> Result<(), MutationError> {
+                for (backend_name, operations) in event.operations.iter() {
+                    state.apply_operations(backend_name.clone(), operations)?;
+                }
+                state.head = new_head;
+                Ok(())
+            })? {
+                self.broadcast.send(());
+                return Ok(true);
             }
+            continue;
         }
 
-        // If we've exhausted retries, return a budget exceeded error
-        Err(LineageError::BudgetExceeded {
-            original_budget: MAX_RETRIES,
-            subject_frontier: std::collections::BTreeSet::from([event.id()]),
-            other_frontier: std::collections::BTreeSet::new(),
-        }
-        .into())
+        warn!("apply_event retries exhausted while chasing moving head; applying event as Descends");
+        Err(MutationError::TOCTOUAttemptsExhausted)
     }
 
     pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
     where G: GetEvents<Id = EventId, Event = Event> {
-        let head = self.head();
+        let mut head = self.head();
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
         let budget = 100;
+        const MAX_RETRIES: usize = 5;
 
-        match crate::lineage::compare(getter, &new_head, &head, budget).await? {
-            lineage::Ordering::Equal => {
-                debug!("{self} apply_state - heads are equal, skipping");
-                Ok(false)
-            }
-            lineage::Ordering::Descends => {
-                debug!("{self} apply_state - new head descends from current, applying");
-                // TODO: Consider playing forward the event lineage instead of overwriting backends.
-                // Current approach has a security vulnerability: a malicious peer could send a state
-                // buffer that disagrees with the actual event operations. Playing forward events would
-                // ensure the state always matches the verified event lineage.
+        for _attempt in 0..MAX_RETRIES {
+            let apply = match crate::lineage::compare(getter, &new_head, &head, budget).await? {
+                lineage::Ordering::Equal => return Ok(false),
+                lineage::Ordering::Descends => true,
+                lineage::Ordering::NotDescends { meet } => return Ok(false),
+                lineage::Ordering::Incomparable => return Err(LineageError::Incomparable.into()),
+                lineage::Ordering::PartiallyDescends { meet } => return Err(LineageError::PartiallyDescends { meet }.into()),
+                lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
+                    warn!(
+                        "{self} apply_state - budget exhausted after {budget} events. Assuming Descends. subject: {subject_frontier:?}, other: {other_frontier:?}"
+                    );
+                    true
+                }
+            };
 
-                // Atomic update: overwrite backends and set head under single lock
-                {
-                    let mut entity_state = self.state.write().unwrap();
+            if apply {
+                if self.try_mutate::<_, MutationError>(&mut head, |es| -> Result<(), MutationError> {
                     for (name, state_buffer) in state.state_buffers.iter() {
                         let backend = backend_from_string(name, Some(state_buffer))?;
-                        entity_state.backends.insert(name.to_owned(), backend);
+                        es.backends.insert(name.to_owned(), backend);
                     }
-                    entity_state.head = new_head;
+                    es.head = state.head.clone();
+                    Ok(())
+                })? {
+                    self.broadcast.send(());
+                    return Ok(true);
                 }
-                // Notify Signal subscribers about the change
-                self.broadcast.send(());
-                Ok(true)
-            }
-            lineage::Ordering::NotDescends { meet } => {
-                warn!("{self} apply_state - new head {new_head} does not descend {head}, meet: {meet:?}");
-                Ok(false)
-            }
-            lineage::Ordering::Incomparable => {
-                error!("{self} apply_state - heads are incomparable. This should essentially never happen among good actors.");
-                // total apples and oranges - take a hike buddy
-                Err(LineageError::Incomparable.into())
-            }
-            lineage::Ordering::PartiallyDescends { meet } => {
-                error!("{self} apply_state - heads partially descend, meet: {meet:?}");
-                // TODO - figure out how to handle this. I don't think we need to materialize a new event
-                // but it requires that we update the propertybackends to support this
-                Err(LineageError::PartiallyDescends { meet }.into())
-            }
-            lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                tracing::warn!("{self} apply_state - budget exceeded. subject: {subject_frontier:?}, other: {other_frontier:?}");
-                Err(LineageError::BudgetExceeded { original_budget: budget, subject_frontier, other_frontier }.into())
+                continue;
             }
         }
+
+        warn!("{self} apply_state retries exhausted while chasing moving head");
+        Err(MutationError::TOCTOUAttemptsExhausted)
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does

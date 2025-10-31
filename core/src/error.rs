@@ -155,6 +155,8 @@ pub enum MutationError {
     FutureJoin(tokio::task::JoinError),
     #[error("anyhow error: {0}")]
     Anyhow(anyhow::Error),
+    #[error("TOCTOU attempts exhausted")]
+    TOCTOUAttemptsExhausted,
 }
 
 impl From<tokio::task::JoinError> for MutationError {
