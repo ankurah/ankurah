@@ -166,6 +166,9 @@ impl EntityLiveQuery {
         // Increment current_version atomically and get the new version number
         let new_version = self.0.current_version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
+        // Mark resultset as not loaded since we're changing the selection
+        self.0.resultset.set_loaded(false);
+
         // Store new selection and version in pending_selection mutex
         *self.0.selection.lock().unwrap() = (new_selection.clone(), new_version);
 
