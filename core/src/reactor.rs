@@ -223,41 +223,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Add a new predicate to a subscription (initial subscription only)
     /// Fails if query_id already exists - use update_query for updates
     ///
-    /// The resultset should be empty - this method will populate it with all matching entities
-    /// Returns all entities (initial + gap-filled) that match the predicate
-    pub async fn add_query(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
-        node: &dyn crate::node::TNodeErased<E>,
-        resultset: EntityResultSet<E>,
-        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
-    ) -> anyhow::Result<Vec<E>> {
-        // Get subscription reference
-        let subscription = {
-            let subscriptions = self.0.subscriptions.lock().unwrap();
-            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
-        };
-
-        // Fetch initial entities from local storage (do this first to avoid holding locks across await)
-        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
-
-        // Register empty query state with subscription (will be populated by update_query)
-        subscription.register_query(query_id, collection_id.clone(), resultset.clone(), gap_fetcher)?;
-
-        // Update query - watcher management (predicate + entity) is handled internally
-        let mut all_entities = subscription.update_query(query_id, collection_id, selection, included_entities, 1, &mut ())?;
-
-        // Fill gaps if needed (also registers entity watchers)
-        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
-
-        resultset.set_loaded(true);
-
-        Ok(all_entities)
-    }
-
     /// Add a query and send initialization notification (for local subscriptions)
     /// Collects ReactorUpdateItems and sends them
     /// pre_notify_hook is called before sending notification (e.g., to mark LiveQuery initialized)
@@ -310,37 +275,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         subscription.send_update(reactor_update_items);
 
         Ok(())
-    }
-
-    /// Update an existing predicate (v>0) - does NOT send notifications
-    /// Does diffing against the current resultset
-    /// Used by server-side remote subscriptions
-    /// Returns all entities that currently match the updated predicate (for delta generation)
-    pub async fn update_query(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        query_id: proto::QueryId,
-        collection_id: proto::CollectionId,
-        selection: ankql::ast::Selection,
-        node: &dyn crate::node::TNodeErased<E>,
-        version: u32,
-    ) -> anyhow::Result<Vec<E>> {
-        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
-
-        let subscription = {
-            let subscriptions = self.0.subscriptions.lock().unwrap();
-            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
-        };
-
-        // Update query - watcher management is handled internally
-        let mut all_entities =
-            subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, &mut ())?;
-
-        // Fill gaps if needed for this specific query (also registers entity watchers)
-        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
-
-        // Return all entities (newly added + gap-filled)
-        Ok(all_entities)
     }
 
     /// Update an existing predicate (v>0) and send notifications
@@ -445,6 +379,51 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         for subscription in subscriptions.values() {
             subscription.system_reset();
         }
+    }
+}
+
+// Entity-specific methods for remote subscriptions
+impl Reactor<Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
+    /// Add or update a query for remote subscriptions (server-side)
+    /// This method is idempotent - it works whether the query exists or not
+    /// Constructs gap_fetcher internally using the provided Node and ContextData
+    /// Returns all entities that currently match the selection (for delta generation)
+    pub async fn upsert_query<SE, PA>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        collection_id: proto::CollectionId,
+        selection: ankql::ast::Selection,
+        node: &crate::node::Node<SE, PA>,
+        cdata: &PA::ContextData,
+        version: u32,
+    ) -> anyhow::Result<Vec<Entity>>
+    where
+        SE: crate::storage::StorageEngine + Send + Sync + 'static,
+        PA: crate::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let subscription = {
+            let subscriptions = self.0.subscriptions.lock().unwrap();
+            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
+        };
+
+        let included_entities = node.fetch_entities_from_local(&collection_id, &selection).await?;
+
+        // Upsert query - register if new or get existing resultset
+        // Gap fetcher is only created if query doesn't exist yet
+        let resultset = subscription.upsert_query(query_id, collection_id.clone(), node, cdata);
+
+        // Update query - watcher management is handled internally
+        let mut all_entities =
+            subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, &mut ())?;
+
+        // Fill gaps if needed for this specific query (also registers entity watchers)
+        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
+
+        resultset.set_loaded(true);
+
+        // Return all entities (newly added + gap-filled)
+        Ok(all_entities)
     }
 }
 

@@ -6,7 +6,6 @@ use crate::{
     node::Node,
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},
-    resultset::EntityResultSet,
     storage::StorageEngine,
 };
 use ankurah_signals::{Subscribe, SubscriptionGuard};
@@ -82,18 +81,11 @@ impl SubscriptionHandler {
         selection.predicate = node.policy_agent.filter_predicate(cdata, &collection_id, selection.predicate)?;
         let storage_collection = node.collections.get(&collection_id).await?;
 
-        // Add or update the query - returns all matching entities
-        let matching_entities = if version == 1 {
-            // Initial subscription (version 1 is the first valid version)
-            let resultset = EntityResultSet::empty();
-            let gap_fetcher = std::sync::Arc::new(crate::reactor::fetch_gap::QueryGapFetcher::new(node, cdata.clone()));
-            node.reactor
-                .add_query(self.subscription.id(), query_id, collection_id.clone(), selection.clone(), node, resultset, gap_fetcher)
-                .await?
-        } else {
-            // Subscription update (version > 1)
-            node.reactor.update_query(self.subscription.id(), query_id, collection_id.clone(), selection.clone(), node, version).await?
-        };
+        // Add or update the query - idempotent, works whether query exists or not
+        let matching_entities = node
+            .reactor
+            .upsert_query(self.subscription.id(), query_id, collection_id.clone(), selection.clone(), node, cdata, version)
+            .await?;
 
         // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
 
