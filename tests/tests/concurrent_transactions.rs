@@ -1,7 +1,6 @@
 mod common;
 use anyhow::Result;
 use common::*;
-use std::sync::Arc;
 
 /// Test two concurrent transactions modifying the same entity
 /// This reproduces the scenario where:
@@ -44,32 +43,32 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
     // The second transaction's event has parent that equals the head before trx1 committed,
     // but now the head has been updated by trx1. This should be detected as NotDescends
     // and handled appropriately.
-    let result = trx2.commit().await;
+    trx2.commit().await?;
 
-    // For now, we expect this to either:
-    // 1. Succeed (if concurrent updates are handled correctly)
-    // 2. Return a clear error (not BudgetExceeded with wrong frontiers)
-    match result {
-        Ok(_) => {
-            // If it succeeds, verify both changes were applied
-            let final_album = context.get::<AlbumView>(album_id).await?;
-            println!("Final album name: {:?}", final_album.name());
-            println!("Final album year: {:?}", final_album.year());
+    // Verify both changes were applied via the live entity view
+    let final_album = context.get::<AlbumView>(album_id).await?;
+    println!("Final album name: {:?}", final_album.name());
+    println!("Final album year: {:?}", final_album.year());
+    assert_eq!(final_album.name().unwrap(), "Updated by Trx1");
+    assert_eq!(final_album.year().unwrap(), "2025");
 
-            // With proper concurrent update handling, both changes should be visible
-            assert_eq!(final_album.name().unwrap(), "Updated by Trx1");
-            assert_eq!(final_album.year().unwrap(), "2025");
-        }
-        Err(e) => {
-            // If it fails, it should be a clear error, not BudgetExceeded
-            println!("Transaction 2 failed with: {:?}", e);
+    // Persisted state must include both concurrent commits in its head
+    let collection = context.collection(&Album::collection()).await?;
+    let stored_state = collection.get_state(album_id).await?;
+    let persisted_head = stored_state.payload.state.head;
+    let persisted_head_ids: Vec<_> = persisted_head.iter().map(|id| id.to_base64_short()).collect();
+    println!("Persisted head ids: {:?}", persisted_head_ids);
+    assert_eq!(persisted_head.len(), 2, "Persisted head should include both concurrent commits");
 
-            // Check that it's not a BudgetExceeded error with wrong frontiers
-            let error_str = format!("{:?}", e);
-            if error_str.contains("BudgetExceeded") {
-                panic!("Got BudgetExceeded error, which suggests lineage comparison is failing: {}", error_str);
-            }
-        }
+    // All head entries must correspond to stored events
+    let persisted_events = collection.dump_entity_events(album_id).await?;
+    let persisted_event_ids: Vec<_> = persisted_events.iter().map(|e| e.payload.id()).collect();
+    for head_id in persisted_head.iter() {
+        assert!(
+            persisted_event_ids.iter().any(|event_id| event_id == head_id),
+            "Head event {:?} must exist in persisted events",
+            head_id.to_base64_short()
+        );
     }
 
     Ok(())

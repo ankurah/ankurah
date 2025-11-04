@@ -264,22 +264,25 @@ where
             entity.commit_head(Clock::new([attested_event.payload.id()]));
 
             let collection_id = &attested_event.payload.collection;
-            // If this entity has an upstream, propagate the changes
-            if let crate::entity::EntityKind::Transacted { upstream, .. } = &entity.kind {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
-                upstream.apply_event(&retriever, &attested_event.payload).await?;
-            }
 
-            // Persist
+            // Persist canonical entity (upstream for transactional forks, entity itself for primary)
+            let canonical_entity = match &entity.kind {
+                crate::entity::EntityKind::Transacted { upstream, .. } => {
+                    let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
+                    upstream.apply_event(&retriever, &attested_event.payload).await?;
+                    upstream.clone()
+                }
+                crate::entity::EntityKind::Primary => entity,
+            };
 
-            let state = entity.to_state()?;
+            let state = canonical_entity.to_state()?;
 
-            let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
+            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
             let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
             collection.set_state(attested).await?;
 
-            changes.push(EntityChange::new(entity.clone(), vec![attested_event])?);
+            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
         }
 
         // Notify reactor of ALL changes
