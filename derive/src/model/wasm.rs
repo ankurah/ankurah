@@ -177,6 +177,13 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 
             }
 
+            /// Get the current selection as a string, tracked by the observer
+            #[wasm_bindgen(getter, js_name = currentSelection)]
+            pub fn current_selection(&self) -> String {
+                use ::ankurah::signals::With;
+                self.0.selection().with(|(sel, _version)| sel.to_string())
+            }
+
             #[wasm_bindgen(skip_typescript)]
             pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function, immediate: Option<bool>) -> ::ankurah::signals::SubscriptionGuard {
                 ::ankurah::core::model::js_livequery_subscribe(
