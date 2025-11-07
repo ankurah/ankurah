@@ -122,6 +122,7 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
     let subscribe_ts = format!(
         r#"export interface {livequery_name} {{
     subscribe(callback: (changeset: {changeset_name}) => void, immediate?: boolean): SubscriptionGuard;
+    updateSelection(selection: string, ...substitution_values: any): Promise<void>;
 }}"#
     );
 
@@ -195,9 +196,16 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             }
 
             /// Update the predicate for this query and return a promise that resolves when complete
-            #[wasm_bindgen(js_name = updateSelection)]
-            pub async fn update_selection(&self, new_selection: &str) -> Result<(), ::wasm_bindgen::JsValue> {
-                self.0.update_selection_wait(new_selection)
+            #[wasm_bindgen(js_name = updateSelection, variadic, skip_typescript)]
+            pub async fn update_selection(&self, new_selection: String, substitution_values: &JsValue) -> Result<(), ::wasm_bindgen::JsValue> {
+                let mut selection = ::ankurah::ankql::parser::parse_selection(new_selection.as_str())?;
+
+                // Convert the variadic JsValue (which is an array) and pass directly to populate
+                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
+                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                selection.predicate = selection.predicate.populate(args_array)?;
+
+                self.0.update_selection_wait(selection)
                     .await
                     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
             }
