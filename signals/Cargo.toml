@@ -13,6 +13,7 @@ default = ["tokio"]
 tokio   = ["dep:tokio"]
 wasm    = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures"]
 react   = ["wasm", "dep:send_wrapper"]
+jsvalue = ["wasm"]
 
 [dependencies]
 tokio   = { version = "1.40", features = ["sync"], optional = true }
