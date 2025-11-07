@@ -45,6 +45,24 @@ pub struct OrderByItem {
     pub direction: OrderDirection,
 }
 
+impl std::fmt::Display for OrderByItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let field = match &self.identifier {
+            Identifier::Property(prop) => prop.clone(),
+            Identifier::CollectionProperty(coll, prop) => format!("{}.{}", coll, prop),
+        };
+        write!(
+            f,
+            "{} {}",
+            field,
+            match self.direction {
+                OrderDirection::Asc => "ASC",
+                OrderDirection::Desc => "DESC",
+            }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OrderDirection {
     Asc,
@@ -52,7 +70,22 @@ pub enum OrderDirection {
 }
 
 impl std::fmt::Display for Selection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.predicate) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.predicate)?;
+        if let Some(order_by) = &self.order_by {
+            write!(f, " ORDER BY ")?;
+            for (i, item) in order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", item)?;
+            }
+        }
+        if let Some(limit) = self.limit {
+            write!(f, " LIMIT {}", limit)?;
+        }
+        Ok(())
+    }
 }
 
 // Backward compatibility
