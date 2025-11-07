@@ -1,6 +1,6 @@
 use std::{
     marker::PhantomData,
-    sync::{atomic::AtomicBool, Arc, Weak},
+    sync::{Arc, Weak},
 };
 
 use ankurah_proto::{self as proto, CollectionId};
@@ -46,7 +46,8 @@ struct Inner {
     pub(crate) current_version: std::sync::atomic::AtomicU32,
     // Store selection with its version (starts with version 1, updated on selection changes)
     // This represents user intent (client-side state), separate from reactor's QueryState.selection (reactor-side state)
-    pub(crate) selection: std::sync::Mutex<(ankql::ast::Selection, u32)>,
+    // Using Mut for reactive updates that can be observed in WASM
+    pub(crate) selection: Mut<(ankql::ast::Selection, u32)>,
     // Store collection_id for selection updates
     pub(crate) collection_id: CollectionId,
     // Gap fetcher for reactor.add_query (type-erased)
@@ -108,7 +109,7 @@ impl EntityLiveQuery {
             initialized: tokio::sync::Notify::new(),
             initialized_version: std::sync::atomic::AtomicU32::new(0), // 0 means uninitialized
             current_version: std::sync::atomic::AtomicU32::new(1),     // Start at version 1
-            selection: std::sync::Mutex::new((args.selection.clone(), 1)), // Start with version 1
+            selection: Mut::new((args.selection.clone(), 1)),          // Start with version 1
             collection_id: collection_id.clone(),
             gap_fetcher,
         }));
@@ -169,8 +170,8 @@ impl EntityLiveQuery {
         // Mark resultset as not loaded since we're changing the selection
         self.0.resultset.set_loaded(false);
 
-        // Store new selection and version in pending_selection mutex
-        *self.0.selection.lock().unwrap() = (new_selection.clone(), new_version);
+        // Store new selection and version
+        self.0.selection.set((new_selection.clone(), new_version));
 
         // Check if this node has a relay (ephemeral) or not (durable)
         let has_relay = self.0.node.has_subscription_relay();
@@ -210,7 +211,7 @@ impl EntityLiveQuery {
     /// Rejects activation if the version is older than the current selection to prevent regression
     async fn activate(&self, version: u32) -> Result<(), RetrievalError> {
         // Get the current selection and its version
-        let (selection, stored_version) = self.0.selection.lock().unwrap().clone();
+        let (selection, stored_version) = self.0.selection.value();
 
         // Reject activation if this is an older version than what's currently stored
         // This prevents out-of-order activations from regressing the state
@@ -260,6 +261,7 @@ impl EntityLiveQuery {
     }
     pub fn error(&self) -> Read<Option<RetrievalError>> { self.0.error.read() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
+    pub fn selection(&self) -> Read<(ankql::ast::Selection, u32)> { self.0.selection.read() }
 
     /// Create a weak reference to this LiveQuery
     pub fn weak(&self) -> WeakEntityLiveQuery { WeakEntityLiveQuery(Arc::downgrade(&self.0)) }
