@@ -56,6 +56,9 @@ mod value;
 #[cfg(feature = "react")]
 pub mod react;
 
+#[cfg(feature = "jsvalue")]
+pub mod jsvalue;
+
 pub use broadcast::BroadcastId;
 pub use context::*;
 pub use observer::*;
@@ -64,3 +67,6 @@ pub use signal::*;
 
 #[cfg(feature = "react")]
 pub use react::*;
+
+#[cfg(feature = "jsvalue")]
+pub use jsvalue::*;
