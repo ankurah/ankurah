@@ -253,17 +253,21 @@ where
             entity_attested_events.push((entity, attested));
         }
 
-        // Relay to peers and wait for confirmation
-        self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
-
-        // All peers confirmed, now we can update local state
-        let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
+        // Store events and update heads BEFORE relaying (makes entities visible to server echo)
+        for (entity, attested_event) in &entity_attested_events {
             let collection = self.node.collections.get(&attested_event.payload.collection).await?;
             collection.add_event(&attested_event).await?;
             entity.commit_head(Clock::new([attested_event.payload.id()]));
+        }
 
+        // Relay to peers and wait for confirmation
+        self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
+
+        // All peers confirmed, persist state to storage
+        let mut changes: Vec<EntityChange> = Vec::new();
+        for (entity, attested_event) in entity_attested_events {
             let collection_id = &attested_event.payload.collection;
+            let collection = self.node.collections.get(collection_id).await?;
 
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
