@@ -42,7 +42,10 @@ where T: Clone
 }
 
 impl<T: Clone + 'static> Get<T> for Mut<T> {
-    fn get(&self) -> T { self.value.value() }
+    fn get(&self) -> T {
+        CurrentObserver::track(self);
+        self.value.value()
+    }
 }
 
 impl<T: 'static> With<T> for Mut<T> {
