@@ -25,8 +25,18 @@ impl NavigatorLock {
         send_wrapper::SendWrapper::new(async move {
             let window = window().require("get window")?;
             let navigator: Navigator = window.navigator();
-            let locks = Reflect::get(navigator.as_ref(), &JsValue::from_str("locks"))
-                .map_err(|e| anyhow!("navigator.locks not available: {:?}", e))?;
+
+            // Check if locks API is available (requires secure context)
+            let locks_result = Reflect::get(navigator.as_ref(), &JsValue::from_str("locks"));
+
+            // If locks API is not available, just run the work without locking
+            // This can happen in non-secure contexts (http:// on non-localhost)
+            if locks_result.is_err() || locks_result.as_ref().unwrap().is_undefined() {
+                tracing::warn!("Web Locks API not available (requires secure context), running without lock");
+                return work().await;
+            }
+
+            let locks = locks_result.unwrap();
 
             let options = Object::new();
             Reflect::set(&options, &JsValue::from_str("mode"), &JsValue::from_str("exclusive")).ok();
