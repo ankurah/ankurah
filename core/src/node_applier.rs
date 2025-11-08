@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::{
     changes::EntityChange,
     error::{ApplyError, ApplyErrorItem, MutationError},
@@ -170,12 +172,13 @@ impl NodeApplier {
         PA: PolicyAgent + Send + Sync + 'static,
         R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
     {
+        let delta_applications = deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, retriever));
+
+        let mut all_errors = Vec::new();
         // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
         // if there are stragglers, they will be picked up on the next wake
         // this should in theory be deterministic for eventbridge cases where all events are immediately available
-        let mut ready_chunks = ReadyChunks::new(deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, retriever)));
-
-        let mut all_errors = Vec::new();
+        let mut ready_chunks = ReadyChunks::new(delta_applications, Duration::from_millis(10));
 
         while let Some(results) = ready_chunks.next().await {
             let mut batch = Vec::new();
@@ -194,6 +197,19 @@ impl NodeApplier {
                 node.reactor.notify_change(batch).await;
             }
         }
+
+        // use tokio join_all to wait for all delta_applications to complete
+        // let results = futures::future::join_all(delta_applications).await;
+        // let mut changes = Vec::new();
+        // for result in results {
+        //     match result {
+        //         Ok(Some(change)) => changes.push(change),
+        //         Ok(None) => {} // No change, continue
+        //         Err(error_item) => {
+        //             all_errors.push(error_item);
+        //         }
+        //     }
+        // }
 
         if !all_errors.is_empty() {
             return Err(ApplyError::Items(all_errors));
