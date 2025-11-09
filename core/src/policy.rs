@@ -59,7 +59,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         node: &NodeInner<SE, Self>,
         cdata: &C,
         request: &proto::NodeRequest,
-    ) -> Vec<proto::AuthData>
+    ) -> Result<Vec<proto::AuthData>, AccessDenied>
     where
         C: Iterable<Self::ContextData>;
 
@@ -80,11 +80,14 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// Check the event and optionally return an attestation
     /// This could be used to attest that the event has passed the policy check for a given context
     /// or you could just return None if you don't want to attest to the event
+    /// entity_before: Entity state before the event is applied
+    /// entity_after: Entity state after the event has been applied (allows inspection of resulting state)
     fn check_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
         cdata: &Self::ContextData,
-        entity: &Entity,
+        entity_before: &Entity,
+        entity_after: &Entity,
         event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied>;
 
@@ -176,13 +179,13 @@ impl PolicyAgent for PermissiveAgent {
         _node: &NodeInner<SE, Self>,
         cdata: &C,
         _request: &proto::NodeRequest,
-    ) -> Vec<proto::AuthData>
+    ) -> Result<Vec<proto::AuthData>, AccessDenied>
     where
         C: Iterable<Self::ContextData>,
     {
         debug!("PermissiveAgent sign_request: {:?}", _request);
         // Create one AuthData per context (though PermissiveAgent doesn't really use them)
-        cdata.iterable().map(|_| proto::AuthData(vec![])).collect()
+        Ok(cdata.iterable().map(|_| proto::AuthData(vec![])).collect())
     }
 
     /// Validate auth data and yield the context data if valid
@@ -204,7 +207,8 @@ impl PolicyAgent for PermissiveAgent {
         &self,
         _node: &Node<SE, Self>,
         _cdata: &Self::ContextData,
-        _entity: &Entity,
+        _entity_before: &Entity,
+        _entity_after: &Entity,
         _event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, AccessDenied> {
         Ok(None)

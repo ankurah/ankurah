@@ -25,9 +25,9 @@ pub enum Plan {
         order_by_spill: Vec<ankql::ast::OrderByItem>, // extra sort keys
     },
     TableScan {
-        bounds: KeyBounds, // primary key bounds (empty if no constraints). TODO: Consider renaming IndexBounds to KeyBounds for clarity
-        scan_direction: ScanDirection, // forward/reverse based on primary key ORDER BY
-        remaining_predicate: ankql::ast::Predicate, // all predicates (no index to satisfy any)
+        bounds: KeyBounds,                            // primary key bounds (empty if no constraints).
+        scan_direction: ScanDirection,                // forward/reverse based on primary key ORDER BY
+        remaining_predicate: ankql::ast::Predicate,   // all predicates (no index to satisfy any)
         order_by_spill: Vec<ankql::ast::OrderByItem>, // ORDER BY fields not satisfied by scan direction
     },
     EmptyScan, // "scan" over an emptyset - the query can never match anything

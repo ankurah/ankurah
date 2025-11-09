@@ -39,7 +39,7 @@ pub(crate) struct ClientInner {
 
 /// Client provides a primary handle to speak to the server
 impl WebsocketClient {
-    pub fn new<SE, PA>(node: Node<SE, PA>, server_url: &str) -> Result<WebsocketClient, JsValue>
+    pub fn new<SE, PA>(node: Node<SE, PA>, server_url: &str) -> anyhow::Result<WebsocketClient>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -127,8 +127,9 @@ impl ClientInner {
         true
     }
 
-    pub fn connect(self: &Arc<Self>) -> Result<(), JsValue> {
-        let connection = Connection::new(self.node.cloned(), self.server_url.clone(), Arc::downgrade(self))?;
+    pub fn connect(self: &Arc<Self>) -> anyhow::Result<()> {
+        let connection =
+            Connection::new(self.node.cloned(), self.server_url.clone(), Arc::downgrade(self)).map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         action_info!(self, "connecting to", "{}", &self.server_url);
         *self.connection.borrow_mut() = Some(connection);

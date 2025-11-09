@@ -445,6 +445,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 RequestError::InternalChannelClosed => true,
                 RequestError::ServerError(_) => false,
                 RequestError::UnexpectedResponse(_) => false,
+                RequestError::AccessDenied(_) => false,
             },
             // Other retrieval errors are not retryable
             _ => false,
