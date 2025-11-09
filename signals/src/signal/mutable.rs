@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    Peek,
     broadcast::Broadcast,
     context::CurrentObserver,
     porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
@@ -46,6 +47,10 @@ impl<T: Clone + 'static> Get<T> for Mut<T> {
         CurrentObserver::track(self);
         self.value.value()
     }
+}
+
+impl<T: Clone + 'static> Peek<T> for Mut<T> {
+    fn peek(&self) -> T { self.value.value() }
 }
 
 impl<T: 'static> With<T> for Mut<T> {
