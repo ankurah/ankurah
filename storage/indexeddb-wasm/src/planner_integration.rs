@@ -3,6 +3,37 @@ use ankurah_storage_common::{CanonicalRange, Endpoint, KeyBounds, KeyDatum, Scan
 use anyhow::Result;
 use wasm_bindgen::JsValue;
 
+fn next_upper_bound(value: &Value) -> Option<(Value, bool)> {
+    match value {
+        Value::Bool(false) => Some((Value::Bool(true), true)),
+        Value::Bool(true) => Some((Value::I32(2), true)),
+        Value::I16(v) => Some((Value::I16(v.saturating_add(1)), true)),
+        Value::I32(v) => Some((Value::I32(v.saturating_add(1)), true)),
+        Value::I64(v) => Some((Value::I64(v.saturating_add(1)), true)),
+        Value::F64(v) => {
+            if v.is_nan() || v.is_infinite() {
+                None
+            } else {
+                // Use nextafter-like logic: add a small epsilon scaled to the magnitude
+                // For values near zero, use f64::EPSILON; for larger values, scale appropriately
+                let epsilon = f64::EPSILON.max(v.abs() * f64::EPSILON);
+                Some((Value::F64(v + epsilon), true))
+            }
+        }
+        Value::String(s) => {
+            let mut bumped = s.clone();
+            bumped.push('\u{0000}');
+            Some((Value::String(bumped), true))
+        }
+        Value::EntityId(entity_id) => {
+            let mut bumped = entity_id.to_base64();
+            bumped.push('\u{0000}');
+            Some((Value::String(bumped), true))
+        }
+        Value::Object(_) | Value::Binary(_) => None,
+    }
+}
+
 /// Normalize IndexBounds to CanonicalRange following the playbook algorithm
 /// Returns (CanonicalRange, eq_prefix_len, eq_prefix_values)
 pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<Value>) {
@@ -68,7 +99,20 @@ pub fn normalize(bounds: &KeyBounds) -> (CanonicalRange, usize, Vec<Value>) {
     // Equality-only bounds: if we have equality on exactly one leading column
     // and no inequality processed, prefer a prefix-open scan to cover full suffix.
     // If there are multiple equality columns present, keep exact closed range.
-    if eq_prefix_len == bounds.keyparts.len() && eq_prefix_len == 1 {
+    if eq_prefix_len == bounds.keyparts.len() && eq_prefix_len > 0 {
+        if let Some(last_value) = lower_tuple.last() {
+            if let Some((next_value, upper_open)) = next_upper_bound(last_value) {
+                let mut upper_with_bump = lower_tuple.clone();
+                if let Some(slot) = upper_with_bump.last_mut() {
+                    *slot = next_value;
+                    return (
+                        CanonicalRange { lower: Some((lower_tuple, lower_open)), upper: Some((upper_with_bump, upper_open)) },
+                        eq_prefix_len,
+                        eq_prefix_values,
+                    );
+                }
+            }
+        }
         return (CanonicalRange { lower: Some((lower_tuple, lower_open)), upper: None }, eq_prefix_len, eq_prefix_values);
     }
 
@@ -303,6 +347,7 @@ mod tests {
     #[test]
     fn test_normalize_equality_only() {
         // Test normalization of equality-only bounds: __collection = 'album' AND age = 30
+        // With the new bounded range logic, this should create [album, 30] to [album, 31)
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
                 column: "__collection".to_string(),
@@ -318,10 +363,10 @@ mod tests {
         assert_eq!(eq_prefix_len, 2);
         assert_eq!(eq_prefix_values, vec![Value::String("album".to_string()), Value::I32(30)]);
 
-        // Both lower and upper should be the same (exact match)
-        assert_eq!(canonical_range.lower, Some((vec![Value::String("album".to_string()), Value::I32(30)], false))); // closed bounds
-        assert_eq!(canonical_range.upper, Some((vec![Value::String("album".to_string()), Value::I32(30)], false)));
-        // closed bounds
+        // Lower bound is inclusive [album, 30], upper bound is exclusive [album, 31)
+        assert_eq!(canonical_range.lower, Some((vec![Value::String("album".to_string()), Value::I32(30)], false))); // closed lower
+        assert_eq!(canonical_range.upper, Some((vec![Value::String("album".to_string()), Value::I32(31)], true)));
+        // open upper (exclusive)
     }
 
     #[test]
@@ -414,7 +459,7 @@ mod tests {
     #[test]
     fn test_plan_bounds_to_idb_range_syntax_equality_only() {
         // Test with equality-only bounds on a single column
-        // Per normalize() line 71-72: single equality becomes open-ended upper bound
+        // With the new bounded range logic, single equality becomes bound(["album"], ["album\uFFFF"], false, false)
         let bounds = KeyBounds::new(vec![KeyBoundComponent {
             column: "__collection".to_string(),
             low: Endpoint::incl(Value::String("album".to_string())),
@@ -427,16 +472,17 @@ mod tests {
         let js_syntax = result.unwrap();
         println!("Generated JavaScript syntax for single equality: {}", js_syntax);
 
-        // Single equality becomes lowerBound (open-ended) per normalize() logic
-        assert!(js_syntax.contains("IDBKeyRange.lowerBound"));
+        // Single equality now becomes a bounded range with next_upper_bound
+        assert!(js_syntax.contains("IDBKeyRange.bound"));
         assert!(js_syntax.contains("\"album\""));
-        assert!(js_syntax.contains("false)")); // Inclusive lower bound
+        // The upper bound has a null character appended (may appear as space or invisible in output)
+        assert!(js_syntax.contains("], [\"album") && js_syntax.ends_with("\"], false, true)"));
     }
 
     #[test]
     fn test_plan_bounds_to_idb_range_syntax_multi_equality() {
         // Test with equality on multiple columns
-        // Per normalize() line 71-72: multiple equalities use exact closed range
+        // With the new bounded range logic, this becomes bound(["album", "2000"], ["album", "2000\uFFFF"], false, false)
         let bounds = KeyBounds::new(vec![
             KeyBoundComponent {
                 column: "__collection".to_string(),
@@ -456,10 +502,11 @@ mod tests {
         let js_syntax = result.unwrap();
         println!("Generated JavaScript syntax for multi-equality: {}", js_syntax);
 
-        // Multiple equalities use bound() with exact match
+        // Multiple equalities now use bound() with next_upper_bound on the last column
         assert!(js_syntax.contains("IDBKeyRange.bound"));
         assert!(js_syntax.contains("\"album\""));
         assert!(js_syntax.contains("\"2000\""));
-        assert!(js_syntax.contains("false, false")); // Both bounds inclusive (closed)
+        // The upper bound has a null character appended to the last value
+        assert!(js_syntax.contains("], [\"album\", \"2000") && js_syntax.ends_with("\"], false, true)"));
     }
 }

@@ -47,6 +47,9 @@ pub fn sort_names(albums: &[AlbumView]) -> Vec<String> {
 pub fn years(albums: &[AlbumView]) -> Vec<String> { albums.iter().map(|a| a.year().unwrap()).collect() }
 
 #[allow(unused)]
+pub fn event_timestamps(events: &[EventView]) -> Vec<i64> { events.iter().map(|e| e.timestamp().unwrap()).collect() }
+
+#[allow(unused)]
 pub fn setup() -> () {
     console_error_panic_hook::set_once();
 

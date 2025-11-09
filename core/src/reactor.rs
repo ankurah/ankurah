@@ -262,7 +262,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         )?;
 
         // Fill gaps if needed for this specific query
-        // fill_gaps_for_query also registers entity watchers and pushes items internally
+        // FIXME: Open question — is there a window where entity edits land between the local fetch
+        // above and downstream notification handling (reactor.notify_change + evaluate_changes)
+        // such that we need this gap fill to catch the missed edit-driven gap?
         subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
 
         // Mark as loaded
@@ -310,7 +312,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         )?;
 
         // Fill gaps if needed for this specific query
-        // fill_gaps_for_query also registers entity watchers and pushes items internally
+        // FIXME: Same open question as add_query_and_notify — do edits that slip in between the
+        // storage fetch and subsequent notify_change path require this gap fill to keep limits tight?
         subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
 
         // Call pre-notify hook (e.g., mark LiveQuery as initialized)
@@ -418,6 +421,8 @@ impl Reactor<Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
             subscription.update_query(query_id, collection_id.clone(), selection.clone(), included_entities, version, &mut ())?;
 
         // Fill gaps if needed for this specific query (also registers entity watchers)
+        // FIXME: Same follow-up — we should confirm whether edit-driven gaps can occur between the
+        // storage fetch and notify_change handling, which would make this gap fill mandatory.
         subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
 
         resultset.set_loaded(true);
