@@ -1,3 +1,4 @@
+0.6.8  Fix IndexedDB equality-prefix queries with ORDER BY; LiveQuery selection reactivity; transaction ordering; Web Locks fallback, JsValue signals and other ergonomics
 0.6.7  Fix concurrent server transaction commits: persist and notify with canonical entity to prevent head truncation and client divergence
 0.6.6  Fix query reconnect errors by making reactor.upsert_query idempotent; lazy gap fetcher creation; set loaded=false on selection updates
 0.6.5  Increase lineage budget to 100 and apply optimistically when exhausted; refactor Entity TOCTOU handling; fix postgres add_event idempotency
