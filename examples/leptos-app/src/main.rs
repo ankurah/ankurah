@@ -10,10 +10,10 @@ fn main() {
 }
 
 #[allow(unused)]
-async fn create_client() -> WebsocketClient {
-    let storage = IndexedDBStorageEngine::open("test_db").await.unwrap();
+async fn create_client() -> Result<WebsocketClient, String> {
+    let storage = IndexedDBStorageEngine::open("test_db").await.map_err(|e| e.to_string())?;
     let node = Node::new(Arc::new(storage), PermissiveAgent::new());
-    WebsocketClient::new(node, "localhost:9797").unwrap()
+    WebsocketClient::new(node, "localhost:9797").map_err(|e| e.to_string())
 }
 
 #[component]

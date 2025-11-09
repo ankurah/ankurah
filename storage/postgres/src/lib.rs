@@ -30,6 +30,12 @@ pub struct Postgres {
 impl Postgres {
     pub fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> { Ok(Self { pool }) }
 
+    pub async fn open(uri: &str) -> anyhow::Result<Self> {
+        let manager = PostgresConnectionManager::new_from_stringlike(uri, NoTls)?;
+        let pool = bb8::Pool::builder().build(manager).await?;
+        Self::new(pool)
+    }
+
     // TODO: newtype this to `BucketName(&str)` with a constructor that
     // only accepts a subset of characters.
     pub fn sane_name(collection: &str) -> bool {

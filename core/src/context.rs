@@ -247,7 +247,23 @@ where
 
         // Check policy and collect attestations
         for (entity, event) in entity_events {
-            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity, &event)?;
+            // Create a temporary fork to apply the event for validation
+            use std::sync::atomic::AtomicBool;
+            let trx_alive = Arc::new(AtomicBool::new(true));
+            let forked = entity.snapshot(trx_alive);
+
+            // Get the canonical (upstream) entity for before state
+            let entity_before = match &entity.kind {
+                crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
+                crate::entity::EntityKind::Primary => entity.clone(),
+            };
+
+            // Apply event to fork for after state
+            let collection_id = &event.collection;
+            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
+            forked.apply_event(&retriever, &event).await?;
+
+            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
             let attested = Attested::opt(event.clone(), attestation);
             attested_events.push(attested.clone());
             entity_attested_events.push((entity, attested));

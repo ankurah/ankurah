@@ -99,6 +99,12 @@ pub enum RequestError {
     InternalChannelClosed,
     #[error("Unexpected response: {0:?}")]
     UnexpectedResponse(ankurah_proto::NodeResponseBody),
+    #[error("Access denied: {0}")]
+    AccessDenied(AccessDenied),
+}
+
+impl From<AccessDenied> for RequestError {
+    fn from(err: AccessDenied) -> Self { RequestError::AccessDenied(err) }
 }
 
 impl From<SendError> for RequestError {

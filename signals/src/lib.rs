@@ -53,6 +53,9 @@ pub mod porcelain;
 pub mod signal;
 mod value;
 
+#[cfg(feature = "reactive-graph")]
+pub mod reactive_graph;
+
 #[cfg(feature = "react")]
 pub mod react;
 
@@ -64,6 +67,9 @@ pub use context::*;
 pub use observer::*;
 pub use porcelain::*;
 pub use signal::*;
+
+#[cfg(feature = "reactive-graph")]
+pub use reactive_graph::*;
 
 #[cfg(feature = "react")]
 pub use react::*;

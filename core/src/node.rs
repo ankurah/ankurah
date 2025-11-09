@@ -279,7 +279,7 @@ where
         let request_id = proto::RequestId::new();
 
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
-        let auth = self.policy_agent.sign_request(self, cdata, &request);
+        let auth = self.policy_agent.sign_request(self, cdata, &request)?;
 
         // Get the peer connection
         let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
@@ -548,12 +548,29 @@ where
             let retriever = LocalRetriever::new(collection.clone());
             let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
 
-            // we have the entity, so we can check access, optionally atteste, and apply/save the event;
-            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity, &event.payload)? {
+            // Handle creates vs updates differently for policy validation
+            let (entity_before, entity_after, already_applied) = if event.payload.is_entity_create() && entity.head().is_empty() {
+                // Create: apply to entity directly, use as both before/after
+                entity.apply_event(&retriever, &event.payload).await?;
+                (entity.clone(), entity.clone(), true)
+            } else {
+                // Update: snapshot, apply to fork for validation
+                use std::sync::atomic::AtomicBool;
+                let trx_alive = Arc::new(AtomicBool::new(true));
+                let forked = entity.snapshot(trx_alive);
+                forked.apply_event(&retriever, &event.payload).await?;
+                (entity.clone(), forked, false)
+            };
+
+            // Check policy with before/after states
+            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity_before, &entity_after, &event.payload)? {
                 event.attestations.push(attestation);
             }
 
-            if entity.apply_event(&retriever, &event.payload).await? {
+            // For updates only: apply event to real entity (creates already applied above)
+            let applied = if already_applied { true } else { entity.apply_event(&retriever, &event.payload).await? };
+
+            if applied {
                 let state = entity.to_state()?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);

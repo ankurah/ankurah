@@ -59,6 +59,7 @@ into!(i64 => I64);
 into!(f64 => F64);
 into!(bool => Bool);
 into!(EntityId => EntityId);
+into!(Vec<u8> => Binary);
 
 impl<'a> Property for std::borrow::Cow<'a, str> {
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::String(self.to_string()))) }
