@@ -605,6 +605,7 @@ pub enum ErrorKind {
     UndefinedTable { table: String },
     UndefinedColumn { table: Option<String>, column: String },
     Unknown,
+    PostgresError(String),
 }
 
 pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
@@ -622,6 +623,7 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
     // error!("sql_code: {:?}", err.code());
     // error!("err: {:?}", err);
     // error!("err: {:?}", err.to_string());
+    debug!("postgres error: {:?}", err);
 
     let quote_indices = |s: &str| {
         let mut quotes = Vec::new();
@@ -637,25 +639,33 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
         Some(SqlState::UNDEFINED_TABLE) => {
             // relation "album" does not exist
             let quotes = quote_indices(&string);
-            let table = &string[quotes[0] + 1..quotes[1]];
-            ErrorKind::UndefinedTable { table: table.to_owned() }
+            if quotes.len() >= 2 {
+                let table = &string[quotes[0] + 1..quotes[1]];
+                ErrorKind::UndefinedTable { table: table.to_owned() }
+            } else {
+                ErrorKind::PostgresError(string.clone())
+            }
         }
         Some(SqlState::UNDEFINED_COLUMN) => {
             // Handle both formats:
             // "column "name" of relation "album" does not exist"
             // "column "status" does not exist"
             let quotes = quote_indices(&string);
-            let column = string[quotes[0] + 1..quotes[1]].to_owned();
+            if quotes.len() >= 2 {
+                let column = string[quotes[0] + 1..quotes[1]].to_owned();
 
-            let table = if quotes.len() >= 4 {
-                // Full format with table name
-                Some(string[quotes[2] + 1..quotes[3]].to_owned())
+                let table = if quotes.len() >= 4 {
+                    // Full format with table name
+                    Some(string[quotes[2] + 1..quotes[3]].to_owned())
+                } else {
+                    // Short format without table name
+                    None
+                };
+
+                ErrorKind::UndefinedColumn { table, column }
             } else {
-                // Short format without table name, use empty string
-                None
-            };
-
-            ErrorKind::UndefinedColumn { table, column }
+                ErrorKind::PostgresError(string.clone())
+            }
         }
         _ => ErrorKind::Unknown,
     }
