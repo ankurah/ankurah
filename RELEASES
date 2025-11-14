@@ -1,3 +1,4 @@
+0.7.0  PolicyAgent::check_event now receives entity_before and entity_after for state transition validation; PolicyAgent::sign_request returns Result for error propagation; WebsocketClient::new returns anyhow::Result. Added Leptos/reactive_graph integration foundation; Vec<u8> LWW support; Postgres::open convenience constructor
 0.6.8  Fix IndexedDB equality-prefix queries with ORDER BY; LiveQuery selection reactivity; transaction ordering; Web Locks fallback, JsValue signals and other ergonomics
 0.6.7  Fix concurrent server transaction commits: persist and notify with canonical entity to prevent head truncation and client divergence
 0.6.6  Fix query reconnect errors by making reactor.upsert_query idempotent; lazy gap fetcher creation; set loaded=false on selection updates
