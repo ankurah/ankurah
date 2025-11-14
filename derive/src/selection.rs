@@ -79,14 +79,14 @@ impl Parse for FetchInput {
     }
 }
 
-// Parse the subscribe macro input: subscribe!(ctx, callback, template, arg1, arg2, ...)
-struct SubscribeInput {
+// Parse the subscribe macro input: livequery!(ctx, callback, template, arg1, arg2, ...)
+struct LiveQueryInput {
     context: Expr,
     callback: Expr,
     predicate_input: SelectionInput,
 }
 
-impl Parse for SubscribeInput {
+impl Parse for LiveQueryInput {
     fn parse(input: ParseStream) -> Result<Self> {
         let context = input.parse::<Expr>()?;
         input.parse::<Token![,]>()?;
@@ -95,7 +95,7 @@ impl Parse for SubscribeInput {
 
         // Parse the rest as predicate input
         let predicate_input = if input.peek(syn::LitStr) {
-            // Quoted syntax: subscribe!(ctx, callback, "name = {}", value)
+            // Quoted syntax: livequery!(ctx, callback, "name = {}", value)
             let literal = input.parse::<syn::LitStr>()?;
             let mut args = Vec::new();
 
@@ -109,7 +109,7 @@ impl Parse for SubscribeInput {
 
             SelectionInput { template: literal.value(), args }
         } else {
-            // Unquoted syntax: subscribe!(ctx, callback, name = {name})
+            // Unquoted syntax: livequery!(ctx, callback, name = {name})
             let mut tokens = proc_macro2::TokenStream::new();
             while !input.is_empty() {
                 let token = input.parse::<proc_macro2::TokenTree>()?;
@@ -119,7 +119,7 @@ impl Parse for SubscribeInput {
             SelectionInput { template: tokens_to_template_string(&tokens), args: Vec::new() }
         };
 
-        Ok(SubscribeInput { context, callback, predicate_input })
+        Ok(LiveQueryInput { context, callback, predicate_input })
     }
 }
 
@@ -154,7 +154,7 @@ pub fn fetch_macro(input: TokenStream) -> TokenStream {
 
 /// Implementation function for the subscribe macro.
 pub fn subscribe_macro(input: TokenStream) -> TokenStream {
-    let SubscribeInput { context, callback, predicate_input } = parse_macro_input!(input as SubscribeInput);
+    let LiveQueryInput { context, callback, predicate_input } = parse_macro_input!(input as LiveQueryInput);
     let predicate_code = generate_selection_from_template(&predicate_input.template, &predicate_input.args);
 
     let expanded = quote! {
