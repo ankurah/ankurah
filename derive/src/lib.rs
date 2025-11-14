@@ -142,25 +142,25 @@ pub fn fetch(input: TokenStream) -> TokenStream { selection::fetch_macro(input) 
 /// **Unquoted form** - The most terse syntax. Supports inlined variable substitution:
 /// ```rust,ignore
 /// // Expand variables into comparisons of the same name. Equivalent to status = {status}
-/// let handle = subscribe!(ctx, callback, {status}).await?;
+/// let handle = livequery!(ctx, callback, {status}).await?;
 /// // Default comparison is equality but you can prefix with >, <, >=, <=, !=
-/// let handle = subscribe!(ctx, callback, {name} AND {>age}).await?;
+/// let handle = livequery!(ctx, callback, {name} AND {>age}).await?;
 /// // Equivalent to the above
-/// let handle = subscribe!(ctx, callback, {name} AND age > {age}).await?;
+/// let handle = livequery!(ctx, callback, {name} AND age > {age}).await?;
 /// // Equivalent to:
-/// let handle = ctx.subscribe(selection!({name} AND {>age}), callback).await?;
+/// let livequery = ctx.query(selection!({name} AND {>age}), callback).await?;
 /// ```
 ///
 /// **Quoted form** - Required for quoted string literals and positional arguments:
 /// ```rust,ignore
-/// let handle = subscribe!(ctx, callback, "status = 'active'").await?;              // Pure literals
-/// let handle = subscribe!(ctx, callback, "status = 'active' AND {name}").await?;   // Mixed: variable + literal
-/// let handle = subscribe!(ctx, callback, "status = 'active' AND {}", name).await?; // Equivalent to the above
+/// let handle = livequery!(ctx, callback, "status = 'active'").await?;              // Pure literals
+/// let handle = livequery!(ctx, callback, "status = 'active' AND {name}").await?;   // Mixed: variable + literal
+/// let handle = livequery!(ctx, callback, "status = 'active' AND {}", name).await?; // Equivalent to the above
 /// ```
 ///
 /// See [`ankurah_derive::selection!`] documentation for complete syntax details.
 #[proc_macro]
-pub fn subscribe(input: TokenStream) -> TokenStream { selection::subscribe_macro(input) }
+pub fn livequery(input: TokenStream) -> TokenStream { selection::subscribe_macro(input) }
 
 /// Generate WASM wrappers for all types marked as "provided" in the backend config
 ///
