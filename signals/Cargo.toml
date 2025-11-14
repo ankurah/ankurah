@@ -9,16 +9,16 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-default = ["tokio", "reactive-graph"]
-tokio   = ["dep:tokio"]
-wasm    = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures"]
-react   = ["wasm", "dep:send_wrapper"]
-jsvalue = ["wasm", "dep:send_wrapper"]
+default        = ["tokio", "reactive-graph"]
+tokio          = ["dep:tokio"]
+wasm           = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures"]
+react          = ["wasm", "dep:send_wrapper"]
+jsvalue        = ["wasm", "dep:send_wrapper"]
 reactive-graph = ["dep:reactive_graph"]
 
 [dependencies]
-tokio   = { version = "1.40", features = ["sync"], optional = true }
-tracing = "0.1"
+tokio          = { version = "1.40", features = ["sync"], optional = true }
+tracing        = "0.1"
 reactive_graph = { version = "0.2.9", optional = true }
 
 # WASM and React integration (optional)
