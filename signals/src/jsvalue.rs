@@ -1,4 +1,4 @@
-use crate::{Mut, Read};
+use crate::{Get, Mut, Peek, Read, porcelain::subscribe::DynSubscribe};
 use send_wrapper::SendWrapper;
 use wasm_bindgen::prelude::*;
 
@@ -6,7 +6,9 @@ use wasm_bindgen::prelude::*;
 pub struct JsValueMut(Mut<SendWrapper<JsValue>>);
 
 #[wasm_bindgen(skip_typescript)]
-pub struct JsValueRead(Read<SendWrapper<JsValue>>);
+pub struct JsValueRead(Box<dyn JsValueReadSignal>);
+
+trait JsValueReadSignal: Get<SendWrapper<JsValue>> + Peek<SendWrapper<JsValue>> + DynSubscribe<SendWrapper<JsValue>> + Send + Sync {}
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND: &'static str = r#"
@@ -52,7 +54,7 @@ impl JsValueMut {
     pub fn peek(&self) -> JsValue { self.0.value().take() }
 
     #[wasm_bindgen(skip_typescript)]
-    pub fn read(&self) -> JsValueRead { JsValueRead(self.0.read()) }
+    pub fn read(&self) -> JsValueRead { JsValueRead(Box::new(self.0.read())) }
 
     #[wasm_bindgen(skip_typescript)]
     pub fn subscribe(&self, listener: js_sys::Function) -> JsValue {
@@ -69,25 +71,30 @@ impl JsValueMut {
 #[wasm_bindgen]
 impl JsValueRead {
     #[wasm_bindgen(skip_typescript)]
-    pub fn get(&self) -> JsValue {
-        use crate::Get;
-        self.0.get().take()
-    }
+    pub fn get(&self) -> JsValue { Get::<SendWrapper<JsValue>>::get(&*self.0).take() }
 
     #[wasm_bindgen(skip_typescript)]
-    pub fn peek(&self) -> JsValue {
-        use crate::Peek;
-        self.0.peek().take()
-    }
+    pub fn peek(&self) -> JsValue { Peek::<SendWrapper<JsValue>>::peek(&*self.0).take() }
 
     #[wasm_bindgen(skip_typescript)]
     pub fn subscribe(&self, listener: js_sys::Function) -> JsValue {
-        use crate::Subscribe;
         let listener = SendWrapper::new(listener);
-        let guard = self.0.subscribe(move |value: SendWrapper<JsValue>| {
+        let guard = self.0.dyn_subscribe(Box::new(move |value: SendWrapper<JsValue>| {
             let _ = listener.call1(&JsValue::NULL, &value);
-        });
-        // Return the guard so it can be dropped to unsubscribe
+        }));
         JsValue::from(Box::into_raw(Box::new(guard)) as u32)
+    }
+}
+
+// Blanket impl for anything that implements the required traits
+impl<S> JsValueReadSignal for S where S: Get<SendWrapper<JsValue>> + Peek<SendWrapper<JsValue>> + DynSubscribe<SendWrapper<JsValue>> + Send + Sync
+{}
+
+impl<T> From<Read<T>> for JsValueRead
+where T: Clone + Into<JsValue> + Send + Sync + 'static
+{
+    fn from(read: Read<T>) -> Self {
+        let mapped = read.map(|value: &T| SendWrapper::new(value.clone().into()));
+        JsValueRead(Box::new(mapped))
     }
 }

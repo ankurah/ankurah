@@ -61,6 +61,28 @@ into!(bool => Bool);
 into!(EntityId => EntityId);
 into!(Vec<u8> => Binary);
 
+impl Property for serde_json::Value {
+    fn into_value(&self) -> Result<Option<Value>, PropertyError> {
+        let bytes = serde_json::to_vec(self).map_err(|err| PropertyError::SerializeError(Box::new(err)))?;
+        Ok(Some(Value::Object(bytes)))
+    }
+
+    fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
+        match value {
+            Some(Value::Object(bytes)) => serde_json::from_slice(&bytes).map_err(|err| PropertyError::DeserializeError(Box::new(err))),
+            Some(variant) => Err(PropertyError::InvalidVariant { given: variant, ty: "serde_json::Value".into() }),
+            None => Err(PropertyError::Missing),
+        }
+    }
+}
+
+impl From<serde_json::Value> for Value {
+    fn from(value: serde_json::Value) -> Self {
+        let bytes = serde_json::to_vec(&value).expect("serde_json::Value should serialize");
+        Value::Object(bytes)
+    }
+}
+
 impl<'a> Property for std::borrow::Cow<'a, str> {
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::String(self.to_string()))) }
 
