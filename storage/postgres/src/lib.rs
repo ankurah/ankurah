@@ -609,7 +609,7 @@ pub enum ErrorKind {
 }
 
 pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
-    let string = err.to_string().trim().to_owned();
+    let string = err.as_db_error().map(|e| e.message()).unwrap_or_default().trim().to_owned();
     let _db_error = err.as_db_error();
     let sql_code = err.code().cloned();
 
