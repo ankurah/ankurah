@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-storage-common"
-version       = "0.7.1"
+version       = "0.7.2"
 edition       = "2024"
 description   = "Ankurah storage engine common libraries"
 license       = "MIT OR Apache-2.0"
@@ -9,12 +9,12 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
-ankql         = { path = "../../ankql", version = "^0.7.1" }
-ankurah-core  = { path = "../../core", version = "^0.7.1" }
-ankurah-proto = { path = "../../proto", version = "^0.7.1" }
+ankql         = { path = "../../ankql", version = "^0.7.2" }
+ankurah-core  = { path = "../../core", version = "^0.7.2" }
+ankurah-proto = { path = "../../proto", version = "^0.7.2" }
 indexmap      = "2.0"
 serde         = { version = "1.0", features = ["derive"] }
 tracing       = { version = "0.1.40" }
 
 [dev-dependencies]
-ankurah-derive = { path = "../../derive", version = "^0.7.1" }
+ankurah-derive = { path = "../../derive", version = "^0.7.2" }
