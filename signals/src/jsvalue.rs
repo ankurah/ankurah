@@ -1,12 +1,13 @@
 use crate::{Get, Mut, Peek, Read, porcelain::subscribe::DynSubscribe};
 use send_wrapper::SendWrapper;
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(skip_typescript)]
 pub struct JsValueMut(Mut<SendWrapper<JsValue>>);
 
 #[wasm_bindgen(skip_typescript)]
-pub struct JsValueRead(Box<dyn JsValueReadSignal>);
+pub struct JsValueRead(Arc<dyn JsValueReadSignal>);
 
 trait JsValueReadSignal: Get<SendWrapper<JsValue>> + Peek<SendWrapper<JsValue>> + DynSubscribe<SendWrapper<JsValue>> + Send + Sync {}
 
@@ -54,7 +55,7 @@ impl JsValueMut {
     pub fn peek(&self) -> JsValue { self.0.value().take() }
 
     #[wasm_bindgen(skip_typescript)]
-    pub fn read(&self) -> JsValueRead { JsValueRead(Box::new(self.0.read())) }
+    pub fn read(&self) -> JsValueRead { JsValueRead(Arc::new(self.0.read())) }
 
     #[wasm_bindgen(skip_typescript)]
     pub fn subscribe(&self, listener: js_sys::Function) -> JsValue {
@@ -95,6 +96,10 @@ where T: Clone + Into<JsValue> + Send + Sync + 'static
 {
     fn from(read: Read<T>) -> Self {
         let mapped = read.map(|value: &T| SendWrapper::new(value.clone().into()));
-        JsValueRead(Box::new(mapped))
+        JsValueRead(Arc::new(mapped))
     }
+}
+
+impl Clone for JsValueRead {
+    fn clone(&self) -> Self { JsValueRead(self.0.clone()) }
 }
