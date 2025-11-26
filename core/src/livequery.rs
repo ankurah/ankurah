@@ -9,7 +9,7 @@ use ankurah_signals::{
     broadcast::BroadcastId,
     porcelain::subscribe::{IntoSubscribeListener, SubscriptionGuard},
     signal::{Listener, ListenerGuard},
-    Get, Mut, Peek, Read, Signal, Subscribe,
+    Get, Mut, Peek, Read, Signal, Subscribe, With,
 };
 use tracing::{debug, warn};
 
