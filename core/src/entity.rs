@@ -285,7 +285,7 @@ impl Entity {
             let apply = match crate::lineage::compare(getter, &new_head, &head, budget).await? {
                 lineage::Ordering::Equal => return Ok(false),
                 lineage::Ordering::Descends => true,
-                lineage::Ordering::NotDescends { meet } => return Ok(false),
+                lineage::Ordering::NotDescends { meet: _ } => return Ok(false),
                 lineage::Ordering::Incomparable => return Err(LineageError::Incomparable.into()),
                 lineage::Ordering::PartiallyDescends { meet } => return Err(LineageError::PartiallyDescends { meet }.into()),
                 lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {

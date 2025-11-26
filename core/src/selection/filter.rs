@@ -2,8 +2,7 @@
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
 use crate::value::Value;
-use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
-use base64::{engine::general_purpose, Engine as _};
+use ankql::ast::{ComparisonOperator, Expr, Identifier, Predicate};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
