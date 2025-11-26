@@ -7,7 +7,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
     let name = model.name();
     let view_name = model.view_name();
     // TODO - add this to the accessors
-    let active_field_visibility = model.active_field_visibility();
+    let _active_field_visibility = model.active_field_visibility();
     let active_field_names = model.active_field_names();
     let active_field_name_strs = model.active_field_name_strs();
     let active_field_types = match model.active_field_types() {

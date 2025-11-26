@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    error::{ApplyError, MutationError, RetrievalError},
+    error::{MutationError, RetrievalError},
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
     util::Iterable,

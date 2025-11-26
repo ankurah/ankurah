@@ -497,11 +497,11 @@ fn generate_literal_code_with_replacements(
             let ulid_u128 = ulid.0;
             quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::EntityId(::ulid::Ulid(#ulid_u128))) }
         }
-        ankql::ast::Literal::Object(items) => {
+        ankql::ast::Literal::Object(_items) => {
             todo!("Object literals");
             // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Object(#items)) }
         }
-        ankql::ast::Literal::Binary(items) => {
+        ankql::ast::Literal::Binary(_items) => {
             todo!("Binary literals");
             // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Binary(#items)) }
         }

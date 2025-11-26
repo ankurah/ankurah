@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{punctuated::Punctuated, AngleBracketedGenericArguments, Data, DeriveInput, Fields, Ident, Type, Visibility};
+use syn::{Data, DeriveInput, Fields, Ident, Type, Visibility};
 
 /// Encapsulates all the parsed information about a model and provides clean accessors
 pub struct ModelDescription {
