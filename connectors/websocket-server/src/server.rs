@@ -1,10 +1,12 @@
 use ankurah_core::storage::StorageEngine;
 use ankurah_proto as proto;
 use anyhow::Result;
-use axum::extract::State;
 use axum::{
-    extract::ws::{WebSocket, WebSocketUpgrade},
-    response::IntoResponse,
+    extract::{
+        ws::{WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -12,7 +14,7 @@ use axum_extra::{headers, TypedHeader};
 use bincode::deserialize;
 use futures_util::StreamExt;
 use std::net::IpAddr;
-use std::{net::SocketAddr, ops::ControlFlow};
+use std::{future::Future, net::SocketAddr, ops::ControlFlow, pin::Pin};
 use tower::ServiceBuilder;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 #[cfg(feature = "instrument")]
@@ -21,7 +23,7 @@ use tracing::{debug, error, info, warn, Level};
 
 use ankurah_core::{node::Node, policy::PolicyAgent};
 
-use crate::client_ip::SmartClientIp;
+use crate::{client_ip::SmartClientIp, OptionalUserAgent};
 
 use super::state::Connection;
 
@@ -39,6 +41,18 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub fn new(node: Node<SE, PA>) -> Self { Self { node: Some(node) } }
+
+    pub fn route_handler(
+        &self,
+    ) -> impl Clone + Send + 'static + Fn(WebSocketUpgrade, SmartClientIp, OptionalUserAgent) -> Pin<Box<dyn Future<Output = Response> + Send>>
+    {
+        let node = self.node.as_ref().expect("websocket server cannot produce a route after being run").clone();
+
+        move |ws: WebSocketUpgrade, SmartClientIp(client_ip): SmartClientIp, OptionalUserAgent(user_agent)| {
+            let node = node.clone();
+            Box::pin(async move { upgrade_connection(ws, client_ip, user_agent, node) })
+        }
+    }
 
     pub async fn run(&mut self, bind_address: &str) -> Result<()> {
         let Some(node) = self.node.take() else {
@@ -74,11 +88,22 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    let user_agent = user_agent.map(|TypedHeader(user_agent)| user_agent.to_string());
+    upgrade_connection(ws, client_ip, user_agent, node)
+}
+
+fn upgrade_connection<SE, PA>(ws: WebSocketUpgrade, client_ip: IpAddr, user_agent: Option<String>, node: Node<SE, PA>) -> Response
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     debug!("Websocket server upgrading connection");
-    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent { user_agent.to_string() } else { String::from("Unknown browser") };
+    let user_agent = format_user_agent(user_agent);
     debug!("`{user_agent}` at {client_ip} connected.");
     ws.on_upgrade(move |socket| handle_websocket(socket, client_ip, node))
 }
+
+fn format_user_agent(user_agent: Option<String>) -> String { user_agent.unwrap_or_else(|| String::from("Unknown browser")) }
 
 #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(client_ip = %client_ip)))]
 async fn handle_websocket<SE, PA>(socket: WebSocket, client_ip: IpAddr, node: Node<SE, PA>)
