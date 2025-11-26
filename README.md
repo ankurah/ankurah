@@ -7,7 +7,7 @@ Ankurah is a state-management framework that enables real-time data synchronizat
 
 It supports multiple storage and data type backends to enable no-compromise representation of your data.
 
-This project is in the early stages of development, and is not yet ready for production use.
+This project is beta status. It works, but be careful with production use.
 
 ## Key Features
 
@@ -80,7 +80,7 @@ client.system.wait_system_ready().await; // Wait for the client to join the serv
 let client = client.context(c)?;
 
 // Subscribe to changes on the client
-let _subscription = client.subscribe::<_,_,AlbumView>("name = 'Origin of Symmetry'", |changes| {
+let _subscription = client.query::<AlbumView>("name = 'Origin of Symmetry'", |changes| {
     println!("Received changes: {}", changes);
 }).await?;
 
