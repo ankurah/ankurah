@@ -369,25 +369,23 @@ impl StorageCollection for PostgresBucket {
         };
 
         debug!("PostgresBucket({}).get_state: {}", self.collection_id, query);
-        let row = match client.query_one(&query, &[&id]).await {
-            Ok(row) => row,
+        let rows = match client.query(&query, &[&id]).await {
+            Ok(rows) => rows,
             Err(err) => {
                 let kind = error_kind(&err);
-                match kind {
-                    ErrorKind::RowCount => {
+                if let ErrorKind::UndefinedTable { table } = kind {
+                    if table == self.state_table() {
+                        self.create_state_table(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
                         return Err(RetrievalError::EntityNotFound(id));
                     }
-                    ErrorKind::UndefinedTable { table } => {
-                        if table == self.state_table() {
-                            self.create_state_table(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
-                            return Err(RetrievalError::EntityNotFound(id));
-                        }
-                    }
-                    _ => {}
                 }
-
                 return Err(RetrievalError::StorageError(err.into()));
             }
+        };
+
+        let row = match rows.into_iter().next() {
+            Some(row) => row,
+            None => return Err(RetrievalError::EntityNotFound(id)),
         };
 
         debug!("PostgresBucket({}).get_state: Row: {:?}", self.collection_id, row);
@@ -613,7 +611,9 @@ pub fn error_kind(err: &tokio_postgres::Error) -> ErrorKind {
     let _db_error = err.as_db_error();
     let sql_code = err.code().cloned();
 
-    if string == "query returned an unexpected number of rows" {
+    // Check the error's Display string for RowCount errors (client-side, not db error)
+    let err_string = err.to_string();
+    if err_string.contains("query returned an unexpected number of rows") || string == "query returned an unexpected number of rows" {
         return ErrorKind::RowCount;
     }
 
