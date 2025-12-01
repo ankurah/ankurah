@@ -4,11 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [[bench]]
-name = "sprout_postgres_local"
-harness = false
-
-[[bench]]
-name = "sprout_sled_local"
+name = "single_node"
 harness = false
 
 [[bench]]
