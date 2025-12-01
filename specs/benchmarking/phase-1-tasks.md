@@ -1,4 +1,4 @@
-## Phase 1 Tasks — Cotyledon Benchmark Suite
+## Phase 1 Tasks — sprout Benchmark Suite
 
 ### 1. Harness & Interfaces
 
@@ -12,7 +12,7 @@
 - Support single-durable and durable+N-ephemeral layouts; ensure `N` is a runtime parameter.
 - Provide utilities for seeding datasets on durable nodes and synchronizing ephemerals before workloads begin.
 
-### 3. Cotyledon Workloads
+### 3. sprout Workloads
 
 - Create dataset builders (albums, pets, etc.) with scalable counts; expose knobs for entity volume.
 - Encode workload phases:
@@ -31,7 +31,7 @@
 
 ### 5. Reference Configurations & Docs
 
-- Wire Cotyledon benchmarks into `cargo bench`, ensuring each benchmark case registers as a named bench function.
+- Wire sprout benchmarks into `cargo bench`, ensuring each benchmark case registers as a named bench function.
 - Provide example invocation scripts/configs for sled-only and Postgres (with bb8 pool size parameter) baselines.
 - Document how to plug in alternative storage engines, policy agents, and connectors without editing the suite.
-- Add README snippets describing how to run Cotyledon locally and interpret the results.
+- Add README snippets describing how to run sprout locally and interpret the results.
