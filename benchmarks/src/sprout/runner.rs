@@ -1,6 +1,6 @@
 //! Topology orchestration and lifecycle management.
 
-use crate::sprout::{workloads, WorkloadConfig};
+use crate::sprout::{WorkloadConfig, workloads};
 use ankurah::Node;
 use ankurah_core::policy::PolicyAgent;
 use ankurah_core::storage::StorageEngine;

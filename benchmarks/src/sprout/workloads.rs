@@ -16,7 +16,7 @@ pub async fn seed_albums(ctx: &Context, count: usize) -> Result<()> {
 
 /// Performs sequential fetch rounds, querying all albums.
 pub async fn fetch_rounds(ctx: &Context, rounds: usize) -> Result<()> {
-    use ankurah::{signals::Peek, LiveQuery};
+    use ankurah::{LiveQuery, signals::Peek};
 
     for _ in 0..rounds {
         let predicate = ankql::parser::parse_selection("year > '1999'").unwrap();
@@ -29,7 +29,7 @@ pub async fn fetch_rounds(ctx: &Context, rounds: usize) -> Result<()> {
 
 /// Performs concurrent mutations on existing albums.
 pub async fn concurrent_mutations(ctx: &Context, concurrency: usize) -> Result<()> {
-    use ankurah::{signals::Peek, LiveQuery};
+    use ankurah::{LiveQuery, signals::Peek};
 
     let predicate = ankql::parser::parse_selection("year > '1999'").unwrap();
     let query: LiveQuery<AlbumView> = ctx.query_wait::<AlbumView>(predicate).await?;
@@ -57,7 +57,7 @@ pub async fn concurrent_mutations(ctx: &Context, concurrency: usize) -> Result<(
 
 /// Performs subscription churn cycles, measuring notification latency.
 pub async fn subscription_churn(ctx: &Context, cycles: usize) -> Result<()> {
-    use ankurah::{signals::Subscribe, LiveQuery};
+    use ankurah::{LiveQuery, signals::Subscribe};
 
     for _ in 0..cycles {
         let watcher = BenchWatcher::new();
@@ -79,7 +79,7 @@ pub async fn subscription_churn(ctx: &Context, cycles: usize) -> Result<()> {
 
 /// Performs ORDER BY + LIMIT queries to exercise gap filling.
 pub async fn limit_gap_queries(ctx: &Context, rounds: usize) -> Result<()> {
-    use ankurah::{signals::Peek, LiveQuery};
+    use ankurah::{LiveQuery, signals::Peek};
 
     for _ in 0..rounds {
         let predicate = ankql::parser::parse_selection("year > '1999' ORDER BY year LIMIT 10").unwrap();

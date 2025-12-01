@@ -19,33 +19,30 @@ pub mod postgres {
     }
 
     /// Clears all tables from the Postgres database using raw SQL.
-    pub fn clear_database(connection_string: &str) -> Result<()> {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            let (client, connection) = tokio_postgres::connect(connection_string, tokio_postgres::NoTls).await?;
+    pub async fn clear_database(connection_string: &str) -> Result<()> {
+        let (client, connection) = tokio_postgres::connect(connection_string, tokio_postgres::NoTls).await?;
 
-            // Spawn connection handler
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    eprintln!("connection error: {}", e);
-                }
-            });
+        // Spawn connection handler
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("connection error: {}", e);
+            }
+        });
 
-            // Drop all tables in the public schema
-            client
-                .batch_execute(
-                    "DO $$ DECLARE
-                    r RECORD;
-                BEGIN
-                    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
-                        EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
-                    END LOOP;
-                END $$;",
-                )
-                .await?;
+        // Drop all tables in the public schema
+        client
+            .batch_execute(
+                "DO $$ DECLARE
+                r RECORD;
+            BEGIN
+                FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
+                    EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
+                END LOOP;
+            END $$;",
+            )
+            .await?;
 
-            Ok(())
-        })
+        Ok(())
     }
 
     /// Creates a Postgres storage engine from a connection string.

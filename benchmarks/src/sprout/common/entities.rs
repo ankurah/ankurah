@@ -19,18 +19,13 @@ pub struct Pet {
 
 impl Album {
     /// Creates a new album with the given index for dataset seeding.
-    pub fn with_index(index: usize) -> Self {
-        Self { name: format!("Album {}", index), year: format!("{}", 2000 + (index % 25)) }
-    }
+    pub fn with_index(index: usize) -> Self { Self { name: format!("Album {}", index), year: format!("{}", 2000 + (index % 25)) } }
 }
 
 impl Pet {
     /// Creates a new pet with the given index for dataset seeding.
-    pub fn with_index(index: usize) -> Self {
-        Self { name: format!("Pet {}", index), age: format!("{}", index % 20) }
-    }
+    pub fn with_index(index: usize) -> Self { Self { name: format!("Pet {}", index), age: format!("{}", index % 20) } }
 }
 
 // Re-export the generated View types (they are generated in the same module by the Model macro)
 pub use self::{AlbumView, PetView};
-

@@ -2,7 +2,7 @@
 //!
 //! NOTE: Currently disabled until single-node case is fully working.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn postgres_websocket_placeholder(c: &mut Criterion) {
     c.bench_function("postgres_websocket_placeholder", |b| {

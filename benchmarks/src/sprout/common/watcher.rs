@@ -3,8 +3,8 @@
 use ankurah::signals::broadcast::{BroadcastListener, IntoBroadcastListener};
 use ankurah::signals::subscribe::IntoSubscribeListener;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::Notify;
 
@@ -18,7 +18,11 @@ pub struct BenchWatcher<T> {
 
 impl<T> BenchWatcher<T> {
     pub fn new() -> Self {
-        Self { notification_count: Arc::new(AtomicUsize::new(0)), changes: Arc::new(Mutex::new(Vec::new())), notify: Arc::new(Notify::new()) }
+        Self {
+            notification_count: Arc::new(AtomicUsize::new(0)),
+            changes: Arc::new(Mutex::new(Vec::new())),
+            notify: Arc::new(Notify::new()),
+        }
     }
 
     /// Returns the total number of notifications received.
@@ -67,4 +71,3 @@ impl<T: Send + 'static> IntoSubscribeListener<T> for &BenchWatcher<T> {
 impl<T> Default for BenchWatcher<T> {
     fn default() -> Self { Self::new() }
 }
-

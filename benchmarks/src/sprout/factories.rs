@@ -45,8 +45,8 @@ mod tests {
     use super::*;
     use ankurah::PermissiveAgent;
     use ankurah_storage_sled::SledStorageEngine;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockNodeFactory {
         call_count: Arc<AtomicUsize>,
