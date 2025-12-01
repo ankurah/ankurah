@@ -32,6 +32,14 @@
    - Integrate Cotyledon with `cargo bench`, exposing each benchmark case as a named bench function that orchestrates its scenario and prints metrics.
    - Ship reference configs (e.g., sled local baseline, postgres pooled baseline) that `cargo bench` can call into, plus helper scripts for CI (eventually via `github-action-benchmark`).
 
+### Implementation Decisions
+
+- **Crate layout**: Cotyledon ships as a dedicated library crate under `lib/cotyledon`; benchmark entry points live in `benches/` so `cargo bench -p cotyledon` can execute discrete cases.
+- **Shared fixtures**: The suite owns its own `common` module (entities, watchers, dataset builders) so it does not depend on `tests/tests`.
+- **Reference cases**: Phase 1 includes two topologies per workload—durable node on Postgres plus ephemeral node on Sled—duplicated across LocalProcess and WebSocket connectors.
+- **Output contract**: Benchmarks emit the default `cargo bench` output for now; `github-action-benchmark` JSON lands in a follow-up phase.
+- **Configuration knobs**: Workload knobs (node counts, concurrency, dataset sizes, predicate mixes) are exposed by the suite but fixed per benchmark case so each bench run documents its chosen parameters.
+
 ### Phase Outlook
 
 - **Phase 1 (Cotyledon implementation)**: build the harness, parameter plumbing, scenarios, and reporting for local/manual usage.
