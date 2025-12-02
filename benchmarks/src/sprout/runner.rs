@@ -1,10 +1,10 @@
 //! Topology orchestration and lifecycle management.
 
 use crate::sprout::{WorkloadConfig, workloads};
-use ankurah::Node;
+use ankurah::{Context, Node};
 use ankurah_core::policy::PolicyAgent;
 use ankurah_core::storage::StorageEngine;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::future::Future;
 
 /// Orchestrates benchmark workload execution.
@@ -17,6 +17,7 @@ where
     Fut: Future<Output = Result<Node<SE, PA>>> + Send + 'static,
 {
     config: WorkloadConfig<SE, PA, F, Fut>,
+    prepared_contexts: Vec<Context>,
 }
 
 impl<SE, PA, F, Fut> Runner<SE, PA, F, Fut>
@@ -28,33 +29,48 @@ where
     Fut: Future<Output = Result<Node<SE, PA>>> + Send + 'static,
 {
     /// Creates a new runner with the given workload configuration.
-    pub fn new(config: WorkloadConfig<SE, PA, F, Fut>) -> Self { Self { config } }
+    pub fn new(config: WorkloadConfig<SE, PA, F, Fut>) -> Self { Self { config, prepared_contexts: Vec::new() } }
 
-    /// Executes the complete benchmark workload.
-    pub async fn run(&self) -> Result<()> {
-        // Create the durable node
-        let node = (self.config.durable_node_factory)(0).await?;
+    /// Prepares the requested number of durable nodes and stores their contexts internally.
+    pub async fn setup(&mut self, node_count: usize) -> Result<()> {
+        self.prepared_contexts.clear();
 
-        // Initialize the system
-        node.system.create().await?;
+        for index in 0..node_count {
+            let node = (self.config.durable_node_factory)(index).await?;
+            node.system.create().await?;
+            let ctx = node.context(self.config.context_data.clone())?;
+            self.prepared_contexts.push(ctx);
+        }
 
-        // Get a context for the workload
-        let ctx = node.context(self.config.context_data.clone())?;
+        Ok(())
+    }
 
-        // Phase 1: Seed dataset
-        workloads::seed_albums(&ctx, self.config.seed_entity_count).await?;
+    /// Runs the workload on all prepared contexts sequentially.
+    pub async fn execute(&self) -> Result<()> {
+        if self.prepared_contexts.is_empty() {
+            return Err(anyhow!("Runner::execute called before setup"));
+        }
 
-        // Phase 2: Fetch rounds
-        workloads::fetch_rounds(&ctx, self.config.fetch_rounds).await?;
+        for ctx in &self.prepared_contexts {
+            self.execute_for_context(ctx).await?;
+        }
 
-        // Phase 3: Limit/gap queries
-        workloads::limit_gap_queries(&ctx, self.config.fetch_rounds).await?;
+        Ok(())
+    }
 
-        // Phase 4: Concurrent mutations
-        workloads::concurrent_mutations(&ctx, self.config.concurrency).await?;
+    async fn execute_for_context(&self, ctx: &Context) -> Result<()> {
+        workloads::seed_albums(ctx, self.config.seed_entity_count).await?;
+        workloads::seed_artists(ctx, self.config.seed_entity_count).await?;
 
-        // Phase 5: Subscription churn
-        workloads::subscription_churn(&ctx, self.config.subscription_churn_cycles).await?;
+        workloads::workload_readonly_fetch(ctx, self.config.fetch_rounds).await?;
+
+        workloads::limit_gap_queries(ctx, self.config.fetch_rounds).await?;
+
+        // workloads::concurrent_mutations(ctx, self.config.concurrency).await?;
+
+        workloads::subscription_churn(ctx, self.config.subscription_churn_cycles).await?;
+
+        workloads::subscribe_rounds(ctx, self.config.subscription_churn_cycles).await?;
 
         Ok(())
     }

@@ -24,7 +24,7 @@ where
     /// Context data to use for all operations
     pub context_data: PA::ContextData,
 
-    /// Number of entities to seed before running workload phases
+    /// Number of entities to seed in the database
     pub seed_entity_count: usize,
 
     /// Concurrency level for concurrent mutation operations
@@ -32,6 +32,9 @@ where
 
     /// Number of sequential fetch rounds to execute
     pub fetch_rounds: usize,
+
+    /// Limit applied to read-heavy fetch workloads to bound result volumes
+    pub fetch_limit: usize,
 
     /// Number of subscription setup/teardown cycles to measure notification latency
     pub subscription_churn_cycles: usize,
@@ -51,9 +54,10 @@ where
             durable_node_factory,
             ephemeral_node_factory: None,
             context_data,
-            seed_entity_count: 100,
+            seed_entity_count: 1000,
             concurrency: 4,
             fetch_rounds: 10,
+            fetch_limit: 100,
             subscription_churn_cycles: 5,
         }
     }
@@ -74,6 +78,7 @@ where
     seed_entity_count: usize,
     concurrency: usize,
     fetch_rounds: usize,
+    fetch_limit: usize,
     subscription_churn_cycles: usize,
 }
 
@@ -105,6 +110,11 @@ where
         self
     }
 
+    pub fn fetch_limit(mut self, limit: usize) -> Self {
+        self.fetch_limit = limit.max(1);
+        self
+    }
+
     pub fn subscription_churn_cycles(mut self, cycles: usize) -> Self {
         self.subscription_churn_cycles = cycles;
         self
@@ -118,6 +128,7 @@ where
             seed_entity_count: self.seed_entity_count,
             concurrency: self.concurrency,
             fetch_rounds: self.fetch_rounds,
+            fetch_limit: self.fetch_limit,
             subscription_churn_cycles: self.subscription_churn_cycles,
         }
     }

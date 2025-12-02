@@ -40,9 +40,10 @@ fn postgres_single_node(c: &mut Criterion) {
                 .subscription_churn_cycles(5)
                 .build();
 
-                let runner = Runner::new(config);
+                let mut runner = Runner::new(config);
+                runner.setup(1).await.unwrap();
                 let start = Instant::now();
-                runner.run().await.unwrap();
+                runner.execute().await.unwrap();
                 total += start.elapsed();
             }
 
@@ -72,9 +73,10 @@ fn sled_single_node(c: &mut Criterion) {
                 .subscription_churn_cycles(5)
                 .build();
 
-                let runner = Runner::new(config);
+                let mut runner = Runner::new(config);
+                runner.setup(1).await.unwrap();
                 let start = Instant::now();
-                runner.run().await.unwrap();
+                runner.execute().await.unwrap();
                 total += start.elapsed();
             }
 

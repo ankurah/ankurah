@@ -10,7 +10,7 @@ pub mod instrumentation;
 pub mod runner;
 pub mod workloads;
 
-pub use common::{Album, BenchWatcher, Pet};
+pub use common::{Album, Artist, BenchWatcher};
 pub use config::{WorkloadConfig, WorkloadConfigBuilder};
 pub use instrumentation::Report;
 pub use runner::Runner;
