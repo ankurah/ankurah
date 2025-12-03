@@ -37,6 +37,9 @@ pub(crate) struct ClientInner {
     pending_ready_wakers: RefCell<Vec<Waker>>,
 }
 
+// FIXME2: ready_or_error that ignores certain types of errors, but bails on others.
+// should we add an error signal?
+
 /// Client provides a primary handle to speak to the server
 impl WebsocketClient {
     pub fn new<SE, PA>(node: Node<SE, PA>, server_url: &str) -> anyhow::Result<WebsocketClient>
