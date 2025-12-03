@@ -45,8 +45,9 @@ pub mod client;
 pub mod sender;
 
 // Re-export the main types for easy use
-pub use client::{ConnectionState, WebsocketClient};
+pub use client::{ConnectionState, WebsocketClient, WebsocketClientBuilder};
 pub use sender::WebsocketPeerSender;
 
 // Re-export common types for convenience
+pub use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 pub use tokio_tungstenite::tungstenite::Error as TungsteniteError;

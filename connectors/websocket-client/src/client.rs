@@ -14,8 +14,62 @@ use std::{
 use strum::Display;
 use thiserror::Error;
 use tokio::{select, sync::Notify, task::JoinHandle, time::sleep};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async_tls_with_config,
+    tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message},
+    Connector,
+};
 use tracing::{debug, error, info, warn};
+
+/// Builder for configuring and creating a WebSocket client
+pub struct WebsocketClientBuilder<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    node: Node<SE, PA>,
+    server_url: String,
+    config: Option<WebSocketConfig>,
+    disable_nagle: bool,
+    connector: Option<Connector>,
+}
+
+impl<SE, PA> WebsocketClientBuilder<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    /// Set WebSocket protocol configuration
+    pub fn config(mut self, config: WebSocketConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Disable Nagle's algorithm (enable TCP_NODELAY)
+    pub fn disable_nagle(mut self) -> Self {
+        self.disable_nagle = true;
+        self
+    }
+
+    /// Use a custom TLS connector
+    pub fn connector(mut self, connector: Connector) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+
+    /// Skip TLS certificate verification (insecure, use only for development)
+    pub fn insecure(mut self) -> Self {
+        let tls =
+            native_tls::TlsConnector::builder().danger_accept_invalid_certs(true).build().expect("Failed to build insecure TLS connector");
+        self.connector = Some(Connector::NativeTls(tls));
+        self
+    }
+
+    /// Build and start the WebSocket client
+    pub async fn build(self) -> anyhow::Result<WebsocketClient<SE, PA>> {
+        WebsocketClient::create(self.node, &self.server_url, self.config, self.disable_nagle, self.connector).await
+    }
+}
 
 /// Connection state for the websocket client
 #[derive(Debug, Clone, PartialEq, Display)]
@@ -50,6 +104,9 @@ where
 {
     node: Node<SE, PA>,
     server_url: String,
+    config: Option<WebSocketConfig>,
+    disable_nagle: bool,
+    connector: Option<Connector>,
     connection_state: Mut<ConnectionState>,
     connected: AtomicBool,
     shutdown: Notify,
@@ -73,12 +130,30 @@ where
 {
     /// Create a new WebSocket client and start connecting to the server
     pub async fn new(node: Node<SE, PA>, server_url: &str) -> anyhow::Result<Self> {
+        Self::create(node, server_url, None, false, None).await
+    }
+
+    /// Create a builder for configuring the WebSocket client
+    pub fn builder(node: Node<SE, PA>, server_url: &str) -> WebsocketClientBuilder<SE, PA> {
+        WebsocketClientBuilder { node, server_url: server_url.to_string(), config: None, disable_nagle: false, connector: None }
+    }
+
+    async fn create(
+        node: Node<SE, PA>,
+        server_url: &str,
+        config: Option<WebSocketConfig>,
+        disable_nagle: bool,
+        connector: Option<Connector>,
+    ) -> anyhow::Result<Self> {
         let ws_url = Self::normalize_url(server_url);
         info!("Creating WebSocket client for {}", ws_url);
 
         let inner = Arc::new(Inner {
             node,
             server_url: ws_url,
+            config,
+            disable_nagle,
+            connector,
             connection_state: Mut::new(ConnectionState::Disconnected),
             connected: AtomicBool::new(false),
             shutdown: Notify::new(),
@@ -190,7 +265,8 @@ where
         info!("Attempting to connect to {}", inner.server_url);
         inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
 
-        let (ws_stream, _) = connect_async(inner.server_url.as_str()).await?;
+        let request = inner.server_url.as_str().into_client_request()?;
+        let (ws_stream, _) = connect_async_tls_with_config(request, inner.config, inner.disable_nagle, inner.connector.clone()).await?;
         info!("WebSocket handshake completed with {}", inner.server_url);
 
         let (mut sink, mut stream) = ws_stream.split();
