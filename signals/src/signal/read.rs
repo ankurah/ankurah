@@ -5,7 +5,7 @@ use crate::{
     broadcast::Broadcast,
     context::CurrentObserver,
     porcelain::{Subscribe, SubscriptionGuard, subscribe::IntoSubscribeListener},
-    signal::{Get, GetReadCell, Listener, ListenerGuard, Signal, With, map::Map},
+    signal::{Get, GetReadCell, Listener, ListenerGuard, Signal, With, map::Map, memo::Memo},
     value::{ReadValueCell, ValueCell},
 };
 
@@ -33,6 +33,17 @@ impl<T> Read<T> {
         Output: 'static,
     {
         Map::new(self.clone(), transform)
+    }
+
+    /// Create a memoized mapped signal - caches output until upstream changes.
+    /// Unlike `map`, returns the same output value on repeated reads until invalidated.
+    pub fn memo<Output, Transform>(&self, transform: Transform) -> Memo<Self, T, Output, Transform>
+    where
+        T: 'static,
+        Transform: Fn(&T) -> Output,
+        Output: Send + Sync + 'static,
+    {
+        Memo::new(self.clone(), transform)
     }
 }
 

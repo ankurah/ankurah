@@ -1,7 +1,7 @@
 use ankurah_signals::*;
 mod common;
 use common::watcher;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
@@ -274,4 +274,92 @@ async fn test_read_map_convenience_method() {
     // Should receive transformed values
     assert_eq!(receiver1.recv().unwrap(), 100); // 50 * 2
     assert_eq!(receiver2.recv().unwrap(), "Number: 50");
+}
+
+#[tokio::test]
+async fn test_memo_caches_value() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mutable = Mut::new(10);
+    let transform_count = Arc::new(AtomicUsize::new(0));
+
+    let count_clone = transform_count.clone();
+    let memo = mutable.read().memo(move |x| {
+        count_clone.fetch_add(1, Ordering::SeqCst);
+        *x * 2
+    });
+
+    // First access computes the value
+    assert_eq!(memo.get(), 20);
+    assert_eq!(transform_count.load(Ordering::SeqCst), 1);
+
+    // Subsequent accesses return cached value without recomputing
+    assert_eq!(memo.get(), 20);
+    assert_eq!(memo.get(), 20);
+    assert_eq!(transform_count.load(Ordering::SeqCst), 1); // Still 1
+}
+
+#[tokio::test]
+async fn test_memo_invalidates_on_change() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mutable = Mut::new(10);
+    let transform_count = Arc::new(AtomicUsize::new(0));
+
+    let count_clone = transform_count.clone();
+    let memo = mutable.read().memo(move |x| {
+        count_clone.fetch_add(1, Ordering::SeqCst);
+        *x * 2
+    });
+
+    // First access
+    assert_eq!(memo.get(), 20);
+    assert_eq!(transform_count.load(Ordering::SeqCst), 1);
+
+    // Change upstream - cache should be invalidated
+    mutable.set(15);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Next access recomputes
+    assert_eq!(memo.get(), 30);
+    assert_eq!(transform_count.load(Ordering::SeqCst), 2);
+
+    // Subsequent accesses return cached value
+    assert_eq!(memo.get(), 30);
+    assert_eq!(transform_count.load(Ordering::SeqCst), 2); // Still 2
+}
+
+#[tokio::test]
+async fn test_memo_subscription() {
+    let mutable = Mut::new(5);
+    let memo = mutable.read().memo(|x| format!("Value: {}", x));
+
+    let (sender, receiver) = mpsc::channel();
+    let _handle = memo.subscribe(sender);
+
+    mutable.set(10);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    mutable.set(15);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    assert_eq!(receiver.recv().unwrap(), "Value: 10");
+    assert_eq!(receiver.recv().unwrap(), "Value: 15");
+}
+
+#[tokio::test]
+async fn test_memo_with_does_not_require_clone() {
+    // This test verifies With works without Clone on Output
+    struct NonClone(i32);
+
+    let mutable = Mut::new(10);
+    let memo = mutable.read().memo(|x| NonClone(*x * 2));
+
+    // with() should work without Clone
+    memo.with(|val| assert_eq!(val.0, 20));
+
+    mutable.set(15);
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    memo.with(|val| assert_eq!(val.0, 30));
 }

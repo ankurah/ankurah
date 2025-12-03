@@ -95,8 +95,11 @@ impl<T> From<Read<T>> for JsValueRead
 where T: Clone + Into<JsValue> + Send + Sync + 'static
 {
     fn from(read: Read<T>) -> Self {
-        let mapped = read.map(|value: &T| SendWrapper::new(value.clone().into()));
-        JsValueRead(Arc::new(mapped))
+        // Use memo instead of map - caches the JsValue until upstream changes.
+        // This ensures the same JsValue reference is returned on repeated reads,
+        // which is important for React dependency tracking (useMemo, useEffect, etc.)
+        let memoized = read.memo(|value: &T| SendWrapper::new(value.clone().into()));
+        JsValueRead(Arc::new(memoized))
     }
 }
 
