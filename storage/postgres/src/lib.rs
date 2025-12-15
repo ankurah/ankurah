@@ -1,6 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{hash_map::DefaultHasher, BTreeMap},
+    hash::{Hash, Hasher},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use ankurah_core::{
@@ -23,6 +25,13 @@ use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use tokio_postgres::{error::SqlState, types::ToSql};
 use tracing::{debug, error, info, warn};
 
+/// Default connection pool size for `Postgres::open()`.
+/// Production applications should configure their own pool via `Postgres::new()`.
+pub const DEFAULT_POOL_SIZE: u32 = 15;
+
+/// Default connection timeout in seconds
+pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
+
 pub struct Postgres {
     pool: bb8::Pool<PostgresConnectionManager<NoTls>>,
 }
@@ -32,7 +41,11 @@ impl Postgres {
 
     pub async fn open(uri: &str) -> anyhow::Result<Self> {
         let manager = PostgresConnectionManager::new_from_stringlike(uri, NoTls)?;
-        let pool = bb8::Pool::builder().build(manager).await?;
+        let pool = bb8::Pool::builder()
+            .max_size(DEFAULT_POOL_SIZE)
+            .connection_timeout(Duration::from_secs(DEFAULT_CONNECTION_TIMEOUT_SECS))
+            .build(manager)
+            .await?;
         Self::new(pool)
     }
 
@@ -50,6 +63,34 @@ impl Postgres {
 
         true
     }
+}
+
+/// Compute advisory lock key from a string identifier
+fn advisory_lock_key(identifier: &str) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    identifier.hash(&mut hasher);
+    hasher.finish() as i64
+}
+
+/// Acquire a PostgreSQL advisory lock for DDL operations on a collection
+async fn acquire_ddl_lock(client: &tokio_postgres::Client, collection_id: &str) -> Result<i64, StateError> {
+    let lock_key = advisory_lock_key(&format!("ankurah_ddl:{}", collection_id));
+    debug!("Acquiring advisory lock {} for collection {}", lock_key, collection_id);
+    client.execute("SELECT pg_advisory_lock($1)", &[&lock_key]).await.map_err(|err| {
+        error!("Failed to acquire advisory lock for {}: {:?}", collection_id, err);
+        StateError::DDLError(Box::new(err))
+    })?;
+    Ok(lock_key)
+}
+
+/// Release a PostgreSQL advisory lock
+async fn release_ddl_lock(client: &tokio_postgres::Client, lock_key: i64) -> Result<(), StateError> {
+    debug!("Releasing advisory lock {}", lock_key);
+    client.execute("SELECT pg_advisory_unlock($1)", &[&lock_key]).await.map_err(|err| {
+        error!("Failed to release advisory lock {}: {:?}", lock_key, err);
+        StateError::DDLError(Box::new(err))
+    })?;
+    Ok(())
 }
 
 #[async_trait]
@@ -74,11 +115,22 @@ impl StorageEngine for Postgres {
             columns: Arc::new(RwLock::new(Vec::new())),
         };
 
-        // Create tables if they don't exist
-        bucket.create_state_table(&mut client).await?;
-        bucket.create_event_table(&mut client).await?;
-        bucket.rebuild_columns_cache(&mut client).await?;
+        // Acquire advisory lock to serialize DDL operations for this collection
+        let lock_key = acquire_ddl_lock(&client, collection_id.as_str()).await?;
 
+        // Create tables if they don't exist (protected by advisory lock)
+        let result = async {
+            bucket.create_state_table(&mut client).await?;
+            bucket.create_event_table(&mut client).await?;
+            bucket.rebuild_columns_cache(&mut client).await?;
+            Ok::<_, StateError>(())
+        }
+        .await;
+
+        // Always release the lock, even if DDL failed
+        release_ddl_lock(&client, lock_key).await?;
+
+        result?;
         Ok(Arc::new(bucket))
     }
 
@@ -205,7 +257,12 @@ impl PostgresBucket {
         match client.execute(&create_query, &[]).await {
             Ok(_) => Ok(()),
             Err(err) => {
-                error!("Error: {}", err);
+                // Log full error details for debugging
+                if let Some(db_err) = err.as_db_error() {
+                    error!("PostgresBucket({}).create_state_table error: {} (code: {:?})", self.collection_id, db_err, db_err.code());
+                } else {
+                    error!("PostgresBucket({}).create_state_table error: {:?}", self.collection_id, err);
+                }
                 Err(StateError::DDLError(Box::new(err)))
             }
         }
@@ -216,23 +273,52 @@ impl PostgresBucket {
         client: &mut tokio_postgres::Client,
         missing: Vec<(String, &'static str)>, // column name, datatype
     ) -> Result<(), StateError> {
-        for (column, datatype) in missing {
-            if Postgres::sane_name(&column) {
-                let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.state_table(), column, datatype,);
-                info!("PostgresBucket({}).add_missing_columns: {}", self.collection_id, alter_query);
-                match client.execute(&alter_query, &[]).await {
-                    Ok(_) => {}
-                    Err(err) => {
-                        warn!("Error adding column: {} to table: {} - rebuilding columns cache", err, self.state_table());
-                        self.rebuild_columns_cache(client).await?;
-                        return Err(StateError::DDLError(Box::new(err)));
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // Acquire advisory lock to serialize DDL operations for this collection
+        let lock_key = acquire_ddl_lock(client, self.collection_id.as_str()).await?;
+
+        let result = async {
+            // Re-check columns after acquiring lock (another session may have added them)
+            self.rebuild_columns_cache(client).await?;
+
+            for (column, datatype) in missing {
+                if Postgres::sane_name(&column) && !self.has_column(&column) {
+                    let alter_query = format!(r#"ALTER TABLE "{}" ADD COLUMN "{}" {}"#, self.state_table(), column, datatype);
+                    info!("PostgresBucket({}).add_missing_columns: {}", self.collection_id, alter_query);
+                    match client.execute(&alter_query, &[]).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            // Log full error details for debugging
+                            if let Some(db_err) = err.as_db_error() {
+                                warn!(
+                                    "Error adding column {} to table {}: {} (code: {:?})",
+                                    column,
+                                    self.state_table(),
+                                    db_err,
+                                    db_err.code()
+                                );
+                            } else {
+                                warn!("Error adding column {} to table {}: {:?}", column, self.state_table(), err);
+                            }
+                            self.rebuild_columns_cache(client).await?;
+                            return Err(StateError::DDLError(Box::new(err)));
+                        }
                     }
                 }
             }
-        }
 
-        self.rebuild_columns_cache(client).await?;
-        Ok(())
+            self.rebuild_columns_cache(client).await?;
+            Ok(())
+        }
+        .await;
+
+        // Always release the lock
+        release_ddl_lock(client, lock_key).await?;
+
+        result
     }
 }
 
