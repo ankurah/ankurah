@@ -1,6 +1,6 @@
 [package]
 name    = "ankurah-tests"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 publish = false
 
@@ -11,15 +11,15 @@ postgres = ["ankurah-storage-postgres", "tokio-postgres", "bb8", "bb8-postgres"]
 [dependencies]
 anyhow                          = "1.0"
 tracing                         = "0.1"
-ankql                           = { path = "../ankql", version = "^0.7.4" }
-ankurah                         = { path = "../ankurah", features = ["derive", "instrument"], version = "^0.7.4" }
-ankurah-storage-sled            = { path = "../storage/sled", version = "^0.7.4" }
-ankurah-connector-local-process = { path = "../connectors/local-process", version = "^0.7.4" }
-ankurah-websocket-client        = { path = "../connectors/websocket-client", version = "^0.7.4" }
-ankurah-websocket-server        = { path = "../connectors/websocket-server", version = "^0.7.4" }
-ankurah-storage-common          = { path = "../storage/common", version = "^0.7.4" }
+ankql                           = { path = "../ankql", version = "^0.7.5" }
+ankurah                         = { path = "../ankurah", features = ["derive", "instrument"], version = "^0.7.5" }
+ankurah-storage-sled            = { path = "../storage/sled", version = "^0.7.5" }
+ankurah-connector-local-process = { path = "../connectors/local-process", version = "^0.7.5" }
+ankurah-websocket-client        = { path = "../connectors/websocket-client", version = "^0.7.5" }
+ankurah-websocket-server        = { path = "../connectors/websocket-server", version = "^0.7.5" }
+ankurah-storage-common          = { path = "../storage/common", version = "^0.7.5" }
 tokio-postgres                  = { version = "0.7", optional = true }
-ankurah-storage-postgres        = { path = "../storage/postgres", optional = true, version = "^0.7.4" }
+ankurah-storage-postgres        = { path = "../storage/postgres", optional = true, version = "^0.7.5" }
 bb8                             = { version = "0.9", optional = true }
 bb8-postgres                    = { version = "0.9", optional = true }
 tokio                           = { version = "1.40", features = ["full"] }
