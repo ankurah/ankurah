@@ -417,18 +417,21 @@ impl StorageCollection for PostgresBucket {
         );
 
         debug!("PostgresBucket({}).set_state: {}", self.collection_id, query);
-        let row = match client.query_one(&query, params.as_slice()).await {
-            Ok(row) => row,
-            Err(err) => {
-                let kind = error_kind(&err);
-                if let ErrorKind::UndefinedTable { table } = kind {
-                    if table == self.state_table() {
-                        self.create_state_table(&mut client).await?;
-                        return self.set_state(state).await; // retry
+        let mut created_table = false;
+        let row = loop {
+            match client.query_one(&query, params.as_slice()).await {
+                Ok(row) => break row,
+                Err(err) => {
+                    let kind = error_kind(&err);
+                    if let ErrorKind::UndefinedTable { table } = kind {
+                        if table == self.state_table() && !created_table {
+                            self.create_state_table(&mut client).await?;
+                            created_table = true;
+                            continue; // retry exactly once
+                        }
                     }
+                    return Err(StateError::DDLError(Box::new(err)).into());
                 }
-
-                return Err(StateError::DDLError(Box::new(err)).into());
             }
         };
 
@@ -500,12 +503,37 @@ impl StorageCollection for PostgresBucket {
 
     async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         debug!("fetch_states: {:?}", selection);
-        let client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
+        let mut client = self.pool.get().await.map_err(|err| RetrievalError::StorageError(Box::new(err)))?;
+
+        // Pre-filter selection based on cached schema to avoid undefined column errors.
+        // If we see columns not in our cache, refresh it first (they might have been added).
+        // TODO: Once property metadata is in the system catalog, we can create missing columns
+        // on-demand here instead of refreshing the cache each time we see unknown columns.
+        let referenced = selection.referenced_columns();
+        let cached = self.existing_columns();
+        let unknown_to_cache: Vec<&String> = referenced.iter().filter(|col| !cached.contains(col)).collect();
+
+        // Refresh cache if we see columns we haven't seen before
+        if !unknown_to_cache.is_empty() {
+            debug!("PostgresBucket({}).fetch_states: Unknown columns {:?}, refreshing schema cache", self.collection_id, unknown_to_cache);
+            self.rebuild_columns_cache(&mut client).await.map_err(|e| RetrievalError::StorageError(e.into()))?;
+        }
+
+        // Now check with (possibly refreshed) cache - columns still missing truly don't exist
+        let existing = self.existing_columns();
+        let missing: Vec<String> = referenced.into_iter().filter(|col| !existing.contains(col)).collect();
+
+        let effective_selection = if missing.is_empty() {
+            selection.clone()
+        } else {
+            debug!("PostgresBucket({}).fetch_states: Columns {:?} don't exist, treating as NULL", self.collection_id, missing);
+            selection.assume_null(&missing)
+        };
 
         let mut results = Vec::new();
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "attestations"]);
         builder.table_name(self.state_table());
-        builder.selection(selection)?;
+        builder.selection(&effective_selection)?;
 
         let (sql, args) = builder.build()?;
         debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, sql, args);
@@ -514,23 +542,12 @@ impl StorageCollection for PostgresBucket {
             Ok(stream) => stream,
             Err(err) => {
                 let kind = error_kind(&err);
-                match kind {
-                    ErrorKind::UndefinedTable { table } => {
-                        if table == self.state_table() {
-                            // Table doesn't exist yet, return empty results
-                            return Ok(Vec::new());
-                        }
+                if let ErrorKind::UndefinedTable { table } = kind {
+                    if table == self.state_table() {
+                        // Table doesn't exist yet, return empty results
+                        return Ok(Vec::new());
                     }
-                    ErrorKind::UndefinedColumn { table, column } => {
-                        // this means we didn't write the column yet, which suggests that all values are null
-                        // So we can recompute the predicate to treat this column as always NULL and retry
-                        debug!("Undefined column: {} in table: {:?}, {}", column, table, self.state_table());
-                        let new_selection = selection.assume_null(&[column]);
-                        return self.fetch_states(&new_selection).await;
-                    }
-                    _ => {}
                 }
-
                 return Err(RetrievalError::StorageError(err.into()));
             }
         };
@@ -573,29 +590,34 @@ impl StorageCollection for PostgresBucket {
 
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
         debug!("PostgresBucket({}).add_event: {}", self.collection_id, query);
-        let affected = match client
-            .execute(
-                &query,
-                &[&entity_event.payload.id(), &entity_event.payload.entity_id, &operations, &entity_event.payload.parent, &attestations],
-            )
-            .await
-        {
-            Ok(affected) => affected,
-            Err(err) => {
-                let kind = error_kind(&err);
-                match kind {
-                    ErrorKind::UndefinedTable { table } => {
-                        if table == self.event_table() {
+        let mut created_table = false;
+        let affected = loop {
+            match client
+                .execute(
+                    &query,
+                    &[
+                        &entity_event.payload.id(),
+                        &entity_event.payload.entity_id,
+                        &operations,
+                        &entity_event.payload.parent,
+                        &attestations,
+                    ],
+                )
+                .await
+            {
+                Ok(affected) => break affected,
+                Err(err) => {
+                    let kind = error_kind(&err);
+                    if let ErrorKind::UndefinedTable { table } = kind {
+                        if table == self.event_table() && !created_table {
                             self.create_event_table(&mut client).await?;
-                            return self.add_event(entity_event).await; // retry
+                            created_table = true;
+                            continue; // retry exactly once
                         }
                     }
-                    _ => {
-                        error!("PostgresBucket({}).add_event: Error: {:?}", self.collection_id, err);
-                    }
+                    error!("PostgresBucket({}).add_event: Error: {:?}", self.collection_id, err);
+                    return Err(StateError::DMLError(Box::new(err)).into());
                 }
-
-                return Err(StateError::DMLError(Box::new(err)).into());
             }
         };
 
