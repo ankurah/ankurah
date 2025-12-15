@@ -115,8 +115,43 @@ impl std::fmt::Display for Predicate {
 }
 
 impl Selection {
+    /// Transform the selection to assume the given columns are NULL.
+    /// This filters out ORDER BY items that reference missing columns.
     pub fn assume_null(&self, columns: &[String]) -> Self {
-        Self { predicate: self.predicate.assume_null(columns), order_by: self.order_by.clone(), limit: self.limit }
+        let order_by = self.order_by.as_ref().map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    let col_name = match &item.identifier {
+                        Identifier::Property(name) => name,
+                        Identifier::CollectionProperty(_, name) => name,
+                    };
+                    !columns.contains(col_name)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        // If all ORDER BY items were filtered out, set to None
+        let order_by = order_by.and_then(|v| if v.is_empty() { None } else { Some(v) });
+
+        Self { predicate: self.predicate.assume_null(columns), order_by, limit: self.limit }
+    }
+
+    /// Collect all column names referenced in this selection (WHERE + ORDER BY)
+    pub fn referenced_columns(&self) -> Vec<String> {
+        let mut columns = self.predicate.referenced_columns();
+        if let Some(order_by) = &self.order_by {
+            for item in order_by {
+                let col = match &item.identifier {
+                    Identifier::Property(name) => name.clone(),
+                    Identifier::CollectionProperty(_, name) => name.clone(),
+                };
+                if !columns.contains(&col) {
+                    columns.push(col);
+                }
+            }
+        }
+        columns
     }
 }
 
@@ -133,6 +168,40 @@ impl Predicate {
             Predicate::Not(inner) => inner.walk(accumulator, visitor),
             _ => accumulator,
         }
+    }
+
+    /// Collect all column names referenced in this predicate
+    pub fn referenced_columns(&self) -> Vec<String> {
+        self.walk(Vec::new(), &mut |mut cols, pred| {
+            match pred {
+                Predicate::Comparison { left, right, .. } => {
+                    for expr in [&**left, &**right] {
+                        if let Expr::Identifier(id) = expr {
+                            let col = match id {
+                                Identifier::Property(name) => name.clone(),
+                                Identifier::CollectionProperty(_, name) => name.clone(),
+                            };
+                            if !cols.contains(&col) {
+                                cols.push(col);
+                            }
+                        }
+                    }
+                }
+                Predicate::IsNull(expr) => {
+                    if let Expr::Identifier(id) = &**expr {
+                        let col = match id {
+                            Identifier::Property(name) => name.clone(),
+                            Identifier::CollectionProperty(_, name) => name.clone(),
+                        };
+                        if !cols.contains(&col) {
+                            cols.push(col);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            cols
+        })
     }
 
     /// Clones the predicate tree and evaluates comparisons involving missing columns as if they were NULL
