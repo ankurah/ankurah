@@ -160,4 +160,3 @@ async fn test_jsonb_path_extraction_with_comparison() -> Result<()> {
 
     Ok(())
 }
-

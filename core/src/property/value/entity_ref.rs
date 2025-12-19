@@ -41,19 +41,13 @@ pub struct Ref<T> {
 
 impl<T> Ref<T> {
     /// Create a new Ref from an EntityId.
-    pub fn new(id: EntityId) -> Self {
-        Ref { id, _phantom: PhantomData }
-    }
+    pub fn new(id: EntityId) -> Self { Ref { id, _phantom: PhantomData } }
 
     /// Get the underlying EntityId.
-    pub fn id(&self) -> EntityId {
-        self.id.clone()
-    }
+    pub fn id(&self) -> EntityId { self.id.clone() }
 
     /// Get the underlying EntityId as a reference.
-    pub fn id_ref(&self) -> &EntityId {
-        &self.id
-    }
+    pub fn id_ref(&self) -> &EntityId { &self.id }
 }
 
 impl<T: Model> Ref<T> {
@@ -64,33 +58,23 @@ impl<T: Model> Ref<T> {
     /// let album: AlbumView = ctx.get(album_id).await?;
     /// let artist: ArtistView = album.artist().get(&ctx).await?;
     /// ```
-    pub async fn get(&self, ctx: &Context) -> Result<T::View, RetrievalError> {
-        ctx.get::<T::View>(self.id.clone()).await
-    }
+    pub async fn get(&self, ctx: &Context) -> Result<T::View, RetrievalError> { ctx.get::<T::View>(self.id.clone()).await }
 }
 
 impl<T> From<EntityId> for Ref<T> {
-    fn from(id: EntityId) -> Self {
-        Ref::new(id)
-    }
+    fn from(id: EntityId) -> Self { Ref::new(id) }
 }
 
 impl<T> From<Ref<T>> for EntityId {
-    fn from(r: Ref<T>) -> Self {
-        r.id
-    }
+    fn from(r: Ref<T>) -> Self { r.id }
 }
 
 impl<T> From<&Ref<T>> for EntityId {
-    fn from(r: &Ref<T>) -> Self {
-        r.id.clone()
-    }
+    fn from(r: &Ref<T>) -> Self { r.id.clone() }
 }
 
 impl<T> Property for Ref<T> {
-    fn into_value(&self) -> Result<Option<Value>, PropertyError> {
-        Ok(Some(Value::EntityId(self.id.clone())))
-    }
+    fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::EntityId(self.id.clone()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
         match value {
@@ -188,4 +172,3 @@ mod tests {
         assert!(matches!(result, Err(PropertyError::InvalidVariant { .. })));
     }
 }
-
