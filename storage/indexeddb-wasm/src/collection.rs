@@ -467,10 +467,7 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
             // Set field directly on entity object (no prefix - they become the primary fields)
             // Use IdbValue encoding to ensure fields are IndexedDB-key-compatible (bool as 0/1, etc.)
             let js_value = match value {
-                Some(ref prop_value) => {
-                    let js_val: JsValue = crate::idb_value::IdbValue::from(prop_value).into();
-                    js_val
-                }
+                Some(ref prop_value) => crate::idb_value::IdbValue::from(prop_value).into(),
                 None => JsValue::NULL,
             };
             entity_obj.set(&field_name, js_value)?;
