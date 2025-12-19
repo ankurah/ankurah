@@ -92,9 +92,15 @@ impl From<IdbValue> for JsValue {
             Value::String(s) => JsValue::from_str(&s),
             Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
             Value::Binary(bytes) | Value::Object(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
-            // Json is stored as a parsed JS object to enable IndexedDB's native nested property indexing
+            // Json is stored as a parsed JS object to enable IndexedDB's native nested property indexing.
+            // IMPORTANT: We must use serialize_maps_as_objects(true) to create plain JS objects,
+            // not ES2015 Maps. IndexedDB keyPath traversal only works with plain objects.
             Value::Json(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(json) => serde_wasm_bindgen::to_value(&json).unwrap_or_else(|_| JsValue::NULL),
+                Ok(json) => {
+                    use serde::Serialize;
+                    let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+                    json.serialize(&serializer).unwrap_or(JsValue::NULL)
+                }
                 Err(_) => JsValue::NULL,
             },
         }
