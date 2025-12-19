@@ -626,6 +626,7 @@ mod tests {
         let key_spec = KeySpec {
             keyparts: vec![IndexKeyPart {
                 column: "name".to_string(),
+                sub_path: None,
                 direction: IndexDirection::Asc,
                 nulls: Some(NullsOrder::Last),
                 collation: None,

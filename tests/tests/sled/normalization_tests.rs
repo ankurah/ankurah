@@ -16,6 +16,7 @@ fn equality_bounds_use_prefix_guard_for_multi_key() -> Result<(), IndexError> {
         keyparts: vec![
             IndexKeyPart {
                 column: "name".to_string(),
+                sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::String,
                 nulls: None,
@@ -23,6 +24,7 @@ fn equality_bounds_use_prefix_guard_for_multi_key() -> Result<(), IndexError> {
             },
             IndexKeyPart {
                 column: "age".to_string(),
+                sub_path: None,
                 direction: IndexDirection::Asc,
                 value_type: ValueType::I32,
                 nulls: None,
@@ -52,6 +54,7 @@ fn equality_bounds_use_tight_range_for_single_key() -> Result<(), IndexError> {
     let key_spec = KeySpec {
         keyparts: vec![IndexKeyPart {
             column: "name".to_string(),
+            sub_path: None,
             direction: IndexDirection::Asc,
             value_type: ValueType::String,
             nulls: None,
@@ -80,6 +83,7 @@ fn inequality_bounds_handle_desc_correctly() -> Result<(), IndexError> {
     let key_spec = KeySpec {
         keyparts: vec![IndexKeyPart {
             column: "age".to_string(),
+            sub_path: None,
             direction: IndexDirection::Desc,
             value_type: ValueType::I32,
             nulls: None,
