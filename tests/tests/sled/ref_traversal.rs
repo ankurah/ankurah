@@ -15,10 +15,11 @@ pub struct RefTestArtist {
     pub name: String,
 }
 
+// Note: No #[active_type(LWW)] needed - Ref<T> defaults to LWW backend
 #[derive(Model, Debug, Serialize, Deserialize, Clone)]
 pub struct RefTestAlbum {
     pub name: String,
-    pub artist: Ref<RefTestArtist>,
+    pub artist: Ref<RefTestArtist>,  // LWW backend selected automatically
 }
 
 async fn setup_context() -> Result<ankurah::Context> {
