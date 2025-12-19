@@ -1,15 +1,13 @@
 use crate::error::sled_error;
 use ankurah_core::error::RetrievalError;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct PropertyManager(Arc<Inner>);
 
 struct Inner {
     property_config_tree: sled::Tree,
-    properties: RwLock<HashMap<String, u32>>,
     next_property_id: AtomicU32,
 }
 
@@ -26,26 +24,40 @@ impl PropertyManager {
             }
         }
 
-        Ok(Self(Arc::new(Inner {
-            property_config_tree,
-            properties: RwLock::new(HashMap::new()),
-            next_property_id: AtomicU32::new(max_property_id + 1),
-        })))
+        Ok(Self(Arc::new(Inner { property_config_tree, next_property_id: AtomicU32::new(max_property_id + 1) })))
     }
 
-    /// Gets or creates a property ID for the given property name
+    /// Gets or creates a property ID for the given property name.
+    /// Uses compare_and_swap for atomic insert-if-absent to avoid race conditions.
     pub fn get_property_id(&self, name: &str) -> Result<u32, RetrievalError> {
-        // TASK: Race condition in PropertyManager::get_property_id can cause index corruption https://github.com/ankurah/ankurah/issues/149
-        match self.0.property_config_tree.get(name.as_bytes()).map_err(sled_error)? {
-            Some(ivec) => {
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&ivec);
-                Ok(u32::from_be_bytes(arr))
-            }
-            None => {
-                let new_id = self.0.next_property_id.fetch_add(1, Ordering::Relaxed);
-                self.0.property_config_tree.insert(name.as_bytes(), &new_id.to_be_bytes()).map_err(sled_error)?;
-                Ok(new_id)
+        // Fast path: check if already exists
+        if let Some(ivec) = self.0.property_config_tree.get(name.as_bytes()).map_err(sled_error)? {
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(&ivec);
+            return Ok(u32::from_be_bytes(arr));
+        }
+
+        // Slow path: try to insert atomically
+        loop {
+            let new_id = self.0.next_property_id.fetch_add(1, Ordering::Relaxed);
+            let new_id_bytes = new_id.to_be_bytes();
+
+            // Atomically insert only if key doesn't exist (expected = None)
+            match self.0.property_config_tree.compare_and_swap(name.as_bytes(), None::<&[u8]>, Some(&new_id_bytes[..])) {
+                Ok(Ok(())) => {
+                    // Successfully inserted our new ID
+                    return Ok(new_id);
+                }
+                Ok(Err(cas_error)) => {
+                    // Another thread inserted first - use their value
+                    let existing = cas_error.current.expect("CAS failed but no current value");
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&existing);
+                    return Ok(u32::from_be_bytes(arr));
+                }
+                Err(e) => {
+                    return Err(sled_error(e));
+                }
             }
         }
     }
