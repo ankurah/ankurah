@@ -178,3 +178,60 @@ pub async fn test_json_path_combined_with_regular_field() -> Result<(), anyhow::
     IndexedDBStorageEngine::cleanup(&db_name).await?;
     Ok(())
 }
+
+/// Test that entities with missing JSON paths are correctly excluded
+#[wasm_bindgen_test]
+pub async fn test_json_path_missing_field() -> Result<(), anyhow::Error> {
+    let (ctx, db_name) = setup_track_context().await?;
+
+    // Create tracks with different JSON structures
+    create_tracks(
+        &ctx,
+        vec![
+            ("Has Territory", serde_json::json!({"territory": "US"})),
+            ("No Territory", serde_json::json!({"other": "value"})), // Missing territory field
+        ],
+    )
+    .await?;
+
+    // Query should only find the track that HAS the territory field
+    let results: Vec<TrackView> = ctx.fetch("licensing.territory = 'US'").await?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name().unwrap(), "Has Territory");
+
+    // Cleanup
+    IndexedDBStorageEngine::cleanup(&db_name).await?;
+    Ok(())
+}
+
+/// Verify planner generates correct sub_path for JSON queries
+/// This is a sync test that verifies the planner behavior
+#[wasm_bindgen_test]
+pub fn test_json_path_planner_generates_sub_path() {
+    use ankurah_storage_common::planner::{Planner, PlannerConfig};
+    use ankurah_storage_common::Plan;
+
+    let planner = Planner::new(PlannerConfig::indexeddb());
+    let selection = ankql::parser::parse_selection("licensing.territory = 'US'").expect("parse selection");
+    let plans = planner.plan(&selection, "id");
+
+    // Find the index plan
+    let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. }));
+    assert!(index_plan.is_some(), "Should generate an index plan for JSON path query");
+
+    if let Some(Plan::Index { index_spec, remaining_predicate, .. }) = index_plan {
+        // Verify keypart has sub_path
+        assert!(!index_spec.keyparts.is_empty(), "Should have at least one keypart");
+        let keypart = &index_spec.keyparts[0];
+        assert_eq!(keypart.column, "licensing", "Column should be 'licensing'");
+        assert_eq!(keypart.sub_path, Some(vec!["territory".to_string()]), "sub_path should be ['territory']");
+        assert_eq!(keypart.full_path(), "licensing.territory", "full_path should be 'licensing.territory'");
+
+        // Verify full pushdown (remaining predicate should be True)
+        assert!(
+            matches!(remaining_predicate, ankql::ast::Predicate::True),
+            "JSON path equality should be fully pushed down, got: {:?}",
+            remaining_predicate
+        );
+    }
+}
