@@ -148,7 +148,7 @@ pub use ankurah_core::{
     model::{Model, Mutable},
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
-    property::{self, Property},
+    property::{self, Property, Ref},
     resultset::ResultSet,
     storage, transaction, value,
     value::{Value, ValueType},
