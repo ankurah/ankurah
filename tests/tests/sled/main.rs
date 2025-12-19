@@ -7,3 +7,4 @@ mod index_creation;
 mod json_property;
 mod normalization_tests;
 mod pagination;
+mod ref_traversal;
