@@ -77,16 +77,16 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
                         let name = &remaining[0];
                         return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
                     }
-                    // collection.property.nested... - get property and traverse JSON
+                    // collection.property.nested... - get property and traverse sub-path
                     let property_name = &remaining[0];
-                    let json_path = &remaining[1..];
-                    return evaluate_json_path(item, property_name, json_path);
+                    let sub_path = &remaining[1..];
+                    return evaluate_sub_path(item, property_name, sub_path);
                 }
 
-                // Not a collection qualifier - treat first step as property, rest as JSON path
+                // Not a collection qualifier - treat first step as property, rest as sub-path
                 let property_name = first;
-                let json_path: Vec<&str> = path.steps[1..].iter().map(|s| s.as_str()).collect();
-                evaluate_json_path(item, property_name, &json_path)
+                let sub_path: Vec<&str> = path.steps[1..].iter().map(|s| s.as_str()).collect();
+                evaluate_sub_path(item, property_name, &sub_path)
             }
         }
         Expr::ExprList(exprs) => {
@@ -100,64 +100,21 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
     }
 }
 
-/// Evaluate a JSON path traversal: get property value, parse as JSON, walk path
-fn evaluate_json_path<I: Filterable>(item: &I, property_name: &str, json_path: &[impl AsRef<str>]) -> Result<ExprOutput<Value>, Error> {
+/// Evaluate a sub-path traversal: get property value, extract nested value at path
+/// Delegates to Value::extract_at_path for the actual traversal.
+fn evaluate_sub_path<I: Filterable>(item: &I, property_name: &str, sub_path: &[impl AsRef<str>]) -> Result<ExprOutput<Value>, Error> {
     let property_value = item.value(property_name).ok_or_else(|| Error::PropertyNotFound(property_name.to_string()))?;
 
-    // The property must be Json or Binary (serialized JSON)
-    let json_bytes = match property_value {
-        Value::Json(bytes) | Value::Binary(bytes) => bytes,
-        _ => {
-            // Not a JSON property - can't traverse into it
-            return Err(Error::PropertyNotFound(format!(
-                "Cannot traverse into non-JSON property '{}' (path: {}.{})",
-                property_name,
-                property_name,
-                json_path.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(".")
-            )));
-        }
-    };
+    // Convert sub_path to Vec<String> for extract_at_path
+    let path: Vec<String> = sub_path.iter().map(|s| s.as_ref().to_string()).collect();
 
-    // Parse JSON
-    let json_value: serde_json::Value = serde_json::from_slice(&json_bytes)
-        .map_err(|e| Error::PropertyNotFound(format!("Failed to parse JSON in property '{}': {}", property_name, e)))?;
-
-    // Walk the JSON path
-    let mut current = &json_value;
-    for step in json_path {
-        current = current.get(step.as_ref()).ok_or_else(|| {
-            Error::PropertyNotFound(format!(
-                "JSON path '{}' not found in property '{}'",
-                json_path.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join("."),
-                property_name
-            ))
-        })?;
-    }
-
-    // Convert JSON value to our Value type
-    Ok(ExprOutput::Value(json_to_value(current)))
-}
-
-/// Convert a serde_json::Value to our Value type
-fn json_to_value(json: &serde_json::Value) -> Value {
-    match json {
-        serde_json::Value::Null => Value::String("null".to_string()), // Represent null as string for now
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::I64(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::F64(f)
-            } else {
-                Value::String(n.to_string())
-            }
-        }
-        serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            // For nested structures, serialize back to JSON bytes
-            Value::Binary(serde_json::to_vec(json).unwrap_or_default())
-        }
-    }
+    property_value.extract_at_path(&path).map(ExprOutput::Value).ok_or_else(|| {
+        Error::PropertyNotFound(format!(
+            "Sub-path '{}' not found in property '{}'",
+            sub_path.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join("."),
+            property_name
+        ))
+    })
 }
 
 /// Compare two values with automatic casting (for regular schema-typed fields).

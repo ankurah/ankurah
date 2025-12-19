@@ -61,14 +61,14 @@ impl Value {
     /// Extract value at a sub-path within structured data.
     /// Returns None if the path doesn't exist (missing - distinct from null).
     /// For empty path, returns self unchanged.
-    /// Currently supports Json; other types return None for non-empty paths.
+    /// Supports Json, Binary, and String (permissive for backward compat).
     pub fn extract_at_path(&self, path: &[String]) -> Option<Value> {
         if path.is_empty() {
             return Some(self.clone());
         }
 
         match self {
-            Value::Json(bytes) => {
+            Value::Json(bytes) | Value::Binary(bytes) => {
                 let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
                 let mut current = &json;
                 for key in path {
@@ -76,7 +76,14 @@ impl Value {
                 }
                 Some(json_value_to_value(current))
             }
-            // Future: other structured types (Ref, Object, etc.)
+            Value::String(s) => {
+                let json: serde_json::Value = serde_json::from_str(s).ok()?;
+                let mut current = &json;
+                for key in path {
+                    current = current.get(key)?;
+                }
+                Some(json_value_to_value(current))
+            }
             _ => None,
         }
     }
@@ -98,9 +105,7 @@ fn json_value_to_value(json: &serde_json::Value) -> Value {
         }
         serde_json::Value::String(s) => Value::String(s.clone()),
         // Arrays and objects remain as Json
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            Value::Json(serde_json::to_vec(json).unwrap_or_default())
-        }
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Json(serde_json::to_vec(json).unwrap_or_default()),
     }
 }
 
