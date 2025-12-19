@@ -93,12 +93,10 @@ impl From<IdbValue> for JsValue {
             Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
             Value::Binary(bytes) | Value::Object(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
             // Json is stored as a parsed JS object to enable IndexedDB's native nested property indexing
-            Value::Json(bytes) => {
-                match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    Ok(json) => serde_wasm_bindgen::to_value(&json).unwrap_or_else(|_| JsValue::NULL),
-                    Err(_) => JsValue::NULL,
-                }
-            }
+            Value::Json(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(json) => serde_wasm_bindgen::to_value(&json).unwrap_or_else(|_| JsValue::NULL),
+                Err(_) => JsValue::NULL,
+            },
         }
     }
 }

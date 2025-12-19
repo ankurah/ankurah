@@ -19,7 +19,7 @@ pub struct RefTestArtist {
 #[derive(Model, Debug, Serialize, Deserialize, Clone)]
 pub struct RefTestAlbum {
     pub name: String,
-    pub artist: Ref<RefTestArtist>,  // LWW backend selected automatically
+    pub artist: Ref<RefTestArtist>, // LWW backend selected automatically
 }
 
 async fn setup_context() -> Result<ankurah::Context> {
@@ -45,12 +45,7 @@ async fn test_ref_basic_creation() -> Result<()> {
     // Create an album referencing the artist
     let album_id = {
         let trx = ctx.begin();
-        let album = trx
-            .create(&RefTestAlbum {
-                name: "OK Computer".to_string(),
-                artist: Ref::new(artist_id.clone()),
-            })
-            .await?;
+        let album = trx.create(&RefTestAlbum { name: "OK Computer".to_string(), artist: Ref::new(artist_id.clone()) }).await?;
         let id = album.id();
         trx.commit().await?;
         id
@@ -80,12 +75,7 @@ async fn test_ref_get_traversal() -> Result<()> {
     // Create an album referencing the artist
     let album_id = {
         let trx = ctx.begin();
-        let album = trx
-            .create(&RefTestAlbum {
-                name: "Origin of Symmetry".to_string(),
-                artist: Ref::new(artist_id.clone()),
-            })
-            .await?;
+        let album = trx.create(&RefTestAlbum { name: "Origin of Symmetry".to_string(), artist: Ref::new(artist_id.clone()) }).await?;
         let id = album.id();
         trx.commit().await?;
         id
@@ -131,4 +121,3 @@ async fn test_ref_serialization() -> Result<()> {
 
     Ok(())
 }
-
