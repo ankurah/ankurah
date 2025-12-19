@@ -1,3 +1,4 @@
+0.7.8  Ref<T> typed entity references with ergonomic traits (Deref, Copy, Borrow, AsRef, Display, TryFrom); Option<Ref<T>> WASM bindings; From<Ref<T>> for ankql::ast::Expr; IndexedDB JSON serialization fix (use plain objects not ES2015 Maps); Sled PropertyManager race condition fix
 0.7.7  Json property type with dot-path query support; Value helpers (json(), parse_as_json(), parse_as_string()); EntityId FromStr/Into<String>
 0.7.6  Fix assume_null to filter ORDER BY columns referencing missing columns, preventing retry loops
 0.7.5  Fix concurrent DDL race conditions with PostgreSQL advisory locks; improved postgres error logging
@@ -11,7 +12,7 @@
 0.6.6  Fix query reconnect errors by making reactor.upsert_query idempotent; lazy gap fetcher creation; set loaded=false on selection updates
 0.6.5  Increase lineage budget to 100 and apply optimistically when exhausted; refactor Entity TOCTOU handling; fix postgres add_event idempotency
 0.6.4  Fix IndexedDB range scanning and residual predicate bug affecting integers/bools
-0.6.3  Fix LiveQuery::Signal to fire on entity changes, not just membership changes 
+0.6.3  Fix LiveQuery::Signal to fire on entity changes, not just membership changes
 0.6.2  Conditional compilation bugfix
 0.6.1  Misc bugfixes
 0.6.0  Subscription deltas with known_matches and event bridges
@@ -20,26 +21,26 @@
 0.5.2  Handle exceptions from react hooks, restore react feature flag differentiation vs wasm flag, revert erroneous edit to react extern binding
 0.5.1  Fix subscription caching bug where stale locally-cached records were included in re-subscriptions
 0.5.0  Event retrieval bugfixes, improved ID serialization, NodeAndContext reorganization
-0.4.7  
-0.4.6  
-0.4.5  
-0.4.4  
-0.4.3  
-0.4.2  
-0.4.1  
-0.4.0  
-0.3.5  
-0.3.4  
-0.3.3  
-0.3.2  
-0.3.1  
-0.3.0  
-0.2.2  
-0.2.1  
-0.2.0  
-0.1.5  
-0.1.4  
-0.1.3  
-0.1.2  
-0.1.1  
+0.4.7
+0.4.6
+0.4.5
+0.4.4
+0.4.3
+0.4.2
+0.4.1
+0.4.0
+0.3.5
+0.3.4
+0.3.3
+0.3.2
+0.3.1
+0.3.0
+0.2.2
+0.2.1
+0.2.0
+0.1.5
+0.1.4
+0.1.3
+0.1.2
+0.1.1
 0.1.0
