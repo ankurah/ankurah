@@ -14,7 +14,7 @@ This plan prioritizes delivering **Json property + structured queries** as the f
 | **1d** | PostgreSQL JSONB pushdown + predicate splitting | 1c | ✅ Complete |
 | **1e** | JSON-aware type casting (numeric-only) | 1c | ✅ Complete |
 | **1f** | JSON path index pushdown (Sled/IndexedDB) | 1c | ✅ Complete |
-| **2a** | `Ref<T>` typed entity reference | 1 | ✅ Complete |
+| **2a** | `Ref<T>` typed entity reference | 1 | 🚧 In Progress (WASM wrappers pending) |
 | **2b** | Ref traversal in queries | 2a | Pending |
 | 3 | Full schema registry / PropertyId | 2 | Pending |
 | 4 | Inbound navigation, traversal filters | 2, 3 | Pending |
@@ -102,7 +102,7 @@ See: `phase-1f-index-pushdown.md`
 
 ---
 
-### Phase 2a: `Ref<T>` Typed Entity Reference ✅ COMPLETE
+### Phase 2a: `Ref<T>` Typed Entity Reference 🚧 IN PROGRESS
 
 **Deliverable**: Type-safe entity references with programmatic traversal
 
@@ -113,24 +113,48 @@ pub struct Album {
     pub artist: Ref<Artist>,  // typed reference
 }
 
-// Programmatic traversal
+// Rust-side programmatic traversal ✅
 let album: AlbumView = ctx.get(album_id).await?;
 let artist: ArtistView = album.artist().get(&ctx).await?;
+
+// TypeScript-side traversal ❌ (needs wrapper generation)
+const album = await Album.get(ctx, albumId);
+const artistId = album.artist;  // string (EntityId base64) ✅
+const artist = await ctx.get<ArtistView>(artistId);  // manual lookup required
 ```
 
 **What was delivered:**
 
-| Component | Description |
-|-----------|-------------|
-| `Ref<T>` type | Wrapper around `EntityId` with `PhantomData<T>` |
-| `Property` impl | Stores as `Value::EntityId` |
-| `.get(&ctx)` | Async method to fetch referenced entity as `T::View` |
-| Conversions | `From<EntityId>` / `Into<EntityId>` |
-| Serde | Transparent serialization |
+| Component | Description | Status |
+|-----------|-------------|--------|
+| `Ref<T>` type | Wrapper around `EntityId` with `PhantomData<T>` | ✅ |
+| `Property` impl | Stores as `Value::EntityId` | ✅ |
+| `.get(&ctx)` | Async method to fetch referenced entity as `T::View` | ✅ Rust only |
+| Conversions | `From<EntityId>` / `Into<EntityId>` | ✅ |
+| Serde | Transparent serialization | ✅ |
+| WASM bindings | `Ref<T>` ↔ `JsValue` (string) | ✅ |
+| LWW wrapper gen | `LWWRefFoo` for each `Ref<Foo>` usage | ❌ |
+
+**Open issue: WASM wrapper generation for `Ref<T>`**
+
+For WASM, we need `LWWRefArtist` wrapper types. Two problems:
+
+1. **Manual invocation required**: Currently requires `impl_wrapper_type!(Ref<Artist>)` 
+   for each concrete `Ref<T>` used in models — poor ergonomics.
+
+2. **Duplicate generation risk**: If the Model derive macro auto-generates wrappers,
+   multiple models using `Ref<Artist>` would generate duplicate `LWWRefArtist` definitions.
+
+**Possible solutions:**
+- Special-case `Ref<T>` in the derive macro to emit wrappers once per type
+- Move wrapper generation to a centralized location (e.g., `impl_provided_wrapper_types!`)
+- Use a registry/dedup mechanism during compilation
+- Generate wrappers lazily at runtime (WASM overhead concern)
 
 **Key files:**
 - `core/src/property/value/entity_ref.rs` — `Ref<T>` implementation
 - `tests/tests/sled/ref_traversal.rs` — Integration tests
+- `storage/indexeddb-wasm/tests/ref_property.rs` — WASM tests (requires manual wrapper)
 
 ---
 

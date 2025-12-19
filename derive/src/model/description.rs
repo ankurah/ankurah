@@ -125,6 +125,30 @@ impl ModelDescription {
     pub fn ephemeral_field_types(&self) -> Vec<&Type> { self.ephemeral_fields.iter().map(|f| &f.ty).collect() }
     pub fn ephemeral_field_visibility(&self) -> Vec<&Visibility> { self.ephemeral_fields.iter().map(|f| &f.vis).collect() }
 
+    /// Generate WASM wrapper definitions for custom types not in provided_wrapper_types
+    #[cfg(feature = "wasm")]
+    pub fn generate_custom_wrapper_definitions(&self) -> Vec<proc_macro2::TokenStream> {
+        let mut wrappers = Vec::new();
+        let mut seen_wrappers = std::collections::HashSet::new();
+
+        for field in self.active_fields().iter() {
+            if let Some(backend_desc) = self.backend_registry.resolve_active_type(field) {
+                // Only generate wrapper for custom types (not provided by backend)
+                if !backend_desc.is_provided_type() {
+                    let wrapper_name = backend_desc.wrapper_type_name();
+                    // Avoid generating duplicate wrappers for same type
+                    if !seen_wrappers.contains(&wrapper_name) {
+                        seen_wrappers.insert(wrapper_name);
+                        let wrapper = backend_desc.generate_wrapper("external");
+                        wrappers.push(wrapper);
+                    }
+                }
+            }
+        }
+
+        wrappers
+    }
+
     /// Generate WASM getter methods for this model's active fields
     pub fn generate_wasm_getter_methods(&self) -> Vec<proc_macro2::TokenStream> {
         let mut getter_methods = Vec::new();
