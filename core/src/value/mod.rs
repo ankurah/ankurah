@@ -29,23 +29,18 @@ pub enum Value {
 
 impl Value {
     /// Create a Json value from any serializable type.
-    pub fn json<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> {
-        Ok(Value::Json(serde_json::to_vec(value)?))
-    }
+    pub fn json<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> { Ok(Value::Json(serde_json::to_vec(value)?)) }
 
     /// Parse this value as JSON into the target type.
     /// Works for Json, Object, Binary (as bytes) and String variants.
     /// Returns InvalidVariant error for numeric, bool, and EntityId types.
     pub fn parse_as_json<T: serde::de::DeserializeOwned>(&self) -> Result<T, crate::property::PropertyError> {
         match self {
-            Value::Json(bytes) | Value::Object(bytes) | Value::Binary(bytes) => {
-                Ok(serde_json::from_slice(bytes)?)
-            }
+            Value::Json(bytes) | Value::Object(bytes) | Value::Binary(bytes) => Ok(serde_json::from_slice(bytes)?),
             Value::String(s) => Ok(serde_json::from_str(s)?),
-            other => Err(crate::property::PropertyError::InvalidVariant {
-                given: other.clone(),
-                ty: std::any::type_name::<T>().to_string(),
-            }),
+            other => {
+                Err(crate::property::PropertyError::InvalidVariant { given: other.clone(), ty: std::any::type_name::<T>().to_string() })
+            }
         }
     }
 
@@ -54,14 +49,12 @@ impl Value {
     /// Returns InvalidVariant error for other types.
     pub fn parse_as_string<T: std::str::FromStr>(&self) -> Result<T, crate::property::PropertyError> {
         match self {
-            Value::String(s) => s.parse().map_err(|_| crate::property::PropertyError::InvalidValue {
-                value: s.clone(),
-                ty: std::any::type_name::<T>().to_string(),
-            }),
-            other => Err(crate::property::PropertyError::InvalidVariant {
-                given: other.clone(),
-                ty: std::any::type_name::<T>().to_string(),
-            }),
+            Value::String(s) => s
+                .parse()
+                .map_err(|_| crate::property::PropertyError::InvalidValue { value: s.clone(), ty: std::any::type_name::<T>().to_string() }),
+            other => {
+                Err(crate::property::PropertyError::InvalidVariant { given: other.clone(), ty: std::any::type_name::<T>().to_string() })
+            }
         }
     }
 }
