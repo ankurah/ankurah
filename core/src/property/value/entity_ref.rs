@@ -17,7 +17,10 @@
 
 use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
+use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Deref;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -31,7 +34,7 @@ use crate::value::Value;
 ///
 /// Stores an `EntityId` internally but carries compile-time type information
 /// about the target model, enabling type-safe `.get()` calls.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Ref<T> {
     id: EntityId,
@@ -39,9 +42,25 @@ pub struct Ref<T> {
     _phantom: PhantomData<T>,
 }
 
+impl<T> Deref for Ref<T> {
+    type Target = EntityId;
+    fn deref(&self) -> &EntityId { &self.id }
+}
+
+impl<T> AsRef<EntityId> for Ref<T> {
+    fn as_ref(&self) -> &EntityId { &self.id }
+}
+
+impl<T> Borrow<EntityId> for Ref<T> {
+    fn borrow(&self) -> &EntityId { &self.id }
+}
+
 impl<T> Ref<T> {
     /// Create a new Ref from an EntityId.
     pub fn new(id: EntityId) -> Self { Ref { id, _phantom: PhantomData } }
+
+    /// Create a Ref from a base64-encoded EntityId string.
+    pub fn from_base64(s: &str) -> Result<Self, ankurah_proto::DecodeError> { Ok(Ref::new(EntityId::from_base64(s)?)) }
 
     /// Get the underlying EntityId.
     pub fn id(&self) -> EntityId { self.id.clone() }
@@ -65,12 +84,39 @@ impl<T> From<EntityId> for Ref<T> {
     fn from(id: EntityId) -> Self { Ref::new(id) }
 }
 
+impl<T> From<&EntityId> for Ref<T> {
+    fn from(id: &EntityId) -> Self { Ref::new(id.clone()) }
+}
+
+impl<T> TryFrom<&str> for Ref<T> {
+    type Error = ankurah_proto::DecodeError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> { Ref::from_base64(s) }
+}
+
+impl<T> TryFrom<String> for Ref<T> {
+    type Error = ankurah_proto::DecodeError;
+    fn try_from(s: String) -> Result<Self, Self::Error> { Ref::from_base64(&s) }
+}
+
 impl<T> From<Ref<T>> for EntityId {
     fn from(r: Ref<T>) -> Self { r.id }
 }
 
 impl<T> From<&Ref<T>> for EntityId {
     fn from(r: &Ref<T>) -> Self { r.id.clone() }
+}
+
+impl<T> fmt::Display for Ref<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.id.to_base64()) }
+}
+
+// Ref<T> support for predicates (queries)
+impl<T> From<Ref<T>> for ::ankql::ast::Expr {
+    fn from(r: Ref<T>) -> ::ankql::ast::Expr { r.id.into() }
+}
+
+impl<T> From<&Ref<T>> for ::ankql::ast::Expr {
+    fn from(r: &Ref<T>) -> ::ankql::ast::Expr { (&r.id).into() }
 }
 
 impl<T> Property for Ref<T> {
@@ -124,6 +170,17 @@ impl<T> wasm_bindgen::convert::FromWasmAbi for Ref<T> {
         let id = EntityId::from_base64(&id_str).unwrap_or_else(|_| EntityId::new());
         Ref::new(id)
     }
+}
+
+// Option<Ref<T>> WASM bindings - needed for optional entity references
+#[cfg(feature = "wasm")]
+impl<T> wasm_bindgen::convert::OptionIntoWasmAbi for Ref<T> {
+    fn none() -> Self::Abi { <JsValue as wasm_bindgen::convert::OptionIntoWasmAbi>::none() }
+}
+
+#[cfg(feature = "wasm")]
+impl<T> wasm_bindgen::convert::OptionFromWasmAbi for Ref<T> {
+    fn is_none(abi: &Self::Abi) -> bool { <JsValue as wasm_bindgen::convert::OptionFromWasmAbi>::is_none(abi) }
 }
 
 #[cfg(test)]
