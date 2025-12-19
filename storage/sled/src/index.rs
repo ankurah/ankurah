@@ -140,11 +140,22 @@ impl Index {
 
         // Build composite key using per-keypart direction from spec
         let mut tuple_values: Vec<ankurah_core::value::Value> = Vec::with_capacity(self.0.spec.keyparts.len());
-        for pid in pids.iter() {
+        for (pid, kp) in pids.iter().zip(self.0.spec.keyparts.iter()) {
             if let Some(val) = property_map.get(pid).cloned() {
-                tuple_values.push(val);
+                // If keypart has a sub_path, extract the value at that path
+                let extracted = match &kp.sub_path {
+                    None => Some(val),
+                    Some(path) => val.extract_at_path(path),
+                };
+                match extracted {
+                    Some(v) => tuple_values.push(v),
+                    None => {
+                        // Missing sub_path value - don't index this entity
+                        return Ok(None);
+                    }
+                }
             } else {
-                // Missing required value for this index
+                // Missing required property for this index
                 return Ok(None);
             }
         }

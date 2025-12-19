@@ -129,9 +129,8 @@ impl Planner {
             return None;
         }
 
-        // Keyparts: EQ prefix
-        let mut index_keyparts: Vec<IndexKeyPart> =
-            equalities.iter().map(|(f, v)| IndexKeyPart::asc(f.clone(), ValueType::of(v))).collect();
+        // Keyparts: EQ prefix (using asc_path for multi-step path support)
+        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
 
         // Append ORDER BY fields per capability
         if self.config.supports_desc_indexes {
@@ -235,10 +234,9 @@ impl Planner {
         // Keyparts: EQ + primary INEQ (do not append ORDER BY fields; they do not satisfy global order after a range)
         // NOTE (micro-optimization): Appending OB columns after the range could help spill comparator locality,
         // but it does not change correctness and the tests expect the simpler invariant-preserving form.
-        let mut index_keyparts: Vec<IndexKeyPart> =
-            equalities.iter().map(|(f, v)| IndexKeyPart::asc(f.clone(), ValueType::of(v))).collect();
+        let mut index_keyparts: Vec<IndexKeyPart> = equalities.iter().map(|(f, v)| IndexKeyPart::asc_path(f, ValueType::of(v))).collect();
         let primary_value = &primary.1[0].1; // Get Value from first inequality
-        index_keyparts.push(IndexKeyPart::asc(primary.0.to_string(), ValueType::of(primary_value))); // Use actual primary key value type
+        index_keyparts.push(IndexKeyPart::asc_path(primary.0, ValueType::of(primary_value))); // Use actual primary key value type
 
         // Bounds: EQ + primary INEQ (most-restrictive)
         let bounds = self.build_bounds(equalities, Some(primary), &index_keyparts)?;
@@ -312,13 +310,14 @@ impl Planner {
         (equalities, inequalities)
     }
 
-    /// Extract field name, operator, and value from a comparison predicate
+    /// Extract field path, operator, and value from a comparison predicate.
+    /// Returns the full path as a dot-separated string (e.g., "context.session_id").
     fn extract_comparison(&self, predicate: &Predicate) -> Option<(String, ComparisonOperator, Value)> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                // Extract field name from left side
-                let field_name = match left.as_ref() {
-                    Expr::Path(path) if path.is_simple() => path.first().to_string(),
+                // Extract field path from left side (supports multi-step paths)
+                let field_path = match left.as_ref() {
+                    Expr::Path(path) => path.steps.join("."),
                     _ => return None,
                 };
 
@@ -328,7 +327,7 @@ impl Planner {
                     _ => return None,
                 };
 
-                Some((field_name, operator.clone(), value))
+                Some((field_path, operator.clone(), value))
             }
             _ => None,
         }
@@ -347,13 +346,13 @@ impl Planner {
         // Add equality fields first
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
-            index_keyparts.push(IndexKeyPart::asc(field.clone(), ValueType::of(value)));
+            index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
 
         // Add the inequality field
         let inequality_values = inequalities.get(inequality_field)?;
         let first_inequality_value = &inequality_values[0].1; // Get Value from first inequality
-        index_keyparts.push(IndexKeyPart::asc(inequality_field.to_string(), ValueType::of(first_inequality_value)));
+        index_keyparts.push(IndexKeyPart::asc_path(inequality_field, ValueType::of(first_inequality_value)));
 
         // Build bounds
         let bounds = self.build_bounds(equalities, Some((inequality_field, inequality_values)), &index_keyparts);
@@ -397,7 +396,7 @@ impl Planner {
         // Add all equality fields
         let mut index_keyparts = Vec::new();
         for (field, value) in equalities {
-            index_keyparts.push(IndexKeyPart::asc(field.clone(), ValueType::of(value)));
+            index_keyparts.push(IndexKeyPart::asc_path(field, ValueType::of(value)));
         }
 
         // Build bounds (exact match on all equality values)
@@ -432,22 +431,22 @@ impl Planner {
     ) -> Option<KeyBounds> {
         let mut keypart_bounds = Vec::new();
 
-        // Build per-column bounds
+        // Build per-column bounds (using full_path for multi-step path support)
         for keypart in index_keyparts {
-            let column = &keypart.column;
+            let full_path = keypart.full_path();
 
-            // Check if this column has an equality constraint
-            let equality_value = equalities.iter().find(|(field, _)| field == column).map(|(_, value)| value);
+            // Check if this path has an equality constraint
+            let equality_value = equalities.iter().find(|(field, _)| field == &full_path).map(|(_, value)| value);
 
             if let Some(value) = equality_value {
                 // Equality constraint: both bounds are the same value, inclusive
                 keypart_bounds.push(KeyBoundComponent {
-                    column: column.clone(),
+                    column: full_path.clone(),
                     low: Endpoint::incl(value.clone()),
                     high: Endpoint::incl(value.clone()),
                 });
             } else if let Some((ineq_field, inequalities)) = inequality {
-                if ineq_field == column {
+                if ineq_field == full_path {
                     // This column has inequality constraints
                     let mut low = Endpoint::UnboundedLow(ValueType::of(&inequalities[0].1));
                     let mut high = Endpoint::UnboundedHigh(ValueType::of(&inequalities[0].1));
@@ -483,7 +482,7 @@ impl Planner {
                         }
                     }
 
-                    keypart_bounds.push(KeyBoundComponent { column: column.clone(), low, high });
+                    keypart_bounds.push(KeyBoundComponent { column: full_path.clone(), low, high });
                     break; // Stop at first inequality column
                 } else {
                     // No constraint on this column - stop here, don't add unbounded bounds
@@ -2071,6 +2070,77 @@ mod tests {
                     }
                 ]
             );
+        }
+    }
+
+    mod json_path_tests {
+        use super::*;
+
+        /// Test that multi-step paths (e.g., context.session_id) are correctly handled
+        #[test]
+        fn test_json_path_equality() {
+            let planner = Planner::new(PlannerConfig::full_support());
+            let selection = selection!("context.session_id = 'sess123'");
+            let plans = planner.plan(&selection, "id");
+
+            // Should generate an index plan with sub_path
+            let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
+
+            if let Plan::Index { index_spec, bounds, .. } = index_plan {
+                // Check that the keypart has the correct sub_path
+                assert_eq!(index_spec.keyparts.len(), 1);
+                let keypart = &index_spec.keyparts[0];
+                assert_eq!(keypart.column, "context");
+                assert_eq!(keypart.sub_path, Some(vec!["session_id".to_string()]));
+                assert_eq!(keypart.full_path(), "context.session_id");
+
+                // Check bounds use full path
+                assert_eq!(bounds.keyparts.len(), 1);
+                assert_eq!(bounds.keyparts[0].column, "context.session_id");
+            } else {
+                panic!("Expected Index plan");
+            }
+        }
+
+        /// Test multi-step path with ORDER BY
+        #[test]
+        fn test_json_path_with_order_by() {
+            let planner = Planner::new(PlannerConfig::full_support());
+            let selection = selection!("context.user_id = 'user123' ORDER BY created DESC");
+            let plans = planner.plan(&selection, "id");
+
+            let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
+
+            if let Plan::Index { index_spec, .. } = index_plan {
+                // First keypart should be the JSON path equality
+                let first = &index_spec.keyparts[0];
+                assert_eq!(first.column, "context");
+                assert_eq!(first.sub_path, Some(vec!["user_id".to_string()]));
+
+                // ORDER BY field should be second (simple path)
+                if index_spec.keyparts.len() > 1 {
+                    let second = &index_spec.keyparts[1];
+                    assert_eq!(second.column, "created");
+                    assert_eq!(second.sub_path, None);
+                }
+            }
+        }
+
+        /// Test deeper JSON paths
+        #[test]
+        fn test_deep_json_path() {
+            let planner = Planner::new(PlannerConfig::full_support());
+            let selection = selection!("data.nested.field = 'value'");
+            let plans = planner.plan(&selection, "id");
+
+            let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
+
+            if let Plan::Index { index_spec, .. } = index_plan {
+                let keypart = &index_spec.keyparts[0];
+                assert_eq!(keypart.column, "data");
+                assert_eq!(keypart.sub_path, Some(vec!["nested".to_string(), "field".to_string()]));
+                assert_eq!(keypart.full_path(), "data.nested.field");
+            }
         }
     }
 }

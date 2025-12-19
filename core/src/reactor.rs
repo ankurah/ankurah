@@ -211,7 +211,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
             ankql::ast::OrderDirection::Desc => IndexDirection::Desc,
         };
 
-        keyparts.push(IndexKeyPart { column, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
+        keyparts.push(IndexKeyPart { column, sub_path: None, direction, value_type, nulls: Some(NullsOrder::Last), collation: None });
     }
 
     Ok(KeySpec { keyparts })

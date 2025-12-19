@@ -21,6 +21,8 @@ pub enum NullsOrder {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IndexKeyPart {
     pub column: String,
+    /// Optional path within property value (for JSON, future Ref, etc.)
+    pub sub_path: Option<Vec<String>>,
     pub direction: IndexDirection, // ASC/DESC
     pub value_type: ValueType,     // Expected type for this key component
     pub nulls: Option<NullsOrder>, // PG-style NULLS FIRST/LAST (optional)
@@ -29,11 +31,54 @@ pub struct IndexKeyPart {
 
 impl IndexKeyPart {
     pub fn asc<S: Into<String>>(col: S, value_type: ValueType) -> Self {
-        Self { column: col.into(), direction: IndexDirection::Asc, value_type, nulls: None, collation: None }
+        Self { column: col.into(), sub_path: None, direction: IndexDirection::Asc, value_type, nulls: None, collation: None }
     }
     pub fn desc<S: Into<String>>(col: S, value_type: ValueType) -> Self {
-        Self { column: col.into(), direction: IndexDirection::Desc, value_type, nulls: None, collation: None }
+        Self { column: col.into(), sub_path: None, direction: IndexDirection::Desc, value_type, nulls: None, collation: None }
     }
+
+    /// Create from a PathExpr (handles multi-step paths)
+    pub fn from_path(path: &ankql::ast::PathExpr, direction: IndexDirection, value_type: ValueType) -> Self {
+        let (column, sub_path) = if path.steps.len() == 1 {
+            (path.steps[0].clone(), None)
+        } else {
+            let column = path.steps[0].clone();
+            let sub_path = path.steps[1..].to_vec();
+            (column, Some(sub_path))
+        };
+        Self { column, sub_path, direction, value_type, nulls: None, collation: None }
+    }
+
+    /// Full path as a flat string (e.g., "context.session_id")
+    pub fn full_path(&self) -> String {
+        match &self.sub_path {
+            None => self.column.clone(),
+            Some(sub) => {
+                let mut parts = vec![self.column.clone()];
+                parts.extend(sub.clone());
+                parts.join(".")
+            }
+        }
+    }
+
+    /// Create from a flat path string (e.g., "context.session_id")
+    pub fn from_flat_path(path: &str, direction: IndexDirection, value_type: ValueType) -> Self {
+        let parts: Vec<&str> = path.split('.').collect();
+        let (column, sub_path) = if parts.len() == 1 {
+            (parts[0].to_string(), None)
+        } else {
+            let column = parts[0].to_string();
+            let sub_path: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            (column, Some(sub_path))
+        };
+        Self { column, sub_path, direction, value_type, nulls: None, collation: None }
+    }
+
+    /// Create ascending keypart from flat path
+    pub fn asc_path(path: &str, value_type: ValueType) -> Self { Self::from_flat_path(path, IndexDirection::Asc, value_type) }
+
+    /// Create descending keypart from flat path
+    pub fn desc_path(path: &str, value_type: ValueType) -> Self { Self::from_flat_path(path, IndexDirection::Desc, value_type) }
 }
 
 impl IndexDirection {
@@ -53,6 +98,7 @@ impl KeySpec {
                     IndexDirection::Asc => "asc",
                     IndexDirection::Desc => "desc",
                 };
+                let col_name = k.full_path();
                 if k.collation.is_some() || k.nulls.is_some() {
                     // include extras only if present
                     let mut extras = Vec::new();
@@ -62,9 +108,9 @@ impl KeySpec {
                     if let Some(n) = &k.nulls {
                         extras.push(format!("nulls={:?}", n).to_lowercase());
                     }
-                    format!("{} {}({})", k.column, dir, extras.join(","))
+                    format!("{} {}({})", col_name, dir, extras.join(","))
                 } else {
-                    format!("{} {}", k.column, dir)
+                    format!("{} {}", col_name, dir)
                 }
             })
             .collect();
@@ -89,7 +135,8 @@ impl KeySpec {
         let mut inverse_match = true;
 
         for (self_keypart, other_keypart) in self.keyparts.iter().zip(other.keyparts.iter()) {
-            if self_keypart.column != other_keypart.column {
+            // Both column and sub_path must match
+            if self_keypart.column != other_keypart.column || self_keypart.sub_path != other_keypart.sub_path {
                 return None;
             }
 
