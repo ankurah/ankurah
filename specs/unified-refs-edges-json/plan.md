@@ -14,7 +14,8 @@ This plan prioritizes delivering **Json property + structured queries** as the f
 | **1d** | PostgreSQL JSONB pushdown + predicate splitting | 1c | ✅ Complete |
 | **1e** | JSON-aware type casting (numeric-only) | 1c | ✅ Complete |
 | **1f** | JSON path index pushdown (Sled/IndexedDB) | 1c | ✅ Complete |
-| 2 | Ref metadata + forward ref traversal | 1 | Pending |
+| **2a** | `Ref<T>` typed entity reference | 1 | ✅ Complete |
+| **2b** | Ref traversal in queries | 2a | Pending |
 | 3 | Full schema registry / PropertyId | 2 | Pending |
 | 4 | Inbound navigation, traversal filters | 2, 3 | Pending |
 | 5 | Relation-entities, index pushdown | 3, 4 | Future |
@@ -101,27 +102,53 @@ See: `phase-1f-index-pushdown.md`
 
 ---
 
-### Phase 2: Forward Ref Traversal
+### Phase 2a: `Ref<T>` Typed Entity Reference ✅ COMPLETE
 
-**Deliverable**: Query across entity references
+**Deliverable**: Type-safe entity references with programmatic traversal
 
 ```rust
 #[derive(Model)]
 pub struct Album {
     pub name: String,
-    #[model(ref_to = "artist")]  // metadata for target collection
-    pub artist: EntityId,
+    pub artist: Ref<Artist>,  // typed reference
 }
 
+// Programmatic traversal
+let album: AlbumView = ctx.get(album_id).await?;
+let artist: ArtistView = album.artist().get(&ctx).await?;
+```
+
+**What was delivered:**
+
+| Component | Description |
+|-----------|-------------|
+| `Ref<T>` type | Wrapper around `EntityId` with `PhantomData<T>` |
+| `Property` impl | Stores as `Value::EntityId` |
+| `.get(&ctx)` | Async method to fetch referenced entity as `T::View` |
+| Conversions | `From<EntityId>` / `Into<EntityId>` |
+| Serde | Transparent serialization |
+
+**Key files:**
+- `core/src/property/value/entity_ref.rs` — `Ref<T>` implementation
+- `tests/tests/sled/ref_traversal.rs` — Integration tests
+
+---
+
+### Phase 2b: Ref Traversal in Queries (Pending)
+
+**Deliverable**: Query across entity references
+
+```rust
+// Query-time traversal (requires resolver)
 ctx.fetch::<AlbumView>("artist.name = ?", "Radiohead")
 ```
 
-**Key requirement**: Need minimal ref metadata to know target collection. Options:
-- Field annotation: `#[model(ref_to = "artist")]`
-- `Ref<T>` wrapper type
-- Runtime registry
+**Key requirements:**
+- Resolver to annotate paths with target collection
+- Cross-entity fetching during filter evaluation
+- N+1 query considerations
 
-See: `phase-3-ref-traversal.md` (to be revised)
+See: `phase-2b-ref-traversal.md` (to be created)
 
 ---
 
