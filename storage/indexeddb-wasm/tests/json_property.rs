@@ -5,8 +5,9 @@
 //! - Storing entities with Json properties
 //! - Querying with JSON path syntax (e.g., `licensing.territory = 'US'`)
 //!
-//! Note: IndexedDB uses table-scan + post-filtering for JSON path queries since it doesn't
-//! have native JSON indexing. These tests verify the filtering logic works correctly in WASM.
+//! JSON properties are stored as parsed JS objects (not raw bytes), enabling IndexedDB's
+//! native nested property indexing via dot-notation keyPath (e.g., "licensing.territory").
+//! This means JSON path queries can use index-backed lookups.
 
 mod common;
 

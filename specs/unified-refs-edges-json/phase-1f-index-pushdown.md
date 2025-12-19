@@ -18,13 +18,13 @@ Enable index-backed queries on JSON paths for Sled and IndexedDB storage engines
 | Sled | ⚠️ Works | Post-fetch filter in Rust |
 | IndexedDB | ⚠️ Works | Post-fetch filter in Rust |
 
-### Target State
+### Target State (Achieved)
 
 | Storage | JSON Path Queries | How |
 |---------|-------------------|-----|
 | Postgres | ✅ Pushed down | JSONB operators (unchanged) |
-| Sled | ✅ Index-backed | KeySpec with JSON paths |
-| IndexedDB | ✅ Index-backed | Native `createIndex()` with keyPath |
+| Sled | ✅ Index-backed | `sub_path` + `Value::extract_at_path()` |
+| IndexedDB | ✅ Index-backed | Native `createIndex()` with dot-notation keyPath |
 
 ---
 

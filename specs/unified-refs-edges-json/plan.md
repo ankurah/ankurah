@@ -13,7 +13,7 @@ This plan prioritizes delivering **Json property + structured queries** as the f
 | **1c** | Structured property queries (`licensing.territory = ?`) | 1a, 1b | ✅ Complete |
 | **1d** | PostgreSQL JSONB pushdown + predicate splitting | 1c | ✅ Complete |
 | **1e** | JSON-aware type casting (numeric-only) | 1c | ✅ Complete |
-| **1f** | JSON path index pushdown (Sled/IndexedDB) | 1c | **In Progress** |
+| **1f** | JSON path index pushdown (Sled/IndexedDB) | 1c | ✅ Complete |
 | 2 | Ref metadata + forward ref traversal | 1 | Pending |
 | 3 | Full schema registry / PropertyId | 2 | Pending |
 | 4 | Inbound navigation, traversal filters | 2, 3 | Pending |
