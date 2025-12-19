@@ -13,6 +13,7 @@ This plan prioritizes delivering **Json property + structured queries** as the f
 | **1c** | Structured property queries (`licensing.territory = ?`) | 1a, 1b | ✅ Complete |
 | **1d** | PostgreSQL JSONB pushdown + predicate splitting | 1c | ✅ Complete |
 | **1e** | JSON-aware type casting (numeric-only) | 1c | ✅ Complete |
+| **1f** | JSON path index pushdown (Sled/IndexedDB) | 1c | **In Progress** |
 | 2 | Ref metadata + forward ref traversal | 1 | Pending |
 | 3 | Full schema registry / PropertyId | 2 | Pending |
 | 4 | Inbound navigation, traversal filters | 2, 3 | Pending |
@@ -65,6 +66,38 @@ ctx.fetch::<TrackView>("licensing.rights.holder = ?", "Label")
 - `^Model.field` syntax (for inbound navigation)
 - Schema registry / PropertyId
 - Ref traversal across entities
+
+---
+
+### Phase 1f: JSON Path Index Pushdown (Sled/IndexedDB)
+
+**Deliverable**: Index-backed JSON path queries for Sled and IndexedDB
+
+Currently Sled and IndexedDB evaluate JSON path predicates via post-fetch filtering in Rust. Phase 1f enables these queries to use indexes:
+
+```rust
+// These should use indexes, not post-fetch filtering:
+ctx.fetch::<DetectionView>("context.session_id = ?", "sess1")
+ctx.fetch::<DetectionView>("context.year > ?", 2020)
+```
+
+**Key changes:**
+
+| Component | Change |
+|-----------|--------|
+| `IndexKeyPart` | Add `sub_path: Option<Vec<String>>` for sub-navigation |
+| `Value` | Add `extract_at_path()` method for structured value extraction |
+| Planner | Generate keyparts with sub_path from multi-step `PathExpr` |
+| Sled | Use `extract_at_path`, skip indexing if path missing |
+| IndexedDB | Translate to native `createIndex()` with dot-path keyPath |
+
+**Design notes:**
+- `sub_path` generalizes over JSON, future Ref traversal, etc.
+- Missing path → don't index (distinguishes from explicit null)
+- Array offsets normalized: `items[0].name` → `["items", "name"]`
+- IndexedDB natively supports `"context.session_id"` keyPath syntax
+
+See: `phase-1f-index-pushdown.md`
 
 ---
 
