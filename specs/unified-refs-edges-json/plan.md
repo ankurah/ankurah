@@ -113,24 +113,46 @@ pub struct Album {
     pub artist: Ref<Artist>,  // typed reference
 }
 
-// Programmatic traversal
+// Rust-side programmatic traversal ✅
 let album: AlbumView = ctx.get(album_id).await?;
-let artist: ArtistView = album.artist().get(&ctx).await?;
+let artist: ArtistView = album.artist()?.get(&ctx).await?;
+
+// TypeScript-side access ✅
+const album = await Album.get(ctx, albumId);
+const artistId = album.artist;  // string (EntityId base64)
+const artist = await ctx.get<ArtistView>(artistId);  // manual lookup
 ```
 
 **What was delivered:**
 
-| Component | Description |
-|-----------|-------------|
-| `Ref<T>` type | Wrapper around `EntityId` with `PhantomData<T>` |
-| `Property` impl | Stores as `Value::EntityId` |
-| `.get(&ctx)` | Async method to fetch referenced entity as `T::View` |
-| Conversions | `From<EntityId>` / `Into<EntityId>` |
-| Serde | Transparent serialization |
+| Component | Description | Status |
+|-----------|-------------|--------|
+| `Ref<T>` type | Wrapper around `EntityId` with `PhantomData<T>` | ✅ |
+| `Property` impl | Stores as `Value::EntityId` | ✅ |
+| `.get(&ctx)` | Async method to fetch referenced entity as `T::View` | ✅ |
+| Conversions | `From<EntityId>` / `Into<EntityId>` | ✅ |
+| Serde | Transparent serialization | ✅ |
+| WASM bindings | `Ref<T>` ↔ `JsValue` (string) | ✅ |
+| LWW wrapper gen | Model-scoped `{Model}_LWWRef{T}` auto-generated | ✅ |
+
+**WASM wrapper generation solution:**
+
+The Model derive macro auto-generates model-scoped wrapper types to avoid symbol
+collisions when multiple models use the same `Ref<T>` type:
+
+- `Album` with `artist: Ref<Artist>` → generates `Album_LWWRefArtist`
+- `Track` with `artist: Ref<Artist>` → generates `Track_LWWRefArtist`
+
+This accepts some code duplication in exchange for ergonomics (no manual 
+`impl_wrapper_type!` calls needed) and correctness (no wasm-bindgen symbol conflicts).
 
 **Key files:**
 - `core/src/property/value/entity_ref.rs` — `Ref<T>` implementation
-- `tests/tests/sled/ref_traversal.rs` — Integration tests
+- `derive/src/model/backend.rs` — `wrapper_type_name_for_model()`, `generate_wrapper_for_model()`
+- `derive/src/model/description.rs` — `generate_custom_wrapper_definitions()`
+- `tests/tests/sled/ref_traversal.rs` — Rust integration tests
+- `storage/indexeddb-wasm/tests/ref_property.rs` — WASM single-model test
+- `storage/indexeddb-wasm/tests/duplicate_ref.rs` — WASM multi-model collision test
 
 ---
 

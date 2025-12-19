@@ -67,6 +67,12 @@ impl ActiveTypeDesc {
         pattern
     }
 
+    /// Get a model-scoped wrapper type name for WASM bindings.
+    /// This includes the model name to avoid collisions when multiple models use
+    /// the same custom type (e.g., Ref<Artist> in both Album and Track).
+    /// Format: {ModelName}_{BaseWrapperName} e.g., "Album_LWWRefArtist"
+    pub fn wrapper_type_name_for_model(&self, model_name: &str) -> String { format!("{}_{}", model_name, self.wrapper_type_name()) }
+
     /// Get the fully qualified wrapper type path for WASM bindings
     pub fn wrapper_type_path(&self, context: &str) -> String {
         let wrapper_name = self.wrapper_type_name();
@@ -221,6 +227,87 @@ impl ActiveTypeDesc {
             #[wasm_bindgen]
             pub struct #wrapper_name( #[wasm_bindgen(skip)] pub #original_type);
 
+
+            #[wasm_bindgen]
+            impl #wrapper_name {
+                #(#methods)*
+            }
+        }
+    }
+
+    /// Generate a model-scoped wrapper struct to avoid symbol collisions.
+    /// Used for custom types (not in provided_wrapper_types) that may appear
+    /// in multiple models with the same inner type (e.g., Ref<Artist>).
+    pub fn generate_wrapper_for_model(&self, context: &str, model_name: &str) -> TokenStream {
+        let value_config = &self.backend_config.values[0];
+
+        let wrapper_name = format_ident!("{}", self.wrapper_type_name_for_model(model_name));
+        let original_type: Type = self.rust_type_with_context(context).expect("Failed to parse original type");
+
+        let substitute_fn = |backend: &ActiveTypeDesc, pattern: &str| backend.do_substitutions(pattern, context);
+
+        // Generate method implementations (only for methods with wasm: true)
+        let methods: Vec<TokenStream> = value_config
+            .methods
+            .iter()
+            .filter(|method| method.wasm)
+            .map(|method| {
+                let method_name = format_ident!("{}", method.name);
+                let args: Vec<TokenStream> = method
+                    .args
+                    .iter()
+                    .map(|(arg_name, arg_type)| {
+                        let arg_name = format_ident!("{}", arg_name);
+                        let arg_type = substitute_fn(self, arg_type);
+                        let arg_type: Type = syn::parse_str(&arg_type).expect("Failed to parse arg type");
+                        quote! { #arg_name: #arg_type }
+                    })
+                    .collect();
+
+                let return_type_str = substitute_fn(self, &method.return_type);
+                let arg_names: Vec<syn::Ident> = method.args.iter().map(|(name, _)| format_ident!("{}", name)).collect();
+
+                let converted_args: Vec<TokenStream> = method
+                    .args
+                    .iter()
+                    .zip(arg_names.iter())
+                    .map(|((_, arg_type), arg_name)| {
+                        if arg_type == "{T}" && method.name == "set" {
+                            quote! { &#arg_name }
+                        } else {
+                            quote! { #arg_name }
+                        }
+                    })
+                    .collect();
+
+                let (wasm_return_type_str, method_call) = if return_type_str.starts_with("Result<") {
+                    let inner_type = return_type_str.strip_prefix("Result<").unwrap().strip_suffix(">").unwrap();
+                    let parts: Vec<&str> = inner_type.split(", ").collect();
+                    let ok_type = parts[0];
+                    (
+                        format!("Result<{}, ::wasm_bindgen::JsValue>", ok_type),
+                        quote! {
+                            self.0.#method_name(#(#converted_args),*)
+                                .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
+                        },
+                    )
+                } else {
+                    (return_type_str.clone(), quote! { self.0.#method_name(#(#converted_args),*) })
+                };
+
+                let wasm_return_type: Type = syn::parse_str(&wasm_return_type_str).expect("Failed to parse return type");
+
+                quote! {
+                    pub fn #method_name(&self, #(#args),*) -> #wasm_return_type {
+                        #method_call
+                    }
+                }
+            })
+            .collect();
+
+        quote! {
+            #[wasm_bindgen]
+            pub struct #wrapper_name( #[wasm_bindgen(skip)] pub #original_type);
 
             #[wasm_bindgen]
             impl #wrapper_name {

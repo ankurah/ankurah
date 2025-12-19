@@ -18,6 +18,8 @@
 use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
+#[cfg(feature = "wasm")]
+use wasm_bindgen::prelude::*;
 
 use crate::context::Context;
 use crate::error::RetrievalError;
@@ -99,8 +101,46 @@ impl<T> Property for Ref<T> {
     }
 }
 
-// The async `get` method is implemented via extension trait in the context module
-// because it requires access to the Context/Node infrastructure.
+// WASM bindings for Ref<T> - serializes as base64 EntityId string in TypeScript
+
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(typescript_custom_section)]
+const TS_REF_TYPE: &'static str = r#"
+/** A typed entity reference - serialized as a base64 EntityId string */
+export type Ref<T> = string;
+"#;
+
+#[cfg(feature = "wasm")]
+impl<T> From<Ref<T>> for JsValue {
+    fn from(r: Ref<T>) -> Self {
+        // Serialize as base64 string
+        JsValue::from_str(&r.id.to_base64())
+    }
+}
+
+#[cfg(feature = "wasm")]
+impl<T> wasm_bindgen::describe::WasmDescribe for Ref<T> {
+    fn describe() { JsValue::describe() }
+}
+
+#[cfg(feature = "wasm")]
+impl<T> wasm_bindgen::convert::IntoWasmAbi for Ref<T> {
+    type Abi = <JsValue as wasm_bindgen::convert::IntoWasmAbi>::Abi;
+
+    fn into_abi(self) -> Self::Abi { JsValue::from(self).into_abi() }
+}
+
+#[cfg(feature = "wasm")]
+impl<T> wasm_bindgen::convert::FromWasmAbi for Ref<T> {
+    type Abi = <JsValue as wasm_bindgen::convert::FromWasmAbi>::Abi;
+
+    unsafe fn from_abi(js: Self::Abi) -> Self {
+        let js_value = JsValue::from_abi(js);
+        let id_str = js_value.as_string().unwrap_or_default();
+        let id = EntityId::from_base64(&id_str).unwrap_or_else(|_| EntityId::new());
+        Ref::new(id)
+    }
+}
 
 #[cfg(test)]
 mod tests {

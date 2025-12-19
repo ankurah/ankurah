@@ -125,23 +125,61 @@ impl ModelDescription {
     pub fn ephemeral_field_types(&self) -> Vec<&Type> { self.ephemeral_fields.iter().map(|f| &f.ty).collect() }
     pub fn ephemeral_field_visibility(&self) -> Vec<&Visibility> { self.ephemeral_fields.iter().map(|f| &f.vis).collect() }
 
-    /// Generate WASM getter methods for this model's active fields
+    /// Generate WASM wrapper definitions for custom types not in provided_wrapper_types.
+    /// Uses model-scoped wrapper names to avoid symbol collisions when multiple models
+    /// use the same custom type (e.g., Ref<Artist> in both Album and Track).
+    pub fn generate_custom_wrapper_definitions(&self) -> Vec<proc_macro2::TokenStream> {
+        let mut wrappers = Vec::new();
+        let mut seen_wrappers = std::collections::HashSet::new();
+        let model_name = self.name.to_string();
+
+        for field in self.active_fields().iter() {
+            if let Some(backend_desc) = self.backend_registry.resolve_active_type(field) {
+                // Only generate wrapper for custom types (not provided by backend)
+                if !backend_desc.is_provided_type() {
+                    // Use model-scoped name to avoid collisions across models
+                    let wrapper_name = backend_desc.wrapper_type_name_for_model(&model_name);
+                    // Avoid generating duplicate wrappers for same type within this model
+                    if !seen_wrappers.contains(&wrapper_name) {
+                        seen_wrappers.insert(wrapper_name);
+                        let wrapper = backend_desc.generate_wrapper_for_model("external", &model_name);
+                        wrappers.push(wrapper);
+                    }
+                }
+            }
+        }
+
+        wrappers
+    }
+
+    /// Generate WASM getter methods for this model's active fields.
+    /// For custom types (not in provided_wrapper_types), uses model-scoped wrapper names.
     pub fn generate_wasm_getter_methods(&self) -> Vec<proc_macro2::TokenStream> {
         let mut getter_methods = Vec::new();
+        let model_name = self.name.to_string();
 
         for field in self.active_fields().iter() {
             let field_name = field.ident.as_ref().unwrap();
 
             if let Some(backend_desc) = self.backend_registry.resolve_active_type(field) {
-                // Get the fully qualified wrapper type path
-                let wrapper_type_path = backend_desc.get_wrapper_type_path();
+                // For provided types, use the standard path; for custom types, use model-scoped name
+                let wrapper_type_path = if backend_desc.is_provided_type() {
+                    backend_desc.wrapper_type_path("local")
+                } else {
+                    // Custom type: use model-scoped wrapper name
+                    backend_desc.wrapper_type_name_for_model(&model_name)
+                };
 
                 // Parse the wrapper type path as a syn::Type
                 let wrapper_type: syn::Type = match syn::parse_str(&wrapper_type_path) {
                     Ok(ty) => ty,
                     Err(_) => {
                         // Fallback: just use the wrapper name as an identifier
-                        let wrapper_name = backend_desc.wrapper_type_name();
+                        let wrapper_name = if backend_desc.is_provided_type() {
+                            backend_desc.wrapper_type_name()
+                        } else {
+                            backend_desc.wrapper_type_name_for_model(&model_name)
+                        };
                         syn::parse_str(&wrapper_name).unwrap_or_else(|_| {
                             syn::Type::Path(syn::TypePath { qself: None, path: syn::Path::from(quote::format_ident!("UnknownWrapper")) })
                         })
