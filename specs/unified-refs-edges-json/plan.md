@@ -6,19 +6,21 @@ This plan prioritizes delivering **Json property + structured queries** as the f
 
 ### Phase Summary
 
-| Phase | Goal | Depends On | Effort |
+| Phase | Goal | Depends On | Status |
 |-------|------|------------|--------|
-| **1a** | Parser: basic dot-path navigation | — | 1-2 days |
-| **1b** | `Json` builtin property type | — | 1 day |
-| **1c** | Structured property queries (`licensing.territory = ?`) | 1a, 1b | 2 days |
-| 2 | Ref metadata + forward ref traversal | 1a | 3-4 days |
-| 3 | Full schema registry / PropertyId | 2 | 3-4 days |
-| 4 | Inbound navigation, traversal filters | 2, 3 | 3-4 days |
+| **1a** | Parser: basic dot-path navigation | — | ✅ Complete |
+| **1b** | `Json` builtin property type | — | ✅ Complete |
+| **1c** | Structured property queries (`licensing.territory = ?`) | 1a, 1b | ✅ Complete |
+| **1d** | PostgreSQL JSONB pushdown + predicate splitting | 1c | ✅ Complete |
+| **1e** | JSON-aware type casting (numeric-only) | 1c | ✅ Complete |
+| 2 | Ref metadata + forward ref traversal | 1 | Pending |
+| 3 | Full schema registry / PropertyId | 2 | Pending |
+| 4 | Inbound navigation, traversal filters | 2, 3 | Pending |
 | 5 | Relation-entities, index pushdown | 3, 4 | Future |
 
 ---
 
-### Phase 1: Json + Structured Queries (First Milestone)
+### Phase 1: Json + Structured Queries ✅ COMPLETE
 
 **Deliverable**: Query nested JSON properties with dot syntax
 
@@ -33,14 +35,36 @@ ctx.fetch::<TrackView>("licensing.territory = ?", "US")
 ctx.fetch::<TrackView>("licensing.rights.holder = ?", "Label")
 ```
 
+**What was delivered:**
+
+| Component | Description |
+|-----------|-------------|
+| `PathExpr` AST | Dot-separated paths replace `Identifier` enum |
+| `Json` property type | New builtin wrapping `serde_json::Value` |
+| Filter evaluation | Multi-step path → JSON traversal in Rust |
+| PostgreSQL JSONB | `->` and `->>` operators for pushdown |
+| Predicate splitting | Infrastructure for partial pushdown |
+| JSON-aware casting | Numeric-only casting for JSON values |
+
+**Key files changed:**
+- `ankql/src/ast.rs` — `PathExpr` struct, `Expr::Path`
+- `ankql/src/ankql.pest` — `PathExpr` grammar rule
+- `ankql/src/parser.rs` — Parse dot-paths
+- `core/src/property/value/json.rs` — New `Json` type
+- `core/src/selection/filter.rs` — JSON path evaluation + casting
+- `storage/postgres/src/sql_builder.rs` — JSONB SQL generation
+
+**Known limitations (to be addressed in Phase 3):**
+- JSON semantics inferred from multi-step paths (hack)
+- No schema validation of JSON structure
+- No `Ref<T>` traversal yet
+
 **What this phase does NOT include:**
 - `[filter]` syntax (for multi-valued traversals)
 - `->role` syntax (for relation-entities)  
 - `^Model.field` syntax (for inbound navigation)
 - Schema registry / PropertyId
 - Ref traversal across entities
-
-See: `phase-1a-parser-paths.md`, `phase-1b-json-type.md`, `phase-1c-structured-queries.md`
 
 ---
 

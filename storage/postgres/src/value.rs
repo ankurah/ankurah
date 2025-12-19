@@ -11,8 +11,9 @@ pub enum PGValue {
     BigInt(i64),
     DoublePrecision(f64),
     Boolean(bool),
-    // Text(String),
-    // Timestamp(chrono::DateTime<chrono::Utc>),
+    /// JSON value - stored as PostgreSQL's native jsonb type for query support.
+    /// Uses serde_json::Value for proper type conversion via tokio-postgres.
+    Jsonb(serde_json::Value),
 }
 
 impl PGValue {
@@ -25,6 +26,7 @@ impl PGValue {
             PGValue::DoublePrecision(_) => "float8",
             PGValue::Bytea(_) => "bytea",
             PGValue::Boolean(_) => "boolean",
+            PGValue::Jsonb(_) => "jsonb",
         }
     }
 }
@@ -41,6 +43,11 @@ impl From<Value> for PGValue {
             Value::EntityId(entity_id) => PGValue::CharacterVarying(entity_id.to_base64()),
             Value::Object(items) => PGValue::Bytea(items),
             Value::Binary(items) => PGValue::Bytea(items),
+            // Parse JSON bytes to serde_json::Value for PostgreSQL jsonb type
+            Value::Json(bytes) => {
+                let json_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::Value::Null);
+                PGValue::Jsonb(json_value)
+            }
         }
     }
 }

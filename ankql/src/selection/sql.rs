@@ -1,4 +1,4 @@
-use crate::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
+use crate::ast::{ComparisonOperator, Expr, Literal, Predicate};
 use crate::error::SqlGenerationError;
 use base64::{engine::general_purpose, Engine as _};
 
@@ -64,22 +64,17 @@ fn generate_expr_sql(
                 buffer.push('\'');
             }
         },
-        Expr::Identifier(id) => match id {
-            Identifier::Property(name) => {
+        Expr::Path(path) => {
+            // Output each step quoted and dot-separated: "a"."b"."c"
+            for (i, step) in path.steps.iter().enumerate() {
+                if i > 0 {
+                    buffer.push('.');
+                }
                 buffer.push('"');
-                buffer.push_str(name);
-                buffer.push('"');
-            }
-            Identifier::CollectionProperty(collection, name) => {
-                buffer.push('"');
-                buffer.push_str(collection);
-                buffer.push('"');
-                buffer.push('.');
-                buffer.push('"');
-                buffer.push_str(name);
+                buffer.push_str(step);
                 buffer.push('"');
             }
-        },
+        }
         Expr::ExprList(exprs) => {
             buffer.push('(');
             for (i, expr) in exprs.iter().enumerate() {
@@ -237,7 +232,7 @@ fn generate_selection_sql_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
+    use crate::ast::{ComparisonOperator, Expr, Literal, PathExpr, Predicate};
     use crate::error::SqlGenerationError;
     use crate::parser::parse_selection;
     use anyhow::Result;
@@ -348,7 +343,7 @@ mod tests {
     fn test_string_escaping() -> Result<()> {
         // Create a predicate with a string containing single quotes directly
         let predicate = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
+            left: Box::new(Expr::Path(PathExpr::simple("name"))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("O'Brien".to_string()))),
         };
@@ -361,7 +356,7 @@ mod tests {
     fn test_null_byte_handling() -> Result<()> {
         // Test that null bytes are removed for safety
         let predicate = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier::Property("data".to_string()))),
+            left: Box::new(Expr::Path(PathExpr::simple("data"))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("test\0data".to_string()))),
         };

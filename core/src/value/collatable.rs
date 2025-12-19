@@ -25,8 +25,8 @@ impl Collatable for Value {
             }
             Value::Bool(b) => vec![*b as u8],
             Value::EntityId(entity_id) => entity_id.to_bytes().to_vec(),
-            // For binary/object, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
-            Value::Object(bytes) | Value::Binary(bytes) => bytes.clone(),
+            // For binary/object/json, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
+            Value::Object(bytes) | Value::Binary(bytes) | Value::Json(bytes) => bytes.clone(),
         }
     }
 
@@ -87,7 +87,7 @@ impl Collatable for Value {
                 }
                 None // Overflow - already at maximum
             }
-            Value::Object(_) | Value::Binary(_) => None,
+            Value::Object(_) | Value::Binary(_) | Value::Json(_) => None,
         }
     }
 
@@ -155,7 +155,7 @@ impl Collatable for Value {
                     None // Should never reach here since we checked for zero above
                 }
             }
-            Value::Object(_) | Value::Binary(_) => None,
+            Value::Object(_) | Value::Binary(_) | Value::Json(_) => None,
         }
     }
 
@@ -168,7 +168,7 @@ impl Collatable for Value {
             Value::F64(f) => *f == f64::NEG_INFINITY,
             Value::Bool(b) => !b,
             Value::EntityId(entity_id) => entity_id.to_bytes() == [0u8; 16],
-            Value::Object(_) | Value::Binary(_) => false,
+            Value::Object(_) | Value::Binary(_) | Value::Json(_) => false,
         }
     }
 
@@ -181,7 +181,7 @@ impl Collatable for Value {
             Value::F64(f) => *f == f64::INFINITY,
             Value::Bool(b) => *b,
             Value::EntityId(entity_id) => entity_id.to_bytes() == [0xFFu8; 16],
-            Value::Object(_) | Value::Binary(_) => false,
+            Value::Object(_) | Value::Binary(_) | Value::Json(_) => false,
         }
     }
 }

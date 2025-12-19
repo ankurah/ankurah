@@ -1,5 +1,5 @@
 use crate::{KeyBounds, predicate::ConjunctFinder, types::*};
-use ankql::ast::{ComparisonOperator, Expr, Identifier, Predicate};
+use ankql::ast::{ComparisonOperator, Expr, Predicate};
 use ankurah_core::indexing::{IndexKeyPart, KeySpec};
 use ankurah_core::value::{Value, ValueType};
 use indexmap::IndexMap;
@@ -60,10 +60,8 @@ impl Planner {
                 plans.push(plan);
             }
             // If an ORDER BY field has inequalities (covered inequality), do NOT emit INEQ-FIRST
-            let covered_ineq = order_by.iter().any(|item| match &item.identifier {
-                Identifier::Property(name) => inequalities.contains_key(name),
-                _ => false,
-            });
+            let covered_ineq =
+                order_by.iter().any(|item| if item.path.is_simple() { inequalities.contains_key(item.path.first()) } else { false });
             if !covered_ineq
                 && !inequalities.is_empty()
                 && let Some(plan) = self.build_ineq_first_plan(&equalities, &inequalities, order_by, &conjuncts)
@@ -138,10 +136,11 @@ impl Planner {
         // Append ORDER BY fields per capability
         if self.config.supports_desc_indexes {
             for item in order_by {
-                if let Identifier::Property(name) = &item.identifier {
+                if item.path.is_simple() {
+                    let name = item.path.first();
                     index_keyparts.push(match item.direction {
-                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.clone(), ValueType::String),
-                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.clone(), ValueType::String),
+                        ankql::ast::OrderDirection::Asc => IndexKeyPart::asc(name.to_string(), ValueType::String),
+                        ankql::ast::OrderDirection::Desc => IndexKeyPart::desc(name.to_string(), ValueType::String),
                     });
                 }
             }
@@ -150,9 +149,10 @@ impl Planner {
             let first_dir = order_by[0].direction.clone();
             let mut broke = false;
             for item in order_by {
-                if let Identifier::Property(name) = &item.identifier {
+                if item.path.is_simple() {
+                    let name = item.path.first();
                     if !broke && item.direction == first_dir {
-                        index_keyparts.push(IndexKeyPart::asc(name.clone(), ValueType::String));
+                        index_keyparts.push(IndexKeyPart::asc(name.to_string(), ValueType::String));
                     } else {
                         broke = true;
                     }
@@ -161,9 +161,13 @@ impl Planner {
         }
 
         // Bounds: equalities + (optional) bounds on the first ORDER BY field that has inequalities
-        let applied_ineq = order_by.iter().find_map(|item| match &item.identifier {
-            Identifier::Property(name) => inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v)),
-            _ => None,
+        let applied_ineq = order_by.iter().find_map(|item| {
+            if item.path.is_simple() {
+                let name = item.path.first();
+                inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v))
+            } else {
+                None
+            }
         });
 
         let bounds = match applied_ineq {
@@ -193,7 +197,7 @@ impl Planner {
             let first_dir = order_by[0].direction.clone();
             let mut broke = false;
             for item in order_by {
-                if let Identifier::Property(_name) = &item.identifier {
+                if item.path.is_simple() {
                     if !broke && item.direction == first_dir {
                         continue;
                     } else {
@@ -218,9 +222,13 @@ impl Planner {
         // Pick primary inequality: prefer first OB field with ineq, else first ineq in map order
         let primary = order_by
             .iter()
-            .find_map(|item| match &item.identifier {
-                Identifier::Property(name) => inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v)),
-                _ => None,
+            .find_map(|item| {
+                if item.path.is_simple() {
+                    let name = item.path.first();
+                    inequalities.get_key_value(name).map(|(k, v)| (k.as_str(), v))
+                } else {
+                    None
+                }
             })
             .or_else(|| inequalities.iter().next().map(|(k, v)| (k.as_str(), v)))?;
 
@@ -257,10 +265,11 @@ impl Planner {
         covered.insert(primary.0);
         let mut order_by_spill = Vec::new();
         for item in order_by {
-            if let Identifier::Property(name) = &item.identifier
-                && !covered.contains(name.as_str())
-            {
-                order_by_spill.push(item.clone());
+            if item.path.is_simple() {
+                let name = item.path.first();
+                if !covered.contains(name) {
+                    order_by_spill.push(item.clone());
+                }
             }
         }
 
@@ -309,7 +318,7 @@ impl Planner {
             Predicate::Comparison { left, operator, right } => {
                 // Extract field name from left side
                 let field_name = match left.as_ref() {
-                    Expr::Identifier(Identifier::Property(name)) => name.clone(),
+                    Expr::Path(path) if path.is_simple() => path.first().to_string(),
                     _ => return None,
                 };
 
@@ -370,10 +379,11 @@ impl Planner {
                 equalities.iter().map(|(f, _)| f.as_str()).chain(std::iter::once(inequality_field)).collect();
 
             for item in order_by_items {
-                if let Identifier::Property(name) = &item.identifier
-                    && !covered_fields.contains(name.as_str())
-                {
-                    order_by_spill.push(item.clone());
+                if item.path.is_simple() {
+                    let name = item.path.first();
+                    if !covered_fields.contains(name) {
+                        order_by_spill.push(item.clone());
+                    }
                 }
             }
         }
@@ -683,20 +693,15 @@ impl Planner {
         // Determine scan direction and ORDER BY spill based on primary key ORDER BY
         let (scan_direction, order_by_spill) = if let Some(order_items) = order_by {
             if let Some(first_item) = order_items.first() {
-                if let ankql::ast::Identifier::Property(field_name) = &first_item.identifier {
-                    if field_name == primary_key {
-                        // Primary key ORDER BY is satisfied by scan direction
-                        let direction = match first_item.direction {
-                            ankql::ast::OrderDirection::Asc => ScanDirection::Forward,
-                            ankql::ast::OrderDirection::Desc => ScanDirection::Reverse,
-                        };
-                        (direction, order_items[1..].to_vec())
-                    } else {
-                        // Primary key not in ORDER BY, use forward scan and spill all
-                        (ScanDirection::Forward, order_items.clone())
-                    }
+                if first_item.path.is_simple() && first_item.path.first() == primary_key {
+                    // Primary key ORDER BY is satisfied by scan direction
+                    let direction = match first_item.direction {
+                        ankql::ast::OrderDirection::Asc => ScanDirection::Forward,
+                        ankql::ast::OrderDirection::Desc => ScanDirection::Reverse,
+                    };
+                    (direction, order_items[1..].to_vec())
                 } else {
-                    // Non-property ORDER BY, use forward scan and spill all
+                    // Primary key not in ORDER BY, use forward scan and spill all
                     (ScanDirection::Forward, order_items.clone())
                 }
             } else {
@@ -740,19 +745,11 @@ impl Planner {
     fn extract_primary_key_bound(&self, predicate: &Predicate, primary_key: &str) -> Option<KeyBoundComponent> {
         if let Predicate::Comparison { left, operator, right } = predicate {
             // Check if this is a primary key comparison
-            let (is_primary_key, value) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Identifier(Identifier::Property(name)), Expr::Literal(literal)) if name == primary_key => {
-                    (true, Value::from(literal))
-                }
-                (Expr::Literal(literal), Expr::Identifier(Identifier::Property(name))) if name == primary_key => {
-                    (true, Value::from(literal))
-                }
+            let value = match (left.as_ref(), right.as_ref()) {
+                (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
+                (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
                 _ => return None,
             };
-
-            if !is_primary_key {
-                return None;
-            }
 
             // Convert comparison operator to bounds
             let (low, high) = match operator {
@@ -849,7 +846,7 @@ impl Planner {
     fn is_primary_key_predicate(&self, predicate: &Predicate, primary_key: &str) -> bool {
         if let Predicate::Comparison { left, operator: _, right: _ } = predicate {
             match left.as_ref() {
-                Expr::Identifier(Identifier::Property(name)) => name == primary_key,
+                Expr::Path(path) if path.is_simple() => path.first() == primary_key,
                 _ => false,
             }
         } else {
@@ -861,9 +858,9 @@ impl Planner {
     fn has_primary_key_order_by(&self, order_by: &Option<Vec<ankql::ast::OrderByItem>>, primary_key: &str) -> bool {
         if let Some(order_items) = order_by
             && let Some(first_item) = order_items.first()
-            && let ankql::ast::Identifier::Property(field_name) = &first_item.identifier
+            && first_item.path.is_simple()
         {
-            return field_name == primary_key;
+            return first_item.path.first() == primary_key;
         }
         false
     }
@@ -874,7 +871,7 @@ impl Planner {
             if let Predicate::Comparison { left, operator, right: _ } = predicate {
                 // Check if this is a primary key comparison with supported operators
                 let is_primary_key_field = match left.as_ref() {
-                    Expr::Identifier(Identifier::Property(name)) => name == primary_key,
+                    Expr::Path(path) if path.is_simple() => path.first() == primary_key,
                     _ => false,
                 };
 
@@ -932,18 +929,12 @@ mod tests {
     }
     macro_rules! oby_asc {
         ($name:expr) => {
-            ankql::ast::OrderByItem {
-                identifier: ankql::ast::Identifier::Property($name.to_string()),
-                direction: ankql::ast::OrderDirection::Asc,
-            }
+            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Asc }
         };
     }
     macro_rules! oby_desc {
         ($name:expr) => {
-            ankql::ast::OrderByItem {
-                identifier: ankql::ast::Identifier::Property($name.to_string()),
-                direction: ankql::ast::OrderDirection::Desc,
-            }
+            ankql::ast::OrderByItem { path: ankql::ast::PathExpr::simple($name), direction: ankql::ast::OrderDirection::Desc }
         };
     }
 
@@ -1818,7 +1809,7 @@ mod tests {
                         scan_direction: ScanDirection::Forward,
                         bounds: bounds!("__collection" => ("album"..="album")),
                         remaining_predicate: Predicate::Comparison {
-                            left: Box::new(Expr::Identifier(Identifier::Property("year".to_string()))),
+                            left: Box::new(Expr::Path(ankql::ast::PathExpr::simple("year"))),
                             operator: ComparisonOperator::GreaterThanOrEqual,
                             right: Box::new(Expr::Literal(ankql::ast::Literal::String("2001".to_string()))),
                         },
@@ -1831,7 +1822,7 @@ mod tests {
                         bounds: bounds!("__collection" => ("album"..="album"), "year" => ("2001"..)),
                         remaining_predicate: Predicate::True,
                         order_by_spill: vec![ankql::ast::OrderByItem {
-                            identifier: ankql::ast::Identifier::Property("name".to_string()),
+                            path: ankql::ast::PathExpr::simple("name"),
                             direction: ankql::ast::OrderDirection::Asc,
                         }],
                     },

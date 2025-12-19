@@ -5,7 +5,7 @@ pub mod value;
 use ankurah_proto::EntityId;
 
 pub use traits::{FromActiveType, FromEntity, InitializeWith, PropertyError};
-pub use value::YrsString;
+pub use value::{Json, YrsString};
 
 use crate::value::Value;
 

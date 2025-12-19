@@ -4,5 +4,6 @@ mod common;
 mod edge_cases;
 mod inclusion_and_ordering;
 mod index_creation;
+mod json_property;
 mod normalization_tests;
 mod pagination;

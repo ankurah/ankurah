@@ -113,6 +113,8 @@ impl StorageEngine for Postgres {
             schema,
             collection_id: collection_id.clone(),
             columns: Arc::new(RwLock::new(Vec::new())),
+            #[cfg(debug_assertions)]
+            last_spilled_predicate: Arc::new(RwLock::new(None)),
         };
 
         // Acquire advisory lock to serialize DDL operations for this collection
@@ -178,12 +180,25 @@ pub struct PostgresBucket {
     collection_id: CollectionId,
     schema: String,
     columns: Arc<RwLock<Vec<PostgresColumn>>>,
+    /// Tracks the last predicate that spilled to post-filtering (debug builds only)
+    #[cfg(debug_assertions)]
+    last_spilled_predicate: Arc<RwLock<Option<ankql::ast::Predicate>>>,
 }
 
 impl PostgresBucket {
     fn state_table(&self) -> String { self.collection_id.as_str().to_string() }
 
     pub fn event_table(&self) -> String { format!("{}_event", self.collection_id.as_str()) }
+
+    /// Returns the last predicate that spilled to post-filtering (debug builds only).
+    ///
+    /// Use this in tests to verify queries are fully pushed down to PostgreSQL:
+    /// ```rust,ignore
+    /// let spilled = bucket.last_spilled_predicate();
+    /// assert!(spilled.is_none(), "Expected full pushdown, but got spill: {:?}", spilled);
+    /// ```
+    #[cfg(debug_assertions)]
+    pub fn last_spilled_predicate(&self) -> Option<ankql::ast::Predicate> { self.last_spilled_predicate.read().unwrap().clone() }
 
     /// Rebuild the cache of columns in the table.
     pub async fn rebuild_columns_cache(&self, client: &mut tokio_postgres::Client) -> Result<(), StateError> {
@@ -387,11 +402,11 @@ impl StorageCollection for PostgresBucket {
                     PGValue::DoublePrecision(float) => params.push(float),
                     PGValue::Bytea(bytes) => params.push(bytes),
                     PGValue::Boolean(bool) => params.push(bool),
+                    PGValue::Jsonb(json_val) => params.push(json_val),
                 },
                 None => params.push(&UntypedNull),
             }
         }
-
         let columns_str = columns.iter().map(|name| format!("\"{}\"", name)).collect::<Vec<String>>().join(", ");
         let values_str = params.iter().enumerate().map(|(index, _)| format!("${}", index + 1)).collect::<Vec<String>>().join(", ");
         let columns_update_str = columns
@@ -530,10 +545,44 @@ impl StorageCollection for PostgresBucket {
             selection.assume_null(&missing)
         };
 
+        // Split predicate into parts we can pushdown to PostgreSQL vs post-filter in Rust
+        let split = sql_builder::split_predicate_for_postgres(&effective_selection.predicate);
+        let needs_post_filter = split.needs_post_filter();
+        let remaining_predicate = split.remaining_predicate; // Cache before moving sql_predicate
+        debug!(
+            "PostgresBucket({}).fetch_states: SQL predicate: {:?}, remaining: {:?}, needs_post_filter: {}",
+            self.collection_id, split.sql_predicate, remaining_predicate, needs_post_filter
+        );
+
+        // Track spilled predicate for test assertions (debug builds only)
+        #[cfg(debug_assertions)]
+        {
+            let mut spilled = self.last_spilled_predicate.write().unwrap();
+            *spilled = if needs_post_filter { Some(remaining_predicate.clone()) } else { None };
+        }
+
+        // Track spilled predicate for test assertions (debug builds only)
+        #[cfg(debug_assertions)]
+        {
+            let spilled = if needs_post_filter { Some(remaining_predicate.clone()) } else { None };
+            *self.last_spilled_predicate.write().unwrap() = spilled;
+        }
+
+        // Build SQL with only the pushdown-capable predicate
+        let sql_selection = ankql::ast::Selection {
+            predicate: split.sql_predicate,
+            order_by: effective_selection.order_by.clone(),
+            limit: if needs_post_filter {
+                None // Can't limit in SQL if we need to post-filter (would drop valid results)
+            } else {
+                effective_selection.limit
+            },
+        };
+
         let mut results = Vec::new();
         let mut builder = SqlBuilder::with_fields(vec!["id", "state_buffer", "head", "attestations"]);
         builder.table_name(self.state_table());
-        builder.selection(&effective_selection)?;
+        builder.selection(&sql_selection)?;
 
         let (sql, args) = builder.build()?;
         debug!("PostgresBucket({}).fetch_states: SQL: {} with args: {:?}", self.collection_id, sql, args);
@@ -574,6 +623,25 @@ impl StorageCollection for PostgresBucket {
                 attestations: AttestationSet(attestations),
             });
         }
+
+        // Post-filter results if we have remaining predicate that couldn't be pushed down
+        let results = if needs_post_filter {
+            debug!(
+                "PostgresBucket({}).fetch_states: Post-filtering {} results with remaining predicate",
+                self.collection_id,
+                results.len()
+            );
+            let filtered = post_filter_states(&results, &remaining_predicate, &self.collection_id);
+
+            // Apply limit after post-filter if needed
+            if let Some(limit) = effective_selection.limit {
+                filtered.into_iter().take(limit as usize).collect()
+            } else {
+                filtered
+            }
+        } else {
+            results
+        };
 
         Ok(results)
     }
@@ -788,6 +856,44 @@ use bytes::BytesMut;
 use tokio_postgres::types::{to_sql_checked, IsNull, Type};
 
 use crate::sql_builder::SqlBuilder;
+
+/// Post-filter EntityStates using a predicate that couldn't be pushed to SQL.
+///
+/// This is the escape hatch for predicates that PostgreSQL can't handle natively,
+/// such as complex JSON traversals or future features like Ref traversal.
+fn post_filter_states(
+    states: &[Attested<EntityState>],
+    predicate: &ankql::ast::Predicate,
+    collection_id: &CollectionId,
+) -> Vec<Attested<EntityState>> {
+    use ankurah_core::entity::TemporaryEntity;
+    use ankurah_core::selection::filter::evaluate_predicate;
+
+    states
+        .iter()
+        .filter(|attested| {
+            // Create a TemporaryEntity for filtering (implements Filterable)
+            match TemporaryEntity::new(attested.payload.entity_id, collection_id.clone(), &attested.payload.state) {
+                Ok(temp_entity) => {
+                    // Evaluate the predicate
+                    match evaluate_predicate(&temp_entity, predicate) {
+                        Ok(true) => true,
+                        Ok(false) => false,
+                        Err(e) => {
+                            warn!("Post-filter evaluation error for entity {}: {}", attested.payload.entity_id, e);
+                            false // Exclude entities that fail evaluation
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create TemporaryEntity for post-filtering {}: {}", attested.payload.entity_id, e);
+                    false // Exclude entities we can't evaluate
+                }
+            }
+        })
+        .cloned()
+        .collect()
+}
 
 #[derive(Debug)]
 struct UntypedNull;

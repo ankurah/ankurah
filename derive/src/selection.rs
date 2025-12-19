@@ -305,17 +305,14 @@ fn generate_selection_code_with_replacements(
         let order_items: Vec<_> = order_by
             .iter()
             .map(|item| {
-                let identifier_code = generate_identifier_code(&item.identifier);
+                let steps: Vec<_> = item.path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
                 let direction_code = match item.direction {
                     ankql::ast::OrderDirection::Asc => quote! { ::ankql::ast::OrderDirection::Asc },
                     ankql::ast::OrderDirection::Desc => quote! { ::ankql::ast::OrderDirection::Desc },
                 };
                 quote! {
                     ::ankql::ast::OrderByItem {
-                        identifier: match #identifier_code {
-                            ::ankql::ast::Expr::Identifier(id) => id,
-                            _ => panic!("Expected identifier in order by"),
-                        },
+                        path: ::ankql::ast::PathExpr { steps: vec![#(#steps),*] },
                         direction: #direction_code,
                     }
                 }
@@ -370,8 +367,8 @@ fn generate_predicate_code_with_replacements(
 
             quote! {
                 ::ankql::ast::Predicate::Comparison {
-                    left: Box::new(::ankql::ast::Expr::Identifier(
-                        ::ankql::ast::Identifier::Property(#var_name.to_string())
+                    left: Box::new(::ankql::ast::Expr::Path(
+                        ::ankql::ast::PathExpr::simple(#var_name)
                     )),
                     operator: #op_code,
                     right: Box::new((#arg).into()),
@@ -443,7 +440,7 @@ fn generate_expr_code_with_replacements(
             quote! { (#arg).into() }
         }
         ankql::ast::Expr::Literal(lit) => generate_literal_code_with_replacements(lit, args, arg_index),
-        ankql::ast::Expr::Identifier(id) => generate_identifier_code(id),
+        ankql::ast::Expr::Path(path) => generate_path_code(path),
         ankql::ast::Expr::Predicate(pred) => {
             let pred_code = generate_predicate_code_with_replacements(pred, args, arg_index);
             quote! { ::ankql::ast::Expr::Predicate(#pred_code) }
@@ -562,20 +559,9 @@ fn tokens_to_template_string(tokens: &proc_macro2::TokenStream) -> String {
     result
 }
 
-fn generate_identifier_code(identifier: &ankql::ast::Identifier) -> proc_macro2::TokenStream {
-    match identifier {
-        ankql::ast::Identifier::Property(name) => {
-            quote! { ::ankql::ast::Expr::Identifier(::ankql::ast::Identifier::Property(#name.to_string())) }
-        }
-        ankql::ast::Identifier::CollectionProperty(collection, property) => {
-            quote! {
-                ::ankql::ast::Expr::Identifier(::ankql::ast::Identifier::CollectionProperty(
-                    #collection.to_string(),
-                    #property.to_string()
-                ))
-            }
-        }
-    }
+fn generate_path_code(path: &ankql::ast::PathExpr) -> proc_macro2::TokenStream {
+    let steps: Vec<_> = path.steps.iter().map(|s| quote! { #s.to_string() }).collect();
+    quote! { ::ankql::ast::Expr::Path(::ankql::ast::PathExpr { steps: vec![#(#steps),*] }) }
 }
 
 fn generate_comparison_op_code(operator: &ankql::ast::ComparisonOperator) -> proc_macro2::TokenStream {

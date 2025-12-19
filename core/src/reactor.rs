@@ -200,10 +200,8 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
 
     let read = resultset.read();
     for item in order_by {
-        let column = match &item.identifier {
-            ankql::ast::Identifier::Property(name) => name.clone(),
-            _ => return Err(anyhow::anyhow!("Collection properties not supported in ORDER BY")),
-        };
+        // Use the property name from the path (currently only simple paths are supported in ORDER BY)
+        let column = item.path.property().to_string();
 
         // Infer type from first non-null value in resultset entities
         let value_type = read.iter_entities().find_map(|(_, e)| e.value(&column).map(|v| ValueType::of(&v))).unwrap_or(ValueType::String); // TODO: Get type from system catalog instead of defaulting to String
