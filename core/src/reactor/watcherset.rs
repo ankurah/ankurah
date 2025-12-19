@@ -164,16 +164,12 @@ impl WatcherSet {
         watcher_id: (ReactorSubscriptionId, proto::QueryId), // Should this be a tuple of (subscription_id, query_id) or just subscription_id?
         op: WatcherOp,
     ) {
-        use ankql::ast::{Expr, Identifier, Predicate};
+        use ankql::ast::{Expr, Predicate};
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                if let (Expr::Identifier(field), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Identifier(field)) =
-                    (&**left, &**right)
-                {
-                    let field_name = match field {
-                        Identifier::Property(name) => name.clone(),
-                        Identifier::CollectionProperty(_, name) => name.clone(),
-                    };
+                if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
+                    // Use the property name (last step) for field indexing
+                    let field_name = path.property().to_string();
 
                     let field_id = FieldId(field_name);
                     let index = self.index_watchers.entry((collection_id.clone(), field_id)).or_default();

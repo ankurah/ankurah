@@ -30,7 +30,7 @@ fn next_upper_bound(value: &Value) -> Option<(Value, bool)> {
             bumped.push('\u{0000}');
             Some((Value::String(bumped), true))
         }
-        Value::Object(_) | Value::Binary(_) => None,
+        Value::Object(_) | Value::Binary(_) | Value::Json(_) => None,
     }
 }
 
@@ -285,10 +285,10 @@ fn values_to_js_array(values: &[Value]) -> Result<String> {
                 result.push_str(&entity_id.to_base64());
                 result.push('"');
             }
-            Value::Object(_) | Value::Binary(_) => {
+            Value::Object(_) | Value::Binary(_) | Value::Json(_) => {
                 // Same as idb_key_tuple: converts to ArrayBuffer
                 // For syntax generation, we can't easily represent this
-                return Err(anyhow::anyhow!("Object and Binary values not supported in key syntax generation: {:?}", value));
+                return Err(anyhow::anyhow!("Object, Binary and Json values not supported in key syntax generation: {:?}", value));
             }
         }
     }

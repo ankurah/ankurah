@@ -51,6 +51,10 @@ impl From<RetrievalError> for PropertyError {
     fn from(retrieval: RetrievalError) -> Self { PropertyError::RetrievalError(retrieval) }
 }
 
+impl From<serde_json::Error> for PropertyError {
+    fn from(e: serde_json::Error) -> Self { PropertyError::SerializeError(Box::new(e)) }
+}
+
 pub trait FromEntity {
     fn from_entity(property_name: PropertyName, entity: &Entity) -> Self;
 }

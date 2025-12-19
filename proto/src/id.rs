@@ -80,6 +80,19 @@ impl TryFrom<&String> for EntityId {
     fn try_from(id: &String) -> Result<Self, Self::Error> { Self::try_from(id.as_str()) }
 }
 
+impl std::str::FromStr for EntityId {
+    type Err = DecodeError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> { Self::from_base64(s) }
+}
+
+impl From<EntityId> for String {
+    fn from(id: EntityId) -> String { id.to_base64() }
+}
+
+impl From<&EntityId> for String {
+    fn from(id: &EntityId) -> String { id.to_base64() }
+}
+
 impl TryInto<EntityId> for Vec<u8> {
     type Error = DecodeError;
     fn try_into(self) -> Result<EntityId, Self::Error> {

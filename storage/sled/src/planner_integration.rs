@@ -310,7 +310,7 @@ pub fn encode_component_for_sled(value: &Value, descending: bool) -> Vec<u8> {
             }
             out
         }
-        Value::Object(bytes) | Value::Binary(bytes) => {
+        Value::Object(bytes) | Value::Binary(bytes) | Value::Json(bytes) => {
             if !descending {
                 // ASC: [0x50][escaped bytes][0x00]
                 let mut out = Vec::with_capacity(1 + bytes.len() + 1);

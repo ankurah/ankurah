@@ -23,6 +23,47 @@ pub enum Value {
     EntityId(proto::EntityId),
     Object(Vec<u8>),
     Binary(Vec<u8>),
+    /// JSON value - stored as jsonb in PostgreSQL for proper query support
+    Json(Vec<u8>),
+}
+
+impl Value {
+    /// Create a Json value from any serializable type.
+    pub fn json<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> {
+        Ok(Value::Json(serde_json::to_vec(value)?))
+    }
+
+    /// Parse this value as JSON into the target type.
+    /// Works for Json, Object, Binary (as bytes) and String variants.
+    /// Returns InvalidVariant error for numeric, bool, and EntityId types.
+    pub fn parse_as_json<T: serde::de::DeserializeOwned>(&self) -> Result<T, crate::property::PropertyError> {
+        match self {
+            Value::Json(bytes) | Value::Object(bytes) | Value::Binary(bytes) => {
+                Ok(serde_json::from_slice(bytes)?)
+            }
+            Value::String(s) => Ok(serde_json::from_str(s)?),
+            other => Err(crate::property::PropertyError::InvalidVariant {
+                given: other.clone(),
+                ty: std::any::type_name::<T>().to_string(),
+            }),
+        }
+    }
+
+    /// Parse this value as a string using FromStr.
+    /// Only works for Value::String variant.
+    /// Returns InvalidVariant error for other types.
+    pub fn parse_as_string<T: std::str::FromStr>(&self) -> Result<T, crate::property::PropertyError> {
+        match self {
+            Value::String(s) => s.parse().map_err(|_| crate::property::PropertyError::InvalidValue {
+                value: s.clone(),
+                ty: std::any::type_name::<T>().to_string(),
+            }),
+            other => Err(crate::property::PropertyError::InvalidVariant {
+                given: other.clone(),
+                ty: std::any::type_name::<T>().to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,6 +77,7 @@ pub enum ValueType {
     EntityId,
     Object,
     Binary,
+    Json,
 }
 
 impl ValueType {
@@ -50,6 +92,7 @@ impl ValueType {
             Value::EntityId(_) => ValueType::EntityId,
             Value::Object(_) => ValueType::Object,
             Value::Binary(_) => ValueType::Binary,
+            Value::Json(_) => ValueType::Json,
         }
     }
 }
@@ -66,6 +109,7 @@ impl Display for Value {
             Value::EntityId(entity_id) => write!(f, "{}", entity_id),
             Value::Object(object) => write!(f, "{:?}", object),
             Value::Binary(binary) => write!(f, "{:?}", binary),
+            Value::Json(json) => write!(f, "{}", String::from_utf8_lossy(json)),
         }
     }
 }
@@ -114,6 +158,7 @@ impl From<Value> for ankql::ast::Literal {
             Value::EntityId(entity_id) => ankql::ast::Literal::EntityId(entity_id.to_ulid()),
             Value::Object(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
             Value::Binary(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
+            Value::Json(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
         }
     }
 }
@@ -130,6 +175,7 @@ impl From<&Value> for ankql::ast::Literal {
             Value::EntityId(entity_id) => ankql::ast::Literal::EntityId(entity_id.to_ulid()),
             Value::Object(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
             Value::Binary(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
+            Value::Json(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
         }
     }
 }

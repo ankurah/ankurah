@@ -6,7 +6,7 @@ use ulid::Ulid;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Literal(Literal),
-    Identifier(Identifier),
+    Path(PathExpr),
     Predicate(Predicate),
     InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
     ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
@@ -26,10 +26,28 @@ pub enum Literal {
     Binary(Vec<u8>),
 }
 
+/// A dot-separated path like `name` or `licensing.territory`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Identifier {
-    Property(String),
-    CollectionProperty(String, String),
+pub struct PathExpr {
+    pub steps: Vec<String>,
+}
+
+impl PathExpr {
+    /// Create a single-step path
+    pub fn simple(name: impl Into<String>) -> Self { Self { steps: vec![name.into()] } }
+
+    /// Check if this is a single-step path
+    pub fn is_simple(&self) -> bool { self.steps.len() == 1 }
+
+    /// Get the first step (always exists)
+    pub fn first(&self) -> &str { &self.steps[0] }
+
+    /// Get the property name (last step)
+    pub fn property(&self) -> &str { self.steps.last().expect("PathExpr must have at least one step") }
+}
+
+impl std::fmt::Display for PathExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.steps.join(".")) }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,20 +59,16 @@ pub struct Selection {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderByItem {
-    pub identifier: Identifier,
+    pub path: PathExpr,
     pub direction: OrderDirection,
 }
 
 impl std::fmt::Display for OrderByItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let field = match &self.identifier {
-            Identifier::Property(prop) => prop.clone(),
-            Identifier::CollectionProperty(coll, prop) => format!("{}.{}", coll, prop),
-        };
         write!(
             f,
             "{} {}",
-            field,
+            self.path,
             match self.direction {
                 OrderDirection::Asc => "ASC",
                 OrderDirection::Desc => "DESC",
@@ -122,11 +136,9 @@ impl Selection {
             items
                 .iter()
                 .filter(|item| {
-                    let col_name = match &item.identifier {
-                        Identifier::Property(name) => name,
-                        Identifier::CollectionProperty(_, name) => name,
-                    };
-                    !columns.contains(col_name)
+                    // Use the property name (last step) for column matching
+                    let col_name = item.path.property();
+                    !columns.contains(&col_name.to_string())
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -137,15 +149,15 @@ impl Selection {
         Self { predicate: self.predicate.assume_null(columns), order_by, limit: self.limit }
     }
 
-    /// Collect all column names referenced in this selection (WHERE + ORDER BY)
+    /// Collect all column names referenced in this selection (WHERE + ORDER BY).
+    /// For JSON paths like `licensing.territory`, returns the column name (`licensing`),
+    /// not the JSON path step (`territory`).
     pub fn referenced_columns(&self) -> Vec<String> {
         let mut columns = self.predicate.referenced_columns();
         if let Some(order_by) = &self.order_by {
             for item in order_by {
-                let col = match &item.identifier {
-                    Identifier::Property(name) => name.clone(),
-                    Identifier::CollectionProperty(_, name) => name.clone(),
-                };
+                // Use first step for column reference (actual PostgreSQL column name)
+                let col = item.path.first().to_string();
                 if !columns.contains(&col) {
                     columns.push(col);
                 }
@@ -170,17 +182,18 @@ impl Predicate {
         }
     }
 
-    /// Collect all column names referenced in this predicate
+    /// Collect all column names referenced in this predicate.
+    /// For JSON paths like `licensing.territory`, returns the column name (`licensing`),
+    /// not the JSON path step (`territory`).
     pub fn referenced_columns(&self) -> Vec<String> {
         self.walk(Vec::new(), &mut |mut cols, pred| {
             match pred {
                 Predicate::Comparison { left, right, .. } => {
                     for expr in [&**left, &**right] {
-                        if let Expr::Identifier(id) = expr {
-                            let col = match id {
-                                Identifier::Property(name) => name.clone(),
-                                Identifier::CollectionProperty(_, name) => name.clone(),
-                            };
+                        if let Expr::Path(path) = expr {
+                            // Use first step for column reference (actual PostgreSQL column name)
+                            // For `licensing.territory`, the column is `licensing`
+                            let col = path.first().to_string();
                             if !cols.contains(&col) {
                                 cols.push(col);
                             }
@@ -188,11 +201,8 @@ impl Predicate {
                     }
                 }
                 Predicate::IsNull(expr) => {
-                    if let Expr::Identifier(id) = &**expr {
-                        let col = match id {
-                            Identifier::Property(name) => name.clone(),
-                            Identifier::CollectionProperty(_, name) => name.clone(),
-                        };
+                    if let Expr::Path(path) = &**expr {
+                        let col = path.first().to_string();
                         if !cols.contains(&col) {
                             cols.push(col);
                         }
@@ -208,16 +218,13 @@ impl Predicate {
     pub fn assume_null(&self, columns: &[String]) -> Self {
         match self {
             Predicate::Comparison { left, operator, right } => {
-                // Check if either side is an identifier that's in our null list
-                let has_null_identifier = match (&**left, &**right) {
-                    (Expr::Identifier(id), _) | (_, Expr::Identifier(id)) => match id {
-                        Identifier::Property(name) => columns.contains(name),
-                        Identifier::CollectionProperty(_, name) => columns.contains(name),
-                    },
+                // Check if either side is a path whose property is in our null list
+                let has_null_path = match (&**left, &**right) {
+                    (Expr::Path(path), _) | (_, Expr::Path(path)) => columns.contains(&path.property().to_string()),
                     _ => false,
                 };
 
-                if has_null_identifier {
+                if has_null_path {
                     match operator {
                         // NULL = anything is false
                         ComparisonOperator::Equal => Predicate::False,
@@ -237,19 +244,16 @@ impl Predicate {
                         ComparisonOperator::Between => Predicate::False,
                     }
                 } else {
-                    // No NULL identifiers, keep the comparison as is
+                    // No NULL paths, keep the comparison as is
                     Predicate::Comparison { left: left.clone(), operator: operator.clone(), right: right.clone() }
                 }
             }
             Predicate::IsNull(expr) => {
-                // If we're explicitly checking for NULL and the identifier is in our null list,
+                // If we're explicitly checking for NULL and the path's property is in our null list,
                 // then this evaluates to true
                 match &**expr {
-                    Expr::Identifier(id) => {
-                        let is_null = match id {
-                            Identifier::Property(name) => columns.contains(name),
-                            Identifier::CollectionProperty(_, name) => columns.contains(name),
-                        };
+                    Expr::Path(path) => {
+                        let is_null = columns.contains(&path.property().to_string());
                         if is_null {
                             Predicate::True
                         } else {
@@ -364,7 +368,7 @@ impl Expr {
                 None => Err(ParseError::InvalidPredicate("Not enough values provided for placeholders".to_string())),
             },
             Expr::Literal(lit) => Ok(Expr::Literal(lit)),
-            Expr::Identifier(id) => Ok(Expr::Identifier(id)),
+            Expr::Path(path) => Ok(Expr::Path(path)),
             Expr::Predicate(pred) => Ok(Expr::Predicate(pred.populate_recursive(values)?)),
             Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
                 left: Box::new(left.populate_recursive(values)?),
@@ -439,7 +443,7 @@ mod tests {
         let populated = selection.predicate.populate(vec!["Alice"]).unwrap();
 
         let expected = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
+            left: Box::new(Expr::Path(PathExpr::simple("name".to_string()))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String("Alice".to_string()))),
         };
@@ -455,12 +459,12 @@ mod tests {
 
         let expected = Predicate::And(
             Box::new(Predicate::Comparison {
-                left: Box::new(Expr::Identifier(Identifier::Property("age".to_string()))),
+                left: Box::new(Expr::Path(PathExpr::simple("age".to_string()))),
                 operator: ComparisonOperator::GreaterThan,
                 right: Box::new(Expr::Literal(Literal::I64(25))),
             }),
             Box::new(Predicate::Comparison {
-                left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
+                left: Box::new(Expr::Path(PathExpr::simple("name".to_string()))),
                 operator: ComparisonOperator::Equal,
                 right: Box::new(Expr::Literal(Literal::String("Bob".to_string()))),
             }),
@@ -475,7 +479,7 @@ mod tests {
         let populated = selection.predicate.populate(vec!["active", "pending", "review"]).unwrap();
 
         let expected = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier::Property("status".to_string()))),
+            left: Box::new(Expr::Path(PathExpr::simple("status".to_string()))),
             operator: ComparisonOperator::In,
             right: Box::new(Expr::ExprList(vec![
                 Expr::Literal(Literal::String("active".to_string())),

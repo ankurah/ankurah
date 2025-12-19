@@ -28,6 +28,7 @@ pub mod collectionset;
 pub mod schema;
 pub use model::Model;
 pub use node::Node;
+pub use property::Json;
 
 pub use ankurah_proto as proto;
 pub use ankurah_proto::EntityId;

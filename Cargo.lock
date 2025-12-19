@@ -254,6 +254,7 @@ dependencies = [
  "bincode",
  "bytes",
  "futures-util",
+ "serde_json",
  "thiserror 2.0.17",
  "tokio",
  "tokio-postgres",
@@ -2412,6 +2413,8 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

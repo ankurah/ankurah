@@ -1,4 +1,4 @@
-use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, OrderByItem, OrderDirection, Predicate, Selection};
+use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, PathExpr, Predicate, Selection};
 use ankurah::{policy::DEFAULT_CONTEXT as c, proto::EntityId, Model, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -34,7 +34,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 1: Simple ORDER BY id ASC with LIMIT (should use optimization)
     let selection_asc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { identifier: Identifier::Property("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -55,7 +55,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 2: ORDER BY id DESC (should use FullScan reverse + skip sorting)
     let selection_desc = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { identifier: Identifier::Property("id".to_string()), direction: OrderDirection::Desc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Desc }]),
         limit: Some(3),
     };
 
@@ -72,7 +72,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Test 3: ORDER BY name (should require in-memory sorting, no optimization)
     let selection_name = Selection {
         predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { identifier: Identifier::Property("name".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("name".to_string()), direction: OrderDirection::Asc }]),
         limit: Some(5),
     };
 
@@ -112,11 +112,11 @@ async fn test_id_range_with_where_clause() -> Result<()> {
     // Query with WHERE id >= start_id ORDER BY id
     let selection = Selection {
         predicate: Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
+            left: Box::new(Expr::Path(PathExpr::simple("id".to_string()))),
             operator: ComparisonOperator::GreaterThanOrEqual,
             right: Box::new(Expr::Literal(Literal::String(start_id.to_base64()))),
         },
-        order_by: Some(vec![OrderByItem { identifier: Identifier::Property("id".to_string()), direction: OrderDirection::Asc }]),
+        order_by: Some(vec![OrderByItem { path: PathExpr::simple("id".to_string()), direction: OrderDirection::Asc }]),
         limit: Some(3),
     };
 

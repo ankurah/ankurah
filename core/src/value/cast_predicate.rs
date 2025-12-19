@@ -11,14 +11,24 @@ pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &
             // Handle both cases: field = literal AND literal = field
             match (left.as_ref(), right.as_ref()) {
                 // Case 1: field = literal (cast literal to field type)
-                (Expr::Identifier(identifier), Expr::Literal(literal)) => {
-                    let target_type = schema.field_type(identifier)?;
+                (Expr::Path(path), Expr::Literal(literal)) => {
+                    // Skip casting for multi-step paths (JSON traversals) - the filter handles
+                    // dynamic type comparison for JSON fields. This is a HACK until we have
+                    // proper schema metadata for JSON properties (Phase 3 - Schema Registry).
+                    if !path.is_simple() {
+                        return Ok(Predicate::Comparison { left, operator, right });
+                    }
+                    let target_type = schema.field_type(path)?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left, operator, right: Box::new(cast_literal) })
                 }
                 // Case 2: literal = field (cast literal to field type)
-                (Expr::Literal(literal), Expr::Identifier(identifier)) => {
-                    let target_type = schema.field_type(identifier)?;
+                (Expr::Literal(literal), Expr::Path(path)) => {
+                    // Skip casting for multi-step paths (JSON traversals) - see comment above
+                    if !path.is_simple() {
+                        return Ok(Predicate::Comparison { left, operator, right });
+                    }
+                    let target_type = schema.field_type(path)?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left: Box::new(cast_literal), operator, right })
                 }
@@ -46,7 +56,7 @@ pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &
 fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, RetrievalError> {
     match expr {
         Expr::Literal(literal) => Ok(Expr::Literal(literal)), // Literals are cast in context
-        Expr::Identifier(identifier) => Ok(Expr::Identifier(identifier)),
+        Expr::Path(path) => Ok(Expr::Path(path)),
         Expr::Predicate(predicate) => Ok(Expr::Predicate(cast_predicate_types(predicate, schema)?)),
         Expr::InfixExpr { left, operator, right } => Ok(Expr::InfixExpr {
             left: Box::new(cast_expr_types(*left, schema)?),
@@ -74,23 +84,19 @@ fn cast_literal_to_type(literal: Literal, target_type: ValueType) -> Result<Expr
 mod tests {
     use super::*;
     use crate::property::PropertyError;
-    use ankql::ast::{ComparisonOperator, Identifier};
+    use ankql::ast::{ComparisonOperator, PathExpr};
     use ankurah_proto::EntityId;
 
     // Test schema implementation
     struct TestSchema;
 
     impl CollectionSchema for TestSchema {
-        fn field_type(&self, identifier: &Identifier) -> Result<ValueType, PropertyError> {
-            match identifier {
-                Identifier::Property(name) => match name.as_str() {
-                    "id" => Ok(ValueType::EntityId),
-                    _ => Ok(ValueType::String),
-                },
-                Identifier::CollectionProperty(_collection, property) => match property.as_str() {
-                    "id" => Ok(ValueType::EntityId),
-                    _ => Ok(ValueType::String),
-                },
+        fn field_type(&self, path: &PathExpr) -> Result<ValueType, PropertyError> {
+            // Use property name (last step) for type lookup
+            let property_name = path.property();
+            match property_name {
+                "id" => Ok(ValueType::EntityId),
+                _ => Ok(ValueType::String),
             }
         }
     }
@@ -102,7 +108,7 @@ mod tests {
 
         // Create a predicate: id = "base64_string"
         let predicate = Predicate::Comparison {
-            left: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
+            left: Box::new(Expr::Path(PathExpr::simple("id"))),
             operator: ComparisonOperator::Equal,
             right: Box::new(Expr::Literal(Literal::String(base64_str.clone()))),
         };
@@ -131,7 +137,7 @@ mod tests {
         let predicate = Predicate::Comparison {
             left: Box::new(Expr::Literal(Literal::String(base64_str.clone()))),
             operator: ComparisonOperator::Equal,
-            right: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
+            right: Box::new(Expr::Path(PathExpr::simple("id"))),
         };
 
         let schema = TestSchema;
@@ -157,12 +163,12 @@ mod tests {
         // Create a complex predicate: id = "base64_string" AND name = "test"
         let predicate = Predicate::And(
             Box::new(Predicate::Comparison {
-                left: Box::new(Expr::Identifier(Identifier::Property("id".to_string()))),
+                left: Box::new(Expr::Path(PathExpr::simple("id"))),
                 operator: ComparisonOperator::Equal,
                 right: Box::new(Expr::Literal(Literal::String(base64_str.clone()))),
             }),
             Box::new(Predicate::Comparison {
-                left: Box::new(Expr::Identifier(Identifier::Property("name".to_string()))),
+                left: Box::new(Expr::Path(PathExpr::simple("name"))),
                 operator: ComparisonOperator::Equal,
                 right: Box::new(Expr::Literal(Literal::String("test".to_string()))),
             }),

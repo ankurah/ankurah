@@ -17,7 +17,7 @@ mod tests {
             rule: Rule::Selection,
             tokens: [
                 Expr(0, 3, [
-                    IdentifierWithOptionalContinuation(0, 1,[Identifier(0, 1)]),
+                    PathExpr(0, 1, [Identifier(0, 1)]),
                     Eq(1, 2),
                     Unsigned(2, 3)
                 ])
@@ -26,7 +26,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identifier_comparison() {
+    fn test_path_comparison() {
         let parser = AnkqlParser::parse(Rule::Selection, "a.foo = b.foo").unwrap();
         println!("{:#?}", parser);
         parses_to! {
@@ -35,9 +35,9 @@ mod tests {
             rule: Rule::Selection,
             tokens: [
                 Expr(0, 13, [
-                    IdentifierWithOptionalContinuation(0, 5,[Identifier(0, 1), ReferenceContinuation(1, 5, [Identifier(2, 5)])]),
+                    PathExpr(0, 5, [Identifier(0, 1), Identifier(2, 5)]),
                     Eq(6, 7),
-                    IdentifierWithOptionalContinuation(8, 13, [Identifier(8, 9), ReferenceContinuation(9, 13, [Identifier(10, 13)])])
+                    PathExpr(8, 13, [Identifier(8, 9), Identifier(10, 13)])
                 ])
             ]
         };
@@ -47,26 +47,26 @@ mod tests {
     fn test_boolean_expression() {
         let parser = AnkqlParser::parse(Rule::Selection, "a.foo = b.foo AND a.bar > 1 OR b.bar > 1").unwrap();
         println!("{:#?}", parser);
-        // parses_to! {
-        //     parser: AnkqlParser,
-        //     input: "a.foo = b.foo AND a.bar > 1 OR b.bar > 1",
-        //     rule: Rule::Selection,
-        //     tokens: [
-        //             Expr(0, 40, [
-        //                 IdentifierWithOptionalContinuation(0, 5, [Identifier(0, 1), ReferenceContinuation(1, 5, [Identifier(2, 5)])]),
-        //                 Eq(6, 7),
-        //                 IdentifierWithOptionalContinuation(8, 13, [Identifier(8, 9), ReferenceContinuation(9, 13, [Identifier(10, 13)])]),
-        //                 And(14, 17),
-        //                 IdentifierWithOptionalContinuation(18, 23, [Identifier(18, 19), ReferenceContinuation(19, 23, [Identifier(20, 23)])]),
-        //                 Gt(24, 25),
-        //                 Unsigned(26, 27),
-        //                 Or(28, 30),
-        //                 IdentifierWithOptionalContinuation(31, 36, [Identifier(31, 32), ReferenceContinuation(32, 36, [Identifier(33, 36)])]),
-        //                 Gt(37, 38),
-        //                 Unsigned(39, 40)
-        //             ])
-        //     ]
-        // };
+        parses_to! {
+            parser: AnkqlParser,
+            input: "a.foo = b.foo AND a.bar > 1 OR b.bar > 1",
+            rule: Rule::Selection,
+            tokens: [
+                    Expr(0, 40, [
+                        PathExpr(0, 5, [Identifier(0, 1), Identifier(2, 5)]),
+                        Eq(6, 7),
+                        PathExpr(8, 13, [Identifier(8, 9), Identifier(10, 13)]),
+                        And(14, 17),
+                        PathExpr(18, 23, [Identifier(18, 19), Identifier(20, 23)]),
+                        Gt(24, 25),
+                        Unsigned(26, 27),
+                        Or(28, 30),
+                        PathExpr(31, 36, [Identifier(31, 32), Identifier(33, 36)]),
+                        Gt(37, 38),
+                        Unsigned(39, 40)
+                    ])
+            ]
+        };
     }
 
     #[test]
@@ -79,17 +79,17 @@ mod tests {
                     Expr(0, 42, [
                         ExpressionInParentheses(0, 29, [
                             Expr(1, 28, [
-                                IdentifierWithOptionalContinuation(1, 6, [Identifier(1, 2), ReferenceContinuation(2, 6, [Identifier(3, 6)])]),
+                                PathExpr(1, 6, [Identifier(1, 2), Identifier(3, 6)]),
                                 Eq(7, 8),
-                                IdentifierWithOptionalContinuation(9, 14, [Identifier(9, 10), ReferenceContinuation(10, 14, [Identifier(11, 14)])]),
+                                PathExpr(9, 14, [Identifier(9, 10), Identifier(11, 14)]),
                                 And(15, 18),
-                                IdentifierWithOptionalContinuation(19, 24, [Identifier(19, 20), ReferenceContinuation(20, 24, [Identifier(21, 24)])]),
+                                PathExpr(19, 24, [Identifier(19, 20), Identifier(21, 24)]),
                                 Gt(25, 26),
                                 Unsigned(27, 28)
                             ])
                         ]),
                         Or(30, 32),
-                        IdentifierWithOptionalContinuation(33, 38, [Identifier(33, 34), ReferenceContinuation(34, 38, [Identifier(35, 38)])]),
+                        PathExpr(33, 38, [Identifier(33, 34), Identifier(35, 38)]),
                         Gt(39, 40),
                         Unsigned(41, 42)
                     ])
@@ -144,7 +144,7 @@ mod tests {
             rule: Rule::Selection,
             tokens: [
                 Expr(0, 18, [
-                    IdentifierWithOptionalContinuation(0, 7, [Identifier(0, 6)]),
+                    PathExpr(0, 7, [Identifier(0, 6)]),
                     Eq(7, 8),
                     SingleQuotedString(9, 17)
                 ]),
@@ -180,7 +180,7 @@ mod tests {
             rule: Rule::Selection,
             tokens: [
                 Expr(0, 9, [
-                    IdentifierWithOptionalContinuation(0, 6, [Identifier(0, 5)]),
+                    PathExpr(0, 6, [Identifier(0, 5)]),
                     Eq(6, 7),
                     Unsigned(8, 9)
                 ])
@@ -193,7 +193,7 @@ mod tests {
             rule: Rule::Selection,
             tokens: [
                 Expr(0, 10, [
-                    IdentifierWithOptionalContinuation(0, 6, [Identifier(0, 5)]),
+                    PathExpr(0, 6, [Identifier(0, 5)]),
                     Eq(6, 7),
                     Unsigned(8, 9)
                 ]),

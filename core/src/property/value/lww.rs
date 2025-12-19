@@ -94,6 +94,8 @@ where T: Clone + Send + Sync + 'static
 #[cfg(feature = "wasm")]
 pub mod wasm {
     //! WASM wrapper types for LWW backend
+    use super::*;
+    use crate::property::Json;
     use ankurah_derive::impl_provided_wrapper_types;
     impl_provided_wrapper_types!("src/property/value/lww.ron");
 }

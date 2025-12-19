@@ -6,10 +6,7 @@ use std::collections::BinaryHeap;
 fn sort_items_by_order<T: Filterable>(items: &mut [T], order_by: &[ankql::ast::OrderByItem]) {
     items.sort_by(|a, b| {
         for order_item in order_by {
-            let property_name = match &order_item.identifier {
-                ankql::ast::Identifier::Property(name) => name,
-                ankql::ast::Identifier::CollectionProperty(_, name) => name,
-            };
+            let property_name = order_item.path.property();
 
             let a_val = a.value(property_name);
             let b_val = b.value(property_name);
@@ -164,10 +161,7 @@ impl<T: Filterable> Ord for HeapItem<T> {
         // BinaryHeap is a max-heap, but we want min-heap behavior for TopK
         // So we reverse the comparison to get the smallest items at the top
         for order_item in &self.order_by {
-            let property_name = match &order_item.identifier {
-                ankql::ast::Identifier::Property(name) => name,
-                ankql::ast::Identifier::CollectionProperty(_, name) => name,
-            };
+            let property_name = order_item.path.property();
 
             let self_val = self.item.value(property_name);
             let other_val = other.item.value(property_name);

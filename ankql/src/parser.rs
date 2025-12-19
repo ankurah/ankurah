@@ -194,10 +194,10 @@ fn create_logical_op(
     }))
 }
 
-/// Parse an atomic expression, which can be an identifier, literal, or parenthesized expression
+/// Parse an atomic expression, which can be a path, literal, or parenthesized expression
 fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
     match pair.as_rule() {
-        grammar::Rule::IdentifierWithOptionalContinuation => parse_identifier(pair),
+        grammar::Rule::PathExpr => parse_path_expr(pair),
         grammar::Rule::SingleQuotedString => parse_string_literal(pair),
         grammar::Rule::True => Ok(ast::Expr::Literal(ast::Literal::Bool(true))),
         grammar::Rule::False => Ok(ast::Expr::Literal(ast::Literal::Bool(false))),
@@ -224,38 +224,20 @@ fn parse_atomic_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError>
     }
 }
 
-/// Parse an identifier, which can be a simple name or a dotted path
-fn parse_identifier(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
-    if pair.as_rule() != grammar::Rule::IdentifierWithOptionalContinuation {
-        return Err(ParseError::UnexpectedRule { expected: "IdentifierWithOptionalContinuation", got: pair.as_rule() });
+/// Parse a path expression (dot-separated identifiers like `name` or `licensing.territory`)
+fn parse_path_expr(pair: Pair<grammar::Rule>) -> Result<ast::Expr, ParseError> {
+    if pair.as_rule() != grammar::Rule::PathExpr {
+        return Err(ParseError::UnexpectedRule { expected: "PathExpr", got: pair.as_rule() });
     }
 
-    let mut ident_parts = pair.into_inner();
-    let ident = ident_parts.next().ok_or(ParseError::InvalidPredicate("Empty identifier parts".into()))?;
+    let steps: Vec<String> =
+        pair.into_inner().filter(|p| p.as_rule() == grammar::Rule::Identifier).map(|p| p.as_str().trim().to_string()).collect();
 
-    if ident.as_rule() != grammar::Rule::Identifier {
-        return Err(ParseError::UnexpectedRule { expected: "Identifier", got: ident.as_rule() });
+    if steps.is_empty() {
+        return Err(ParseError::InvalidPredicate("Empty path expression".into()));
     }
 
-    let collection = ident.as_str().trim().to_string();
-
-    // Check if we have a ReferenceContinuation
-    if let Some(ref_cont) = ident_parts.next() {
-        if ref_cont.as_rule() != grammar::Rule::ReferenceContinuation {
-            return Err(ParseError::UnexpectedRule { expected: "ReferenceContinuation", got: ref_cont.as_rule() });
-        }
-
-        // Get the property name from the ReferenceContinuation
-        let property = ref_cont.into_inner().next().ok_or(ParseError::InvalidPredicate("Empty reference continuation".into()))?;
-
-        if property.as_rule() != grammar::Rule::Identifier {
-            return Err(ParseError::UnexpectedRule { expected: "Identifier", got: property.as_rule() });
-        }
-
-        Ok(ast::Expr::Identifier(ast::Identifier::CollectionProperty(collection, property.as_str().trim().to_string())))
-    } else {
-        Ok(ast::Expr::Identifier(ast::Identifier::Property(collection)))
-    }
+    Ok(ast::Expr::Path(ast::PathExpr { steps }))
 }
 
 /// Parse a string literal, removing the surrounding quotes
@@ -347,7 +329,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
         return Err(ParseError::InvalidPredicate("Dotted identifiers are not supported in ORDER BY clauses".into()));
     }
 
-    let identifier = ast::Identifier::Property(identifier_str.to_string());
+    let path = ast::PathExpr::simple(identifier_str);
 
     let direction = inner_pairs
         .iter()
@@ -360,7 +342,7 @@ fn parse_order_by_item(pair: Pair<grammar::Rule>) -> Result<ast::OrderByItem, Pa
         .transpose()?
         .unwrap_or(ast::OrderDirection::Asc); // Default
 
-    Ok(ast::OrderByItem { identifier, direction })
+    Ok(ast::OrderByItem { path, direction })
 }
 
 #[cfg(test)]
@@ -375,7 +357,7 @@ mod tests {
             selection,
             ast::Selection {
                 predicate: ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                    left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
                     right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
                 },
@@ -394,12 +376,12 @@ mod tests {
             ast::Selection {
                 predicate: ast::Predicate::And(
                     Box::new(ast::Predicate::Comparison {
-                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
+                        left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
                         right: Box::new(ast::Expr::Literal(ast::Literal::I32(123)))
                     }),
                     Box::new(ast::Predicate::Comparison {
-                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                        left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
                         right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
                     })
@@ -419,18 +401,18 @@ mod tests {
             ast::Predicate::And(
                 Box::new(ast::Predicate::Or(
                     Box::new(ast::Predicate::Comparison {
-                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
+                        left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
                         right: Box::new(ast::Expr::Literal(ast::Literal::I32(123)))
                     }),
                     Box::new(ast::Predicate::Comparison {
-                        left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user".to_string()))),
+                        left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user".to_string()))),
                         operator: ast::ComparisonOperator::Equal,
                         right: Box::new(ast::Expr::Literal(ast::Literal::I32(456)))
                     })
                 )),
                 Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                    left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
                     right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
                 })
@@ -442,10 +424,7 @@ mod tests {
     fn test_parse_selection_status_is_null() {
         let input = r#"status IS NULL"#;
         let selection = parse_selection(input).unwrap();
-        assert_eq!(
-            selection.predicate,
-            ast::Predicate::IsNull(Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))))
-        );
+        assert_eq!(selection.predicate, ast::Predicate::IsNull(Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string())))));
     }
 
     #[test]
@@ -454,9 +433,7 @@ mod tests {
         let selection = parse_selection(input).unwrap();
         assert_eq!(
             selection.predicate,
-            ast::Predicate::Not(Box::new(ast::Predicate::IsNull(Box::new(ast::Expr::Identifier(ast::Identifier::Property(
-                "status".to_string()
-            ))))))
+            ast::Predicate::Not(Box::new(ast::Predicate::IsNull(Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))))))
         );
     }
 
@@ -467,7 +444,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Not(Box::new(ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
                 right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
             }))
@@ -505,7 +482,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::In,
                 right: Box::new(ast::Expr::ExprList(vec![
                     ast::Expr::Literal(ast::Literal::String("active".to_string())),
@@ -522,7 +499,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user_id".to_string()))),
                 operator: ast::ComparisonOperator::In,
                 right: Box::new(ast::Expr::ExprList(vec![
                     ast::Expr::Literal(ast::Literal::I32(1)),
@@ -540,7 +517,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
                 right: Box::new(ast::Expr::Literal(ast::Literal::Bool(true)))
             }
@@ -554,7 +531,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("bool_field".to_string()))),
                 operator: ast::ComparisonOperator::NotEqual,
                 right: Box::new(ast::Expr::Literal(ast::Literal::Bool(false)))
             }
@@ -570,7 +547,7 @@ mod tests {
             ast::Predicate::Comparison {
                 left: Box::new(ast::Expr::Literal(ast::Literal::Bool(false))),
                 operator: ast::ComparisonOperator::NotEqual,
-                right: Box::new(ast::Expr::Identifier(ast::Identifier::Property("bool_field".to_string())))
+                right: Box::new(ast::Expr::Path(ast::PathExpr::simple("bool_field".to_string())))
             }
         );
     }
@@ -581,7 +558,7 @@ mod tests {
         assert_eq!(
             parse_selection("user_id = ?")?.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user_id".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
                 right: Box::new(ast::Expr::Placeholder)
             }
@@ -592,12 +569,12 @@ mod tests {
             parse_selection("user_id = ? AND status = ?")?.predicate,
             ast::Predicate::And(
                 Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                    left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user_id".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
                     right: Box::new(ast::Expr::Placeholder)
                 }),
                 Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                    left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
                     right: Box::new(ast::Expr::Placeholder)
                 })
@@ -608,7 +585,7 @@ mod tests {
         assert_eq!(
             parse_selection("status IN (?, ?, ?)")?.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::In,
                 right: Box::new(ast::Expr::ExprList(vec![ast::Expr::Placeholder, ast::Expr::Placeholder, ast::Expr::Placeholder,]))
             }
@@ -635,7 +612,7 @@ mod tests {
             ast::Predicate::And(
                 Box::new(ast::Predicate::Placeholder),
                 Box::new(ast::Predicate::Comparison {
-                    left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("foo".to_string()))),
+                    left: Box::new(ast::Expr::Path(ast::PathExpr::simple("foo".to_string()))),
                     operator: ast::ComparisonOperator::Equal,
                     right: Box::new(ast::Expr::Placeholder),
                 })
@@ -662,14 +639,14 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
                 right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
             }
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { identifier: ast::Identifier::Property("name".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc }])
         );
         assert_eq!(selection.limit, None);
         Ok(())
@@ -681,10 +658,7 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem {
-                identifier: ast::Identifier::Property("created_at".to_string()),
-                direction: ast::OrderDirection::Desc
-            }])
+            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc }])
         );
         Ok(())
     }
@@ -703,7 +677,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("status".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("status".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
                 right: Box::new(ast::Expr::Literal(ast::Literal::String("active".to_string())))
             }
@@ -719,17 +693,14 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("user_id".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("user_id".to_string()))),
                 operator: ast::ComparisonOperator::GreaterThan,
                 right: Box::new(ast::Expr::Literal(ast::Literal::I32(100)))
             }
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem {
-                identifier: ast::Identifier::Property("created_at".to_string()),
-                direction: ast::OrderDirection::Desc
-            }])
+            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc }])
         );
         assert_eq!(selection.limit, Some(5));
         Ok(())
@@ -750,10 +721,7 @@ mod tests {
         assert_eq!(selection.predicate, ast::Predicate::True);
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem {
-                identifier: ast::Identifier::Property("score".to_string()),
-                direction: ast::OrderDirection::Asc
-            }])
+            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("score".to_string()), direction: ast::OrderDirection::Asc }])
         );
         assert_eq!(selection.limit, None);
         Ok(())
@@ -766,10 +734,10 @@ mod tests {
         assert_eq!(
             selection.order_by,
             Some(vec![
-                ast::OrderByItem { identifier: ast::Identifier::Property("name".to_string()), direction: ast::OrderDirection::Asc },
-                ast::OrderByItem { identifier: ast::Identifier::Property("created_at".to_string()), direction: ast::OrderDirection::Desc },
+                ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc },
+                ast::OrderByItem { path: ast::PathExpr::simple("created_at".to_string()), direction: ast::OrderDirection::Desc },
                 ast::OrderByItem {
-                    identifier: ast::Identifier::Property("id".to_string()),
+                    path: ast::PathExpr::simple("id".to_string()),
                     direction: ast::OrderDirection::Asc // Default
                 }
             ])
@@ -785,7 +753,7 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("limit".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("limit".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
                 right: Box::new(ast::Expr::Literal(ast::Literal::I32(1)))
             }
@@ -795,14 +763,14 @@ mod tests {
         assert_eq!(
             selection.predicate,
             ast::Predicate::Comparison {
-                left: Box::new(ast::Expr::Identifier(ast::Identifier::Property("order".to_string()))),
+                left: Box::new(ast::Expr::Path(ast::PathExpr::simple("order".to_string()))),
                 operator: ast::ComparisonOperator::Equal,
                 right: Box::new(ast::Expr::Literal(ast::Literal::I32(2)))
             }
         );
         assert_eq!(
             selection.order_by,
-            Some(vec![ast::OrderByItem { identifier: ast::Identifier::Property("name".to_string()), direction: ast::OrderDirection::Asc }])
+            Some(vec![ast::OrderByItem { path: ast::PathExpr::simple("name".to_string()), direction: ast::OrderDirection::Asc }])
         );
 
         Ok(())

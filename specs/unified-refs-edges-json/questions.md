@@ -1,5 +1,17 @@
 ## Clarifying Questions & Design Decisions
 
+### Resolution Status (Phase 1)
+
+| Question | Status | Resolution |
+|----------|--------|------------|
+| Q4: Json builtin type | ✅ Resolved | `Json` wraps `serde_json::Value`, stored as `Value::Binary` |
+| Q5: Json query integration | ✅ Resolved | Option A implemented: deserialize at eval time, no schema validation |
+| Q6: First milestone | ✅ Resolved | Structured property navigation (Option B) delivered |
+| Q1-Q3: Ref type design | ⏳ Pending | Deferred to Phase 2 |
+| Q7-Q10: Schema registry | ⏳ Pending | Deferred to Phase 3 |
+
+---
+
 ### Critical Prerequisites
 
 #### Q1: How do we know the target collection for a Ref field?

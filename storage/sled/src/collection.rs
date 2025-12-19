@@ -41,29 +41,16 @@ pub struct SledStorageCollectionInner {
 pub struct SledStorageCollection(SledStorageCollectionInner);
 
 impl CollectionSchema for SledStorageCollectionInner {
-    fn field_type(
-        &self,
-        identifier: &ankql::ast::Identifier,
-    ) -> Result<ankurah_core::value::ValueType, ankurah_core::property::PropertyError> {
-        use ankql::ast::Identifier;
+    fn field_type(&self, path: &ankql::ast::PathExpr) -> Result<ankurah_core::value::ValueType, ankurah_core::property::PropertyError> {
         use ankurah_core::value::ValueType;
 
-        match identifier {
-            Identifier::Property(name) => {
-                match name.as_str() {
-                    "id" => Ok(ValueType::EntityId),
-                    // TODO: Add proper schema-based type resolution here
-                    // For now, we'll default to String for unknown fields
-                    _ => Ok(ValueType::String),
-                }
-            }
-            Identifier::CollectionProperty(_collection, property) => {
-                match property.as_str() {
-                    "id" => Ok(ValueType::EntityId),
-                    // TODO: Add proper schema-based type resolution here
-                    _ => Ok(ValueType::String),
-                }
-            }
+        // Use the property name (last step) for type resolution
+        let property_name = path.property();
+        match property_name {
+            "id" => Ok(ValueType::EntityId),
+            // TODO: Add proper schema-based type resolution here
+            // For now, we'll default to String for unknown fields
+            _ => Ok(ValueType::String),
         }
     }
 }

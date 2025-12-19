@@ -499,10 +499,10 @@ impl<'a> Filterable for FilterableObject<'a> {
 
 /// Amend a selection with __collection = 'value' comparison
 pub fn add_collection(selection: &ankql::ast::Selection, collection_id: &ankurah_proto::CollectionId) -> ankql::ast::Selection {
-    use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, Predicate};
+    use ankql::ast::{ComparisonOperator, Expr, Literal, PathExpr, Predicate};
 
     let collection_comparison = Predicate::Comparison {
-        left: Box::new(Expr::Identifier(Identifier::Property("__collection".to_string()))),
+        left: Box::new(Expr::Path(PathExpr::simple("__collection"))),
         operator: ComparisonOperator::Equal,
         right: Box::new(Expr::Literal(Literal::String(collection_id.to_string()))),
     };
