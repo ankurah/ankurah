@@ -91,7 +91,14 @@ impl From<IdbValue> for JsValue {
             Value::Bool(b) => JsValue::from_f64(if b { 1.0 } else { 0.0 }), // IndexedDB keys don't support boolean
             Value::String(s) => JsValue::from_str(&s),
             Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
-            Value::Binary(bytes) | Value::Object(bytes) | Value::Json(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
+            Value::Binary(bytes) | Value::Object(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
+            // Json is stored as a parsed JS object to enable IndexedDB's native nested property indexing
+            Value::Json(bytes) => {
+                match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(json) => serde_wasm_bindgen::to_value(&json).unwrap_or_else(|_| JsValue::NULL),
+                    Err(_) => JsValue::NULL,
+                }
+            }
         }
     }
 }
@@ -104,6 +111,7 @@ impl TryFrom<JsValue> for IdbValue {
     /// Uses standard Value conversion without schema information. Type information may be lost:
     /// - 0/1 numbers → I32 (bool type info lost)
     /// - Zero-padded numeric strings → String (i64 type info lost for large values)
+    /// - JS objects → Value::Json (serialized back to JSON bytes)
     ///
     /// **Future enhancement:** Accept schema/ValueType hints for direct conversion to proper types.
     ///
@@ -113,8 +121,21 @@ impl TryFrom<JsValue> for IdbValue {
     /// - `Value::I32(1)` ↔ `Value::Bool(true)`
     /// - `Value::String("9007199254740992000")` ↔ `Value::I64(9007199254740992000)`
     fn try_from(js_value: JsValue) -> Result<Self, Self::Error> {
-        let value = Value::try_from(js_value)?;
-        Ok(IdbValue(value))
+        // Try standard Value conversion first
+        if let Ok(value) = Value::try_from(js_value.clone()) {
+            return Ok(IdbValue(value));
+        }
+
+        // If standard conversion failed and it's an object, try to serialize as JSON
+        if js_value.is_object() {
+            if let Ok(json) = serde_wasm_bindgen::from_value::<serde_json::Value>(js_value.clone()) {
+                if let Ok(bytes) = serde_json::to_vec(&json) {
+                    return Ok(IdbValue(Value::Json(bytes)));
+                }
+            }
+        }
+
+        Err(js_value)
     }
 }
 
