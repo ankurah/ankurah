@@ -2142,5 +2142,69 @@ mod tests {
                 assert_eq!(keypart.full_path(), "data.nested.field");
             }
         }
+
+        /// Test that JSON path equality has no remaining predicate (fully pushed down)
+        #[test]
+        fn test_json_path_full_pushdown() {
+            let planner = Planner::new(PlannerConfig::full_support());
+            let selection = selection!("context.session_id = 'sess123'");
+            let plans = planner.plan(&selection, "id");
+
+            let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
+
+            if let Plan::Index { remaining_predicate, .. } = index_plan {
+                // Full pushdown: remaining_predicate should be True
+                assert_eq!(*remaining_predicate, Predicate::True, "JSON path equality should be fully pushed down");
+            } else {
+                panic!("Expected Index plan");
+            }
+        }
+
+        /// Test JSON path with inequality (partial pushdown for range)
+        #[test]
+        fn test_json_path_inequality() {
+            let planner = Planner::new(PlannerConfig::full_support());
+            let selection = selection!("context.count > 100");
+            let plans = planner.plan(&selection, "id");
+
+            // Should still generate an index plan
+            let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan for inequality");
+
+            if let Plan::Index { index_spec, remaining_predicate, .. } = index_plan {
+                let keypart = &index_spec.keyparts[0];
+                assert_eq!(keypart.column, "context");
+                assert_eq!(keypart.sub_path, Some(vec!["count".to_string()]));
+
+                // Inequality should be fully pushed to bounds, remaining_predicate is True
+                assert_eq!(*remaining_predicate, Predicate::True, "JSON path inequality should be fully pushed down");
+            }
+        }
+
+        /// Test mixed: JSON path + regular field
+        #[test]
+        fn test_json_path_mixed_predicates() {
+            let planner = Planner::new(PlannerConfig::full_support());
+            let selection = selection!("status = 'active' AND context.user_id = 'user123'");
+            let plans = planner.plan(&selection, "id");
+
+            // Should have an index plan
+            let index_plan = plans.iter().find(|p| matches!(p, Plan::Index { .. })).expect("Should generate index plan");
+
+            if let Plan::Index { index_spec, remaining_predicate, .. } = index_plan {
+                // Should have 2 keyparts
+                assert_eq!(index_spec.keyparts.len(), 2, "Should have 2 keyparts for mixed query");
+
+                // Find the JSON path keypart
+                let json_keypart = index_spec.keyparts.iter().find(|kp| kp.sub_path.is_some());
+                assert!(json_keypart.is_some(), "Should have a keypart with sub_path");
+
+                let json_kp = json_keypart.unwrap();
+                assert_eq!(json_kp.column, "context");
+                assert_eq!(json_kp.sub_path, Some(vec!["user_id".to_string()]));
+
+                // Both should be fully pushed, remaining is True
+                assert_eq!(*remaining_predicate, Predicate::True, "Both predicates should be pushed down");
+            }
+        }
     }
 }
