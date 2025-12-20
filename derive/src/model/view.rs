@@ -82,6 +82,12 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
             }
 
+            impl From<&#view_name> for ::ankurah::ankql::ast::Expr {
+                fn from(view: &#view_name) -> ::ankurah::ankql::ast::Expr {
+                    view.entity.id().into()
+                }
+            }
+
             impl ::ankurah::model::View for #view_name {
                 type Model = #name;
                 type Mutable = #mutable_name;
@@ -147,6 +153,20 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 pub fn id(&self) -> ankurah::proto::EntityId {
                     self.entity.id().clone()
                 }
+
+                /// Get a typed reference to this entity.
+                ///
+                /// This is useful when creating related entities that reference this one:
+                /// ```ignore
+                /// trx.create(&Album {
+                ///     name: "OK Computer".to_string(),
+                ///     artist: artist_view.r(),
+                /// })
+                /// ```
+                pub fn r(&self) -> ::ankurah::property::Ref<#name> {
+                    ::ankurah::property::Ref::new(self.entity.id())
+                }
+
                 /// Manually track this View in the current observer
                 pub fn track(&self) {
                     ::ankurah::signals::CurrentObserver::track(self);
@@ -165,6 +185,14 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
             impl<'a> Into<ankurah::proto::EntityId> for &'a #view_name {
                 fn into(self) -> ankurah::proto::EntityId {
                     self.entity.id()
+                }
+            }
+
+            // From<&View> for Ref<Model> is implemented via blanket impl in entity_ref.rs
+
+            impl From<#view_name> for ::ankurah::property::Ref<#name> {
+                fn from(view: #view_name) -> Self {
+                    ::ankurah::property::Ref::new(view.entity.id())
                 }
             }
     };

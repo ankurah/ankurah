@@ -15,6 +15,7 @@
 //! let artist: ArtistView = album.artist().get(&ctx).await?;
 //! ```
 
+use crate::model::View;
 use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -117,6 +118,11 @@ impl<T> From<Ref<T>> for ::ankql::ast::Expr {
 
 impl<T> From<&Ref<T>> for ::ankql::ast::Expr {
     fn from(r: &Ref<T>) -> ::ankql::ast::Expr { (&r.id).into() }
+}
+
+// Any View can be converted to Ref<Model> by borrowing
+impl<V: View> From<&V> for Ref<V::Model> {
+    fn from(view: &V) -> Ref<V::Model> { Ref::new(view.id()) }
 }
 
 impl<T> Property for Ref<T> {
