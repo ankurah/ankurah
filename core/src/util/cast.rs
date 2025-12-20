@@ -1,4 +1,4 @@
-//! Macro for ergonomic entity creation.
+//! Macros for ergonomic entity creation.
 
 /// Macro for ergonomic entity creation with automatic `.into()` on fields.
 ///
@@ -43,5 +43,24 @@ macro_rules! into {
     };
     (@expand $ty:ident { $($out:tt)* } $field:ident : $value:expr) => {
         $crate::into!(@expand $ty { $($out)* $field: ($value).into(), })
+    };
+}
+
+/// Macro for creating entities with automatic `.into()` on fields.
+///
+/// Combines a transaction's `create` call with the `into!` macro:
+/// ```rust,ignore
+/// use ankurah::create;
+///
+/// // This:
+/// create!(trx, ConnectionEvent { &user, session: &session_view, timestamp: ts })
+///
+/// // Expands to:
+/// trx.create(&into!(ConnectionEvent { &user, session: &session_view, timestamp: ts }))
+/// ```
+#[macro_export]
+macro_rules! create {
+    ($trx:expr, $ty:ident { $($tt:tt)* }) => {
+        $trx.create(&$crate::into!($ty { $($tt)* }))
     };
 }

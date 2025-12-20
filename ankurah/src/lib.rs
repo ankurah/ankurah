@@ -158,8 +158,8 @@ pub use ankurah_core::{
 #[cfg(feature = "derive")]
 pub use ankurah_derive::*;
 
-// Re-export the into! macro for ergonomic entity creation
-pub use ankurah_core::into;
+// Re-export macros for ergonomic entity creation
+pub use ankurah_core::{create, into};
 
 // Re-export dependencies needed by derive macros
 #[cfg(feature = "derive")]
