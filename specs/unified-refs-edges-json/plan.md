@@ -16,6 +16,7 @@ This plan prioritizes delivering **Json property + structured queries** as the f
 | **1f** | JSON path index pushdown (Sled/IndexedDB) | 1c | ✅ Complete |
 | **2a** | `Ref<T>` typed entity reference | 1 | ✅ Complete |
 | **2b** | Ref traversal in queries | 2a | Pending |
+| **2c** | `Ref<T>` WASM ergonomics (typed refs, flexible setters) | 2a | Pending |
 | 3 | Full schema registry / PropertyId | 2 | Pending |
 | 4 | Inbound navigation, traversal filters | 2, 3 | Pending |
 | 5 | Relation-entities, index pushdown | 3, 4 | Future |
