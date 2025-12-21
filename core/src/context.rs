@@ -218,6 +218,9 @@ where
 
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
 
+        // Resolve types in the AST (converts literals for JSON path comparisons)
+        args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
+
         // TODO implement cached: true
         if !self.node.durable {
             // Fetch from peers and commit first response

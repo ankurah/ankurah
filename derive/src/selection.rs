@@ -502,6 +502,10 @@ fn generate_literal_code_with_replacements(
             todo!("Binary literals");
             // quote! { ::ankql::ast::Expr::Literal(::ankql::ast::Literal::Binary(#items)) }
         }
+        ankql::ast::Literal::Json(_) => {
+            // Json literals are not parsed from query syntax; created by AST preparation pass
+            unreachable!("Json literals cannot appear in parsed queries")
+        }
     }
 }
 

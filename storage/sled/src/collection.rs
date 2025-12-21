@@ -3,11 +3,9 @@ use std::sync::atomic::AtomicBool;
 
 use ankql::ast::{OrderByItem, Predicate};
 use ankurah_core::indexing::KeySpec;
-use ankurah_core::value::cast_predicate::cast_predicate_types;
 use ankurah_core::{
     entity::TemporaryEntity,
     error::{MutationError, RetrievalError},
-    schema::CollectionSchema,
     storage::StorageCollection,
     EntityId,
 };
@@ -39,21 +37,6 @@ pub struct SledStorageCollectionInner {
 }
 
 pub struct SledStorageCollection(SledStorageCollectionInner);
-
-impl CollectionSchema for SledStorageCollectionInner {
-    fn field_type(&self, path: &ankql::ast::PathExpr) -> Result<ankurah_core::value::ValueType, ankurah_core::property::PropertyError> {
-        use ankurah_core::value::ValueType;
-
-        // Use the property name (last step) for type resolution
-        let property_name = path.property();
-        match property_name {
-            "id" => Ok(ValueType::EntityId),
-            // TODO: Add proper schema-based type resolution here
-            // For now, we'll default to String for unknown fields
-            _ => Ok(ValueType::String),
-        }
-    }
-}
 
 impl SledStorageCollection {
     pub fn new(
@@ -171,9 +154,8 @@ impl SledStorageCollectionInner {
     // (and we need to make sure that both are using industry best practices for that sort of index -> record scan)
 
     fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        // Cast all literals in the selection to their correct types based on field names
-        let cast_predicate = cast_predicate_types(selection.predicate, self)?;
-        let selection = ankql::ast::Selection { predicate: cast_predicate, order_by: selection.order_by, limit: selection.limit };
+        // Type resolution (Literal -> Json for non-simple paths) is handled by TypeResolver
+        // at the entry points (Context/Node). The selection here is already type-resolved.
 
         // Generate query plans and choose the first non-empty one
         let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");

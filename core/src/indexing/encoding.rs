@@ -9,6 +9,15 @@ pub enum IndexError {
     TypeMismatch(ValueType, ValueType),
 }
 
+// Type tags for JSON encoding.
+// These are chosen to provide sensible sort order: null < bool < int < float < string
+// Each type uses fixed-width encoding where possible to avoid sentinel issues.
+const JSON_TAG_NULL: u8 = 0x00;
+const JSON_TAG_BOOL: u8 = 0x10;
+const JSON_TAG_INT: u8 = 0x20; // i64: fixed 8 bytes, no sentinel needed
+const JSON_TAG_FLOAT: u8 = 0x30; // f64: fixed 8 bytes, no sentinel needed
+const JSON_TAG_STRING: u8 = 0x40; // variable length, uses 0x00 sentinel with 0x00→0x00 0xFF escaping
+
 /// Encode a single component (no NULL handling for now - TODO: add NULL support later)
 pub fn encode_component_typed(value: &Value, expected_type: ValueType, descending: bool) -> Result<Vec<u8>, IndexError> {
     // Cast value to expected type (short-circuits if types already match)
@@ -114,7 +123,59 @@ fn encode_value_component(value: &Value, expected_type: ValueType, descending: b
                 Ok(out)
             }
         }
+        // JSON: type-tagged encoding preserving original type (no cross-type casting)
+        (Value::Json(json), ValueType::Json) => Ok(encode_json_value(json, descending)),
         _ => Err(IndexError::TypeMismatch(expected_type, ValueType::of(value))),
+    }
+}
+
+/// Encode JSON value with type tag prefix.
+/// Different types get different prefixes, so "9" (string) != 9 (int).
+fn encode_json_value(json: &serde_json::Value, descending: bool) -> Vec<u8> {
+    let (tag, payload) = match json {
+        serde_json::Value::Null => (JSON_TAG_NULL, vec![]),
+        serde_json::Value::Bool(b) => (JSON_TAG_BOOL, vec![if *b { 1 } else { 0 }]),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                // i64: fixed 8 bytes big-endian with sign flip for proper ordering
+                (JSON_TAG_INT, Value::I64(i).to_bytes())
+            } else if let Some(f) = n.as_f64() {
+                // f64: fixed 8 bytes with IEEE 754 ordering
+                (JSON_TAG_FLOAT, Value::F64(f).to_bytes())
+            } else {
+                // Fallback for very large numbers
+                (JSON_TAG_NULL, vec![])
+            }
+        }
+        serde_json::Value::String(s) => {
+            // Variable length: escape 0x00 bytes and add 0x00 terminator
+            let mut payload = Vec::with_capacity(s.len() + 1);
+            for &b in s.as_bytes() {
+                if b == 0x00 {
+                    payload.push(0x00);
+                    payload.push(0xFF);
+                } else {
+                    payload.push(b);
+                }
+            }
+            payload.push(0x00); // terminator
+            (JSON_TAG_STRING, payload)
+        }
+        // Objects and arrays are unsortable - encode as null
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => (JSON_TAG_NULL, vec![]),
+    };
+
+    if !descending {
+        let mut out = Vec::with_capacity(1 + payload.len());
+        out.push(tag);
+        out.extend(payload);
+        out
+    } else {
+        // DESC: invert tag and all payload bytes
+        let mut out = Vec::with_capacity(1 + payload.len());
+        out.push(0xFFu8.wrapping_sub(tag));
+        out.extend(payload.into_iter().map(|b| 0xFFu8.wrapping_sub(b)));
+        out
     }
 }
 

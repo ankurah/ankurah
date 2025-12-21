@@ -94,6 +94,9 @@ impl EntityLiveQuery {
         node.policy_agent.can_access_collection(&cdata, &collection_id)?;
         args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
 
+        // Resolve types in the AST (converts literals for JSON path comparisons)
+        args.selection = node.type_resolver.resolve_selection_types(args.selection);
+
         let subscription = node.reactor.subscribe();
 
         let resultset = EntityResultSet::empty();

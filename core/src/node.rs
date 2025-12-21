@@ -140,6 +140,9 @@ where PA: PolicyAgent
     pub system: SystemManager<SE, PA>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
+
+    /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
+    pub(crate) type_resolver: crate::TypeResolver,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -171,6 +174,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
+            type_resolver: crate::TypeResolver::new(),
         }));
 
         // Set up the message sender for the subscription relay
@@ -204,6 +208,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay: None,
+            type_resolver: crate::TypeResolver::new(),
         }))
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
@@ -783,6 +788,8 @@ where
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
         if let Some(ref relay) = self.subscription_relay {
+            // Resolve types in the AST (converts literals for JSON path comparisons)
+            let selection = self.type_resolver.resolve_selection_types(selection);
             self.predicate_context.insert(query_id, cdata.clone());
             relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
         }
@@ -836,6 +843,8 @@ where
 
     fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
         if let Some(ref relay) = self.subscription_relay {
+            // Resolve types in the AST (converts literals for JSON path comparisons)
+            let selection = self.type_resolver.resolve_selection_types(selection);
             relay.update_query(query_id, selection, version)?;
         }
         Ok(())

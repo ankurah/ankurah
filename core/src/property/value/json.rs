@@ -142,15 +142,13 @@ impl wasm_bindgen::convert::FromWasmAbi for Json {
 }
 
 impl Property for Json {
-    fn into_value(&self) -> Result<Option<Value>, PropertyError> {
-        let bytes = serde_json::to_vec(&self.0).map_err(|e| PropertyError::SerializeError(Box::new(e)))?;
-        Ok(Some(Value::Json(bytes)))
-    }
+    fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::Json(self.0.clone()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
         match value {
-            Some(Value::Json(bytes)) | Some(Value::Binary(bytes)) => {
-                // Accept both Json and Binary for backwards compatibility
+            Some(Value::Json(json)) => Ok(Json(json)),
+            Some(Value::Binary(bytes)) => {
+                // Accept Binary for backwards compatibility
                 let json_value: serde_json::Value =
                     serde_json::from_slice(&bytes).map_err(|e| PropertyError::DeserializeError(Box::new(e)))?;
                 Ok(Json(json_value))

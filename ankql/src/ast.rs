@@ -3,6 +3,24 @@ use crate::selection::sql::generate_selection_sql;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+/// Custom serialization for serde_json::Value that stores as bytes.
+/// This is needed because bincode doesn't support deserialize_any.
+mod json_as_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        let bytes = serde_json::to_vec(value).map_err(serde::ser::Error::custom)?;
+        bytes.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+    where D: Deserializer<'de> {
+        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
+        serde_json::from_slice(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Literal(Literal),
@@ -24,6 +42,11 @@ pub enum Literal {
     EntityId(Ulid),
     Object(Vec<u8>),
     Binary(Vec<u8>),
+    /// JSON value - used for comparisons against JSON property subfields.
+    /// Not parsed from query syntax; created by AST preparation pass.
+    /// Serialized as bytes for bincode compatibility.
+    #[serde(with = "json_as_bytes")]
+    Json(serde_json::Value),
 }
 
 /// A dot-separated path like `name` or `licensing.territory`

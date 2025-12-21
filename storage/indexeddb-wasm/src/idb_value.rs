@@ -20,6 +20,20 @@
 use ankurah_core::value::Value;
 use wasm_bindgen::JsValue;
 
+/// Convert boolean values to 0/1 numbers recursively in a JSON structure.
+/// IndexedDB doesn't support boolean keys, so we must encode bools as numbers
+/// for subpath indexing to work (e.g., `data.enabled = true` → `data.enabled = 1`).
+fn convert_json_bools_to_numbers(json: &serde_json::Value) -> serde_json::Value {
+    match json {
+        serde_json::Value::Bool(b) => serde_json::Value::Number(if *b { 1.into() } else { 0.into() }),
+        serde_json::Value::Array(arr) => serde_json::Value::Array(arr.iter().map(convert_json_bools_to_numbers).collect()),
+        serde_json::Value::Object(obj) => {
+            serde_json::Value::Object(obj.iter().map(|(k, v)| (k.clone(), convert_json_bools_to_numbers(v))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// Maximum safe integer in JavaScript (2^53 - 1)
 #[allow(unused)]
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
@@ -95,14 +109,13 @@ impl From<IdbValue> for JsValue {
             // Json is stored as a parsed JS object to enable IndexedDB's native nested property indexing.
             // IMPORTANT: We must use serialize_maps_as_objects(true) to create plain JS objects,
             // not ES2015 Maps. IndexedDB keyPath traversal only works with plain objects.
-            Value::Json(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(json) => {
-                    use serde::Serialize;
-                    let serializer = serde_wasm_bindgen::Serializer::json_compatible();
-                    json.serialize(&serializer).unwrap_or(JsValue::NULL)
-                }
-                Err(_) => JsValue::NULL,
-            },
+            // NOTE: Booleans must be converted to 0/1 because IDB doesn't support boolean keys.
+            Value::Json(json) => {
+                use serde::Serialize;
+                let converted = convert_json_bools_to_numbers(&json);
+                let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+                converted.serialize(&serializer).unwrap_or(JsValue::NULL)
+            }
         }
     }
 }
@@ -133,9 +146,7 @@ impl TryFrom<JsValue> for IdbValue {
         // If standard conversion failed and it's an object, try to serialize as JSON
         if js_value.is_object() {
             if let Ok(json) = serde_wasm_bindgen::from_value::<serde_json::Value>(js_value.clone()) {
-                if let Ok(bytes) = serde_json::to_vec(&json) {
-                    return Ok(IdbValue(Value::Json(bytes)));
-                }
+                return Ok(IdbValue(Value::Json(json)));
             }
         }
 

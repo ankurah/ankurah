@@ -1,0 +1,136 @@
+{
+    "comment": "Parity test cases: verify storage backends match in-memory Filterable behavior",
+    "suites": [
+        {
+            "name": "json_cross_type",
+            "description": "Cross-type JSON comparisons should not match (e.g., 9 != '9')",
+            "cases": [
+                {
+                    "name": "number_vs_string",
+                    "entities": [
+                        {
+                            "label": "numeric",
+                            "data": {
+                                "number": 9
+                            }
+                        }
+                    ],
+                    "expectations": [
+                        {
+                            "query": "data.number = 9",
+                            "matches": [
+                                "numeric"
+                            ]
+                        },
+                        {
+                            "query": "data.number = '9'",
+                            "matches": []
+                        }
+                    ]
+                },
+                {
+                    "name": "string_vs_number",
+                    "entities": [
+                        {
+                            "label": "text",
+                            "data": {
+                                "text": "9"
+                            }
+                        }
+                    ],
+                    "expectations": [
+                        {
+                            "query": "data.text = '9'",
+                            "matches": [
+                                "text"
+                            ]
+                        },
+                        {
+                            "query": "data.text = 9",
+                            "matches": []
+                        }
+                    ]
+                },
+                {
+                    "name": "bool_vs_string",
+                    "entities": [
+                        {
+                            "label": "boolean",
+                            "data": {
+                                "enabled": true
+                            }
+                        }
+                    ],
+                    "expectations": [
+                        {
+                            "query": "data.enabled = true",
+                            "matches": [
+                                "boolean"
+                            ]
+                        },
+                        {
+                            "query": "data.enabled = 'true'",
+                            "matches": []
+                        }
+                    ]
+                },
+                {
+                    "name": "nested_path",
+                    "entities": [
+                        {
+                            "label": "nested",
+                            "data": {
+                                "level1": {
+                                    "level2": "value"
+                                }
+                            }
+                        }
+                    ],
+                    "expectations": [
+                        {
+                            "query": "data.level1.level2 = 'value'",
+                            "matches": [
+                                "nested"
+                            ]
+                        },
+                        {
+                            "query": "data.level1.level2 = 123",
+                            "matches": []
+                        }
+                    ]
+                },
+                {
+                    "name": "mixed_types_same_field",
+                    "entities": [
+                        {
+                            "label": "number_value",
+                            "data": {
+                                "value": 42
+                            }
+                        },
+                        {
+                            "label": "string_value",
+                            "data": {
+                                "value": "42"
+                            }
+                        }
+                    ],
+                    "expectations": [
+                        {
+                            "query": "data.value = 42",
+                            "matches": [
+                                "number_value"
+                            ]
+                        },
+                        {
+                            "query": "data.value = '42'",
+                            "matches": [
+                                "string_value"
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
