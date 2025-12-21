@@ -5,6 +5,22 @@ on:
     branches: [main]
 
 jobs:
+  liaison:
+    name: Verify README examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install liaison
+        run: |
+          curl -L -o /tmp/liaison https://github.com/dnorman/liaison/releases/download/v0.1.3/liaison-linux-amd64
+          echo "6899799117b0f25c2b02555c83d486c278351c8c8e387674aeb6ffdec13af97f /tmp/liaison" | sha256sum -c
+          chmod +x /tmp/liaison
+          sudo mv /tmp/liaison /usr/local/bin/liaison
+
+      - name: Verify code examples are up to date
+        run: liaison --check README.md
+
   test:
     name: Run Tests
     runs-on: ubuntu-latest

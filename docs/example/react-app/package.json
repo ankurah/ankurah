@@ -1,0 +1,27 @@
+{
+  "name": "ankurah-doc-example-react-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "ankurah-doc-example-wasm-bindings": "../wasm-bindings/pkg",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "prettier": "^3.6.2",
+    "typescript": "^5.2.2",
+    "vite": "^5.3.4"
+  },
+  "prettier": {
+    "tabWidth": 2
+  }
+}

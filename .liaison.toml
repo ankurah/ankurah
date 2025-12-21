@@ -1,0 +1,15 @@
+# Liaison configuration for ankurah
+# Automatically transclude code examples from docs/example/ into the README
+
+[glob]
+# Files to process (empty = specify on command line)
+include = ["README.md"]
+
+# Files/directories to exclude from processing
+exclude = [
+    "target/**",
+    "node_modules/**",
+    "docs/example/react-app/node_modules/**",
+    "docs/example/react-app/dist/**",
+    "docs/example/wasm-bindings/pkg/**",
+]

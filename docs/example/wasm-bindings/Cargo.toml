@@ -1,0 +1,18 @@
+[package]
+name    = "ankurah-doc-example-wasm-bindings"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ankurah-doc-example-model      = { path = "../model", features = ["wasm"] }
+ankurah                        = { path = "../../../ankurah", features = ["derive", "wasm"] }
+ankurah-websocket-client-wasm  = { path = "../../../websocket/client-wasm" }
+ankurah-storage-indexeddb-wasm = { path = "../../../storage/indexeddb-wasm" }
+ankurah-signals                = { path = "../../../signals", features = ["wasm", "react", "jsvalue"] }
+wasm-bindgen                   = "0.2"
+wasm-bindgen-futures           = "0.4"
+console_error_panic_hook       = "0.1"
+anyhow                         = { workspace = true }

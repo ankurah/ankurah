@@ -1,0 +1,10 @@
+[workspace]
+members  = ["model", "server", "wasm-bindings"]
+resolver = "2"
+
+    [workspace.dependencies]
+    ankurah         = { path = "../../ankurah" }
+    ankurah-signals = { path = "../../signals" }
+    ankql           = { path = "../../ankql" }
+    serde           = { version = "1.0", features = ["derive"] }
+    anyhow          = "1.0"
