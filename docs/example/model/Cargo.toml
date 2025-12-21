@@ -9,7 +9,7 @@ wasm    = ["dep:wasm-bindgen", "ankurah/wasm", "ankurah/react"]
 
 [dependencies]
 ankurah      = { path = "../../../ankurah", features = ["derive"] }
-serde        = { workspace = true }
+serde        = { version = "1.0", features = ["derive"] }
 wasm-bindgen = { version = "0.2", optional = true }
 
 # Patch for wasm
