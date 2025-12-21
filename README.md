@@ -1,136 +1,221 @@
-<div style="width:100%; display:flex; background:linear-gradient(0deg, rgba(112,182,255,1) 0%, rgba(200,200,255,1) 100%); padding: 8px; margin: -15px 0 10px 0">
-<img src="./logo-128.png" alt="Ankurah Logo" width=64 height=64 style=""/>
-<div style="margin: auto 0 auto 5px">The root of all cosmic projections of state</div>
+<div align="center">
+  <img src="./logo-128.png" alt="Ankurah Logo" width="80" height="80">
+  <h1>Ankurah</h1>
+  <p><em>The root of all cosmic projections of state</em></p>
+  
+  <p>A distributed state-management framework that enables real-time data synchronization<br>across multiple nodes with built-in observability.</p>
+
+  <p>
+    <a href="https://ankurah.org/getting-started.html"><strong>Get Started</strong></a> •
+    <a href="https://ankurah.org/what-is-ankurah.html">Documentation</a> •
+    <a href="https://discord.gg/XMUUxsbT5S">Discord</a>
+  </p>
+
+  <p>
+    <img src="https://img.shields.io/badge/status-beta-blue" alt="Beta Status">
+    <a href="https://crates.io/crates/ankurah"><img src="https://img.shields.io/crates/v/ankurah.svg" alt="Crates.io"></a>
+    <a href="https://docs.rs/ankurah"><img src="https://docs.rs/ankurah/badge.svg" alt="Documentation"></a>
+  </p>
 </div>
 
-Ankurah is a state-management framework that enables real-time data synchronization across multiple nodes with built-in observability.
+---
 
-It supports multiple storage and data type backends to enable no-compromise representation of your data.
+## What is Ankurah?
 
-This project is beta status. It works, but be careful with production use.
+Ankurah is a **real-time reactive database** for building collaborative and multiplayer applications. Define your data model once in Rust, and use it everywhere—native servers, browser clients, mobile apps—with automatic synchronization across all connected nodes.
+
+### The Challenge
+
+Building applications where multiple users interact with shared state is hard. You need real-time sync, offline support, conflict resolution, reactive UI updates, and query pushdown—and it all has to work consistently across your server (Postgres) and clients (IndexedDB in browsers). Most teams either build fragile ad-hoc solutions or accept significant compromises.
+
+### The Approach
+
+Ankurah is **event-sourced**: every change is an operation that can be replayed, merged, and synchronized. Entities can reference each other (graph-style navigation), and you can subscribe to live queries that automatically update as data changes anywhere in the system.
+
+Your model is defined once in Rust with a derive macro. The same code compiles to native binaries for servers and WASM for browsers. TypeScript interfaces and React hooks are generated automatically.
+
+### Why Ankurah?
+
+**Local-first by default.** Your queries execute against the local cache instantly, then sync with durable servers in the background. Users get sub-millisecond reads and offline support without you writing sync logic.
+
+**Live queries that just work.** Subscribe to a query and your UI stays in sync automatically—changes flow in from anywhere.
+
+**Graph-ready data model.** Entities can reference each other, and you can navigate those relationships directly in queries. Full graph traversal is on the roadmap.
+
+**Collaborative editing built in.** Text fields can use Yjs-backed CRDTs for real-time collaborative editing with automatic conflict resolution.
+
+**One codebase, multiple backends.** Swap between Sled, Postgres, and IndexedDB without changing application code. Your server uses Postgres while browsers use IndexedDB—same queries, same models.
+
+### Who it's for
+
+Teams building collaborative tools, local-first apps, multiplayer experiences, or anything where users interact with shared state in real-time.
+
+---
 
 ## Key Features
 
-- **Schema-First Design**: Define data models using Rust structs with an ActiveRecord-style interface - View/Mutable
-- **Content-filtered pub/sub**: Subscribe to changes on a collection using a SQL-like query
-- **Real-Time Observability**: Signal-based pattern for tracking entity changes
-- **Distributed Architecture**: Multi-node synchronization with event sourcing
-- **Flexible Storage**: Support for multiple storage backends (Sled, Postgres, TiKV)
-- **Isomorphic code**: Server applications and Web applications use the same code, including first-class support for React and Leptos out of the box
+### 1️⃣ Schema-First Design
+
+<pre><code transclude="docs/example/model/src/lib.rs#model">#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Album {
+    #[active_type(YrsString)]
+    pub name: String,
+    pub artist: String,
+    pub year: i32,
+}</code></pre>
+
+<sub>YrsString is default backend for String, LWW otherwise</sub>
+
+### 🔍 Live Queries
+
+**Rust**
+<pre><code transclude="docs/example/server/src/main.rs#livequery-rust">let q: LiveQuery&lt;AlbumView&gt; = ctx.query(&quot;year &gt; 1985&quot;)?;</code></pre>
+
+**TypeScript**
+<pre><code transclude="docs/example/react-app/src/App.tsx#react-livequery">const q: AlbumLiveQuery = Album.query(ctx(), &quot;year &gt; 1985&quot;);</code></pre>
+
+<sub>Views and WASM bindings generated by the Model macro</sub>
+
+### ⚛️ React Support
+
+<pre><code transclude="docs/example/react-app/src/App.tsx#react-component">/* creates and Binds a ReactObserver to the component */
+const AlbumList = signalObserver(({ albums }: Props) =&gt; {
+  return (
+    &lt;ul&gt;
+      /* React Observer automatically tracks albums */
+      {albums.items.map((album) =&gt; (
+        &lt;li&gt;{album.name}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+});</code></pre>
+
+<sub>ReactObserver tracks livequery.items</sub>
+
+### 🗄️ Flexible Storage
+
+**Sled**
+<pre><code transclude="docs/example/server/src/main.rs#storage-sled">let storage = SledStorageEngine::new()?;</code></pre>
+
+**Postgres**
+<pre><code transclude="docs/example/server/src/main.rs#storage-postgres">let storage = Postgres::open(uri).await?;</code></pre>
+
+**IndexedDB**
+<pre><code transclude="docs/example/wasm-bindings/src/lib.rs#storage-indexeddb">let storage = IndexedDBStorageEngine::open(&quot;myapp&quot;).await?;</code></pre>
+
+<sub>TiKV planned</sub>
+
+### ⚡ Generated Interfaces
+
+```typescript
+export class Album {
+  static query(context: Context, selection: string, ...args: any): AlbumLiveQuery;
+  ...
+}
+```
+
+### 🔋 Batteries Included
+
+WebSocket server & client • HTTP/REST endpoints • Authentication hooks • Query routing & pushdown
+
+---
+
+## Quick Example
+
+**Server**
+<pre><code transclude="docs/example/server/src/main.rs#server-example">let storage = SledStorageEngine::with_path(storage_dir)?;
+let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+node.system.create().await?;
+
+let mut server = WebsocketServer::new(node);
+println!(&quot;Running server...&quot;);
+server.run(&quot;0.0.0.0:9797&quot;).await?;</code></pre>
+
+**Rust Client**
+<pre><code transclude="docs/example/server/src/main.rs#rust-client-example">let storage = SledStorageEngine::new_test()?;
+let node = Node::new(Arc::new(storage), PermissiveAgent::new());
+let _client = WebsocketClient::new(node.clone(), &quot;ws://localhost:9797&quot;).await?;
+node.system.wait_system_ready().await;
+
+// Create album
+let ctx = node.context(ankurah::policy::DEFAULT_CONTEXT)?;
+let trx = ctx.begin();
+trx.create(&amp;Album { name: &quot;Parade&quot;.into(), artist: &quot;Prince&quot;.into(), year: 1986 }).await?;
+trx.commit().await?;</code></pre>
+
+**WASM Client**
+<pre><code transclude="docs/example/wasm-bindings/src/lib.rs#client-example">let storage = IndexedDBStorageEngine::open(&quot;myapp&quot;).await?;
+let node = Node::new(Arc::new(storage), PermissiveAgent::new());
+let _client = WebsocketClient::new(node.clone(), server_url)?;
+node.system.wait_system_ready().await;
+
+let context = node.context(DEFAULT_CONTEXT)?;
+let _albums = context.query::&lt;ankurah_doc_example_model::AlbumView&gt;(&quot;year &gt; 1985&quot;)?;</code></pre>
+
+**React Component**
+<pre><code transclude="docs/example/react-app/src/App.tsx#react-component">/* creates and Binds a ReactObserver to the component */
+const AlbumList = signalObserver(({ albums }: Props) =&gt; {
+  return (
+    &lt;ul&gt;
+      /* React Observer automatically tracks albums */
+      {albums.items.map((album) =&gt; (
+        &lt;li&gt;{album.name}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+});</code></pre>
+
+---
+
+## Getting Started
+
+Get up and running quickly with our React + Sled template:
+
+```bash
+cargo generate https://github.com/ankurah/react-sled-template
+```
+
+Or run the example manually:
+
+```bash
+# Start the server
+cargo run -p ankurah-example-server
+
+# Build WASM bindings (in examples/wasm-bindings)
+wasm-pack build --target web --debug
+
+# Run the React app (in examples/react-app)
+bun install && bun dev
+```
+
+Then open http://localhost:5173/ in two browser tabs (one regular, one incognito) to see real-time sync.
+
+---
 
 ## Core Concepts
 
-- **Model**: A struct describing fields and types for entities in a collection (data binding)
-- **Collection**: A group of entities of the same type (similar to a database table, and backed by a table in the postgres backend)
-- **Entity**: A discrete identity in a collection - Dynamic schema (similar to a schema-less database row)
-- **View**: A read-only representation of an entity - Typed by the model
-- **Mutable**: A mutable state representation of an entity - Typed by the model
-- **Event**: An atomic change that can be applied to an entity - used for synchronization and audit trail
+| Concept | Description |
+|---------|-------------|
+| **Model** | A struct describing fields and types for entities in a collection |
+| **Collection** | A group of entities of the same type (like a database table) |
+| **Entity** | A discrete identity in a collection with dynamic schema |
+| **View** | A read-only, typed representation of an entity |
+| **Mutable** | A mutable, typed state representation of an entity |
+| **Event** | An atomic change used for synchronization and audit trail |
 
-## Quick Start
+---
 
-1. Start the server:
+## Roadmap
 
-```bash
-cargo run -p ankurah-example-server
+**Milestone 2** - TiKV backend, Graph functionality, User-definable data types
 
-# or dev mode
-cargo watch -x 'run -p ankurah-example-server'
-```
+**Milestone 3** - P2P, Portable cryptographic identities, E2EE, Hypergraph
 
-2. Build WASM bindings:
+---
 
-```bash
-cd examples/wasm-bindings
-wasm-pack build --target web --debug
-
-# or dev mode
-cargo watch -s 'wasm-pack build --target web --debug'
-```
-
-3. Run the React example app:
-
-```bash
-cd examples/react-app
-bun install
-bun dev
-```
-
-Then load http://localhost:5173/ in one regular browser tab, and one incognito browser tab and play with the example app.
-You can also use two regular browser tabs, but they share one IndexedDB local storage backend, so it's not as good of a test.
-In this example, the "server" process is a native Rust process whose node is flagged as "durable", meaning that it attests it
-will not lose data. The "client" process is a WASM process that is also durable in some sense, but not to be relied upon to have
-all data. The demo server currently uses the sled backend, but postgres is also supported, and TiKV support is planned.
-
-## Example: Inter-Node Subscription
-
-```rust
-// Create server and client nodes
-let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-server.system.create()it?; // Initialize a new "system" - something you only do once on the first startup.
-
-let server = server.context(c)?;
-
-let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-
-// Connect nodes using local process connection
-let _conn = LocalProcessConnection::new(&server, &client).await?;
-
-client.system.wait_system_ready().await; // Wait for the client to join the server "system"
-let client = client.context(c)?;
-
-// Subscribe to changes on the client
-let _subscription = client.query::<AlbumView>("name = 'Origin of Symmetry'", |changes| {
-    println!("Received changes: {}", changes);
-}).await?;
-
-// Create a new album on the server
-let trx = server.begin();
-let album = trx.create(&Album {
-    name: "Origin of Symmetry".into(),
-    year: "2001".into(),
-}).await?;
-trx.commit().await?;
-```
-
-## Design Philosophy
-
-Ankurah follows an event-sourced architecture where:
-
-- All operations have unique IDs and precursor operations
-- Entity state is maintained per node with operation tree tracking
-- Operations use ULID for distributed ID generation
-- Entity IDs are derived from their creation operation
-
-## Development Milestones
-
-### Major Milestone 1 - Getting the foot in the door
-
-- Production-usable event-sourced ORM which uses an off the shelf database for storage
-- Rust structs for data modeling
-- Signals pattern for notifications
-- WASM Bindings for client-side use
-- Websockets server and client
-- React Bindings
-- Basic included data-types: including CRDT text(yrs crate) and primitive types
-- Very basic embedded KV backing store (Sled DB)
-- Basic, single field queries (auto indexed?)
-- Postgres
-- Multi-field queries
-- A robust recursive query AST which can define queries declaratively
-
-### Major Milestone 2 - Stuff we need, but can live without for a bit
-
-- and TiKV Backends
-- Graph Functionality
-- User definable data types
-
-### Major Milestone 3 - Maybe someday...
-
-- P2P functionality
-- Portable cryptographic identities
-- E2EE
-- Hypergraph functionality
-
-For more details, see the [repository documentation](https://github.com/ankurah/ankurah).
-And join the [Discord server](https://discord.gg/XMUUxsbT5S) to be part of the discussion!
+<div align="center">
+  <a href="https://github.com/ankurah/ankurah">GitHub</a> •
+  <a href="https://discord.gg/XMUUxsbT5S">Discord</a> •
+  <a href="https://ankurah.org">Website</a>
+  <br><sub>Licensed under MIT or Apache-2.0</sub>
+</div>

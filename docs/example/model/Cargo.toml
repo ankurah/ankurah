@@ -1,0 +1,16 @@
+[package]
+name    = "ankurah-doc-example-model"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+wasm    = ["dep:wasm-bindgen", "ankurah/wasm", "ankurah/react"]
+
+[dependencies]
+ankurah      = { path = "../../../ankurah", features = ["derive"] }
+serde        = { workspace = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+# Patch for wasm
+getrandom = { version = "0.3", features = ["wasm_js"] }

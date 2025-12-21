@@ -1,0 +1,17 @@
+[package]
+name    = "ankurah-doc-example-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ankurah-doc-example-model = { path = "../model" }
+ankurah                   = { path = "../../../ankurah" }
+ankurah-websocket-server  = { path = "../../../websocket/server" }
+ankurah-websocket-client  = { path = "../../../websocket/client" }
+ankurah-storage-sled      = { path = "../../../storage/sled" }
+ankurah-storage-postgres  = { path = "../../../storage/postgres" }
+bb8                       = "0.9"
+bb8-postgres              = "0.9"
+anyhow                    = { workspace = true }
+tokio                     = { version = "1", features = ["rt-multi-thread"] }
+dirs                      = "5.0"
