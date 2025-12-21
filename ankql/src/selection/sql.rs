@@ -63,6 +63,12 @@ fn generate_expr_sql(
                 buffer.push_str(&String::from_utf8_lossy(bytes));
                 buffer.push('\'');
             }
+            Literal::Json(value) => {
+                // Serialize JSON and wrap in quotes for SQL
+                buffer.push('\'');
+                buffer.push_str(&value.to_string());
+                buffer.push('\'');
+            }
         },
         Expr::Path(path) => {
             // Output each step quoted and dot-separated: "a"."b"."c"
@@ -139,6 +145,11 @@ fn generate_expr_sql(
                             // buffer.push('\'');
                             // buffer.push_str(&String::from_utf8_lossy(bytes));
                             // buffer.push('\'');
+                        }
+                        Literal::Json(value) => {
+                            buffer.push('\'');
+                            buffer.push_str(&value.to_string());
+                            buffer.push('\'');
                         }
                     },
                     _ => {

@@ -10,7 +10,25 @@ use ankurah_proto as proto;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, PartialOrd)]
+/// Custom serialization for serde_json::Value that stores as bytes.
+/// This is needed because bincode doesn't support deserialize_any.
+mod json_as_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        let bytes = serde_json::to_vec(value).map_err(serde::ser::Error::custom)?;
+        bytes.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+    where D: Deserializer<'de> {
+        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
+        serde_json::from_slice(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Value {
     // Numbers
     I16(i16),
@@ -23,20 +41,23 @@ pub enum Value {
     EntityId(proto::EntityId),
     Object(Vec<u8>),
     Binary(Vec<u8>),
-    /// JSON value - stored as jsonb in PostgreSQL for proper query support
-    Json(Vec<u8>),
+    /// JSON value - stored as jsonb in PostgreSQL for proper query support.
+    /// Serialized as bytes for bincode compatibility.
+    #[serde(with = "json_as_bytes")]
+    Json(serde_json::Value),
 }
 
 impl Value {
     /// Create a Json value from any serializable type.
-    pub fn json<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> { Ok(Value::Json(serde_json::to_vec(value)?)) }
+    pub fn json<T: Serialize>(value: &T) -> Result<Self, serde_json::Error> { Ok(Value::Json(serde_json::to_value(value)?)) }
 
     /// Parse this value as JSON into the target type.
     /// Works for Json, Object, Binary (as bytes) and String variants.
     /// Returns InvalidVariant error for numeric, bool, and EntityId types.
     pub fn parse_as_json<T: serde::de::DeserializeOwned>(&self) -> Result<T, crate::property::PropertyError> {
         match self {
-            Value::Json(bytes) | Value::Object(bytes) | Value::Binary(bytes) => Ok(serde_json::from_slice(bytes)?),
+            Value::Json(json) => Ok(serde_json::from_value(json.clone())?),
+            Value::Object(bytes) | Value::Binary(bytes) => Ok(serde_json::from_slice(bytes)?),
             Value::String(s) => Ok(serde_json::from_str(s)?),
             other => {
                 Err(crate::property::PropertyError::InvalidVariant { given: other.clone(), ty: std::any::type_name::<T>().to_string() })
@@ -68,7 +89,14 @@ impl Value {
         }
 
         match self {
-            Value::Json(bytes) | Value::Binary(bytes) => {
+            Value::Json(json) => {
+                let mut current = json;
+                for key in path {
+                    current = current.get(key)?;
+                }
+                Some(json_value_to_value(current))
+            }
+            Value::Binary(bytes) => {
                 let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
                 let mut current = &json;
                 for key in path {
@@ -92,7 +120,7 @@ impl Value {
 /// Convert serde_json::Value to ankurah Value
 fn json_value_to_value(json: &serde_json::Value) -> Value {
     match json {
-        serde_json::Value::Null => Value::String("null".to_string()), // TODO: proper null handling
+        serde_json::Value::Null => Value::Json(serde_json::Value::Null),
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -105,7 +133,7 @@ fn json_value_to_value(json: &serde_json::Value) -> Value {
         }
         serde_json::Value::String(s) => Value::String(s.clone()),
         // Arrays and objects remain as Json
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Json(serde_json::to_vec(json).unwrap_or_default()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Json(json.clone()),
     }
 }
 
@@ -140,6 +168,40 @@ impl ValueType {
     }
 }
 
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            // Same types - compare directly
+            (Value::I16(a), Value::I16(b)) => a.partial_cmp(b),
+            (Value::I32(a), Value::I32(b)) => a.partial_cmp(b),
+            (Value::I64(a), Value::I64(b)) => a.partial_cmp(b),
+            (Value::F64(a), Value::F64(b)) => a.partial_cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
+            (Value::String(a), Value::String(b)) => a.partial_cmp(b),
+            (Value::EntityId(a), Value::EntityId(b)) => a.to_bytes().partial_cmp(&b.to_bytes()),
+            (Value::Object(a), Value::Object(b)) => a.partial_cmp(b),
+            (Value::Binary(a), Value::Binary(b)) => a.partial_cmp(b),
+            // JSON values: compare by serialized form (not ideal but works for basic cases)
+            (Value::Json(a), Value::Json(b)) => a.to_string().partial_cmp(&b.to_string()),
+            // Cross-type comparison: different types are not comparable
+            _ => None,
+        }
+    }
+}
+
+// Comparison operators for Value (used in filter.rs)
+impl Value {
+    pub fn gt(&self, other: &Self) -> bool { self.partial_cmp(other) == Some(std::cmp::Ordering::Greater) }
+
+    pub fn ge(&self, other: &Self) -> bool {
+        matches!(self.partial_cmp(other), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+    }
+
+    pub fn lt(&self, other: &Self) -> bool { self.partial_cmp(other) == Some(std::cmp::Ordering::Less) }
+
+    pub fn le(&self, other: &Self) -> bool { matches!(self.partial_cmp(other), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)) }
+}
+
 impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -152,7 +214,7 @@ impl Display for Value {
             Value::EntityId(entity_id) => write!(f, "{}", entity_id),
             Value::Object(object) => write!(f, "{:?}", object),
             Value::Binary(binary) => write!(f, "{:?}", binary),
-            Value::Json(json) => write!(f, "{}", String::from_utf8_lossy(json)),
+            Value::Json(json) => write!(f, "{}", json),
         }
     }
 }
@@ -169,6 +231,7 @@ impl From<ankql::ast::Literal> for Value {
             ankql::ast::Literal::EntityId(ulid) => Value::EntityId(proto::EntityId::from_ulid(ulid)),
             ankql::ast::Literal::Object(object) => Value::Object(object),
             ankql::ast::Literal::Binary(binary) => Value::Binary(binary),
+            ankql::ast::Literal::Json(json) => Value::Json(json),
         }
     }
 }
@@ -185,6 +248,7 @@ impl From<&ankql::ast::Literal> for Value {
             ankql::ast::Literal::EntityId(ulid) => Value::EntityId(proto::EntityId::from_ulid(*ulid)),
             ankql::ast::Literal::Object(object) => Value::Object(object.clone()),
             ankql::ast::Literal::Binary(binary) => Value::Binary(binary.clone()),
+            ankql::ast::Literal::Json(json) => Value::Json(json.clone()),
         }
     }
 }
@@ -201,7 +265,7 @@ impl From<Value> for ankql::ast::Literal {
             Value::EntityId(entity_id) => ankql::ast::Literal::EntityId(entity_id.to_ulid()),
             Value::Object(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
             Value::Binary(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
-            Value::Json(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(&bytes).to_string()),
+            Value::Json(json) => ankql::ast::Literal::Json(json),
         }
     }
 }
@@ -218,7 +282,7 @@ impl From<&Value> for ankql::ast::Literal {
             Value::EntityId(entity_id) => ankql::ast::Literal::EntityId(entity_id.to_ulid()),
             Value::Object(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
             Value::Binary(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
-            Value::Json(bytes) => ankql::ast::Literal::String(String::from_utf8_lossy(bytes).to_string()),
+            Value::Json(json) => ankql::ast::Literal::Json(json.clone()),
         }
     }
 }
@@ -237,7 +301,7 @@ mod tests {
     #[test]
     fn test_extract_at_path_json_string() {
         let json = serde_json::json!({ "session_id": "sess123" });
-        let value = Value::Json(serde_json::to_vec(&json).unwrap());
+        let value = Value::Json(json);
 
         let result = value.extract_at_path(&["session_id".to_string()]);
         assert_eq!(result, Some(Value::String("sess123".to_string())));
@@ -246,7 +310,7 @@ mod tests {
     #[test]
     fn test_extract_at_path_json_number() {
         let json = serde_json::json!({ "count": 42 });
-        let value = Value::Json(serde_json::to_vec(&json).unwrap());
+        let value = Value::Json(json);
 
         let result = value.extract_at_path(&["count".to_string()]);
         assert_eq!(result, Some(Value::I64(42)));
@@ -255,7 +319,7 @@ mod tests {
     #[test]
     fn test_extract_at_path_json_nested() {
         let json = serde_json::json!({ "context": { "user": { "name": "Alice" } } });
-        let value = Value::Json(serde_json::to_vec(&json).unwrap());
+        let value = Value::Json(json);
 
         let result = value.extract_at_path(&["context".to_string(), "user".to_string(), "name".to_string()]);
         assert_eq!(result, Some(Value::String("Alice".to_string())));
@@ -264,7 +328,7 @@ mod tests {
     #[test]
     fn test_extract_at_path_missing() {
         let json = serde_json::json!({ "session_id": "sess123" });
-        let value = Value::Json(serde_json::to_vec(&json).unwrap());
+        let value = Value::Json(json);
 
         let result = value.extract_at_path(&["nonexistent".to_string()]);
         assert_eq!(result, None);

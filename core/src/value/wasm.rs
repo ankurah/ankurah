@@ -13,7 +13,7 @@ impl From<Value> for JsValue {
             Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
             Value::Object(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
             Value::Binary(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
-            Value::Json(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
+            Value::Json(json) => serde_wasm_bindgen::to_value(&json).unwrap_or(JsValue::NULL),
         }
     }
 }
@@ -30,7 +30,7 @@ impl From<&Value> for JsValue {
             Value::EntityId(entity_id) => JsValue::from_str(&entity_id.to_base64()),
             Value::Object(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
             Value::Binary(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
-            Value::Json(bytes) => js_sys::Uint8Array::from(&bytes[..]).into(),
+            Value::Json(json) => serde_wasm_bindgen::to_value(json).unwrap_or(JsValue::NULL),
         }
     }
 }

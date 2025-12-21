@@ -12,22 +12,12 @@ pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &
             match (left.as_ref(), right.as_ref()) {
                 // Case 1: field = literal (cast literal to field type)
                 (Expr::Path(path), Expr::Literal(literal)) => {
-                    // Skip casting for multi-step paths (JSON traversals) - the filter handles
-                    // dynamic type comparison for JSON fields. This is a HACK until we have
-                    // proper schema metadata for JSON properties (Phase 3 - Schema Registry).
-                    if !path.is_simple() {
-                        return Ok(Predicate::Comparison { left, operator, right });
-                    }
                     let target_type = schema.field_type(path)?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left, operator, right: Box::new(cast_literal) })
                 }
                 // Case 2: literal = field (cast literal to field type)
                 (Expr::Literal(literal), Expr::Path(path)) => {
-                    // Skip casting for multi-step paths (JSON traversals) - see comment above
-                    if !path.is_simple() {
-                        return Ok(Predicate::Comparison { left, operator, right });
-                    }
                     let target_type = schema.field_type(path)?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left: Box::new(cast_literal), operator, right })

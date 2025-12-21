@@ -287,6 +287,7 @@ impl SqlBuilder {
                 Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
                 Literal::Object(bytes) => self.arg(bytes.clone()),
                 Literal::Binary(bytes) => self.arg(bytes.clone()),
+                Literal::Json(json) => self.arg(json.clone()),
             },
             Expr::Path(path) => {
                 if path.is_simple() {
@@ -325,6 +326,7 @@ impl SqlBuilder {
                             Literal::EntityId(ulid) => self.arg(EntityId::from_ulid(*ulid).to_base64()),
                             Literal::Object(bytes) => self.arg(bytes.clone()),
                             Literal::Binary(bytes) => self.arg(bytes.clone()),
+                            Literal::Json(json) => self.arg(json.clone()),
                         },
                         _ => {
                             return Err(SqlGenerationError::UnsupportedExpression(
@@ -366,6 +368,8 @@ impl SqlBuilder {
                         // Fall back to regular expression (will likely fail comparison, but that's correct)
                         self.expr(expr)?;
                     }
+                    // JSON literal is already properly typed
+                    Literal::Json(json) => self.sql(format!("'{}'::jsonb", json)),
                 }
                 Ok(())
             }

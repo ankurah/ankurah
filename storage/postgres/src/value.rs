@@ -43,11 +43,8 @@ impl From<Value> for PGValue {
             Value::EntityId(entity_id) => PGValue::CharacterVarying(entity_id.to_base64()),
             Value::Object(items) => PGValue::Bytea(items),
             Value::Binary(items) => PGValue::Bytea(items),
-            // Parse JSON bytes to serde_json::Value for PostgreSQL jsonb type
-            Value::Json(bytes) => {
-                let json_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::Value::Null);
-                PGValue::Jsonb(json_value)
-            }
+            // Value::Json already contains serde_json::Value
+            Value::Json(json) => PGValue::Jsonb(json),
         }
     }
 }

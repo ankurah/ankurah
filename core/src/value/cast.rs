@@ -151,6 +151,55 @@ impl Value {
             (Value::I64(n), ValueType::Bool) => Ok(Value::Bool(*n != 0)),
             (Value::F64(f), ValueType::Bool) => Ok(Value::Bool(*f != 0.0)),
 
+            // Cast TO Json: wrap scalar values as JSON, preserving their original type tag
+            // This is used for JSON subfield indexing where type must be preserved
+            (Value::String(s), ValueType::Json) => Ok(Value::Json(serde_json::Value::String(s.clone()))),
+            (Value::I64(n), ValueType::Json) => Ok(Value::Json(serde_json::json!(*n))),
+            (Value::I32(n), ValueType::Json) => Ok(Value::Json(serde_json::json!(*n as i64))),
+            (Value::I16(n), ValueType::Json) => Ok(Value::Json(serde_json::json!(*n as i64))),
+            (Value::F64(n), ValueType::Json) => Ok(Value::Json(serde_json::json!(*n))),
+            (Value::Bool(b), ValueType::Json) => Ok(Value::Json(serde_json::Value::Bool(*b))),
+
+            // Cast FROM Json: extract value if types match
+            (Value::Json(json), ValueType::String) => match json {
+                serde_json::Value::String(s) => Ok(Value::String(s.clone())),
+                _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
+            },
+            (Value::Json(json), ValueType::I64) => match json {
+                serde_json::Value::Number(n) if n.is_i64() => Ok(Value::I64(n.as_i64().unwrap())),
+                _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
+            },
+            (Value::Json(json), ValueType::I32) => match json {
+                serde_json::Value::Number(n) if n.is_i64() => {
+                    let i = n.as_i64().unwrap();
+                    if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                        Ok(Value::I32(i as i32))
+                    } else {
+                        Err(CastError::NumericOverflow { value: i.to_string(), target_type: ValueType::I32 })
+                    }
+                }
+                _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
+            },
+            (Value::Json(json), ValueType::I16) => match json {
+                serde_json::Value::Number(n) if n.is_i64() => {
+                    let i = n.as_i64().unwrap();
+                    if i >= i16::MIN as i64 && i <= i16::MAX as i64 {
+                        Ok(Value::I16(i as i16))
+                    } else {
+                        Err(CastError::NumericOverflow { value: i.to_string(), target_type: ValueType::I16 })
+                    }
+                }
+                _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
+            },
+            (Value::Json(json), ValueType::F64) => match json {
+                serde_json::Value::Number(n) => Ok(Value::F64(n.as_f64().unwrap_or(0.0))),
+                _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
+            },
+            (Value::Json(json), ValueType::Bool) => match json {
+                serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
+                _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
+            },
+
             // All other combinations are incompatible
             _ => Err(CastError::IncompatibleTypes { from: source_type, to: target_type }),
         }

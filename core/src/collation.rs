@@ -71,6 +71,7 @@ impl Collatable for ast::Literal {
             ast::Literal::EntityId(ulid) => ulid.to_bytes().to_vec(),
             ast::Literal::Object(bytes) => bytes.clone(),
             ast::Literal::Binary(bytes) => bytes.clone(),
+            ast::Literal::Json(json) => serde_json::to_vec(json).unwrap_or_default(),
         }
     }
 
@@ -159,6 +160,8 @@ impl Collatable for ast::Literal {
                 bytes.push(0);
                 Some(bytes)
             }
+            // JSON doesn't support successor/predecessor (dynamic types)
+            ast::Literal::Json(_) => None,
         }
     }
 
@@ -249,6 +252,8 @@ impl Collatable for ast::Literal {
                     }
                 }
             }
+            // JSON doesn't support successor/predecessor (dynamic types)
+            ast::Literal::Json(_) => None,
         }
     }
 
@@ -262,6 +267,7 @@ impl Collatable for ast::Literal {
             ast::Literal::Bool(b) => !b,
             ast::Literal::EntityId(ulid) => ulid.to_bytes().iter().all(|&b| b == 0),
             ast::Literal::Object(bytes) | ast::Literal::Binary(bytes) => bytes.is_empty(),
+            ast::Literal::Json(_) => false, // JSON doesn't have a minimum
         }
     }
 
@@ -275,6 +281,7 @@ impl Collatable for ast::Literal {
             ast::Literal::Bool(b) => *b,
             ast::Literal::EntityId(ulid) => ulid.to_bytes().iter().all(|&b| b == 255),
             ast::Literal::Object(_) | ast::Literal::Binary(_) => false, // No theoretical maximum
+            ast::Literal::Json(_) => false,                             // JSON doesn't have a maximum
         }
     }
 }

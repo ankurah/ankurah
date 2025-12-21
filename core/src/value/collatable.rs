@@ -25,8 +25,10 @@ impl Collatable for Value {
             }
             Value::Bool(b) => vec![*b as u8],
             Value::EntityId(entity_id) => entity_id.to_bytes().to_vec(),
-            // For binary/object/json, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
-            Value::Object(bytes) | Value::Binary(bytes) | Value::Json(bytes) => bytes.clone(),
+            // For binary/object, return raw bytes; tuple framing will add type-tag/len for cross-type ordering
+            Value::Object(bytes) | Value::Binary(bytes) => bytes.clone(),
+            // For JSON, serialize to bytes
+            Value::Json(json) => serde_json::to_vec(json).unwrap_or_default(),
         }
     }
 
