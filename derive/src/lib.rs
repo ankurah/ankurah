@@ -23,7 +23,10 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
 
     let hygiene_module = quote::format_ident!("__ankurah_derive_impl_{}", to_snake_case(&desc.name().to_string()));
     let wasm_imports = if cfg!(feature = "wasm") {
-        quote! { use ::ankurah::derive_deps::wasm_bindgen::prelude::*; }
+        quote! {
+            use ::ankurah::derive_deps::wasm_bindgen::prelude::*;
+            use ::ankurah::derive_deps::wasm_bindgen_futures;
+        }
     } else {
         quote! {}
     };

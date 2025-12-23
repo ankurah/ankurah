@@ -1,9 +1,15 @@
+//! WASM wrapper generation for Model types.
+//!
+//! wasm-bindgen doesn't support generics, so we generate concrete wrapper types:
+//! - `SessionRef` - wraps `Ref<Session>` with `get(ctx)`, `id`, `from(view)` methods
+//! - `SessionResultSet`, `SessionLiveQuery`, etc.
+//! - Static methods via `NSSession` namespace class
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{DeriveInput, Ident};
 
-/// we need to generate wrappers for any generic types we want to expose to typescript, because wasm-bindgen doesn't support types with generics
-
+/// Main WASM implementation generator for a Model.
 pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::ModelDescription) -> TokenStream {
     // Generate the namespace struct name (NSEntry for Entry)
     let namespace_struct = format_ident!("NS{}", model.name());
@@ -21,9 +27,14 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
     let changeset_wrapper = wasm_changeset_wrapper(&model.changeset_name(), &model.view_name(), &model.resultset_name());
     let livequery_wrapper =
         wasm_livequery_wrapper(&model.livequery_name(), &model.view_name(), &model.resultset_name(), &model.changeset_name());
+    let ref_wrapper = wasm_ref_wrapper(&model.ref_name(), model.name(), &model.view_name());
 
     quote! {
         #tsify_impl
+
+        // RefModel wrapper at module level (accessible for trait associated type).
+        // Uses short wasm_bindgen path from module-level import in lib.rs
+        #ref_wrapper
 
         const _: () = {
             use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
@@ -208,6 +219,57 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
                 self.0.update_selection_wait(selection)
                     .await
                     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
+            }
+        }
+    }
+}
+
+/// SessionRef(Ref<Session>) - Typed entity reference wrapper
+///
+/// Wraps `Ref<Model>` with methods for TypeScript consumption:
+/// - `get(ctx)` - Fetch the referenced entity, returns Promise<ModelView>
+/// - `id` getter - Get the raw EntityId (use `.id().to_base64()` for string)
+/// - `from(view)` - Create from a View (static method)
+///
+/// Uses short wasm_bindgen path from module-level import in lib.rs
+pub fn wasm_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -> TokenStream {
+    quote! {
+        #[wasm_bindgen]
+        pub struct #ref_name(::ankurah::property::Ref<#model_name>);
+
+        #[wasm_bindgen]
+        impl #ref_name {
+            /// Fetch the referenced entity
+            #[wasm_bindgen]
+            pub async fn get(&self, ctx: &::ankurah::core::context::Context) -> Result<#view_name, JsValue> {
+                use ::ankurah::model::Model;
+                self.0.get(ctx).await.map_err(|e| JsValue::from(e.to_string()))
+            }
+
+            /// Get the raw EntityId
+            #[wasm_bindgen(getter)]
+            pub fn id(&self) -> ::ankurah::proto::EntityId {
+                self.0.id()
+            }
+
+            /// Create a reference from a View
+            #[wasm_bindgen(js_name = "from")]
+            pub fn from_view(view: &#view_name) -> Self {
+                #ref_name(view.r())
+            }
+        }
+
+        // Allow constructing RefModel from Ref<Model>
+        impl From<::ankurah::property::Ref<#model_name>> for #ref_name {
+            fn from(r: ::ankurah::property::Ref<#model_name>) -> Self {
+                #ref_name(r)
+            }
+        }
+
+        // Allow extracting Ref<Model> from RefModel
+        impl From<#ref_name> for ::ankurah::property::Ref<#model_name> {
+            fn from(r: #ref_name) -> Self {
+                r.0
             }
         }
     }

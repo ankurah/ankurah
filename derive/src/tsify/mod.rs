@@ -1,3 +1,10 @@
+//! Vendored subset of the tsify crate for generating TypeScript type definitions.
+//!
+//! We use this to generate POJO interfaces for Model structs (e.g., `interface Message { ... }`).
+//!
+//! TODO: Strip this down to just the parts we actually use - currently includes much more
+//! than needed for our Model type generation use case.
+
 pub(crate) mod attrs;
 pub(crate) mod comments;
 pub(crate) mod container;

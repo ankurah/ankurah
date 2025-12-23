@@ -57,6 +57,8 @@ impl ModelDescription {
     pub fn livequery_name(&self) -> Ident { format_ident!("{}LiveQuery", self.name) }
     #[cfg(feature = "wasm")]
     pub fn changeset_name(&self) -> Ident { format_ident!("{}ChangeSet", self.name) }
+    #[cfg(feature = "wasm")]
+    pub fn ref_name(&self) -> Ident { format_ident!("{}Ref", self.name) }
 
     // Computed accessors for active fields
     pub fn active_fields(&self) -> &[syn::Field] { &self.active_fields }
@@ -125,10 +127,137 @@ impl ModelDescription {
     pub fn ephemeral_field_types(&self) -> Vec<&Type> { self.ephemeral_fields.iter().map(|f| &f.ty).collect() }
     pub fn ephemeral_field_visibility(&self) -> Vec<&Visibility> { self.ephemeral_fields.iter().map(|f| &f.vis).collect() }
 
-    /// Generate WASM wrapper definitions for custom types not in provided_wrapper_types.
-    /// Uses model-scoped wrapper names to avoid symbol collisions when multiple models
-    /// use the same custom type (e.g., Ref<Artist> in both Album and Track).
-    pub fn generate_custom_wrapper_definitions(&self) -> Vec<proc_macro2::TokenStream> {
+    /// Get the WASM wrapper name for a `Ref<T>` type (e.g., `Ref<Artist>` → `ArtistRef`).
+    #[cfg(feature = "wasm")]
+    pub fn wasm_wrapper_for_type(ty: &Type) -> Option<Ident> {
+        if let Type::Path(type_path) = ty {
+            let segment = type_path.path.segments.last()?;
+
+            // Check if it's Ref<T>
+            if segment.ident == "Ref" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
+                        // Extract the inner type name (e.g., "Artist" from Ref<Artist>)
+                        if let Type::Path(inner_path) = inner_type {
+                            let inner_name = inner_path.path.segments.last()?.ident.to_string();
+                            return Some(format_ident!("{}Ref", inner_name));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get fields that need WASM wrappers for their projected types (generics like Ref<T>)
+    #[cfg(feature = "wasm")]
+    pub fn ref_fields(&self) -> Vec<(&syn::Field, Ident)> {
+        self.active_fields.iter().filter_map(|field| Self::wasm_wrapper_for_type(&field.ty).map(|wrapper| (field, wrapper))).collect()
+    }
+
+    /// Generate WASM getters for View - returns projected values (not active type wrappers).
+    ///
+    /// - `Ref<T>` → `TRef` (via `<T as Model>::RefWrapper`)
+    /// - `Option<Ref<T>>` → `Option<TRef>`
+    /// - Other → direct value
+    ///
+    /// Uses `__wasm_` prefix + `#[doc(hidden)]` to hide from Rust callers.
+    #[cfg(feature = "wasm")]
+    pub fn wasm_getters(&self) -> Vec<TokenStream> {
+        let model_name = &self.name;
+        let ref_field_names: std::collections::HashSet<_> =
+            self.ref_fields().iter().map(|(f, _)| f.ident.as_ref().unwrap().to_string()).collect();
+
+        // r() method - returns ModelRef for this model
+        let r_method = quote! {
+            #[doc(hidden)]
+            #[wasm_bindgen(js_name = r)]
+            pub fn __wasm_r(&self) -> <#model_name as ::ankurah::model::Model>::RefWrapper {
+                self.r().into()
+            }
+        };
+
+        let field_getters = self.active_fields
+            .iter()
+            .map(|field| {
+                let field_name = field.ident.as_ref().unwrap();
+                let wasm_method_name = format_ident!("__wasm_{}", field_name);
+                let is_ref = ref_field_names.contains(&field_name.to_string());
+
+                if is_ref {
+                    // Ref<T> field: return RefModel wrapper
+                    let inner_model = Self::extract_ref_inner_type(&field.ty)
+                        .expect("ref_fields should only contain Ref<T> types");
+                    quote! {
+                        #[doc(hidden)]
+                        #[wasm_bindgen(getter, js_name = #field_name)]
+                        pub fn #wasm_method_name(&self) -> Result<<#inner_model as ::ankurah::model::Model>::RefWrapper, JsValue> {
+                            self.#field_name().map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r)).map_err(|e| JsValue::from(e.to_string()))
+                        }
+                    }
+                } else if let Some(inner_model) = Self::extract_option_ref_inner_type(&field.ty) {
+                    // Option<Ref<T>> field: return Option<RefModel>
+                    quote! {
+                        #[doc(hidden)]
+                        #[wasm_bindgen(getter, js_name = #field_name)]
+                        pub fn #wasm_method_name(&self) -> Result<Option<<#inner_model as ::ankurah::model::Model>::RefWrapper>, JsValue> {
+                            self.#field_name().map(|opt| opt.map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r))).map_err(|e| JsValue::from(e.to_string()))
+                        }
+                    }
+                } else {
+                    // Non-Ref field: simple wrapper
+                    let projected_type = &field.ty;
+                    quote! {
+                        #[doc(hidden)]
+                        #[wasm_bindgen(getter, js_name = #field_name)]
+                        pub fn #wasm_method_name(&self) -> Result<#projected_type, JsValue> {
+                            self.#field_name().map_err(|e| JsValue::from(e.to_string()))
+                        }
+                    }
+                }
+            });
+
+        std::iter::once(r_method).chain(field_getters).collect()
+    }
+
+    /// Extract the inner type from Ref<T>, returning the T as a syn::Type
+    #[cfg(feature = "wasm")]
+    fn extract_ref_inner_type(ty: &Type) -> Option<Type> {
+        if let Type::Path(type_path) = ty {
+            let segment = type_path.path.segments.last()?;
+            if segment.ident == "Ref" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
+                        return Some(inner_type.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the inner model type from Option<Ref<T>>, returning T as a syn::Type
+    #[cfg(feature = "wasm")]
+    fn extract_option_ref_inner_type(ty: &Type) -> Option<Type> {
+        if let Type::Path(type_path) = ty {
+            let segment = type_path.path.segments.last()?;
+            if segment.ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
+                        // inner_type is Ref<T>, extract T
+                        return Self::extract_ref_inner_type(inner_type);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Generate model-scoped WASM wrappers for custom active types.
+    ///
+    /// "Custom" = NOT in `provided_wrapper_types` (e.g., `LWW<Ref<Session>>`).
+    /// Scoped as `Connection_LWWRefSession` to prevent symbol collisions.
+    pub fn custom_active_type_wrappers(&self) -> Vec<proc_macro2::TokenStream> {
         let mut wrappers = Vec::new();
         let mut seen_wrappers = std::collections::HashSet::new();
         let model_name = self.name.to_string();
@@ -142,7 +271,7 @@ impl ModelDescription {
                     // Avoid generating duplicate wrappers for same type within this model
                     if !seen_wrappers.contains(&wrapper_name) {
                         seen_wrappers.insert(wrapper_name);
-                        let wrapper = backend_desc.generate_wrapper_for_model("external", &model_name);
+                        let wrapper = backend_desc.wasm_wrapper("external", Some(&model_name));
                         wrappers.push(wrapper);
                     }
                 }
@@ -152,9 +281,11 @@ impl ModelDescription {
         wrappers
     }
 
-    /// Generate WASM getter methods for this model's active fields.
-    /// For custom types (not in provided_wrapper_types), uses model-scoped wrapper names.
-    pub fn generate_wasm_getter_methods(&self) -> Vec<proc_macro2::TokenStream> {
+    /// Generate WASM getters for Mutable - returns active type wrappers (e.g., `Connection_LWWRefSession`).
+    ///
+    /// Unlike View getters (which return projected values), these return the wrapper itself
+    /// so callers can use `.get()` and `.set()`.
+    pub fn mutable_wasm_getters(&self) -> Vec<proc_macro2::TokenStream> {
         let mut getter_methods = Vec::new();
         let model_name = self.name.to_string();
 

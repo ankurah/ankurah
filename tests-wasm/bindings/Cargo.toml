@@ -1,0 +1,24 @@
+[package]
+name = "ankurah-tests-wasm-bindings"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ankurah = { path = "../../ankurah", features = ["wasm"] }
+ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm" }
+console_error_panic_hook = "0.1"
+serde = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["console"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+

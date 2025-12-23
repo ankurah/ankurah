@@ -15,12 +15,21 @@ use anyhow::Result;
 use js_sys;
 #[cfg(feature = "wasm")]
 use wasm_bindgen;
+#[cfg(feature = "wasm")]
+use wasm_bindgen::JsCast;
 
 /// A model is a struct that represents the present values for a given entity
 /// Schema is defined primarily by the Model object, and the View is derived from that via macro.
-pub trait Model {
+pub trait Model: Sized {
     type View: View;
     type Mutable: Mutable;
+
+    /// WASM wrapper type for Ref<Self> - enables typed entity references in TypeScript.
+    /// The RefWrapper is a monomorphized struct (e.g., RefUser for Ref<User>) that
+    /// provides methods like `.get(ctx)` and `.id()` with proper TypeScript types.
+    #[cfg(feature = "wasm")]
+    type RefWrapper: From<crate::property::Ref<Self>> + Into<crate::property::Ref<Self>>;
+
     fn collection() -> CollectionId;
     // TODO - this seems to be necessary, but I don't understand why
     // Backend fields should be getting initialized on demand when the values are set
@@ -118,6 +127,44 @@ where
         listener(());
     }));
     ankurah_signals::SubscriptionGuard::new(subscription)
+}
+
+// Preprocess a Ref<T> field in a JS object before serde deserialization.
+// Uses duck typing: if value has an `.id` property (View/Ref types), extracts it.
+// Otherwise tries to parse as base64 string.
+#[doc(hidden)]
+#[cfg(feature = "wasm")]
+pub fn js_preprocess_ref_field(obj: &wasm_bindgen::JsValue, field_name: &str) -> Result<(), wasm_bindgen::JsValue> {
+    let field_key = wasm_bindgen::JsValue::from_str(field_name);
+    if let Ok(v) = js_sys::Reflect::get(obj, &field_key) {
+        // Skip if already a string
+        if v.as_string().is_some() {
+            return Ok(());
+        }
+
+        // Duck typing: check if value has an `.id` property (View/Ref types have this)
+        let id_key = wasm_bindgen::JsValue::from_str("id");
+        if let Ok(id_value) = js_sys::Reflect::get(&v, &id_key) {
+            // id_value should be an EntityId - get its base64 representation
+            let base64_key = wasm_bindgen::JsValue::from_str("to_base64");
+            if let Ok(to_base64_fn) = js_sys::Reflect::get(&id_value, &base64_key) {
+                if let Some(func) = to_base64_fn.dyn_ref::<js_sys::Function>() {
+                    if let Ok(result) = func.call0(&id_value) {
+                        if let Some(id_str) = result.as_string() {
+                            js_sys::Reflect::set(obj, &field_key, &wasm_bindgen::JsValue::from_str(&id_str))?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we get here and it's not a string, it's an invalid value
+        if !v.is_undefined() && !v.is_null() {
+            return Err(wasm_bindgen::JsValue::from_str(&format!("Field '{}' must be a View, Ref, or base64 string", field_name)));
+        }
+    }
+    Ok(())
 }
 
 // Helper function for map implementations in generated WASM ResultSet wrappers

@@ -33,8 +33,8 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
 
     // Generate WASM getter methods and wrapper definitions for custom types
     let (wasm_getter_impl, wasm_custom_wrappers) = if cfg!(feature = "wasm") {
-        let getter_methods = model.generate_wasm_getter_methods();
-        let custom_wrappers = model.generate_custom_wrapper_definitions();
+        let getter_methods = model.mutable_wasm_getters();
+        let custom_wrappers = model.custom_active_type_wrappers();
         (
             quote! {
                 #[wasm_bindgen]

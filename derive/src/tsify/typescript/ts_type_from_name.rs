@@ -114,6 +114,24 @@ impl TsType {
 
                 Self::Fn { params, type_ann: Box::new(type_ann) }
             }
+
+            // Ref<Model> → ModelRef | ModelView | string
+            // Allows create() to accept View, Ref wrapper, or base64 string
+            // Note: EntityId objects not supported (serde can't handle WASM pointers)
+            "Ref" if args.len() == 1 => {
+                let inner_type = Self::from_syn_type(config, args[0]);
+                if let Self::Ref { name, .. } = &inner_type {
+                    Self::Union(vec![
+                        Self::Ref { name: format!("{}Ref", name), type_params: vec![] },
+                        Self::Ref { name: format!("{}View", name), type_params: vec![] },
+                        Self::STRING,
+                    ])
+                } else {
+                    // Fallback for complex inner types
+                    Self::STRING
+                }
+            }
+
             _ => {
                 let type_params = args.into_iter().map(|ty| Self::from_syn_type(config, ty)).collect();
                 Self::Ref { name: config.format_name(ident.to_string()), type_params }

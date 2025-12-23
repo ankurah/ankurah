@@ -35,7 +35,7 @@ pub fn impl_provided_wrapper_types_impl(config_filename: &str) -> syn::Result<To
             }
 
             let backend = ActiveTypeDesc::new(config.clone(), value_config.clone(), concrete_types);
-            let wrapper = backend.generate_wrapper("local");
+            let wrapper = backend.wasm_wrapper("local", None);
             all_wrappers.push(wrapper);
         }
     }
@@ -86,7 +86,7 @@ pub fn impl_wrapper_type_impl(custom_type: &syn::Type) -> syn::Result<TokenStrea
             }
 
             let backend_desc = ActiveTypeDesc::new(config.clone(), value_config.clone(), concrete_types);
-            let wrapper = backend_desc.generate_wrapper("external");
+            let wrapper = backend_desc.wasm_wrapper("external", None);
             all_wrappers.push(wrapper);
         }
     }
