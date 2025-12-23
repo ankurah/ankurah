@@ -1,8 +1,38 @@
+//! Active type wrapper generation for WASM bindings.
+//!
+//! Active types (LWW, Yrs, etc.) need WASM wrappers because wasm-bindgen doesn't support
+//! generics. This module handles:
+//! - Wrapper struct generation (e.g., `LWWString`, `Connection_LWWRefSession`)
+//! - Method generation with proper TypeScript types
+//! - `Ref<T>` → `TRef` conversion for type-safe entity references
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use syn::Type;
+
+// --- Type string helpers for Ref<T> handling ---
+
+/// Rewrite `Ref<Model>` → `<Model as Model>::RefWrapper` for proper TS typing.
+fn convert_ref_to_wrapper(type_str: &str) -> String {
+    Regex::new(r"Ref<(\w+)>")
+        .unwrap()
+        .replace_all(type_str, |caps: &regex::Captures| format!("<{} as ::ankurah::model::Model>::RefWrapper", &caps[1]))
+        .to_string()
+}
+
+/// Check for `Option<Ref<T>>` pattern.
+fn has_option_ref(type_str: &str) -> bool { Regex::new(r"Option<\s*Ref<\w+>").unwrap().is_match(type_str) }
+
+/// Check for bare `Ref<T>` (not wrapped in Option).
+fn has_bare_ref(type_str: &str) -> bool { type_str.contains("Ref<") && !has_option_ref(type_str) }
+
+/// Extract model name from `Ref<Model>` (e.g., `"Ref<User>"` → `Some("User")`).
+fn extract_ref_model_name(type_str: &str) -> Option<String> {
+    Regex::new(r"Ref<(\w+)>").unwrap().captures(type_str).map(|caps| caps[1].to_string())
+}
 
 /// Backend configuration for code generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +131,8 @@ impl ActiveTypeDesc {
         false
     }
 
-    /// Get the appropriate fully qualified wrapper type path
+    /// Get the appropriate fully qualified wrapper type path (used in tests)
+    #[allow(unused)]
     pub fn get_wrapper_type_path(&self) -> String {
         if self.is_provided_type() {
             self.wrapper_type_path("local")
@@ -147,74 +178,135 @@ impl ActiveTypeDesc {
         syn::parse_str(&type_str)
     }
 
-    /// Generate the materialized wrapper struct with context-specific substitutions
-    pub fn generate_wrapper(&self, context: &str) -> TokenStream {
-        // For now, assume single value config
+    /// WASM methods for this active type wrapper.
+    ///
+    /// - `get()` → Projected value (e.g., `SessionRef` for `LWW<Ref<Session>>`)
+    /// - `set(value)` → Accepts `TRef | TView` via duck typing on `.id` property
+    ///
+    /// Returns `(methods, ts_override)` - ts_override provides union type for set().
+    fn wasm_methods(&self, context: &str) -> (Vec<TokenStream>, Option<String>) {
         let value_config = &self.backend_config.values[0];
-
-        let wrapper_name = format_ident!("{}", self.wrapper_type_name());
-        let original_type: Type = self.rust_type_with_context(context).expect("Failed to parse original type");
-
         let substitute_fn = |backend: &ActiveTypeDesc, pattern: &str| backend.do_substitutions(pattern, context);
 
-        // Generate method implementations (only for methods with wasm: true)
-        let methods: Vec<TokenStream> = value_config
+        let mut ts_set_override: Option<String> = None;
+
+        let methods = value_config
             .methods
             .iter()
             .filter(|method| method.wasm)
             .map(|method| {
                 let method_name = format_ident!("{}", method.name);
+
+                // Check if any arg is a Ref<T> type for set method
+                let ref_model_for_set: Option<String> = if method.name == "set" {
+                    method.args.iter().find_map(|(_, arg_type)| {
+                        let substituted = substitute_fn(self, arg_type);
+                        if has_bare_ref(&substituted) {
+                            extract_ref_model_name(&substituted)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+
+                // For set with Ref<T>, accept JsValue and extract EntityId via duck typing
+                // Accepts: ModelRef, ModelView (have .id), EntityId, or base64 string
+                if let Some(ref model_name) = ref_model_for_set {
+                    let model_ident = format_ident!("{}", model_name);
+                    ts_set_override = Some(format!("{}Ref | {}View | string", model_name, model_name));
+
+                    return quote! {
+                        #[wasm_bindgen(skip_typescript)]
+                        pub fn set(&self, value: JsValue) -> Result<(), JsValue> {
+                            // Try multiple conversion strategies:
+                            // 1. String -> parse as base64
+                            // 2. EntityId -> use directly
+                            // 3. Object with .id -> extract EntityId
+                            let id: ::ankurah::proto::EntityId = if let Some(s) = value.as_string() {
+                                ::ankurah::proto::EntityId::from_base64(&s)
+                                    .map_err(|e| JsValue::from_str(&format!("Invalid EntityId string: {}", e)))?
+                            } else if let Ok(id) = value.clone().try_into() {
+                                id
+                            } else {
+                                let id_value = ::ankurah::derive_deps::js_sys::Reflect::get(&value, &JsValue::from_str("id"))
+                                    .map_err(|_| JsValue::from_str("Expected string, EntityId, or object with 'id' property"))?;
+                                id_value.try_into()
+                                    .map_err(|_| JsValue::from_str("'id' property is not an EntityId"))?
+                            };
+
+                            let r: ::ankurah::property::Ref<#model_ident> = ::ankurah::property::Ref::new(id);
+                            self.0.set(&r).map_err(|e| JsValue::from(e.to_string()))
+                        }
+                    };
+                }
+
+                // Regular method handling
                 let args: Vec<TokenStream> = method
                     .args
                     .iter()
                     .map(|(arg_name, arg_type)| {
                         let arg_name = format_ident!("{}", arg_name);
-                        let arg_type = substitute_fn(self, arg_type);
-                        let arg_type: Type = syn::parse_str(&arg_type).expect("Failed to parse arg type");
+                        let substituted = substitute_fn(self, arg_type);
+                        let arg_type_str = convert_ref_to_wrapper(&substituted);
+                        let arg_type: Type = syn::parse_str(&arg_type_str).expect("Failed to parse arg type");
                         quote! { #arg_name: #arg_type }
                     })
                     .collect();
 
-                let return_type_str = substitute_fn(self, &method.return_type);
+                let original_return_type_str = substitute_fn(self, &method.return_type);
+                let return_has_ref = original_return_type_str.contains("Ref<");
+                let return_has_option_ref = has_option_ref(&original_return_type_str);
+                let return_type_str = convert_ref_to_wrapper(&original_return_type_str);
 
-                // Generate method call: self.0.method_name(args...)
                 let arg_names: Vec<syn::Ident> = method.args.iter().map(|(name, _)| format_ident!("{}", name)).collect();
-
-                // Handle argument conversion for WASM (e.g., value -> &value for LWW::set)
                 let converted_args: Vec<TokenStream> = method
                     .args
                     .iter()
                     .zip(arg_names.iter())
                     .map(|((_, arg_type), arg_name)| {
+                        let substituted = substitute_fn(self, arg_type);
+                        let is_ref_arg = has_bare_ref(&substituted);
+                        let is_option_ref_arg = has_option_ref(&substituted);
                         if arg_type == "{T}" && method.name == "set" {
-                            // For LWW::set and similar, convert value parameter to reference
-                            quote! { &#arg_name }
+                            if is_option_ref_arg {
+                                quote! { &#arg_name.map(Into::into) }
+                            } else if is_ref_arg {
+                                quote! { &(#arg_name.into()) }
+                            } else {
+                                quote! { &#arg_name }
+                            }
+                        } else if is_option_ref_arg {
+                            quote! { #arg_name.map(Into::into) }
+                        } else if is_ref_arg {
+                            quote! { #arg_name.into() }
                         } else {
                             quote! { #arg_name }
                         }
                     })
                     .collect();
 
-                // Handle Result types properly - don't double-wrap
                 let (wasm_return_type_str, method_call) = if return_type_str.starts_with("Result<") {
-                    // Already a Result, just change the error type
-                    let inner_type = return_type_str.strip_prefix("Result<").unwrap().strip_suffix(">").unwrap();
-                    let parts: Vec<&str> = inner_type.split(", ").collect();
-                    let ok_type = parts[0];
-                    (
-                        format!("Result<{}, ::wasm_bindgen::JsValue>", ok_type),
-                        quote! {
-                            self.0.#method_name(#(#converted_args),*)
-                                .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
-                        },
-                    )
+                    let inner = return_type_str.strip_prefix("Result<").unwrap().strip_suffix(">").unwrap();
+                    let ok_type = inner.split(", ").next().unwrap();
+                    let call = if return_has_option_ref {
+                        quote! { self.0.#method_name(#(#converted_args),*).map(|opt| opt.map(Into::into)).map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string())) }
+                    } else if return_has_ref {
+                        quote! { self.0.#method_name(#(#converted_args),*).map(Into::into).map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string())) }
+                    } else {
+                        quote! { self.0.#method_name(#(#converted_args),*).map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string())) }
+                    };
+                    (format!("Result<{}, ::wasm_bindgen::JsValue>", ok_type), call)
+                } else if return_has_option_ref {
+                    (return_type_str.clone(), quote! { self.0.#method_name(#(#converted_args),*).map(Into::into) })
+                } else if return_has_ref {
+                    (return_type_str.clone(), quote! { self.0.#method_name(#(#converted_args),*).into() })
                 } else {
-                    // Not a Result, return directly
                     (return_type_str.clone(), quote! { self.0.#method_name(#(#converted_args),*) })
                 };
 
                 let wasm_return_type: Type = syn::parse_str(&wasm_return_type_str).expect("Failed to parse return type");
-
                 quote! {
                     pub fn #method_name(&self, #(#args),*) -> #wasm_return_type {
                         #method_call
@@ -223,87 +315,32 @@ impl ActiveTypeDesc {
             })
             .collect();
 
-        quote! {
-            #[wasm_bindgen]
-            pub struct #wrapper_name( #[wasm_bindgen(skip)] pub #original_type);
-
-
-            #[wasm_bindgen]
-            impl #wrapper_name {
-                #(#methods)*
-            }
-        }
+        (methods, ts_set_override)
     }
 
-    /// Generate a model-scoped wrapper struct to avoid symbol collisions.
-    /// Used for custom types (not in provided_wrapper_types) that may appear
-    /// in multiple models with the same inner type (e.g., Ref<Artist>).
-    pub fn generate_wrapper_for_model(&self, context: &str, model_name: &str) -> TokenStream {
-        let value_config = &self.backend_config.values[0];
-
-        let wrapper_name = format_ident!("{}", self.wrapper_type_name_for_model(model_name));
+    /// WASM wrapper struct for this active type.
+    ///
+    /// - `model_scope: None` → Global (e.g., `LWWString`)
+    /// - `model_scope: Some("Connection")` → Scoped (e.g., `Connection_LWWRefSession`)
+    pub fn wasm_wrapper(&self, context: &str, model_scope: Option<&str>) -> TokenStream {
+        let wrapper_name_str = match model_scope {
+            Some(model) => self.wrapper_type_name_for_model(model),
+            None => self.wrapper_type_name(),
+        };
+        let wrapper_name = format_ident!("{}", wrapper_name_str);
         let original_type: Type = self.rust_type_with_context(context).expect("Failed to parse original type");
+        let (methods, ts_set_override) = self.wasm_methods(context);
 
-        let substitute_fn = |backend: &ActiveTypeDesc, pattern: &str| backend.do_substitutions(pattern, context);
-
-        // Generate method implementations (only for methods with wasm: true)
-        let methods: Vec<TokenStream> = value_config
-            .methods
-            .iter()
-            .filter(|method| method.wasm)
-            .map(|method| {
-                let method_name = format_ident!("{}", method.name);
-                let args: Vec<TokenStream> = method
-                    .args
-                    .iter()
-                    .map(|(arg_name, arg_type)| {
-                        let arg_name = format_ident!("{}", arg_name);
-                        let arg_type = substitute_fn(self, arg_type);
-                        let arg_type: Type = syn::parse_str(&arg_type).expect("Failed to parse arg type");
-                        quote! { #arg_name: #arg_type }
-                    })
-                    .collect();
-
-                let return_type_str = substitute_fn(self, &method.return_type);
-                let arg_names: Vec<syn::Ident> = method.args.iter().map(|(name, _)| format_ident!("{}", name)).collect();
-
-                let converted_args: Vec<TokenStream> = method
-                    .args
-                    .iter()
-                    .zip(arg_names.iter())
-                    .map(|((_, arg_type), arg_name)| {
-                        if arg_type == "{T}" && method.name == "set" {
-                            quote! { &#arg_name }
-                        } else {
-                            quote! { #arg_name }
-                        }
-                    })
-                    .collect();
-
-                let (wasm_return_type_str, method_call) = if return_type_str.starts_with("Result<") {
-                    let inner_type = return_type_str.strip_prefix("Result<").unwrap().strip_suffix(">").unwrap();
-                    let parts: Vec<&str> = inner_type.split(", ").collect();
-                    let ok_type = parts[0];
-                    (
-                        format!("Result<{}, ::wasm_bindgen::JsValue>", ok_type),
-                        quote! {
-                            self.0.#method_name(#(#converted_args),*)
-                                .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
-                        },
-                    )
-                } else {
-                    (return_type_str.clone(), quote! { self.0.#method_name(#(#converted_args),*) })
-                };
-
-                let wasm_return_type: Type = syn::parse_str(&wasm_return_type_str).expect("Failed to parse return type");
-
-                quote! {
-                    pub fn #method_name(&self, #(#args),*) -> #wasm_return_type {
-                        #method_call
-                    }
-                }
-            })
-            .collect();
+        // Generate TypeScript custom section for union type if needed
+        let ts_custom_section = if let Some(ref union_type) = ts_set_override {
+            let ts_decl = format!("interface {} {{ set(value: {}): void; }}", wrapper_name_str, union_type);
+            quote! {
+                #[wasm_bindgen(typescript_custom_section)]
+                const _: &'static str = #ts_decl;
+            }
+        } else {
+            quote! {}
+        };
 
         quote! {
             #[wasm_bindgen]
@@ -313,6 +350,8 @@ impl ActiveTypeDesc {
             impl #wrapper_name {
                 #(#methods)*
             }
+
+            #ts_custom_section
         }
     }
 

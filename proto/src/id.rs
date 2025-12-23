@@ -50,6 +50,10 @@ impl EntityId {
     #[cfg(feature = "wasm")]
     #[wasm_bindgen(js_name = from_base64)]
     pub fn from_base64_js(s: &str) -> Result<Self, JsValue> { Self::from_base64(s).map_err(|e| JsValue::from_str(&e.to_string())) }
+
+    #[cfg(feature = "wasm")]
+    #[wasm_bindgen]
+    pub fn equals(&self, other: &EntityId) -> bool { self.0 == other.0 }
 }
 
 impl fmt::Display for EntityId {

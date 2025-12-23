@@ -1,8 +1,38 @@
 use proc_macro2::TokenStream;
 use quote::quote;
+use serde_derive_internals::ast::Data;
 use syn::parse_quote;
 
 use crate::tsify::{container::Container, decl::Decl};
+
+/// Finds all `Ref<T>` fields in a struct, returning (serde_field_name, inner_type).
+/// Used to determine which fields need preprocessing in FromWasmAbi.
+fn extract_ref_fields(cont: &Container) -> Vec<(String, syn::Ident)> {
+    let Data::Struct(_, fields) = cont.serde_data() else {
+        return Vec::new();
+    };
+
+    fields
+        .iter()
+        .filter_map(|field| {
+            let inner = extract_ref_inner_type(field.ty)?;
+            let name = field.attrs.name().serialize_name().to_owned();
+            Some((name, inner))
+        })
+        .collect()
+}
+
+/// Matches `Ref<T>` and extracts T as an Ident.
+fn extract_ref_inner_type(ty: &syn::Type) -> Option<syn::Ident> {
+    let syn::Type::Path(type_path) = ty else { return None };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Ref" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else { return None };
+    let syn::GenericArgument::Type(syn::Type::Path(inner)) = args.args.first()? else { return None };
+    Some(inner.path.segments.last()?.ident.clone())
+}
 
 pub fn expand(cont: &Container, decl: Decl) -> TokenStream {
     let attrs = &cont.attrs;
@@ -196,6 +226,60 @@ fn expand_from_wasm_abi(cont: &Container) -> TokenStream {
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
+    // Ref<T> fields require preprocessing: View/Ref objects → base64 EntityId strings.
+    // This runs before serde deserialization since serde can't handle WASM object pointers.
+    let ref_fields = extract_ref_fields(cont);
+    let preprocess_calls: Vec<TokenStream> = ref_fields
+        .iter()
+        .map(|(field_name, _)| {
+            quote! {
+                ::ankurah::core::model::js_preprocess_ref_field(&js_value, #field_name).unwrap_throw();
+            }
+        })
+        .collect();
+
+    let from_abi_body = if preprocess_calls.is_empty() {
+        quote! {
+            let result = Self::from_js(&JsType::from_abi(js));
+            if let Err(err) = result {
+                wasm_bindgen::throw_str(err.to_string().as_ref());
+            }
+            result.unwrap_throw()
+        }
+    } else {
+        quote! {
+            use wasm_bindgen::JsCast;
+            let js_value: JsValue = JsType::from_abi(js).unchecked_into();
+            #(#preprocess_calls)*
+            let result = Self::from_js(js_value);
+            if let Err(err) = result {
+                wasm_bindgen::throw_str(err.to_string().as_ref());
+            }
+            result.unwrap_throw()
+        }
+    };
+
+    let ref_from_abi_body = if preprocess_calls.is_empty() {
+        quote! {
+            let result = Self::from_js(&*JsType::ref_from_abi(js));
+            if let Err(err) = result {
+                wasm_bindgen::throw_str(err.to_string().as_ref());
+            }
+            SelfOwner(result.unwrap_throw())
+        }
+    } else {
+        quote! {
+            use wasm_bindgen::JsCast;
+            let js_value: JsValue = (*JsType::ref_from_abi(js)).unchecked_ref::<JsValue>().clone();
+            #(#preprocess_calls)*
+            let result = Self::from_js(js_value);
+            if let Err(err) = result {
+                wasm_bindgen::throw_str(err.to_string().as_ref());
+            }
+            SelfOwner(result.unwrap_throw())
+        }
+    };
+
     quote! {
         #[automatically_derived]
         impl #impl_generics FromWasmAbi for #ident #ty_generics #where_clause {
@@ -203,11 +287,7 @@ fn expand_from_wasm_abi(cont: &Container) -> TokenStream {
 
             #[inline]
             unsafe fn from_abi(js: Self::Abi) -> Self {
-                let result = Self::from_js(&JsType::from_abi(js));
-                if let Err(err) = result {
-                    wasm_bindgen::throw_str(err.to_string().as_ref());
-                }
-                result.unwrap_throw()
+                #from_abi_body
             }
         }
 
@@ -237,11 +317,7 @@ fn expand_from_wasm_abi(cont: &Container) -> TokenStream {
             type Anchor = SelfOwner<Self>;
 
             unsafe fn ref_from_abi(js: Self::Abi) -> Self::Anchor {
-                let result = Self::from_js(&*JsType::ref_from_abi(js));
-                if let Err(err) = result {
-                    wasm_bindgen::throw_str(err.to_string().as_ref());
-                }
-                SelfOwner(result.unwrap_throw())
+                #ref_from_abi_body
             }
         }
 

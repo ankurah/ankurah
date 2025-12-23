@@ -1,5 +1,5 @@
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 
 /// Generate the Model trait implementation
 pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenStream {
@@ -14,10 +14,21 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
         Err(e) => return e.into_compile_error(),
     };
 
+    // RefWrapper associated type for WASM builds
+    let ref_wrapper_type = if cfg!(feature = "wasm") {
+        let ref_name = format_ident!("{}Ref", name);
+        quote! {
+            type RefWrapper = #ref_name;
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         impl ::ankurah::model::Model for #name {
             type View = #view_name;
             type Mutable = #mutable_name;
+            #ref_wrapper_type
             fn collection() -> ankurah::proto::CollectionId {
                 #collection_str.into()
             }

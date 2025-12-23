@@ -14,11 +14,25 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     let projected_field_types_turbofish = model.projected_field_types_turbofish();
     let active_field_types_turbofish = match model.active_field_types_turbofish() {
         Ok(types) => types,
-        Err(_) => return quote! { compile_error!("Failed to generate active field types"); },
+        Err(e) => return e.into_compile_error(),
     };
     let active_field_name_strs = model.active_field_name_strs();
 
-    let (struct_attributes, impl_attributes, getter_attributes, wasm_edit_impl) = if cfg!(feature = "wasm") {
+    // WASM field getters (conditionally generated)
+    #[cfg(feature = "wasm")]
+    let wasm_field_getters_impl = {
+        let wasm_getters = model.wasm_getters();
+        quote! {
+            #[wasm_bindgen]
+            impl #view_name {
+                #(#wasm_getters)*
+            }
+        }
+    };
+    #[cfg(not(feature = "wasm"))]
+    let wasm_field_getters_impl = quote! {};
+
+    let (struct_attributes, impl_attributes, id_getter_attr, wasm_edit_impl) = if cfg!(feature = "wasm") {
         let subscribe_ts = format!(
             r#"export interface {view_name} {{
     subscribe(callback: () => void): SubscriptionGuard;
@@ -149,11 +163,19 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
 
             #impl_attributes
             impl #view_name {
-                #getter_attributes
+                #id_getter_attr
                 pub fn id(&self) -> ankurah::proto::EntityId {
                     self.entity.id().clone()
                 }
 
+                /// Manually track this View in the current observer
+                pub fn track(&self) {
+                    ::ankurah::signals::CurrentObserver::track(self);
+                }
+            }
+
+            // Rust-only impl block: r() and all field getters (no wasm_bindgen)
+            impl #view_name {
                 /// Get a typed reference to this entity.
                 ///
                 /// This is useful when creating related entities that reference this one:
@@ -167,12 +189,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     ::ankurah::property::Ref::new(self.entity.id())
                 }
 
-                /// Manually track this View in the current observer
-                pub fn track(&self) {
-                    ::ankurah::signals::CurrentObserver::track(self);
-                }
                 #(
-                    #getter_attributes
                     pub fn #active_field_names(&self) -> Result<#projected_field_types, ankurah::property::PropertyError> {
                         use ankurah::property::{FromActiveType, FromEntity};
                         ::ankurah::signals::CurrentObserver::track(self);
@@ -181,6 +198,8 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                     }
                 )*
             }
+
+            #wasm_field_getters_impl
 
             impl<'a> Into<ankurah::proto::EntityId> for &'a #view_name {
                 fn into(self) -> ankurah::proto::EntityId {
