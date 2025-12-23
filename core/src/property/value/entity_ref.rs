@@ -180,8 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_invalid_variant() {
+    fn test_ref_invalid_string() {
+        // Invalid base64 string should return InvalidValue (backwards compat path tries to parse)
         let result: Result<Ref<TestModel>, _> = Ref::from_value(Some(Value::String("not an id".to_string())));
+        assert!(matches!(result, Err(PropertyError::InvalidValue { .. })));
+    }
+
+    #[test]
+    fn test_ref_invalid_variant() {
+        // Completely wrong type should return InvalidVariant
+        let result: Result<Ref<TestModel>, _> = Ref::from_value(Some(Value::I64(42)));
         assert!(matches!(result, Err(PropertyError::InvalidVariant { .. })));
     }
 }
