@@ -228,6 +228,7 @@ fn expand_from_wasm_abi(cont: &Container) -> TokenStream {
 
     // Ref<T> fields require preprocessing: View/Ref objects → base64 EntityId strings.
     // This runs before serde deserialization since serde can't handle WASM object pointers.
+    // This is a pretty gross hack but we'll clean it up later
     let ref_fields = extract_ref_fields(cont);
     let preprocess_calls: Vec<TokenStream> = ref_fields
         .iter()

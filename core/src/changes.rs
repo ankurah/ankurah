@@ -105,8 +105,30 @@ pub struct ChangeSet<R: View> {
 impl<R: View> ChangeSet<R>
 where R: Clone
 {
-    /// Returns all items that were added or now match the query
-    pub fn adds(&self) -> Vec<R> {
+    /// Returns items from the initial query load (before subscription was active)
+    pub fn initial(&self) -> Vec<R> {
+        self.changes
+            .iter()
+            .filter_map(|change| match change {
+                ItemChange::Initial { item } => Some(item.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns genuinely new items (added after subscription, or now match the predicate)
+    pub fn added(&self) -> Vec<R> {
+        self.changes
+            .iter()
+            .filter_map(|change| match change {
+                ItemChange::Add { item, .. } => Some(item.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns all items that appeared in the result set (initial load + newly added)
+    pub fn appeared(&self) -> Vec<R> {
         self.changes
             .iter()
             .filter_map(|change| match change {
@@ -116,8 +138,12 @@ where R: Clone
             .collect()
     }
 
+    #[deprecated(since = "0.7.10", note = "Use `appeared()`, `initial()`, or `added()` instead")]
+    /// Returns all items that were added or now match the query
+    pub fn adds(&self) -> Vec<R> { self.appeared() }
+
     /// Returns all items that were removed or no longer match the query
-    pub fn removes(&self) -> Vec<R> {
+    pub fn removed(&self) -> Vec<R> {
         self.changes
             .iter()
             .filter_map(|change| match change {
@@ -127,8 +153,12 @@ where R: Clone
             .collect()
     }
 
+    #[deprecated(since = "0.7.10", note = "Use `removed()` instead")]
+    /// Returns all items that were removed or no longer match the query
+    pub fn removes(&self) -> Vec<R> { self.removed() }
+
     /// Returns all items that were updated but still match the query
-    pub fn updates(&self) -> Vec<R> {
+    pub fn updated(&self) -> Vec<R> {
         self.changes
             .iter()
             .filter_map(|change| match change {
@@ -137,6 +167,10 @@ where R: Clone
             })
             .collect()
     }
+
+    #[deprecated(since = "0.7.10", note = "Use `updated()` instead")]
+    /// Returns all items that were updated but still match the query
+    pub fn updates(&self) -> Vec<R> { self.updated() }
 }
 
 impl<I> std::fmt::Display for ChangeSet<I>
