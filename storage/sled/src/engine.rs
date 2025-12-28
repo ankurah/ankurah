@@ -113,12 +113,11 @@ impl StorageEngine for SledStorageEngine {
                 if name == "__sled__default" {
                     continue;
                 }
-                println!("Dropping tree: {}", String::from_utf8_lossy(&name));
+
                 match database.db.drop_tree(&name) {
                     Ok(true) => any_deleted = true,
                     Ok(false) => {}
                     Err(err) => {
-                        println!("Error dropping tree: {}", err);
                         return Err(MutationError::General(Box::new(err)));
                     }
                 }
