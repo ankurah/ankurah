@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use ankurah::{policy::DEFAULT_CONTEXT, Context, Model, Node, PermissiveAgent, Ref};
+use ankurah::{policy::DEFAULT_CONTEXT, property::Json, Context, Model, Node, PermissiveAgent, Ref};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -36,6 +36,13 @@ pub struct TestMessage {
     #[active_type(LWW)]
     pub room: Ref<TestRoom>,
     pub text: String,
+}
+
+/// Entity with Json field - tests Json serialization to JS
+#[derive(Model, Debug, Serialize, Deserialize, Clone)]
+pub struct TestConfig {
+    pub name: String,
+    pub settings: Json,
 }
 
 // ============================================================================

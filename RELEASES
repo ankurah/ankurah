@@ -1,3 +1,4 @@
+0.7.11  Fix Json WASM serialization to return plain objects (POJOs) instead of ES2015 Maps
 0.7.10  ChangeSet API: initial(), added(), appeared(), updated(), removed() with deprecation of ambiguous adds()/removes()/updates(); Model.query_nocache() for WASM
 0.7.9  Ref<T> WASM monomorphization: ModelRef wrappers (e.g., UserRef) for proper TypeScript typing; set() accepts ModelRef | ModelView; View.r() returns ModelRef; static ModelRef.from_view(view) factory
 0.7.8  Ref<T> typed entity references with ergonomic traits (Deref, Copy, Borrow, AsRef, Display, TryFrom); Option<Ref<T>> WASM bindings; From<Ref<T>> for ankql::ast::Expr; IndexedDB JSON serialization fix (use plain objects not ES2015 Maps); Sled PropertyManager race condition fix
