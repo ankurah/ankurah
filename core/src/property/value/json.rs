@@ -113,7 +113,9 @@ export type Json = any;
 impl From<Json> for JsValue {
     fn from(json: Json) -> Self {
         // Convert serde_json::Value to JsValue using serde-wasm-bindgen
-        serde_wasm_bindgen::to_value(&json.0).unwrap_or(JsValue::NULL)
+        // Use serialize_maps_as_objects to get POJOs instead of Map instances
+        let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+        json.0.serialize(&serializer).unwrap_or(JsValue::NULL)
     }
 }
 
