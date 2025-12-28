@@ -109,18 +109,55 @@ pub fn wasm_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, results
                 #resultset_name(self.0.resultset.wrap())
             }
 
+            /// Items from the initial query load (before subscription was active)
             #[wasm_bindgen(getter)]
+            pub fn initial(&self) -> Vec<#view_name> {
+                self.0.initial()
+            }
+
+            /// Genuinely new items (added after subscription started)
+            #[wasm_bindgen(getter)]
+            pub fn added(&self) -> Vec<#view_name> {
+                self.0.added()
+            }
+
+            /// All items that appeared in the result set (initial load + newly added)
+            #[wasm_bindgen(getter)]
+            pub fn appeared(&self) -> Vec<#view_name> {
+                self.0.appeared()
+            }
+
+            /// Items that no longer match the query
+            #[wasm_bindgen(getter)]
+            pub fn removed(&self) -> Vec<#view_name> {
+                self.0.removed()
+            }
+
+            /// Items that were updated but still match
+            #[wasm_bindgen(getter)]
+            pub fn updated(&self) -> Vec<#view_name> {
+                self.0.updated()
+            }
+
+            // Deprecated methods for backwards compatibility
+            #[wasm_bindgen(getter)]
+            #[deprecated(since = "0.7.10", note = "Use appeared, initial, or added instead")]
             pub fn adds(&self) -> Vec<#view_name> {
+                #[allow(deprecated)]
                 self.0.adds()
             }
 
             #[wasm_bindgen(getter)]
+            #[deprecated(since = "0.7.10", note = "Use removed instead")]
             pub fn removes(&self) -> Vec<#view_name> {
+                #[allow(deprecated)]
                 self.0.removes()
             }
 
             #[wasm_bindgen(getter)]
+            #[deprecated(since = "0.7.10", note = "Use updated instead")]
             pub fn updates(&self) -> Vec<#view_name> {
+                #[allow(deprecated)]
                 self.0.updates()
             }
         }
@@ -299,6 +336,8 @@ pub fn wasm_model_namespace(
         static fetch(context: Context, selection: string, ...substitution_values: any): Promise<{view_name}[]>;
         /** Subscribe to the set of {name}s that match the predicate */
         static query(context: Context, selection: string, ...substitution_values: any): {livequery_name};
+        /** Waits for remote subscription establishment - existing items are Initial, items added after are Add */
+        static query_nocache(context: Context, selection: string, ...substitution_values: any): {livequery_name};
         /** Create a new {name} */
         static create(transaction: Transaction, me: {pojo_interface}): Promise<{view_name}>;
         /** Create a new {name} within an automatically created and committed transaction. */
@@ -350,6 +389,25 @@ pub fn wasm_model_namespace(
                 selection.predicate = selection.predicate.populate(args_array)?;
 
                 let livequery = context.query::<#view_name>(selection)
+                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                Ok(#livequery_name(livequery))
+            }
+
+            /// Query that waits for remote subscription establishment before initializing, ensuring existing items
+            /// appear as `Initial` in the first changeset. Items added after subscription is initialized
+            /// will be reported as `Add`.
+            /// TODO: May be replaced with a NOCACHE pragma in the selection string when MatchArgs parsing is implemented.
+            #[wasm_bindgen(variadic)]
+            pub fn query_nocache (context: &ankurah::core::context::Context, selection: String, substitution_values: &JsValue) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
+                let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
+
+                // Convert the variadic JsValue (which is an array) and pass directly to populate
+                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
+                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                selection.predicate = selection.predicate.populate(args_array)?;
+
+                let args = ::ankurah::MatchArgs { selection, cached: false };
+                let livequery = context.query::<#view_name>(args)
                     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(#livequery_name(livequery))
             }
