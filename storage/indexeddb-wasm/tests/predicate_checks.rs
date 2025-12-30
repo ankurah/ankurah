@@ -8,6 +8,7 @@
 mod common;
 
 use ankurah::core::selection::filter::{evaluate_predicate, Filterable};
+use ankurah::core::type_resolver::TypeResolver;
 use ankurah::core::value::Value;
 use ankurah::property::Json;
 use ankurah::{policy::DEFAULT_CONTEXT, Model, Node, PermissiveAgent};
@@ -78,11 +79,14 @@ impl Filterable for MockFilterable {
 }
 
 fn verify_filterable(case: &TestCase) {
+    let type_resolver = TypeResolver::new();
     for entity in &case.entities {
         let f = MockFilterable::new("QueryTest").with_json("data", entity.data.clone());
         for exp in &case.expectations {
             let sel = ankql::parser::parse_selection(&exp.query).expect("parse");
-            let matches = evaluate_predicate(&f, &sel.predicate).unwrap_or(false);
+            // Apply type resolver to convert literals for JSON path comparisons
+            let resolved_sel = type_resolver.resolve_selection_types(sel);
+            let matches = evaluate_predicate(&f, &resolved_sel.predicate).unwrap_or(false);
             let should = exp.matches.contains(&entity.label);
             assert_eq!(matches, should, "[Filterable] case={} entity={} query='{}'", case.name, entity.label, exp.query);
         }
