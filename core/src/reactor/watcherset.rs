@@ -7,8 +7,8 @@ use std::sync::Arc;
 use crate::reactor::candidate_changes::CandidateChanges;
 
 pub struct WatcherSet {
-    /// Each field has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as change
-    index_watchers: HashMap<(proto::CollectionId, FieldId), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
+    /// Each property path has a ComparisonIndex so we can quickly find all subscriptions that care if a given value CHANGES (creation and deletion also count as change)
+    index_watchers: HashMap<(proto::CollectionId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
     /// The set of watchers who want to be notified of any changes to a given collection
     wildcard_watchers: HashMap<proto::CollectionId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
     /// Index of subscriptions that presently match each entity, either by predicate or by entity subscription.
@@ -30,10 +30,11 @@ impl WatcherSet {
         let entity_id = AbstractEntity::id(entity);
 
         // Find subscriptions interested based on index watchers
-        for ((collection_id, field_id), index_ref) in &self.index_watchers {
+        for ((collection_id, property_path), index_ref) in &self.index_watchers {
             if *collection_id == AbstractEntity::collection(entity) {
-                if let Some(field_value) = AbstractEntity::value(entity, &field_id.0) {
-                    for (subscription_id, query_id) in index_ref.find_matching(field_value) {
+                // Extract value at the property path (handles both simple fields and JSON paths)
+                if let Some(value) = property_path.extract_value(entity) {
+                    for (subscription_id, query_id) in index_ref.find_matching(value) {
                         candidates_by_sub
                             .entry(subscription_id)
                             .or_insert_with(|| CandidateChanges::new(changes_arc.clone()))
@@ -124,7 +125,7 @@ impl WatcherSet {
     pub fn debug_data(
         &self,
     ) -> (
-        &HashMap<(proto::CollectionId, FieldId), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
+        &HashMap<(proto::CollectionId, PropertyPath), ComparisonIndex<(ReactorSubscriptionId, proto::QueryId)>>,
         &HashMap<proto::CollectionId, HashSet<(ReactorSubscriptionId, proto::QueryId)>>,
         &HashMap<ankurah_proto::EntityId, HashSet<EntityWatcherId>>,
     ) {
@@ -168,11 +169,12 @@ impl WatcherSet {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
-                    // Use the property name (last step) for field indexing
-                    let field_name = path.property().to_string();
-
-                    let field_id = FieldId(field_name);
-                    let index = self.index_watchers.entry((collection_id.clone(), field_id)).or_default();
+                    // Use the full path for indexing.
+                    // For simple paths like `name`, this is just "name".
+                    // For JSON paths like `context.task_id`, this is "context.task_id".
+                    // accumulate_interested_watchers will extract the value at this path.
+                    let property_path = PropertyPath::from_path(path);
+                    let index = self.index_watchers.entry((collection_id.clone(), property_path)).or_default();
 
                     match op {
                         WatcherOp::Add => {
@@ -236,11 +238,66 @@ impl EntityWatcherId {
     }
 }
 
+/// A path to a property value, supporting both simple fields and JSON sub-paths.
+/// Used by the watcher system to index and extract values for comparison.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FieldId(String);
+pub struct PropertyPath {
+    /// The root property name (e.g., "context" for "context.task_id")
+    root: String,
+    /// The sub-path within the property (e.g., ["task_id"] for "context.task_id"), empty for simple fields
+    sub_path: Vec<String>,
+}
 
-impl From<&str> for FieldId {
-    fn from(val: &str) -> Self { FieldId(val.to_string()) }
+impl PropertyPath {
+    /// Create a PropertyPath from a PathExpr
+    pub fn from_path(path: &ankql::ast::PathExpr) -> Self {
+        let steps = &path.steps;
+        Self { root: steps[0].clone(), sub_path: steps[1..].to_vec() }
+    }
+
+    /// Get the root property name
+    pub fn root(&self) -> &str { &self.root }
+
+    /// Check if this is a simple field (no sub-path)
+    pub fn is_simple(&self) -> bool { self.sub_path.is_empty() }
+
+    /// Extract the value at this path from an entity.
+    /// For JSON paths, keeps the value wrapped as Value::Json to match index keys.
+    pub fn extract_value<E: super::AbstractEntity>(&self, entity: &E) -> Option<crate::value::Value> {
+        use crate::value::Value;
+
+        let root_value = E::value(entity, &self.root)?;
+        if self.sub_path.is_empty() {
+            Some(root_value)
+        } else {
+            // Extract nested value from JSON, keeping it wrapped as Value::Json
+            // This matches how literals are stored in the comparison index after TypeResolver
+            match root_value {
+                Value::Json(json) => {
+                    let mut current = &json;
+                    for key in &self.sub_path {
+                        current = current.get(key)?;
+                    }
+                    // Keep as Value::Json to match index keys
+                    Some(Value::Json(current.clone()))
+                }
+                Value::Binary(bytes) => {
+                    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                    let mut current = &json;
+                    for key in &self.sub_path {
+                        current = current.get(key)?;
+                    }
+                    // Keep as Value::Json to match index keys
+                    Some(Value::Json(current.clone()))
+                }
+                _ => None, // Can't traverse into non-JSON types
+            }
+        }
+    }
+}
+
+impl From<&str> for PropertyPath {
+    fn from(val: &str) -> Self { PropertyPath { root: val.to_string(), sub_path: Vec::new() } }
 }
 
 #[derive(Debug, Copy, Clone)]

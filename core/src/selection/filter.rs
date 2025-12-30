@@ -141,102 +141,48 @@ fn compare_values_with_cast(left: &Value, right: &Value, op: impl Fn(&Value, &Va
     false
 }
 
-/// Compare two values with JSON-aware casting rules.
-///
-/// Unlike `compare_values_with_cast`, this function only allows casting within the
-/// numeric family (I16, I32, I64, F64). Cross-family casting (e.g., string to number)
-/// is not allowed - the comparison returns false if types are incompatible.
-///
-/// This is the correct semantic for JSON property values, where the actual type
-/// can vary per-entity and we don't want to silently coerce mismatched types.
-fn compare_json_values(left: &Value, right: &Value, op: impl Fn(&Value, &Value) -> bool) -> bool {
-    use crate::value::ValueType;
-
-    let left_type = ValueType::of(left);
-    let right_type = ValueType::of(right);
-
-    // If types match exactly, compare directly
-    if left_type == right_type {
-        return op(left, right);
-    }
-
-    // Allow casting within the numeric family only
-    if is_numeric_type(left_type) && is_numeric_type(right_type) {
-        // Try casting right to left's type
-        if let Ok(casted_right) = right.cast_to(left_type) {
-            return op(left, &casted_right);
-        }
-        // Try casting left to right's type
-        if let Ok(casted_left) = left.cast_to(right_type) {
-            return op(&casted_left, right);
-        }
-    }
-
-    // Different type families (e.g., string vs number) - no casting, comparison fails
-    false
-}
-
-/// Check if a ValueType is in the numeric family (can be cast between each other)
-fn is_numeric_type(t: crate::value::ValueType) -> bool {
-    use crate::value::ValueType;
-    matches!(t, ValueType::I16 | ValueType::I32 | ValueType::I64 | ValueType::F64)
-}
-
-/// Check if an expression represents a JSON path traversal.
-///
-/// HACK: Currently we infer "JSON semantics" from multi-step paths (e.g., `data.field`).
-/// This is a temporary approximation that works for Phase 1 where only Json properties
-/// support nested traversal.
-///
-/// TODO(Phase 3 - Schema Registry): Replace this heuristic with proper property type lookup.
-/// Once we have PropertyId and ModelSchema, we should check if the root property is of type
-/// `Json` rather than inferring from path structure. This will be necessary when we add
-/// Ref<T> traversal, where `artist.name` traverses a reference, not JSON.
-fn is_json_path_expr(expr: &Expr) -> bool { matches!(expr, Expr::Path(path) if !path.is_simple()) }
-
 pub fn evaluate_predicate<I: Filterable>(item: &I, predicate: &Predicate) -> Result<bool, Error> {
     match predicate {
         Predicate::Comparison { left, operator, right } => {
             let left_val = evaluate_expr(item, left)?;
             let right_val = evaluate_expr(item, right)?;
 
-            // HACK: Determine if we should use JSON-aware comparison based on path structure.
-            // If either side is a multi-step path (e.g., `data.field`), we assume it's traversing
-            // into a Json property and use strict JSON casting rules (numeric family only).
-            //
-            // TODO(Phase 3 - Schema Registry): Replace this with proper property type lookup.
-            // Once we have schema metadata, check if the path's root property is type `Json`
-            // rather than inferring from path depth.
-            let use_json_comparison = is_json_path_expr(left) || is_json_path_expr(right);
-
-            // Select the appropriate comparison function
-            let compare_fn: fn(&Value, &Value, fn(&Value, &Value) -> bool) -> bool =
-                if use_json_comparison { compare_json_values } else { compare_values_with_cast };
-
             Ok(match operator {
-                ComparisonOperator::Equal => {
-                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| compare_fn(l, r, |a, b| a == b)).unwrap_or(false)
-                }
-                ComparisonOperator::NotEqual => {
-                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| compare_fn(l, r, |a, b| a != b)).unwrap_or(false)
-                }
-                ComparisonOperator::GreaterThan => {
-                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| compare_fn(l, r, |a, b| a > b)).unwrap_or(false)
-                }
-                ComparisonOperator::GreaterThanOrEqual => {
-                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| compare_fn(l, r, |a, b| a >= b)).unwrap_or(false)
-                }
-                ComparisonOperator::LessThan => {
-                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| compare_fn(l, r, |a, b| a < b)).unwrap_or(false)
-                }
-                ComparisonOperator::LessThanOrEqual => {
-                    left_val.as_value().zip(right_val.as_value()).map(|(l, r)| compare_fn(l, r, |a, b| a <= b)).unwrap_or(false)
-                }
+                ComparisonOperator::Equal => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a == b))
+                    .unwrap_or(false),
+                ComparisonOperator::NotEqual => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a != b))
+                    .unwrap_or(false),
+                ComparisonOperator::GreaterThan => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a > b))
+                    .unwrap_or(false),
+                ComparisonOperator::GreaterThanOrEqual => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a >= b))
+                    .unwrap_or(false),
+                ComparisonOperator::LessThan => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a < b))
+                    .unwrap_or(false),
+                ComparisonOperator::LessThanOrEqual => left_val
+                    .as_value()
+                    .zip(right_val.as_value())
+                    .map(|(l, r)| compare_values_with_cast(l, r, |a, b| a <= b))
+                    .unwrap_or(false),
                 ComparisonOperator::In => {
                     let value =
                         left_val.as_value().ok_or_else(|| Error::PropertyNotFound("Expected single value for IN left operand".into()))?;
                     let list = right_val.as_list().ok_or_else(|| Error::PropertyNotFound("Expected list for IN right operand".into()))?;
-                    list.iter().any(|item| item.as_value().map(|v| compare_fn(value, v, |a, b| a == b)).unwrap_or(false))
+                    list.iter().any(|item| item.as_value().map(|v| compare_values_with_cast(value, v, |a, b| a == b)).unwrap_or(false))
                 }
                 ComparisonOperator::Between => return Err(Error::UnsupportedOperator("BETWEEN operator not yet supported")),
             })
@@ -418,6 +364,7 @@ mod tests {
     // JSON path traversal tests
     mod json_tests {
         use super::*;
+        use crate::type_resolver::TypeResolver;
 
         /// Test item with a JSON property for testing nested path queries
         #[derive(Debug, Clone, PartialEq)]
@@ -442,6 +389,12 @@ mod tests {
                     _ => None,
                 }
             }
+        }
+
+        /// Helper to parse and resolve types for JSON path queries
+        fn parse_with_types(query: &str) -> ankql::ast::Selection {
+            let selection = parse_selection(query).unwrap();
+            TypeResolver::new().resolve_selection_types(selection)
         }
 
         #[test]
@@ -714,7 +667,8 @@ mod tests {
                     serde_json::json!({ "count": "42" }), // String, not number
                 )];
 
-                let selection = parse_selection("licensing.count = 42").unwrap();
+                // Type resolver converts literal 42 to Json(42) for JSON path comparison
+                let selection = parse_with_types("licensing.count = 42");
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 // Should NOT pass - no string->number casting for JSON
@@ -729,7 +683,8 @@ mod tests {
                     serde_json::json!({ "count": 42 }), // Number, not string
                 )];
 
-                let selection = parse_selection("licensing.count = '42'").unwrap();
+                // Type resolver converts literal '42' to Json("42") for JSON path comparison
+                let selection = parse_with_types("licensing.count = '42'");
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 // Should NOT pass - no number->string casting for JSON
@@ -741,7 +696,8 @@ mod tests {
                 // JSON string matching string literal should work
                 let items = vec![TrackItem::new("Track A", serde_json::json!({ "status": "active" }))];
 
-                let selection = parse_selection("licensing.status = 'active'").unwrap();
+                // Type resolver converts literal to Json for JSON path comparison
+                let selection = parse_with_types("licensing.status = 'active'");
                 let results: Vec<_> = FilterIterator::new(items.into_iter(), selection.predicate).collect();
 
                 assert!(matches!(results[0], FilterResult::Pass(_)));
@@ -756,22 +712,22 @@ mod tests {
                     TrackItem::new("C", serde_json::json!({ "score": 150 })),
                 ];
 
-                // > operator
-                let selection = parse_selection("licensing.score > 100").unwrap();
+                // > operator (type resolver converts literals to Json)
+                let selection = parse_with_types("licensing.score > 100");
                 let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
                 assert!(matches!(results[0], FilterResult::Skip(_)));
                 assert!(matches!(results[1], FilterResult::Skip(_)));
                 assert!(matches!(results[2], FilterResult::Pass(_)));
 
                 // >= operator
-                let selection = parse_selection("licensing.score >= 100").unwrap();
+                let selection = parse_with_types("licensing.score >= 100");
                 let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
                 assert!(matches!(results[0], FilterResult::Skip(_)));
                 assert!(matches!(results[1], FilterResult::Pass(_)));
                 assert!(matches!(results[2], FilterResult::Pass(_)));
 
                 // < operator
-                let selection = parse_selection("licensing.score < 100").unwrap();
+                let selection = parse_with_types("licensing.score < 100");
                 let results: Vec<_> = FilterIterator::new(items.clone().into_iter(), selection.predicate).collect();
                 assert!(matches!(results[0], FilterResult::Pass(_)));
                 assert!(matches!(results[1], FilterResult::Skip(_)));
