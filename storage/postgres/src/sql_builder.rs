@@ -387,6 +387,9 @@ impl SqlBuilder {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
                 // Check if either side is a JSONB path (multi-step path)
+                // TODO: Replace path depth heuristic with schema metadata when available.
+                // We infer JSON type from !is_simple(), but with a schema registry we could
+                // look up the actual field type. See phase-3-schema.md for details.
                 let left_is_jsonb = matches!(left.as_ref(), Expr::Path(p) if !p.is_simple());
                 let right_is_jsonb = matches!(right.as_ref(), Expr::Path(p) if !p.is_simple());
 
