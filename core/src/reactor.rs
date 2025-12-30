@@ -1,6 +1,7 @@
 mod candidate_changes;
 mod comparison_index;
 pub mod fetch_gap;
+mod property_path;
 mod subscription;
 mod subscription_state;
 mod update;
