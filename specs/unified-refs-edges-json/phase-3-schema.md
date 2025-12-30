@@ -215,4 +215,6 @@ fn test_structured_path() {
 
 - **Defer derive macro work**: Auto-generating schemas from `#[derive(Model)]` is significant work. Start with manual schemas for testing.
 - **PropertyId stability**: For now, manually assign PropertyIds. Later, derive from field order or hashing.
+- **Schema-aware TypeResolver**: Currently `TypeResolver` infers that a field is JSON based on path depth (`!is_simple()`). With schema metadata, we can look up the actual field type and convert literals precisely, eliminating the heuristic and handling edge cases like top-level JSON fields.
+- **Schema-aware collation**: The reactor's `ComparisonIndex` uses byte representations for lookups. Currently `Value::String("x")` and `Value::Json(String("x"))` produce different bytes, requiring special handling in `PropertyPath::extract_value`. With schema metadata, we can normalize collation for JSON scalar types.
 
