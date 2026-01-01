@@ -46,4 +46,3 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
         // See ankurah/specs/uniffi-derive-integration.md for implementation plan
     }
 }
-
