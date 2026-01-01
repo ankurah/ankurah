@@ -27,6 +27,9 @@ pub mod value;
 
 pub mod collectionset;
 pub mod schema;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 pub use model::Model;
 pub use node::Node;
 pub use property::Json;

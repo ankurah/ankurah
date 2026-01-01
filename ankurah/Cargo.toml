@@ -25,6 +25,7 @@ wasm = [
 uniffi = [
     "derive",
     "ankurah-derive?/uniffi",
+    "ankurah-core/uniffi",
     "ankurah-proto/uniffi",
     "dep:uniffi",
 ]

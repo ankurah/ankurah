@@ -40,12 +40,8 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     let ffi_attrs = super::uniffi::view_attributes();
 
     #[cfg(not(any(feature = "wasm", feature = "uniffi")))]
-    let ffi_attrs = super::ViewAttributes {
-        struct_attr: quote! {},
-        impl_attr: quote! {},
-        id_method_attr: quote! {},
-        extra_impl: quote! {},
-    };
+    let ffi_attrs =
+        super::ViewAttributes { struct_attr: quote! {}, impl_attr: quote! {}, id_method_attr: quote! {}, extra_impl: quote! {} };
 
     let struct_attr = ffi_attrs.struct_attr;
     let impl_attr = ffi_attrs.impl_attr;

@@ -104,6 +104,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "uniffi",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "yrs",

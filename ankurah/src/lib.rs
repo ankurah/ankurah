@@ -133,6 +133,14 @@
 #[cfg(all(feature = "wasm", feature = "uniffi"))]
 compile_error!("Only one bindings feature can be enabled at a time. Choose 'wasm' OR 'uniffi'.");
 
+// Re-export UniFFI scaffolding from dependency crates
+// This ensures symbols from ankurah-proto and ankurah-core are available
+// when this crate is used as a dependency in a cdylib
+#[cfg(feature = "uniffi")]
+ankurah_proto::uniffi_reexport_scaffolding!();
+#[cfg(feature = "uniffi")]
+ankurah_core::uniffi_reexport_scaffolding!();
+
 pub use ankql;
 pub use ankurah_core as core;
 #[cfg(feature = "derive")]
