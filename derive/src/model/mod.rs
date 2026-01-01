@@ -6,3 +6,5 @@ pub(crate) mod mutable;
 pub(crate) mod view;
 #[cfg(feature = "wasm")]
 pub(crate) mod wasm;
+// TODO: Add uniffi module when implemented
+// See ankurah/specs/uniffi-derive-integration.md for plan

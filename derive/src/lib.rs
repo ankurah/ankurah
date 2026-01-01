@@ -39,6 +39,8 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let wasm_impl = model::wasm::wasm_impl(&input, &desc);
     #[cfg(not(feature = "wasm"))]
     let wasm_impl = quote! {};
+    // TODO: Add uniffi_impl when model/uniffi.rs is implemented
+    // See ankurah/specs/uniffi-derive-integration.md for plan
 
     let expanded = quote! {
         mod #hygiene_module {
