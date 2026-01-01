@@ -129,6 +129,10 @@
 //! For more details, see the [repository documentation](https://github.com/ankurah/ankurah).
 //! And join the [Discord server](https://discord.gg/XMUUxsbT5S) to be part of the discussion!
 
+// Ensure bindings features are mutually exclusive
+#[cfg(all(feature = "wasm", feature = "uniffi"))]
+compile_error!("Only one bindings feature can be enabled at a time. Choose 'wasm' OR 'uniffi'.");
+
 pub use ankql;
 pub use ankurah_core as core;
 #[cfg(feature = "derive")]
@@ -170,6 +174,8 @@ pub mod derive_deps {
     #[cfg(feature = "wasm")]
     pub use ::send_wrapper;
     pub use ::tracing;
+    #[cfg(feature = "uniffi")]
+    pub use ::uniffi;
     #[cfg(feature = "wasm")]
     pub use ::wasm_bindgen;
     #[cfg(feature = "wasm")]
