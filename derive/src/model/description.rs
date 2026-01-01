@@ -51,13 +51,13 @@ impl ModelDescription {
     pub fn view_name(&self) -> Ident { format_ident!("{}View", self.name) }
     pub fn mutable_name(&self) -> Ident { format_ident!("{}Mut", self.name) }
 
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", feature = "uniffi"))]
     pub fn resultset_name(&self) -> Ident { format_ident!("{}ResultSet", self.name) }
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", feature = "uniffi"))]
     pub fn livequery_name(&self) -> Ident { format_ident!("{}LiveQuery", self.name) }
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", feature = "uniffi"))]
     pub fn changeset_name(&self) -> Ident { format_ident!("{}ChangeSet", self.name) }
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", feature = "uniffi"))]
     pub fn ref_name(&self) -> Ident { format_ident!("{}Ref", self.name) }
 
     // Computed accessors for active fields
