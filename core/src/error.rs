@@ -6,6 +6,8 @@ use thiserror::Error;
 use crate::{connector::SendError, policy::AccessDenied};
 
 #[derive(Error, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
+#[cfg_attr(feature = "uniffi", uniffi(flat_error))]
 pub enum RetrievalError {
     #[error("access denied")]
     AccessDenied(AccessDenied),
