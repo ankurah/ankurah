@@ -13,6 +13,7 @@ pub mod node_applier;
 pub mod peer_subscription;
 pub mod policy;
 pub mod property;
+pub mod query_value;
 pub mod reactor;
 pub mod resultset;
 pub mod retrieval;
@@ -33,6 +34,7 @@ uniffi::setup_scaffolding!();
 pub use model::Model;
 pub use node::Node;
 pub use property::Json;
+pub use query_value::QueryValue;
 pub use type_resolver::TypeResolver;
 
 pub use ankurah_proto as proto;

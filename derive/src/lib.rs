@@ -180,9 +180,18 @@ pub fn livequery(input: TokenStream) -> TokenStream { selection::subscribe_macro
 #[proc_macro]
 pub fn impl_provided_wrapper_types(input: TokenStream) -> TokenStream {
     let config_filename = parse_macro_input!(input as syn::LitStr);
-    match wrapper_macros::impl_provided_wrapper_types_impl(&config_filename.value()) {
-        Ok(tokens) => tokens.into(),
-        Err(err) => err.to_compile_error().into(),
+    let wasm_result = wrapper_macros::impl_provided_wrapper_types_impl(&config_filename.value());
+    let uniffi_result = wrapper_macros::impl_provided_wrapper_types_uniffi_impl(&config_filename.value());
+
+    match (wasm_result, uniffi_result) {
+        (Ok(wasm_tokens), Ok(uniffi_tokens)) => {
+            let combined = quote::quote! {
+                #wasm_tokens
+                #uniffi_tokens
+            };
+            combined.into()
+        }
+        (Err(err), _) | (_, Err(err)) => err.to_compile_error().into(),
     }
 }
 
@@ -196,8 +205,17 @@ pub fn impl_provided_wrapper_types(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn impl_wrapper_type(input: TokenStream) -> TokenStream {
     let custom_type = parse_macro_input!(input as syn::Type);
-    match wrapper_macros::impl_wrapper_type_impl(&custom_type) {
-        Ok(tokens) => tokens.into(),
-        Err(err) => err.to_compile_error().into(),
+    let wasm_result = wrapper_macros::impl_wrapper_type_impl(&custom_type);
+    let uniffi_result = wrapper_macros::impl_wrapper_type_uniffi_impl(&custom_type);
+
+    match (wasm_result, uniffi_result) {
+        (Ok(wasm_tokens), Ok(uniffi_tokens)) => {
+            let combined = quote::quote! {
+                #wasm_tokens
+                #uniffi_tokens
+            };
+            combined.into()
+        }
+        (Err(err), _) | (_, Err(err)) => err.to_compile_error().into(),
     }
 }

@@ -153,6 +153,7 @@ pub use ankurah_core::{
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
     property::{self, Property, Ref},
+    query_value::QueryValue,
     resultset::ResultSet,
     storage, transaction, value,
     value::{Value, ValueType},

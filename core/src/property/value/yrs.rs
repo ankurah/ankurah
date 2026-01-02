@@ -145,9 +145,14 @@ where Projected: Clone + Send + Sync + 'static
     }
 }
 
-#[cfg(feature = "wasm")]
-pub mod wasm {
-    //! WASM wrapper types for YrsString backend
+#[cfg(any(feature = "wasm", feature = "uniffi"))]
+pub mod ffi {
+    //! FFI wrapper types for YrsString backend (WASM and UniFFI)
+    use super::*;
+    #[cfg(feature = "wasm")]
+    use ::wasm_bindgen::prelude::*;
     use ankurah_derive::impl_provided_wrapper_types;
     impl_provided_wrapper_types!("src/property/value/yrs.ron");
 }
+#[cfg(any(feature = "wasm", feature = "uniffi"))]
+pub use ffi::*;

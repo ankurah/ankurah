@@ -57,6 +57,90 @@ pub fn uniffi_view_edit_impl(view_name: &Ident, model_name: &Ident, mutable_name
     }
 }
 
+/// Generate UniFFI getter methods for Mutable struct that return wrapper types.
+///
+/// For each active field, generates a getter that returns the UniFFI wrapper type
+/// (e.g., `LWWString`, `YrsStringString`). The wrapper types have the methods
+/// defined in the RON config (get/set for LWW, value/replace for YrsString, etc.).
+///
+/// This mirrors the WASM approach where wrapper types expose the active type methods.
+/// Uses `uniffi_fieldname` as Rust name, exposed as `fieldname` in foreign bindings.
+pub fn uniffi_mutable_field_methods(model: &crate::model::description::ModelDescription) -> TokenStream {
+    let mutable_name = model.mutable_name();
+    let model_name_str = model.name().to_string();
+
+    let methods: Vec<TokenStream> = model
+        .active_fields()
+        .iter()
+        .filter_map(|field| {
+            let field_name = field.ident.as_ref()?;
+            let uniffi_method_name = quote::format_ident!("uniffi_{}", field_name);
+            let field_name_str = field_name.to_string();
+
+            // Get the backend description for this field
+            let backend_desc = model.backend_registry.resolve_active_type(field)?;
+
+            // Get the wrapper type path (fully qualified for provided types, local for custom)
+            let wrapper_type_str = if backend_desc.is_provided_type() {
+                // Provided types: use full path from ankurah-core
+                backend_desc.wrapper_type_path("local")
+            } else {
+                // Custom types: generated in same hygiene module, use local name
+                backend_desc.wrapper_type_name_for_model(&model_name_str)
+            };
+            let wrapper_type: syn::Type = syn::parse_str(&wrapper_type_str).expect("Failed to parse wrapper type path");
+
+            Some(quote! {
+                /// Get the active property wrapper for this field
+                #[uniffi::method(name = #field_name_str)]
+                pub fn #uniffi_method_name(&self) -> #wrapper_type {
+                    #wrapper_type(self.#field_name())
+                }
+            })
+        })
+        .collect();
+
+    if methods.is_empty() {
+        return quote! {};
+    }
+
+    quote! {
+        #[::uniffi::export]
+        impl #mutable_name {
+            #(#methods)*
+        }
+    }
+}
+
+/// Generate UniFFI wrapper types for active types.
+///
+/// For each unique active type used in the model, generates a wrapper struct
+/// with the methods defined in the RON config. These are similar to WASM wrappers
+/// but use UniFFI attributes.
+pub fn uniffi_custom_wrappers(model: &crate::model::description::ModelDescription) -> TokenStream {
+    let model_name_str = model.name().to_string();
+
+    let wrappers: Vec<TokenStream> = model
+        .active_fields()
+        .iter()
+        .filter_map(|field| {
+            let backend_desc = model.backend_registry.resolve_active_type(field)?;
+
+            // Only generate wrappers for custom types (non-provided)
+            // Provided types are generated globally elsewhere
+            if backend_desc.is_provided_type() {
+                return None;
+            }
+
+            Some(backend_desc.uniffi_wrapper("external", Some(&model_name_str)))
+        })
+        .collect();
+
+    quote! {
+        #(#wrappers)*
+    }
+}
+
 /// Check if a type is Ref<T> and extract the inner type name
 fn is_ref_type(ty: &syn::Type) -> Option<Ident> {
     if let syn::Type::Path(type_path) = ty {
@@ -88,6 +172,7 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
     let livequery_name = model.livequery_name();
 
     let view_edit_impl = uniffi_view_edit_impl(&view_name, &name, &mutable_name);
+    let mutable_field_methods = uniffi_mutable_field_methods(model);
     let ref_wrapper = uniffi_ref_wrapper(&ref_name, &name, &view_name);
     let input_record = uniffi_input_record(model, &input_name, &name);
     let ops_wrapper = uniffi_ops_wrapper(&ops_name, &name, &view_name, &livequery_name, &input_name);
@@ -99,6 +184,9 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
     quote! {
         #[cfg(feature = "uniffi")]
         #view_edit_impl
+
+        #[cfg(feature = "uniffi")]
+        #mutable_field_methods
 
         #[cfg(feature = "uniffi")]
         #ref_wrapper
@@ -269,35 +357,44 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
 
             /// Fetch all entities matching the selection predicate
             /// Returns Vec<Arc<View>> because UniFFI Objects must be wrapped in Arc for collections
+            /// Use `values` to fill in `?` placeholders in the selection string
             pub async fn fetch(
                 &self,
                 ctx: &::ankurah::core::context::Context,
                 selection: String,
+                values: Vec<::ankurah::core::QueryValue>,
             ) -> Result<Vec<std::sync::Arc<#view_name>>, ::ankurah::core::error::RetrievalError> {
-                let selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
+                let mut selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
+                selection.predicate = selection.predicate.populate(values)?;
                 let results = ctx.fetch::<#view_name>(selection).await?;
                 Ok(results.into_iter().map(std::sync::Arc::new).collect())
             }
 
             /// Create a live query that tracks changes matching the selection
+            /// Use `values` to fill in `?` placeholders in the selection string
             pub fn query(
                 &self,
                 ctx: &::ankurah::core::context::Context,
                 selection: String,
+                values: Vec<::ankurah::core::QueryValue>,
             ) -> Result<#livequery_name, ::ankurah::core::error::RetrievalError> {
-                let selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
+                let mut selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
+                selection.predicate = selection.predicate.populate(values)?;
                 let lq = ctx.query::<#view_name>(selection)?;
                 Ok(#livequery_name::from(lq))
             }
 
             /// Create a live query that waits for remote subscription before initializing
             /// Ensures existing items appear as `initial` in the first changeset
+            /// Use `values` to fill in `?` placeholders in the selection string
             pub fn query_nocache(
                 &self,
                 ctx: &::ankurah::core::context::Context,
                 selection: String,
+                values: Vec<::ankurah::core::QueryValue>,
             ) -> Result<#livequery_name, ::ankurah::core::error::RetrievalError> {
-                let selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
+                let mut selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
+                selection.predicate = selection.predicate.populate(values)?;
                 let args = ::ankurah::MatchArgs { selection, cached: false };
                 let lq = ctx.query::<#view_name>(args)?;
                 Ok(#livequery_name::from(lq))
@@ -504,8 +601,10 @@ fn uniffi_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, resultset
             }
 
             /// Update the query selection predicate
-            pub async fn update_selection(&self, new_selection: String) -> Result<(), ::ankurah::core::error::RetrievalError> {
-                let selection = ::ankurah::ankql::parser::parse_selection(&new_selection)?;
+            /// Use `values` to fill in `?` placeholders in the selection string
+            pub async fn update_selection(&self, new_selection: String, values: Vec<::ankurah::core::QueryValue>) -> Result<(), ::ankurah::core::error::RetrievalError> {
+                let mut selection = ::ankurah::ankql::parser::parse_selection(&new_selection)?;
+                selection.predicate = selection.predicate.populate(values)?;
                 self.0.update_selection_wait(selection).await?;
                 Ok(())
             }

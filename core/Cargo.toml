@@ -19,7 +19,7 @@ wasm = [
     "ankurah-derive",
     "futures-timer/wasm-bindgen",
 ]
-uniffi = ["dep:uniffi", "ankurah-proto/uniffi"]
+uniffi = ["dep:uniffi", "ankurah-proto/uniffi", "ankurah-derive"]
 default = []
 instrument = []
 
