@@ -27,9 +27,11 @@ uniffi = [
     "ankurah-derive?/uniffi",
     "ankurah-core/uniffi",
     "ankurah-proto/uniffi",
+    "ankurah-signals/uniffi",
     "dep:uniffi",
 ]
 react = ["wasm", "ankurah-signals/react"]
+react-native = ["uniffi", "ankurah-signals/react-native"]
 derive = ["dep:ankurah-derive"]
 instrument = ["ankurah-core/instrument"]
 

@@ -1,6 +1,5 @@
-# Cross-Crate UniFFI Learnings
+# Cross-Crate UniFFI
 
-> **Date**: January 2026  
 > **Pain Level**: High 🔥  
 > **Resolution**: Success 🎉
 
@@ -55,10 +54,6 @@ pub fn wrap_message(msg: &MessageView) -> Arc<MessageView> { ... }
 #[uniffi::export]
 pub fn take_message(msg: MessageView) -> String { ... }  // Lift<UniFfiTag> not satisfied
 ```
-
-## UniFFI Objects in Collections (General Limitation)
-
-**This is NOT a cross-crate issue** - see `uniffi-basics.md` for details. UniFFI Objects must be `Arc<T>` wrapped in generic containers (`Vec`, `Option`, `HashMap` values).
 
 ## Critical: Use `::uniffi::` Not `::crate::derive_deps::uniffi::`
 
@@ -122,7 +117,7 @@ The practice of re-exporting dependencies for derive macros to use (e.g., `::myc
 - Can cause subtle breakage when the re-exported crate changes behavior
 - Makes it harder to understand what's actually being used
 
-**Recommendation:** For derive macros that generate non-trivial code (especially those using `crate::` references), require users to add direct dependencies. It's more explicit, more robust, and avoids macro hygiene surprises. The minor inconvenience of an extra `Cargo.toml` line is worth the clarity and reliability.
+**Recommendation:** For derive macros that generate non-trivial code (especially those using `crate::` references), require users to add direct dependencies. It's more explicit, more robust, and avoids macro hygiene surprises.
 
 ## Architecture Pattern
 
@@ -147,28 +142,15 @@ The practice of re-exporting dependencies for derive macros to use (e.g., `::myc
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Conditional Compilation
-
-UniFFI derives should be conditional on the user's crate feature, not the derive crate's feature:
-
-```rust
-// In derive macro code:
-pub fn view_attributes() -> ViewAttributes {
-    ViewAttributes {
-        // cfg_attr ensures this only applies when USER's crate has uniffi feature
-        struct_attr: quote! { #[cfg_attr(feature = "uniffi", derive(::uniffi::Object))] },
-        impl_attr: quote! { #[cfg_attr(feature = "uniffi", ::uniffi::export)] },
-        ...
-    }
-}
-```
-
 ## Common Errors and Solutions
 
 ### "cannot find type `UniFfiTag` in the crate root"
 
 **Cause**: Using `::other_crate::uniffi::Object` instead of `::uniffi::Object`  
 **Solution**: Change to `::uniffi::Object` in generated code
+
+**Also**: Missing `uniffi::setup_scaffolding!()` in a crate that uses UniFFI derives  
+**Solution**: Add `uniffi::setup_scaffolding!();` to the crate's `lib.rs`
 
 ### "conflicting implementations of trait `FfiConverter<UniFfiTag>`"
 
@@ -184,6 +166,19 @@ pub fn view_attributes() -> ViewAttributes {
 
 **Cause**: Generic containers with external types don't work cross-crate  
 **Solution**: Define the function in the same crate as type `T`
+
+### "there is no reactor running, must be called from the context of a Tokio 1.x runtime"
+
+**Cause**: UniFFI async functions default to using `async_compat` which doesn't provide a full tokio runtime  
+**Solution**: Add `#[uniffi::export(async_runtime = "tokio")]` to async method impls, and enable the `tokio` feature on the `uniffi` dependency:
+```toml
+uniffi = { version = "0.29", features = ["tokio"] }
+```
+
+### "could not find `async_compat` in `deps`"
+
+**Cause**: Missing `tokio` feature on `uniffi` dependency when using `async_runtime = "tokio"`  
+**Solution**: Add `features = ["tokio"]` to the uniffi dependency in Cargo.toml
 
 ## What ChatGPT Got Wrong
 

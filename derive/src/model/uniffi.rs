@@ -358,7 +358,7 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
 
             /// Create a live query that tracks changes matching the selection
             /// Use `values` to fill in `?` placeholders in the selection string
-            pub fn query(
+            pub async fn query(
                 &self,
                 ctx: &::ankurah::core::context::Context,
                 selection: String,
@@ -373,7 +373,7 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
             /// Create a live query that waits for remote subscription before initializing
             /// Ensures existing items appear as `initial` in the first changeset
             /// Use `values` to fill in `?` placeholders in the selection string
-            pub fn query_nocache(
+            pub async fn query_nocache(
                 &self,
                 ctx: &::ankurah::core::context::Context,
                 selection: String,
