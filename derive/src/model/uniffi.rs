@@ -179,32 +179,18 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
     let resultset_wrapper = uniffi_resultset_wrapper(&resultset_name, &view_name);
     let changeset_wrapper = uniffi_changeset_wrapper(&changeset_name, &view_name, &resultset_name);
     let livequery_wrapper = uniffi_livequery_wrapper(&livequery_name, &view_name, &resultset_name);
+    let custom_wrappers = uniffi_custom_wrappers(model);
 
-    // Wrapped in cfg - these are in the same hygiene module as View/Mutable
     quote! {
-        #[cfg(feature = "uniffi")]
         #view_edit_impl
-
-        #[cfg(feature = "uniffi")]
         #mutable_field_methods
-
-        #[cfg(feature = "uniffi")]
         #ref_wrapper
-
-        #[cfg(feature = "uniffi")]
         #input_record
-
-        #[cfg(feature = "uniffi")]
         #ops_wrapper
-
-        #[cfg(feature = "uniffi")]
         #resultset_wrapper
-
-        #[cfg(feature = "uniffi")]
         #changeset_wrapper
-
-        #[cfg(feature = "uniffi")]
         #livequery_wrapper
+        #custom_wrappers
     }
 }
 

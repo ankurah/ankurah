@@ -40,6 +40,9 @@ pub struct BackendConfig {
     pub backend_name: String,
     pub namespace: String,
     pub provided_wrapper_types: Vec<String>,
+    /// Optional separate list for UniFFI-compatible types. If None, uses provided_wrapper_types.
+    #[serde(default)]
+    pub uniffi_provided_wrapper_types: Option<Vec<String>>,
     pub substitutions: HashMap<String, HashMap<String, String>>,
     pub values: Vec<ValueConfig>,
 }
@@ -321,9 +324,10 @@ impl ActiveTypeDesc {
         (methods, ts_set_override)
     }
 
-    /// Unified FFI wrapper - generates ONE struct with conditional WASM/UniFFI impl blocks.
-    /// This replaces separate wasm_wrapper() and uniffi_wrapper() methods.
-    pub fn ffi_wrapper(&self, context: &str, model_scope: Option<&str>) -> TokenStream {
+    /// Generate WASM wrapper struct and impl block.
+    /// Called when ankurah-derive is compiled with the `wasm` feature.
+    #[cfg(feature = "wasm")]
+    pub fn wasm_wrapper(&self, context: &str, model_scope: Option<&str>) -> TokenStream {
         let wrapper_name_str = match model_scope {
             Some(model) => self.wrapper_type_name_for_model(model),
             None => self.wrapper_type_name(),
@@ -332,12 +336,10 @@ impl ActiveTypeDesc {
         let original_type: Type = self.rust_type_with_context(context).expect("Failed to parse original type");
         
         let (wasm_methods, ts_set_override) = self.wasm_methods(context);
-        let uniffi_methods = self.uniffi_methods(context);
 
         let ts_custom_section = if let Some(ref union_type) = ts_set_override {
             let ts_decl = format!("interface {} {{ set(value: {}): void; }}", wrapper_name_str, union_type);
             quote! {
-                #[cfg(feature = "wasm")]
                 #[wasm_bindgen(typescript_custom_section)]
                 const _: &'static str = #ts_decl;
             }
@@ -346,34 +348,59 @@ impl ActiveTypeDesc {
         };
 
         quote! {
-            #[cfg_attr(feature = "wasm", wasm_bindgen)]
-            #[cfg_attr(feature = "uniffi", derive(::uniffi::Object))]
+            #[wasm_bindgen]
             pub struct #wrapper_name(
-                #[cfg_attr(feature = "wasm", wasm_bindgen(skip))]
+                #[wasm_bindgen(skip)]
                 pub #original_type
             );
 
-            #[cfg(feature = "wasm")]
             #[wasm_bindgen]
             impl #wrapper_name {
                 #(#wasm_methods)*
-            }
-
-            #[cfg(feature = "uniffi")]
-            #[::uniffi::export]
-            impl #wrapper_name {
-                #(#uniffi_methods)*
             }
 
             #ts_custom_section
         }
     }
 
-    /// UniFFI methods - same structure as wasm_methods but with String errors and base64 EntityId.
+    /// Generate UniFFI wrapper struct and impl block.
+    /// Called when ankurah-derive is compiled with the `uniffi` feature.
+    #[cfg(feature = "uniffi")]
+    pub fn uniffi_wrapper(&self, context: &str, model_scope: Option<&str>) -> TokenStream {
+        let wrapper_name_str = match model_scope {
+            Some(model) => self.wrapper_type_name_for_model(model),
+            None => self.wrapper_type_name(),
+        };
+        let wrapper_name = format_ident!("{}", wrapper_name_str);
+        let original_type: Type = self.rust_type_with_context(context).expect("Failed to parse original type");
+        
+        let uniffi_methods = self.uniffi_methods(context);
+
+        quote! {
+            #[derive(::uniffi::Object)]
+            pub struct #wrapper_name(pub #original_type);
+
+            #[::uniffi::export]
+            impl #wrapper_name {
+                #(#uniffi_methods)*
+            }
+        }
+    }
+
+    /// Stub for wasm_wrapper when wasm feature is not enabled
+    #[cfg(not(feature = "wasm"))]
+    pub fn wasm_wrapper(&self, _context: &str, _model_scope: Option<&str>) -> TokenStream { quote! {} }
+    
+    /// Stub for uniffi_wrapper when uniffi feature is not enabled
+    #[cfg(not(feature = "uniffi"))]
+    pub fn uniffi_wrapper(&self, _context: &str, _model_scope: Option<&str>) -> TokenStream { quote! {} }
+
+    /// UniFFI methods - generates methods with PropertyError for error handling.
+    /// PropertyError has #[uniffi(flat_error)] so it serializes via ToString.
     fn uniffi_methods(&self, context: &str) -> Vec<TokenStream> {
         let substitute_fn = |backend: &ActiveTypeDesc, pattern: &str| backend.do_substitutions(pattern, context);
 
-        self.value_config.methods.iter().map(|method| {
+        self.value_config.methods.iter().filter(|method| method.uniffi).map(|method| {
             let method_name = format_ident!("{}", method.name);
 
             // Special case: set with Ref<T>
@@ -384,10 +411,14 @@ impl ActiveTypeDesc {
                 }) {
                     let model_ident = format_ident!("{}", model_name);
                     return quote! {
-                        pub fn set(&self, value: String) -> Result<(), String> {
-                            let id = ::ankurah::proto::EntityId::from_base64(&value).map_err(|e| format!("Invalid EntityId: {}", e))?;
+                        pub fn set(&self, value: String) -> Result<(), ::ankurah::property::PropertyError> {
+                            let id = ::ankurah::proto::EntityId::from_base64(&value)
+                                .map_err(|e| ::ankurah::property::PropertyError::InvalidValue { 
+                                    value: value.clone(), 
+                                    ty: format!("EntityId ({})", e) 
+                                })?;
                             let r: ::ankurah::property::Ref<#model_ident> = ::ankurah::property::Ref::from(id);
-                            self.0.set(&r).map_err(|e| e.to_string())
+                            self.0.set(&r)
                         }
                     };
                 }
@@ -414,11 +445,14 @@ impl ActiveTypeDesc {
             if return_type_str.starts_with("Result<") {
                 let inner = return_type_str.strip_prefix("Result<").unwrap().strip_suffix(">").unwrap();
                 let ok_type_str = inner.split(", ").next().unwrap();
+                // Parse and use the original error type from the method signature
+                let err_type_str = inner.split(", ").nth(1).unwrap_or("::ankurah::property::PropertyError");
+                let err_type: Type = syn::parse_str(err_type_str).expect("Failed to parse error type");
                 if return_has_ref {
-                    quote! { pub fn #method_name(&self, #(#args),*) -> Result<String, String> { self.0.#method_name(#(#converted_args),*).map(|r| r.id().to_base64()).map_err(|e| e.to_string()) } }
+                    quote! { pub fn #method_name(&self, #(#args),*) -> Result<String, #err_type> { self.0.#method_name(#(#converted_args),*).map(|r| r.id().to_base64()) } }
                 } else {
                     let ok_type: Type = syn::parse_str(ok_type_str).expect("Failed to parse ok type");
-                    quote! { pub fn #method_name(&self, #(#args),*) -> Result<#ok_type, String> { self.0.#method_name(#(#converted_args),*).map_err(|e| e.to_string()) } }
+                    quote! { pub fn #method_name(&self, #(#args),*) -> Result<#ok_type, #err_type> { self.0.#method_name(#(#converted_args),*) } }
                 }
             } else if return_has_ref {
                 quote! { pub fn #method_name(&self, #(#args),*) -> Option<String> { self.0.#method_name(#(#converted_args),*).map(|r| r.id().to_base64()) } }
@@ -428,10 +462,6 @@ impl ActiveTypeDesc {
             }
         }).collect()
     }
-
-    // Keep these as aliases during transition
-    pub fn wasm_wrapper(&self, context: &str, model_scope: Option<&str>) -> TokenStream { self.ffi_wrapper(context, model_scope) }
-    pub fn uniffi_wrapper(&self, context: &str, model_scope: Option<&str>) -> TokenStream { self.ffi_wrapper(context, model_scope) }
 
     /// Substitute generic parameters in type/method signatures
     fn substitute_generics(&self, pattern: &str) -> String {

@@ -62,9 +62,12 @@ pub fn impl_provided_wrapper_types_uniffi_impl(config_filename: &str) -> syn::Re
 
     let mut all_wrappers = Vec::new();
 
+    // Use uniffi_provided_wrapper_types if specified, otherwise fall back to provided_wrapper_types
+    let uniffi_types = config.uniffi_provided_wrapper_types.as_ref().unwrap_or(&config.provided_wrapper_types);
+
     // Generate wrappers for each provided type in each value config
     for value_config in &config.values {
-        for provided_type in &config.provided_wrapper_types {
+        for provided_type in uniffi_types {
             let mut concrete_types = std::collections::HashMap::new();
             if value_config.generic_params.len() == 1 {
                 let param = &value_config.generic_params[0];
