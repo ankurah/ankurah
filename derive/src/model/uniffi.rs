@@ -323,7 +323,7 @@ fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, l
         #[derive(::uniffi::Object)]
         pub struct #ops_name;
 
-        #[::uniffi::export]
+        #[::uniffi::export(async_runtime = "tokio")]
         impl #ops_name {
             /// Get the singleton instance
             #[uniffi::constructor]

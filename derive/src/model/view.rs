@@ -32,6 +32,20 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     #[cfg(not(feature = "wasm"))]
     let wasm_field_getters_impl = quote! {};
 
+    // UniFFI field getters (conditionally generated)
+    #[cfg(feature = "uniffi")]
+    let uniffi_field_getters_impl = {
+        let uniffi_getters = model.uniffi_view_getters();
+        quote! {
+            #[::uniffi::export]
+            impl #view_name {
+                #(#uniffi_getters)*
+            }
+        }
+    };
+    #[cfg(not(feature = "uniffi"))]
+    let uniffi_field_getters_impl = quote! {};
+
     // Get FFI-specific attributes from the appropriate module
     #[cfg(feature = "wasm")]
     let ffi_attrs = super::wasm::view_attributes(&view_name, &mutable_name, &name);
@@ -170,6 +184,8 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
             }
 
             #wasm_field_getters_impl
+
+            #uniffi_field_getters_impl
 
             impl<'a> Into<ankurah::proto::EntityId> for &'a #view_name {
                 fn into(self) -> ankurah::proto::EntityId {

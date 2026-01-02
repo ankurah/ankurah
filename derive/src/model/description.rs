@@ -253,6 +253,52 @@ impl ModelDescription {
         None
     }
 
+    /// Generate UniFFI getter methods for View fields.
+    /// Returns projected field values (String, i64, etc.) via the underlying View methods.
+    /// Ref<T> fields return String (base64 EntityId) since UniFFI doesn't support generics.
+    /// Uses `uniffi_` prefix internally with `#[uniffi::method(name = "...")]` to expose
+    /// with original field names, avoiding conflicts with core Rust methods.
+    #[cfg(feature = "uniffi")]
+    pub fn uniffi_view_getters(&self) -> Vec<TokenStream> {
+        self.active_fields
+            .iter()
+            .map(|field| {
+                let field_name = field.ident.as_ref().unwrap();
+                let uniffi_method_name = format_ident!("uniffi_{}", field_name);
+                let field_name_str = field_name.to_string();
+                let projected_type = &field.ty;
+                let type_str = quote!(#projected_type).to_string();
+
+                // Check if it's a Ref<T> type
+                if type_str.contains("Ref <") || type_str.starts_with("Ref<") {
+                    // Ref<T> -> return base64 String
+                    quote! {
+                        #[uniffi::method(name = #field_name_str)]
+                        pub fn #uniffi_method_name(&self) -> Result<String, ::ankurah::property::PropertyError> {
+                            self.#field_name().map(|r| r.id().to_base64())
+                        }
+                    }
+                } else if type_str.contains("Option < Ref") || type_str.contains("Option<Ref") {
+                    // Option<Ref<T>> -> return Option<String>
+                    quote! {
+                        #[uniffi::method(name = #field_name_str)]
+                        pub fn #uniffi_method_name(&self) -> Result<Option<String>, ::ankurah::property::PropertyError> {
+                            self.#field_name().map(|opt| opt.map(|r| r.id().to_base64()))
+                        }
+                    }
+                } else {
+                    // Regular field - return as-is
+                    quote! {
+                        #[uniffi::method(name = #field_name_str)]
+                        pub fn #uniffi_method_name(&self) -> Result<#projected_type, ::ankurah::property::PropertyError> {
+                            self.#field_name()
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Generate model-scoped WASM wrappers for custom active types.
     ///
     /// "Custom" = NOT in `provided_wrapper_types` (e.g., `LWW<Ref<Session>>`).
