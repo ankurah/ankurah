@@ -22,6 +22,9 @@ pub fn mutable_attributes() -> (TokenStream, TokenStream) {
 /// Generate UniFFI-specific attributes for View struct.
 /// NOTE: We use ::uniffi directly, not ::ankurah::derive_deps::uniffi, because
 /// the derive macro needs to resolve crate::UniFfiTag in the USER's crate context.
+///
+/// Note: extra_impl for UniFFI (edit method) is generated in uniffi_impl() because
+/// it needs access to model names that aren't available here.
 pub fn view_attributes() -> ViewAttributes {
     ViewAttributes {
         struct_attr: quote! { #[cfg_attr(feature = "uniffi", derive(::uniffi::Object))] },
@@ -31,6 +34,44 @@ pub fn view_attributes() -> ViewAttributes {
     }
 }
 
+/// Generate UniFFI edit() method for View struct.
+/// This is separate from view_attributes() because it needs model/mutable names.
+/// Uses `name = "edit"` so it's exposed as `edit` in foreign bindings while
+/// not conflicting with the Rust `edit()` method that returns MutableBorrow.
+pub fn uniffi_view_edit_impl(view_name: &Ident, model_name: &Ident, mutable_name: &Ident) -> TokenStream {
+    quote! {
+        #[::uniffi::export]
+        impl #view_name {
+            /// Edit this entity in a transaction (UniFFI version - returns owned Mutable)
+            /// Note: The returned Mutable is not lifetime-bound to the transaction,
+            /// so the caller must ensure the transaction outlives the Mutable.
+            #[uniffi::method(name = "edit")]
+            pub fn uniffi_edit(&self, trx: &::ankurah::transaction::Transaction) -> Result<#mutable_name, ::ankurah::core::error::MutationError> {
+                use ::ankurah::model::View;
+                match trx.edit::<#model_name>(&self.entity) {
+                    Ok(mutable_borrow) => Ok(mutable_borrow.into_core()),
+                    Err(e) => Err(::ankurah::core::error::MutationError::AccessDenied(e))
+                }
+            }
+        }
+    }
+}
+
+/// Check if a type is Ref<T> and extract the inner type name
+fn is_ref_type(ty: &syn::Type) -> Option<Ident> {
+    if let syn::Type::Path(type_path) = ty {
+        let segment = type_path.path.segments.last()?;
+        if segment.ident == "Ref" {
+            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) = args.args.first() {
+                    return Some(inner_path.path.segments.last()?.ident.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Main UniFFI implementation generator for a Model.
 /// Generates Ref wrapper, Ops singleton, and ResultSet wrapper for UniFFI consumption.
 /// These are generated in the same hygiene module as the View/Mutable types so that
@@ -38,14 +79,18 @@ pub fn view_attributes() -> ViewAttributes {
 pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> TokenStream {
     let name = model.name();
     let view_name = model.view_name();
+    let mutable_name = model.mutable_name();
     let ref_name = model.ref_name();
     let ops_name = quote::format_ident!("{}Ops", name);
+    let input_name = quote::format_ident!("{}Input", name);
     let resultset_name = model.resultset_name();
     let changeset_name = model.changeset_name();
     let livequery_name = model.livequery_name();
 
+    let view_edit_impl = uniffi_view_edit_impl(&view_name, &name, &mutable_name);
     let ref_wrapper = uniffi_ref_wrapper(&ref_name, &name, &view_name);
-    let ops_wrapper = uniffi_ops_wrapper(&ops_name, &name, &view_name, &livequery_name);
+    let input_record = uniffi_input_record(model, &input_name, &name);
+    let ops_wrapper = uniffi_ops_wrapper(&ops_name, &name, &view_name, &livequery_name, &input_name);
     let resultset_wrapper = uniffi_resultset_wrapper(&resultset_name, &view_name);
     let changeset_wrapper = uniffi_changeset_wrapper(&changeset_name, &view_name, &resultset_name);
     let livequery_wrapper = uniffi_livequery_wrapper(&livequery_name, &view_name, &resultset_name);
@@ -53,7 +98,13 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
     // Wrapped in cfg - these are in the same hygiene module as View/Mutable
     quote! {
         #[cfg(feature = "uniffi")]
+        #view_edit_impl
+
+        #[cfg(feature = "uniffi")]
         #ref_wrapper
+
+        #[cfg(feature = "uniffi")]
+        #input_record
 
         #[cfg(feature = "uniffi")]
         #ops_wrapper
@@ -116,6 +167,71 @@ fn uniffi_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -
     }
 }
 
+/// MessageInput - UniFFI Record for creating new entities
+///
+/// This is a value type that can be passed across FFI boundaries.
+/// Ref<T> fields become String (base64 EntityId) since:
+/// 1. UniFFI doesn't support generics
+/// 2. EntityId is an Object, not a Record, so can't be in a Record directly
+fn uniffi_input_record(model: &crate::model::description::ModelDescription, input_name: &Ident, model_name: &Ident) -> TokenStream {
+    let fields = model.active_fields();
+
+    // Generate Input Record fields - Ref<T> becomes String (base64 EntityId)
+    let input_fields: Vec<_> = fields
+        .iter()
+        .map(|field| {
+            let field_name = field.ident.as_ref().unwrap();
+            let field_vis = &field.vis;
+
+            if is_ref_type(&field.ty).is_some() {
+                quote! { #field_vis #field_name: String }
+            } else {
+                let field_ty = &field.ty;
+                quote! { #field_vis #field_name: #field_ty }
+            }
+        })
+        .collect();
+
+    // Generate conversion from Input to Model - Ref<T> fields parse base64 to EntityId
+    let field_conversions: Vec<_> = fields
+        .iter()
+        .map(|field| {
+            let field_name = field.ident.as_ref().unwrap();
+
+            if is_ref_type(&field.ty).is_some() {
+                // Parse base64 string to EntityId, then wrap in Ref
+                quote! {
+                    #field_name: ::ankurah::property::Ref::from(
+                        ::ankurah::proto::EntityId::from_base64(&input.#field_name)
+                            .expect("Invalid EntityId base64 string")
+                    )
+                }
+            } else {
+                quote! { #field_name: input.#field_name }
+            }
+        })
+        .collect();
+
+    quote! {
+        /// Input record for creating new entities.
+        /// Ref<T> fields are represented as String (base64 EntityId) since:
+        /// - UniFFI doesn't support generics
+        /// - EntityId is an Object, not a Record
+        #[derive(::uniffi::Record)]
+        pub struct #input_name {
+            #(#input_fields),*
+        }
+
+        impl From<#input_name> for #model_name {
+            fn from(input: #input_name) -> Self {
+                #model_name {
+                    #(#field_conversions),*
+                }
+            }
+        }
+    }
+}
+
 /// MessageOps - Singleton with static-like methods for UniFFI
 ///
 /// Since UniFFI doesn't support true static methods, we use a singleton pattern:
@@ -126,7 +242,7 @@ fn uniffi_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -
 /// Note: All args use borrowed references (&T) because owned args don't work cross-crate.
 /// Functions returning Vec<T> are defined here (same crate as T) because generic
 /// containers don't work cross-crate.
-fn uniffi_ops_wrapper(ops_name: &Ident, _model_name: &Ident, view_name: &Ident, livequery_name: &Ident) -> TokenStream {
+fn uniffi_ops_wrapper(ops_name: &Ident, model_name: &Ident, view_name: &Ident, livequery_name: &Ident, input_name: &Ident) -> TokenStream {
     quote! {
         /// Singleton providing static-like operations for this model type.
         /// Use `new()` to get an instance, then call methods like `get()` and `fetch()`.
@@ -174,7 +290,47 @@ fn uniffi_ops_wrapper(ops_name: &Ident, _model_name: &Ident, view_name: &Ident, 
                 Ok(#livequery_name::from(lq))
             }
 
-            // TODO: create() and create_one() methods
+            /// Create a live query that waits for remote subscription before initializing
+            /// Ensures existing items appear as `initial` in the first changeset
+            pub fn query_nocache(
+                &self,
+                ctx: &::ankurah::core::context::Context,
+                selection: String,
+            ) -> Result<#livequery_name, ::ankurah::core::error::RetrievalError> {
+                let selection = ::ankurah::ankql::parser::parse_selection(&selection)?;
+                let args = ::ankurah::MatchArgs { selection, cached: false };
+                let lq = ctx.query::<#view_name>(args)?;
+                Ok(#livequery_name::from(lq))
+            }
+
+            /// Create a new entity within a transaction
+            /// Use the Input record type which has EntityId fields for Ref<T> types
+            pub async fn create(
+                &self,
+                trx: &::ankurah::transaction::Transaction,
+                input: #input_name,
+            ) -> Result<#view_name, ::ankurah::core::error::MutationError> {
+                use ::ankurah::Mutable;
+                let model: #model_name = input.into();
+                let mutable = trx.create(&model).await?;
+                Ok(mutable.read())
+            }
+
+            /// Create a new entity with an auto-committed transaction
+            /// Use the Input record type which has EntityId fields for Ref<T> types
+            pub async fn create_one(
+                &self,
+                ctx: &::ankurah::core::context::Context,
+                input: #input_name,
+            ) -> Result<#view_name, ::ankurah::core::error::MutationError> {
+                use ::ankurah::Mutable;
+                let model: #model_name = input.into();
+                let tx = ctx.begin();
+                let mutable = tx.create(&model).await?;
+                let view = mutable.read();
+                tx.commit().await?;
+                Ok(view)
+            }
         }
     }
 }
@@ -352,6 +508,12 @@ fn uniffi_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, resultset
                 let selection = ::ankurah::ankql::parser::parse_selection(&new_selection)?;
                 self.0.update_selection_wait(selection).await?;
                 Ok(())
+            }
+
+            /// Get the current selection predicate as a string
+            pub fn current_selection(&self) -> String {
+                use ::ankurah::signals::With;
+                self.0.selection().with(|(sel, _version)| sel.to_string())
             }
 
             // TODO: Add callback-based subscribe() once UniFFI callback interfaces
