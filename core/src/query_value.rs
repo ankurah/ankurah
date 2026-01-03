@@ -77,3 +77,4 @@ impl From<bool> for QueryValue {
 impl From<EntityId> for QueryValue {
     fn from(id: EntityId) -> Self { QueryValue::EntityId(id.to_base64()) }
 }
+

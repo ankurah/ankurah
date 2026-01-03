@@ -84,9 +84,14 @@ And in Cargo.toml:
 uniffi = { version = "0.29", features = ["tokio"] }
 ```
 
+## Reference Implementation
+
+The [ankurah-react-native-template](https://github.com/ankurah/ankurah-react-native-template) demonstrates UniFFI integration with React Native. It ports the browser chat app from `ankurah-react-sled-template` and serves as the validation testbed for the UniFFI feature.
+
 ## References
 
 - [UniFFI Documentation](https://mozilla.github.io/uniffi-rs/)
 - [uniffi-bindgen-react-native](https://github.com/jhugman/uniffi-bindgen-react-native)
 - [UniFFI Proc Macros](https://mozilla.github.io/uniffi-rs/latest/proc_macro/index.html)
+
 
