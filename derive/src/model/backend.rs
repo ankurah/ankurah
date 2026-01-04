@@ -501,6 +501,7 @@ mod tests {
             backend_name: "LWW".to_string(),
             namespace: "test".to_string(),
             provided_wrapper_types: vec![],
+            uniffi_provided_wrapper_types: None,
             substitutions: HashMap::new(),
             values: vec![],
         };

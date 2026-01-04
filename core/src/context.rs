@@ -85,6 +85,7 @@ impl Context {
 
 // This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl Context {
     /// Begin a transaction.
     pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone()) }

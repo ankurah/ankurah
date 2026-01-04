@@ -146,6 +146,7 @@ impl Drop for Transaction {
 #[uniffi::export]
 impl Transaction {
     /// Commit the transaction (UniFFI version - uses Arc<Self>)
+    #[uniffi::method(name = "commit")]
     pub async fn uniffi_commit(self: Arc<Self>) -> Result<(), MutationError> {
         // We need to get ownership. Try to unwrap the Arc.
         match Arc::try_unwrap(self) {
@@ -161,6 +162,7 @@ impl Transaction {
     }
 
     /// Rollback the transaction (UniFFI version)
+    #[uniffi::method(name = "rollback")]
     pub fn uniffi_rollback(&self) {
         tracing::info!("trx.rollback (uniffi)");
         self.alive.store(false, Ordering::Release);
