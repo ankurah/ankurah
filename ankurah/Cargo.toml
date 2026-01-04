@@ -22,7 +22,16 @@ wasm = [
     "ankql/wasm",
     "dep:send_wrapper",
 ]
+uniffi = [
+    "derive",
+    "ankurah-derive?/uniffi",
+    "ankurah-core/uniffi",
+    "ankurah-proto/uniffi",
+    "ankurah-signals/uniffi",
+    "dep:uniffi",
+]
 react = ["wasm", "ankurah-signals/react"]
+react-native = ["uniffi", "ankurah-signals/react-native"]
 derive = ["dep:ankurah-derive"]
 instrument = ["ankurah-core/instrument"]
 
@@ -40,6 +49,7 @@ wasm-bindgen         = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys               = { version = "0.3", optional = true }
 send_wrapper         = { version = "0.6", optional = true }
+uniffi               = { version = "0.29", optional = true }
 
 [dev-dependencies]
 ankurah-storage-sled            = { path = "../storage/sled" }

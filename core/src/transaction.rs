@@ -22,6 +22,7 @@ use wasm_bindgen::prelude::*;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Transaction {
     pub(crate) dyncontext: Option<Arc<dyn TContext + Send + Sync + 'static>>,
     id: proto::TransactionId,
@@ -138,5 +139,32 @@ impl Drop for Transaction {
         // Mark transaction as no longer alive when dropped
         self.alive.store(false, Ordering::Release);
         // how do we want to do the rollback?
+    }
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl Transaction {
+    /// Commit the transaction (UniFFI version - uses Arc<Self>)
+    #[uniffi::method(name = "commit")]
+    pub async fn uniffi_commit(self: Arc<Self>) -> Result<(), MutationError> {
+        // We need to get ownership. Try to unwrap the Arc.
+        match Arc::try_unwrap(self) {
+            Ok(mut trx) => {
+                let context = trx.dyncontext.take().expect("Transaction already consumed");
+                context.commit_local_trx(trx).await
+            }
+            Err(_arc) => {
+                // Arc has multiple owners - this shouldn't happen in normal usage
+                Err(MutationError::General("Transaction has multiple references, cannot commit".into()))
+            }
+        }
+    }
+
+    /// Rollback the transaction (UniFFI version)
+    #[uniffi::method(name = "rollback")]
+    pub fn uniffi_rollback(&self) {
+        tracing::info!("trx.rollback (uniffi)");
+        self.alive.store(false, Ordering::Release);
     }
 }

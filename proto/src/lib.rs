@@ -1,3 +1,6 @@
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
+
 pub mod auth;
 pub mod clock;
 pub mod collection;

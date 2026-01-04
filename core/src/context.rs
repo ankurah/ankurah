@@ -20,6 +20,7 @@ use wasm_bindgen::prelude::*;
 /// with a specific ContextData. Generally this means your auth token for a specific user,
 /// but ContextData is abstracted so you can use what you want.
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Context(Arc<dyn TContext + Send + Sync + 'static>);
 impl Clone for Context {
     fn clone(&self) -> Self { Self(self.0.clone()) }
@@ -84,6 +85,7 @@ impl Context {
 
 // This impl may or may not have the wasm_bindgen attribute but the functions will always be defined
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl Context {
     /// Begin a transaction.
     pub fn begin(&self) -> Transaction { Transaction::new(self.0.clone()) }
