@@ -46,7 +46,7 @@ pub trait TContext {
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
-    async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
+    async fn commit_local_trx(&self, trx: &Transaction) -> Result<(), MutationError>;
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
@@ -66,7 +66,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.fetch_entities(collection, args).await
     }
-    async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
+    async fn commit_local_trx(&self, trx: &Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
         EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
     }
@@ -245,8 +245,27 @@ where
 
     /// Does all the things necessary to commit a local transaction
     /// notably, the application of events to Entities works differently versus remote transactions
-    pub async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> {
-        let (trx_id, entity_events) = trx.into_parts()?;
+    pub async fn commit_local_trx(&self, trx: &Transaction) -> Result<(), MutationError> {
+        use std::sync::atomic::Ordering;
+
+        // Check if already committed using the alive flag
+        if !trx.alive.load(Ordering::Acquire) {
+            return Err(MutationError::General("Transaction already committed or rolled back".into()));
+        }
+
+        // Generate events from the transaction entities
+        let trx_id = trx.id.clone();
+        let mut entity_events = Vec::new();
+        for entity in trx.entities.iter() {
+            if let Some(event) = entity.generate_commit_event()? {
+                entity_events.push((entity.clone(), event));
+            }
+        }
+
+        // Mark transaction as no longer alive AFTER generating events
+        trx.alive.store(false, Ordering::Release);
+
+        // Now commit the events
         let mut attested_events = Vec::new();
         let mut entity_attested_events = Vec::new();
 
