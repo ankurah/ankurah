@@ -97,20 +97,20 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
         // Uses short wasm_bindgen path from module-level import in lib.rs
         #ref_wrapper
 
+        // Generate ResultSet wrapper (at module level for re-export)
+        #resultset_wrapper
+
+        // Generate ChangeSet wrapper (at module level for re-export)
+        #changeset_wrapper
+
+        // Generate LiveQuery wrapper (at module level for re-export)
+        #livequery_wrapper
+
         const _: () = {
             use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
 
             // Generate namespace struct with static methods
             #namespace_class
-
-            // Generate ResultSet wrapper
-            #resultset_wrapper
-
-            // Generate ChangeSet wrapper
-            #changeset_wrapper
-
-            // Generate LiveQuery wrapper
-            #livequery_wrapper
         };
     }
 }
