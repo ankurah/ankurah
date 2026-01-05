@@ -178,7 +178,7 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
     let ops_wrapper = uniffi_ops_wrapper(&ops_name, &name, &view_name, &livequery_name, &input_name);
     let resultset_wrapper = uniffi_resultset_wrapper(&resultset_name, &view_name);
     let changeset_wrapper = uniffi_changeset_wrapper(&changeset_name, &view_name, &resultset_name);
-    let livequery_wrapper = uniffi_livequery_wrapper(&livequery_name, &view_name, &resultset_name);
+    let livequery_wrapper = uniffi_livequery_wrapper(&name, &livequery_name, &view_name, &resultset_name, &changeset_name);
     let custom_wrappers = uniffi_custom_wrappers(model);
 
     quote! {
@@ -535,24 +535,23 @@ fn uniffi_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, resultset
 /// Methods:
 /// - `items()` - Get current items
 /// - `resultset()` - Get the ResultSet wrapper
-/// - `loaded()` - Check if initial load is complete
-/// - `subscribe(callback)` - Subscribe to changes, returns guard that unsubscribes on drop
-/// - `update_selection(selection)` - Update the query predicate
-/// MessageLiveQuery - Wrapper around LiveQuery<MessageView> for UniFFI
-///
-/// Provides reactive query with polling-based access to results.
-/// Note: Callback-based subscriptions are not yet supported due to UniFFI
-/// callback interface limitations with hygiene modules. Use polling for now.
-///
-/// Methods:
-/// - `items()` - Get current items
-/// - `resultset()` - Get the ResultSet wrapper  
 /// - `is_loaded()` - Check if initial load is complete
 /// - `len()` - Get count of items
 /// - `error()` - Get any error message
+/// - `subscribe(callback)` - Subscribe to changes, returns guard that unsubscribes on drop
 /// - `update_selection(selection)` - Update the query predicate
-fn uniffi_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, resultset_name: &Ident) -> TokenStream {
+fn uniffi_livequery_wrapper(model_name: &Ident, livequery_name: &Ident, view_name: &Ident, resultset_name: &Ident, changeset_name: &Ident) -> TokenStream {
+    let callback_name = quote::format_ident!("{}LiveQueryCallback", model_name);
+
     quote! {
+        /// Callback interface for LiveQuery subscription updates.
+        /// JS implements this trait and passes it to LiveQuery.subscribe()
+        #[::uniffi::export(callback_interface)]
+        pub trait #callback_name: Send + Sync {
+            /// Called when the LiveQuery resultset changes
+            fn on_change(&self, changeset: std::sync::Arc<#changeset_name>);
+        }
+
         #[derive(::uniffi::Object)]
         pub struct #livequery_name(::ankurah::LiveQuery<#view_name>);
 
@@ -604,10 +603,10 @@ fn uniffi_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, resultset
             /// Subscribe to changes in the LiveQuery resultset
             /// The callback will be called whenever the resultset changes.
             /// Returns a guard that cancels the subscription when dropped.
-            pub fn subscribe(&self, callback: Box<dyn ::ankurah::signals::LiveQueryChangeCallback>) -> std::sync::Arc<::ankurah::signals::SubscriptionGuard> {
+            pub fn subscribe(&self, callback: Box<dyn #callback_name>) -> std::sync::Arc<::ankurah::signals::SubscriptionGuard> {
                 use ::ankurah::signals::Subscribe;
-                let guard = self.0.subscribe(move |_changeset| {
-                    callback.on_change();
+                let guard = self.0.subscribe(move |changeset| {
+                    callback.on_change(std::sync::Arc::new(#changeset_name::from(changeset)));
                 });
                 std::sync::Arc::new(guard)
             }
