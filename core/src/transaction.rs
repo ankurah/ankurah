@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ankurah_proto::Event;
 use ankurah_proto::{self as proto, EntityId};
@@ -24,7 +24,8 @@ use wasm_bindgen::prelude::*;
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Transaction {
-    pub(crate) dyncontext: Option<Arc<dyn TContext + Send + Sync + 'static>>,
+    // Use Mutex for interior mutability - allows UniFFI to take the context without consuming self
+    pub(crate) dyncontext: Mutex<Option<Arc<dyn TContext + Send + Sync + 'static>>>,
     id: proto::TransactionId,
     entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
