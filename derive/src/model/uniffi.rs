@@ -601,8 +601,16 @@ fn uniffi_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, resultset
                 self.0.selection().with(|(sel, _version)| sel.to_string())
             }
 
-            // TODO: Add callback-based subscribe() once UniFFI callback interfaces
-            // work correctly with hygiene modules. For now, use polling.
+            /// Subscribe to changes in the LiveQuery resultset
+            /// The callback will be called whenever the resultset changes.
+            /// Returns a guard that cancels the subscription when dropped.
+            pub fn subscribe(&self, callback: Box<dyn ::ankurah::signals::LiveQueryChangeCallback>) -> std::sync::Arc<::ankurah::signals::SubscriptionGuard> {
+                use ::ankurah::signals::Subscribe;
+                let guard = self.0.subscribe(move |_changeset| {
+                    callback.on_change();
+                });
+                std::sync::Arc::new(guard)
+            }
         }
 
         // Allow constructing from inner type

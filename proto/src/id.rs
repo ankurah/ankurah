@@ -72,7 +72,8 @@ impl EntityId {
     }
 
     /// Compare two EntityIds for equality
-    pub fn equals(&self, other: &EntityId) -> bool { self.0 == other.0 }
+    #[uniffi::method(name = "equals")]
+    pub fn equals_uniffi(&self, other: &EntityId) -> bool { self.0 == other.0 }
 }
 
 impl fmt::Display for EntityId {

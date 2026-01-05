@@ -22,6 +22,14 @@ pub trait StoreChangeCallback: Send + Sync {
     fn on_change(&self);
 }
 
+/// Callback interface for LiveQuery subscription updates
+/// JS implements this trait and passes it to LiveQuery.subscribe()
+#[uniffi::export(callback_interface)]
+pub trait LiveQueryChangeCallback: Send + Sync {
+    /// Called when the LiveQuery resultset changes
+    fn on_change(&self);
+}
+
 struct ListenerEntry {
     _guard: ListenerGuard,
     marked_for_removal: bool,
