@@ -197,3 +197,69 @@ impl Observer for ReactObserver {
 
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
+
+// ============================================================================
+// JsSignal - A signal that can be created and controlled from JavaScript
+// ============================================================================
+
+/// A signal that can be created and controlled from JavaScript/TypeScript.
+///
+/// This allows TypeScript code to create signals that participate in the
+/// Ankurah signal graph. The value is stored in JS - Rust only handles
+/// the observation and notification mechanism.
+///
+/// # Usage from TypeScript
+/// ```typescript
+/// function useSignal<T>(initialValue: T) {
+///   const [signal] = useState(() => ({
+///     rust: new JsSignal(),
+///     value: initialValue,
+///   }));
+///
+///   return {
+///     get: () => {
+///       signal.rust.track(); // Register with current observer
+///       return signal.value;
+///     },
+///     set: (newValue: T) => {
+///       signal.value = newValue;
+///       signal.rust.notify(); // Trigger re-renders
+///     },
+///   };
+/// }
+/// ```
+#[derive(uniffi::Object)]
+pub struct JsSignal {
+    broadcast: crate::broadcast::Broadcast<()>,
+}
+
+#[uniffi::export]
+impl JsSignal {
+    /// Create a new JsSignal
+    #[uniffi::constructor]
+    pub fn new() -> Self {
+        Self { broadcast: crate::broadcast::Broadcast::new() }
+    }
+
+    /// Call this when reading the signal value.
+    /// Registers this signal with the current observer (if any).
+    pub fn track(&self) {
+        CurrentObserver::track(self);
+    }
+
+    /// Call this when the signal value changes.
+    /// Notifies all observers that this signal has changed.
+    pub fn notify(&self) {
+        self.broadcast.send(());
+    }
+}
+
+impl crate::signal::Signal for JsSignal {
+    fn listen(&self, listener: crate::signal::Listener) -> crate::signal::ListenerGuard {
+        crate::signal::ListenerGuard::new(self.broadcast.reference().listen(listener))
+    }
+
+    fn broadcast_id(&self) -> crate::broadcast::BroadcastId {
+        self.broadcast.id()
+    }
+}
