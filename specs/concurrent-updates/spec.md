@@ -1,5 +1,7 @@
 ## Concurrent Updates: Functional Specification
 
+> **Implementation status:** See [implementation-status.md](./implementation-status.md) for current progress on the `trusted_causal_assertions` branch.
+
 ### Motivation
 
 Ephemeral and durable peers observe edits at different times. When a peer receives updates for an entity, it must determine if those updates descend from its current head, are ancestors, or represent true concurrency. The system must converge deterministically without regressions or spurious multi-heads.
