@@ -34,8 +34,10 @@ Ephemeral and durable peers observe edits at different times. When a peer receiv
     - From the meet, apply the subject’s forward chain in causal order. In the same step, consider the known immediate descendants of the meet that we currently have (from staged → local → remote) and prune those that are subsumed by the applied chain’s tip. Any remaining (still-unsubsumed) descendants are bubbled into the resulting frontier as concurrent head members.
     - Apply a deterministic per-backend LWW policy for value resolution with the following precedence:
       1. Lineage precedence relative to the meet (later along its branch wins),
-      2. Tiebreak by lexicographic ordering of event id,
+      2. Tiebreak by lexicographic ordering of event id (ONLY when causal depths are identical),
       3. Optionally, Yrs as a stronger causal metric in the future.
+    - **Per-property resolution**: LWW conflict resolution is per-property, not per-event. Different properties may have different winners from different branches. The merged state combines winning values.
+    - **Backend-specific handling**: Yrs backends just apply operations in causal order; Yrs handles merge internally. LWW backends require explicit conflict resolution as described above.
     - The system MAY preserve multi-heads when unsubsumed concurrency remains. It MUST NOT create multi-heads for linear histories.
   - Disjoint: reject (no common genesis) per policy.
   - BudgetExceeded { subject, other }: traversal stopped early; return the frontiers to resume in a subsequent attempt.
