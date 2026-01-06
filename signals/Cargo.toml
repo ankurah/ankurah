@@ -16,7 +16,9 @@ react          = ["wasm", "dep:send_wrapper"]
 jsvalue        = ["wasm", "dep:send_wrapper"]
 reactive-graph = ["dep:reactive_graph"]
 uniffi         = ["dep:uniffi"]
-react-native   = ["uniffi"]
+react-native   = ["uniffi", "multithread"]
+# Enable cross-thread observer tracking (required for UniFFI/React Native where JS and native code run on different threads)
+multithread    = []
 
 [dependencies]
 tokio          = { version = "1.40", features = ["sync"], optional = true }
