@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     error::{MutationError, RetrievalError},
+    event_dag::{CausalNavigator, NavigationStep},
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
     util::Iterable,
@@ -15,59 +16,10 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event, EventId};
 use async_trait::async_trait;
-
-/// a trait for events and eventlike things that can be descended
-pub trait TEvent: std::fmt::Display {
-    type Id: Eq + PartialEq + Clone;
-    type Parent: TClock<Id = Self::Id>;
-
-    fn id(&self) -> Self::Id;
-    fn parent(&self) -> &Self::Parent;
-}
-
-pub trait TClock {
-    type Id: Eq + PartialEq + Clone;
-    fn members(&self) -> &[Self::Id];
-}
-
-impl TClock for Clock {
-    type Id = EventId;
-    fn members(&self) -> &[Self::Id] { self.as_slice() }
-}
-
-impl TEvent for ankurah_proto::Event {
-    type Id = ankurah_proto::EventId;
-    type Parent = Clock;
-
-    fn id(&self) -> EventId { self.id() }
-    fn parent(&self) -> &Clock { &self.parent }
-}
+use std::collections::BTreeSet;
 
 #[async_trait]
-pub trait GetEvents {
-    type Id: Eq + PartialEq + Clone + std::fmt::Debug + Send + Sync;
-    type Event: TEvent<Id = Self::Id> + std::fmt::Display;
-
-    /// Estimate the budget cost for retrieving a batch of events
-    /// This allows different implementations to model their cost structure
-    fn estimate_cost(&self, _batch_size: usize) -> usize {
-        // Default implementation: fixed cost of 1 per batch
-        1
-    }
-
-    /// retrieve the events from the store OR the remote peer
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError>;
-
-    /// Stage events for immediate retrieval without storage. Used when applying EventBridge deltas.
-    /// Staged events are available for lineage comparison at zero budget cost before being persisted.
-    fn stage_events(&self, events: impl IntoIterator<Item = Attested<Self::Event>>);
-
-    /// Mark an event as used. Used when applying EventBridge deltas.
-    fn mark_event_used(&self, event_id: &Self::Id);
-}
-
-#[async_trait]
-pub trait Retrieve: GetEvents {
+pub trait Retrieve {
     // Each implementation of Retrieve determines whether to use local or remote storage
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError>;
 }
@@ -102,45 +54,25 @@ impl LocalRetriever {
 }
 
 #[async_trait]
-impl GetEvents for LocalRetriever {
-    type Id = EventId;
+impl CausalNavigator for LocalRetriever {
+    type EID = EventId;
     type Event = ankurah_proto::Event;
 
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-        let mut events = Vec::with_capacity(event_ids.len());
-        let mut event_ids: HashSet<Self::Id> = event_ids.into_iter().collect();
+    async fn expand_frontier(
+        &self,
+        frontier_ids: &[Self::EID],
+        _budget: usize,
+    ) -> Result<NavigationStep<Self::EID, Self::Event>, RetrievalError> {
+        // Fetch events for the given frontier IDs
+        let events = self.0.collection.get_events(frontier_ids.to_vec()).await?;
+        let event_payloads = events.into_iter().map(|e| e.payload).collect();
 
-        // First check staged events (zero cost)
-        {
-            if let Some(staged) = self.0.staged_events.lock().unwrap().as_mut() {
-                event_ids.retain(|id| {
-                    if let Some((event, used)) = staged.get_mut(id) {
-                        events.push(event.clone());
-                        *used = true;
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-        }
-
-        if event_ids.is_empty() {
-            return Ok((0, events));
-        }
-
-        // staged events are free
-        // cost for local retrieval is 1 per batch
-
-        // Then retrieve from storage if needed
-        let stored_events = self.0.collection.get_events(event_ids.into_iter().collect()).await?;
-        events.extend(stored_events);
-
-        // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
-        Ok((1, events))
+        Ok(NavigationStep { events: event_payloads, assertions: Vec::new(), consumed_budget: 1 })
     }
+}
 
-    fn stage_events(&self, events: impl IntoIterator<Item = Attested<Self::Event>>) {
+impl LocalRetriever {
+    pub fn stage_events(&self, events: impl IntoIterator<Item = Attested<Event>>) {
         let mut staged = self.0.staged_events.lock().unwrap();
         let staged = staged.get_or_insert_with(|| HashMap::new());
 
@@ -149,7 +81,7 @@ impl GetEvents for LocalRetriever {
         }
     }
 
-    fn mark_event_used(&self, event_id: &Self::Id) {
+    pub fn mark_event_used(&self, event_id: &EventId) {
         let mut staged = self.0.staged_events.lock().unwrap();
         let staged = staged.get_or_insert_with(|| HashMap::new());
         staged.get_mut(event_id).map(|(_, used)| {
@@ -212,18 +144,23 @@ where
 }
 
 #[async_trait]
-impl<'a, SE, PA, C> GetEvents for EphemeralNodeRetriever<'a, SE, PA, C>
+impl<'a, SE, PA, C> CausalNavigator for EphemeralNodeRetriever<'a, SE, PA, C>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    type Id = EventId;
+    type EID = EventId;
     type Event = Event;
 
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
-        let mut events = Vec::with_capacity(event_ids.len());
-        let mut event_ids: HashSet<Self::Id> = event_ids.into_iter().collect();
+    async fn expand_frontier(
+        &self,
+        frontier_ids: &[Self::EID],
+        _budget: usize,
+    ) -> Result<NavigationStep<Self::EID, Self::Event>, RetrievalError> {
+        let mut events: Vec<Attested<Event>> = Vec::with_capacity(frontier_ids.len());
+        let mut event_ids: HashSet<EventId> = frontier_ids.iter().cloned().collect();
+        let mut cost = 0;
 
         // First check staged events (zero cost)
         {
@@ -241,28 +178,27 @@ where
         }
 
         if event_ids.is_empty() {
-            return Ok((0, events));
+            let event_payloads = events.into_iter().map(|e| e.payload).collect();
+            return Ok(NavigationStep { events: event_payloads, assertions: Vec::new(), consumed_budget: cost });
         }
-
-        // staged events are free
-        // cost for local retrieval is 1 per batch
-        // cost for remote retrieval is 5 per batch
 
         // Then try to get events from local storage
         let collection = self.node.system.collection(&self.collection).await?;
-        // TODO update get_events to take &HashSet
         for event in collection.get_events(event_ids.iter().cloned().collect()).await? {
             event_ids.remove(&event.payload.id());
             events.push(event);
         }
+        cost = 1; // Cost for local retrieval
 
         if event_ids.is_empty() {
-            return Ok((1, events));
+            let event_payloads = events.into_iter().map(|e| e.payload).collect();
+            return Ok(NavigationStep { events: event_payloads, assertions: Vec::new(), consumed_budget: cost });
         }
 
         // If we have missing events and a durable peer, try to fetch them
         let Some(peer_id) = self.node.get_durable_peer_random() else {
-            return Ok((1, events)); // no durable peers - return what we have
+            let event_payloads = events.into_iter().map(|e| e.payload).collect();
+            return Ok(NavigationStep { events: event_payloads, assertions: Vec::new(), consumed_budget: cost });
         };
 
         match self
@@ -270,26 +206,35 @@ where
             .request(
                 peer_id,
                 self.cdata,
-                proto::NodeRequestBody::GetEvents { collection: self.collection.clone(), event_ids: event_ids.into_iter().collect() }, // TODO update ::GetEvents to take HashSet
+                proto::NodeRequestBody::GetEvents { collection: self.collection.clone(), event_ids: event_ids.into_iter().collect() },
             )
             .await?
-            // .map_err(|e| RetrievalError::StorageError(format!("Request failed: {}", e).into()))?
         {
             proto::NodeResponseBody::GetEvents(peer_events) => {
                 for event in peer_events.iter() {
                     collection.add_event(event).await?;
                 }
                 events.extend(peer_events);
+                cost = 5; // Cost for remote retrieval
             }
             proto::NodeResponseBody::Error(e) => {
                 return Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into()));
             }
             _ => return Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
         }
-        Ok((5, events))
-    }
 
-    fn stage_events(&self, events: impl IntoIterator<Item = Attested<Self::Event>>) {
+        let event_payloads = events.into_iter().map(|e| e.payload).collect();
+        Ok(NavigationStep { events: event_payloads, assertions: Vec::new(), consumed_budget: cost })
+    }
+}
+
+impl<'a, SE, PA, C> EphemeralNodeRetriever<'a, SE, PA, C>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+    C: Iterable<PA::ContextData> + Send + Sync + 'a,
+{
+    pub fn stage_events(&self, events: impl IntoIterator<Item = Attested<Event>>) {
         let mut staged = self.staged_events.lock().unwrap();
         let staged = staged.get_or_insert_with(|| HashMap::new());
 
@@ -298,7 +243,7 @@ where
         }
     }
 
-    fn mark_event_used(&self, event_id: &Self::Id) {
+    pub fn mark_event_used(&self, event_id: &EventId) {
         let mut staged = self.staged_events.lock().unwrap();
         let staged = staged.get_or_insert_with(|| HashMap::new());
         staged.get_mut(event_id).map(|(_, used)| {

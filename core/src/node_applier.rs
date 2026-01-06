@@ -1,9 +1,10 @@
 use crate::{
     changes::EntityChange,
     error::{ApplyError, ApplyErrorItem, MutationError},
-    lineage::Retrieve,
+    event_dag::CausalNavigator,
     node::Node,
     policy::PolicyAgent,
+    retrieval::Retrieve,
     storage::StorageEngine,
     util::ready_chunks::ReadyChunks,
 };
@@ -63,7 +64,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
     {
         // TODO: do we actually need predicate_relevance?
         let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _ } = update;
