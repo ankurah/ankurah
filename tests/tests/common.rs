@@ -39,6 +39,15 @@ pub struct Album {
     pub year: String,
 }
 
+/// LWW-backed model for testing Last-Write-Wins conflict resolution
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Record {
+    #[active_type(LWW)]
+    pub title: String,
+    #[active_type(LWW)]
+    pub artist: String,
+}
+
 // Initialize tracing for tests
 #[ctor::ctor]
 fn init_tracing() {
@@ -285,4 +294,160 @@ pub async fn durable_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAg
 pub async fn ephemeral_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAgent>, anyhow::Error> {
     let node = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     Ok(node)
+}
+
+// ============================================================================
+// DAG STRUCTURE VERIFICATION (TestDag and assert_dag! macro)
+// ============================================================================
+
+use std::collections::HashMap;
+
+/// Test helper for tracking event labels based on creation order.
+///
+/// Labels are assigned in the order events are enumerated (A, B, C...).
+/// This provides stable, predictable labels for DAG verification.
+#[derive(Debug, Default)]
+pub struct TestDag {
+    next_label: char,
+    /// Map from EventId to label
+    pub id_to_label: HashMap<proto::EventId, char>,
+    /// Map from label to EventId
+    pub label_to_id: HashMap<char, proto::EventId>,
+}
+
+impl TestDag {
+    pub fn new() -> Self { Self { next_label: 'A', id_to_label: HashMap::new(), label_to_id: HashMap::new() } }
+
+    /// Enumerate events from a commit, assigning labels in order.
+    pub fn enumerate(&mut self, events: Vec<proto::Event>) {
+        for event in events {
+            let id = event.id();
+            if self.id_to_label.contains_key(&id) {
+                continue; // Already registered
+            }
+            let label = self.next_label;
+            self.next_label = (label as u8 + 1) as char;
+            self.id_to_label.insert(id.clone(), label);
+            self.label_to_id.insert(label, id);
+        }
+    }
+
+    /// Get the label for an EventId, if registered.
+    pub fn label(&self, id: &proto::EventId) -> Option<char> { self.id_to_label.get(id).copied() }
+
+    /// Get the EventId for a label, if registered.
+    pub fn id(&self, label: char) -> Option<&proto::EventId> { self.label_to_id.get(&label) }
+
+    /// Convert a Clock to sorted labels for assertion.
+    pub fn clock_labels(&self, clock: &proto::Clock) -> Vec<char> {
+        let mut labels: Vec<char> = clock.as_slice().iter().filter_map(|id| self.id_to_label.get(id).copied()).collect();
+        labels.sort();
+        labels
+    }
+
+    /// Verify DAG structure against expected parent relationships.
+    pub fn verify(&self, events: &[proto::Attested<proto::Event>], expected: &HashMap<char, Vec<char>>) -> Result<(), String> {
+        let mut errors = Vec::new();
+
+        // Build actual parent map from events
+        let mut actual_parents: HashMap<char, Vec<char>> = HashMap::new();
+        for event in events {
+            let id = event.payload.id();
+            if let Some(&label) = self.id_to_label.get(&id) {
+                let parents: Vec<char> =
+                    event.payload.parent.as_slice().iter().filter_map(|pid| self.id_to_label.get(pid).copied()).collect();
+                actual_parents.insert(label, parents);
+            }
+        }
+
+        // Verify each expected relationship
+        for (&label, expected_parents) in expected {
+            let actual = actual_parents.get(&label);
+            match actual {
+                None => {
+                    errors.push(format!("Label {} not found in events", label));
+                }
+                Some(actual) => {
+                    let mut expected_sorted = expected_parents.clone();
+                    expected_sorted.sort();
+                    let mut actual_sorted = actual.clone();
+                    actual_sorted.sort();
+
+                    if expected_sorted != actual_sorted {
+                        let expected_str: String = expected_sorted.iter().collect();
+                        let actual_str: String = actual_sorted.iter().collect();
+                        if expected_parents.is_empty() {
+                            errors.push(format!("{} => [] (expected) vs {} => [{}] (actual)", label, label, actual_str));
+                        } else {
+                            errors.push(format!("{} => [{}] (expected) vs {} => [{}] (actual)", label, expected_str, label, actual_str));
+                        }
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "DAG structure mismatch:\n\n{}\n\nRegistered labels: {:?}",
+                errors.join("\n"),
+                self.label_to_id.keys().collect::<Vec<_>>()
+            ))
+        }
+    }
+}
+
+/// Macro for declarative DAG structure verification.
+///
+/// Verifies the parent relationships in a DAG of events using a TestDag
+/// that was populated via `dag.enumerate()` during commits.
+///
+/// Usage:
+/// ```ignore
+/// let mut dag = TestDag::new();
+/// dag.enumerate(trx1.commit().await?);
+/// dag.enumerate(trx2.commit().await?);
+///
+/// let events = collection.dump_entity_events(id).await?;
+/// assert_dag!(dag, events, {
+///     A => [],         // genesis event (no parents)
+///     B => [A],
+///     C => [A],
+/// });
+/// ```
+#[macro_export]
+macro_rules! assert_dag {
+    ($dag:expr, $events:expr, { $($label:ident => [$($parent:ident),* $(,)?]),* $(,)? }) => {{
+        use std::collections::HashMap;
+
+        let mut expected_parents: HashMap<char, Vec<char>> = HashMap::new();
+
+        $(
+            let label_char = stringify!($label).chars().next().unwrap();
+            expected_parents.insert(label_char, vec![$(stringify!($parent).chars().next().unwrap()),*]);
+        )*
+
+        if let Err(msg) = $dag.verify(&$events, &expected_parents) {
+            panic!("{}", msg);
+        }
+    }};
+}
+
+/// Macro for asserting that a Clock contains specific labeled events.
+///
+/// Usage:
+/// ```ignore
+/// clock_eq!(dag, head, [B, C]);  // head contains events B and C
+/// ```
+#[macro_export]
+macro_rules! clock_eq {
+    ($dag:expr, $clock:expr, [$($label:ident),* $(,)?]) => {{
+        let expected: Vec<char> = vec![$(stringify!($label).chars().next().unwrap()),*];
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        let actual = $dag.clock_labels(&$clock);
+        assert_eq!(actual, expected_sorted,
+            "Clock mismatch: expected {:?}, got {:?}", expected_sorted, actual);
+    }};
 }
