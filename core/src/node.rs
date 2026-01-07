@@ -369,8 +369,6 @@ where
                 // I think we want timeouts to be handled by the node, not the connector,
                 // which would lend itself to spawning a task here and making this function synchronous.
 
-                let cdata = self.policy_agent.check_request(self, &auth, &request).await?;
-
                 // double check to make sure we have a connection to the peer based on the node id
                 if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
                     let from = request.from;
@@ -380,8 +378,12 @@ where
                         return Ok(());
                     }
 
-                    let body = match self.handle_request(&cdata, request).await {
-                        Ok(result) => result,
+                    // Validate the request auth first, converting errors to error responses
+                    let body = match self.policy_agent.check_request(self, &auth, &request).await {
+                        Ok(cdata) => match self.handle_request(&cdata, request).await {
+                            Ok(result) => result,
+                            Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                        },
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                     };
                     let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
