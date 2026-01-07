@@ -1,3 +1,4 @@
+0.7.13  Fix check_request error handling: errors now return proper error responses to clients instead of causing hangs
 0.7.12  Fix JSON path LiveQuery: predicate re-evaluation and new entity notifications now work correctly for queries like `context.task_id = 'xyz'`
 0.7.11  Fix Json WASM serialization to return plain objects (POJOs) instead of ES2015 Maps
 0.7.10  ChangeSet API: initial(), added(), appeared(), updated(), removed() with deprecation of ambiguous adds()/removes()/updates(); Model.query_nocache() for WASM
