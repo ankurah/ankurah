@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::Operation;
+use ankurah_proto::{Event, EventId, Operation};
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,8 @@ const LWW_DIFF_VERSION: u8 = 1;
 struct ValueEntry {
     value: Option<Value>,
     committed: bool,
+    /// The event that wrote this value (None for uncommitted local changes)
+    event_id: Option<EventId>,
 }
 
 #[derive(Debug)]
@@ -44,7 +46,7 @@ impl LWWBackend {
 
     pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
         let mut values = self.values.write().unwrap();
-        values.insert(property_name, ValueEntry { value, committed: false });
+        values.insert(property_name, ValueEntry { value, committed: false, event_id: None });
     }
 
     pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
@@ -82,18 +84,27 @@ impl PropertyBackend for LWWBackend {
         values.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect()
     }
 
-    fn property_backend_name() -> String { "lww".to_owned() }
+    fn property_backend_name() -> &'static str { "lww" }
 
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
-        let property_values = self.property_values();
-        let state_buffer = bincode::serialize(&property_values)?;
+        // Serialize with event_id for per-property conflict resolution after loading
+        let values = self.values.read().unwrap();
+        let serializable: BTreeMap<PropertyName, (Option<Value>, Option<EventId>)> =
+            values.iter().map(|(k, v)| (k.clone(), (v.value.clone(), v.event_id.clone()))).collect();
+        let state_buffer = bincode::serialize(&serializable)?;
         Ok(state_buffer)
     }
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
+        // Try new format first (with event_id), fall back to legacy format
+        if let Ok(raw_map) = bincode::deserialize::<BTreeMap<PropertyName, (Option<Value>, Option<EventId>)>>(state_buffer) {
+            let map = raw_map.into_iter().map(|(k, (v, eid))| (k, ValueEntry { value: v, committed: true, event_id: eid })).collect();
+            return Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) });
+        }
+        // Fall back to legacy format (without event_id)
         let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
-        let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true })).collect();
+        let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true, event_id: None })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
@@ -117,27 +128,108 @@ impl PropertyBackend for LWWBackend {
         }]))
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
-        let mut changed_fields = Vec::new();
+    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError> {
+        // No event tracking - used when loading from state buffer
+        self.apply_operations_internal(operations, None)
+    }
 
-        for operation in operations {
-            let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
-            match version {
-                1 => {
-                    let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
+    fn apply_operations_with_event(&self, operations: &[Operation], event_id: EventId) -> Result<(), MutationError> {
+        // Track which event set each property - used for all event applications
+        self.apply_operations_internal(operations, Some(event_id))
+    }
 
-                    let mut values = self.values.write().unwrap();
-                    for (property_name, new_value) in changes {
-                        // Insert as committed entry since this came from an operation
-                        values.insert(property_name.clone(), ValueEntry { value: new_value, committed: true });
-                        changed_fields.push(property_name);
+    fn apply_layer(&self, already_applied: &[&Event], to_apply: &[&Event], current_head: &[EventId]) -> Result<(), MutationError> {
+        // All events in this layer are concurrent (same causal depth from meet).
+        // For each property, determine winner by lexicographic EventId.
+        // Only apply values where winner is from to_apply.
+
+        use std::collections::BTreeSet;
+
+        // Build sets of event IDs for quick lookup
+        let to_apply_ids: BTreeSet<EventId> = to_apply.iter().map(|e| e.id()).collect();
+        let already_applied_ids: BTreeSet<EventId> = already_applied.iter().map(|e| e.id()).collect();
+        let current_head_ids: BTreeSet<EventId> = current_head.iter().cloned().collect();
+
+        // Start with empty winners - layer events compete with each other first
+        let mut winners: BTreeMap<PropertyName, (Option<Value>, EventId)> = BTreeMap::new();
+
+        // Process all events (both already_applied and to_apply)
+        for event in already_applied.iter().chain(to_apply.iter()) {
+            // Extract LWW operations from this event
+            if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
+                for operation in operations {
+                    let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
+                    match version {
+                        1 => {
+                            let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
+                            for (prop, value) in changes {
+                                // Check if this event wins for this property
+                                let dominated = winners.get(&prop).map(|(_, existing_id)| event.id() > *existing_id).unwrap_or(true);
+                                if dominated {
+                                    winners.insert(prop, (value, event.id()));
+                                }
+                            }
+                        }
+                        version => {
+                            return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()))
+                        }
                     }
                 }
-                version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
             }
         }
 
-        // Notify field subscribers for changed fields only
+        // After processing layer events, check for values from concurrent tips
+        // not in this layer. Example: head=[B,C], event E extends B only.
+        // C's values are not in any layer but must still compete with E's values.
+        //
+        // We only consider values whose event_id is in the CURRENT HEAD but not
+        // in this layer. Ancestor values (like genesis) should not compete.
+        {
+            let values = self.values.read().unwrap();
+            for (prop, entry) in values.iter() {
+                if let Some(eid) = &entry.event_id {
+                    // Skip if this event is in the layer (already processed above)
+                    if already_applied_ids.contains(eid) || to_apply_ids.contains(eid) {
+                        continue;
+                    }
+                    // Only consider values from events in the current head
+                    // These are true concurrent tips, not ancestors
+                    if !current_head_ids.contains(eid) {
+                        continue;
+                    }
+                    // This value is from a concurrent tip not in this layer
+                    // It should compete with the layer winner for this property
+                    match winners.get(prop) {
+                        Some((_, winner_eid)) if eid > winner_eid => {
+                            // Concurrent tip wins - update winner
+                            winners.insert(prop.clone(), (entry.value.clone(), eid.clone()));
+                        }
+                        None => {
+                            // No layer event touched this property - concurrent tip wins by default
+                            winners.insert(prop.clone(), (entry.value.clone(), eid.clone()));
+                        }
+                        _ => {
+                            // Layer winner has higher EventId - keep it
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply winning values that come from to_apply events
+        let mut changed_fields = Vec::new();
+        {
+            let mut values = self.values.write().unwrap();
+            for (prop, (value, winner_id)) in winners {
+                if to_apply_ids.contains(&winner_id) {
+                    values.insert(prop.clone(), ValueEntry { value, committed: true, event_id: Some(winner_id) });
+                    changed_fields.push(prop);
+                }
+                // Winner from already_applied or concurrent tip → already in state, no mutation needed
+            }
+        }
+
+        // Notify subscribers for changed fields
         let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
         for field_name in changed_fields {
             if let Some(broadcast) = field_broadcasts.get(&field_name) {
@@ -164,6 +256,43 @@ impl LWWBackend {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
         let broadcast = field_broadcasts.entry(field_name.clone()).or_default();
         broadcast.id()
+    }
+
+    /// Get the event_id that last wrote a property value (if tracked).
+    pub fn get_event_id(&self, property_name: &PropertyName) -> Option<EventId> {
+        let values = self.values.read().unwrap();
+        values.get(property_name).and_then(|entry| entry.event_id.clone())
+    }
+    /// Internal implementation that handles both tracked and untracked operations.
+    fn apply_operations_internal(&self, operations: &[Operation], event_id: Option<EventId>) -> Result<(), MutationError> {
+        let mut changed_fields = Vec::new();
+
+        for operation in operations {
+            let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
+            match version {
+                1 => {
+                    let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
+
+                    let mut values = self.values.write().unwrap();
+                    for (property_name, new_value) in changes {
+                        // Insert as committed entry since this came from an operation
+                        values.insert(property_name.clone(), ValueEntry { value: new_value, committed: true, event_id: event_id.clone() });
+                        changed_fields.push(property_name);
+                    }
+                }
+                version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
+            }
+        }
+
+        // Notify field subscribers for changed fields only
+        let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        for field_name in changed_fields {
+            if let Some(broadcast) = field_broadcasts.get(&field_name) {
+                broadcast.send(());
+            }
+        }
+
+        Ok(())
     }
 }
 
