@@ -9,7 +9,7 @@ use crate::{
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, Event};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
@@ -46,6 +46,7 @@ pub trait TContext {
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
     async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError>;
+    async fn commit_local_trx_with_events(&self, trx: Transaction) -> Result<Vec<Event>, MutationError>;
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
@@ -65,7 +66,13 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.fetch_entities(collection, args).await
     }
-    async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> { self.commit_local_trx(trx).await }
+    async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> {
+        self.commit_local_trx_with_events(trx).await?;
+        Ok(())
+    }
+    async fn commit_local_trx_with_events(&self, trx: Transaction) -> Result<Vec<Event>, MutationError> {
+        self.commit_local_trx_impl(trx).await
+    }
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
         EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
     }
@@ -243,7 +250,7 @@ where
 
     /// Does all the things necessary to commit a local transaction
     /// notably, the application of events to Entities works differently versus remote transactions
-    pub async fn commit_local_trx(&self, trx: Transaction) -> Result<(), MutationError> {
+    async fn commit_local_trx_impl(&self, trx: Transaction) -> Result<Vec<Event>, MutationError> {
         let (trx_id, entity_events) = trx.into_parts()?;
         let mut attested_events = Vec::new();
         let mut entity_attested_events = Vec::new();
@@ -310,7 +317,8 @@ where
 
         // Notify reactor of ALL changes
         self.node.reactor.notify_change(changes).await;
-        Ok(())
+
+        Ok(attested_events.into_iter().map(|a| a.payload).collect())
     }
 
     /// Fetch entities from the first available durable peer with known_matches support
