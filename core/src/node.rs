@@ -639,7 +639,8 @@ where
         Ok(Some(proto::EntityDelta { entity_id, collection, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
 
-    /// Collect events between known_head and current_head using lineage comparison
+    /// Collect events between known_head and current_head using event_dag comparison.
+    /// Returns events needed to advance from known_head to current_head.
     pub(crate) async fn collect_event_bridge(
         &self,
         storage_collection: &crate::storage::StorageCollectionWrapper,
@@ -650,42 +651,55 @@ where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        use crate::lineage::{EventAccumulator, Ordering};
+        use crate::event_dag::{compare, AbstractCausalRelation};
         use crate::retrieval::LocalRetriever;
+        use std::collections::HashSet;
 
         let retriever = LocalRetriever::new(storage_collection.clone());
-        let accumulator = EventAccumulator::new(None); // No limit for Phase 1
-        let mut comparison = crate::lineage::Comparison::new_with_accumulator(
-            &retriever,
-            current_head,
-            known_head,
-            100000, // TODO: make budget configurable
-            Some(accumulator),
-        );
 
-        // Run comparison
-        loop {
-            match comparison.step().await? {
-                Some(Ordering::Descends) => {
-                    // Current descends from known - perfect for event bridge
-                    break;
+        // First check the causal relationship
+        let relation = compare(&retriever, current_head, known_head, 100000).await?;
+
+        match relation {
+            AbstractCausalRelation::Equal => {
+                // Heads are equal - no events needed
+                Ok(vec![])
+            }
+            AbstractCausalRelation::StrictDescends { chain: _ } => {
+                // Current descends from known - collect events by walking backward
+                // TODO: Optimize with forward chain from relation (GitHub #200)
+                let known_set: HashSet<_> = known_head.as_slice().iter().collect();
+                let mut events = Vec::new();
+                let mut frontier: Vec<proto::EventId> = current_head.as_slice().to_vec();
+                let mut visited: HashSet<proto::EventId> = HashSet::new();
+
+                while !frontier.is_empty() {
+                    let batch = std::mem::take(&mut frontier);
+                    let fetched = storage_collection.get_events(batch).await?;
+
+                    for event in fetched {
+                        let id = event.payload.id();
+                        if visited.insert(id.clone()) && !known_set.contains(&id) {
+                            // Add parents to frontier (walking backward)
+                            for parent in event.payload.parent.as_slice() {
+                                if !visited.contains(parent) && !known_set.contains(parent) {
+                                    frontier.push(parent.clone());
+                                }
+                            }
+                            events.push(event);
+                        }
+                    }
                 }
-                Some(Ordering::Equal) => {
-                    // Heads are equal - no events needed
-                    break;
-                }
-                Some(_) => {
-                    // Other relationships (NotDescends, Incomparable, etc.) - can't build bridge
-                    return Ok(vec![]);
-                }
-                None => {
-                    // Continue stepping
-                }
+
+                // Reverse to get oldest-first order
+                events.reverse();
+                Ok(events)
+            }
+            _ => {
+                // Other relationships (NotDescends, Incomparable, etc.) - can't build simple bridge
+                Ok(vec![])
             }
         }
-
-        // Extract accumulated events
-        Ok(comparison.take_accumulated_events().unwrap_or_default())
     }
 
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }

@@ -1,7 +1,9 @@
-use crate::lineage::{self, GetEvents, Retrieve};
+use crate::event_dag::{AccumulatingNavigator, CausalNavigator};
+use crate::retrieval::Retrieve;
 use crate::selection::filter::Filterable;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
+    event_dag::{compute_ancestry, compute_layers, AbstractCausalRelation},
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
@@ -11,7 +13,7 @@ use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -31,14 +33,23 @@ struct EntityInnerState {
 }
 
 impl EntityInnerState {
-    /// Apply operations to a specific backend within this state
-    /// TODO: backends currently rely on interior mutability; refactor to externalize mutability
-    fn apply_operations(&mut self, backend_name: String, operations: &Vec<ankurah_proto::Operation>) -> Result<(), MutationError> {
+    /// Apply operations from an event, tracking which event set each property.
+    ///
+    /// This enables per-property conflict resolution when concurrent events arrive later.
+    /// For CRDT backends (like Yrs), the event_id tracking is a no-op since CRDTs
+    /// handle concurrency internally. For LWW backends, this stores the event_id
+    /// alongside each property value.
+    fn apply_operations_from_event(
+        &mut self,
+        backend_name: String,
+        operations: &[ankurah_proto::Operation],
+        event_id: EventId,
+    ) -> Result<(), MutationError> {
         if let Some(backend) = self.backends.get(&backend_name) {
-            backend.apply_operations(operations)?;
+            backend.apply_operations_with_event(operations, event_id)?;
         } else {
             let backend = backend_from_string(&backend_name, None)?;
-            backend.apply_operations(operations)?;
+            backend.apply_operations_with_event(operations, event_id)?;
             self.backends.insert(backend_name, backend);
         }
         Ok(())
@@ -205,7 +216,7 @@ impl Entity {
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
-    where G: GetEvents<Id = EventId, Event = Event> {
+    where G: CausalNavigator<EID = EventId, Event = Event> + Send + Sync {
         debug!("apply_event head: {event} to {self}");
 
         // Check for entity creation under the mutex to avoid TOCTOU race
@@ -215,7 +226,7 @@ impl Entity {
             if state.head.is_empty() {
                 // this is the creation event for a new entity, so we simply accept it
                 for (backend_name, operations) in event.operations.iter() {
-                    state.apply_operations(backend_name.clone(), operations)?;
+                    state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
                 }
                 state.head = event.id().into();
                 drop(state); // Release lock before broadcast
@@ -229,90 +240,192 @@ impl Entity {
         let mut head = self.head();
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;
-        let budget = 100;
+        // Budget for DAG traversal - should be large enough for typical histories
+        // but bounded to prevent runaway traversal on malicious/corrupted data
+        const COMPARISON_BUDGET: usize = 100;
 
         for attempt in 0..MAX_RETRIES {
-            let new_head: Clock = match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
-                lineage::Ordering::Equal => return Ok(false),
-                lineage::Ordering::Descends => event.id().into(),
-                lineage::Ordering::NotDescends { meet: _ } => {
-                    warn!("NotDescends - HACK - applying (attempt {})", attempt + 1);
-                    head.with_event(event.id())
+            // Use AccumulatingNavigator to collect events during BFS traversal
+            let acc_navigator = AccumulatingNavigator::new(getter);
+            match crate::event_dag::compare_unstored_event(&acc_navigator, event, &head, COMPARISON_BUDGET).await? {
+                AbstractCausalRelation::Equal => {
+                    debug!("Equal - skip");
+                    return Ok(false);
                 }
-                lineage::Ordering::Incomparable => {
-                    return Err(LineageError::Incomparable.into());
+                AbstractCausalRelation::StrictDescends { .. } => {
+                    debug!("Descends - apply (attempt {})", attempt + 1);
+                    let new_head = event.id().into();
+                    // Atomic update: apply operations and set head under single lock
+                    {
+                        let mut state = self.state.write().unwrap();
+                        // Re-check that head hasn't changed since lineage comparison
+                        if state.head != head {
+                            debug!("Head changed during lineage comparison, retrying...");
+                            head = state.head.clone();
+                            continue;
+                        }
+                        for (backend_name, operations) in event.operations.iter() {
+                            state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
+                        }
+                        state.head = new_head;
+                    }
+                    // Notify Signal subscribers about the change
+                    self.broadcast.send(());
+                    return Ok(true);
                 }
-                lineage::Ordering::PartiallyDescends { meet } => {
-                    return Err(LineageError::PartiallyDescends { meet }.into());
+                AbstractCausalRelation::StrictAscends => {
+                    // Incoming event is older than current state - no-op
+                    debug!("StrictAscends - incoming event is older, ignoring");
+                    return Ok(false);
                 }
-                lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                    warn!(
-                        "apply_event budget exhausted after {budget} events. Assuming Descends. subject_frontier: {}, other_frontier: {}",
-                        subject_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", "),
-                        other_frontier.iter().map(|id| id.to_base64_short()).collect::<Vec<String>>().join(", ")
-                    );
-                    event.id().into()
-                }
-            };
+                AbstractCausalRelation::DivergedSince { meet, .. } => {
+                    debug!("DivergedSince - true concurrency, applying via layers (attempt {})", attempt + 1);
 
-            if self.try_mutate(&mut head, move |state| -> Result<(), MutationError> {
-                for (backend_name, operations) in event.operations.iter() {
-                    state.apply_operations(backend_name.clone(), operations)?;
+                    // Get accumulated events from navigator and add incoming event
+                    let mut events = acc_navigator.get_events();
+                    events.insert(event.id(), event.clone());
+
+                    // Compute current head's ancestry for partitioning
+                    let current_ancestry = compute_ancestry(&events, head.as_slice());
+
+                    // Compute layers from meet point
+                    let layers = compute_layers(&events, &meet, &current_ancestry);
+
+                    // Atomic update: apply layers and augment head under single lock
+                    {
+                        let mut state = self.state.write().unwrap();
+                        // Re-check that head hasn't changed since lineage comparison
+                        if state.head != head {
+                            warn!("Head changed during lineage comparison, retrying...");
+                            head = state.head.clone();
+                            continue;
+                        }
+
+                        // Apply layers in causal order
+                        let head_slice = head.as_slice();
+                        for layer in &layers {
+                            // Collect event references for already_applied and to_apply
+                            let already_applied: Vec<&Event> = layer.already_applied.iter().collect();
+                            let to_apply: Vec<&Event> = layer.to_apply.iter().collect();
+
+                            // Apply to all backends
+                            for (_backend_name, backend) in state.backends.iter() {
+                                backend.apply_layer(&already_applied, &to_apply, head_slice)?;
+                            }
+
+                            // Create backends for operations in to_apply events that don't exist yet
+                            for evt in &to_apply {
+                                for (backend_name, _) in evt.operations.iter() {
+                                    if !state.backends.contains_key(backend_name) {
+                                        let backend = backend_from_string(backend_name, None)?;
+                                        backend.apply_layer(&already_applied, &to_apply, head_slice)?;
+                                        state.backends.insert(backend_name.clone(), backend);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Update head: remove superseded tips, add new event
+                        // The incoming event extends tips in its parent clock (meet).
+                        // Any of those that are in the current head are now superseded.
+                        for parent_id in &meet {
+                            state.head.remove(parent_id);
+                        }
+                        state.head.insert(event.id());
+                    }
+                    self.broadcast.send(());
+                    return Ok(true);
                 }
-                state.head = new_head;
-                Ok(())
-            })? {
-                self.broadcast.send(());
-                return Ok(true);
+                AbstractCausalRelation::Disjoint { gca: _, subject_root: _, other_root: _ } => {
+                    return Err(LineageError::Disjoint.into());
+                }
+                AbstractCausalRelation::BudgetExceeded { subject, other } => {
+                    return Err(LineageError::BudgetExceeded {
+                        original_budget: COMPARISON_BUDGET,
+                        subject_frontier: subject,
+                        other_frontier: other,
+                    }
+                    .into());
+                }
             }
-            continue;
         }
 
-        warn!("apply_event retries exhausted while chasing moving head; applying event as Descends");
+        warn!("apply_event retries exhausted while chasing moving head");
         Err(MutationError::TOCTOUAttemptsExhausted)
     }
 
     pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
-    where G: GetEvents<Id = EventId, Event = Event> {
+    where G: CausalNavigator<EID = EventId, Event = Event> + Send + Sync {
         let mut head = self.head();
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
-        let budget = 100;
         const MAX_RETRIES: usize = 5;
+        const COMPARISON_BUDGET: usize = 100;
 
-        for _attempt in 0..MAX_RETRIES {
-            let apply = match crate::lineage::compare(getter, &new_head, &head, budget).await? {
-                lineage::Ordering::Equal => return Ok(false),
-                lineage::Ordering::Descends => true,
-                lineage::Ordering::NotDescends { meet: _ } => return Ok(false),
-                lineage::Ordering::Incomparable => return Err(LineageError::Incomparable.into()),
-                lineage::Ordering::PartiallyDescends { meet } => return Err(LineageError::PartiallyDescends { meet }.into()),
-                lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
-                    warn!(
-                        "{self} apply_state - budget exhausted after {budget} events. Assuming Descends. subject: {subject_frontier:?}, other: {other_frontier:?}"
-                    );
-                    true
+        for attempt in 0..MAX_RETRIES {
+            match crate::event_dag::compare(getter, &new_head, &head, COMPARISON_BUDGET).await? {
+                AbstractCausalRelation::Equal => {
+                    debug!("{self} apply_state - heads are equal, skipping");
+                    return Ok(false);
                 }
-            };
-
-            if apply {
-                if self.try_mutate::<_, MutationError>(&mut head, |es| -> Result<(), MutationError> {
-                    for (name, state_buffer) in state.state_buffers.iter() {
-                        let backend = backend_from_string(name, Some(state_buffer))?;
-                        es.backends.insert(name.to_owned(), backend);
+                AbstractCausalRelation::StrictDescends { .. } => {
+                    debug!("{self} apply_state - new head descends from current, applying (attempt {})", attempt + 1);
+                    // Atomic update: apply state under lock with TOCTOU check
+                    {
+                        let mut es = self.state.write().unwrap();
+                        // Re-check that head hasn't changed since comparison
+                        if es.head != head {
+                            debug!("Head changed during state comparison, retrying...");
+                            head = es.head.clone();
+                            continue;
+                        }
+                        for (name, state_buffer) in state.state_buffers.iter() {
+                            let backend = backend_from_string(name, Some(state_buffer))?;
+                            es.backends.insert(name.to_owned(), backend);
+                        }
+                        es.head = state.head.clone();
                     }
-                    es.head = state.head.clone();
-                    Ok(())
-                })? {
                     self.broadcast.send(());
                     return Ok(true);
                 }
-                continue;
+                AbstractCausalRelation::StrictAscends => {
+                    // State is older than current - no-op
+                    debug!("{self} apply_state - new head {new_head} is older than current {head}, ignoring");
+                    return Ok(false);
+                }
+                AbstractCausalRelation::DivergedSince { meet, .. } => {
+                    // State snapshots cannot be merged without the underlying events.
+                    // The caller should either:
+                    // 1. Request the full event history and use apply_event() for each
+                    // 2. Accept this state via policy if the attestation is trusted
+                    // 3. Reject and resync from a known-good state
+                    //
+                    // Returning Ok(false) signals "not applied, but not an error" so the
+                    // caller can decide how to proceed based on their sync strategy.
+                    warn!(
+                        "{self} apply_state - new head {new_head} diverged from {head}, meet: {meet:?}. \
+                        State not applied; events required for proper merge."
+                    );
+                    return Ok(false);
+                }
+                AbstractCausalRelation::Disjoint { gca: _, subject_root: _, other_root: _ } => {
+                    error!("{self} apply_state - heads are disjoint (different genesis)");
+                    return Err(LineageError::Disjoint.into());
+                }
+                AbstractCausalRelation::BudgetExceeded { subject, other } => {
+                    tracing::warn!("{self} apply_state - budget exceeded. subject: {subject:?}, other: {other:?}");
+                    return Err(LineageError::BudgetExceeded {
+                        original_budget: COMPARISON_BUDGET,
+                        subject_frontier: subject,
+                        other_frontier: other,
+                    }
+                    .into());
+                }
             }
         }
 
-        warn!("{self} apply_state retries exhausted while chasing moving head");
+        warn!("apply_state retries exhausted while chasing moving head");
         Err(MutationError::TOCTOUAttemptsExhausted)
     }
 
@@ -342,14 +455,14 @@ impl Entity {
     pub fn get_backend<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
         let backend_name = P::property_backend_name();
         let mut state = self.state.write().expect("other thread panicked, panic here too");
-        if let Some(backend) = state.backends.get(&backend_name) {
+        if let Some(backend) = state.backends.get(backend_name) {
             let upcasted = backend.clone().as_arc_dyn_any();
             Ok(upcasted.downcast::<P>().unwrap()) // TODO: handle downcast error
         } else {
-            let backend = backend_from_string(&backend_name, None)?;
+            let backend = backend_from_string(backend_name, None)?;
             let upcasted = backend.clone().as_arc_dyn_any();
             let typed_backend = upcasted.downcast::<P>().unwrap(); // TODO handle downcast error
-            state.backends.insert(backend_name, backend);
+            state.backends.insert(backend_name.to_owned(), backend);
             Ok(typed_backend)
         }
     }
@@ -474,7 +587,7 @@ impl WeakEntitySet {
         id: &EntityId,
     ) -> Result<Option<Entity>, RetrievalError>
     where
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
     {
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get(id) {
@@ -499,7 +612,7 @@ impl WeakEntitySet {
         id: &EntityId,
     ) -> Result<Entity, RetrievalError>
     where
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
     {
         match self.get_or_retrieve(retriever, collection_id, id).await? {
             Some(entity) => Ok(entity),
@@ -570,7 +683,7 @@ impl WeakEntitySet {
         state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where
-        R: Retrieve<Id = EventId, Event = Event>,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
     {
         let entity = match self.get(&id) {
             Some(entity) => entity, // already resident

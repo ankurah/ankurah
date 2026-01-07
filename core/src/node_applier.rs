@@ -1,9 +1,10 @@
 use crate::{
     changes::EntityChange,
     error::{ApplyError, ApplyErrorItem, MutationError},
-    lineage::Retrieve,
+    event_dag::CausalNavigator,
     node::Node,
     policy::PolicyAgent,
+    retrieval::{EventStaging, Retrieve},
     storage::StorageEngine,
     util::ready_chunks::ReadyChunks,
 };
@@ -63,7 +64,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
     {
         // TODO: do we actually need predicate_relevance?
         let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _ } = update;
@@ -168,7 +169,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + EventStaging + Send + Sync,
     {
         // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
         // if there are stragglers, they will be picked up on the next wake
@@ -213,7 +214,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + EventStaging + Send + Sync,
     {
         let entity_id = delta.entity_id;
         let collection = delta.collection.clone();
@@ -231,7 +232,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + EventStaging + Send + Sync,
     {
         let collection = node.collections.get(&delta.collection).await?;
 
@@ -258,9 +259,9 @@ impl NodeApplier {
                 // Get or create entity
                 let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
 
-                // HACK - applying events in reverse order to avoid triggering the NotDescends bug
-                // in apply_event where the event is wrongly made concurrent
-                for event in attested_events.into_iter().rev() {
+                // Apply events in forward (causal) order - oldest first
+                // Events in EventBridge are already in causal order from the server
+                for event in attested_events.into_iter() {
                     entity.apply_event(retriever, &event.payload).await?;
                     retriever.mark_event_used(&event.payload.id());
                 }

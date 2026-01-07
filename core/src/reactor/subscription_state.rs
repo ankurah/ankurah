@@ -636,6 +636,35 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         ))
     }
 
+    fn spawn_gap_filling_task(&self, update: ReactorUpdate<E, Ev>, gaps_to_fill: Vec<GapFillData<E>>) {
+        let broadcast = self.state.lock().unwrap().broadcast.clone();
+        let initial_items = update.items;
+
+        crate::task::spawn(async move {
+            let mut all_items = initial_items;
+
+            // Clear gap_dirty flags immediately for all queries
+            for (_, _, _, _, ref resultset, _, _) in &gaps_to_fill {
+                resultset.clear_gap_dirty();
+            }
+
+            // Process all gap fills concurrently
+            let gap_fill_futures =
+                gaps_to_fill.into_iter().map(|(query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size)| {
+                    Self::process_gap_fill(query_id, gap_fetcher, collection_id, selection, resultset, last_entity, gap_size)
+                });
+
+            let gap_results = future::join_all(gap_fill_futures).await;
+
+            // Collect all the new items from gap filling
+            for (_query_id, gap_items) in gap_results {
+                all_items.extend(gap_items);
+            }
+
+            broadcast.send(ReactorUpdate { items: all_items });
+        });
+    }
+
     async fn process_gap_fill(
         query_id: proto::QueryId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
