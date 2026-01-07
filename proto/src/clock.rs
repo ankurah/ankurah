@@ -33,6 +33,17 @@ impl Clock {
         }
     }
 
+    /// Remove an event ID from the clock if present.
+    /// Returns true if the ID was present and removed.
+    pub fn remove(&mut self, id: &EventId) -> bool {
+        if let Ok(index) = self.0.binary_search(id) {
+            self.0.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Creates a clone of the clock with the given event inserted
     pub fn with_event(&self, id: EventId) -> Self {
         let mut n = self.clone();

@@ -88,6 +88,13 @@ impl Transaction {
     #[must_use]
     pub async fn commit(self) -> Result<(), MutationError> { self.dyncontext.commit_local_trx(&self).await }
 
+    /// Commits the transaction and returns the events that were created.
+    /// This is primarily useful for testing DAG structures.
+    #[must_use]
+    pub async fn commit_and_return_events(self) -> Result<Vec<ankurah_proto::Event>, MutationError> {
+        self.dyncontext.commit_local_trx_with_events(&self).await
+    }
+
     pub fn rollback(self) {
         // Mark transaction as no longer alive
         self.alive.store(false, Ordering::Release);
