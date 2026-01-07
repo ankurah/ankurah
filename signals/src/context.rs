@@ -64,31 +64,26 @@ mod stack {
 
     pub fn track<S: Signal>(signal: &S) {
         if let Ok(stack) = OBSERVER_STACK.read() {
-            tracing::info!(
-                "[SIGNAL_DEBUG] multithread stack::track() - stack has {} observers",
-                stack.len()
-            );
+            let stack_len = stack.len();
+            tracing::debug!("[OBSERVER_STACK] track called, stack_len={}", stack_len);
             if let Some(observer) = stack.last() {
-                tracing::info!("[SIGNAL_DEBUG] Found observer, calling observe()");
+                tracing::debug!("[OBSERVER_STACK] track found observer, calling observe()");
                 observer.observe(signal);
             } else {
-                tracing::info!("[SIGNAL_DEBUG] No observer on stack!");
+                tracing::debug!("[OBSERVER_STACK] track - NO observer on stack!");
             }
         } else {
-            tracing::warn!("[SIGNAL_DEBUG] Failed to acquire read lock on observer stack!");
+            tracing::warn!("[OBSERVER_STACK] track - failed to acquire read lock!");
         }
     }
 
     pub fn set<O: Observer + 'static>(observer: O) {
-        tracing::info!(
-            "[SIGNAL_DEBUG] multithread stack::set() called, thread={:?}",
-            std::thread::current().id()
-        );
+        tracing::debug!("[OBSERVER_STACK] set called");
         if let Ok(mut stack) = OBSERVER_STACK.write() {
             stack.push(Arc::new(observer));
-            tracing::info!("[SIGNAL_DEBUG] Observer pushed, stack now has {} observers", stack.len());
+            tracing::debug!("[OBSERVER_STACK] set - pushed observer, stack_len now={}", stack.len());
         } else {
-            tracing::warn!("[SIGNAL_DEBUG] Failed to acquire write lock on observer stack!");
+            tracing::warn!("[OBSERVER_STACK] set - failed to acquire write lock!");
         }
     }
 
@@ -100,14 +95,18 @@ mod stack {
 
     pub fn remove(observer: &dyn Observer) {
         let target_id = observer.observer_id();
+        tracing::debug!("[OBSERVER_STACK] remove called, target_id={}", target_id);
         if let Ok(mut stack) = OBSERVER_STACK.write() {
+            let before_len = stack.len();
             if let Some(last) = stack.last() {
                 if last.observer_id() == target_id {
                     stack.pop();
+                    tracing::debug!("[OBSERVER_STACK] remove - popped matching observer, len {} -> {}", before_len, stack.len());
                     return;
                 }
             }
             stack.retain(|o| o.observer_id() != target_id);
+            tracing::debug!("[OBSERVER_STACK] remove - retained, len {} -> {}", before_len, stack.len());
         }
     }
 
@@ -124,11 +123,6 @@ impl CurrentObserver {
     /// Subscribes the current context to a signal
     pub fn track<S>(signal: &S)
     where S: Signal {
-        tracing::info!(
-            "[SIGNAL_DEBUG] CurrentObserver::track() called, thread={:?}, broadcast_id={:?}",
-            std::thread::current().id(),
-            signal.broadcast_id()
-        );
         stack::track(signal);
     }
 

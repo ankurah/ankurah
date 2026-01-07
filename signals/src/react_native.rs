@@ -110,10 +110,6 @@ impl ReactObserver {
     /// Call this at the start of your component render. Any signals accessed
     /// after this call will be automatically subscribed to.
     pub fn begin_tracking(&self) {
-        tracing::info!(
-            "[SIGNAL_DEBUG] begin_tracking() called, thread={:?}",
-            std::thread::current().id()
-        );
         // Mark all existing listeners for removal (mark phase of mark-and-sweep)
         let mut entries = self.0.entries.write().expect("entries lock poisoned");
         for entry in entries.values_mut() {
@@ -130,10 +126,6 @@ impl ReactObserver {
     /// Call this in a finally block after component rendering completes.
     /// This removes subscriptions to signals that weren't accessed during this render.
     pub fn finish(&self) {
-        tracing::info!(
-            "[SIGNAL_DEBUG] finish() called, thread={:?}",
-            std::thread::current().id()
-        );
         // Sweep away any listeners that weren't preserved during render
         let mut entries = self.0.entries.write().expect("entries lock poisoned");
         entries.retain(|_, entry| !entry.marked_for_removal);
