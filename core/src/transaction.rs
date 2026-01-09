@@ -110,6 +110,14 @@ impl Transaction {
         context.commit_local_trx(self).await
     }
 
+    /// Commits the transaction and returns the events that were created.
+    /// This is primarily useful for testing DAG structures.
+    #[must_use]
+    pub async fn commit_and_return_events(mut self) -> Result<Vec<ankurah_proto::Event>, MutationError> {
+        let context = self.dyncontext.take().expect("Transaction already consumed");
+        context.commit_local_trx_with_events(self).await
+    }
+
     pub fn rollback(self) {
         tracing::info!("trx.rollback");
         // Mark transaction as no longer alive

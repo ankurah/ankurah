@@ -130,7 +130,7 @@ impl PropertyBackend for YrsBackend {
         values
     }
 
-    fn property_backend_name() -> String { "yrs".to_owned() }
+    fn property_backend_name() -> &'static str { "yrs" }
 
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         let txn = self.doc.transact();
@@ -167,12 +167,42 @@ impl PropertyBackend for YrsBackend {
         }
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
+    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError> {
         let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));
         for operation in operations {
             self.apply_update(&operation.diff, &changed_fields)?;
         }
         //Only notify field subscribers for fields that actually changed
+        let field_broadcasts = self.field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
+        for field_name in changed_fields.lock().unwrap().iter() {
+            if let Some(broadcast) = field_broadcasts.get(field_name) {
+                broadcast.send(());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_layer(
+        &self,
+        _already_applied: &[&ankurah_proto::Event], // Ignored - CRDT handles idempotency
+        to_apply: &[&ankurah_proto::Event],
+        _current_head: &[ankurah_proto::EventId], // Ignored - CRDT doesn't need head info
+    ) -> Result<(), MutationError> {
+        // Order within layer doesn't matter for CRDTs - they're commutative.
+        // Just apply all operations from to_apply events.
+        let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        for event in to_apply {
+            // Extract Yrs operations from this event
+            if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
+                for operation in operations {
+                    self.apply_update(&operation.diff, &changed_fields)?;
+                }
+            }
+        }
+
+        // Notify field subscribers for fields that actually changed
         let field_broadcasts = self.field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
         for field_name in changed_fields.lock().unwrap().iter() {
             if let Some(broadcast) = field_broadcasts.get(field_name) {
