@@ -53,6 +53,10 @@ impl<T> Clone for Read<T> {
 
 impl<T: Clone + 'static> Get<T> for Read<T> {
     fn get(&self) -> T {
+        tracing::info!(
+            "[SIGNAL_DEBUG] Read::get() called, broadcast_id={:?}",
+            self.broadcast.id()
+        );
         CurrentObserver::track(self);
         self.value.value()
     }

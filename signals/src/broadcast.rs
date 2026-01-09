@@ -100,6 +100,12 @@ where T: Clone
             listeners.values().cloned().collect::<Vec<_>>()
         };
 
+        tracing::info!(
+            "[SIGNAL_DEBUG] broadcast.send() called, listeners={}, broadcast_id={}",
+            subscribers.len(),
+            self.id()
+        );
+
         // Call all listeners without holding any locks
         // clone the value for each subscriber except the last one
         if let Some((last, rest)) = subscribers.split_last() {

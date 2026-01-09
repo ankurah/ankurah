@@ -143,6 +143,14 @@ impl wasm_bindgen::convert::FromWasmAbi for Json {
     }
 }
 
+// UniFFI custom type - maps Json <-> String (JSON serialized)
+// TypeScript side can use JSON.parse/JSON.stringify via uniffi.toml config
+#[cfg(feature = "uniffi")]
+::uniffi::custom_type!(Json, String, {
+    lower: |obj| serde_json::to_string(&obj.0).expect("Failed to serialize JSON"),
+    try_lift: |val| serde_json::from_str(&val).map(Json).map_err(Into::into),
+});
+
 impl Property for Json {
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::Json(self.0.clone()))) }
 
