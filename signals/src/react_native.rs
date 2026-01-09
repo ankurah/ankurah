@@ -34,7 +34,8 @@ struct Inner {
     /// Version counter for React's useSyncExternalStore snapshot
     version: AtomicUsize,
     /// The callback to trigger React re-renders
-    trigger_render: Mutex<Option<Box<dyn StoreChangeCallback>>>,
+    /// Uses Arc so we can clone it out of the lock before calling (avoids deadlock)
+    trigger_render: Mutex<Option<Arc<dyn StoreChangeCallback>>>,
 }
 
 /// Weak reference to ReactObserver for use in signal listeners
@@ -90,7 +91,7 @@ impl ReactObserver {
     /// This is designed to be used with React's useSyncExternalStore.
     pub fn subscribe(&self, callback: Box<dyn StoreChangeCallback>) {
         let mut trigger = self.0.trigger_render.lock().expect("trigger_render lock poisoned");
-        *trigger = Some(callback);
+        *trigger = Some(Arc::from(callback));
     }
 
     /// Unsubscribe from store changes
@@ -172,11 +173,13 @@ impl Observer for ReactObserver {
                         // Increment version to trigger React re-render
                         observer.0.version.fetch_add(1, Ordering::Relaxed);
 
-                        // Call React's callback if subscribed
-                        if let Ok(trigger) = observer.0.trigger_render.lock() {
-                            if let Some(callback) = trigger.as_ref() {
-                                callback.on_change();
-                            }
+                        // Clone callback out of the lock BEFORE calling to avoid deadlock.
+                        // If we held the lock while calling on_change(), and the JS callback
+                        // triggered subscribe/unsubscribe, we'd deadlock.
+                        let callback = observer.0.trigger_render.lock().ok()
+                            .and_then(|guard| guard.clone());
+                        if let Some(cb) = callback {
+                            cb.on_change();
                         }
                     }
                 })),
