@@ -44,7 +44,7 @@ Your model is defined once in Rust with a derive macro. The same code compiles t
 
 **Collaborative editing built in.** Text fields can use Yjs-backed CRDTs for real-time collaborative editing with automatic conflict resolution.
 
-**One codebase, multiple backends.** Swap between Sled, Postgres, and IndexedDB without changing application code. Your server uses Postgres while browsers use IndexedDB—same queries, same models.
+**One codebase, multiple backends.** Swap between Sled, SQLite, Postgres, and IndexedDB without changing application code. Your server uses Postgres while browsers use IndexedDB—same queries, same models.
 
 ### Who it's for
 
@@ -100,10 +100,15 @@ const AlbumList = signalObserver(({ albums }: Props) =&gt; {
 **Postgres**
 <pre><code transclude="docs/example/server/src/main.rs#storage-postgres">let storage = Postgres::open(uri).await?;</code></pre>
 
+**SQLite**
+```rust
+let storage = SqliteStorageEngine::open("myapp.db").await?;
+```
+
 **IndexedDB**
 <pre><code transclude="docs/example/wasm-bindings/src/lib.rs#storage-indexeddb">let storage = IndexedDBStorageEngine::open(&quot;myapp&quot;).await?;</code></pre>
 
-<sub>TiKV planned</sub>
+<sub>SQLite ideal for mobile (iOS/Android) • TiKV planned</sub>
 
 ### ⚡ Generated Interfaces
 
