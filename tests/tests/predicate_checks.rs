@@ -6,6 +6,7 @@
 #![cfg(feature = "postgres")]
 
 mod common;
+#[cfg(feature = "postgres")]
 mod pg_common;
 
 use ankurah::core::selection::filter::{evaluate_predicate, Filterable};
@@ -138,6 +139,7 @@ async fn test_sled_predicate_checks() -> Result<()> {
 // POSTGRES PREDICATE CHECK
 // =============================================================================
 
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_postgres_predicate_checks() -> Result<()> {
     let cases = all_test_cases();
