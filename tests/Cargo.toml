@@ -7,6 +7,7 @@ publish = false
 [features]
 default  = ["postgres"]
 postgres = ["ankurah-storage-postgres", "tokio-postgres", "bb8", "bb8-postgres"]
+sqlite   = ["ankurah-storage-sqlite"]
 
 [dependencies]
 anyhow                          = "1.0"
@@ -18,6 +19,7 @@ ankurah-connector-local-process = { path = "../connectors/local-process", versio
 ankurah-websocket-client        = { path = "../connectors/websocket-client", version = "=0.7.13" }
 ankurah-websocket-server        = { path = "../connectors/websocket-server", version = "=0.7.13" }
 ankurah-storage-common          = { path = "../storage/common", version = "=0.7.13" }
+ankurah-storage-sqlite          = { path = "../storage/sqlite", optional = true, version = "=0.7.13" }
 tokio-postgres                  = { version = "0.7", optional = true }
 ankurah-storage-postgres        = { path = "../storage/postgres", optional = true, version = "=0.7.13" }
 bb8                             = { version = "0.9", optional = true }
