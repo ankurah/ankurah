@@ -43,8 +43,13 @@ jobs:
         with:
           key: docker-${{ runner.os }}
 
-      - name: Run regular tests
+      - name: Run tests (all features)
         run: cargo test --all-features
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run tests (uniffi only)
+        run: cargo test --features uniffi
         env:
           RUST_BACKTRACE: 1
 

@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-connector-local-process"
-version       = "0.7.14"
+version       = "0.7.15"
 edition       = "2021"
 description   = "Ankurah connector for local processes"
 license       = "MIT OR Apache-2.0"
@@ -9,8 +9,8 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [dependencies]
-ankurah-core  = { path = "../../core", version = "=0.7.14" }
-ankurah-proto = { path = "../../proto", version = "=0.7.14" }
+ankurah-core  = { path = "../../core", version = "=0.7.15" }
+ankurah-proto = { path = "../../proto", version = "=0.7.15" }
 
 tokio       = { version = "1.40", features = ["full"] }
 async-trait = "0.1"

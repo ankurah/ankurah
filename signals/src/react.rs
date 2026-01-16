@@ -6,7 +6,6 @@
 use send_wrapper::SendWrapper;
 use wasm_bindgen::prelude::*;
 
-use std::cell::OnceCell;
 use std::collections::HashMap;
 #[cfg(debug_assertions)]
 use std::sync::OnceLock;
@@ -46,11 +45,13 @@ pub struct Inner {
     #[cfg(debug_assertions)]
     name: OnceLock<Option<String>>,
     entries: std::sync::RwLock<HashMap<BroadcastId, ListenerEntry>>,
-    /// This function gets called when a change is observed
-    trigger_render: Arc<SendWrapper<OnceCell<js_sys::Function>>>,
+    /// This function gets called when a change is observed.
+    /// Using Mutex<Option<...>> to support subscribe/unsubscribe pattern.
+    trigger_render: Arc<std::sync::Mutex<Option<SendWrapper<js_sys::Function>>>>,
 
     /// This function gets called by react on the initial render with the notify_fn as an argument
     /// we have to store it to prevent it from being dropped.
+    /// Only used by the legacy useObserve() hook.
     subscribe_fn: SendWrapper<Closure<dyn Fn(js_sys::Function) -> JsValue>>,
     /// get_snapshot is called by react for every render to get the "snapshot" - which in our case is just the version number
     /// it's a goofy way to get react to re-render the component. We're using this instead of the typical
@@ -58,6 +59,7 @@ pub struct Inner {
     /// I haven't yet analyzed the react dispatch cycle internals sufficiently well to know the difference, but
     /// the preact folks probably didn't choose useSyncExternalStore by throwing a dart at the dartboard,
     /// so I'm inclined to start there.
+    /// Only used by the legacy useObserve() hook.
     get_snapshot: SendWrapper<Closure<dyn Fn() -> JsValue>>,
     version: Arc<AtomicUsize>,
 }
@@ -71,20 +73,22 @@ impl ReactObserver {
         // Version counter for React's useSyncExternalStore
         let version = Arc::new(AtomicUsize::new(0));
 
-        // Storage for React's on_store_change callback - wrap in Arc immediately
-        let trigger_render = Arc::new(SendWrapper::new(OnceCell::new()));
+        // Storage for React's on_store_change callback
+        let trigger_render = Arc::new(std::sync::Mutex::new(None));
 
-        // Create subscription function for useSyncExternalStore
+        // Create subscription function for useSyncExternalStore (legacy useObserve hook)
         let subscribe_fn = {
             let trigger_render = trigger_render.clone();
             Closure::wrap(Box::new(move |callback: js_sys::Function| {
                 // Store the callback for later use when signals change
-                let _ = trigger_render.set(callback);
+                if let Ok(mut guard) = trigger_render.lock() {
+                    *guard = Some(SendWrapper::new(callback));
+                }
                 JsValue::UNDEFINED
             }) as Box<dyn Fn(js_sys::Function) -> JsValue>)
         };
 
-        // Create snapshot function for useSyncExternalStore
+        // Create snapshot function for useSyncExternalStore (legacy useObserve hook)
         let get_snapshot = {
             let version = version.clone();
             Closure::wrap(Box::new(move || JsValue::from(version.load(Ordering::Relaxed))) as Box<dyn Fn() -> JsValue>)
@@ -148,9 +152,28 @@ impl ReactObserver {
     }
 }
 
-#[allow(unused)]
 #[wasm_bindgen]
 impl ReactObserver {
+    /// Create a new ReactObserver
+    ///
+    /// This constructor is exported for use with @ankurah/react-hooks.
+    /// The hooks package manages React integration (useRef, useSyncExternalStore)
+    /// in JavaScript, and just needs the Rust observer for signal tracking.
+    #[wasm_bindgen(constructor)]
+    pub fn js_new() -> Self { Self::new() }
+
+    /// Begin tracking signal accesses for this render
+    ///
+    /// Call this at the start of your component render. Any signals accessed
+    /// after this call will be automatically subscribed to.
+    #[wasm_bindgen(js_name = beginTracking)]
+    pub fn begin_tracking(&self) {
+        // Mark all existing listeners for removal (mark phase of mark-and-sweep)
+        self.mark_all_for_removal();
+        // Set as current observer context
+        CurrentObserver::set(self.clone());
+    }
+
     /// Finish using this observer and restore the previous context
     /// This should be called in a finally block after component rendering
     #[wasm_bindgen]
@@ -160,10 +183,42 @@ impl ReactObserver {
         CurrentObserver::remove(self as &dyn Observer);
     }
 
-    /// Get the number of signals currently being observed by this observer (debug builds only)
-    #[cfg(debug_assertions)]
-    #[wasm_bindgen(js_name = signalCount, getter)]
-    pub fn js_signal_count(&self) -> usize { self.signal_count() }
+    /// Subscribe to store changes
+    ///
+    /// The callback object should have an `onChange()` method that will be called
+    /// whenever any observed signal changes. Used with React's useSyncExternalStore.
+    #[wasm_bindgen]
+    pub fn subscribe(&self, callback: JsValue) {
+        // Extract onChange function from callback object
+        if let Ok(on_change) = js_sys::Reflect::get(&callback, &JsValue::from_str("onChange")) {
+            if let Some(func) = on_change.dyn_ref::<js_sys::Function>() {
+                if let Ok(mut guard) = self.0.trigger_render.lock() {
+                    *guard = Some(SendWrapper::new(func.clone()));
+                }
+            }
+        }
+    }
+
+    /// Unsubscribe from store changes
+    #[wasm_bindgen]
+    pub fn unsubscribe(&self) {
+        if let Ok(mut guard) = self.0.trigger_render.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Get the current snapshot version
+    ///
+    /// Returns a monotonically increasing number that changes whenever
+    /// any observed signal changes. Used by React's useSyncExternalStore.
+    #[wasm_bindgen(js_name = getSnapshot)]
+    pub fn get_snapshot(&self) -> js_sys::BigInt { js_sys::BigInt::from(self.0.version.load(Ordering::Relaxed) as u64) }
+
+    /// Get the number of signals currently being observed by this observer
+    #[wasm_bindgen(js_name = signalCount)]
+    pub fn js_signal_count(&self) -> usize {
+        self.0.entries.read().expect("entries lock is poisoned").values().filter(|e| !e.marked_for_removal).count()
+    }
 
     /// Get the observer name (debug builds only)
     #[cfg(debug_assertions)]
@@ -296,8 +351,10 @@ impl Observer for ReactObserver {
                         observer.0.version.fetch_add(1, Ordering::Relaxed);
 
                         // Call React's callback if it's been set
-                        if let Some(callback) = observer.0.trigger_render.get() {
-                            let _ = callback.call0(&JsValue::NULL);
+                        if let Ok(guard) = observer.0.trigger_render.lock() {
+                            if let Some(callback) = guard.as_ref() {
+                                let _ = callback.call0(&JsValue::NULL);
+                            }
                         }
                     }
                 })),

@@ -59,6 +59,13 @@ pub mod reactive_graph;
 #[cfg(feature = "react")]
 pub mod react;
 
+#[cfg(feature = "react-native")]
+pub mod react_native;
+
+// UniFFI scaffolding for react-native feature
+#[cfg(feature = "react-native")]
+uniffi::setup_scaffolding!();
+
 #[cfg(feature = "jsvalue")]
 pub mod jsvalue;
 
@@ -73,6 +80,9 @@ pub use reactive_graph::*;
 
 #[cfg(feature = "react")]
 pub use react::*;
+
+#[cfg(feature = "react-native")]
+pub use react_native::*;
 
 #[cfg(feature = "jsvalue")]
 pub use jsvalue::*;

@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah"
-version       = "0.7.14"
+version       = "0.7.15"
 edition       = "2021"
 description   = "Observable, event-driven state management for native and web"
 license       = "MIT OR Apache-2.0"
@@ -22,16 +22,25 @@ wasm = [
     "ankql/wasm",
     "dep:send_wrapper",
 ]
+uniffi = [
+    "derive",
+    "ankurah-derive?/uniffi",
+    "ankurah-core/uniffi",
+    "ankurah-proto/uniffi",
+    "ankurah-signals/uniffi",
+    "dep:uniffi",
+]
 react = ["wasm", "ankurah-signals/react"]
+react-native = ["uniffi", "ankurah-signals/react-native"]
 derive = ["dep:ankurah-derive"]
 instrument = ["ankurah-core/instrument"]
 
 [dependencies]
-ankurah-core    = { path = "../core", version = "=0.7.14" }
-ankurah-proto   = { path = "../proto", version = "=0.7.14" }
-ankurah-derive  = { path = "../derive", version = "=0.7.14", optional = true }
-ankurah-signals = { path = "../signals", version = "=0.7.14" }
-ankql           = { path = "../ankql", version = "=0.7.14" }
+ankurah-core    = { path = "../core", version = "=0.7.15" }
+ankurah-proto   = { path = "../proto", version = "=0.7.15" }
+ankurah-derive  = { path = "../derive", version = "=0.7.15", optional = true }
+ankurah-signals = { path = "../signals", version = "=0.7.15" }
+ankql           = { path = "../ankql", version = "=0.7.15" }
 serde_json      = { version = "1.0" }
 serde           = { version = "1.0" }
 tracing         = { version = "0.1.40" }
@@ -40,6 +49,7 @@ wasm-bindgen         = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys               = { version = "0.3", optional = true }
 send_wrapper         = { version = "0.6", optional = true }
+uniffi               = { version = "0.29", optional = true }
 
 [dev-dependencies]
 ankurah-storage-sled            = { path = "../storage/sled" }

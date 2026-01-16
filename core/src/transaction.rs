@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ankurah_proto::Event;
 use ankurah_proto::{self as proto, EntityId};
 
 use crate::error::RetrievalError;
@@ -22,10 +21,11 @@ use wasm_bindgen::prelude::*;
 // A. When we start to care about differentiating possible recipients for different properties.
 
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Transaction {
-    pub(crate) dyncontext: Option<Arc<dyn TContext + Send + Sync + 'static>>,
-    id: proto::TransactionId,
-    entities: AppendOnlyVec<Entity>,
+    pub(crate) dyncontext: Arc<dyn TContext + Send + Sync + 'static>,
+    pub(crate) id: proto::TransactionId,
+    pub(crate) entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
 }
 
@@ -33,21 +33,15 @@ pub struct Transaction {
 #[wasm_bindgen]
 impl Transaction {
     #[wasm_bindgen(js_name = "commit")]
-    pub async fn js_commit(mut self) -> Result<(), JsValue> {
-        let context = self.dyncontext.take().expect("Transaction already consumed");
-        context.commit_local_trx(self).await?;
+    pub async fn js_commit(self) -> Result<(), JsValue> {
+        self.dyncontext.commit_local_trx(&self).await?;
         Ok(())
     }
 }
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
-        Self {
-            dyncontext: Some(dyncontext),
-            id: proto::TransactionId::new(),
-            entities: AppendOnlyVec::new(),
-            alive: Arc::new(AtomicBool::new(true)),
-        }
+        Self { dyncontext, id: proto::TransactionId::new(), entities: AppendOnlyVec::new(), alive: Arc::new(AtomicBool::new(true)) }
     }
 
     pub(crate) fn add_entity(&self, entity: Entity) -> &Entity {
@@ -55,22 +49,10 @@ impl Transaction {
         &self.entities[index]
     }
 
-    /// Consumes the transaction and returns the transaction id and a list of entities and events to be committed
-    pub(crate) fn into_parts(self) -> Result<(proto::TransactionId, Vec<(Entity, Event)>), MutationError> {
-        let mut events = Vec::new();
-        for entity in self.entities.iter() {
-            if let Some(event) = entity.generate_commit_event()? {
-                events.push((entity.clone(), event));
-            }
-        }
-        Ok((self.id.clone(), events))
-    }
-
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
-        let context = self.dyncontext.as_ref().expect("Transaction already consumed");
-        let entity = context.create_entity(M::collection(), self.alive.clone());
+        let entity = self.dyncontext.create_entity(M::collection(), self.alive.clone());
         model.initialize_new_entity(&entity);
-        context.check_write(&entity)?;
+        self.dyncontext.check_write(&entity)?;
 
         let entity_ref = self.add_entity(entity);
         Ok(MutableBorrow::new(entity_ref))
@@ -81,8 +63,7 @@ impl Transaction {
             Some(entity) => Ok(MutableBorrow::new(entity)),
             None => {
                 // go fetch the entity from the context
-                let retrieved_entity =
-                    self.dyncontext.as_ref().expect("Transaction already consumed").get_entity(*id, &M::collection(), false).await?;
+                let retrieved_entity = self.dyncontext.get_entity(*id, &M::collection(), false).await?;
                 // double check to make sure somebody didn't add the entity to the trx during the await
                 // because we're forking the entity, we need to make sure we aren't adding the same entity twice
                 if let Some(entity) = self.get_trx_entity(&retrieved_entity.id) {
@@ -99,19 +80,15 @@ impl Transaction {
         if let Some(entity) = self.get_trx_entity(&entity.id) {
             return Ok(MutableBorrow::new(entity));
         }
-        self.dyncontext.as_ref().expect("Transaction already consumed").check_write(entity)?;
+        self.dyncontext.check_write(entity)?;
 
         Ok(MutableBorrow::new(self.add_entity(entity.snapshot(self.alive.clone()))))
     }
 
     #[must_use]
-    pub async fn commit(mut self) -> Result<(), MutationError> {
-        let context = self.dyncontext.take().expect("Transaction already consumed");
-        context.commit_local_trx(self).await
-    }
+    pub async fn commit(self) -> Result<(), MutationError> { self.dyncontext.commit_local_trx(&self).await }
 
     pub fn rollback(self) {
-        tracing::info!("trx.rollback");
         // Mark transaction as no longer alive
         self.alive.store(false, Ordering::Release);
         // The transaction will be dropped without committing
@@ -139,4 +116,17 @@ impl Drop for Transaction {
         self.alive.store(false, Ordering::Release);
         // how do we want to do the rollback?
     }
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl Transaction {
+    /// Commit the transaction (UniFFI version - uses Arc<Self>)
+    /// Simply borrows self and calls commit_local_trx - the alive flag prevents double commits
+    #[uniffi::method(name = "commit")]
+    pub async fn uniffi_commit(self: Arc<Self>) -> Result<(), MutationError> { self.dyncontext.commit_local_trx(&self).await }
+
+    /// Rollback the transaction (UniFFI version)
+    #[uniffi::method(name = "rollback")]
+    pub fn uniffi_rollback(&self) { self.alive.store(false, Ordering::Release); }
 }

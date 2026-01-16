@@ -6,10 +6,11 @@ use ulid::Ulid;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::error::DecodeError;
+use crate::error::{DecodeError, IdParseError};
 // TODO - split out the different id types. Presently there's a lot of not-entities that are using this type for their ID
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct EntityId(pub(crate) Ulid);
 
 impl EntityId {
@@ -38,22 +39,39 @@ impl EntityId {
     pub fn from_ulid(ulid: Ulid) -> Self { EntityId(ulid) }
 }
 
+// Methods exported to both WASM and UniFFI
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl EntityId {
     #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = toString))]
     pub fn to_string(&self) -> String { self.to_base64() }
+}
 
-    #[cfg(feature = "wasm")]
+// WASM-only methods
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl EntityId {
     #[wasm_bindgen(js_name = to_base64)]
     pub fn to_base64_js(&self) -> String { general_purpose::URL_SAFE_NO_PAD.encode(self.0.to_bytes()) }
 
-    #[cfg(feature = "wasm")]
     #[wasm_bindgen(js_name = from_base64)]
     pub fn from_base64_js(s: &str) -> Result<Self, JsValue> { Self::from_base64(s).map_err(|e| JsValue::from_str(&e.to_string())) }
 
-    #[cfg(feature = "wasm")]
     #[wasm_bindgen]
     pub fn equals(&self, other: &EntityId) -> bool { self.0 == other.0 }
+}
+
+// UniFFI-only methods
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl EntityId {
+    /// Parse an EntityId from a base64 string
+    #[uniffi::constructor(name = "fromBase64")]
+    pub fn from_base64_uniffi(s: String) -> Result<Self, IdParseError> { Self::from_base64(s).map_err(|e| e.into()) }
+
+    /// Compare two EntityIds for equality
+    #[uniffi::method(name = "equals")]
+    pub fn equals_uniffi(&self, other: &EntityId) -> bool { self.0 == other.0 }
 }
 
 impl fmt::Display for EntityId {

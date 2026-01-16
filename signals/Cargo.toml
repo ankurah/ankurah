@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-signals"
-version       = "0.7.14"
+version       = "0.7.15"
 edition       = "2024"
 description   = "Ankurah Signals"
 license       = "MIT OR Apache-2.0"
@@ -9,12 +9,20 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-default        = ["tokio", "reactive-graph"]
+default        = ["tokio", "reactive-graph", "singlethread"]
 tokio          = ["dep:tokio"]
 wasm           = ["dep:wasm-bindgen", "dep:js-sys", "dep:wasm-bindgen-futures"]
 react          = ["wasm", "dep:send_wrapper"]
 jsvalue        = ["wasm", "dep:send_wrapper"]
 reactive-graph = ["dep:reactive_graph"]
+uniffi         = ["dep:uniffi"]
+react-native   = ["uniffi", "multithread"]
+# Thread-local observer stack (default) - for single-threaded environments like WASM
+# Takes precedence over multithread when both are enabled (allows --all-features to work)
+singlethread = []
+# Global observer stack - for cross-thread environments like React Native
+# Only active when singlethread is NOT enabled
+multithread = []
 
 [dependencies]
 tokio          = { version = "1.40", features = ["sync"], optional = true }
@@ -26,6 +34,9 @@ wasm-bindgen         = { version = "0.2", optional = true }
 js-sys               = { version = "0.3", optional = true }
 send_wrapper         = { version = "0.6", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+
+# UniFFI and React Native integration (optional)
+uniffi = { version = "0.29", optional = true, features = ["tokio"] }
 
 [dev-dependencies]
 tokio              = { version = "1.40", features = ["sync", "macros", "rt", "time"] }

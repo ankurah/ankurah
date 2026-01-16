@@ -211,7 +211,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         crate::task::spawn(async move {
             if let Some(node) = me.inner.node.get() {
                 // Get the livequery for error handling
-                let livequery = { me.inner.subscriptions.lock().unwrap().get(&query_id).map(|state| state.livequery.clone()) };
+                let livequery = {
+                    me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone())
+                };
 
                 // Send the updated predicate to the peer
                 match node.remote_subscribe(peer_id, query_id, collection_id, selection, &context_data, version).await {
@@ -222,7 +224,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                         }
 
                         // Mark as established - subscription succeeded even if livequery activation had issues
-                        let mut subscriptions = me.inner.subscriptions.lock().unwrap();
+                        let mut subscriptions = me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(info) = subscriptions.get_mut(&query_id) {
                             info.status = Status::Established(peer_id, version);
                         }
@@ -246,7 +248,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         // If subscription was established with a peer, send unsubscribe request
         {
-            let mut subscriptions = self.inner.subscriptions.lock().unwrap();
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = subscriptions.remove(&query_id) {
                 if let Status::Established(peer_id, _version) = &info.status {
                     let node = self.inner.node.get();
@@ -307,14 +309,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
     /// Get the current state of a predicate registration
     pub fn get_status(&self, query_id: proto::QueryId) -> Option<Status> {
-        let subscriptions = self.inner.subscriptions.lock().unwrap();
+        let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
         subscriptions.get(&query_id).map(|info| info.status.clone())
     }
 
     /// Get all unique contexts for predicates established or requested with a specific peer
     /// TODO: update the data structure to do this via a direct lookup rather than having to scan the entire map
     pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {
-        let subscriptions = self.inner.subscriptions.lock().unwrap();
+        let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
         let mut contexts = std::collections::HashSet::new();
 
         for (_, state) in subscriptions.iter() {
@@ -386,7 +388,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let version = content.version;
 
         // Get the livequery for error handling
-        let livequery = { self.inner.subscriptions.lock().unwrap().get(&query_id).map(|state| state.livequery.clone()) };
+        let livequery =
+            { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
         // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
         match node.remote_subscribe(target_peer, query_id, content.collection_id.clone(), predicate, &context_data, version).await {
@@ -398,7 +401,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 }
 
                 // Mark as established - subscription succeeded even if livequery activation had issues
-                let mut subscriptions = self.inner.subscriptions.lock().unwrap();
+                let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(info) = subscriptions.get_mut(&query_id) {
                     info.status = Status::Established(target_peer, version);
                 }
@@ -452,7 +455,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         };
 
         // Update state based on retriability
-        let mut subscriptions = self.inner.subscriptions.lock().unwrap();
+        let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(info) = subscriptions.get_mut(&query_id) {
             if is_retryable {
                 // Retryable errors go back to pending for retry by background task
@@ -836,7 +839,7 @@ mod tests {
 
         // Manually set different failure types - retryable goes back to pending, non-retryable stays failed
         {
-            let mut subscriptions = relay.inner.subscriptions.lock().unwrap();
+            let mut subscriptions = relay.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = subscriptions.get_mut(&retryable_query_id) {
                 info.status = Status::PendingRemote; // Retryable errors go back to pending
             }

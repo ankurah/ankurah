@@ -9,6 +9,58 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{DeriveInput, Ident};
 
+use super::ViewAttributes;
+
+/// Generate WASM-specific attributes for Mutable struct.
+/// Returns (struct_attributes, field_attributes)
+pub fn mutable_attributes() -> (TokenStream, TokenStream) { (quote! { #[wasm_bindgen] }, quote! { #[wasm_bindgen(skip)] }) }
+
+/// Generate WASM-specific attributes for View struct.
+pub fn view_attributes(view_name: &Ident, mutable_name: &Ident, model_name: &Ident) -> ViewAttributes {
+    let subscribe_ts = format!(
+        r#"export interface {view_name} {{
+    subscribe(callback: () => void): SubscriptionGuard;
+}}"#
+    );
+
+    ViewAttributes {
+        struct_attr: quote! { #[wasm_bindgen] },
+        impl_attr: quote! { #[wasm_bindgen] },
+        id_method_attr: quote! { #[wasm_bindgen(getter)] },
+        extra_impl: quote! {
+            #[wasm_bindgen(typescript_custom_section)]
+            const TS_VIEW_SUBSCRIBE: &'static str = #subscribe_ts;
+
+            #[wasm_bindgen]
+            impl #view_name {
+                /// Edit this entity in a transaction (WASM version - returns owned Mutable)
+                #[wasm_bindgen(js_name = "edit")]
+                pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
+                    use ::ankurah::model::View;
+                    match trx.edit::<#model_name>(&self.entity) {
+                        Ok(mutable_borrow) => {
+                            // Extract the core mutable from the borrow wrapper
+                            Ok(mutable_borrow.into_core())
+                        }
+                        Err(e) => Err(::wasm_bindgen::JsValue::from(e.to_string()))
+                    }
+                }
+
+                #[wasm_bindgen(skip_typescript, js_name = "subscribe")]
+                pub fn subscribe_wasm(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
+
+                    let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
+                    ::ankurah::core::model::view_subscribe_no_clone(self, move |_| {
+                        let _ = callback.call0(
+                            &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
+                        );
+                    })
+                }
+            }
+        },
+    }
+}
+
 /// Main WASM implementation generator for a Model.
 pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::ModelDescription) -> TokenStream {
     // Generate the namespace struct name (NSEntry for Entry)
@@ -36,20 +88,20 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
         // Uses short wasm_bindgen path from module-level import in lib.rs
         #ref_wrapper
 
+        // Generate ResultSet wrapper (at module level for re-export)
+        #resultset_wrapper
+
+        // Generate ChangeSet wrapper (at module level for re-export)
+        #changeset_wrapper
+
+        // Generate LiveQuery wrapper (at module level for re-export)
+        #livequery_wrapper
+
         const _: () = {
             use ::ankurah::derive_deps::{tracing::error,wasm_bindgen::prelude::*, wasm_bindgen_futures};
 
             // Generate namespace struct with static methods
             #namespace_class
-
-            // Generate ResultSet wrapper
-            #resultset_wrapper
-
-            // Generate ChangeSet wrapper
-            #changeset_wrapper
-
-            // Generate LiveQuery wrapper
-            #livequery_wrapper
         };
     }
 }
