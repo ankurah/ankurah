@@ -180,12 +180,48 @@ fn idb_key_tuple(parts: &[Value]) -> Result<JsValue> {
 
 /// Convert Plan bounds to IndexedDB IdbKeyRange using the new IR pipeline
 /// Returns (IdbKeyRange, upper_open_ended_flag, eq_prefix_len, eq_prefix_values)
-pub fn plan_bounds_to_idb_range(bounds: &KeyBounds) -> Result<(web_sys::IdbKeyRange, bool, usize, Vec<Value>)> {
+///
+/// The `scan_direction` parameter is critical for handling DESC ordering correctly:
+/// - For Reverse (DESC) scans with open-ended lower bounds (e.g., timestamp >= X),
+///   we must cap the upper bound at the equality prefix boundary to prevent the
+///   cursor from starting outside the intended key range.
+pub fn plan_bounds_to_idb_range(
+    bounds: &KeyBounds,
+    scan_direction: &ScanDirection,
+) -> Result<(web_sys::IdbKeyRange, bool, usize, Vec<Value>)> {
     // Step 1: Normalize IR to CanonicalRange
     let (canonical_range, eq_prefix_len, eq_prefix_values) = normalize(bounds);
 
-    // Step 2: Convert CanonicalRange to IdbKeyRange
-    let (idb_range, upper_open_ended) = to_idb_keyrange(&canonical_range)?;
+    // Step 2: For Reverse scans with open-ended upper bound and equality prefix,
+    // we need to cap the range to stay within the equality prefix.
+    // Otherwise, the Prev cursor will start at the max key in the entire index
+    // (potentially in a different equality group) and the prefix guard will
+    // immediately terminate the scan.
+    let adjusted_range = if *scan_direction == ScanDirection::Reverse
+        && canonical_range.upper.is_none()
+        && eq_prefix_len > 0
+        && canonical_range.lower.is_some()
+    {
+        // Create upper bound by bumping the last equality prefix value
+        if let Some(last_eq_value) = eq_prefix_values.last() {
+            if let Some((next_value, is_open)) = next_upper_bound(last_eq_value) {
+                let mut upper_tuple = eq_prefix_values[..eq_prefix_len].to_vec();
+                if let Some(slot) = upper_tuple.last_mut() {
+                    *slot = next_value;
+                }
+                CanonicalRange { lower: canonical_range.lower.clone(), upper: Some((upper_tuple, is_open)) }
+            } else {
+                canonical_range
+            }
+        } else {
+            canonical_range
+        }
+    } else {
+        canonical_range
+    };
+
+    // Step 3: Convert CanonicalRange to IdbKeyRange
+    let (idb_range, upper_open_ended) = to_idb_keyrange(&adjusted_range)?;
 
     Ok((idb_range, upper_open_ended, eq_prefix_len, eq_prefix_values))
 }
@@ -311,7 +347,7 @@ mod tests {
     use ankql::ast::Predicate;
     use ankurah_core::indexing::{IndexKeyPart, KeySpec};
     use ankurah_core::value::ValueType;
-    use ankurah_storage_common::{KeyBoundComponent, Plan};
+    use ankurah_storage_common::{KeyBoundComponent, OrderByComponents, Plan};
 
     #[test]
     fn test_plan_index_spec_name() {
@@ -324,7 +360,7 @@ mod tests {
             scan_direction: ScanDirection::Forward,
             bounds: KeyBounds::new(vec![]), // Empty bounds for this test
             remaining_predicate: Predicate::True,
-            order_by_spill: vec![],
+            order_by_spill: OrderByComponents::default(),
         };
 
         if let Plan::Index { index_spec, .. } = plan {
@@ -408,7 +444,7 @@ mod tests {
             high: Endpoint::incl(Value::String("album".to_string())),
         }]);
 
-        let result = plan_bounds_to_idb_range(&bounds);
+        let result = plan_bounds_to_idb_range(&bounds, &ScanDirection::Forward);
         assert!(result.is_ok());
 
         let (_idb_range, upper_open_ended, eq_prefix_len, eq_prefix_values) = result.unwrap();

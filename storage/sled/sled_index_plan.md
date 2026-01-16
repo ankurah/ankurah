@@ -34,7 +34,7 @@
 - `collection_{collection}` (per-collection materialized values)
   - key: `EntityId.to_bytes()`
   - val: `Vec<(SledPropertyId, PropertyValue)>` (bincode)
-  - Sled exposes `MatRow { id: EntityId, mat: MatEntity }` per-row for filtering/sorting; `MatEntity` implements `Filterable` (to be renamed `GetPropertyValue`)
+  - Sled exposes `ProjectedEntity { id, collection, map }` per-row for filtering/sorting; implements `Filterable` and `HasEntityId`
 - `index_{index_id}` (per-index tree; bound to one collection via metadata)
 
   - key: composite tuple bytes (per `IndexSpec`) `|| 0x00 || entity_id_bytes`

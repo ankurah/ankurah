@@ -4,6 +4,7 @@ mod engine;
 pub(crate) mod error;
 pub mod idb_value;
 mod planner_integration;
+mod scanner;
 mod statics;
 mod util;
 

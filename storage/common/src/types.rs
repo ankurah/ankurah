@@ -14,21 +14,53 @@ use ankurah_core::indexing::KeySpec;
 // IndexedDB: upper=None ⇒ IDBKeyRange.lowerBound(lower, open) + stop on prefix change; finite-finite ⇒ IDBKeyRange.bound(...); empty ⇒ no scan.
 // This gives you PG-style, per-column correctness in the IR and a clean, safe path to concrete engine ranges.
 
+// --- ORDER BY Components (partition-aware sorting) ----------------------------------------
+
+/// Describes how ORDER BY should be handled by the execution engine.
+///
+/// When an index can only partially satisfy ORDER BY (e.g., mixed directions on IndexedDB),
+/// results arrive pre-sorted by `presort` columns but need in-memory sorting by `spill` columns
+/// within each partition (group of rows with identical `presort` values).
+///
+/// See specs/pushdown/order_by.md for detailed documentation.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderByComponents {
+    /// ORDER BY columns satisfied by the index scan direction.
+    /// These define "partition boundaries" - when these values change,
+    /// we're in a new partition that needs independent sorting.
+    /// Empty if the entire ORDER BY must be spilled (global sort).
+    pub presort: Vec<ankql::ast::OrderByItem>,
+
+    /// ORDER BY columns requiring in-memory sort.
+    /// Empty if the index fully satisfies the ORDER BY.
+    pub spill: Vec<ankql::ast::OrderByItem>,
+}
+
+impl OrderByComponents {
+    pub fn new(presort: Vec<ankql::ast::OrderByItem>, spill: Vec<ankql::ast::OrderByItem>) -> Self { Self { presort, spill } }
+
+    /// Returns true if no sorting is needed (index satisfies entire ORDER BY)
+    pub fn is_satisfied(&self) -> bool { self.spill.is_empty() }
+
+    /// Returns true if the entire ORDER BY must be spilled (global sort)
+    pub fn is_global_spill(&self) -> bool { self.presort.is_empty() && !self.spill.is_empty() }
+}
+
 // --- Plan (similar to PG IndexScan/IndexOnlyScan inputs) --------------------------------
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
     Index {
-        index_spec: KeySpec,                          // key order (ASC/DESC per part)
-        scan_direction: ScanDirection,                // engine scan direction
-        bounds: KeyBounds,                            // per-column bounds (planner IR)
-        remaining_predicate: ankql::ast::Predicate,   // residual quals
-        order_by_spill: Vec<ankql::ast::OrderByItem>, // extra sort keys
+        index_spec: KeySpec,                        // key order (ASC/DESC per part)
+        scan_direction: ScanDirection,              // engine scan direction
+        bounds: KeyBounds,                          // per-column bounds (planner IR)
+        remaining_predicate: ankql::ast::Predicate, // residual quals
+        order_by_spill: OrderByComponents,          // spill sorting needed (presort for partitions, spill for sort)
     },
     TableScan {
-        bounds: KeyBounds,                            // primary key bounds (empty if no constraints).
-        scan_direction: ScanDirection,                // forward/reverse based on primary key ORDER BY
-        remaining_predicate: ankql::ast::Predicate,   // all predicates (no index to satisfy any)
-        order_by_spill: Vec<ankql::ast::OrderByItem>, // ORDER BY fields not satisfied by scan direction
+        bounds: KeyBounds,                          // primary key bounds (empty if no constraints).
+        scan_direction: ScanDirection,              // forward/reverse based on primary key ORDER BY
+        remaining_predicate: ankql::ast::Predicate, // all predicates (no index to satisfy any)
+        order_by_spill: OrderByComponents,          // spill sorting needed (presort for partitions, spill for sort)
     },
     EmptyScan, // "scan" over an emptyset - the query can never match anything
 }

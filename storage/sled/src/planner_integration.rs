@@ -101,17 +101,70 @@ fn convert_to_physical_bounds(
         }
     }
 
-    // Case 2: Single-component DESC inequality
-    if let Some(first_keypart) = key_spec.keyparts.first() {
-        if first_keypart.direction.is_desc() {
-            let is_single = (lower_tuple.len() <= 1) && (upper_tuple.len() <= 1);
+    // =====================================================================================
+    // Case 2: DESC inequality - requires bound inversion
+    // =====================================================================================
+    //
+    // WHY DESC NEEDS SPECIAL HANDLING:
+    //
+    // DESC columns invert each byte during encoding (0xFF - b), which reverses the
+    // lexicographic order. This means logical bounds must be SWAPPED to produce the
+    // correct physical scan range.
+    //
+    // Example with 2-byte integers (simplified):
+    //
+    //   Logical values:    5 < 10
+    //   ASC encoding:      [0x00, 0x05] < [0x00, 0x0A]  ✓ same order
+    //   DESC encoding:     [0xFF, 0xFA] > [0xFF, 0xF5]  ✗ REVERSED order
+    //
+    // So for a query like `timestamp > 5` on a DESC column:
+    //
+    //   Logical meaning:   "values greater than 5" → {6, 7, 8, 9, 10, ...}
+    //   ASC scan range:    enc(5) to end            → [0x00,0x05] to [0xFF,0xFF]
+    //   DESC scan range:   start to enc(5)          → [0x00,0x00] to [0xFF,0xFA]
+    //                      ↑ INVERTED! larger values have SMALLER bytes in DESC
+    //
+    // Similarly for `timestamp <= 5` on DESC:
+    //
+    //   Logical meaning:   "values ≤ 5" → {..., 3, 4, 5}
+    //   ASC scan range:    start to succ(enc(5))   → [0x00,0x00] to [0x00,0x06]
+    //   DESC scan range:   enc(5) to end           → [0xFF,0xFA] to [0xFF,0xFF]
+    //                      ↑ INVERTED! smaller values have LARGER bytes in DESC
+    //
+    // ASC columns don't need this because logical order matches byte order.
+    //
+    // ---------------------------------------------------------------------------------
+    // PR #212 BUG: The inequality column index matters!
+    // ---------------------------------------------------------------------------------
+    //
+    // For composite indexes with equality prefix + DESC inequality:
+    //   Index:  [room ASC, deleted ASC, timestamp DESC]
+    //   Query:  room = 'abc' AND deleted = false AND timestamp <= 1000
+    //
+    // The inequality column (timestamp) is at index 2, NOT index 0.
+    //
+    //   eq_prefix_len = 2  (room and deleted are equality predicates)
+    //   inequality column = keyparts[2] = timestamp (DESC)
+    //
+    // OLD BUG: checked keyparts[0].is_desc() → room is ASC → FALSE → wrong path!
+    // FIX:     check keyparts[eq_prefix_len].is_desc() → timestamp is DESC → TRUE
+    // =====================================================================================
+
+    let ineq_lower_len = lower_tuple.len().saturating_sub(eq_prefix_len);
+    let ineq_upper_len = upper_tuple.len().saturating_sub(eq_prefix_len);
+
+    if let Some(ineq_keypart) = key_spec.keyparts.get(eq_prefix_len) {
+        if ineq_keypart.direction.is_desc() {
+            // Single-component inequality (0 or 1 values beyond the equality prefix)
+            let is_single = ineq_lower_len <= 1 && ineq_upper_len <= 1;
             if is_single {
                 return handle_desc_inequality(lower_tuple, upper_tuple, lower_open, upper_open, eq_prefix_len, eq_prefix_values, key_spec);
             }
         }
     }
 
-    // Case 3: General bounds (ASC or multi-component)
+    // Case 3: General bounds (ASC inequality or multi-component)
+    // ASC columns don't need bound inversion - logical order matches byte order
     handle_general_bounds(lower_tuple, upper_tuple, lower_open, upper_open, eq_prefix_len, eq_prefix_values, key_spec)
 }
 
@@ -179,6 +232,7 @@ fn handle_desc_inequality(
         if eq_prefix_len > 0 { encode_tuple_values_with_key_spec(&eq_prefix_values[..eq_prefix_len], key_spec)? } else { Vec::new() };
 
     let upper_open_ended = end_bytes_opt.is_none();
+
     Ok(SledRangeBounds { start: start_bytes, end: end_bytes_opt, upper_open_ended, eq_prefix_guard: eq_guard })
 }
 

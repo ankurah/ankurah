@@ -5,6 +5,9 @@ use crate::{
 use ankurah_core::indexing::IndexSpecMatch;
 use ankurah_core::{error::RetrievalError, EntityId};
 use ankurah_storage_common::{KeyBounds, ScanDirection};
+use futures::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use crate::index::Index;
 
@@ -85,26 +88,29 @@ impl<'a> SledIndexScanner<'a> {
     }
 }
 
-impl<'a> Iterator for SledIndexScanner<'a> {
+impl Unpin for SledIndexScanner<'_> {}
+
+impl Stream for SledIndexScanner<'_> {
     type Item = Result<EntityId, RetrievalError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        // Get next item from iterator
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Synchronous implementation - always returns Ready
         loop {
-            let (key_bytes, _value_bytes) = match self.iter.next()? {
-                Ok(kv) => kv,
-                Err(e) => return Some(Err(RetrievalError::StorageError(e.to_string().into()))),
+            let (key_bytes, _value_bytes) = match self.iter.next() {
+                Some(Ok(kv)) => kv,
+                Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::StorageError(e.to_string().into())))),
+                None => return Poll::Ready(None),
             };
 
             // Apply prefix guard if needed
             if self.use_prefix_guard && !self.eq_prefix_bytes.is_empty() && !key_bytes.starts_with(&self.eq_prefix_bytes) {
-                return None; // End of prefix range
+                return Poll::Ready(None); // End of prefix range
             }
 
             // Decode EntityId from key suffix
             match decode_entity_id_from_index_key(&key_bytes) {
-                Ok(entity_id) => return Some(Ok(entity_id)),
-                Err(e) => return Some(Err(e)),
+                Ok(entity_id) => return Poll::Ready(Some(Ok(entity_id))),
+                Err(e) => return Poll::Ready(Some(Err(e))),
             }
         }
     }
