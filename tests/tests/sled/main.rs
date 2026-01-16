@@ -5,6 +5,7 @@ mod edge_cases;
 mod inclusion_and_ordering;
 mod index_creation;
 mod json_property;
+mod multi_column_order_by;
 mod normalization_tests;
 mod pagination;
 mod ref_traversal;

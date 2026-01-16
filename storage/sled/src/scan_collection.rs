@@ -5,6 +5,9 @@ use ankurah_core::indexing::{IndexDirection, IndexKeyPart, KeySpec};
 use ankurah_core::value::ValueType;
 use ankurah_core::{error::RetrievalError, EntityId};
 use ankurah_storage_common::{traits::EntityIdStream, KeyBounds, ScanDirection};
+use futures::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// Scanner over a materialized collection tree yielding EntityId directly (for ID-only queries)
 pub struct SledCollectionKeyScanner<'a> {
@@ -63,19 +66,23 @@ impl<'a> SledCollectionKeyScanner<'a> {
     }
 }
 
-impl<'a> Iterator for SledCollectionKeyScanner<'a> {
+impl Unpin for SledCollectionKeyScanner<'_> {}
+
+impl Stream for SledCollectionKeyScanner<'_> {
     type Item = Result<EntityId, RetrievalError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        // Get next item from iterator
-        let (key_bytes, _value_bytes) = match self.iter.next()? {
-            Ok(kv) => kv,
-            Err(e) => return Some(Err(RetrievalError::StorageError(e.to_string().into()))),
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Synchronous implementation - always returns Ready
+        let (key_bytes, _value_bytes) = match self.iter.next() {
+            Some(Ok(kv)) => kv,
+            Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::StorageError(e.to_string().into())))),
+            None => return Poll::Ready(None),
         };
 
         // For collection trees, the key is directly the EntityId bytes
-        match EntityId::from_bytes(key_bytes.as_ref().try_into().ok()?) {
-            entity_id => Some(Ok(entity_id)),
+        match key_bytes.as_ref().try_into() {
+            Ok(bytes) => Poll::Ready(Some(Ok(EntityId::from_bytes(bytes)))),
+            Err(_) => Poll::Ready(None),
         }
     }
 }
@@ -125,26 +132,32 @@ impl<'a> SledCollectionScanner<'a> {
     }
 }
 
-impl<'a> Iterator for SledCollectionScanner<'a> {
-    type Item = crate::materialization::MatRow;
+impl Unpin for SledCollectionScanner<'_> {}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        // Get next item from iterator
-        let (key_bytes, value_bytes) = match self.iter.next()? {
-            Ok(kv) => kv,
-            Err(_e) => return None, // Skip errors for now - TODO: proper error handling
+impl Stream for SledCollectionScanner<'_> {
+    type Item = crate::materialization::ProjectedEntity;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Synchronous implementation - always returns Ready
+        let (key_bytes, value_bytes) = match self.iter.next() {
+            Some(Ok(kv)) => kv,
+            Some(Err(_e)) => return Poll::Ready(None), // Skip errors for now - TODO: proper error handling
+            None => return Poll::Ready(None),
         };
 
         // Extract EntityId from key
-        let entity_id = EntityId::from_bytes(key_bytes.as_ref().try_into().ok()?);
+        let entity_id = match key_bytes.as_ref().try_into() {
+            Ok(bytes) => EntityId::from_bytes(bytes),
+            Err(_) => return Poll::Ready(None),
+        };
 
         // Decode materialized values from value
         let property_values: Vec<(u32, ankurah_core::value::Value)> = match bincode::deserialize(&value_bytes) {
             Ok(values) => values,
-            Err(_e) => return None, // Skip errors for now - TODO: proper error handling
+            Err(_e) => return Poll::Ready(None), // Skip errors for now - TODO: proper error handling
         };
 
-        // Convert to MatEntity - store by property name (not ID)
+        // Convert to ProjectedEntity - store by property name (not ID)
         let mut map = std::collections::BTreeMap::new();
         for (property_id, value) in property_values {
             if let Some(property_name) = self.property_manager.get_property_name(property_id) {
@@ -152,70 +165,67 @@ impl<'a> Iterator for SledCollectionScanner<'a> {
             }
         }
 
-        let mat_entity = crate::materialization::MatEntity {
+        Poll::Ready(Some(crate::materialization::ProjectedEntity {
             id: entity_id,
             collection: ankurah_proto::CollectionId::from("unknown"), // TODO: get from context
             map,
-        };
-
-        Some(crate::materialization::MatRow { id: entity_id, mat: mat_entity })
+        }))
     }
 }
 
 /// Sled-specific materialized value lookup iterator (for index scans that need materialization)
-pub struct SledMaterializeIter<S> {
+pub struct SledCollectionLookup<S> {
     pub tree: sled::Tree,
     pub property_manager: PropertyManager,
     pub stream: S,
 }
 
-impl<S: EntityIdStream> SledMaterializeIter<S> {
+impl<S: EntityIdStream> SledCollectionLookup<S> {
     pub fn new(tree: &sled::Tree, property_manager: &PropertyManager, stream: S) -> Self {
         Self { tree: tree.clone(), property_manager: property_manager.clone(), stream }
     }
 }
 
-impl<S: EntityIdStream> Iterator for SledMaterializeIter<S> {
-    type Item = crate::materialization::MatRow;
+impl<S: Unpin> Unpin for SledCollectionLookup<S> {}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl<S: EntityIdStream> Stream for SledCollectionLookup<S> {
+    type Item = crate::materialization::ProjectedEntity;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Get next EntityId from upstream stream
-        let entity_id = match self.stream.next()? {
-            Ok(id) => id,
-            Err(_e) => return None, // Skip errors for now - TODO: proper error handling
+        let entity_id = match Pin::new(&mut self.stream).poll_next(cx) {
+            Poll::Ready(Some(Ok(id))) => id,
+            Poll::Ready(Some(Err(_e))) => return Poll::Ready(None), // Skip errors for now
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
         };
 
         // Lookup materialized values from collection tree
         let key = entity_id.to_bytes();
         let value_bytes = match self.tree.get(key) {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return None, // Entity not found
-            Err(_e) => return None,  // Skip errors for now - TODO: proper error handling
+            Ok(None) => return Poll::Ready(None), // Entity not found
+            Err(_e) => return Poll::Ready(None),  // Skip errors for now - TODO: proper error handling
         };
 
         // Decode materialized values
         let property_values: Vec<(u32, ankurah_core::value::Value)> = match bincode::deserialize(&value_bytes) {
             Ok(values) => values,
-            Err(_e) => return None, // Skip errors for now - TODO: proper error handling
+            Err(_e) => return Poll::Ready(None), // Skip errors for now - TODO: proper error handling
         };
 
-        // Convert to MatEntity - store by property ID for now
+        // Convert to ProjectedEntity - store by property name
         let mut map = std::collections::BTreeMap::new();
         for (property_id, value) in property_values {
-            // For now, use property_id as string key - we can optimize this later
-            // do it:
-            let property_name = self.property_manager.get_property_name(property_id);
-            if let Some(property_name) = property_name {
+            if let Some(property_name) = self.property_manager.get_property_name(property_id) {
                 map.insert(property_name, value);
             }
         }
 
-        let mat_entity = crate::materialization::MatEntity {
+        Poll::Ready(Some(crate::materialization::ProjectedEntity {
             id: entity_id,
             collection: ankurah_proto::CollectionId::from("unknown"), // TODO: get from context
             map,
-        };
-
-        Some(crate::materialization::MatRow { id: entity_id, mat: mat_entity })
+        }))
     }
 }

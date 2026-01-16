@@ -16,7 +16,7 @@ use crate::{
     statics::*,
     util::{cb_future::cb_future, cb_stream::cb_stream, object::Object, require::WBGRequire},
 };
-use ankurah_storage_common::Plan;
+use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan};
 // Import tracing for debug macro and futures for StreamExt
 use futures::StreamExt;
 use tracing::debug;
@@ -142,7 +142,7 @@ impl StorageCollection for IndexedDBBucket {
                 // Empty scan - return empty results immediately
                 return Ok(Vec::new());
             }
-            Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, .. } => {
+            Plan::Index { index_spec, bounds, scan_direction, remaining_predicate, order_by_spill } => {
                 // Step 4: Ensure index exists using plan's IndexSpec
                 self.db
                     .assure_index_exists(index_spec)
@@ -163,7 +163,7 @@ impl StorageCollection for IndexedDBBucket {
 
                     // Convert plan bounds to IndexedDB key range using new pipeline
                     let (key_range, upper_open_ended, eq_prefix_len, eq_prefix_values) =
-                        crate::planner_integration::plan_bounds_to_idb_range(bounds)
+                        crate::planner_integration::plan_bounds_to_idb_range(bounds, scan_direction)
                             .map_err(|e| RetrievalError::StorageError(format!("bounds conversion: {}", e).into()))?;
                     // Convert scan direction to cursor direction
                     let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(scan_direction);
@@ -179,6 +179,7 @@ impl StorageCollection for IndexedDBBucket {
                             upper_open_ended,
                             eq_prefix_len,
                             eq_prefix_values,
+                            &order_by_spill,
                         )
                         .await?;
 
@@ -336,92 +337,150 @@ impl IndexedDBBucket {
         upper_open_ended: bool,
         eq_prefix_len: usize,
         eq_prefix_values: Vec<ankurah_core::value::Value>,
+        order_by_spill: &OrderByComponents,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        // cursor_direction is already provided as parameter
+        let needs_spill_sort = !order_by_spill.spill.is_empty();
 
-        // Open index cursor with optional key range and direction
-        // Convert IdbKeyRange to JsValue for the API call
-        let cursor_request = if let Some(range) = &key_range {
-            index
-                .open_cursor_with_range_and_direction(range.as_ref(), cursor_direction)
-                .require("open index cursor with range and direction")?
-        } else {
-            index
-                .open_cursor_with_range_and_direction(&wasm_bindgen::JsValue::NULL, cursor_direction)
-                .require("open index cursor with direction only")?
-        };
-
-        let mut results = Vec::new();
-        let mut stream = cb_stream(&cursor_request, "success", "error");
-        let mut count = 0u64;
-
-        // Equality-prefix guard: enabled when scanning open-ended ranges with a non-empty equality prefix
+        // Determine effective prefix guard config (can be disabled in debug builds for testing)
         #[cfg(debug_assertions)]
-        let use_prefix_guard =
-            upper_open_ended && eq_prefix_len > 0 && !self.prefix_guard_disabled.load(std::sync::atomic::Ordering::Relaxed);
+        let effective_prefix_len =
+            if upper_open_ended && eq_prefix_len > 0 && !self.prefix_guard_disabled.load(std::sync::atomic::Ordering::Relaxed) {
+                eq_prefix_len
+            } else {
+                0
+            };
         #[cfg(not(debug_assertions))]
-        let use_prefix_guard = upper_open_ended && eq_prefix_len > 0;
+        let effective_prefix_len = if upper_open_ended && eq_prefix_len > 0 { eq_prefix_len } else { 0 };
 
-        let eq_prefix_js: Vec<JsValue> = if use_prefix_guard {
-            eq_prefix_values
-                .iter()
-                .map(|v| {
-                    let js_val: JsValue = crate::idb_value::IdbValue::from(v).into();
-                    js_val
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Use IdbIndexScanner for cursor iteration with prefix guard
+        let scanner =
+            crate::scanner::IdbIndexScanner::new(index.clone(), key_range, cursor_direction, effective_prefix_len, eq_prefix_values);
 
-        'scan: while let Some(result) = stream.next().await {
-            let cursor_result = result.require("cursor error")?;
-            if cursor_result.is_null() || cursor_result.is_undefined() {
-                break;
-            }
+        let mut stream = std::pin::pin!(scanner.scan());
+        let mut count = 0u64;
+        let mut rows: Vec<IdbRecord> = Vec::new();
+        let mut direct_results: Vec<Attested<EntityState>> = Vec::new();
 
-            let cursor = cursor_result.dyn_into::<web_sys::IdbCursorWithValue>().require("cast cursor")?;
+        while let Some(result) = stream.next().await {
+            let entity_obj = result?;
 
-            if use_prefix_guard {
-                let key_js = cursor.key().require("get cursor key")?;
-                if !key_js.is_undefined() && !key_js.is_null() {
-                    let key_arr = js_sys::Array::from(&key_js);
-                    for i in 0..(eq_prefix_len as u32) {
-                        let lhs = key_arr.get(i);
-                        let rhs = &eq_prefix_js[i as usize];
-                        if !js_sys::Object::is(&lhs, rhs) {
-                            break 'scan;
-                        }
-                    }
-                }
-            }
-            let entity_obj = Object::new(cursor.value().require("get cursor value")?);
+            // Create IdbRecord - wraps JS object with lazy value extraction
+            let record = match IdbRecord::new(entity_obj, collection_id.clone()) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
 
-            // Create a wrapper that provides collection context for filtering
-            let filterable_entity = FilterableObject { object: &entity_obj, collection_id };
-
-            // Apply predicate filtering first (cheaper than entity conversion)
-            if evaluate_predicate(&filterable_entity, predicate)
+            // Apply predicate filtering (uses lazy extraction from IdbRecord)
+            if evaluate_predicate(&record, predicate)
                 .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
             {
-                // Only convert to EntityState if predicate matches
-                if let Ok(entity_state) = js_object_to_entity_state(&entity_obj, collection_id) {
-                    results.push(entity_state);
-                    count += 1;
+                if needs_spill_sort {
+                    // Collect for sorting
+                    rows.push(record);
+                } else {
+                    // No sorting needed - extract entity state and apply limit during scan
+                    if let Ok(entity_state) = record.entity_state() {
+                        direct_results.push(entity_state);
+                        count += 1;
 
-                    if let Some(limit_val) = limit {
-                        if count >= limit_val {
-                            break;
+                        if let Some(limit_val) = limit {
+                            if count >= limit_val {
+                                break;
+                            }
                         }
                     }
                 }
             }
-
-            cursor.continue_().require("advance cursor")?;
         }
 
-        Ok(results)
+        // If we need to sort by spilled columns, use partition-aware sorting
+        if needs_spill_sort {
+            // Use ValueSetStream trait methods for partition-aware sorting
+            let results: Vec<Attested<EntityState>> = match limit {
+                Some(limit_val) => {
+                    // Use partition-aware TopK
+                    futures::stream::iter(rows)
+                        .top_k(order_by_spill.clone(), limit_val as usize)
+                        .filter_map(|r| async move { r.entity_state().ok() })
+                        .collect()
+                        .await
+                }
+                None => {
+                    // Use partition-aware sort
+                    futures::stream::iter(rows)
+                        .sort_by(order_by_spill.clone())
+                        .filter_map(|r| async move { r.entity_state().ok() })
+                        .collect()
+                        .await
+                }
+            };
+            Ok(results)
+        } else {
+            Ok(direct_results)
+        }
     }
+}
+
+/// A record from the IndexedDB entities store.
+///
+/// Wraps the raw JS object with lazy extraction for filtering and sorting.
+/// Implements `Filterable` and `HasEntityId` for use with stream combinators.
+struct IdbRecord {
+    id: ankurah_proto::EntityId,
+    object: Object,
+    collection_id: ankurah_proto::CollectionId,
+}
+
+impl IdbRecord {
+    /// Create a new IdbRecord from a JS object
+    fn new(object: Object, collection_id: ankurah_proto::CollectionId) -> Result<Self, RetrievalError> {
+        let id: ankurah_proto::EntityId = object.get(&ID_KEY)?;
+        Ok(Self { id, object, collection_id })
+    }
+
+    /// Get the entity state (converts from JS object on demand)
+    fn entity_state(&self) -> Result<Attested<EntityState>, RetrievalError> { js_object_to_entity_state(&self.object, &self.collection_id) }
+
+    /// Extract property values needed for sorting
+    fn extract_sort_properties(&self, order_by: &OrderByComponents) -> std::collections::BTreeMap<String, ankurah_core::value::Value> {
+        extract_sort_properties(&self.object, order_by)
+    }
+}
+
+impl Filterable for IdbRecord {
+    fn collection(&self) -> &str { self.collection_id.as_str() }
+
+    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
+        // Lazy extraction from JS object
+        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&name.into()).ok()??;
+        Some(idb_val.into_value())
+    }
+}
+
+impl ankurah_storage_common::filtering::HasEntityId for IdbRecord {
+    fn entity_id(&self) -> ankurah_proto::EntityId { self.id }
+}
+
+/// Extract property values needed for sorting from a JS object
+fn extract_sort_properties(
+    entity_obj: &Object,
+    order_by: &OrderByComponents,
+) -> std::collections::BTreeMap<String, ankurah_core::value::Value> {
+    let mut map = std::collections::BTreeMap::new();
+    // Extract all ORDER BY columns - presort for partition detection, spill for sorting
+    for item in &order_by.presort {
+        let property_name = item.path.property();
+        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
+            map.insert(property_name.to_string(), idb_val.into_value());
+        }
+    }
+    for item in &order_by.spill {
+        let property_name = item.path.property();
+        if let Ok(Some(idb_val)) = entity_obj.get_opt::<crate::idb_value::IdbValue>(&property_name.into()) {
+            map.insert(property_name.to_string(), idb_val.into_value());
+        }
+    }
+    map
 }
 
 /// Convert JS object to EntityState using the correct field extraction
@@ -475,23 +534,6 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
     }
 
     Ok(())
-}
-
-/// Wrapper struct to provide collection context for predicate filtering
-struct FilterableObject<'a> {
-    object: &'a Object,
-    collection_id: &'a ankurah_proto::CollectionId,
-}
-
-/// Implement Filterable for FilterableObject to enable direct predicate evaluation on JS objects
-impl<'a> Filterable for FilterableObject<'a> {
-    fn collection(&self) -> &str { self.collection_id.as_str() }
-
-    fn value(&self, name: &str) -> Option<ankurah_core::value::Value> {
-        // Get JsValue, convert through IdbValue to typed Value
-        let idb_val: crate::idb_value::IdbValue = self.object.get_opt(&name.into()).ok()??;
-        Some(idb_val.into_value())
-    }
 }
 
 /// Amend a selection with __collection = 'value' comparison

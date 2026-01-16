@@ -1,7 +1,7 @@
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicBool;
 
-use ankql::ast::{OrderByItem, Predicate};
+use ankql::ast::Predicate;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
     entity::TemporaryEntity,
@@ -10,15 +10,16 @@ use ankurah_core::{
     EntityId,
 };
 use ankurah_proto::{Attested, CollectionId, EntityState, Event, EventId, StateFragment};
-use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, Plan, Planner, PlannerConfig, ScanDirection};
+use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection};
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::sync::Arc;
 
 use tokio::task;
 
 use crate::entity::{SledEntityExt, SledEntityExtFromMats, SledEntityLookup};
 // TODO: Will need bounds_to_sled_range and normalize when implementing scanner logic
-use crate::scan_collection::SledMaterializeIter;
+use crate::scan_collection::SledCollectionLookup;
 use crate::scan_collection::{SledCollectionKeyScanner, SledCollectionScanner};
 use crate::scan_index::SledIndexScanner;
 use crate::{
@@ -183,7 +184,7 @@ impl SledStorageCollectionInner {
         bounds: KeyBounds,
         scan_direction: ScanDirection,
         remaining_predicate: Predicate,
-        order_by_spill: Vec<OrderByItem>,
+        order_by_spill: OrderByComponents,
         limit: Option<u64>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         // Debug flag for disabling equality-prefix guard (testing only)
@@ -206,61 +207,46 @@ impl SledStorageCollectionInner {
 
         let ids = SledIndexScanner::new(&index, &bounds, scan_direction, match_type, prefix_guard_disabled)?;
 
-        if remaining_predicate == Predicate::True && order_by_spill.is_empty() {
-            return ids.limit(limit).entities(&self.database.entities_tree, &self.collection_id).collect_states();
+        if remaining_predicate == Predicate::True && order_by_spill.is_satisfied() {
+            return futures::executor::block_on(
+                ids.limit(limit).entities(&self.database.entities_tree, &self.collection_id).collect_states(),
+            );
         }
 
         // Values path: ids → materialized lookup → filter/sort/topk/limit → hydrate → collect
         let e_tree = &self.database.entities_tree;
-        let sort: Option<Vec<OrderByItem>> = if order_by_spill.is_empty() { None } else { Some(order_by_spill) };
-        let mats = SledMaterializeIter::new(&self.tree, &self.database.property_manager, ids);
+        let needs_spill = !order_by_spill.spill.is_empty();
+        let mats = SledCollectionLookup::new(&self.tree, &self.database.property_manager, ids);
 
         match remaining_predicate {
             Predicate::True => {
-                match (sort, limit) {
-                    // order by + limit
-                    (Some(sort), Some(limit)) => {
-                        mats.top_k(&sort, limit as usize) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
-                    }
-                    // order by only
-                    (Some(sort), None) => {
-                        mats.sort_by(&sort) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
+                match (needs_spill, limit) {
+                    // order by + limit: use partition-aware TopK
+                    (true, Some(limit)) => futures::executor::block_on(
+                        mats.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
+                    ),
+                    // order by only: use partition-aware sort
+                    (true, None) => {
+                        futures::executor::block_on(mats.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
                     }
                     // limit only
-                    (None, limit) => {
-                        mats.limit(limit) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
-                    }
+                    (false, limit) => futures::executor::block_on(mats.limit(limit).entities(e_tree, &self.collection_id).collect_states()),
                 }
             }
             _ => {
                 let filtered = mats.filter_predicate(&remaining_predicate);
-                match (sort, limit) {
-                    // filter + order by + limit
-                    (Some(sort), Some(limit)) => {
-                        filtered
-                            .top_k(&sort, limit as usize) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
-                    }
-                    // filter + order by
-                    (Some(sort), None) => {
-                        filtered
-                            .sort_by(&sort) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
+                match (needs_spill, limit) {
+                    // filter + order by + limit: use partition-aware TopK
+                    (true, Some(limit)) => futures::executor::block_on(
+                        filtered.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
+                    ),
+                    // filter + order by: use partition-aware sort
+                    (true, None) => {
+                        futures::executor::block_on(filtered.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
                     }
                     // filter + limit
-                    (None, limit) => {
-                        filtered
-                            .limit(limit) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
+                    (false, limit) => {
+                        futures::executor::block_on(filtered.limit(limit).entities(e_tree, &self.collection_id).collect_states())
                     }
                 }
             }
@@ -271,66 +257,53 @@ impl SledStorageCollectionInner {
         bounds: KeyBounds,
         scan_direction: ScanDirection,
         remaining_predicate: Predicate,
-        order_by_spill: Vec<OrderByItem>,
+        order_by_spill: OrderByComponents,
         limit: Option<u64>,
     ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
-        if remaining_predicate == Predicate::True && order_by_spill.is_empty() {
+        if remaining_predicate == Predicate::True && order_by_spill.is_satisfied() {
             let ids = SledCollectionKeyScanner::new(&self.tree, &bounds, scan_direction)?;
             let states = SledEntityLookup::new(&self.database.entities_tree, &self.collection_id, ids.limit(limit));
-            return states.collect_states();
+            return futures::executor::block_on(states.collect_states());
         }
 
         // Values path: kvs → decode mats → filter/sort/topk/limit → hydrate → collect
         let e_tree = &self.database.entities_tree;
-        let sort: Option<Vec<OrderByItem>> = if order_by_spill.is_empty() { None } else { Some(order_by_spill) };
+        let needs_spill = !order_by_spill.spill.is_empty();
         let scanner = SledCollectionScanner::new(&self.tree, &bounds, scan_direction, &self.database.property_manager)?;
 
         match remaining_predicate {
             Predicate::True => {
-                match (sort, limit) {
-                    // order by + limit
-                    (Some(sort), Some(limit)) => {
-                        scanner
-                            .top_k(&sort, limit as usize) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
+                match (needs_spill, limit) {
+                    // order by + limit: use partition-aware TopK
+                    (true, Some(limit)) => futures::executor::block_on(
+                        scanner.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
+                    ),
+                    // order by only: use partition-aware sort
+                    (true, None) => {
+                        futures::executor::block_on(scanner.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
                     }
-                    // order by only
-                    (Some(sort), None) => scanner
-                        .sort_by(&sort) //
-                        .entities(e_tree, &self.collection_id)
-                        .collect_states(),
                     // limit only
-                    (None, limit) => scanner
-                        .limit(limit) //
-                        .entities(e_tree, &self.collection_id)
-                        .collect_states(),
+                    (false, limit) => {
+                        futures::executor::block_on(scanner.limit(limit).entities(e_tree, &self.collection_id).collect_states())
+                    }
                 }
             }
             _ => {
-                let collection_items: Vec<_> = scanner.collect();
-                let filtered = collection_items.into_iter().filter_predicate(&remaining_predicate);
-                match (sort, limit) {
-                    // filter + order by + limit
-                    (Some(sort), Some(limit)) => {
-                        filtered
-                            .top_k(&sort, limit as usize) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
-                    }
-                    // filter + order by
-                    (Some(sort), None) => {
-                        filtered
-                            .sort_by(&sort) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
+                // Collect items from scanner first, then filter
+                let collection_items: Vec<_> = futures::executor::block_on(scanner.collect());
+                let filtered = futures::stream::iter(collection_items).filter_predicate(&remaining_predicate);
+                match (needs_spill, limit) {
+                    // filter + order by + limit: use partition-aware TopK
+                    (true, Some(limit)) => futures::executor::block_on(
+                        filtered.top_k(order_by_spill, limit as usize).entities(e_tree, &self.collection_id).collect_states(),
+                    ),
+                    // filter + order by: use partition-aware sort
+                    (true, None) => {
+                        futures::executor::block_on(filtered.sort_by(order_by_spill).entities(e_tree, &self.collection_id).collect_states())
                     }
                     // filter + limit
-                    (None, limit) => {
-                        filtered
-                            .limit(limit) //
-                            .entities(e_tree, &self.collection_id)
-                            .collect_states()
+                    (false, limit) => {
+                        futures::executor::block_on(filtered.limit(limit).entities(e_tree, &self.collection_id).collect_states())
                     }
                 }
             }
