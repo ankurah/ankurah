@@ -33,6 +33,7 @@ impl<T: 'static, S> GetAndDynSubscribe<T> for S where S: Get<T> + Peek<T> + DynS
 
 /// A guard for a subscription to a signal
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
+#[cfg_attr(feature = "react-native", derive(uniffi::Object))]
 pub struct SubscriptionGuard {
     _listenerguard: Box<dyn std::any::Any + Send + Sync>,
 }

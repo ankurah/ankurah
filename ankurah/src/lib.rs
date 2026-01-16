@@ -70,7 +70,8 @@
 //! ## Example: Inter-Node Subscription
 //!
 //! ```rust
-//! # #[cfg(feature="derive")]
+//! # // Skip when uniffi feature is enabled (UniFFI derive requires scaffolding not available in doctests)
+//! # #[cfg(all(feature="derive", not(feature="uniffi")))]
 //! # mod doctest {
 //! # use ankurah::{Node,Model};
 //! # use ankurah_storage_sled::SledStorageEngine;
@@ -129,6 +130,9 @@
 //! For more details, see the [repository documentation](https://github.com/ankurah/ankurah).
 //! And join the [Discord server](https://discord.gg/XMUUxsbT5S) to be part of the discussion!
 
+// Note: When both wasm and uniffi features are enabled, wasm takes precedence.
+// This allows `cargo test --all-features` to work correctly.
+
 pub use ankql;
 pub use ankurah_core as core;
 #[cfg(feature = "derive")]
@@ -149,6 +153,7 @@ pub use ankurah_core::{
     node::{MatchArgs, Node},
     policy::{self, PermissiveAgent},
     property::{self, Property, Ref},
+    query_value::QueryValue,
     resultset::ResultSet,
     storage, transaction, value,
     value::{Value, ValueType},
@@ -170,6 +175,8 @@ pub mod derive_deps {
     #[cfg(feature = "wasm")]
     pub use ::send_wrapper;
     pub use ::tracing;
+    #[cfg(feature = "uniffi")]
+    pub use ::uniffi;
     #[cfg(feature = "wasm")]
     pub use ::wasm_bindgen;
     #[cfg(feature = "wasm")]

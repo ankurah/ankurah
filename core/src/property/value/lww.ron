@@ -33,6 +33,7 @@ BackendConfig(
                     args: [],
                     return_type: "Option<{PREFIX}::value::Value>",
                     wasm: false,
+                    uniffi: false,
                 ),
             ],
         ),

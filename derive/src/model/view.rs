@@ -32,56 +32,40 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     #[cfg(not(feature = "wasm"))]
     let wasm_field_getters_impl = quote! {};
 
-    let (struct_attributes, impl_attributes, id_getter_attr, wasm_edit_impl) = if cfg!(feature = "wasm") {
-        let subscribe_ts = format!(
-            r#"export interface {view_name} {{
-    subscribe(callback: () => void): SubscriptionGuard;
-}}"#
-        );
-
-        (
-            quote! { #[wasm_bindgen] },
-            quote! { #[wasm_bindgen] },
-            quote! { #[wasm_bindgen(getter)] },
-            quote! {
-                #[wasm_bindgen(typescript_custom_section)]
-                const TS_VIEW_SUBSCRIBE: &'static str = #subscribe_ts;
-
-                #[wasm_bindgen]
-                impl #view_name {
-                    /// Edit this entity in a transaction (WASM version - returns owned Mutable)
-                    #[wasm_bindgen(js_name = "edit")]
-                    pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
-                        use ::ankurah::model::View;
-                        match trx.edit::<#name>(&self.entity) {
-                            Ok(mutable_borrow) => {
-                                // Extract the core mutable from the borrow wrapper
-                                Ok(mutable_borrow.into_core())
-                            }
-                            Err(e) => Err(::wasm_bindgen::JsValue::from(e.to_string()))
-                        }
-                    }
-
-                    #[wasm_bindgen(skip_typescript, js_name = "subscribe")]
-                    pub fn subscribe_wasm(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
-
-                        let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
-                        ::ankurah::core::model::view_subscribe_no_clone(self, move |_| {
-                            let _ = callback.call0(
-                                &::ankurah::derive_deps::wasm_bindgen::JsValue::NULL,
-                            );
-                        })
-                    }
-                }
-            },
-        )
-    } else {
-        (quote! {}, quote! {}, quote! {}, quote! {})
+    // UniFFI field getters (conditionally generated - only when uniffi enabled WITHOUT wasm)
+    #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
+    let uniffi_field_getters_impl = {
+        let uniffi_getters = model.uniffi_view_getters();
+        quote! {
+            #[::uniffi::export]
+            impl #view_name {
+                #(#uniffi_getters)*
+            }
+        }
     };
+    #[cfg(any(not(feature = "uniffi"), feature = "wasm"))]
+    let uniffi_field_getters_impl = quote! {};
+
+    // Get FFI-specific attributes from the appropriate module
+    // wasm takes precedence when both features are enabled
+    #[cfg(feature = "wasm")]
+    let ffi_attrs = super::wasm::view_attributes(&view_name, &mutable_name, &name);
+
+    #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
+    let ffi_attrs = super::uniffi::view_attributes();
+
+    #[cfg(not(any(feature = "wasm", feature = "uniffi")))]
+    let ffi_attrs =
+        super::ViewAttributes { struct_attr: quote! {}, impl_attr: quote! {}, id_method_attr: quote! {}, extra_impl: quote! {} };
+
+    let struct_attr = ffi_attrs.struct_attr;
+    let impl_attr = ffi_attrs.impl_attr;
+    let id_method_attr = ffi_attrs.id_method_attr;
+    let ffi_extra_impl = ffi_attrs.extra_impl;
 
     let expanded = quote! {
 
-            #struct_attributes
+            #struct_attr
             #[derive(Clone, Debug, PartialEq)]
             pub struct #view_name {
                 entity: ::ankurah::entity::Entity,
@@ -159,11 +143,12 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
             }
 
-            #wasm_edit_impl
+            #ffi_extra_impl
 
-            #impl_attributes
+            // id() and track() - with conditional FFI attributes
+            #impl_attr
             impl #view_name {
-                #id_getter_attr
+                #id_method_attr
                 pub fn id(&self) -> ankurah::proto::EntityId {
                     self.entity.id().clone()
                 }
@@ -174,7 +159,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
                 }
             }
 
-            // Rust-only impl block: r() and all field getters (no wasm_bindgen)
+            // Rust-only impl block: r() and all field getters (no wasm_bindgen/uniffi)
             impl #view_name {
                 /// Get a typed reference to this entity.
                 ///
@@ -200,6 +185,8 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
             }
 
             #wasm_field_getters_impl
+
+            #uniffi_field_getters_impl
 
             impl<'a> Into<ankurah::proto::EntityId> for &'a #view_name {
                 fn into(self) -> ankurah::proto::EntityId {

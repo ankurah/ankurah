@@ -19,17 +19,15 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
         Err(_) => return quote! { compile_error!("Failed to generate active field types turbofish"); },
     };
 
-    // WASM attributes for the struct and fields
-    let (struct_attributes, field_attributes) = if cfg!(feature = "wasm") {
-        (
-            quote! {
-                #[wasm_bindgen]
-            },
-            quote! { #[wasm_bindgen(skip)] },
-        )
-    } else {
-        (quote! {}, quote! {})
-    };
+    // FFI attributes for the struct and fields
+    #[cfg(feature = "wasm")]
+    let (struct_attributes, field_attributes) = super::wasm::mutable_attributes();
+
+    #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
+    let (struct_attributes, field_attributes) = super::uniffi::mutable_attributes();
+
+    #[cfg(not(any(feature = "wasm", feature = "uniffi")))]
+    let (struct_attributes, field_attributes) = (quote! {}, quote! {});
 
     // Generate WASM getter methods and wrapper definitions for custom types
     let (wasm_getter_impl, wasm_custom_wrappers) = if cfg!(feature = "wasm") {
