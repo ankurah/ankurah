@@ -68,13 +68,14 @@ For `DivergedSince`, the system uses a **layered event application model** with 
 Events are applied in **layers** - sets of concurrent events at the same causal depth from the meet point:
 
 ```rust
-struct EventLayer<'a> {
-    already_applied: Vec<&'a Event>,  // Context: events already in our state
-    to_apply: Vec<&'a Event>,         // New: events to process
+struct EventLayer {
+    already_applied: Vec<Event>,  // Context: events already in our state
+    to_apply: Vec<Event>,         // New: events to process
+    events: Arc<BTreeMap<EventId, Event>>, // DAG context for causal comparison
 }
 ```
 
-**Key insight:** Since all events in a layer are mutually concurrent (same causal depth), winner determination is simple: **lexicographic EventId**. No explicit depth comparison needed - depth is implicit in which layer you're at.
+**Key insight:** Events in a layer are mutually concurrent, but candidates may also include values written earlier on another branch. Use causal comparison when possible; use **lexicographic EventId** only for truly concurrent candidates.
 
 ### Resolution Process
 
@@ -89,19 +90,18 @@ All backends implement the same `apply_layer` method:
 
 ```rust
 trait PropertyBackend {
-    fn apply_layer(
-        &self,
-        already_applied: &[&Event],  // Events at this depth already in state
-        to_apply: &[&Event],         // Events at this depth to process
-    ) -> Result<(), MutationError>;
+    fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError>;
 }
 ```
 
 ### LWW Resolution Within Layer
 
 For LWW backends, each layer is resolved by:
-1. Examine ALL events (already_applied + to_apply)
-2. Per-property winner = highest lexicographic EventId
+1. Examine ALL events (already_applied + to_apply) plus the stored last-write value
+2. Per-property winner determined by `layer.compare(a, b)`:
+   - Descends/Ascends decides the winner
+   - Concurrent falls back to lexicographic EventId
+   - Missing DAG info is an error (bail out)
 3. Only mutate state for winners from to_apply set
 4. Track event_id per property for future conflict resolution
 
@@ -124,7 +124,7 @@ If current head is [H] (via A→B→E→H) and events [C,D,F,G,I] arrive:
 
 ### Backend-Specific Behavior
 
-- **LWW backends**: Determine winner by lexicographic EventId across layer; only apply winners from to_apply
+- **LWW backends**: Determine winner using causal comparison; only apply winners from to_apply
 - **Yrs backends**: Apply all operations from to_apply; CRDT handles idempotency internally; already_applied ignored
 
 ## Key Design Decisions
@@ -174,12 +174,12 @@ LWW backend stores `event_id` per property for future conflict resolution:
 ```rust
 struct ValueEntry {
     value: Option<Value>,
-    event_id: Option<EventId>,  // Which event set this value
+    event_id: EventId,  // Which event set this value (required when committed)
     committed: bool,
 }
 ```
 
-This enables correct resolution when concurrent events arrive at different times.
+Uncommitted local changes may exist in memory without an event_id, but they are never serialized to the state buffer. This enables correct resolution when concurrent events arrive at different times.
 
 ## Invariants
 
