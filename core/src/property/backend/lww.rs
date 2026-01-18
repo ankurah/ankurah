@@ -187,8 +187,11 @@ impl PropertyBackend for LWWBackend {
                             for (prop, value) in changes {
                                 let candidate = Candidate { value, event_id: event.id(), from_to_apply };
                                 if let Some(current) = winners.get_mut(&prop) {
-                                    let relation = layer.compare(&candidate.event_id, &current.event_id).map_err(|err| {
-                                        MutationError::UpdateFailed(Box::new(err))
+                                    let relation = layer.compare(&candidate.event_id, &current.event_id).map_err(|_err| {
+                                        MutationError::InsufficientCausalInfo {
+                                            event_a: candidate.event_id.clone(),
+                                            event_b: current.event_id.clone(),
+                                        }
                                     })?;
                                     match relation {
                                         CausalRelation::Descends => {
