@@ -1,3 +1,4 @@
+0.7.16  SQLite Storage Engine; move postgres tests to storage/postgres/tests/; use default-members for wasm crates in workspace
 0.7.15  UniFFI support for React Native: derive macro generates wrapper types mirroring wasm-bindgen API; multithread observer stack; QueryValue for FFI-safe query parameters
 0.7.14  Fix DESC inequality bounds for composite indexes; fix TopKStream heap comparison; unify Sled and IndexedDB on Stream-based combinators for partition-aware sorting
 0.7.13  Fix check_request error handling: errors now return proper error responses to clients instead of causing hangs
