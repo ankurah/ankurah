@@ -3,27 +3,43 @@ members = [
     "core",
     "derive",
     "proto",
+    "examples/wasm-bindings",
     "examples/model",
     # "examples/leptos-app",
     "examples/server",
     "docs/example/model",
     "docs/example/server",
+    "docs/example/wasm-bindings",
     "ankql",
     "connectors/*",
     "storage/*",
     "tests",
+    "tests-wasm/bindings",
     "ankurah",
     "signals",
 ]
-# Exclude wasm crates - they cause feature unification issues and are tested
+
+# Use default-members to exclude wasm crates from `cargo test` - they are tested
 # separately via wasm-pack. See https://github.com/ankurah/ankurah/issues/211
-exclude = [
-    "connectors/websocket-client-wasm",
-    "storage/indexeddb-wasm",
-    "examples/wasm-bindings",
-    "docs/example/wasm-bindings",
-    "tests-wasm",
+default-members = [
+    "core",
+    "derive",
+    "proto",
+    "examples/model",
+    "examples/server",
+    "docs/example/model",
+    "docs/example/server",
+    "ankql",
+    "connectors/websocket-client",
+    "connectors/websocket-server",
+    "storage/sled",
+    "storage/postgres",
+    "storage/sqlite",
+    "tests",
+    "ankurah",
+    "signals",
 ]
+
 resolver = "2"
 
 [profile.dev]
