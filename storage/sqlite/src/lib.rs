@@ -25,9 +25,7 @@
 //! use ankurah_storage_sqlite::SqliteStorageEngine;
 //!
 //! // Open a file-based database
-//! // liaison id=storage-sqlite
 //! let storage = SqliteStorageEngine::open("myapp.db").await?;
-//! // liaison end
 //!
 //! // Or use an in-memory database for testing
 //! let storage = SqliteStorageEngine::open_in_memory().await?;

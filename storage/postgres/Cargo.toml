@@ -26,3 +26,12 @@ tracing       = "0.1"
 async-trait   = "0.1"
 futures-util  = "0.3"
 bytes         = "1.5"
+
+[dev-dependencies]
+ankurah                = { path = "../../ankurah", version = "=0.7.15", features = ["derive"] }
+tokio                  = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber     = "0.3"
+ctor                   = "0.2"
+serde                  = { version = "1.0", features = ["derive"] }
+testcontainers         = { version = "0.23", features = ["reusable-containers"] }
+testcontainers-modules = { version = "0.11.4", features = ["postgres"] }

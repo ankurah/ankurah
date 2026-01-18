@@ -101,7 +101,7 @@ const AlbumList = signalObserver(({ albums }: Props) =&gt; {
 <pre><code transclude="docs/example/server/src/main.rs#storage-postgres">let storage = Postgres::open(uri).await?;</code></pre>
 
 **SQLite**
-<pre><code transclude="storage/sqlite/src/lib.rs#storage-sqlite">let storage = SqliteStorageEngine::open("myapp.db").await?;</code></pre>
+<pre><code transclude="storage/sqlite/examples/basic.rs#storage-sqlite">let storage = SqliteStorageEngine::open(&quot;myapp.db&quot;).await?;</code></pre>
 
 **IndexedDB**
 <pre><code transclude="docs/example/wasm-bindings/src/lib.rs#storage-indexeddb">let storage = IndexedDBStorageEngine::open(&quot;myapp&quot;).await?;</code></pre>

@@ -15,9 +15,7 @@
 //! PostgreSQL's behavior when JSONB operators are used on `bytea` columns - this was
 //! the source of a subtle bug where the query would silently fail instead of erroring.
 
-#![cfg(feature = "postgres")]
-
-mod pg_common;
+mod common;
 
 use ankurah::property::Json;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
@@ -56,7 +54,7 @@ pub struct Track {
 
 #[tokio::test]
 async fn test_json_property_storage_and_simple_query() -> Result<()> {
-    let (_container, storage) = pg_common::create_postgres_container().await?;
+    let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -101,7 +99,7 @@ async fn test_json_property_storage_and_simple_query() -> Result<()> {
 /// operator mismatch - the silent failure was a different bug in our column resolution.
 #[tokio::test]
 async fn test_bytea_jsonb_operator_behavior() -> Result<()> {
-    let (container, _storage) = pg_common::create_postgres_container().await?;
+    let (container, _storage) = common::create_postgres_container().await?;
 
     // Get a raw PostgreSQL connection to test native behavior
     let host = container.get_host().await?;
@@ -162,7 +160,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
     // Verify pushdown before running the actual query
     assert_fully_pushes_down("licensing.territory = 'US'");
 
-    let (container, storage) = pg_common::create_postgres_container().await?;
+    let (container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -222,7 +220,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_query_numeric_comparison() -> Result<()> {
-    let (_container, storage) = pg_common::create_postgres_container().await?;
+    let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -253,7 +251,7 @@ async fn test_json_path_query_numeric_comparison() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_nested_query() -> Result<()> {
-    let (_container, storage) = pg_common::create_postgres_container().await?;
+    let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -294,7 +292,7 @@ async fn test_json_path_nested_query() -> Result<()> {
 
 #[tokio::test]
 async fn test_json_path_combined_with_regular_field() -> Result<()> {
-    let (_container, storage) = pg_common::create_postgres_container().await?;
+    let (_container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;

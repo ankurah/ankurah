@@ -1,35 +1,10 @@
-#![cfg(feature = "postgres")]
 mod common;
-use ankurah::changes::ChangeKind;
-use anyhow::Result;
-use std::sync::Arc;
-#[cfg(feature = "postgres")]
-mod pg_common;
 use crate::common::TestWatcher;
 use ankurah::signals::{CallbackObserver, Subscribe};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
-
-#[tokio::test]
-async fn test_postgres() -> Result<()> {
-    use common::*;
-
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
-    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
-
-    // Initialize the node's system catalog
-    node.system.create().await?;
-
-    // Get context after system is ready
-    let context = node.context_async(c).await;
-
-    let trx = context.begin();
-    let _album = trx.create(&Album { name: "The rest of the owl".to_owned(), year: "2024".to_owned() }).await?;
-
-    trx.commit().await?;
-
-    Ok(())
-}
+use anyhow::Result;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_sled() -> Result<()> {
@@ -73,11 +48,6 @@ async fn test_sled() -> Result<()> {
     observer.trigger();
     assert_eq!(render_watcher.take_one().await, "name: The rest of the bowl, year: 2024");
 
-    // TODO LATER - figure out how to best access the Active type on the View
-    //              until then we will not support this
-    // let _h2 = album.name().subscribe(w2);
-    // let _h3 = album.year().subscribe(w3);
-
     let trx2 = context.begin();
     let album_mut2 = album.edit(&trx2)?;
 
@@ -104,9 +74,3 @@ async fn test_sled() -> Result<()> {
 
     Ok(())
 }
-
-// After this:
-// 1. ensure that each ActiveValue (YrsString<T>, LWW<T>) keeps the AlbumView resident so it continues to receive updates made on the local node
-// 2. ensure that doing so doesn't leak memory by confirming that the AlbumView is dropped immediately after the YrsString<T> or LWW<T> is dropped.
-//    We will have to test this in the inter_node test because the only way to make edits on a single-node test is to keep the AlbumMut alive, which
-// invalidates the test, because that will continue to update the
