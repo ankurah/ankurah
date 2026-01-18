@@ -254,24 +254,19 @@ impl Entity {
                 }
                 AbstractCausalRelation::StrictDescends { .. } => {
                     debug!("Descends - apply (attempt {})", attempt + 1);
-                    let new_head = event.id().into();
-                    // Atomic update: apply operations and set head under single lock
-                    {
-                        let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
-                        if state.head != head {
-                            debug!("Head changed during lineage comparison, retrying...");
-                            head = state.head.clone();
-                            continue;
-                        }
+                    let new_head: Clock = event.id().into();
+                    let event_id = event.id();
+                    if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
                         for (backend_name, operations) in event.operations.iter() {
-                            state.apply_operations_from_event(backend_name.clone(), operations, event.id())?;
+                            state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
                         }
-                        state.head = new_head;
+                        state.head = new_head.clone();
+                        Ok(())
+                    })? {
+                        self.broadcast.send(());
+                        return Ok(true);
                     }
-                    // Notify Signal subscribers about the change
-                    self.broadcast.send(());
-                    return Ok(true);
+                    continue;
                 }
                 AbstractCausalRelation::StrictAscends => {
                     // Incoming event is older than current state - no-op
