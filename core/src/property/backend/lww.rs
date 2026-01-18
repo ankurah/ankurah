@@ -6,11 +6,13 @@ use std::{
 };
 
 use ankurah_proto::{Event, EventId, Operation};
+use anyhow::anyhow;
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
+    event_dag::{CausalRelation, EventLayer},
     property::{backend::PropertyBackend, PropertyName, Value},
 };
 
@@ -87,24 +89,26 @@ impl PropertyBackend for LWWBackend {
     fn property_backend_name() -> &'static str { "lww" }
 
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
-        // Serialize with event_id for per-property conflict resolution after loading
+        // Serialize with required event_id for per-property conflict resolution after loading.
         let values = self.values.read().unwrap();
-        let serializable: BTreeMap<PropertyName, (Option<Value>, Option<EventId>)> =
-            values.iter().map(|(k, v)| (k.clone(), (v.value.clone(), v.event_id.clone()))).collect();
+        let mut serializable: BTreeMap<PropertyName, (Option<Value>, EventId)> = BTreeMap::new();
+        for (name, entry) in values.iter() {
+            let Some(event_id) = entry.event_id.clone() else {
+                return Err(StateError::SerializationError(Box::new(anyhow::anyhow!(
+                    "LWW state requires event_id for property {}",
+                    name
+                ))));
+            };
+            serializable.insert(name.clone(), (entry.value.clone(), event_id));
+        }
         let state_buffer = bincode::serialize(&serializable)?;
         Ok(state_buffer)
     }
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        // Try new format first (with event_id), fall back to legacy format
-        if let Ok(raw_map) = bincode::deserialize::<BTreeMap<PropertyName, (Option<Value>, Option<EventId>)>>(state_buffer) {
-            let map = raw_map.into_iter().map(|(k, (v, eid))| (k, ValueEntry { value: v, committed: true, event_id: eid })).collect();
-            return Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) });
-        }
-        // Fall back to legacy format (without event_id)
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
-        let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true, event_id: None })).collect();
+        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, (Option<Value>, EventId)>>(state_buffer)?;
+        let map = raw_map.into_iter().map(|(k, (v, eid))| (k, ValueEntry { value: v, committed: true, event_id: Some(eid) })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
@@ -138,24 +142,43 @@ impl PropertyBackend for LWWBackend {
         self.apply_operations_internal(operations, Some(event_id))
     }
 
-    fn apply_layer(&self, already_applied: &[&Event], to_apply: &[&Event], current_head: &[EventId]) -> Result<(), MutationError> {
-        // All events in this layer are concurrent (same causal depth from meet).
-        // For each property, determine winner by lexicographic EventId.
-        // Only apply values where winner is from to_apply.
+    fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), MutationError> {
+        #[derive(Clone)]
+        struct Candidate {
+            value: Option<Value>,
+            event_id: EventId,
+            from_to_apply: bool,
+        }
 
-        use std::collections::BTreeSet;
+        let mut winners: BTreeMap<PropertyName, Candidate> = BTreeMap::new();
 
-        // Build sets of event IDs for quick lookup
-        let to_apply_ids: BTreeSet<EventId> = to_apply.iter().map(|e| e.id()).collect();
-        let already_applied_ids: BTreeSet<EventId> = already_applied.iter().map(|e| e.id()).collect();
-        let current_head_ids: BTreeSet<EventId> = current_head.iter().cloned().collect();
+        // Seed with stored last-write candidates (required event_id).
+        {
+            let values = self.values.read().unwrap();
+            for (prop, entry) in values.iter() {
+                let Some(event_id) = entry.event_id.clone() else {
+                    return Err(MutationError::UpdateFailed(
+                        anyhow::anyhow!("LWW candidate missing event_id for property {}", prop).into(),
+                    ));
+                };
+                winners.insert(
+                    prop.clone(),
+                    Candidate {
+                        value: entry.value.clone(),
+                        event_id,
+                        from_to_apply: false,
+                    },
+                );
+            }
+        }
 
-        // Start with empty winners - layer events compete with each other first
-        let mut winners: BTreeMap<PropertyName, (Option<Value>, EventId)> = BTreeMap::new();
-
-        // Process all events (both already_applied and to_apply)
-        for event in already_applied.iter().chain(to_apply.iter()) {
-            // Extract LWW operations from this event
+        // Add candidates from events in this layer.
+        for (event, from_to_apply) in layer
+            .already_applied
+            .iter()
+            .map(|e| (e, false))
+            .chain(layer.to_apply.iter().map(|e| (e, true)))
+        {
             if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
                 for operation in operations {
                     let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
@@ -163,10 +186,24 @@ impl PropertyBackend for LWWBackend {
                         1 => {
                             let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
                             for (prop, value) in changes {
-                                // Check if this event wins for this property
-                                let dominated = winners.get(&prop).map(|(_, existing_id)| event.id() > *existing_id).unwrap_or(true);
-                                if dominated {
-                                    winners.insert(prop, (value, event.id()));
+                                let candidate = Candidate { value, event_id: event.id(), from_to_apply };
+                                if let Some(current) = winners.get_mut(&prop) {
+                                    let relation = layer.compare(&candidate.event_id, &current.event_id).map_err(|err| {
+                                        MutationError::UpdateFailed(Box::new(err))
+                                    })?;
+                                    match relation {
+                                        CausalRelation::Descends => {
+                                            *current = candidate;
+                                        }
+                                        CausalRelation::Ascends => {}
+                                        CausalRelation::Concurrent => {
+                                            if candidate.event_id > current.event_id {
+                                                *current = candidate;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    winners.insert(prop, candidate);
                                 }
                             }
                         }
@@ -178,54 +215,18 @@ impl PropertyBackend for LWWBackend {
             }
         }
 
-        // After processing layer events, check for values from concurrent tips
-        // not in this layer. Example: head=[B,C], event E extends B only.
-        // C's values are not in any layer but must still compete with E's values.
-        //
-        // We only consider values whose event_id is in the CURRENT HEAD but not
-        // in this layer. Ancestor values (like genesis) should not compete.
-        {
-            let values = self.values.read().unwrap();
-            for (prop, entry) in values.iter() {
-                if let Some(eid) = &entry.event_id {
-                    // Skip if this event is in the layer (already processed above)
-                    if already_applied_ids.contains(eid) || to_apply_ids.contains(eid) {
-                        continue;
-                    }
-                    // Only consider values from events in the current head
-                    // These are true concurrent tips, not ancestors
-                    if !current_head_ids.contains(eid) {
-                        continue;
-                    }
-                    // This value is from a concurrent tip not in this layer
-                    // It should compete with the layer winner for this property
-                    match winners.get(prop) {
-                        Some((_, winner_eid)) if eid > winner_eid => {
-                            // Concurrent tip wins - update winner
-                            winners.insert(prop.clone(), (entry.value.clone(), eid.clone()));
-                        }
-                        None => {
-                            // No layer event touched this property - concurrent tip wins by default
-                            winners.insert(prop.clone(), (entry.value.clone(), eid.clone()));
-                        }
-                        _ => {
-                            // Layer winner has higher EventId - keep it
-                        }
-                    }
-                }
-            }
-        }
-
-        // Apply winning values that come from to_apply events
+        // Apply winning values that come from to_apply events.
         let mut changed_fields = Vec::new();
         {
             let mut values = self.values.write().unwrap();
-            for (prop, (value, winner_id)) in winners {
-                if to_apply_ids.contains(&winner_id) {
-                    values.insert(prop.clone(), ValueEntry { value, committed: true, event_id: Some(winner_id) });
+            for (prop, candidate) in winners {
+                if candidate.from_to_apply {
+                    values.insert(
+                        prop.clone(),
+                        ValueEntry { value: candidate.value, committed: true, event_id: Some(candidate.event_id) },
+                    );
                     changed_fields.push(prop);
                 }
-                // Winner from already_applied or concurrent tip → already in state, no mutation needed
             }
         }
 

@@ -183,17 +183,12 @@ impl PropertyBackend for YrsBackend {
         Ok(())
     }
 
-    fn apply_layer(
-        &self,
-        _already_applied: &[&ankurah_proto::Event], // Ignored - CRDT handles idempotency
-        to_apply: &[&ankurah_proto::Event],
-        _current_head: &[ankurah_proto::EventId], // Ignored - CRDT doesn't need head info
-    ) -> Result<(), MutationError> {
+    fn apply_layer(&self, layer: &crate::event_dag::EventLayer<ankurah_proto::EventId, ankurah_proto::Event>) -> Result<(), MutationError> {
         // Order within layer doesn't matter for CRDTs - they're commutative.
         // Just apply all operations from to_apply events.
         let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
-        for event in to_apply {
+        for event in &layer.to_apply {
             // Extract Yrs operations from this event
             if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
                 for operation in operations {
