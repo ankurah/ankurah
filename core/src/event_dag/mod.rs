@@ -25,4 +25,4 @@ pub use navigator::{AccumulatingNavigator, AssertionRelation, AssertionResult, C
 pub use comparison::{compare, compare_unstored_event};
 
 // Layer computation
-pub use layers::{compute_ancestry, compute_layers, EventLayer};
+pub use layers::{compute_ancestry, compute_layers, CausalRelation, EventLayer};

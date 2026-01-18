@@ -1150,11 +1150,13 @@ async fn test_event_in_history_not_at_head() {
 
 #[cfg(test)]
 mod lww_layer_tests {
+    use crate::event_dag::EventLayer;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use crate::value::Value;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
+    use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     /// Create a test event with LWW operations.
     /// Uses a seed to create deterministic but different entity IDs for each event.
@@ -1177,6 +1179,26 @@ mod lww_layer_tests {
         }
     }
 
+    fn layer_from_refs_with_context(
+        already_applied: &[&Event],
+        to_apply: &[&Event],
+        context_events: &[&Event],
+    ) -> EventLayer<EventId, Event> {
+        let mut events = BTreeMap::new();
+        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
+            events.insert(event.id(), (*event).clone());
+        }
+        EventLayer::new_with_context(
+            already_applied.iter().map(|e| (*e).clone()).collect(),
+            to_apply.iter().map(|e| (*e).clone()).collect(),
+            Arc::new(events),
+        )
+    }
+
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+        layer_from_refs_with_context(already_applied, to_apply, &[])
+    }
+
     #[test]
     fn test_apply_layer_higher_event_id_wins() {
         let backend = LWWBackend::new();
@@ -1192,7 +1214,7 @@ mod lww_layer_tests {
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&event_a, &event_b];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Higher event_id should win
         assert_eq!(backend.get(&"x".into()), Some(Value::String(winner_value.into())));
@@ -1214,7 +1236,7 @@ mod lww_layer_tests {
         let already_applied: Vec<&Event> = vec![winner_event];
         let to_apply: Vec<&Event> = vec![loser_event];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Nothing should be set because winner is in already_applied
         // (already_applied values are already in state, we don't mutate for them)
@@ -1237,7 +1259,7 @@ mod lww_layer_tests {
         let already_applied: Vec<&Event> = vec![loser_event];
         let to_apply: Vec<&Event> = vec![winner_event];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // to_apply event should win and be applied
         assert_eq!(backend.get(&"x".into()), Some(Value::String(winner_value.into())));
@@ -1256,7 +1278,7 @@ mod lww_layer_tests {
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&event_a, &event_b];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // x: winner is determined by higher event ID
         let expected_x = if event_a.id() > event_b.id() { "x_from_a" } else { "x_from_b" };
@@ -1283,7 +1305,7 @@ mod lww_layer_tests {
         let already_applied: Vec<&Event> = vec![&event_a];
         let to_apply: Vec<&Event> = vec![&event_b, &event_c];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Winner should be set (if winner is in to_apply) or nothing (if winner is in already_applied)
         if winner_event.id() == event_a.id() {
@@ -1305,10 +1327,12 @@ mod lww_layer_tests {
 
 #[cfg(test)]
 mod yrs_layer_tests {
+    use crate::event_dag::EventLayer;
     use crate::property::backend::yrs::YrsBackend;
     use crate::property::backend::PropertyBackend;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
+    use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     /// Create a test event with Yrs text operations.
     /// Each text operation inserts the given string at position 0.
@@ -1329,6 +1353,26 @@ mod yrs_layer_tests {
         }
     }
 
+    fn layer_from_refs_with_context(
+        already_applied: &[&Event],
+        to_apply: &[&Event],
+        context_events: &[&Event],
+    ) -> EventLayer<EventId, Event> {
+        let mut events = BTreeMap::new();
+        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
+            events.insert(event.id(), (*event).clone());
+        }
+        EventLayer::new_with_context(
+            already_applied.iter().map(|e| (*e).clone()).collect(),
+            to_apply.iter().map(|e| (*e).clone()).collect(),
+            Arc::new(events),
+        )
+    }
+
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+        layer_from_refs_with_context(already_applied, to_apply, &[])
+    }
+
     #[test]
     fn test_yrs_apply_layer_concurrent_inserts() {
         let backend = YrsBackend::new();
@@ -1340,7 +1384,7 @@ mod yrs_layer_tests {
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&event_a, &event_b];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Both inserts should be applied (Yrs CRDT merges them)
         let result = backend.get_string("text").unwrap();
@@ -1356,7 +1400,7 @@ mod yrs_layer_tests {
         let event_a = make_yrs_event(1, "text", "hello");
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&event_a];
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         let initial_text = backend.get_string("text").unwrap();
         assert_eq!(initial_text, "hello");
@@ -1365,7 +1409,7 @@ mod yrs_layer_tests {
         let event_b = make_yrs_event(2, "text", "world");
         let already_applied: Vec<&Event> = vec![&event_a];
         let to_apply: Vec<&Event> = vec![&event_b];
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Only event_b should be applied again (if it wasn't already)
         // The text should contain "world" from event_b
@@ -1382,23 +1426,23 @@ mod yrs_layer_tests {
 
         // Order 1: A, B, C
         let backend1 = YrsBackend::new();
-        backend1.apply_layer(&[], &[&event_a], &[]).unwrap();
-        backend1.apply_layer(&[], &[&event_b], &[]).unwrap();
-        backend1.apply_layer(&[], &[&event_c], &[]).unwrap();
+        backend1.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
+        backend1.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
+        backend1.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
         let result1 = backend1.get_string("text").unwrap();
 
         // Order 2: C, A, B
         let backend2 = YrsBackend::new();
-        backend2.apply_layer(&[], &[&event_c], &[]).unwrap();
-        backend2.apply_layer(&[], &[&event_a], &[]).unwrap();
-        backend2.apply_layer(&[], &[&event_b], &[]).unwrap();
+        backend2.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
+        backend2.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
+        backend2.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
         let result2 = backend2.get_string("text").unwrap();
 
         // Order 3: B, C, A
         let backend3 = YrsBackend::new();
-        backend3.apply_layer(&[], &[&event_b], &[]).unwrap();
-        backend3.apply_layer(&[], &[&event_c], &[]).unwrap();
-        backend3.apply_layer(&[], &[&event_a], &[]).unwrap();
+        backend3.apply_layer(&layer_from_refs(&[], &[&event_b])).unwrap();
+        backend3.apply_layer(&layer_from_refs(&[], &[&event_c])).unwrap();
+        backend3.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
         let result3 = backend3.get_string("text").unwrap();
 
         // All results should be identical (CRDT convergence)
@@ -1417,7 +1461,7 @@ mod yrs_layer_tests {
         let already_applied: Vec<&Event> = vec![&event_a];
         let to_apply: Vec<&Event> = vec![];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Text should be unchanged (only "initial")
         let result = backend.get_string("text").unwrap();
@@ -1431,11 +1475,13 @@ mod yrs_layer_tests {
 
 #[cfg(test)]
 mod determinism_tests {
+    use crate::event_dag::EventLayer;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use crate::value::Value;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
+    use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
         let mut entity_id_bytes = [0u8; 16];
@@ -1455,6 +1501,26 @@ mod determinism_tests {
         }
     }
 
+    fn layer_from_refs_with_context(
+        already_applied: &[&Event],
+        to_apply: &[&Event],
+        context_events: &[&Event],
+    ) -> EventLayer<EventId, Event> {
+        let mut events = BTreeMap::new();
+        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
+            events.insert(event.id(), (*event).clone());
+        }
+        EventLayer::new_with_context(
+            already_applied.iter().map(|e| (*e).clone()).collect(),
+            to_apply.iter().map(|e| (*e).clone()).collect(),
+            Arc::new(events),
+        )
+    }
+
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+        layer_from_refs_with_context(already_applied, to_apply, &[])
+    }
+
     #[test]
     fn test_two_event_determinism() {
         // Create two concurrent events setting same property
@@ -1463,12 +1529,12 @@ mod determinism_tests {
 
         // Order 1: Apply A then B
         let backend1 = LWWBackend::new();
-        backend1.apply_layer(&[], &[&event_a, &event_b], &[]).unwrap();
+        backend1.apply_layer(&layer_from_refs(&[], &[&event_a, &event_b])).unwrap();
         let result1 = backend1.get(&"x".into());
 
         // Order 2: Apply B then A (as a single layer - order within layer shouldn't matter)
         let backend2 = LWWBackend::new();
-        backend2.apply_layer(&[], &[&event_b, &event_a], &[]).unwrap();
+        backend2.apply_layer(&layer_from_refs(&[], &[&event_b, &event_a])).unwrap();
         let result2 = backend2.get(&"x".into());
 
         // Both should produce same result (lexicographic winner)
@@ -1494,7 +1560,7 @@ mod determinism_tests {
         let mut results = Vec::new();
         for perm in &permutations {
             let backend = LWWBackend::new();
-            backend.apply_layer(&[], perm, &[]).unwrap();
+            backend.apply_layer(&layer_from_refs(&[], perm)).unwrap();
             results.push(backend.get(&"x".into()));
         }
 
@@ -1513,11 +1579,11 @@ mod determinism_tests {
 
         // Order 1
         let backend1 = LWWBackend::new();
-        backend1.apply_layer(&[], &[&event_a, &event_b, &event_c], &[]).unwrap();
+        backend1.apply_layer(&layer_from_refs(&[], &[&event_a, &event_b, &event_c])).unwrap();
 
         // Order 2 (reversed)
         let backend2 = LWWBackend::new();
-        backend2.apply_layer(&[], &[&event_c, &event_b, &event_a], &[]).unwrap();
+        backend2.apply_layer(&layer_from_refs(&[], &[&event_c, &event_b, &event_a])).unwrap();
 
         // Same final state for all properties
         assert_eq!(backend1.get(&"x".into()), backend2.get(&"x".into()));
@@ -1535,13 +1601,13 @@ mod determinism_tests {
 
         // Apply layer 1 then layer 2
         let backend1 = LWWBackend::new();
-        backend1.apply_layer(&[], &[&event_a, &event_b], &[]).unwrap();
-        backend1.apply_layer(&[&event_a, &event_b], &[&event_c, &event_d], &[]).unwrap();
+        backend1.apply_layer(&layer_from_refs(&[], &[&event_a, &event_b])).unwrap();
+        backend1.apply_layer(&layer_from_refs(&[&event_a, &event_b], &[&event_c, &event_d])).unwrap();
 
         // Apply layer 1 (reversed) then layer 2 (reversed)
         let backend2 = LWWBackend::new();
-        backend2.apply_layer(&[], &[&event_b, &event_a], &[]).unwrap();
-        backend2.apply_layer(&[&event_b, &event_a], &[&event_d, &event_c], &[]).unwrap();
+        backend2.apply_layer(&layer_from_refs(&[], &[&event_b, &event_a])).unwrap();
+        backend2.apply_layer(&layer_from_refs(&[&event_b, &event_a], &[&event_d, &event_c])).unwrap();
 
         // Final state should be the same
         assert_eq!(backend1.get(&"x".into()), backend2.get(&"x".into()));
@@ -1554,11 +1620,13 @@ mod determinism_tests {
 
 #[cfg(test)]
 mod edge_case_tests {
+    use crate::event_dag::EventLayer;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use crate::value::Value;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
+    use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
         let mut entity_id_bytes = [0u8; 16];
@@ -1578,16 +1646,36 @@ mod edge_case_tests {
         }
     }
 
+    fn layer_from_refs_with_context(
+        already_applied: &[&Event],
+        to_apply: &[&Event],
+        context_events: &[&Event],
+    ) -> EventLayer<EventId, Event> {
+        let mut events = BTreeMap::new();
+        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
+            events.insert(event.id(), (*event).clone());
+        }
+        EventLayer::new_with_context(
+            already_applied.iter().map(|e| (*e).clone()).collect(),
+            to_apply.iter().map(|e| (*e).clone()).collect(),
+            Arc::new(events),
+        )
+    }
+
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+        layer_from_refs_with_context(already_applied, to_apply, &[])
+    }
+
+    fn empty_layer() -> EventLayer<EventId, Event> { EventLayer::new_with_context(Vec::new(), Vec::new(), Arc::new(BTreeMap::new())) }
+
     #[test]
     fn test_empty_layer_application() {
         let backend = LWWBackend::new();
-        backend.set("x".into(), Some(Value::String("initial".into())));
+        let init_event = make_lww_event(1, vec![("x", "initial")]);
+        backend.apply_layer(&layer_from_refs(&[], &[&init_event])).unwrap();
 
         // Apply empty layer
-        let already_applied: Vec<&Event> = vec![];
-        let to_apply: Vec<&Event> = vec![];
-
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&empty_layer()).unwrap();
 
         // State should be unchanged
         assert_eq!(backend.get(&"x".into()), Some(Value::String("initial".into())));
@@ -1596,7 +1684,8 @@ mod edge_case_tests {
     #[test]
     fn test_event_with_no_lww_operations() {
         let backend = LWWBackend::new();
-        backend.set("x".into(), Some(Value::String("initial".into())));
+        let init_event = make_lww_event(1, vec![("x", "initial")]);
+        backend.apply_layer(&layer_from_refs(&[], &[&init_event])).unwrap();
 
         // Create an event with empty operations
         let entity_id = EntityId::from_bytes([99u8; 16]);
@@ -1610,7 +1699,7 @@ mod edge_case_tests {
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&empty_event];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs_with_context(&already_applied, &to_apply, &[&init_event])).unwrap();
 
         // State should be unchanged
         assert_eq!(backend.get(&"x".into()), Some(Value::String("initial".into())));
@@ -1628,7 +1717,7 @@ mod edge_case_tests {
         let already_applied: Vec<&Event> = vec![&event_a];
         let to_apply: Vec<&Event> = vec![&event_a];
 
-        backend.apply_layer(&already_applied, &to_apply, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&already_applied, &to_apply)).unwrap();
 
         // Event should be applied once (its value should be set)
         assert_eq!(backend.get(&"x".into()), Some(Value::String("value_a".into())));
@@ -1643,7 +1732,7 @@ mod edge_case_tests {
 
         let event_refs: Vec<&Event> = events.iter().collect();
 
-        backend.apply_layer(&[], &event_refs, &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&[], &event_refs)).unwrap();
 
         // Winner should be the one with highest EventId
         let winner_idx = events.iter().enumerate().max_by_key(|(_, e)| e.id()).map(|(i, _)| i).unwrap();
@@ -1655,7 +1744,8 @@ mod edge_case_tests {
     #[test]
     fn test_property_deletion() {
         let backend = LWWBackend::new();
-        backend.set("x".into(), Some(Value::String("initial".into())));
+        let init_event = make_lww_event(1, vec![("x", "initial")]);
+        backend.apply_layer(&layer_from_refs(&[], &[&init_event])).unwrap();
 
         // Create an event that deletes the property (sets to None)
         let mut entity_id_bytes = [0u8; 16];
@@ -1672,10 +1762,31 @@ mod edge_case_tests {
             operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
         };
 
-        backend.apply_layer(&[], &[&delete_event], &[]).unwrap();
+        backend.apply_layer(&layer_from_refs_with_context(&[], &[&delete_event], &[&init_event])).unwrap();
 
-        // Property should be deleted (None)
-        assert_eq!(backend.get(&"x".into()), None);
+        let expected = if delete_event.id() > init_event.id() {
+            None
+        } else {
+            Some(Value::String("initial".into()))
+        };
+        assert_eq!(backend.get(&"x".into()), expected);
+    }
+
+    #[test]
+    fn test_stored_last_write_competes() {
+        let backend = LWWBackend::new();
+        let init_event = make_lww_event(1, vec![("x", "initial")]);
+        backend.apply_layer(&layer_from_refs(&[], &[&init_event])).unwrap();
+
+        let challenger_event = make_lww_event(2, vec![("x", "challenger")]);
+        backend.apply_layer(&layer_from_refs_with_context(&[], &[&challenger_event], &[&init_event])).unwrap();
+
+        let expected = if challenger_event.id() > init_event.id() {
+            Some(Value::String("challenger".into()))
+        } else {
+            Some(Value::String("initial".into()))
+        };
+        assert_eq!(backend.get(&"x".into()), expected);
     }
 
     #[test]
@@ -1684,7 +1795,7 @@ mod edge_case_tests {
 
         let event_a = make_lww_event(1, vec![("x", "value_a")]);
 
-        backend.apply_layer(&[], &[&event_a], &[]).unwrap();
+        backend.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
 
         // The event_id should be tracked
         let tracked_id = backend.get_event_id(&"x".into());
