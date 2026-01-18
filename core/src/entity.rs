@@ -217,6 +217,7 @@ impl Entity {
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
     where G: CausalNavigator<EID = EventId, Event = Event> + Send + Sync {
+        tracing::info!("[TRACE-AE] apply_event called for entity={}, event_id={}, event_parent={}", self.id(), event.id(), event.parent);
         debug!("apply_event head: {event} to {self}");
 
         // Check for entity creation under the mutex to avoid TOCTOU race
@@ -349,6 +350,9 @@ impl Entity {
         Err(MutationError::TOCTOUAttemptsExhausted)
     }
 
+    // FIXME - apply_state needs a detailed doc comment about its semantics and usage
+    // for example, what does false mean?
+    // FIXME 2 - should we be applying the events in here rather than returning false?
     pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
     where G: CausalNavigator<EID = EventId, Event = Event> + Send + Sync {
         let mut head = self.head();
@@ -359,7 +363,12 @@ impl Entity {
         const COMPARISON_BUDGET: usize = 100;
 
         for attempt in 0..MAX_RETRIES {
-            match crate::event_dag::compare(getter, &new_head, &head, COMPARISON_BUDGET).await? {
+            let comparison_result = crate::event_dag::compare(getter, &new_head, &head, COMPARISON_BUDGET).await?;
+            tracing::info!(
+                "[TRACE-AS] apply_state comparing new_head={} vs current_head={}, result={:?}",
+                new_head, head, comparison_result
+            );
+            match comparison_result {
                 AbstractCausalRelation::Equal => {
                     debug!("{self} apply_state - heads are equal, skipping");
                     return Ok(false);
