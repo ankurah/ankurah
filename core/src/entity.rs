@@ -298,23 +298,19 @@ impl Entity {
                         }
 
                         // Apply layers in causal order
-                        let head_slice = head.as_slice();
                         for layer in &layers {
                             // Collect event references for already_applied and to_apply
-                            let already_applied: Vec<&Event> = layer.already_applied.iter().collect();
-                            let to_apply: Vec<&Event> = layer.to_apply.iter().collect();
-
                             // Apply to all backends
                             for (_backend_name, backend) in state.backends.iter() {
-                                backend.apply_layer(&already_applied, &to_apply, head_slice)?;
+                                backend.apply_layer(layer)?;
                             }
 
                             // Create backends for operations in to_apply events that don't exist yet
-                            for evt in &to_apply {
+                            for evt in &layer.to_apply {
                                 for (backend_name, _) in evt.operations.iter() {
                                     if !state.backends.contains_key(backend_name) {
                                         let backend = backend_from_string(backend_name, None)?;
-                                        backend.apply_layer(&already_applied, &to_apply, head_slice)?;
+                                        backend.apply_layer(layer)?;
                                         state.backends.insert(backend_name.clone(), backend);
                                     }
                                 }

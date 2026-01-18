@@ -4,7 +4,9 @@
 //! for organizing events into concurrency layers for unified backend application.
 
 use super::traits::{EventId, TClock, TEvent};
+use crate::error::RetrievalError;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// A layer of concurrent events for unified backend application.
 ///
@@ -13,16 +15,33 @@ use std::collections::{BTreeMap, BTreeSet};
 /// - `already_applied`: Events already in the current state (for context)
 /// - `to_apply`: Events that need to be processed
 #[derive(Debug, Clone)]
-pub struct EventLayer<E> {
+pub struct EventLayer<Id, E> {
     /// Events at this layer already in our state (for context/comparison).
     pub already_applied: Vec<E>,
     /// Events at this layer we need to process.
     pub to_apply: Vec<E>,
+    events: Arc<BTreeMap<Id, E>>,
 }
 
-impl<E> EventLayer<E> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CausalRelation {
+    Descends,
+    Ascends,
+    Concurrent,
+}
+
+impl<Id, E> EventLayer<Id, E>
+where
+    Id: EventId,
+    E: TEvent<Id = Id> + Clone,
+    E::Parent: TClock<Id = Id>,
+{
     /// Create a new empty layer.
-    pub fn new() -> Self { Self { already_applied: Vec::new(), to_apply: Vec::new() } }
+    pub fn new(events: Arc<BTreeMap<Id, E>>) -> Self { Self { already_applied: Vec::new(), to_apply: Vec::new(), events } }
+
+    pub fn new_with_context(already_applied: Vec<E>, to_apply: Vec<E>, events: Arc<BTreeMap<Id, E>>) -> Self {
+        Self { already_applied, to_apply, events }
+    }
 
     /// Check if this layer has any events to apply.
     pub fn has_work(&self) -> bool { !self.to_apply.is_empty() }
@@ -32,10 +51,35 @@ impl<E> EventLayer<E> {
 
     /// Check if layer is empty.
     pub fn is_empty(&self) -> bool { self.already_applied.is_empty() && self.to_apply.is_empty() }
+
+    /// Compare two event IDs using accumulated DAG context.
+    /// Returns Err if relation cannot be proven with available data.
+    pub fn compare(&self, a: &Id, b: &Id) -> Result<CausalRelation, RetrievalError> {
+        if a == b {
+            return Ok(CausalRelation::Descends);
+        }
+
+        let a_ancestry = collect_ancestry(&self.events, a)?;
+        let b_ancestry = collect_ancestry(&self.events, b)?;
+
+        if a_ancestry.contains(b) {
+            return Ok(CausalRelation::Descends);
+        }
+        if b_ancestry.contains(a) {
+            return Ok(CausalRelation::Ascends);
+        }
+
+        Ok(CausalRelation::Concurrent)
+    }
 }
 
-impl<E> Default for EventLayer<E> {
-    fn default() -> Self { Self::new() }
+impl<Id, E> Default for EventLayer<Id, E>
+where
+    Id: EventId,
+    E: TEvent<Id = Id> + Clone,
+    E::Parent: TClock<Id = Id>,
+{
+    fn default() -> Self { Self::new(Arc::new(BTreeMap::new())) }
 }
 
 /// Compute concurrency layers from a set of events.
@@ -56,13 +100,18 @@ impl<E> Default for EventLayer<E> {
 /// 3. Create layer if there are events to apply
 /// 4. Advance frontier to children whose parents are all processed
 /// 5. Repeat until frontier is empty
-pub fn compute_layers<Id, E>(events: &BTreeMap<Id, E>, meet: &[Id], current_head_ancestry: &BTreeSet<Id>) -> Vec<EventLayer<E>>
+pub fn compute_layers<Id, E>(
+    events: &BTreeMap<Id, E>,
+    meet: &[Id],
+    current_head_ancestry: &BTreeSet<Id>,
+) -> Vec<EventLayer<Id, E>>
 where
     Id: EventId,
     E: TEvent<Id = Id> + Clone,
     E::Parent: TClock<Id = Id>,
 {
     let mut layers = Vec::new();
+    let events = Arc::new(events.clone());
     let meet_set: BTreeSet<Id> = meet.iter().cloned().collect();
     let mut processed: BTreeSet<Id> = meet_set.clone();
 
@@ -86,7 +135,7 @@ where
 
         // Only create layer if there's something to apply
         if !to_apply.is_empty() {
-            layers.push(EventLayer { already_applied, to_apply });
+            layers.push(EventLayer::new_with_context(already_applied, to_apply, Arc::clone(&events)));
         }
 
         // Mark frontier as processed
@@ -95,7 +144,7 @@ where
         // Advance to next frontier: children whose parents are all processed
         frontier = frontier
             .iter()
-            .flat_map(|id| children_of(events, id))
+            .flat_map(|id| children_of(&events, id))
             .filter(|id| !processed.contains(id))
             .filter(|id| {
                 // Only include if all parents are processed
@@ -154,6 +203,32 @@ where
     }
 
     ancestry
+}
+
+fn collect_ancestry<Id, E>(events: &BTreeMap<Id, E>, start: &Id) -> Result<BTreeSet<Id>, RetrievalError>
+where
+    Id: EventId,
+    E: TEvent<Id = Id>,
+    E::Parent: TClock<Id = Id>,
+{
+    let mut ancestry = BTreeSet::new();
+    let mut frontier: Vec<Id> = vec![start.clone()];
+
+    while let Some(id) = frontier.pop() {
+        if !ancestry.insert(id.clone()) {
+            continue;
+        }
+        let event = events
+            .get(&id)
+            .ok_or_else(|| RetrievalError::Other(format!("missing event for ancestry lookup: {}", id)))?;
+        for parent in event.parent().members() {
+            if !ancestry.contains(parent) {
+                frontier.push(parent.clone());
+            }
+        }
+    }
+
+    Ok(ancestry)
 }
 
 #[cfg(test)]

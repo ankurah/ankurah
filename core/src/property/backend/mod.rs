@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
+use crate::event_dag::EventLayer;
 use crate::error::{MutationError, RetrievalError, StateError};
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
@@ -62,7 +63,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 
     /// Apply a layer of concurrent events.
     ///
-    /// All events in `already_applied` and `to_apply` are mutually concurrent
+    /// All events in `layer.already_applied` and `layer.to_apply` are mutually concurrent
     /// (same causal depth from meet). The backend receives ALL events for
     /// complete context, but only needs to mutate state for `to_apply` events.
     ///
@@ -73,15 +74,14 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// - Backend MUST implement this method (no default)
     ///
     /// # For LWW backends
-    /// Determine per-property winner by lexicographic EventId across all events
-    /// in the layer. Only apply values where winner is in `to_apply`.
-    /// Also considers values from concurrent tips (events in current_head that
-    /// are not in this layer) as potential winners.
+    /// Determine per-property winner by causal dominance among candidates,
+    /// using `layer.compare(...)` to decide causal relationship. Use
+    /// lexicographic EventId only for truly concurrent candidates.
     ///
     /// # For CRDT backends (Yrs)
     /// Apply all operations from `to_apply` events. Order within layer doesn't
     /// matter (CRDTs are commutative). Can ignore `already_applied` and `current_head`.
-    fn apply_layer(&self, already_applied: &[&Event], to_apply: &[&Event], current_head: &[EventId]) -> Result<(), MutationError>;
+    fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), MutationError>;
 
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
