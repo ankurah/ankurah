@@ -366,23 +366,19 @@ impl Entity {
                 }
                 AbstractCausalRelation::StrictDescends { .. } => {
                     debug!("{self} apply_state - new head descends from current, applying (attempt {})", attempt + 1);
-                    // Atomic update: apply state under lock with TOCTOU check
-                    {
-                        let mut es = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since comparison
-                        if es.head != head {
-                            debug!("Head changed during state comparison, retrying...");
-                            head = es.head.clone();
-                            continue;
-                        }
+                    let new_head = state.head.clone();
+                    if self.try_mutate(&mut head, |es| -> Result<(), MutationError> {
                         for (name, state_buffer) in state.state_buffers.iter() {
                             let backend = backend_from_string(name, Some(state_buffer))?;
                             es.backends.insert(name.to_owned(), backend);
                         }
-                        es.head = state.head.clone();
+                        es.head = new_head;
+                        Ok(())
+                    })? {
+                        self.broadcast.send(());
+                        return Ok(true);
                     }
-                    self.broadcast.send(());
-                    return Ok(true);
+                    continue;
                 }
                 AbstractCausalRelation::StrictAscends => {
                     // State is older than current - no-op
