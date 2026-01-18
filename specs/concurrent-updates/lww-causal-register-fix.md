@@ -3,7 +3,12 @@
 ## Summary
 The current LWWCausalRegister implementation filters competing values by `current_head` membership. This is insufficient because a property’s last write may belong to an event that is **not** a head tip (e.g., a later event on the same branch did not touch that property). As a result, concurrent updates can incorrectly overwrite the true last write for a property.
 
-This document specifies a fix: **always include per-property last-write candidates in competition**, and resolve dominance by causal relationship (lexicographic tie-break only when concurrent).
+This document specifies a fix: **always include per-property last-write candidates in competition**, and resolve dominance by causal relationship (lexicographic tie-break only when concurrent). If causal information is incomplete, **bail out** (do not apply).
+
+## Non-Legacy Requirement
+There is no representable legacy state for this backend.
+- The stored `event_id` for each property value is **required** (not `Option<_>`).
+- If a state buffer lacks event IDs, it must be rejected or upgraded before applying.
 
 ## Problem Statement
 Current behavior in `apply_layer`:
@@ -27,37 +32,76 @@ For each property:
 2. Determine causal dominance:
    - If candidate A descends from candidate B, A wins.
    - If candidate B descends from candidate A, B wins.
-3. If concurrent or incomparable, choose lexicographic max `EventId`.
+3. If concurrent, choose lexicographic max `EventId`.
+4. If causal relation cannot be determined with available DAG info, **bail out** (do not apply).
 
 ## Fix Strategy
 ### Core rule
 Always include the **stored per-property last-write value** as a candidate, regardless of head membership.
 
 ### Causal checks
-Use event DAG context (via accumulator/refactor) to determine causal relation between candidates. Lexicographic tie-break only when concurrent.
-
-### Required data
-At minimum, each stored property value must retain:
-- `event_id` (already present)
-
-To resolve causal relations without extra fetches, integrate with the **EventAccumulator** refactor so the layer application can query causal relationships for candidate pairs.
+Use event DAG context (via accumulator/refactor) to determine causal relation between candidates. Lexicographic tie-break only when concurrent. If relation is not provable with available data, **bail out**.
 
 ## Integration with EventAccumulator Refactor
-Proposed flow:
-1. `ComparisonResult` retains an `EventAccumulator` seeded with incoming events.
-2. `apply_layer` receives a `CausalAccessor` (from the accumulator) that can answer `relation(a, b)`.
-3. LWWCausalRegister evaluates candidates using causal dominance; only falls back to lexicographic if concurrent or unknown.
+The EventLayer should be tied to the accumulator embedded in `Comparison`, so the backend can compare candidates without external lookup.
 
-This avoids side-channel re-fetching and ensures deterministic application.
+### Proposed API shape (draft)
+```rust
+/// Comparison result that retains accumulated DAG context.
+pub struct ComparisonResult<Id, Ev> {
+    pub relation: AbstractCausalRelation<Id>,
+    accumulator: EventAccumulator<Id, Ev>,
+}
+
+impl<Id, Ev> ComparisonResult<Id, Ev> {
+    /// Build an iterator over causal layers (only valid for DivergedSince).
+    pub fn into_layers(self, current_head: &[Id]) -> Result<EventLayers<Id, Ev>, RetrievalError>;
+}
+
+/// Iterates over concurrency layers with access to causal comparison.
+pub struct EventLayers<Id, Ev> {
+    // owns accumulator + layer plan
+}
+
+impl<Id, Ev> EventLayers<Id, Ev> {
+    /// Fetch next layer; returns error if DAG info is insufficient.
+    pub async fn next_layer(&mut self) -> Result<Option<EventLayer<Id, Ev>>, RetrievalError>;
+}
+
+/// A concurrency layer, bound to the accumulator for causal comparisons.
+pub struct EventLayer<Id, Ev> {
+    pub already_applied: Vec<Ev>,
+    pub to_apply: Vec<Ev>,
+    // internal reference to accumulator context
+}
+
+impl<Id, Ev> EventLayer<Id, Ev> {
+    /// Compare two event IDs using accumulated DAG context.
+    /// Returns Err if relation cannot be proven with available data.
+    pub fn compare(&self, a: &Id, b: &Id) -> Result<CausalRelation, RetrievalError>;
+}
+
+pub enum CausalRelation {
+    Descends,
+    Ascends,
+    Concurrent,
+}
+```
+
+### LWWCausalRegister usage (sketch)
+For each property:
+1. Build candidate set: stored last-write event_id + any layer events touching that property.
+2. Reduce by repeated `EventLayer::compare` calls.
+3. If any comparison yields Err, bubble up and abort apply.
 
 ## Open Questions
-- Do we want to allow “unknown” relations (missing data) to default to lexicographic, or require fetches to confirm causality?
-- Do we need to include historical last-write candidates from earlier layers, or is “current stored last-write + layer events” sufficient?
-- Should causal checks be batched to reduce overhead in wide layers?
+- Should “insufficient DAG info” be a specific error type to trigger refetch/resume?
+- Should layer iteration guarantee all candidate event_ids are in the accumulator, or should LWW request backfill?
+- What is the expected behavior when `apply_state` receives a state buffer missing event IDs (reject vs migrate)?
 
 ## Test Plan
 Add tests that fail under current behavior:
 - `test_lww_last_write_not_head_competes`: last-write event not in head still competes and can win.
 - `test_lww_concurrent_lexicographic_fallback`: concurrent candidates resolve by EventId.
 - `test_lww_causal_descends_wins`: causal descendant wins even if lexicographic is lower.
-
+- `test_lww_insufficient_dag_bails`: missing DAG info aborts layer application.
