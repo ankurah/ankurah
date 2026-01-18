@@ -116,7 +116,7 @@ where
     let mut processed: BTreeSet<Id> = meet_set.clone();
 
     // Start with immediate children of meet
-    let mut frontier: BTreeSet<Id> = meet.iter().flat_map(|m| children_of(events, m)).collect();
+    let mut frontier: BTreeSet<Id> = meet.iter().flat_map(|m| children_of(&events, m)).collect();
 
     while !frontier.is_empty() {
         // Partition frontier into already_applied vs to_apply

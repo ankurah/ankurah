@@ -6,7 +6,6 @@ use std::{
 };
 
 use ankurah_proto::{Event, EventId, Operation};
-use anyhow::anyhow;
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
@@ -94,9 +93,9 @@ impl PropertyBackend for LWWBackend {
         let mut serializable: BTreeMap<PropertyName, (Option<Value>, EventId)> = BTreeMap::new();
         for (name, entry) in values.iter() {
             let Some(event_id) = entry.event_id.clone() else {
-                return Err(StateError::SerializationError(Box::new(anyhow::anyhow!(
-                    "LWW state requires event_id for property {}",
-                    name
+                return Err(StateError::SerializationError(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("LWW state requires event_id for property {}", name),
                 ))));
             };
             serializable.insert(name.clone(), (entry.value.clone(), event_id));

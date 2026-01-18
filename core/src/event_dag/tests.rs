@@ -1208,7 +1208,7 @@ mod lww_layer_tests {
         let event_b = make_lww_event(2, vec![("x", "value_b")]);
 
         // Determine which has higher ID (computed from content hash)
-        let (winner_value, loser_value) = if event_a.id() > event_b.id() { ("value_a", "value_b") } else { ("value_b", "value_a") };
+        let (winner_value, _loser_value) = if event_a.id() > event_b.id() { ("value_a", "value_b") } else { ("value_b", "value_a") };
 
         // Apply layer where both events are in to_apply
         let already_applied: Vec<&Event> = vec![];
