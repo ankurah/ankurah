@@ -48,6 +48,11 @@ async fn test_sled() -> Result<()> {
     observer.trigger();
     assert_eq!(render_watcher.take_one().await, "name: The rest of the bowl, year: 2024");
 
+    // TODO LATER - figure out how to best access the Active type on the View
+    //              until then we will not support this
+    // let _h2 = album.name().subscribe(w2);
+    // let _h3 = album.year().subscribe(w3);
+
     let trx2 = context.begin();
     let album_mut2 = album.edit(&trx2)?;
 
@@ -74,3 +79,9 @@ async fn test_sled() -> Result<()> {
 
     Ok(())
 }
+
+// After this:
+// 1. ensure that each ActiveValue (YrsString<T>, LWW<T>) keeps the AlbumView resident so it continues to receive updates made on the local node
+// 2. ensure that doing so doesn't leak memory by confirming that the AlbumView is dropped immediately after the YrsString<T> or LWW<T> is dropped.
+//    We will have to test this in the inter_node test because the only way to make edits on a single-node test is to keep the AlbumMut alive, which
+// invalidates the test, because that will continue to update the
