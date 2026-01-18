@@ -1,0 +1,151 @@
+  Comprehensive PR #201 Review: Concurrent Updates with Event DAG
+
+  Summary
+
+  This is a well-architected, thoroughly tested implementation of concurrent update handling using causal DAG comparison and per-property LWW conflict resolution. The code quality is high and the algorithm design is sound.
+
+  Recommendation: APPROVE with minor cleanup items
+
+  ---
+  Architecture Analysis
+
+  Core Algorithm (comparison.rs)
+
+  The dual-frontier backward BFS algorithm is elegant and correct:
+
+  - Simultaneous traversal from both clocks toward common ancestors
+  - Origin tracking for multi-head scenarios correctly propagates which comparison heads reach each node
+  - Forward chain building accumulates events during traversal, avoiding a second pass
+  - StrictAscends transformation in compare_unstored_event correctly handles the multi-head case where an event extends one tip of a multi-head clock
+
+  Layer Computation (layers.rs)
+
+  - Frontier expansion from meet correctly partitions events into already_applied vs to_apply
+  - Diamond reconvergence handled properly (events with multiple parents wait for all parents to be processed)
+  - Performance note: children_of is O(n) per parent - acceptable for typical event counts but could become a bottleneck for very large event maps
+
+  LWW Winner Determination (lww.rs)
+
+  The apply_layer logic is correct and handles all edge cases:
+  1. Higher EventId always wins (consistent tie-breaker)
+  2. Concurrent tips not in the layer are considered via current_head_ids check
+  3. Only winners from to_apply get written (already_applied winners are already in state)
+  4. Legacy state format compatibility is maintained
+
+  TOCTOU Pattern (entity.rs)
+
+  The retry pattern is sound:
+  - Read head outside lock → async comparison → acquire lock → re-check head → apply/retry
+  - 5 retries with 100 budget per attempt is reasonable for typical workloads
+
+  ---
+  Issues Found
+
+  1. Dead Code Introduced by PR
+  ┌───────────────────────────┬────────────────────────┬────────────────────────────────────────────────────────────┐
+  │           File            │         Symbol         │                           Issue                            │
+  ├───────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ entity.rs:197             │ try_mutate             │ Helper function defined but TOCTOU logic is inline instead │
+  ├───────────────────────────┼────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ subscription_state.rs:638 │ spawn_gap_filling_task │ Added in PR but never called                               │
+  └───────────────────────────┴────────────────────────┴────────────────────────────────────────────────────────────┘
+  Recommendation: Remove these or add #[allow(dead_code)] with explanation if intentionally kept for future use.
+
+  2. BudgetExceeded Has No Resumption Path
+
+  The spec mentions "Resume with frontiers" for BudgetExceeded, but there's no actual resumption mechanism implemented. The frontiers are returned, but the caller just returns an error.
+
+  Current behavior: Hard error if budget exceeded
+  Spec suggests: Should be able to resume with returned frontiers
+
+  This may be intentional if budget=100 is expected to be sufficient for all realistic scenarios. If so, document this explicitly.
+
+  3. Magic Constants
+
+  const MAX_RETRIES: usize = 5;
+  const COMPARISON_BUDGET: usize = 100;
+
+  These appear in both apply_event and apply_state. Consider:
+  - Moving to module-level constants
+  - Making configurable for different deployment scenarios
+  - Documenting the rationale for these values
+
+  4. Empty other_chain in StrictAscends Transformation
+
+  In compare_unstored_event lines 135-148, when transforming StrictAscends to DivergedSince, other_chain is empty. The comment explains this is handled conservatively by LWW, but:
+  - This relies on LWW's check for values from current_head_ids not in layer
+  - This coupling is subtle and could break if LWW logic changes
+  - Consider adding an explicit unit test documenting this interaction
+
+  ---
+  Performance Observations
+
+  Memory
+
+  - AccumulatingNavigator stores all traversed events in a BTreeMap<EventId, Event>
+  - Events are cloned into layers
+  - For deep DAGs, this could be significant
+
+  CPU
+
+  - children_of in layers.rs iterates all events for each parent lookup: O(n) per parent
+  - For typical event counts this is fine, but consider building a parent→children index for very large event maps
+
+  Budget
+
+  - Budget of 100 events per comparison seems reasonable
+  - Tests verify deep lineages (50+ events) don't exceed budget for StrictDescends cases
+
+  ---
+  Test Coverage Assessment
+
+  Excellent test coverage:
+  - 55 unit tests for event_dag module
+  - Multi-head scenarios: extends one tip, extends all tips, three-way concurrency
+  - Deep DAGs: 50-event chains, deep diamonds, asymmetric branches
+  - Determinism tests: Same events → same result regardless of arrival order
+  - Integration tests: LWW resolution, Yrs convergence, edge cases
+
+  Notable test cases:
+  - test_multihead_event_extends_one_tip - Critical for StrictAscends bug fix
+  - test_concurrent_transactions_long_lineage - Ensures no BudgetExceeded in normal scenarios
+  - test_lww_three_way_concurrent - Per-property resolution with 3+ concurrent events
+
+  ---
+  Pre-existing vs New Warnings
+
+  Pre-existing (NOT from this PR):
+  - broadcast_id in ankurah-signals
+  - IdParseError, relation in ankurah-proto
+  - root, is_simple in property_path.rs
+  - subscription_id in watcherset.rs
+  - is_empty, query_count, changes in candidate_changes.rs
+
+  New (introduced by this PR):
+  - try_mutate in entity.rs - dead code
+  - spawn_gap_filling_task in subscription_state.rs - dead code
+
+  ---
+  Final Checklist
+
+  - Algorithm correctness verified
+  - Edge cases handled (multi-head, deep DAGs, diamonds)
+  - TOCTOU race conditions handled
+  - Per-property LWW resolution correct
+  - Test coverage comprehensive
+  - All tests pass after rebase
+  - Dead code cleanup needed (2 functions)
+  - Magic constants could be better documented
+
+  ---
+  Verdict
+
+  APPROVE - This is production-quality code with excellent test coverage. The algorithm is sound and handles all the complex edge cases correctly.
+
+  Required before merge:
+  1. Remove dead code (try_mutate, spawn_gap_filling_task) or explicitly silence with comments
+
+  Optional improvements:
+  1. Document magic constants
+  2. Add test for empty other_chain in StrictAscends transformation
+  3. Consider BudgetExceeded resumption (or document why it's not needed)

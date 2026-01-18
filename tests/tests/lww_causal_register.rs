@@ -206,6 +206,103 @@ async fn test_lww_causal_descends_wins() -> Result<()> {
     Ok(())
 }
 
+/// Test: Stored ancestor not in DAG as key still works via cycle detection
+///
+/// When stored event A is an ancestor of layer event B, A appears in DAG only
+/// as a parent reference (dag[B] = [A]), not as a key. The algorithm should
+/// still correctly determine that B > A causally.
+#[tokio::test]
+async fn test_lww_stored_ancestor_not_in_dag_key() -> Result<()> {
+    use ankurah::core::event_dag::DagCausalContext;
+    use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
+    use ankurah::core::value::Value;
+    use ankurah::proto::{Clock, CollectionId, EntityId, Event, Operation, OperationSet};
+    use std::collections::BTreeMap;
+
+    fn make_lww_operation(title: &str) -> Operation {
+        use ankurah::core::value::Value;
+        use serde::{Deserialize, Serialize};
+        use std::collections::BTreeMap;
+        #[derive(Serialize, Deserialize)]
+        struct LWWDiff {
+            version: u8,
+            data: Vec<u8>,
+        }
+        let changes: BTreeMap<String, Option<Value>> =
+            [(String::from("title"), Some(Value::String(title.to_string())))]
+                .into_iter()
+                .collect();
+        let data = bincode::serialize(&changes).unwrap();
+        let diff = bincode::serialize(&LWWDiff { version: 1, data }).unwrap();
+        Operation { diff }
+    }
+
+    let collection = CollectionId::fixed_name("test");
+    let entity_id = EntityId::from_bytes([0u8; 16]);
+
+    // Genesis event (creates entity)
+    let genesis_event = Event {
+        collection: collection.clone(),
+        entity_id: entity_id.clone(),
+        operations: OperationSet(BTreeMap::new()),
+        parent: Clock::default(),
+    };
+    let genesis_id = genesis_event.id();
+
+    // Event A sets title (parent is genesis)
+    let event_a = Event {
+        collection: collection.clone(),
+        entity_id: entity_id.clone(),
+        operations: {
+            let mut ops = BTreeMap::new();
+            ops.insert("lww".to_string(), vec![make_lww_operation("Title-A")]);
+            OperationSet(ops)
+        },
+        parent: Clock::from(genesis_id.clone()),
+    };
+    let id_a = event_a.id();
+
+    // Event B updates title (parent is A)
+    let event_b = Event {
+        collection: collection.clone(),
+        entity_id: entity_id.clone(),
+        operations: {
+            let mut ops = BTreeMap::new();
+            ops.insert("lww".to_string(), vec![make_lww_operation("Title-B")]);
+            OperationSet(ops)
+        },
+        parent: Clock::from(id_a.clone()),
+    };
+    let id_b = event_b.id();
+
+    // DAG only contains B, not A or genesis (simulating partial DAG from layer)
+    // A appears only as a parent reference: dag[B] = [A]
+    let mut dag = BTreeMap::new();
+    dag.insert(id_b.clone(), vec![id_a.clone()]);
+    let context = DagCausalContext::new(&dag);
+
+    // Backend has stored value from A
+    let backend = LWWBackend::new();
+    backend.apply_operations_with_event(
+        event_a.operations.get("lww").unwrap(),
+        id_a.clone(),
+    )?;
+    assert_eq!(backend.get(&"title".to_string()), Some(Value::String("Title-A".to_string())));
+
+    // Apply B in a layer - A is stored but not in DAG as key
+    // Algorithm should determine B > A via cycle detection
+    backend.apply_layer_with_context(&[], &[&event_b], &[id_a.clone()], &context)?;
+
+    let title = backend.get(&"title".to_string());
+    assert_eq!(
+        title,
+        Some(Value::String("Title-B".to_string())),
+        "Layer event B should win over stored ancestor A even when A not in DAG as key"
+    );
+
+    Ok(())
+}
+
 /// Test: Missing DAG info causes InsufficientCausalInfo error
 #[tokio::test]
 async fn test_lww_insufficient_dag_bails() -> Result<()> {

@@ -367,32 +367,89 @@ impl LWWBackend {
         // Phase 1: Find dominated candidates
         // A candidate is dominated if another candidate descends from it
         let mut dominated = BTreeSet::new();
+        // Track discovered descent relationships to avoid redundant checks
+        // (i, j) in descends means candidate[i] descends from candidate[j]
+        let mut descends: BTreeSet<(usize, usize)> = BTreeSet::new();
+        // Track pairs that couldn't be determined from either direction
+        let mut undetermined: Vec<(usize, usize)> = Vec::new();
 
         for (i, (_, id_a)) in candidates.iter().enumerate() {
             for (j, (_, id_b)) in candidates.iter().enumerate() {
                 if i == j {
                     continue;
                 }
-                // Check if id_a is dominated by id_b (id_b descends from id_a)
+                // Skip if we've already determined the relationship from the reverse check
+                if descends.contains(&(i, j)) || descends.contains(&(j, i)) {
+                    continue;
+                }
+
+                // We're checking: does id_b descend from id_a? (does candidate[j] > candidate[i]?)
                 match context.is_descendant(id_b, id_a) {
                     Some(true) => {
                         // id_b > id_a causally, so id_a is dominated
                         dominated.insert(i);
+                        descends.insert((j, i)); // Record: j descends from i
                     }
                     Some(false) => {
                         // id_b does not descend from id_a
-                        // This could mean they're concurrent, or id_a > id_b
-                        // We'll check the reverse in another iteration
+                        // They might be concurrent, or id_a might descend from id_b
+                        // Try the reverse direction
+                        match context.is_descendant(id_a, id_b) {
+                            Some(true) => {
+                                // id_a > id_b causally, so id_b is dominated
+                                dominated.insert(j);
+                                descends.insert((i, j)); // Record: i descends from j
+                            }
+                            Some(false) => {
+                                // Neither descends from the other - they're concurrent
+                                // No action needed, lexicographic tiebreak will handle it
+                            }
+                            None => {
+                                // Couldn't determine reverse either
+                                // But since forward was Some(false), we know id_b does NOT
+                                // descend from id_a. That's enough info for this pair.
+                            }
+                        }
                     }
                     None => {
-                        // Cannot determine relationship - bail out
-                        return Err(MutationError::InsufficientCausalInfo {
-                            event_a: id_a.clone(),
-                            event_b: id_b.clone(),
-                        });
+                        // Couldn't determine from this direction - try reverse
+                        match context.is_descendant(id_a, id_b) {
+                            Some(true) => {
+                                // id_a > id_b causally, so id_b is dominated
+                                dominated.insert(j);
+                                descends.insert((i, j));
+                            }
+                            Some(false) => {
+                                // We know id_a does NOT descend from id_b
+                                // But forward was None - we don't know if id_b descends from id_a
+                                // This is ambiguous: could be concurrent (neither descends)
+                                // or id_b > id_a (but we couldn't prove it)
+                                // Mark as undetermined - require complete DAG info
+                                undetermined.push((i, j));
+                            }
+                            None => {
+                                // Truly cannot determine from either direction
+                                undetermined.push((i, j));
+                            }
+                        }
                     }
                 }
             }
+        }
+
+        // Check if any undetermined pairs can now be resolved via transitivity
+        for (i, j) in undetermined {
+            // If we've already determined one is dominated, skip
+            if dominated.contains(&i) || dominated.contains(&j) {
+                continue;
+            }
+            // If we still can't determine the relationship, bail out
+            let id_a = &candidates[i].1;
+            let id_b = &candidates[j].1;
+            return Err(MutationError::InsufficientCausalInfo {
+                event_a: id_a.clone(),
+                event_b: id_b.clone(),
+            });
         }
 
         // Phase 2: Collect non-dominated (concurrent) candidates
