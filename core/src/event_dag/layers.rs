@@ -59,13 +59,10 @@ where
             return Ok(CausalRelation::Descends);
         }
 
-        let a_ancestry = collect_ancestry(&self.events, a)?;
-        let b_ancestry = collect_ancestry(&self.events, b)?;
-
-        if a_ancestry.contains(b) {
+        if is_descendant(&self.events, a, b)? {
             return Ok(CausalRelation::Descends);
         }
-        if b_ancestry.contains(a) {
+        if is_descendant(&self.events, b, a)? {
             return Ok(CausalRelation::Ascends);
         }
 
@@ -205,30 +202,37 @@ where
     ancestry
 }
 
-fn collect_ancestry<Id, E>(events: &BTreeMap<Id, E>, start: &Id) -> Result<BTreeSet<Id>, RetrievalError>
+fn is_descendant<Id, E>(events: &BTreeMap<Id, E>, descendant: &Id, ancestor: &Id) -> Result<bool, RetrievalError>
 where
     Id: EventId,
     E: TEvent<Id = Id>,
     E::Parent: TClock<Id = Id>,
 {
-    let mut ancestry = BTreeSet::new();
-    let mut frontier: Vec<Id> = vec![start.clone()];
+    if descendant == ancestor {
+        return Ok(false);
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut frontier: Vec<Id> = vec![descendant.clone()];
 
     while let Some(id) = frontier.pop() {
-        if !ancestry.insert(id.clone()) {
+        if !visited.insert(id.clone()) {
             continue;
+        }
+        if &id == ancestor {
+            return Ok(true);
         }
         let event = events
             .get(&id)
             .ok_or_else(|| RetrievalError::Other(format!("missing event for ancestry lookup: {}", id)))?;
         for parent in event.parent().members() {
-            if !ancestry.contains(parent) {
+            if !visited.contains(parent) {
                 frontier.push(parent.clone());
             }
         }
     }
 
-    Ok(ancestry)
+    Ok(false)
 }
 
 #[cfg(test)]
