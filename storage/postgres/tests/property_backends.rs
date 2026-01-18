@@ -1,12 +1,11 @@
 mod common;
+
 use ankurah::{
     policy::DEFAULT_CONTEXT as c,
     property::{value::LWW, YrsString},
     Model, Node, PermissiveAgent, Property,
 };
-use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
-
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -25,15 +24,14 @@ pub struct Video {
     pub description: Option<String>,
     #[active_type(LWW)]
     pub visibility: Visibility,
-    /*#[active_type(PNCounter)]
-    pub views: i32,*/
     #[active_type(LWW)]
     pub attribution: Option<String>,
 }
 
 #[tokio::test]
-async fn property_backends() -> Result<()> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+async fn pg_property_backends() -> Result<()> {
+    let (_container, storage_engine) = common::create_postgres_container().await?;
+    let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context(c)?;
 
@@ -43,19 +41,25 @@ async fn property_backends() -> Result<()> {
             title: "Cat video #2918".into(),
             description: Some("Test".into()),
             visibility: Visibility::Public,
-            //views: 0,
             attribution: None,
         })
         .await?;
 
+    let _cat_video2 = trx
+        .create(&Video {
+            title: "Cat video #9000".into(),
+            description: None,
+            visibility: Visibility::Unlisted,
+            attribution: Some("That guy".into()),
+        })
+        .await?;
+
     let id = cat_video.id();
-    //cat_video.views.add(2); // FIXME: applying twice for some reason
     cat_video.visibility().set(&Visibility::Unlisted)?;
     cat_video.title().insert(15, " (Very cute)")?;
     trx.commit().await?;
 
     let video = ctx.get::<VideoView>(id).await?;
-    //assert_eq!(video.views().unwrap(), 1);
     assert_eq!(video.visibility().unwrap(), Visibility::Unlisted);
     assert_eq!(video.title().unwrap(), "Cat video #2918 (Very cute)");
 

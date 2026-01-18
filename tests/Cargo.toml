@@ -4,10 +4,6 @@ version = "0.7.15"
 edition = "2021"
 publish = false
 
-[features]
-default  = ["postgres"]
-postgres = ["ankurah-storage-postgres", "tokio-postgres", "bb8", "bb8-postgres"]
-
 [dependencies]
 anyhow                          = "1.0"
 tracing                         = "0.1"
@@ -18,14 +14,8 @@ ankurah-connector-local-process = { path = "../connectors/local-process", versio
 ankurah-websocket-client        = { path = "../connectors/websocket-client", version = "=0.7.15" }
 ankurah-websocket-server        = { path = "../connectors/websocket-server", version = "=0.7.15" }
 ankurah-storage-common          = { path = "../storage/common", version = "=0.7.15" }
-tokio-postgres                  = { version = "0.7", optional = true }
-ankurah-storage-postgres        = { path = "../storage/postgres", optional = true, version = "=0.7.15" }
-bb8                             = { version = "0.9", optional = true }
-bb8-postgres                    = { version = "0.9", optional = true }
 tokio                           = { version = "1.40", features = ["full"] }
 tracing-subscriber              = "0.3"
-testcontainers                  = { version = "0.23", features = ["reusable-containers"] }
-testcontainers-modules          = { version = "0.11.4", features = ["postgres"] }
 ctor                            = "0.2"
 wasm-bindgen                    = "0"
 js-sys                          = "0"

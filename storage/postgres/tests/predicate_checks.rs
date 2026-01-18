@@ -1,7 +1,7 @@
-//! Predicate Checks: Sled vs Filterable
+//! Predicate Checks: Postgres vs Filterable
 //!
-//! Verifies predicate evaluation consistency between storage backends and in-memory Filterable.
-//! Test cases loaded from `tests/predicate_cases.json`.
+//! Verifies predicate evaluation consistency between Postgres storage and in-memory Filterable.
+//! Test cases loaded from shared predicate_cases.json.
 
 mod common;
 
@@ -10,7 +10,6 @@ use ankurah::core::type_resolver::TypeResolver;
 use ankurah::core::value::Value;
 use ankurah::property::Json;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
-use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,7 +19,7 @@ use std::sync::Arc;
 // TEST CASE LOADING
 // =============================================================================
 
-const PREDICATE_CASES_JSON: &str = include_str!("../predicate_cases.json");
+const PREDICATE_CASES_JSON: &str = include_str!("../../../tests/predicate_cases.json");
 
 #[derive(Debug, Deserialize)]
 struct PredicateCases {
@@ -79,7 +78,6 @@ fn verify_filterable(case: &TestCase) {
         let f = MockFilterable::new("QueryTest").with_json("data", entity.data.clone());
         for exp in &case.expectations {
             let sel = ankql::parser::parse_selection(&exp.query).expect("parse");
-            // Apply type resolver to convert literals for JSON path comparisons
             let resolved_sel = type_resolver.resolve_selection_types(sel);
             let matches = evaluate_predicate(&f, &resolved_sel.predicate).unwrap_or(false);
             let should = exp.matches.contains(&entity.label);
@@ -99,13 +97,13 @@ pub struct QueryTest {
 }
 
 // =============================================================================
-// SLED PREDICATE CHECK
+// POSTGRES PREDICATE CHECK
 // =============================================================================
 
 #[tokio::test]
-async fn test_sled_predicate_checks() -> Result<()> {
+async fn test_postgres_predicate_checks() -> Result<()> {
     let cases = all_test_cases();
-    let storage = SledStorageEngine::new_test()?;
+    let (container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -125,8 +123,10 @@ async fn test_sled_predicate_checks() -> Result<()> {
             let results: Vec<QueryTestView> = ctx.fetch(exp.query.as_str()).await?;
             let mut actual: Vec<String> = results.iter().map(|r| r.label().unwrap()).collect();
             actual.sort();
-            assert_eq!(actual, expected, "[Sled] case={} query='{}'", case.name, exp.query);
+            assert_eq!(actual, expected, "[Postgres] case={} query='{}'", case.name, exp.query);
         }
     }
+
+    drop(container);
     Ok(())
 }

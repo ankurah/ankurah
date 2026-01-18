@@ -12,9 +12,7 @@
 //! - Cross-type comparisons return false (not error)
 //! - Float/int comparisons work correctly within numeric family
 
-#![cfg(feature = "postgres")]
-
-mod pg_common;
+mod common;
 
 use anyhow::Result;
 
@@ -44,7 +42,7 @@ async fn test_jsonb_numeric_comparison_is_numeric() -> Result<()> {
     // This test verifies that JSONB numeric comparison is numeric, NOT lexicographic.
     // If this were lexicographic, "9" > "10" would be true (because "9" > "1").
     // With proper numeric comparison, 9 > 10 is false.
-    let (container, _storage) = pg_common::create_postgres_container().await?;
+    let (container, _storage) = common::create_postgres_container().await?;
 
     // 9 > 10 should be FALSE (numeric comparison)
     let result = query_bool(&container, "SELECT '9'::jsonb > '10'::jsonb").await?;
@@ -64,7 +62,7 @@ async fn test_jsonb_numeric_comparison_is_numeric() -> Result<()> {
 #[tokio::test]
 async fn test_jsonb_string_comparison_is_lexicographic() -> Result<()> {
     // JSONB string comparisons are lexicographic (as expected for strings)
-    let (container, _storage) = pg_common::create_postgres_container().await?;
+    let (container, _storage) = common::create_postgres_container().await?;
 
     // "9" > "10" lexicographically (because '9' > '1')
     let result = query_bool(&container, r#"SELECT '"9"'::jsonb > '"10"'::jsonb"#).await?;
@@ -81,7 +79,7 @@ async fn test_jsonb_string_comparison_is_lexicographic() -> Result<()> {
 async fn test_jsonb_cross_type_comparison_returns_false() -> Result<()> {
     // Cross-type comparisons in JSONB return false (not error)
     // This is critical for our filter semantics where we want type mismatches to not match
-    let (container, _storage) = pg_common::create_postgres_container().await?;
+    let (container, _storage) = common::create_postgres_container().await?;
 
     // Number 9 should NOT equal string "9"
     let result = query_bool(&container, r#"SELECT '9'::jsonb = '"9"'::jsonb"#).await?;
@@ -101,7 +99,7 @@ async fn test_jsonb_cross_type_comparison_returns_false() -> Result<()> {
 #[tokio::test]
 async fn test_jsonb_float_int_comparison() -> Result<()> {
     // Float and int comparisons should work correctly within the numeric family
-    let (container, _storage) = pg_common::create_postgres_container().await?;
+    let (container, _storage) = common::create_postgres_container().await?;
 
     // 9 should equal 9.0
     let result = query_bool(&container, "SELECT '9'::jsonb = '9.0'::jsonb").await?;
@@ -121,7 +119,7 @@ async fn test_jsonb_float_int_comparison() -> Result<()> {
 #[tokio::test]
 async fn test_jsonb_null_comparison() -> Result<()> {
     // JSONB null comparisons
-    let (container, _storage) = pg_common::create_postgres_container().await?;
+    let (container, _storage) = common::create_postgres_container().await?;
 
     // null should equal null
     let result = query_bool(&container, "SELECT 'null'::jsonb = 'null'::jsonb").await?;
@@ -141,7 +139,7 @@ async fn test_jsonb_null_comparison() -> Result<()> {
 async fn test_jsonb_path_extraction_with_comparison() -> Result<()> {
     // Test that our actual query pattern works correctly
     // This simulates: data->'count' > '10'::jsonb
-    let (container, _storage) = pg_common::create_postgres_container().await?;
+    let (container, _storage) = common::create_postgres_container().await?;
 
     // Create a test with actual JSONB column extraction
     let result = query_bool(&container, r#"SELECT ('{"count": 9}'::jsonb)->'count' > '10'::jsonb"#).await?;

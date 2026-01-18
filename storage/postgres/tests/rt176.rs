@@ -1,6 +1,4 @@
-#![cfg(feature = "postgres")]
 mod common;
-mod pg_common;
 
 use ankurah::error::RetrievalError;
 use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Node, PermissiveAgent};
@@ -19,7 +17,7 @@ use std::sync::Arc;
 /// number of rows" error from `query_one`.
 #[tokio::test]
 async fn postgres_get_state_returns_entity_not_found() -> Result<()> {
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
+    let (_container, storage_engine) = common::create_postgres_container().await?;
 
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;

@@ -1,13 +1,8 @@
-#![cfg(feature = "postgres")]
 mod common;
-use anyhow::Result;
-use std::sync::Arc;
-mod pg_common;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use common::{
-    proto::{Attested, Event},
-    Album,
-};
+use anyhow::Result;
+use common::proto::{Attested, Event};
+use std::sync::Arc;
 
 /// RT165: PostgreSQL storage should be idempotent when inserting duplicate events
 ///
@@ -19,7 +14,7 @@ use common::{
 async fn postgres_duplicate_event_idempotency() -> Result<()> {
     use common::*;
 
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
+    let (_container, storage_engine) = create_postgres_container().await?;
 
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;

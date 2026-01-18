@@ -3,10 +3,7 @@
 //! Tests that queries referencing columns that don't exist yet are handled gracefully
 //! by treating missing columns as NULL via schema-based filtering.
 
-#![cfg(feature = "postgres")]
-
 mod common;
-mod pg_common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
 use anyhow::Result;
@@ -24,7 +21,7 @@ pub struct Task {
 /// Test that queries handle undefined columns in WHERE clause
 #[tokio::test]
 async fn test_undefined_column_in_where() -> Result<()> {
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
+    let (_container, storage_engine) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -40,7 +37,7 @@ async fn test_undefined_column_in_where() -> Result<()> {
 /// Test that queries handle undefined columns in ORDER BY clause
 #[tokio::test]
 async fn test_undefined_column_in_order_by() -> Result<()> {
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
+    let (_container, storage_engine) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -55,7 +52,7 @@ async fn test_undefined_column_in_order_by() -> Result<()> {
 /// Test WHERE on one missing column, ORDER BY on another (both handled upfront)
 #[tokio::test]
 async fn test_undefined_columns_where_and_order_by() -> Result<()> {
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
+    let (_container, storage_engine) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -71,7 +68,7 @@ async fn test_undefined_columns_where_and_order_by() -> Result<()> {
 /// Test that after writing data, subsequent queries work
 #[tokio::test]
 async fn test_columns_exist_after_write() -> Result<()> {
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
+    let (_container, storage_engine) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
@@ -93,7 +90,7 @@ async fn test_columns_exist_after_write() -> Result<()> {
 /// This validates that the schema cache gets refreshed when columns are added.
 #[tokio::test]
 async fn test_cache_refresh_after_column_creation() -> Result<()> {
-    let (_container, storage_engine) = pg_common::create_postgres_container().await?;
+    let (_container, storage_engine) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
