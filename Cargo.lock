@@ -338,6 +338,7 @@ dependencies = [
  "async-trait",
  "bb8",
  "bb8-postgres",
+ "bincode",
  "ctor 0.2.9",
  "itertools",
  "js-sys",

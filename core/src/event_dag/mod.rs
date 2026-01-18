@@ -4,6 +4,7 @@
 //! Attestations are handled at a higher layer - this code works only with
 //! causal assertions and event relationships.
 
+pub mod causal_context;
 pub mod comparison;
 pub mod frontier;
 pub mod layers;
@@ -17,6 +18,9 @@ pub mod traits;
 pub use frontier::{Frontier, FrontierState, TaintReason};
 pub use relation::AbstractCausalRelation;
 pub use traits::{EventId, TClock, TEvent};
+
+// Causal context
+pub use causal_context::{CausalContext, DagCausalContext, NoCausalContext};
 
 // Navigation
 pub use navigator::{AccumulatingNavigator, AssertionRelation, AssertionResult, CausalNavigator, NavigationStep};

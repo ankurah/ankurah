@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     sync::{Arc, Mutex, RwLock},
 };
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
+    event_dag::CausalContext,
     property::{backend::PropertyBackend, PropertyName, Value},
 };
 
@@ -240,6 +241,98 @@ impl PropertyBackend for LWWBackend {
         Ok(())
     }
 
+    fn apply_layer_with_context(
+        &self,
+        already_applied: &[&Event],
+        to_apply: &[&Event],
+        _current_head: &[EventId],
+        context: &dyn CausalContext,
+    ) -> Result<(), MutationError> {
+        // Build candidate set per property: event_id -> (value, event_id)
+        // Candidates include:
+        // 1. All layer events that touch each property
+        // 2. Stored per-property last-write values (if not already in layer)
+
+        let to_apply_ids: BTreeSet<EventId> = to_apply.iter().map(|e| e.id()).collect();
+
+        // Collect candidates from layer events
+        let mut candidates: BTreeMap<PropertyName, Vec<(Option<Value>, EventId)>> = BTreeMap::new();
+
+        for event in already_applied.iter().chain(to_apply.iter()) {
+            if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
+                for operation in operations {
+                    let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
+                    match version {
+                        1 => {
+                            let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
+                            for (prop, value) in changes {
+                                candidates.entry(prop).or_default().push((value, event.id()));
+                            }
+                        }
+                        version => {
+                            return Err(MutationError::UpdateFailed(
+                                anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into(),
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add stored per-property last-write values as candidates
+        {
+            let values = self.values.read().unwrap();
+            for (prop, entry) in values.iter() {
+                if let Some(stored_eid) = &entry.event_id {
+                    // Skip if this event is already in layer candidates for this property
+                    let already_candidate = candidates
+                        .get(prop)
+                        .map(|c| c.iter().any(|(_, id)| id == stored_eid))
+                        .unwrap_or(false);
+
+                    if !already_candidate {
+                        // Add stored value as candidate
+                        candidates
+                            .entry(prop.clone())
+                            .or_default()
+                            .push((entry.value.clone(), stored_eid.clone()));
+                    }
+                }
+            }
+        }
+
+        // Determine winners using causal context
+        let mut changed_fields = Vec::new();
+        {
+            let mut values = self.values.write().unwrap();
+
+            for (prop, prop_candidates) in candidates {
+                let winner = self.select_winner_with_context(&prop_candidates, context)?;
+
+                if let Some((value, winner_id)) = winner {
+                    // Only apply if winner is from to_apply
+                    if to_apply_ids.contains(&winner_id) {
+                        values.insert(
+                            prop.clone(),
+                            ValueEntry { value, committed: true, event_id: Some(winner_id) },
+                        );
+                        changed_fields.push(prop);
+                    }
+                }
+            }
+        }
+
+        // Notify subscribers
+        let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
+        for field_name in changed_fields {
+            if let Some(broadcast) = field_broadcasts.get(&field_name) {
+                broadcast.send(());
+            }
+        }
+
+        Ok(())
+    }
+
     fn listen_field(&self, field_name: &PropertyName, listener: Listener) -> ankurah_signals::signal::ListenerGuard {
         // Get or create the broadcast for this field
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
@@ -251,6 +344,71 @@ impl PropertyBackend for LWWBackend {
 }
 
 impl LWWBackend {
+    /// Select winner from candidates using causal context.
+    ///
+    /// Algorithm:
+    /// 1. Filter dominated: Remove any candidate that is an ancestor of another candidate
+    /// 2. Remaining are concurrent: All survivors are mutually concurrent
+    /// 3. Lexicographic tiebreak: Pick max EventId among survivors
+    ///
+    /// Returns Err if causal relationship cannot be determined.
+    fn select_winner_with_context(
+        &self,
+        candidates: &[(Option<Value>, EventId)],
+        context: &dyn CausalContext,
+    ) -> Result<Option<(Option<Value>, EventId)>, MutationError> {
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        if candidates.len() == 1 {
+            return Ok(Some(candidates[0].clone()));
+        }
+
+        // Phase 1: Find dominated candidates
+        // A candidate is dominated if another candidate descends from it
+        let mut dominated = BTreeSet::new();
+
+        for (i, (_, id_a)) in candidates.iter().enumerate() {
+            for (j, (_, id_b)) in candidates.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                // Check if id_a is dominated by id_b (id_b descends from id_a)
+                match context.is_descendant(id_b, id_a) {
+                    Some(true) => {
+                        // id_b > id_a causally, so id_a is dominated
+                        dominated.insert(i);
+                    }
+                    Some(false) => {
+                        // id_b does not descend from id_a
+                        // This could mean they're concurrent, or id_a > id_b
+                        // We'll check the reverse in another iteration
+                    }
+                    None => {
+                        // Cannot determine relationship - bail out
+                        return Err(MutationError::InsufficientCausalInfo {
+                            event_a: id_a.clone(),
+                            event_b: id_b.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Collect non-dominated (concurrent) candidates
+        let concurrent: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !dominated.contains(i))
+            .map(|(_, c)| c.clone())
+            .collect();
+
+        // Phase 3: Lexicographic tiebreak among concurrent candidates
+        let winner = concurrent.into_iter().max_by_key(|(_, id)| id.clone());
+
+        Ok(winner)
+    }
+
     /// Get the broadcast ID for a specific field, creating the broadcast if necessary
     pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");

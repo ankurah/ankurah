@@ -8,6 +8,7 @@ pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
 use crate::error::{MutationError, RetrievalError, StateError};
+use crate::event_dag::CausalContext;
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -82,6 +83,33 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Apply all operations from `to_apply` events. Order within layer doesn't
     /// matter (CRDTs are commutative). Can ignore `already_applied` and `current_head`.
     fn apply_layer(&self, already_applied: &[&Event], to_apply: &[&Event], current_head: &[EventId]) -> Result<(), MutationError>;
+
+    /// Apply a layer of concurrent events with causal context.
+    ///
+    /// This is an enhanced version of `apply_layer` that provides causal context
+    /// for determining relationships between events. This is required for correct
+    /// LWW semantics when stored property values may come from events not in the
+    /// current head.
+    ///
+    /// # For LWW backends
+    /// Uses causal context to determine if stored per-property last-write values
+    /// should compete with layer events. A stored value competes if its event is
+    /// concurrent with (not dominated by) any layer event touching that property.
+    ///
+    /// # For CRDT backends (Yrs)
+    /// Can ignore the causal context - CRDTs handle concurrency internally.
+    /// Default implementation calls `apply_layer` ignoring the context.
+    fn apply_layer_with_context(
+        &self,
+        already_applied: &[&Event],
+        to_apply: &[&Event],
+        current_head: &[EventId],
+        _context: &dyn CausalContext,
+    ) -> Result<(), MutationError> {
+        // Default: ignore context, use legacy behavior
+        // LWWBackend overrides this with proper causal handling
+        self.apply_layer(already_applied, to_apply, current_head)
+    }
 
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
