@@ -132,8 +132,9 @@ where
         // Add the event to storage first
         storage.add_event(&event.into()).await?;
 
-        // Update the entity's head clock
-        system_entity.commit_head(root.clone());
+        // Apply the creation event so LWW values are tagged with event_id before serialization.
+        let retriever = LocalRetriever::new(storage.clone());
+        system_entity.apply_event(&retriever, &event).await?;
         // Now get the entity state after the head is updated
         let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
         storage.set_state(attested_state.clone()).await?;
