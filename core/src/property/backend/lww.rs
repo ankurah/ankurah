@@ -18,11 +18,27 @@ use crate::{
 const LWW_DIFF_VERSION: u8 = 1;
 
 #[derive(Clone, Debug)]
-struct ValueEntry {
-    value: Option<Value>,
-    committed: bool,
-    /// The event that wrote this value (None for uncommitted local changes)
-    event_id: Option<EventId>,
+enum ValueEntry {
+    Uncommitted { value: Option<Value> },
+    Pending { value: Option<Value> },
+    Committed { value: Option<Value>, event_id: EventId },
+}
+
+impl ValueEntry {
+    fn value(&self) -> Option<Value> {
+        match self {
+            ValueEntry::Uncommitted { value } => value.clone(),
+            ValueEntry::Pending { value } => value.clone(),
+            ValueEntry::Committed { value, .. } => value.clone(),
+        }
+    }
+
+    fn event_id(&self) -> Option<EventId> {
+        match self {
+            ValueEntry::Committed { event_id, .. } => Some(event_id.clone()),
+            ValueEntry::Uncommitted { .. } | ValueEntry::Pending { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -38,6 +54,12 @@ pub struct LWWDiff {
     data: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CommittedEntry {
+    value: Option<Value>,
+    event_id: EventId,
+}
+
 impl Default for LWWBackend {
     fn default() -> Self { Self::new() }
 }
@@ -47,12 +69,12 @@ impl LWWBackend {
 
     pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
         let mut values = self.values.write().unwrap();
-        values.insert(property_name, ValueEntry { value, committed: false, event_id: None });
+        values.insert(property_name, ValueEntry::Uncommitted { value });
     }
 
     pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
         let values = self.values.read().unwrap();
-        values.get(property_name).and_then(|entry| entry.value.clone())
+        values.get(property_name).and_then(|entry| entry.value())
     }
 }
 
@@ -82,7 +104,7 @@ impl PropertyBackend for LWWBackend {
 
     fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
         let values = self.values.read().unwrap();
-        values.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect()
+        values.iter().map(|(k, v)| (k.clone(), v.value())).collect()
     }
 
     fn property_backend_name() -> &'static str { "lww" }
@@ -90,15 +112,15 @@ impl PropertyBackend for LWWBackend {
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         // Serialize with required event_id for per-property conflict resolution after loading.
         let values = self.values.read().unwrap();
-        let mut serializable: BTreeMap<PropertyName, (Option<Value>, EventId)> = BTreeMap::new();
+        let mut serializable: BTreeMap<PropertyName, CommittedEntry> = BTreeMap::new();
         for (name, entry) in values.iter() {
-            let Some(event_id) = entry.event_id.clone() else {
+            let Some(event_id) = entry.event_id() else {
                 return Err(StateError::SerializationError(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("LWW state requires event_id for property {}", name),
                 ))));
             };
-            serializable.insert(name.clone(), (entry.value.clone(), event_id));
+            serializable.insert(name.clone(), CommittedEntry { value: entry.value(), event_id });
         }
         let state_buffer = bincode::serialize(&serializable)?;
         Ok(state_buffer)
@@ -106,8 +128,9 @@ impl PropertyBackend for LWWBackend {
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, (Option<Value>, EventId)>>(state_buffer)?;
-        let map = raw_map.into_iter().map(|(k, (v, eid))| (k, ValueEntry { value: v, committed: true, event_id: Some(eid) })).collect();
+        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, CommittedEntry>>(state_buffer)?;
+        let map =
+            raw_map.into_iter().map(|(k, entry)| (k, ValueEntry::Committed { value: entry.value, event_id: entry.event_id })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
@@ -116,10 +139,12 @@ impl PropertyBackend for LWWBackend {
         let mut changed_values = BTreeMap::new();
 
         for (name, entry) in values.iter_mut() {
-            if !entry.committed {
-                changed_values.insert(name.clone(), entry.value.clone());
-                entry.committed = true;
-            }
+            let ValueEntry::Uncommitted { value } = entry else {
+                continue;
+            };
+            let value = value.clone();
+            changed_values.insert(name.clone(), value.clone());
+            *entry = ValueEntry::Pending { value };
         }
 
         if changed_values.is_empty() {
@@ -155,12 +180,12 @@ impl PropertyBackend for LWWBackend {
         {
             let values = self.values.read().unwrap();
             for (prop, entry) in values.iter() {
-                let Some(event_id) = entry.event_id.clone() else {
+                let Some(event_id) = entry.event_id() else {
                     return Err(MutationError::UpdateFailed(
                         anyhow::anyhow!("LWW candidate missing event_id for property {}", prop).into(),
                     ));
                 };
-                winners.insert(prop.clone(), Candidate { value: entry.value.clone(), event_id, from_to_apply: false });
+                winners.insert(prop.clone(), Candidate { value: entry.value(), event_id, from_to_apply: false });
             }
         }
 
@@ -211,7 +236,7 @@ impl PropertyBackend for LWWBackend {
             let mut values = self.values.write().unwrap();
             for (prop, candidate) in winners {
                 if candidate.from_to_apply {
-                    values.insert(prop.clone(), ValueEntry { value: candidate.value, committed: true, event_id: Some(candidate.event_id) });
+                    values.insert(prop.clone(), ValueEntry::Committed { value: candidate.value, event_id: candidate.event_id });
                     changed_fields.push(prop);
                 }
             }
@@ -249,7 +274,7 @@ impl LWWBackend {
     /// Get the event_id that last wrote a property value (if tracked).
     pub fn get_event_id(&self, property_name: &PropertyName) -> Option<EventId> {
         let values = self.values.read().unwrap();
-        values.get(property_name).and_then(|entry| entry.event_id.clone())
+        values.get(property_name).and_then(|entry| entry.event_id())
     }
     /// Internal implementation that handles both tracked and untracked operations.
     fn apply_operations_internal(&self, operations: &[Operation], event_id: Option<EventId>) -> Result<(), MutationError> {
@@ -263,8 +288,11 @@ impl LWWBackend {
 
                     let mut values = self.values.write().unwrap();
                     for (property_name, new_value) in changes {
-                        // Insert as committed entry since this came from an operation
-                        values.insert(property_name.clone(), ValueEntry { value: new_value, committed: true, event_id: event_id.clone() });
+                        let entry = match event_id.clone() {
+                            Some(event_id) => ValueEntry::Committed { value: new_value, event_id },
+                            None => ValueEntry::Pending { value: new_value },
+                        };
+                        values.insert(property_name.clone(), entry);
                         changed_fields.push(property_name);
                     }
                 }
