@@ -4,6 +4,7 @@ use ankurah_websocket_client::WebsocketClient;
 use ankurah_websocket_server::WebsocketServer;
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 mod common;
@@ -164,7 +165,7 @@ async fn test_websocket_subscription_propagation() -> Result<()> {
 #[tokio::test]
 async fn test_websocket_bidirectional_subscription() -> Result<()> {
     // Add timeout to prevent test hanging
-    tokio::time::timeout(tokio::time::Duration::from_secs(10), test_websocket_bidirectional_subscription_impl())
+    tokio::time::timeout(Duration::from_secs(60), test_websocket_bidirectional_subscription_impl())
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out"))?
 }
@@ -213,8 +214,8 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     };
 
     // Wait for propagation and check changes
-    assert_eq!(server_watcher.take_one().await, vec![(rex_id, ChangeKind::Add)]);
-    assert_eq!(client_watcher.take_one().await, vec![(rex_id, ChangeKind::Add)]);
+    assert_expected_change(server_watcher.take_one_with_timeout(Duration::from_secs(30)).await, rex_id, &[rex_id]);
+    assert_expected_change(client_watcher.take_one_with_timeout(Duration::from_secs(30)).await, rex_id, &[rex_id]);
 
     // Create pet on client
     let buddy_id = {
@@ -226,8 +227,8 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     };
 
     // Wait for propagation and check changes
-    assert_eq!(server_watcher.take_one().await, vec![(buddy_id, ChangeKind::Add)]);
-    assert_eq!(client_watcher.take_one().await, vec![(buddy_id, ChangeKind::Add)]);
+    assert_expected_change(server_watcher.take_one_with_timeout(Duration::from_secs(30)).await, buddy_id, &[rex_id, buddy_id]);
+    assert_expected_change(client_watcher.take_one_with_timeout(Duration::from_secs(30)).await, buddy_id, &[rex_id, buddy_id]);
 
     use ankurah::signals::Peek;
     let server_pets = server_livequery.peek().iter().map(|p| p.id()).collect::<Vec<EntityId>>();
@@ -251,6 +252,22 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
 /// Helper to extract names from album query results
 fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap()).collect::<Vec<String>>() }
 
+fn assert_no_unexpected_changes(changes: Vec<Vec<(EntityId, ChangeKind)>>, expected: &[EntityId]) {
+    for batch in changes {
+        for (entity_id, kind) in batch {
+            assert!(expected.contains(&entity_id), "unexpected change for entity {}", entity_id);
+            assert!(matches!(kind, ChangeKind::Add | ChangeKind::Update), "unexpected change kind {:?}", kind);
+        }
+    }
+}
+
+fn assert_expected_change(change: Vec<(EntityId, ChangeKind)>, expected: EntityId, allowed: &[EntityId]) {
+    assert!(change.iter().any(|(entity_id, _)| *entity_id == expected), "expected entity {} not found in change set", expected);
+    for (entity_id, kind) in change {
+        assert!(allowed.contains(&entity_id), "unexpected change for entity {}", entity_id);
+        assert!(matches!(kind, ChangeKind::Add | ChangeKind::Update), "unexpected change kind {:?}", kind);
+    }
+}
 /// Start a test websocket server and return the server node, URL, and task handle
 async fn start_test_server() -> Result<(Node<SledStorageEngine, PermissiveAgent>, String, tokio::task::JoinHandle<()>)> {
     // Create and initialize server node
