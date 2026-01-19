@@ -143,6 +143,25 @@ impl<T, U> TestWatcher<T, U> {
         }
     }
 
+    #[track_caller]
+    pub async fn take_one_with_timeout(&self, timeout: Duration) -> U {
+        let caller = std::panic::Location::caller();
+        let _success = self.wait_for_count(1, Some(timeout)).await;
+        let mut changes = self.changes.lock().unwrap();
+        if changes.is_empty() {
+            panic!(
+                "take_one_with_timeout() timed out waiting for items (waited {:?}, got {} items) at {}:{}:{}",
+                timeout,
+                changes.len(),
+                caller.file(),
+                caller.line(),
+                caller.column()
+            );
+        }
+        let item = changes.remove(0);
+        (self.transform)(item)
+    }
+
     /// Waits 100ms for any additional items, then returns the count (useful for asserting quiescence)
     pub async fn quiesce(&self) -> usize {
         tokio::time::sleep(Duration::from_millis(100)).await;
