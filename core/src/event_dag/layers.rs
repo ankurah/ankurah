@@ -97,11 +97,7 @@ where
 /// 3. Create layer if there are events to apply
 /// 4. Advance frontier to children whose parents are all processed
 /// 5. Repeat until frontier is empty
-pub fn compute_layers<Id, E>(
-    events: &BTreeMap<Id, E>,
-    meet: &[Id],
-    current_head_ancestry: &BTreeSet<Id>,
-) -> Vec<EventLayer<Id, E>>
+pub fn compute_layers<Id, E>(events: &BTreeMap<Id, E>, meet: &[Id], current_head_ancestry: &BTreeSet<Id>) -> Vec<EventLayer<Id, E>>
 where
     Id: EventId,
     E: TEvent<Id = Id> + Clone,
@@ -222,9 +218,7 @@ where
         if &id == ancestor {
             return Ok(true);
         }
-        let event = events
-            .get(&id)
-            .ok_or_else(|| RetrievalError::Other(format!("missing event for ancestry lookup: {}", id)))?;
+        let event = events.get(&id).ok_or_else(|| RetrievalError::Other(format!("missing event for ancestry lookup: {}", id)))?;
         for parent in event.parent().members() {
             if !visited.contains(parent) {
                 frontier.push(parent.clone());

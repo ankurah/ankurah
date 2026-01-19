@@ -362,7 +362,9 @@ impl Entity {
             let comparison_result = crate::event_dag::compare(getter, &new_head, &head, COMPARISON_BUDGET).await?;
             tracing::info!(
                 "[TRACE-AS] apply_state comparing new_head={} vs current_head={}, result={:?}",
-                new_head, head, comparison_result
+                new_head,
+                head,
+                comparison_result
             );
             match comparison_result {
                 AbstractCausalRelation::Equal => {

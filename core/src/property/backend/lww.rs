@@ -160,24 +160,12 @@ impl PropertyBackend for LWWBackend {
                         anyhow::anyhow!("LWW candidate missing event_id for property {}", prop).into(),
                     ));
                 };
-                winners.insert(
-                    prop.clone(),
-                    Candidate {
-                        value: entry.value.clone(),
-                        event_id,
-                        from_to_apply: false,
-                    },
-                );
+                winners.insert(prop.clone(), Candidate { value: entry.value.clone(), event_id, from_to_apply: false });
             }
         }
 
         // Add candidates from events in this layer.
-        for (event, from_to_apply) in layer
-            .already_applied
-            .iter()
-            .map(|e| (e, false))
-            .chain(layer.to_apply.iter().map(|e| (e, true)))
-        {
+        for (event, from_to_apply) in layer.already_applied.iter().map(|e| (e, false)).chain(layer.to_apply.iter().map(|e| (e, true))) {
             if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
                 for operation in operations {
                     let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
@@ -223,10 +211,7 @@ impl PropertyBackend for LWWBackend {
             let mut values = self.values.write().unwrap();
             for (prop, candidate) in winners {
                 if candidate.from_to_apply {
-                    values.insert(
-                        prop.clone(),
-                        ValueEntry { value: candidate.value, committed: true, event_id: Some(candidate.event_id) },
-                    );
+                    values.insert(prop.clone(), ValueEntry { value: candidate.value, committed: true, event_id: Some(candidate.event_id) });
                     changed_fields.push(prop);
                 }
             }

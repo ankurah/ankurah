@@ -1764,11 +1764,7 @@ mod edge_case_tests {
 
         backend.apply_layer(&layer_from_refs_with_context(&[], &[&delete_event], &[&init_event])).unwrap();
 
-        let expected = if delete_event.id() > init_event.id() {
-            None
-        } else {
-            Some(Value::String("initial".into()))
-        };
+        let expected = if delete_event.id() > init_event.id() { None } else { Some(Value::String("initial".into())) };
         assert_eq!(backend.get(&"x".into()), expected);
     }
 

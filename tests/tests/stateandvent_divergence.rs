@@ -1,5 +1,5 @@
 mod common;
-use ankurah::{policy::DEFAULT_CONTEXT, Node, PermissiveAgent, core::node::nocache};
+use ankurah::{core::node::nocache, policy::DEFAULT_CONTEXT, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
@@ -91,12 +91,10 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
     // If the bug is present, ephemeral will only have its own change (B) and not D's change (C)
     let final_e = ctx_e.get::<RecordView>(record_id).await?;
 
+    assert_eq!(final_e.title().unwrap(), "Title-from-E", "Ephemeral should have its own title change");
     assert_eq!(
-        final_e.title().unwrap(), "Title-from-E",
-        "Ephemeral should have its own title change"
-    );
-    assert_eq!(
-        final_e.artist().unwrap(), "Artist-from-D",
+        final_e.artist().unwrap(),
+        "Artist-from-D",
         "BUG CHECK: Ephemeral should have D's artist change via StateAndEvent divergence handling"
     );
 
@@ -191,16 +189,10 @@ async fn test_two_ephemeral_divergence_subscription() -> Result<()> {
 
     // Ephemeral1 should have both changes
     assert_eq!(final_e1.title().unwrap(), "Title-from-E1", "E1 should have its own title");
-    assert_eq!(
-        final_e1.artist().unwrap(), "Artist-from-E2",
-        "BUG CHECK: E1 should have E2's artist via StateAndEvent"
-    );
+    assert_eq!(final_e1.artist().unwrap(), "Artist-from-E2", "BUG CHECK: E1 should have E2's artist via StateAndEvent");
 
     // Ephemeral2 should have both changes
-    assert_eq!(
-        final_e2.title().unwrap(), "Title-from-E1",
-        "BUG CHECK: E2 should have E1's title via StateAndEvent"
-    );
+    assert_eq!(final_e2.title().unwrap(), "Title-from-E1", "BUG CHECK: E2 should have E1's title via StateAndEvent");
     assert_eq!(final_e2.artist().unwrap(), "Artist-from-E2", "E2 should have its own artist");
 
     // Verify DAG structure
