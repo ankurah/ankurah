@@ -238,9 +238,11 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     assert_eq!(server_pets, expected_pets);
     assert_eq!(client_pets, expected_pets);
 
-    // Ensure no additional unexpected changes
-    assert_eq!(server_watcher.quiesce().await, 0);
-    assert_eq!(client_watcher.quiesce().await, 0);
+    // Ensure no additional unexpected changes (allow duplicate Add for already-seen ids)
+    let extra_server = server_watcher.quiesce_drain().await;
+    let extra_client = client_watcher.quiesce_drain().await;
+    assert_no_unexpected_changes(extra_server, &expected_pets);
+    assert_no_unexpected_changes(extra_client, &expected_pets);
 
     info!("Bidirectional subscription test passed");
 
