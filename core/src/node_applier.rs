@@ -97,17 +97,23 @@ impl NodeApplier {
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
                 tracing::info!(
                     "[TRACE-SAE] StateAndEvent received for entity {} from peer {}, incoming_head={}, event_count={}",
-                    entity_id, from_peer_id, state_fragment.state.head, event_fragments.len()
+                    entity_id,
+                    from_peer_id,
+                    state_fragment.state.head,
+                    event_fragments.len()
                 );
                 let events = Self::save_events(node, from_peer_id, entity_id, &collection_id, event_fragments, &collection).await?;
-                let state: ankurah_proto::Attested<ankurah_proto::EntityState> = (entity_id, collection_id.clone(), state_fragment.clone()).into();
+                let state: ankurah_proto::Attested<ankurah_proto::EntityState> =
+                    (entity_id, collection_id.clone(), state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
                 let (changed, entity) = node.entities.with_state(retriever, entity_id, collection_id.clone(), state.payload.state).await?;
                 tracing::info!(
                     "[TRACE-SAE] with_state returned changed={:?} for entity {}, entity_head={:?}",
-                    changed, entity_id, entity.head()
+                    changed,
+                    entity_id,
+                    entity.head()
                 );
                 entities.push(entity.clone());
 
@@ -121,7 +127,8 @@ impl NodeApplier {
                     // This handles DivergedSince where we need to merge concurrent branches
                     tracing::info!(
                         "[TRACE-SAE] State not applied for entity {} (changed={:?}), falling back to event-by-event application",
-                        entity_id, changed
+                        entity_id,
+                        changed
                     );
                     let mut applied_events = Vec::new();
                     for event in events {
@@ -130,10 +137,7 @@ impl NodeApplier {
                         }
                     }
                     if !applied_events.is_empty() {
-                        tracing::info!(
-                            "[TRACE-SAE] Applied {} events via fallback for entity {}",
-                            applied_events.len(), entity_id
-                        );
+                        tracing::info!("[TRACE-SAE] Applied {} events via fallback for entity {}", applied_events.len(), entity_id);
                         Self::save_state(node, &entity, &collection).await?;
                         changes.push(EntityChange::new(entity, applied_events)?);
                     }
