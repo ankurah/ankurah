@@ -127,10 +127,9 @@ where
         lww_backend.set("item".into(), proto::sys::Item::SysRoot.into_value()?);
 
         let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
-        let root: Clock = event.id().into();
 
         // Add the event to storage first
-        storage.add_event(&event.into()).await?;
+        storage.add_event(&event.clone().into()).await?;
 
         // Apply the creation event so LWW values are tagged with event_id before serialization.
         let retriever = LocalRetriever::new(storage.clone());
