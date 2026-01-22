@@ -74,7 +74,7 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
 
     // Generate WASM wrapper code
     let namespace_class =
-        wasm_model_namespace(&namespace_struct, model.name(), &model.view_name(), &model.livequery_name(), &pojo_interface);
+        wasm_model_namespace(&namespace_struct, model, &model.view_name(), &model.livequery_name(), &pojo_interface);
     let resultset_wrapper = wasm_resultset_wrapper(&model.resultset_name(), &model.view_name());
     let changeset_wrapper = wasm_changeset_wrapper(&model.changeset_name(), &model.view_name(), &model.resultset_name());
     let livequery_wrapper =
@@ -374,11 +374,22 @@ pub fn wasm_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident)
 /// our own complete TypeScript definition.
 pub fn wasm_model_namespace(
     namespace_struct: &Ident,
-    name: &Ident,
+    model: &crate::model::description::ModelDescription,
     view_name: &Ident,
     livequery_name: &Ident,
     pojo_interface: &Ident,
 ) -> TokenStream {
+    let name = model.name();
+    let ref_field_names: Vec<String> =
+        model.ref_fields().iter().map(|(field, _)| field.ident.as_ref().unwrap().to_string()).collect();
+    let preprocess_calls: Vec<TokenStream> = ref_field_names
+        .iter()
+        .map(|field_name| {
+            quote! {
+                ::ankurah::core::model::js_preprocess_ref_field(&js_value, #field_name)?;
+            }
+        })
+        .collect();
     // Generate the custom TypeScript for the static methods
     let static_methods_ts = format!(
         r#"export class {name} {{
@@ -404,6 +415,13 @@ pub fn wasm_model_namespace(
         // These methods are only available via wasm bindgen, so it's ok that we're inside a const block
         #[wasm_bindgen(js_name = #name, skip_typescript)]
         pub struct #namespace_struct {}
+
+        fn js_to_model(me: ::wasm_bindgen::JsValue) -> Result<#name, ::wasm_bindgen::JsValue> {
+            let js_value = me;
+            #(#preprocess_calls)*
+            <#name as ::ankurah::core::model::tsify::Tsify>::from_js(js_value)
+                .map_err(|e| ::wasm_bindgen::JsValue::from_str(&e.to_string()))
+        }
 
         #[wasm_bindgen(js_class = #name)]
         impl #namespace_struct {
@@ -464,16 +482,18 @@ pub fn wasm_model_namespace(
                 Ok(#livequery_name(livequery))
             }
 
-            pub async fn create(transaction: &::ankurah::transaction::Transaction, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+            pub async fn create(transaction: &::ankurah::transaction::Transaction, me: ::wasm_bindgen::JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                 use ankurah::Mutable;
-                let mutable_entity = transaction.create(&me).await?;
+                let model = js_to_model(me)?;
+                let mutable_entity = transaction.create(&model).await?;
                 Ok(mutable_entity.read())
             }
 
-            pub async fn create_one(context: &::ankurah::core::context::Context, me: #name) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+            pub async fn create_one(context: &::ankurah::core::context::Context, me: ::wasm_bindgen::JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
                 use ankurah::Mutable;
                 let tx = context.begin();
-                let mutable_entity = tx.create(&me).await?;
+                let model = js_to_model(me)?;
+                let mutable_entity = tx.create(&model).await?;
                 let read = mutable_entity.read();
                 tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
                 Ok(read)
