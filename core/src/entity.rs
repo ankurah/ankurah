@@ -232,7 +232,10 @@ impl Entity {
         let budget = 100;
 
         for attempt in 0..MAX_RETRIES {
-            let new_head: Clock = match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
+            let comparison = crate::lineage::compare_unstored_event(getter, event, &head, budget)
+                .await
+                .map_err(|e| e.with_context("Entity::apply_event compare_unstored_event"))?;
+            let new_head: Clock = match comparison {
                 lineage::Ordering::Equal => return Ok(false),
                 lineage::Ordering::Descends => event.id().into(),
                 lineage::Ordering::NotDescends { meet: _ } => {
@@ -282,7 +285,10 @@ impl Entity {
         const MAX_RETRIES: usize = 5;
 
         for _attempt in 0..MAX_RETRIES {
-            let apply = match crate::lineage::compare(getter, &new_head, &head, budget).await? {
+            let comparison = crate::lineage::compare(getter, &new_head, &head, budget)
+                .await
+                .map_err(|e| e.with_context("Entity::apply_state compare"))?;
+            let apply = match comparison {
                 lineage::Ordering::Equal => return Ok(false),
                 lineage::Ordering::Descends => true,
                 lineage::Ordering::NotDescends { meet: _ } => return Ok(false),

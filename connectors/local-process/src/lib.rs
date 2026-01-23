@@ -2,6 +2,7 @@ use ankurah_core::policy::PolicyAgent;
 use ankurah_core::storage::StorageEngine;
 use ankurah_proto as proto;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use ankurah_core::connector::{PeerSender, SendError};
@@ -25,6 +26,10 @@ impl PeerSender for LocalProcessSender {
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
+
+pub type MessageTransform = Arc<dyn Fn(proto::NodeMessage) -> proto::NodeMessage + Send + Sync>;
+
+fn identity_transform() -> MessageTransform { Arc::new(|message| message) }
 
 /// connector which establishes one sender between each of the two given nodes
 pub struct LocalProcessConnection<SE1, PA1, SE2, PA2>
@@ -51,6 +56,17 @@ where
 {
     /// Create a new LocalConnector and establish connection between the nodes
     pub async fn new(node1: &Node<SE1, PA1>, node2: &Node<SE2, PA2>) -> anyhow::Result<Self> {
+        Self::new_with_transform(node1, node2, identity_transform(), identity_transform()).await
+    }
+
+    /// Create a new LocalConnector with optional message transforms per direction.
+    /// `to_node1` runs on messages delivered to node1, `to_node2` on messages delivered to node2.
+    pub async fn new_with_transform(
+        node1: &Node<SE1, PA1>,
+        node2: &Node<SE2, PA2>,
+        to_node1: MessageTransform,
+        to_node2: MessageTransform,
+    ) -> anyhow::Result<Self> {
         let (node1_tx, node1_rx) = mpsc::channel(1024);
         let (node2_tx, node2_rx) = mpsc::channel(1024);
 
@@ -64,13 +80,17 @@ where
             Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }),
         );
 
-        let receiver1_task = Self::setup_receiver(node1.clone(), node1_rx);
-        let receiver2_task = Self::setup_receiver(node2.clone(), node2_rx);
+        let receiver1_task = Self::setup_receiver(node1.clone(), node1_rx, to_node1);
+        let receiver2_task = Self::setup_receiver(node2.clone(), node2_rx, to_node2);
 
         Ok(Self { node1: node1.weak(), node2: node2.weak(), node1_id: node1.id, node2_id: node2.id, receiver1_task, receiver2_task })
     }
 
-    fn setup_receiver<SE, PA>(node: Node<SE, PA>, mut rx: mpsc::Receiver<proto::NodeMessage>) -> tokio::task::JoinHandle<()>
+    fn setup_receiver<SE, PA>(
+        node: Node<SE, PA>,
+        mut rx: mpsc::Receiver<proto::NodeMessage>,
+        transform: MessageTransform,
+    ) -> tokio::task::JoinHandle<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -78,6 +98,7 @@ where
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let node = node.clone();
+                let message = (transform)(message);
                 tokio::spawn(async move {
                     let _ = node.handle_message(message).await;
                 });

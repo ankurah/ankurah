@@ -439,7 +439,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let error_msg = error.to_string();
 
         // Evaluate retriability at failure time
-        let is_retryable = match &error {
+        let root_error = error.root();
+        let is_retryable = match root_error {
             // Retrieval errors from fetching are generally not retryable
             RetrievalError::RequestError(req_err) => match req_err {
                 RequestError::PeerNotConnected => true,
