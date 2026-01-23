@@ -73,8 +73,7 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
     let tsify_impl = expand_ts_model_type(input, pojo_interface.to_string()).unwrap_or_else(syn::Error::into_compile_error);
 
     // Generate WASM wrapper code
-    let namespace_class =
-        wasm_model_namespace(&namespace_struct, model, &model.view_name(), &model.livequery_name(), &pojo_interface);
+    let namespace_class = wasm_model_namespace(&namespace_struct, model, &model.view_name(), &model.livequery_name(), &pojo_interface);
     let resultset_wrapper = wasm_resultset_wrapper(&model.resultset_name(), &model.view_name());
     let changeset_wrapper = wasm_changeset_wrapper(&model.changeset_name(), &model.view_name(), &model.resultset_name());
     let livequery_wrapper =
@@ -380,8 +379,7 @@ pub fn wasm_model_namespace(
     pojo_interface: &Ident,
 ) -> TokenStream {
     let name = model.name();
-    let ref_field_names: Vec<String> =
-        model.ref_fields().iter().map(|(field, _)| field.ident.as_ref().unwrap().to_string()).collect();
+    let ref_field_names: Vec<String> = model.ref_fields().iter().map(|(field, _)| field.ident.as_ref().unwrap().to_string()).collect();
     let preprocess_calls: Vec<TokenStream> = ref_field_names
         .iter()
         .map(|field_name| {
