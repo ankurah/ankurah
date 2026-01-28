@@ -53,6 +53,9 @@ pub enum StorageError {
     #[error("collection not found: {0}")]
     CollectionNotFound(CollectionId),
 
+    #[error("invalid collection name: {0}")]
+    InvalidCollectionName(CollectionId),
+
     #[error("decode error: {0}")]
     DecodeError(DecodeError),
 
@@ -66,6 +69,28 @@ pub enum StorageError {
 impl From<DecodeError> for StorageError {
     fn from(err: DecodeError) -> Self {
         StorageError::DecodeError(err)
+    }
+}
+
+impl From<bincode::Error> for StorageError {
+    fn from(err: bincode::Error) -> Self {
+        StorageError::SerializationError(Box::new(err))
+    }
+}
+
+impl From<tokio::task::JoinError> for StorageError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        StorageError::BackendError(Box::new(err))
+    }
+}
+
+impl From<crate::error::RetrievalError> for StorageError {
+    fn from(err: crate::error::RetrievalError) -> Self {
+        match err {
+            crate::error::RetrievalError::NotFound(crate::error::NotFound::Entity(id)) => StorageError::EntityNotFound(id),
+            crate::error::RetrievalError::NotFound(crate::error::NotFound::Collection(id)) => StorageError::CollectionNotFound(id),
+            other => StorageError::BackendError(Box::new(std::io::Error::other(format!("{}", other)))),
+        }
     }
 }
 
@@ -158,6 +183,12 @@ pub struct AnyhowWrapper(String);
 impl From<anyhow::Error> for AnyhowWrapper {
     fn from(err: anyhow::Error) -> Self {
         AnyhowWrapper(format!("{err:#}"))
+    }
+}
+
+impl From<String> for AnyhowWrapper {
+    fn from(s: String) -> Self {
+        AnyhowWrapper(s)
     }
 }
 

@@ -7,7 +7,7 @@ use ankurah_proto::CollectionId;
 use tokio::sync::RwLock;
 
 use crate::{
-    error::{MutationError, RetrievalError},
+    error::StorageError,
     storage::{StorageCollectionWrapper, StorageEngine},
 };
 
@@ -25,7 +25,7 @@ pub struct Inner<SE> {
 impl<SE: StorageEngine> CollectionSet<SE> {
     pub fn new(storage_engine: Arc<SE>) -> Self { Self(Arc::new(Inner { storage_engine, collections: RwLock::new(BTreeMap::new()) })) }
 
-    pub async fn get(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+    pub async fn get(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, StorageError> {
         let collections = self.0.collections.read().await;
         if let Some(store) = collections.get(id) {
             return Ok(store.clone());
@@ -45,13 +45,13 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         Ok(collection)
     }
 
-    pub async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+    pub async fn list_collections(&self) -> Result<Vec<CollectionId>, StorageError> {
         // Just return collections we have in memory
         let memory_collections = self.0.collections.read().await;
         Ok(memory_collections.keys().cloned().collect())
     }
 
-    pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+    pub async fn delete_all_collections(&self) -> Result<bool, StorageError> {
         // Clear in-memory collections first
         {
             let mut collections = self.0.collections.write().await;

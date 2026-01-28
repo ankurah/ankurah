@@ -9,12 +9,13 @@ use yrs::{updates::decoder::Decode, GetString, Observable, ReadTxn, StateVector,
 use yrs::{Update, WriteTxn};
 
 use crate::{
-    error::{MutationError, StateError},
+    error::{AnyhowWrapper, InternalError, MutationError, RetrievalError, StateError},
     property::{
         backend::{Operation, PropertyBackend},
         PropertyName, Value,
     },
 };
+use error_stack::Report;
 
 /// Stores one or more properties of an entity
 #[derive(Debug)]
@@ -74,8 +75,8 @@ impl YrsBackend {
             })
             .collect();
 
-        let update = Update::decode_v2(update).map_err(|e| StateError::SerializationError(Box::new(e)))?;
-        txn.apply_update(update).map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
+        let update = Update::decode_v2(update).map_err(|e| MutationError::InvalidUpdate(format!("yrs decode failed: {}", e)))?;
+        txn.apply_update(update).map_err(|e| MutationError::InvalidUpdate(format!("yrs apply update failed: {}", e)))?;
         txn.commit();
 
         Ok(())
@@ -143,8 +144,8 @@ impl PropertyBackend for YrsBackend {
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError> {
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
-        let update = yrs::Update::decode_v2(state_buffer).map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
-        txn.apply_update(update).map_err(|e| crate::error::RetrievalError::FailedUpdate(Box::new(e)))?;
+        let update = yrs::Update::decode_v2(state_buffer).map_err(|e| RetrievalError::Failure(Report::new(AnyhowWrapper::from(format!("yrs decode failed: {}", e))).change_context(InternalError)))?;
+        txn.apply_update(update).map_err(|e| RetrievalError::Failure(Report::new(AnyhowWrapper::from(format!("yrs apply update failed: {}", e))).change_context(InternalError)))?;
         txn.commit(); // I just don't trust `Drop` too much
         drop(txn);
         let starting_state = doc.transact().state_vector();

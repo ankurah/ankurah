@@ -183,7 +183,8 @@ impl EntityLiveQuery {
 
         if has_relay {
             // Ephemeral node: delegate to relay, which will call update_selection_init after applying deltas
-            self.0.node.update_remote_query(self.0.query_id, new_selection.clone(), new_version)?;
+            self.0.node.update_remote_query(self.0.query_id, new_selection.clone(), new_version)
+                .map_err(|e| RetrievalError::Failure(Report::new(AnyhowWrapper::from(e)).change_context(InternalError)))?;
         } else {
             // Durable node: spawn task to call update_selection_init directly
             let me2 = self.clone();

@@ -5,7 +5,7 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
-    error::{MutationError, RetrievalError},
+    error::StorageError,
     storage::{StorageCollection, StorageEngine},
 };
 use ankurah_proto::CollectionId;
@@ -60,7 +60,7 @@ impl SledStorageEngine {
     }
 
     /// List all collections in the storage engine by looking for trees that start with collection_
-    pub fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> {
+    pub fn list_collections(&self) -> Result<Vec<CollectionId>, StorageError> {
         let database = self.database.lock().unwrap();
         let collections: Vec<CollectionId> = database
             .db
@@ -85,12 +85,12 @@ impl SledStorageEngine {
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
     type Value = Vec<u8>;
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, StorageError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
 
         let database = self.database.lock().unwrap().clone();
         let collection_name = format!("collection_{id}");
-        let tree = database.db.open_tree(collection_name).map_err(SledRetrievalError::StorageError)?;
+        let tree = database.db.open_tree(collection_name).map_err(|e| StorageError::BackendError(Box::new(e)))?;
         Ok(Arc::new(SledStorageCollection::new(
             id.to_owned(),
             database,
@@ -100,7 +100,7 @@ impl StorageEngine for SledStorageEngine {
         )))
     }
 
-    async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+    async fn delete_all_collections(&self) -> Result<bool, StorageError> {
         let mut any_deleted = false;
 
         // Get all tree names and drop them
@@ -118,7 +118,7 @@ impl StorageEngine for SledStorageEngine {
                     Ok(true) => any_deleted = true,
                     Ok(false) => {}
                     Err(err) => {
-                        return Err(MutationError::General(Box::new(err)));
+                        return Err(StorageError::BackendError(Box::new(err)));
                     }
                 }
             }

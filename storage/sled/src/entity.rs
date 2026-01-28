@@ -22,7 +22,7 @@ impl<S: EntityIdStream> SledEntityLookup<S> {
 impl<S: Unpin> Unpin for SledEntityLookup<S> {}
 
 impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
-    type Item = Result<ankurah_proto::Attested<ankurah_proto::EntityState>, ankurah_core::error::RetrievalError>;
+    type Item = Result<ankurah_proto::Attested<ankurah_proto::EntityState>, ankurah_core::error::StorageError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Get next EntityId from upstream stream
@@ -38,15 +38,15 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
         let value_bytes = match self.entities_tree.get(key) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
-                return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::StorageError("Entity not found".to_string().into()))))
+                return Poll::Ready(Some(Err(ankurah_core::error::StorageError::EntityNotFound(entity_id))))
             }
-            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::StorageError(e.to_string().into())))),
+            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::StorageError::BackendError(Box::new(e))))),
         };
 
         // Decode StateFragment
         let state_fragment: ankurah_proto::StateFragment = match bincode::deserialize(&value_bytes) {
             Ok(fragment) => fragment,
-            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::StorageError(e.to_string().into())))),
+            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::StorageError::SerializationError(Box::new(e))))),
         };
 
         // Create Attested<EntityState> from parts
@@ -57,7 +57,7 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
     }
 }
 
-// EntityStateStream is automatically implemented via blanket impl since SledEntityLookup emits Result<Attested<EntityState>, RetrievalError>
+// EntityStateStream is automatically implemented via blanket impl since SledEntityLookup emits Result<Attested<EntityState>, StorageError>
 
 /// Trait that provides a convenient `.entities()` combinator for EntityId streams
 pub trait SledEntityExt: EntityIdStream + Sized {

@@ -1,13 +1,21 @@
 use crate::lineage::{self, GetEvents, Retrieve};
 use crate::selection::filter::Filterable;
 use crate::{
-    error::{internal::{LineageError, StateError}, InternalError, MutationError, RetrievalError},
+    error::{internal::{LineageError, StateError}, AnyhowWrapper, InternalError, MutationError, RetrievalError},
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
     value::Value,
 };
 use error_stack::Report;
+
+/// Convert RetrievalError to MutationError
+fn retrieval_to_mutation(e: RetrievalError) -> MutationError {
+    match e {
+        RetrievalError::AccessDenied(ad) => MutationError::AccessDenied(ad),
+        other => MutationError::Failure(Report::new(AnyhowWrapper::from(format!("{}", other))).change_context(InternalError)),
+    }
+}
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +46,7 @@ impl EntityInnerState {
         if let Some(backend) = self.backends.get(&backend_name) {
             backend.apply_operations(operations)?;
         } else {
-            let backend = backend_from_string(&backend_name, None)?;
+            let backend = backend_from_string(&backend_name, None).map_err(retrieval_to_mutation)?;
             backend.apply_operations(operations)?;
             self.backends.insert(backend_name, backend);
         }

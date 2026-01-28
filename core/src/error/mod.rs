@@ -3,13 +3,16 @@
 //! These are the only error types exposed to FFI (wasm_bindgen, uniffi).
 //! Internal errors are mapped to `Failure` variants at API boundaries.
 
-pub(crate) mod internal;
+pub mod internal;
 
 // Re-export internal types for crate-internal use
 pub(crate) use internal::{
     AnyhowWrapper, ApplyError, ApplyErrorCause, ApplyErrorItem, LineageError, RequestError,
-    StateError, StorageError, SubscriptionError, ValidationError,
+    SubscriptionError, ValidationError,
 };
+
+// Re-export storage types publicly for storage implementation crates
+pub use internal::{StateError, StorageError};
 
 use ankurah_proto::{CollectionId, EntityId};
 use error_stack::{Report, ResultExt};
@@ -156,6 +159,12 @@ impl From<AccessDenied> for MutationError {
 impl From<AccessDenied> for RetrievalError {
     fn from(err: AccessDenied) -> Self {
         RetrievalError::AccessDenied(err)
+    }
+}
+
+impl From<crate::property::PropertyError> for MutationError {
+    fn from(err: crate::property::PropertyError) -> Self {
+        MutationError::Failure(Report::new(err).change_context(InternalError))
     }
 }
 

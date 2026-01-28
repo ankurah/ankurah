@@ -1,8 +1,14 @@
-use crate::error::RetrievalError;
+use crate::error::{AnyhowWrapper, InternalError, RetrievalError, QueryError};
 use crate::schema::CollectionSchema;
 use crate::value::{Value, ValueType};
 use ankql::ast::{Expr, Literal, Predicate};
 use anyhow::Result;
+use error_stack::Report;
+
+/// Convert a schema field lookup error to RetrievalError
+fn field_error_to_retrieval(e: crate::property::PropertyError) -> RetrievalError {
+    RetrievalError::InvalidQuery(QueryError::Filter(format!("{}", e)))
+}
 
 /// Cast all literals in a predicate based on field names using a CollectionSchema
 pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &S) -> Result<Predicate, RetrievalError> {
@@ -12,13 +18,13 @@ pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &
             match (left.as_ref(), right.as_ref()) {
                 // Case 1: field = literal (cast literal to field type)
                 (Expr::Path(path), Expr::Literal(literal)) => {
-                    let target_type = schema.field_type(path)?;
+                    let target_type = schema.field_type(path).map_err(field_error_to_retrieval)?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left, operator, right: Box::new(cast_literal) })
                 }
                 // Case 2: literal = field (cast literal to field type)
                 (Expr::Literal(literal), Expr::Path(path)) => {
-                    let target_type = schema.field_type(path)?;
+                    let target_type = schema.field_type(path).map_err(field_error_to_retrieval)?;
                     let cast_literal = cast_literal_to_type(literal.clone(), target_type)?;
                     Ok(Predicate::Comparison { left: Box::new(cast_literal), operator, right })
                 }
@@ -65,7 +71,7 @@ fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, 
 fn cast_literal_to_type(literal: Literal, target_type: ValueType) -> Result<Expr, RetrievalError> {
     // Convert Literal -> Value -> cast -> Literal -> Expr
     let value: Value = literal.into();
-    let cast_value = value.cast_to(target_type).map_err(|e| RetrievalError::StorageError(format!("Type casting error: {}", e).into()))?;
+    let cast_value = value.cast_to(target_type).map_err(|e| RetrievalError::InvalidQuery(QueryError::Filter(format!("Type casting error: {}", e))))?;
     let cast_literal: Literal = cast_value.into();
     Ok(Expr::Literal(cast_literal))
 }

@@ -1,7 +1,7 @@
 use crate::{
     changes::EntityChange,
     entity::Entity,
-    error::{InternalError, MutationError, NotFound, RequestError, RetrievalError},
+    error::{InternalError, MutationError, NotFound, RequestError, RetrievalError, StorageError},
     livequery::{EntityLiveQuery, LiveQuery},
     model::View,
     node::{MatchArgs, Node},
@@ -10,6 +10,15 @@ use crate::{
     transaction::Transaction,
 };
 use error_stack::Report;
+
+/// Convert StorageError to RetrievalError at API boundary
+fn storage_to_retrieval(e: StorageError) -> RetrievalError {
+    match e {
+        StorageError::EntityNotFound(id) => RetrievalError::NotFound(NotFound::Entity(id)),
+        StorageError::CollectionNotFound(id) => RetrievalError::NotFound(NotFound::Collection(id)),
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
+}
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -198,7 +207,7 @@ where
         }
         debug!("{}.get_entity fetching from storage", self.node);
 
-        let collection = self.node.collections.get(collection_id).await?;
+        let collection = self.node.collections.get(collection_id).await.map_err(storage_to_retrieval)?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
@@ -206,12 +215,12 @@ where
                     self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;
                 Ok(entity)
             }
-            Err(RetrievalError::NotFound(NotFound::Entity(id))) => {
+            Err(StorageError::EntityNotFound(id)) => {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_, entity) = self.node.entities.with_state(&retriever, id, collection_id.clone(), proto::State::default()).await?;
                 Ok(entity)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(storage_to_retrieval(e)),
         }
     }
     /// Fetch a list of entities based on a selection
@@ -229,8 +238,8 @@ where
             // Fetch from peers and commit first response
             Ok(self.fetch_from_peer(collection_id, args.selection).await?)
         } else {
-            let storage_collection = self.node.collections.get(collection_id).await?;
-            let states = storage_collection.fetch_states(&args.selection).await?;
+            let storage_collection = self.node.collections.get(collection_id).await.map_err(storage_to_retrieval)?;
+            let states = storage_collection.fetch_states(&args.selection).await.map_err(storage_to_retrieval)?;
 
             // Convert states to entities
             let mut entities = Vec::new();

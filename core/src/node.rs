@@ -18,7 +18,7 @@ use crate::{
     connector::{PeerSender, SendError},
     context::Context,
     entity::{Entity, WeakEntitySet},
-    error::{internal::RequestError, InternalError, MutationError, RetrievalError},
+    error::{internal::RequestError, InternalError, MutationError, NotFound, RetrievalError, StateError, StorageError},
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
@@ -29,6 +29,33 @@ use crate::{
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
 };
 use error_stack::Report;
+
+/// Convert StorageError to MutationError at API boundary
+fn storage_to_mutation(e: StorageError) -> MutationError {
+    MutationError::Failure(Report::new(e).change_context(InternalError))
+}
+
+/// Convert StorageError to RetrievalError at API boundary
+fn storage_to_retrieval(e: StorageError) -> RetrievalError {
+    match e {
+        StorageError::EntityNotFound(id) => RetrievalError::NotFound(NotFound::Entity(id)),
+        StorageError::CollectionNotFound(id) => RetrievalError::NotFound(NotFound::Collection(id)),
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
+}
+
+/// Convert StateError to MutationError at API boundary
+fn state_to_mutation(e: StateError) -> MutationError {
+    MutationError::Failure(Report::new(e).change_context(InternalError))
+}
+
+/// Convert RetrievalError to MutationError at API boundary
+fn retrieval_to_mutation(e: RetrievalError) -> MutationError {
+    match e {
+        RetrievalError::AccessDenied(ad) => MutationError::AccessDenied(ad),
+        other => MutationError::Failure(Report::new(crate::error::AnyhowWrapper::from(anyhow::anyhow!("{}", other))).change_context(InternalError)),
+    }
+}
 use itertools::Itertools;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
@@ -549,11 +576,11 @@ where
         let mut changes = Vec::new();
 
         for event in events.iter_mut() {
-            let collection = self.collections.get(&event.payload.collection).await?;
+            let collection = self.collections.get(&event.payload.collection).await.map_err(storage_to_mutation)?;
 
             // When applying an event, we should only look at the local storage for the lineage
             let retriever = LocalRetriever::new(collection.clone());
-            let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
+            let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await.map_err(retrieval_to_mutation)?;
 
             // Handle creates vs updates differently for policy validation
             let (entity_before, entity_after, already_applied) = if event.payload.is_entity_create() && entity.head().is_empty() {
@@ -578,12 +605,12 @@ where
             let applied = if already_applied { true } else { entity.apply_event(&retriever, &event.payload).await? };
 
             if applied {
-                let state = entity.to_state()?;
+                let state = entity.to_state().map_err(state_to_mutation)?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
                 let attested = Attested::opt(entity_state, attestation);
-                collection.add_event(event).await?;
-                collection.set_state(attested).await?;
+                collection.add_event(event).await.map_err(storage_to_mutation)?;
+                collection.set_state(attested).await.map_err(storage_to_mutation)?;
                 changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
             }
         }
@@ -708,31 +735,37 @@ where
         ids: Vec<proto::EntityId>,
         cdata: &PA::ContextData,
     ) -> Result<(), RetrievalError> {
-        let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+        let peer_id = self.get_durable_peer_random().ok_or_else(|| {
+            RetrievalError::Failure(Report::new(RequestError::PeerNotConnected).change_context(InternalError))
+        })?;
 
         match self
             .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
             .await
-            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+            .map_err(|e| RetrievalError::Failure(Report::new(e).change_context(InternalError)))?
         {
             proto::NodeResponseBody::Get(states) => {
-                let collection = self.collections.get(collection_id).await?;
+                let collection = self.collections.get(collection_id).await.map_err(|e| {
+                    RetrievalError::Failure(Report::new(e).change_context(InternalError))
+                })?;
 
                 // do we have the ability to merge states?
                 // because that's what we have to do I think
                 for state in states {
                     self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    collection.set_state(state).await.map_err(|e| {
+                        RetrievalError::Failure(Report::new(e).change_context(InternalError))
+                    })?;
                 }
                 Ok(())
             }
             proto::NodeResponseBody::Error(e) => {
                 debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
+                Err(RetrievalError::Failure(Report::new(RequestError::ServerError(e)).change_context(InternalError)))
             }
             _ => {
                 debug!("Unexpected response type from peer get");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
+                Err(RetrievalError::Failure(Report::new(RequestError::UnexpectedResponse(proto::NodeResponseBody::Success)).change_context(InternalError)))
             }
         }
     }
@@ -802,8 +835,8 @@ where
         collection_id: &CollectionId,
         selection: &ankql::ast::Selection,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        let storage_collection = self.collections.get(collection_id).await?;
-        let initial_states = storage_collection.fetch_states(selection).await?;
+        let storage_collection = self.collections.get(collection_id).await.map_err(storage_to_retrieval)?;
+        let initial_states = storage_collection.fetch_states(selection).await.map_err(storage_to_retrieval)?;
         let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {

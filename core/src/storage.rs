@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::error::{MutationError, RetrievalError};
+use crate::error::StorageError;
 use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
 
 pub fn state_name(name: &str) -> String { format!("{}_state", name) }
@@ -14,32 +14,32 @@ pub fn event_name(name: &str) -> String { format!("{}_event", name) }
 pub trait StorageEngine: Send + Sync {
     type Value;
     // Opens and/or creates a storage collection.
-    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError>;
+    async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, StorageError>;
     // Delete all collections and their data from the storage engine
-    async fn delete_all_collections(&self) -> Result<bool, MutationError>;
+    async fn delete_all_collections(&self) -> Result<bool, StorageError>;
 }
 
 #[async_trait]
 pub trait StorageCollection: Send + Sync {
-    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError>;
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, StorageError>;
+    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, StorageError>;
 
     // Fetch raw entity states matching a selection (predicate + order by + limit)
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, StorageError>;
 
-    async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), MutationError> {
+    async fn set_states(&self, states: Vec<Attested<EntityState>>) -> Result<(), StorageError> {
         for state in states {
             self.set_state(state).await?;
         }
         Ok(())
     }
 
-    async fn get_states(&self, ids: Vec<EntityId>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn get_states(&self, ids: Vec<EntityId>) -> Result<Vec<Attested<EntityState>>, StorageError> {
         let mut states = Vec::new();
         for id in ids {
             match self.get_state(id).await {
                 Ok(state) => states.push(state),
-                Err(RetrievalError::EntityNotFound(_)) => {
+                Err(StorageError::EntityNotFound(_)) => {
                     warn!("Entity not found: {:?}", id);
                 }
                 Err(e) => return Err(e),
@@ -48,13 +48,13 @@ pub trait StorageCollection: Send + Sync {
         Ok(states)
     }
 
-    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError>;
+    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, StorageError>;
 
     /// Retrieve a list of events
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError>;
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, StorageError>;
 
     /// Retrieve all events from the collection
-    async fn dump_entity_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError>;
+    async fn dump_entity_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, StorageError>;
 }
 
 /// Manages the storage and state of the collection without any knowledge of the model type
