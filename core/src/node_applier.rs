@@ -1,6 +1,6 @@
 use crate::{
     changes::EntityChange,
-    error::{ApplyError, ApplyErrorItem, MutationError},
+    error::internal::{ApplyError, ApplyErrorCause, ApplyErrorItem},
     lineage::Retrieve,
     node::Node,
     policy::PolicyAgent,
@@ -22,7 +22,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> Result<(), MutationError>
+    ) -> Result<(), ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -32,22 +32,37 @@ impl NodeApplier {
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
         // but this feels brittle, because failure to apply this event would affect the other contexts on this node.
         let Some(relay) = &node.subscription_relay else {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay"));
+            return Err(ApplyError::Other("Should not be receiving updates without a subscription relay".into()));
         };
         let cdata = relay.get_contexts_for_peer(from_peer_id);
         if cdata.is_empty() {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
+            return Err(ApplyError::Other("Should not be receiving updates without at least predicate context".into()));
         }
 
         // Apply all updates and notify reactor
         let mut changes = Vec::new();
+        let mut all_errors = Vec::new();
         for update in items {
-            let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
-            Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
-            retriever.store_used_events().await?;
+            let entity_id = update.entity_id;
+            let collection = update.collection.clone();
+            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection.clone(), node, &cdata);
+            match Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await {
+                Ok(()) => {
+                    if let Err(e) = retriever.store_used_events().await {
+                        all_errors.push(ApplyErrorItem { entity_id, collection, cause: e.into() });
+                    }
+                }
+                Err(cause) => {
+                    all_errors.push(ApplyErrorItem { entity_id, collection, cause });
+                }
+            }
         }
 
         node.reactor.notify_change(changes).await;
+
+        if !all_errors.is_empty() {
+            return Err(ApplyError::Items(all_errors));
+        }
 
         Ok(())
     }
@@ -59,7 +74,7 @@ impl NodeApplier {
         retriever: &R,
         changes: &mut Vec<EntityChange>,
         entities: &mut impl Pushable<crate::entity::Entity>,
-    ) -> Result<(), MutationError>
+    ) -> Result<(), ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -121,7 +136,7 @@ impl NodeApplier {
         collection_id: &proto::CollectionId,
         fragments: Vec<proto::EventFragment>,
         collection: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<Vec<Attested<proto::Event>>, MutationError>
+    ) -> Result<Vec<Attested<proto::Event>>, ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -143,7 +158,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         entity: &crate::entity::Entity,
         collection_wrapper: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<(), MutationError>
+    ) -> Result<(), ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -227,7 +242,7 @@ impl NodeApplier {
         from_peer_id: &proto::EntityId,
         delta: proto::EntityDelta,
         retriever: &R,
-    ) -> Result<Option<EntityChange>, MutationError>
+    ) -> Result<Option<EntityChange>, ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,

@@ -32,6 +32,7 @@ ankurah-signals = { path = "../signals", version = "=0.7.16" }
 
 rand                 = "0.8"
 anyhow               = "1.0"
+error-stack          = "0.6"
 thiserror            = "2"
 chrono               = { version = "0.4", default-features = false }
 futures-signals      = "0.3"

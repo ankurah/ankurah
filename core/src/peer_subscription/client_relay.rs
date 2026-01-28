@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
-use crate::error::{RequestError, RetrievalError};
+use crate::error::{internal::RequestError, RetrievalError};
 use crate::node::ContextData;
 use crate::util::safeset::SafeSet;
 

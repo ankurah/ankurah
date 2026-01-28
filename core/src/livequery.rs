@@ -13,10 +13,12 @@ use ankurah_signals::{
 };
 use tracing::{debug, warn};
 
+use error_stack::Report;
+
 use crate::{
     changes::ChangeSet,
     entity::Entity,
-    error::RetrievalError,
+    error::{AnyhowWrapper, InternalError, RetrievalError},
     model::View,
     node::{MatchArgs, TNodeErased},
     policy::PolicyAgent,
@@ -243,7 +245,8 @@ impl EntityLiveQuery {
                     self.0.gap_fetcher.clone(),
                     self,
                 )
-                .await?
+                .await
+                .map_err(|e| RetrievalError::Failure(Report::new(AnyhowWrapper::from(e)).change_context(InternalError)))?
         } else {
             // Subsequent activation (including cached re-initialization or selection update): use update_query_and_notify
             // This handles both: (1) cached queries re-activating after remote deltas, and (2) selection updates
@@ -257,7 +260,8 @@ impl EntityLiveQuery {
                     version,
                     self,
                 )
-                .await?;
+                .await
+                .map_err(|e| RetrievalError::Failure(Report::new(AnyhowWrapper::from(e)).change_context(InternalError)))?;
         };
 
         Ok(())

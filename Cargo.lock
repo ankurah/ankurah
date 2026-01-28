@@ -98,6 +98,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "chrono",
+ "error-stack",
  "futures",
  "futures-signals",
  "futures-timer",
@@ -1320,6 +1321,16 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "error-stack"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b878b3fac9613c3c7f22eb70bc8a3c6ebdc03cc11479ee60fde1692d747fd45f"
+dependencies = [
+ "anyhow",
+ "rustc_version",
 ]
 
 [[package]]

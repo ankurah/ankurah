@@ -2,7 +2,7 @@ use ankurah_proto::{self as proto, Attested};
 use tracing::warn;
 
 use crate::{
-    error::SubscriptionError,
+    error::internal::SubscriptionError,
     node::Node,
     policy::PolicyAgent,
     reactor::{ReactorSubscription, ReactorUpdate},

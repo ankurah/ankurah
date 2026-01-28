@@ -18,7 +18,7 @@ use crate::{
     connector::{PeerSender, SendError},
     context::Context,
     entity::{Entity, WeakEntitySet},
-    error::{MutationError, RequestError, RetrievalError},
+    error::{internal::RequestError, InternalError, MutationError, RetrievalError},
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
@@ -28,6 +28,7 @@ use crate::{
     system::SystemManager,
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
 };
+use error_stack::Report;
 use itertools::Itertools;
 #[cfg(feature = "instrument")]
 use tracing::instrument;
@@ -70,10 +71,6 @@ impl From<ankql::ast::Predicate> for MatchArgs {
 
 impl From<ankql::ast::Selection> for MatchArgs {
     fn from(val: ankql::ast::Selection) -> Self { MatchArgs { selection: val, cached: true } }
-}
-
-impl From<ankql::error::ParseError> for RetrievalError {
-    fn from(e: ankql::error::ParseError) -> Self { RetrievalError::ParseError(e) }
 }
 
 pub fn nocache<T: TryInto<ankql::ast::Selection, Error = ankql::error::ParseError>>(s: T) -> Result<MatchArgs, ankql::error::ParseError> {
@@ -525,13 +522,16 @@ where
             {
                 Ok(proto::NodeResponseBody::CommitComplete { .. }) => (),
                 Ok(proto::NodeResponseBody::Error(e)) => {
-                    return Err(MutationError::General(Box::new(std::io::Error::other(format!("Peer {} rejected: {}", peer_id, e)))));
+                    return Err(MutationError::Failure(
+                        Report::new(RequestError::ServerError(format!("Peer {} rejected: {}", peer_id, e)))
+                            .change_context(InternalError),
+                    ));
                 }
-                _ => {
-                    return Err(MutationError::General(Box::new(std::io::Error::other(format!(
-                        "Peer {} returned unexpected response",
-                        peer_id
-                    )))));
+                other => {
+                    return Err(MutationError::Failure(
+                        Report::new(RequestError::UnexpectedResponse(other.unwrap_or(proto::NodeResponseBody::Error("No response".into()))))
+                            .change_context(InternalError),
+                    ));
                 }
             }
         }
