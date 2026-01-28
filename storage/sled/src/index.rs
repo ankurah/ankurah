@@ -1,4 +1,4 @@
-use ankurah_core::error::{MutationError, RetrievalError};
+use ankurah_core::error::StorageError;
 use ankurah_core::indexing::IndexSpecMatch;
 use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
@@ -78,7 +78,7 @@ impl IndexManager {
         spec: &ankurah_core::indexing::KeySpec,
         db: &Db,
         property_manager: &PropertyManager,
-    ) -> Result<(Index, IndexSpecMatch), RetrievalError> {
+    ) -> Result<(Index, IndexSpecMatch), StorageError> {
         // Try existing matching index
         if let Some((_, existing, match_type)) = self.indexes.read().unwrap().iter().find_map(|(id, idx)| {
             if idx.collection() == collection {
@@ -234,7 +234,7 @@ impl Index {
         self.0.index_config_tree.insert(self.0.id.to_be_bytes(), bytes)?;
         Ok(())
     }
-    pub fn build_if_needed(&self, db: &Db) -> Result<(), RetrievalError> {
+    pub fn build_if_needed(&self, db: &Db) -> Result<(), StorageError> {
         let _guard = self.0.build_lock.lock().unwrap();
         if matches!(self.status(), BuildStatus::Ready) {
             return Ok(());
@@ -259,7 +259,7 @@ impl IndexManager {
         eid: &EntityId,
         old_mat: Option<&[(u32, ankurah_core::value::Value)]>,
         new_mat: &[(u32, ankurah_core::value::Value)],
-    ) -> Result<(), MutationError> {
+    ) -> Result<(), StorageError> {
         // Snapshot matching indexes
         let indexes: Vec<Index> = {
             let guard = self.indexes.read().unwrap();

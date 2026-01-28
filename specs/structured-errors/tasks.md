@@ -1,64 +1,47 @@
-# Structured Errors - Remaining Tasks
+# Structured Errors - Tasks
 
-## First: Check Current State
+## Current State
 
 ```bash
-cargo check 2>&1 | grep "^error\[" | wc -l
+cargo check  # passes
+cargo test   # passes
 ```
 
-## Core Principle
+## Completed
 
-**Internal code NEVER uses public error types.** Storage, streaming, internal operations all use `StorageError`. Conversion to `RetrievalError`/`MutationError` happens only at API boundaries.
+- [x] Storage traits use `StorageError`
+- [x] SQLite, Sled, Postgres, IndexedDB-wasm all migrated
+- [x] storage-common stream traits migrated
+- [x] All tests pass
 
-## Reference: SQLite is Complete
+## Remaining
 
-Use `storage/sqlite/src/engine.rs` and `storage/sqlite/src/error.rs` as the pattern for other storage backends.
+### 1. Improve `.diagnostic()` output
 
-## Tasks (in order)
+The `Failure` variants have `.diagnostic()` methods, but the output could be more human-readable. Review and improve formatting of error chains.
 
-### 1. storage-common traits (DO FIRST)
-File: `storage/common/src/traits.rs`
+**Files to check:**
+- `core/src/error/mod.rs` - `.diagnostic()` implementations
+- Anywhere `Report::new(...).change_context(InternalError)` is used
 
-The stream traits define the error type that all implementations must match:
+### 2. Add Context Attachments (optional enhancement)
+
+Attach structured context at error sites for richer diagnostics:
+
 ```rust
-// Change from:
-type Item = Result<EntityId, RetrievalError>;
-// To:
-type Item = Result<EntityId, StorageError>;
+struct EntityContext {
+    entity_id: EntityId,
+    collection: CollectionId,
+    method: &'static str,
+}
+
+// Usage
+report.attach(EntityContext { ... })
 ```
 
-### 2. Sled internal streams
-Files:
-- `storage/sled/src/scan_index.rs`
-- `storage/sled/src/scan_collection.rs`
-- `storage/sled/src/entity.rs`
-- `storage/sled/src/index.rs`
-- `storage/sled/src/property.rs`
+See plan.md for full design.
 
-Pattern:
-```rust
-// Change from:
-RetrievalError::StorageError(...)
-// To:
-StorageError::BackendError(...)
-```
+## Reference
 
-### 3. Postgres storage
-File: `storage/postgres/src/lib.rs`
-
-Same pattern as SQLite - import `StorageError`, update signatures and conversions.
-
-### 4. IndexedDB-wasm storage
-File: `storage/indexeddb-wasm/src/*.rs`
-
-Same pattern.
-
-## Done When
-
-- [ ] `cargo check` passes (0 errors)
-- [ ] `cargo test` passes
-- [ ] `.diagnostic()` output is human-readable for failures
-
-## Later: Context Attachments
-
-After everything compiles, enrich error reports with context structs (LineageContext, EntityContext, IntentContext). See plan.md.
+- **Pattern to follow:** `storage/sqlite/src/error.rs` - local error enum with `From<LocalError> for StorageError`
+- **Core principle:** Internal code uses `StorageError`, conversion to public errors at API boundaries only

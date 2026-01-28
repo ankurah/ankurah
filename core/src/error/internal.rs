@@ -84,6 +84,12 @@ impl From<tokio::task::JoinError> for StorageError {
     }
 }
 
+impl From<anyhow::Error> for StorageError {
+    fn from(err: anyhow::Error) -> Self {
+        StorageError::BackendError(err.into())
+    }
+}
+
 impl From<crate::error::RetrievalError> for StorageError {
     fn from(err: crate::error::RetrievalError) -> Self {
         match err {
@@ -109,6 +115,12 @@ pub enum StateError {
 impl From<bincode::Error> for StateError {
     fn from(e: bincode::Error) -> Self {
         StateError::SerializationError(Box::new(e))
+    }
+}
+
+impl From<StateError> for StorageError {
+    fn from(err: StateError) -> Self {
+        StorageError::BackendError(Box::new(err))
     }
 }
 

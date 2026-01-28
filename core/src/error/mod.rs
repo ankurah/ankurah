@@ -6,16 +6,16 @@
 pub mod internal;
 
 // Re-export internal types for crate-internal use
-pub(crate) use internal::{
-    AnyhowWrapper, ApplyError, ApplyErrorCause, ApplyErrorItem, LineageError, RequestError,
-    SubscriptionError, ValidationError,
-};
+pub(crate) use internal::{AnyhowWrapper, ApplyError, RequestError, SubscriptionError};
+
+// ValidationError needs to be public because it's used in PolicyAgent trait
+pub use internal::ValidationError;
 
 // Re-export storage types publicly for storage implementation crates
 pub use internal::{StateError, StorageError};
 
 use ankurah_proto::{CollectionId, EntityId};
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use thiserror::Error;
 
 use crate::policy::AccessDenied;
@@ -98,6 +98,13 @@ impl From<ankql::error::ParseError> for QueryError {
 impl From<ankql::error::ParseError> for RetrievalError {
     fn from(err: ankql::error::ParseError) -> Self {
         RetrievalError::InvalidQuery(QueryError::Parse(err))
+    }
+}
+
+// Required for infallible conversions in derive macros
+impl From<std::convert::Infallible> for RetrievalError {
+    fn from(err: std::convert::Infallible) -> Self {
+        match err {}
     }
 }
 

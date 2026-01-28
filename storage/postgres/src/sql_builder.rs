@@ -1,5 +1,5 @@
 use ankql::ast::{ComparisonOperator, Expr, Literal, OrderByItem, OrderDirection, Predicate, Selection};
-use ankurah_core::{error::RetrievalError, EntityId};
+use ankurah_core::{error::StorageError, EntityId};
 use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
@@ -181,8 +181,8 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
     }
 }
 
-impl From<SqlGenerationError> for RetrievalError {
-    fn from(err: SqlGenerationError) -> Self { RetrievalError::StorageError(Box::new(err)) }
+impl From<SqlGenerationError> for StorageError {
+    fn from(err: SqlGenerationError) -> Self { StorageError::BackendError(Box::new(err)) }
 }
 
 pub enum SqlExpr {

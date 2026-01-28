@@ -79,7 +79,7 @@ where
     S: Stream + Unpin,
     S::Item: HasEntityId,
 {
-    type Item = Result<ankurah_core::EntityId, ankurah_core::error::RetrievalError>;
+    type Item = Result<ankurah_core::EntityId, ankurah_core::error::StorageError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
@@ -95,7 +95,7 @@ pub trait HasEntityId {
     fn entity_id(&self) -> ankurah_core::EntityId;
 }
 
-// ExtractIdsStream implements EntityIdStream (via blanket impl) since it yields Result<EntityId, RetrievalError>
+// ExtractIdsStream implements EntityIdStream (via blanket impl) since it yields Result<EntityId, StorageError>
 
 // Blanket implementation for any Stream with Filterable items
 impl<S> ValueSetStream for S

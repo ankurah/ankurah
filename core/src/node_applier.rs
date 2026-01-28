@@ -2,7 +2,7 @@ use crate::{
     changes::EntityChange,
     error::{
         internal::{ApplyError, ApplyErrorCause, ApplyErrorItem},
-        MutationError, RetrievalError, StorageError,
+        MutationError, RetrievalError,
     },
     lineage::Retrieve,
     node::Node,

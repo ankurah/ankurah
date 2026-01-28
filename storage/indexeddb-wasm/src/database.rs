@@ -1,6 +1,6 @@
 use crate::util::navigator_lock::NavigatorLock;
 use ankurah_core::indexing::KeySpec;
-use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
+use ankurah_core::{error::StorageError, notice_info, util::safeset::SafeSet};
 use anyhow::{anyhow, Result};
 use send_wrapper::SendWrapper;
 use std::sync::{
@@ -37,7 +37,7 @@ pub struct Connection {
 }
 
 impl Database {
-    pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
+    pub async fn open(db_name: &str) -> Result<Self, StorageError> {
         let connection = Connection::open(db_name).await?;
 
         Ok(Self(Arc::new(Inner {
@@ -62,7 +62,7 @@ impl Database {
     pub async fn close(&self) { self.0.connection.lock().await.close(); }
 
     /// Ensure an index exists, creating it if necessary via database version upgrade
-    pub async fn assure_index_exists(&self, index_spec: &KeySpec) -> Result<(), RetrievalError> {
+    pub async fn assure_index_exists(&self, index_spec: &KeySpec) -> Result<(), StorageError> {
         let name = index_spec.name_with("", "__");
         if self.0.index_cache.contains(&name) {
             return Ok(());
@@ -119,7 +119,7 @@ impl Connection {
     pub fn version(&self) -> u32 { self.db.version() as u32 }
 
     /// Check whether the `entities` store already has an index with the given name
-    pub fn has_index(&self, index_name: &str) -> Result<bool, RetrievalError> {
+    pub fn has_index(&self, index_name: &str) -> Result<bool, StorageError> {
         let tx = self.db.transaction_with_str_and_mode("entities", web_sys::IdbTransactionMode::Readonly).require("get transaction")?;
         let store = tx.object_store("entities").require("get object store")?;
         Ok(store.index_names().contains(index_name))
@@ -134,12 +134,12 @@ impl Connection {
     }
 
     /// Open or create a new database connection with default schema
-    pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
+    pub async fn open(db_name: &str) -> Result<Self, StorageError> {
         notice_info!("Database.open({})", db_name);
         if db_name.is_empty() {
             return Err(anyhow!("Database name cannot be empty").into());
         }
-        Self::new(db_name, None, move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
+        Self::new(db_name, None, move |event: IdbVersionChangeEvent| -> Result<(), StorageError> {
             let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
             let transaction = open_request.transaction().require("get upgrade transaction")?;
 
@@ -159,11 +159,11 @@ impl Connection {
     }
 
     /// Open database connection with a specific index to be created
-    pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec) -> Result<Self, RetrievalError> {
+    pub async fn open_with_index(db_name: &str, version: u32, index_spec: KeySpec) -> Result<Self, StorageError> {
         let index_name = index_spec.name_with("", "__");
         notice_info!("creating index {db_name}.entities.{index_name} -> {:?}", index_spec.keyparts);
 
-        Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), RetrievalError> {
+        Self::new(db_name, Some(version), move |event: IdbVersionChangeEvent| -> Result<(), StorageError> {
             let open_request: IdbOpenDbRequest = event.target().require("get event target")?.unchecked_into();
             let transaction = open_request.transaction().require("get upgrade transaction")?;
             let store = transaction.object_store("entities").require("get entities store during upgrade")?;
@@ -175,8 +175,8 @@ impl Connection {
         .await
     }
 
-    async fn new<F>(db_name: &str, version: Option<u32>, onupgradeneeded: F) -> Result<Self, RetrievalError>
-    where F: 'static + Fn(IdbVersionChangeEvent) -> Result<(), RetrievalError> {
+    async fn new<F>(db_name: &str, version: Option<u32>, onupgradeneeded: F) -> Result<Self, StorageError>
+    where F: 'static + Fn(IdbVersionChangeEvent) -> Result<(), StorageError> {
         let open_request = SendWrapper::new({
             let window = window().require("get window")?;
             let idb: IdbFactory = window.indexed_db().require("get indexeddb")?;

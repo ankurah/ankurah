@@ -649,7 +649,7 @@ mod tests {
 
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
-                Err(RetrievalError::RequestError(error))
+                Err(RetrievalError::Failure(error_stack::Report::new(error).change_context(crate::error::InternalError)))
             } else {
                 // Mock successful subscription (fetch, subscribe, apply, store all succeeded)
                 Ok(())

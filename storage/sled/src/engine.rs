@@ -12,7 +12,7 @@ use ankurah_proto::CollectionId;
 use async_trait::async_trait;
 use sled::Config;
 
-use crate::{collection::SledStorageCollection, database::Database, error::SledRetrievalError};
+use crate::{collection::SledStorageCollection, database::Database};
 
 pub struct SledStorageEngine {
     pub database: Mutex<Arc<Database>>,
@@ -129,7 +129,7 @@ impl StorageEngine for SledStorageEngine {
             let mut database_guard = self.database.lock().unwrap();
             let old_database = database_guard.clone();
             let new_database = Database::open(old_database.db.clone())
-                .map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
+                .map_err(|e| StorageError::BackendError(Box::new(std::io::Error::other(e.to_string()))))?;
             *database_guard = Arc::new(new_database);
         }
 

@@ -1,9 +1,8 @@
-use crate::error::{AnyhowWrapper, InternalError, RetrievalError, QueryError};
+use crate::error::{QueryError, RetrievalError};
 use crate::schema::CollectionSchema;
 use crate::value::{Value, ValueType};
 use ankql::ast::{Expr, Literal, Predicate};
 use anyhow::Result;
-use error_stack::Report;
 
 /// Convert a schema field lookup error to RetrievalError
 fn field_error_to_retrieval(e: crate::property::PropertyError) -> RetrievalError {
