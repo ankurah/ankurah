@@ -10,15 +10,10 @@ use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{AnyhowWrapper, InternalError, MutationError, RetrievalError, StateError},
+    error::{AnyhowWrapper, InternalError, MutationError, StateError, StorageError},
     property::{backend::PropertyBackend, PropertyName, Value},
 };
 use error_stack::Report;
-
-/// Convert bincode error to RetrievalError
-fn bincode_to_retrieval(e: bincode::Error) -> RetrievalError {
-    RetrievalError::Failure(Report::new(AnyhowWrapper::from(format!("bincode error: {}", e))).change_context(InternalError))
-}
 
 /// Convert bincode error to MutationError
 fn bincode_to_mutation(e: bincode::Error) -> MutationError {
@@ -101,9 +96,9 @@ impl PropertyBackend for LWWBackend {
         Ok(state_buffer)
     }
 
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageError>
     where Self: Sized {
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer).map_err(bincode_to_retrieval)?;
+        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
         let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }

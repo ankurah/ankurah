@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah::error::RetrievalError;
+use ankurah::error::StorageError;
 use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Node, PermissiveAgent};
 use anyhow::Result;
 use std::sync::Arc;
@@ -8,9 +8,9 @@ use std::sync::Arc;
 /// RT176: get_state should return EntityNotFound for non-existent entities (postgres)
 ///
 /// When `get_state` is called for an entity that doesn't exist in postgres storage,
-/// it should return `EntityNotFound` (not a generic StorageError). This is critical
-/// because the `Retrieve` trait implementation converts `EntityNotFound` to `Ok(None)`,
-/// which allows entity creation to proceed normally.
+/// it should return `StorageError::EntityNotFound` (not a generic BackendError).
+/// This is critical because the `Retrieve` trait implementation converts
+/// `EntityNotFound` to `Ok(None)`, which allows entity creation to proceed normally.
 ///
 /// Regression: commit c48b639 changed `error_kind` to use `err.as_db_error().message()`
 /// instead of `err.to_string()`, breaking detection of the client-side "unexpected
@@ -32,14 +32,14 @@ async fn postgres_get_state_returns_entity_not_found() -> Result<()> {
     // Call get_state directly on the storage collection
     let result = collection.get_state(non_existent_id).await;
 
-    // Should be EntityNotFound, NOT a generic StorageError
+    // Should be EntityNotFound, NOT a generic BackendError
     match result {
-        Err(RetrievalError::EntityNotFound(id)) => {
+        Err(StorageError::EntityNotFound(id)) => {
             assert_eq!(id, non_existent_id, "EntityNotFound should contain the requested ID");
         }
-        Err(RetrievalError::StorageError(e)) => {
+        Err(StorageError::BackendError(e)) => {
             panic!(
-                "get_state returned StorageError instead of EntityNotFound: {}. \
+                "get_state returned BackendError instead of EntityNotFound: {}. \
                 This indicates the postgres storage is not properly handling the \
                 'query returned an unexpected number of rows' error from query_one.",
                 e

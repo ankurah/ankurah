@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
-use crate::error::{MutationError, RetrievalError, StateError};
+use crate::error::{MutationError, StateError, StorageError};
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -35,7 +35,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Get the latest state buffer for this property backend.
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError>;
     /// Construct a property backend from a state buffer.
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageError>
     where Self: Sized;
 
     /// Retrieve operations applied to this backend since the last time we called this method.
@@ -58,7 +58,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 // or if they can take a generic, they should also take a `Vec<u8>`.
 
 // TODO: Implement a property backend type registry rather than this hardcoded nonsense.
-pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
+pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, StorageError> {
     if name == "yrs" {
         let backend = match buffer {
             Some(buffer) => YrsBackend::from_state_buffer(buffer)?,

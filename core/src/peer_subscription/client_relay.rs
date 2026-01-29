@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
-use crate::error::{internal::RequestError, AnyhowWrapper, ApplyError, InternalError, MutationError, RetrievalError};
+use crate::error::{internal::{ApplyErrorCause, RequestError}, AnyhowWrapper, ApplyError, InternalError, MutationError, RetrievalError};
 use crate::node::ContextData;
 use crate::util::safeset::SafeSet;
 
@@ -19,9 +19,30 @@ fn request_to_retrieval(e: RequestError) -> RetrievalError {
     }
 }
 
-/// Convert ApplyError to RetrievalError
+/// Convert ApplyError to RetrievalError, preserving error-stack chain
 fn apply_to_retrieval(e: ApplyError) -> RetrievalError {
-    RetrievalError::Failure(Report::new(AnyhowWrapper::from(format!("{}", e))).change_context(InternalError))
+    match e {
+        // If there's a single item with a Reported cause, extract and use that chain
+        ApplyError::Items(mut items) if items.len() == 1 => {
+            let item = items.pop().unwrap();
+            match item.cause {
+                ApplyErrorCause::Reported(report) => {
+                    // The report already has the full chain, just add InternalError at the top
+                    RetrievalError::Failure(report.change_context(InternalError))
+                }
+                other => {
+                    // Reconstruct the error for non-Report causes
+                    let reconstructed = ApplyError::Items(vec![crate::error::internal::ApplyErrorItem {
+                        entity_id: item.entity_id,
+                        collection: item.collection,
+                        cause: other,
+                    }]);
+                    RetrievalError::Failure(Report::new(reconstructed).change_context(InternalError))
+                }
+            }
+        }
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
 }
 
 /// Convert MutationError to RetrievalError

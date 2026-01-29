@@ -18,7 +18,7 @@ use crate::{
     connector::{PeerSender, SendError},
     context::Context,
     entity::{Entity, WeakEntitySet},
-    error::{internal::RequestError, InternalError, MutationError, NotFound, RetrievalError, StateError, StorageError},
+    error::{internal::{WithStateError, RequestError}, InternalError, MutationError, NotFound, RetrievalError, StateError, StorageError},
     notice_info,
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
@@ -692,7 +692,7 @@ where
 
         // Run comparison
         loop {
-            match comparison.step().await? {
+            match comparison.step().await.map_err(|e| anyhow::anyhow!("{:#}", e))? {
                 Some(Ordering::Descends) => {
                     // Current descends from known - perfect for event bridge
                     break;
@@ -841,7 +841,8 @@ where
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
             let (_, entity) =
-                self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+                self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await
+                    ?;
             entities.push(entity);
         }
         Ok(entities)

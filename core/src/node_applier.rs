@@ -133,7 +133,7 @@ impl NodeApplier {
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
-                let (changed, entity) = node.entities.with_state(retriever, entity_id, collection_id, state.payload.state).await.map_err(retrieval_to_cause)?;
+                let (changed, entity) = node.entities.with_state(retriever, entity_id, collection_id, state.payload.state).await?;
                 entities.push(entity.clone());
 
                 // TODO: get the list of events that where actually applied - don't just pass them all through blindly
@@ -275,7 +275,7 @@ impl NodeApplier {
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
                 let (_, entity) =
-                    node.entities.with_state(retriever, delta.entity_id, delta.collection, attested_state.payload.state).await.map_err(retrieval_to_cause)?;
+                    node.entities.with_state(retriever, delta.entity_id, delta.collection, attested_state.payload.state).await?;
 
                 // Save state to storage
                 Self::save_state(node, &entity, &collection).await?;

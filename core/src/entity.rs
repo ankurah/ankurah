@@ -1,13 +1,13 @@
 use crate::lineage::{self, GetEvents, Retrieve};
 use crate::selection::filter::Filterable;
 use crate::{
-    error::{internal::{LineageError, StateError}, AnyhowWrapper, InternalError, MutationError, RetrievalError},
+    error::{internal::{LineageError, StateError, WithStateError}, AnyhowWrapper, InternalError, MutationError, RetrievalError},
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
     value::Value,
 };
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 
 /// Convert RetrievalError to MutationError
 fn retrieval_to_mutation(e: RetrievalError) -> MutationError {
@@ -16,6 +16,7 @@ fn retrieval_to_mutation(e: RetrievalError) -> MutationError {
         other => MutationError::Failure(Report::new(AnyhowWrapper::from(format!("{}", other))).change_context(InternalError)),
     }
 }
+
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -243,7 +244,7 @@ impl Entity {
         for attempt in 0..MAX_RETRIES {
             let comparison = crate::lineage::compare_unstored_event(getter, event, &head, budget)
                 .await
-                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
+                .map_err(|e| MutationError::Failure(e.change_context(InternalError)))?;
             let new_head: Clock = match comparison {
                 lineage::Ordering::Equal => return Ok(false),
                 lineage::Ordering::Descends => event.id().into(),
@@ -284,7 +285,7 @@ impl Entity {
         Err(MutationError::InvalidUpdate("TOCTOU attempts exhausted".into()))
     }
 
-    pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
+    pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, Report<LineageError>>
     where G: GetEvents<Id = EventId, Event = Event> {
         let mut head = self.head();
         let new_head = state.head.clone();
@@ -296,13 +297,13 @@ impl Entity {
         for _attempt in 0..MAX_RETRIES {
             let comparison = crate::lineage::compare(getter, &new_head, &head, budget)
                 .await
-                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
+                .attach("Entity::apply_state")?;
             let apply = match comparison {
                 lineage::Ordering::Equal => return Ok(false),
                 lineage::Ordering::Descends => true,
                 lineage::Ordering::NotDescends { meet: _ } => return Ok(false),
-                lineage::Ordering::Incomparable => return Err(MutationError::Failure(Report::new(LineageError::Incomparable).change_context(InternalError))),
-                lineage::Ordering::PartiallyDescends { meet } => return Err(MutationError::Failure(Report::new(LineageError::PartiallyDescends { meet }).change_context(InternalError))),
+                lineage::Ordering::Incomparable => return Err(Report::new(LineageError::Incomparable).attach("Entity::apply_state")),
+                lineage::Ordering::PartiallyDescends { meet } => return Err(Report::new(LineageError::PartiallyDescends { meet }).attach("Entity::apply_state")),
                 lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
                     warn!(
                         "{self} apply_state - budget exhausted after {budget} events. Assuming Descends. subject: {subject_frontier:?}, other: {other_frontier:?}"
@@ -312,10 +313,10 @@ impl Entity {
             };
 
             if apply {
-                if self.try_mutate::<_, MutationError>(&mut head, |es| -> Result<(), MutationError> {
+                if self.try_mutate::<_, Report<LineageError>>(&mut head, |es| -> Result<(), Report<LineageError>> {
                     for (name, state_buffer) in state.state_buffers.iter() {
                         let backend = backend_from_string(name, Some(state_buffer))
-                            .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
+                            .map_err(|e| Report::new(LineageError::Storage(crate::error::StorageError::BackendError(Box::new(e)))).attach("Entity::apply_state"))?;
                         es.backends.insert(name.to_owned(), backend);
                     }
                     es.head = state.head.clone();
@@ -329,7 +330,9 @@ impl Entity {
         }
 
         warn!("{self} apply_state retries exhausted while chasing moving head");
-        Err(MutationError::InvalidUpdate("TOCTOU attempts exhausted".into()))
+        Err(Report::new(LineageError::Storage(crate::error::StorageError::BackendError(
+            Box::new(std::io::Error::other("TOCTOU attempts exhausted"))
+        ))).attach("Entity::apply_state"))
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
@@ -500,10 +503,11 @@ impl WeakEntitySet {
                 Ok(Some(state)) => {
                     // technically someone could have added the entity since we last checked, so it's better to use the
                     // with_state method to re-check
-                    let (_, entity) = self.with_state(retriever, *id, collection_id.to_owned(), state.payload.state).await?;
+                    let (_, entity) = self.with_state(retriever, *id, collection_id.to_owned(), state.payload.state).await
+                        ?;
                     Ok(Some(entity))
                 }
-                Err(e) => Err(e),
+                Err(e) => Err(e.into()),
             },
         }
     }
@@ -566,7 +570,7 @@ impl WeakEntitySet {
         id: EntityId,
         collection_id: CollectionId,
         state: State,
-    ) -> Result<(Option<bool>, Entity), RetrievalError>
+    ) -> Result<(Option<bool>, Entity), Report<WithStateError>>
     where
         R: Retrieve<Id = EventId, Event = Event>,
     {
@@ -592,10 +596,9 @@ impl WeakEntitySet {
         };
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let changed = entity
-            .apply_state(retriever, &state)
+        let changed = entity.apply_state(retriever, &state)
             .await
-            .map_err(|e| RetrievalError::Failure(Report::new(e).change_context(InternalError)))?;
+            .map_err(|e| Report::new(WithStateError::Lineage(e)))?;
         Ok((Some(changed), entity))
     }
 }

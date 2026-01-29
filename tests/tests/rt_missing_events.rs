@@ -103,6 +103,6 @@ async fn rt_missing_events_from_state_snapshot() -> Result<(), Box<dyn std::erro
     })
     .await?;
 
-    assert!(err_string.contains("Events not found"), "unexpected error: {err_string}");
+    assert!(err_string.contains("events not found"), "unexpected error: {err_string}");
     Ok(())
 }

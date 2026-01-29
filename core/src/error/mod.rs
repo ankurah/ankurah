@@ -6,7 +6,7 @@
 pub mod internal;
 
 // Re-export internal types for crate-internal use
-pub(crate) use internal::{AnyhowWrapper, ApplyError, RequestError, SubscriptionError};
+pub(crate) use internal::{AnyhowWrapper, ApplyError, LineageError, RequestError, SubscriptionError};
 
 // ValidationError needs to be public because it's used in PolicyAgent trait
 pub use internal::ValidationError;
@@ -19,6 +19,11 @@ use error_stack::Report;
 use thiserror::Error;
 
 use crate::policy::AccessDenied;
+
+/// Format an error-stack Report as a human-readable diagnostic string with locations.
+fn format_diagnostic<C: std::error::Error>(report: &Report<C>) -> String {
+    format!("{report:?}")
+}
 
 /// Marker context for errors that cross the public API boundary.
 /// The actual error chain is preserved in the Report via error-stack.
@@ -49,14 +54,22 @@ pub enum RetrievalError {
     #[error("timeout")]
     Timeout,
 
-    /// Internal failure - use `.diagnostic()` for details
+    /// Internal failure with full error chain and locations
     #[error("{0:?}")]
     Failure(Report<InternalError>),
 }
 
 impl RetrievalError {
-    /// Get diagnostic string if this is a Failure
+    /// Get human-readable diagnostic string if this is a Failure.
     pub fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Failure(report) => Some(format_diagnostic(report)),
+            _ => None,
+        }
+    }
+
+    /// Get raw error-stack debug output if this is a Failure.
+    pub fn diagnostic_debug(&self) -> Option<String> {
         match self {
             Self::Failure(report) => Some(format!("{report:?}")),
             _ => None,
@@ -135,14 +148,22 @@ pub enum MutationError {
     #[error("timeout")]
     Timeout,
 
-    /// Internal failure - use `.diagnostic()` for details
+    /// Internal failure with full error chain and locations
     #[error("{0:?}")]
     Failure(Report<InternalError>),
 }
 
 impl MutationError {
-    /// Get diagnostic string if this is a Failure
+    /// Get human-readable diagnostic string if this is a Failure.
     pub fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Failure(report) => Some(format_diagnostic(report)),
+            _ => None,
+        }
+    }
+
+    /// Get raw error-stack debug output if this is a Failure.
+    pub fn diagnostic_debug(&self) -> Option<String> {
         match self {
             Self::Failure(report) => Some(format!("{report:?}")),
             _ => None,
@@ -166,6 +187,22 @@ impl From<AccessDenied> for MutationError {
 impl From<AccessDenied> for RetrievalError {
     fn from(err: AccessDenied) -> Self {
         RetrievalError::AccessDenied(err)
+    }
+}
+
+impl From<StorageError> for RetrievalError {
+    fn from(err: StorageError) -> Self {
+        match err {
+            StorageError::EntityNotFound(id) => RetrievalError::NotFound(NotFound::Entity(id)),
+            StorageError::CollectionNotFound(id) => RetrievalError::NotFound(NotFound::Collection(id)),
+            other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+        }
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<Report<E>> for RetrievalError {
+    fn from(r: Report<E>) -> Self {
+        RetrievalError::Failure(r.change_context(InternalError))
     }
 }
 
@@ -206,14 +243,22 @@ pub enum PropertyError {
     #[error("deserialize error: {0}")]
     DeserializeError(String),
 
-    /// Internal failure - use `.diagnostic()` for details
+    /// Internal failure with full error chain and locations
     #[error("{0:?}")]
     Failure(Report<InternalError>),
 }
 
 impl PropertyError {
-    /// Get diagnostic string if this is a Failure
+    /// Get human-readable diagnostic string if this is a Failure.
     pub fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Failure(report) => Some(format_diagnostic(report)),
+            _ => None,
+        }
+    }
+
+    /// Get raw error-stack debug output if this is a Failure.
+    pub fn diagnostic_debug(&self) -> Option<String> {
         match self {
             Self::Failure(report) => Some(format!("{report:?}")),
             _ => None,

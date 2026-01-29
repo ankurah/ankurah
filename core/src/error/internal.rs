@@ -6,10 +6,21 @@
 use std::collections::BTreeSet;
 
 use ankurah_proto::{CollectionId, DecodeError, EntityId, EventId};
+use error_stack::Report;
 use thiserror::Error;
 
 use crate::connector::SendError;
 use crate::policy::AccessDenied;
+
+/// Error context for EntitySet::with_state operations.
+/// Used with error-stack's `.change_context()` to add context while preserving the error chain.
+#[derive(Debug, Error)]
+pub enum WithStateError {
+    #[error("storage error in with_state")]
+    Storage,
+    #[error("lineage error in with_state")]
+    Lineage,
+}
 
 #[derive(Debug)]
 pub enum LineageError {
@@ -20,6 +31,10 @@ pub enum LineageError {
         subject_frontier: BTreeSet<EventId>,
         other_frontier: BTreeSet<EventId>,
     },
+    /// Events required for lineage comparison were not found in storage
+    EventsNotFound(Vec<String>),
+    /// Storage error during lineage comparison
+    Storage(StorageError),
 }
 
 impl std::fmt::Display for LineageError {
@@ -36,6 +51,10 @@ impl std::fmt::Display for LineageError {
                 let other: Vec<_> = other_frontier.iter().map(|id| id.to_base64_short()).collect();
                 write!(f, "budget exceeded ({}): subject[{}] other[{}]", original_budget, subject.join(", "), other.join(", "))
             }
+            LineageError::EventsNotFound(ids) => {
+                write!(f, "events not found: [{}]", ids.join(", "))
+            }
+            LineageError::Storage(e) => write!(f, "storage error: {}", e),
         }
     }
 }
@@ -87,16 +106,6 @@ impl From<tokio::task::JoinError> for StorageError {
 impl From<anyhow::Error> for StorageError {
     fn from(err: anyhow::Error) -> Self {
         StorageError::BackendError(err.into())
-    }
-}
-
-impl From<crate::error::RetrievalError> for StorageError {
-    fn from(err: crate::error::RetrievalError) -> Self {
-        match err {
-            crate::error::RetrievalError::NotFound(crate::error::NotFound::Entity(id)) => StorageError::EntityNotFound(id),
-            crate::error::RetrievalError::NotFound(crate::error::NotFound::Collection(id)) => StorageError::CollectionNotFound(id),
-            other => StorageError::BackendError(Box::new(std::io::Error::other(format!("{}", other)))),
-        }
     }
 }
 
@@ -256,9 +265,8 @@ impl std::fmt::Display for ApplyErrorItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "failed to apply delta for entity {} in collection {}: {}",
+            "entity {}: {}",
             self.entity_id.to_base64_short(),
-            self.collection,
             self.cause
         )
     }
@@ -279,6 +287,14 @@ pub enum ApplyErrorCause {
     #[error("access denied: {0}")]
     AccessDenied(#[from] AccessDenied),
 
+    /// Preserves the full error-stack chain from apply operations
+    #[error("{0:?}")]
+    Reported(Report<WithStateError>),
+
     #[error("{0}")]
     Other(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl From<Report<WithStateError>> for ApplyErrorCause {
+    fn from(r: Report<WithStateError>) -> Self { ApplyErrorCause::Reported(r) }
 }

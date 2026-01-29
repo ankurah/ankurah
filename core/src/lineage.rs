@@ -1,6 +1,6 @@
-use crate::error::{InternalError, RetrievalError, StorageError};
-use error_stack::Report;
+use crate::error::LineageError;
 use crate::retrieval::{TClock, TEvent};
+use error_stack::Report;
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -77,7 +77,7 @@ pub enum Ordering<Id> {
 ///
 /// The `subject` event itself may not be stored, as it represents a new event
 /// being compared for potential application.
-pub async fn compare_unstored_event<G, E, C>(getter: &G, subject: &E, other: &C, budget: usize) -> Result<Ordering<G::Id>, RetrievalError>
+pub async fn compare_unstored_event<G, E, C>(getter: &G, subject: &E, other: &C, budget: usize) -> Result<Ordering<G::Id>, Report<LineageError>>
 where
     G: GetEvents,
     G::Event: TEvent<Id = G::Id> + Clone,
@@ -129,7 +129,7 @@ where
 /// required to make a conclusive comparison. I think we can probably purge the `state`
 /// map for a given entity once visited by both sides, and the id is removed from the checklist
 /// but this needs a bit more thought.
-pub async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, RetrievalError>
+pub async fn compare<G, C>(getter: &G, subject: &C, other: &C, budget: usize) -> Result<Ordering<G::Id>, Report<LineageError>>
 where
     G: GetEvents,
     G::Event: TEvent<Id = G::Id> + Clone,
@@ -307,7 +307,7 @@ where
     }
 
     // runs one step of the comparison, returning Some(ordering) if a conclusive determination can be made, or None if it needs more steps
-    pub async fn step(&mut self) -> Result<Option<Ordering<G::Id>>, RetrievalError> {
+    pub async fn step(&mut self) -> Result<Option<Ordering<G::Id>>, Report<LineageError>> {
         // Early short-circuit: if the initial head sets are identical, we are Equal.
         // IMPORTANT: We only use the initial-heads predicate here; we intentionally
         // do NOT short-circuit on incidental frontier equality mid-traversal, because
@@ -322,7 +322,7 @@ where
         // TODO: create a NewType(HashSet) and impl ToSql for the postgres storage method
         // so we can pass the HashSet as a borrow and don't have to alloc this twice
         let mut result_checklist: HashSet<G::Id> = ids.iter().cloned().collect();
-        let (cost, events) = self.getter.retrieve_event(ids).await?;
+        let (cost, events) = self.getter.retrieve_event(ids).await.map_err(|e| Report::new(LineageError::Storage(e)))?;
         self.remaining_budget = self.remaining_budget.saturating_sub(cost);
 
         for event in events {
@@ -331,12 +331,9 @@ where
             }
         }
         if !result_checklist.is_empty() {
-            // Format IDs for the error message
-            let id_strs: Vec<String> = result_checklist.iter().map(|id| format!("{}", id)).collect();
-            return Err(RetrievalError::Failure(
-                Report::new(StorageError::BackendError(format!("Events not found: {:?}", id_strs).into()))
-                    .change_context(InternalError),
-            ));
+            // Events required for lineage comparison were not found
+            let ids: Vec<String> = result_checklist.iter().map(|id| format!("{}", id)).collect();
+            return Err(Report::new(LineageError::EventsNotFound(ids)));
         }
 
         if let Some(ordering) = self.check_result() {
@@ -477,6 +474,7 @@ mod tests {
     use itertools::Itertools;
 
     use super::*;
+    use crate::error::StorageError;
     use async_trait::async_trait;
     use std::collections::HashMap;
 
@@ -531,7 +529,7 @@ mod tests {
         type Id = TestId;
         type Event = TestEvent;
 
-        async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
+        async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageError> {
             let mut result = Vec::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {
