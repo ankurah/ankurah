@@ -23,7 +23,7 @@ pub fn view_impl(model: &crate::model::description::ModelDescription) -> TokenSt
     let wasm_field_getters_impl = {
         let wasm_getters = model.wasm_getters();
         quote! {
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
             impl #view_name {
                 #(#wasm_getters)*
             }

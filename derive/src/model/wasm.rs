@@ -35,14 +35,14 @@ pub fn view_attributes(view_name: &Ident, mutable_name: &Ident, model_name: &Ide
             impl #view_name {
                 /// Edit this entity in a transaction (WASM version - returns owned Mutable)
                 #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = "edit")]
-                pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, JsValue> {
+                pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::ankurah::derive_deps::wasm_bindgen::JsValue> {
                     use ::ankurah::model::View;
                     match trx.edit::<#model_name>(&self.entity) {
                         Ok(mutable_borrow) => {
                             // Extract the core mutable from the borrow wrapper
                             Ok(mutable_borrow.into_core())
                         }
-                        Err(e) => Err(JsValue::from(e.to_string()))
+                        Err(e) => Err(::ankurah::derive_deps::wasm_bindgen::JsValue::from(e.to_string()))
                     }
                 }
 
@@ -296,17 +296,17 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 
             /// Update the predicate for this query and return a promise that resolves when complete
             #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = updateSelection, variadic, skip_typescript)]
-            pub async fn update_selection(&self, new_selection: String, substitution_values: &JsValue) -> Result<(), JsValue> {
+            pub async fn update_selection(&self, new_selection: String, substitution_values: &::ankurah::derive_deps::wasm_bindgen::JsValue) -> Result<(), ::ankurah::derive_deps::wasm_bindgen::JsValue> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(new_selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
                 let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| JsValue::from_str("Invalid arguments array"))?;
+                    .map_err(|_| ::ankurah::derive_deps::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
                 selection.predicate = selection.predicate.populate(args_array)?;
 
                 self.0.update_selection_wait(selection)
                     .await
-                    .map_err(|e| JsValue::from(e.to_string()))
+                    .map_err(|e| ::ankurah::derive_deps::wasm_bindgen::JsValue::from(e.to_string()))
             }
         }
     }
@@ -329,9 +329,9 @@ pub fn wasm_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident)
         impl #ref_name {
             /// Fetch the referenced entity
             #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
-            pub async fn get(&self, ctx: &::ankurah::core::context::Context) -> Result<#view_name, JsValue> {
+            pub async fn get(&self, ctx: &::ankurah::core::context::Context) -> Result<#view_name, ::ankurah::derive_deps::wasm_bindgen::JsValue> {
                 use ::ankurah::model::Model;
-                self.0.get(ctx).await.map_err(|e| JsValue::from(e.to_string()))
+                self.0.get(ctx).await.map_err(|e| ::ankurah::derive_deps::wasm_bindgen::JsValue::from(e.to_string()))
             }
 
             /// Get the raw EntityId

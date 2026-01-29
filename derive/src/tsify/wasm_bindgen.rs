@@ -43,7 +43,7 @@ pub fn expand(cont: &Container, decl: Decl) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = cont.generics().split_for_impl();
 
     let typescript_custom_section = quote! {
-        #[wasm_bindgen(typescript_custom_section)]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, typescript_custom_section)]
         const TS_APPEND_CONTENT: &'static str = #decl_str;
     };
 
@@ -100,9 +100,9 @@ pub fn expand(cont: &Container, decl: Decl) -> TokenStream {
             };
 
 
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
             extern "C" {
-                #[wasm_bindgen(typescript_type = #typescript_type)]
+                #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, typescript_type = #typescript_type)]
                 pub type JsType;
             }
 

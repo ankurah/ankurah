@@ -35,7 +35,7 @@ pub fn mutable_impl(model: &crate::model::description::ModelDescription) -> Toke
         let custom_wrappers = model.custom_active_type_wrappers();
         (
             quote! {
-                #[wasm_bindgen]
+                #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
                 impl #mutable_name {
                     #(#getter_methods)*
                 }

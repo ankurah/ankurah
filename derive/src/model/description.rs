@@ -171,7 +171,7 @@ impl ModelDescription {
         // r() method - returns ModelRef for this model
         let r_method = quote! {
             #[doc(hidden)]
-            #[wasm_bindgen(js_name = r)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = r)]
             pub fn __wasm_r(&self) -> <#model_name as ::ankurah::model::Model>::RefWrapper {
                 self.r().into()
             }
@@ -190,18 +190,18 @@ impl ModelDescription {
                         .expect("ref_fields should only contain Ref<T> types");
                     quote! {
                         #[doc(hidden)]
-                        #[wasm_bindgen(getter, js_name = #field_name)]
-                        pub fn #wasm_method_name(&self) -> Result<<#inner_model as ::ankurah::model::Model>::RefWrapper, JsValue> {
-                            self.#field_name().map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r)).map_err(|e| JsValue::from(e.to_string()))
+                        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter, js_name = #field_name)]
+                        pub fn #wasm_method_name(&self) -> Result<<#inner_model as ::ankurah::model::Model>::RefWrapper, ::ankurah::derive_deps::wasm_bindgen::JsValue> {
+                            self.#field_name().map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r)).map_err(|e| ::ankurah::derive_deps::wasm_bindgen::JsValue::from(e.to_string()))
                         }
                     }
                 } else if let Some(inner_model) = Self::extract_option_ref_inner_type(&field.ty) {
                     // Option<Ref<T>> field: return Option<RefModel>
                     quote! {
                         #[doc(hidden)]
-                        #[wasm_bindgen(getter, js_name = #field_name)]
-                        pub fn #wasm_method_name(&self) -> Result<Option<<#inner_model as ::ankurah::model::Model>::RefWrapper>, JsValue> {
-                            self.#field_name().map(|opt| opt.map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r))).map_err(|e| JsValue::from(e.to_string()))
+                        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter, js_name = #field_name)]
+                        pub fn #wasm_method_name(&self) -> Result<Option<<#inner_model as ::ankurah::model::Model>::RefWrapper>, ::ankurah::derive_deps::wasm_bindgen::JsValue> {
+                            self.#field_name().map(|opt| opt.map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r))).map_err(|e| ::ankurah::derive_deps::wasm_bindgen::JsValue::from(e.to_string()))
                         }
                     }
                 } else {
@@ -209,9 +209,9 @@ impl ModelDescription {
                     let projected_type = &field.ty;
                     quote! {
                         #[doc(hidden)]
-                        #[wasm_bindgen(getter, js_name = #field_name)]
-                        pub fn #wasm_method_name(&self) -> Result<#projected_type, JsValue> {
-                            self.#field_name().map_err(|e| JsValue::from(e.to_string()))
+                        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter, js_name = #field_name)]
+                        pub fn #wasm_method_name(&self) -> Result<#projected_type, ::ankurah::derive_deps::wasm_bindgen::JsValue> {
+                            self.#field_name().map_err(|e| ::ankurah::derive_deps::wasm_bindgen::JsValue::from(e.to_string()))
                         }
                     }
                 }
@@ -367,7 +367,7 @@ impl ModelDescription {
                 let wasm_method_name = quote::format_ident!("wasm_{}", field_name);
 
                 let getter_method = quote::quote! {
-                    #[wasm_bindgen(getter, js_name = #field_name)]
+                    #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter, js_name = #field_name)]
                     pub fn #wasm_method_name(&self) -> #wrapper_type {
                         #wrapper_type(self.#field_name())
                     }

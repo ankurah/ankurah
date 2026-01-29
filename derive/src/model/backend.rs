@@ -190,9 +190,30 @@ impl ActiveTypeDesc {
     /// - `set(value)` → Accepts `TRef | TView` via duck typing on `.id` property
     ///
     /// Returns `(methods, ts_override)` - ts_override provides union type for set().
+    ///
+    /// Uses context-aware paths:
+    /// - "local" (ankurah-core): uses `::wasm_bindgen`, `::js_sys`, `crate::proto`, `crate::property`
+    /// - "external" (user crates): uses `::ankurah::derive_deps::*`, `::ankurah::proto`, `::ankurah::property`
     fn wasm_methods(&self, context: &str) -> (Vec<TokenStream>, Option<String>) {
         let value_config = &self.backend_config.values[0];
         let substitute_fn = |backend: &ActiveTypeDesc, pattern: &str| backend.do_substitutions(pattern, context);
+
+        // Context-aware paths
+        let (wasm_bindgen_path, js_sys_path, proto_path, property_path): (syn::Path, syn::Path, syn::Path, syn::Path) = if context == "local" {
+            (
+                syn::parse_quote!(::wasm_bindgen),
+                syn::parse_quote!(::js_sys),
+                syn::parse_quote!(crate::proto),
+                syn::parse_quote!(crate::property),
+            )
+        } else {
+            (
+                syn::parse_quote!(::ankurah::derive_deps::wasm_bindgen),
+                syn::parse_quote!(::ankurah::derive_deps::js_sys),
+                syn::parse_quote!(::ankurah::proto),
+                syn::parse_quote!(::ankurah::property),
+            )
+        };
 
         let mut ts_set_override: Option<String> = None;
 
@@ -224,25 +245,26 @@ impl ActiveTypeDesc {
                     ts_set_override = Some(format!("{}Ref | {}View | string", model_name, model_name));
 
                     return quote! {
-                        #[wasm_bindgen(skip_typescript)]
-                        pub fn set(&self, value: JsValue) -> Result<(), JsValue> {
+                        #[wasm_bindgen(wasm_bindgen = #wasm_bindgen_path, skip_typescript)]
+                        pub fn set(&self, value: #wasm_bindgen_path::JsValue) -> Result<(), #wasm_bindgen_path::JsValue> {
+                            use #wasm_bindgen_path::JsValue;
                             // Try multiple conversion strategies:
                             // 1. String -> parse as base64
                             // 2. EntityId -> use directly
                             // 3. Object with .id -> extract EntityId
-                            let id: ::ankurah::proto::EntityId = if let Some(s) = value.as_string() {
-                                ::ankurah::proto::EntityId::from_base64(&s)
+                            let id: #proto_path::EntityId = if let Some(s) = value.as_string() {
+                                #proto_path::EntityId::from_base64(&s)
                                     .map_err(|e| JsValue::from_str(&format!("Invalid EntityId string: {}", e)))?
                             } else if let Ok(id) = value.clone().try_into() {
                                 id
                             } else {
-                                let id_value = ::ankurah::derive_deps::js_sys::Reflect::get(&value, &JsValue::from_str("id"))
+                                let id_value = #js_sys_path::Reflect::get(&value, &JsValue::from_str("id"))
                                     .map_err(|_| JsValue::from_str("Expected string, EntityId, or object with 'id' property"))?;
                                 id_value.try_into()
                                     .map_err(|_| JsValue::from_str("'id' property is not an EntityId"))?
                             };
 
-                            let r: ::ankurah::property::Ref<#model_ident> = ::ankurah::property::Ref::new(id);
+                            let r: #property_path::Ref<#model_ident> = #property_path::Ref::new(id);
                             self.0.set(&r).map_err(|e| JsValue::from(e.to_string()))
                         }
                     };
@@ -326,6 +348,10 @@ impl ActiveTypeDesc {
 
     /// Generate WASM wrapper struct and impl block.
     /// Called when ankurah-derive is compiled with the `wasm` feature.
+    ///
+    /// Uses context-aware paths for wasm_bindgen:
+    /// - "local" (impl_provided_wrapper_types in ankurah-core): uses `::wasm_bindgen`
+    /// - "external" (impl_wrapper_type in user crates): uses `::ankurah::derive_deps::wasm_bindgen`
     #[cfg(feature = "wasm")]
     pub fn wasm_wrapper(&self, context: &str, model_scope: Option<&str>) -> TokenStream {
         let wrapper_name_str = match model_scope {
@@ -337,10 +363,17 @@ impl ActiveTypeDesc {
 
         let (wasm_methods, ts_set_override) = self.wasm_methods(context);
 
+        // Use context-aware path for wasm_bindgen
+        let wasm_bindgen_path: syn::Path = if context == "local" {
+            syn::parse_quote!(::wasm_bindgen)
+        } else {
+            syn::parse_quote!(::ankurah::derive_deps::wasm_bindgen)
+        };
+
         let ts_custom_section = if let Some(ref union_type) = ts_set_override {
             let ts_decl = format!("interface {} {{ set(value: {}): void; }}", wrapper_name_str, union_type);
             quote! {
-                #[wasm_bindgen(typescript_custom_section)]
+                #[wasm_bindgen(wasm_bindgen = #wasm_bindgen_path, typescript_custom_section)]
                 const _: &'static str = #ts_decl;
             }
         } else {
@@ -348,13 +381,13 @@ impl ActiveTypeDesc {
         };
 
         quote! {
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = #wasm_bindgen_path)]
             pub struct #wrapper_name(
-                #[wasm_bindgen(skip)]
+                #[wasm_bindgen(wasm_bindgen = #wasm_bindgen_path, skip)]
                 pub #original_type
             );
 
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = #wasm_bindgen_path)]
             impl #wrapper_name {
                 #(#wasm_methods)*
             }

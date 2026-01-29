@@ -42,6 +42,7 @@ pub fn impl_provided_wrapper_types_impl(config_filename: &str) -> syn::Result<To
     let hygiene_module = quote::format_ident!("__ankurah_provided_wrappers_{}", config.backend_name.to_lowercase());
 
     // Wrap in cfg(feature = "wasm") so it compiles conditionally in the target crate
+    // Note: This macro is called from within ankurah-core which has wasm-bindgen as a direct dependency
     Ok(quote! {
         #[cfg(feature = "wasm")]
         mod #hygiene_module {
@@ -136,11 +137,12 @@ pub fn impl_wrapper_type_impl(custom_type: &syn::Type) -> syn::Result<TokenStrea
     );
 
     // Wrap in cfg(feature = "wasm") so it compiles conditionally in the target crate
+    // Note: This macro is called from external crates, so we use ::ankurah::derive_deps
     Ok(quote! {
         #[cfg(feature = "wasm")]
         mod #hygiene_module {
             use super::*;
-            use ::wasm_bindgen::prelude::*;
+            use ::ankurah::derive_deps::wasm_bindgen::prelude::*;
             #(#all_wrappers)*
         }
         #[cfg(feature = "wasm")]

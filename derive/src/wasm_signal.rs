@@ -22,17 +22,17 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
     // Generate the code
     let expanded = quote! {
 
-        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         pub struct #wrapper_name{
             pub (crate) sig: Box<dyn ::ankurah::signals::GetAndDynSubscribe<#name>>,
             pub (crate) handle: ::std::boxed::Box<dyn ::std::any::Any>
         }
 
         // Add TypeScript interface override
-        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, typescript_custom_section)]
         const TS_APPEND_CONTENT: &'static str = #ts_wrapper_interface;
 
-        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
+        #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         impl #wrapper_name {
 
             #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = "subscribe", skip_typescript)]
