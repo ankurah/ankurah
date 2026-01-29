@@ -91,10 +91,12 @@ pub fn expand(cont: &Container, decl: Decl) -> TokenStream {
         const _: () = {
             #use_serde
             use ::ankurah::core::model::tsify::Tsify;
+            use ::ankurah::derive_deps::wasm_bindgen as wasm_bindgen;
             use wasm_bindgen::{
                 convert::{FromWasmAbi, VectorFromWasmAbi, IntoWasmAbi, VectorIntoWasmAbi, OptionFromWasmAbi, OptionIntoWasmAbi, RefFromWasmAbi},
                 describe::WasmDescribe, describe::WasmDescribeVector,
                 prelude::*,
+                JsCast,
             };
 
 
@@ -249,7 +251,6 @@ fn expand_from_wasm_abi(cont: &Container) -> TokenStream {
         }
     } else {
         quote! {
-            use wasm_bindgen::JsCast;
             let js_value: JsValue = JsType::from_abi(js).unchecked_into();
             #(#preprocess_calls)*
             let result = Self::from_js(js_value);
@@ -270,7 +271,6 @@ fn expand_from_wasm_abi(cont: &Container) -> TokenStream {
         }
     } else {
         quote! {
-            use wasm_bindgen::JsCast;
             let js_value: JsValue = (*JsType::ref_from_abi(js)).unchecked_ref::<JsValue>().clone();
             #(#preprocess_calls)*
             let result = Self::from_js(js_value);

@@ -13,7 +13,7 @@ use super::ViewAttributes;
 
 /// Generate WASM-specific attributes for Mutable struct.
 /// Returns (struct_attributes, field_attributes)
-pub fn mutable_attributes() -> (TokenStream, TokenStream) { (quote! { #[wasm_bindgen] }, quote! { #[wasm_bindgen(skip)] }) }
+pub fn mutable_attributes() -> (TokenStream, TokenStream) { (quote! { #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)] }, quote! { #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, skip)] }) }
 
 /// Generate WASM-specific attributes for View struct.
 pub fn view_attributes(view_name: &Ident, mutable_name: &Ident, model_name: &Ident) -> ViewAttributes {
@@ -24,29 +24,29 @@ pub fn view_attributes(view_name: &Ident, mutable_name: &Ident, model_name: &Ide
     );
 
     ViewAttributes {
-        struct_attr: quote! { #[wasm_bindgen] },
-        impl_attr: quote! { #[wasm_bindgen] },
-        id_method_attr: quote! { #[wasm_bindgen(getter)] },
+        struct_attr: quote! { #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)] },
+        impl_attr: quote! { #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)] },
+        id_method_attr: quote! { #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)] },
         extra_impl: quote! {
-            #[wasm_bindgen(typescript_custom_section)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, typescript_custom_section)]
             const TS_VIEW_SUBSCRIBE: &'static str = #subscribe_ts;
 
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
             impl #view_name {
                 /// Edit this entity in a transaction (WASM version - returns owned Mutable)
-                #[wasm_bindgen(js_name = "edit")]
-                pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, ::wasm_bindgen::JsValue> {
+                #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = "edit")]
+                pub fn edit_wasm(&self, trx: &ankurah::transaction::Transaction) -> Result<#mutable_name, JsValue> {
                     use ::ankurah::model::View;
                     match trx.edit::<#model_name>(&self.entity) {
                         Ok(mutable_borrow) => {
                             // Extract the core mutable from the borrow wrapper
                             Ok(mutable_borrow.into_core())
                         }
-                        Err(e) => Err(::wasm_bindgen::JsValue::from(e.to_string()))
+                        Err(e) => Err(JsValue::from(e.to_string()))
                     }
                 }
 
-                #[wasm_bindgen(skip_typescript, js_name = "subscribe")]
+                #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, skip_typescript, js_name = "subscribe")]
                 pub fn subscribe_wasm(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
 
                     let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
@@ -108,13 +108,13 @@ pub fn wasm_impl(input: &syn::DeriveInput, model: &crate::model::description::Mo
 /// FooResultSet(ResultSet<FooView>)
 pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> TokenStream {
     quote! {
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         #[derive(Clone, Default)]
         pub struct #resultset_name(::ankurah::core::resultset::ResultSet<#view_name>);
 
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         impl #resultset_name {
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn items(&self) -> Vec<#view_name> {
                 use ::ankurah::signals::Get;
                 self.0.get()
@@ -123,7 +123,7 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
                 ::ankurah::signals::CurrentObserver::track(&self);
                 self.0.by_id(&id)
             }
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn loaded(&self) -> bool {
                 ::ankurah::signals::CurrentObserver::track(&self);
                 self.0.is_loaded()
@@ -150,62 +150,62 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
 /// FooChangeSet(ChangeSet<FooView>)
 pub fn wasm_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, resultset_name: &Ident) -> TokenStream {
     quote! {
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         pub struct #changeset_name(::ankurah::core::changes::ChangeSet<#view_name>);
 
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         impl #changeset_name {
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn resultset(&self) -> #resultset_name {
                 #resultset_name(self.0.resultset.wrap())
             }
 
             /// Items from the initial query load (before subscription was active)
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn initial(&self) -> Vec<#view_name> {
                 self.0.initial()
             }
 
             /// Genuinely new items (added after subscription started)
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn added(&self) -> Vec<#view_name> {
                 self.0.added()
             }
 
             /// All items that appeared in the result set (initial load + newly added)
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn appeared(&self) -> Vec<#view_name> {
                 self.0.appeared()
             }
 
             /// Items that no longer match the query
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn removed(&self) -> Vec<#view_name> {
                 self.0.removed()
             }
 
             /// Items that were updated but still match
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn updated(&self) -> Vec<#view_name> {
                 self.0.updated()
             }
 
             // Deprecated methods for backwards compatibility
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             #[deprecated(since = "0.7.10", note = "Use appeared, initial, or added instead")]
             pub fn adds(&self) -> Vec<#view_name> {
                 #[allow(deprecated)]
                 self.0.adds()
             }
 
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             #[deprecated(since = "0.7.10", note = "Use removed instead")]
             pub fn removes(&self) -> Vec<#view_name> {
                 #[allow(deprecated)]
                 self.0.removes()
             }
 
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             #[deprecated(since = "0.7.10", note = "Use updated instead")]
             pub fn updates(&self) -> Vec<#view_name> {
                 #[allow(deprecated)]
@@ -226,20 +226,20 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
     );
 
     quote! {
-        #[wasm_bindgen(typescript_custom_section)]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, typescript_custom_section)]
         const TS_APPEND_CONTENT: &'static str = #subscribe_ts;
 
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         pub struct #livequery_name(::ankurah::LiveQuery<#view_name>);
 
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         impl #livequery_name {
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn items(&self) -> Vec<#view_name> {
                 use ::ankurah::signals::Get;
                 self.0.get()
             }
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn signal_id(&self) -> usize {
                 use ::ankurah::signals::Signal;
                 self.0.broadcast_id().into()
@@ -248,27 +248,27 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
                 ::ankurah::core::model::js_resultset_map(&self.0.resultset(), &callback)
             }
 
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn peek(&self) -> Vec<#view_name> {
                 use ::ankurah::signals::Peek;
                 self.0.peek()
             }
 
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn loaded(&self) -> bool { self.0.loaded() }
 
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn resultset(&self) -> #resultset_name {
                 #resultset_name(self.0.resultset())
             }
             /// DEPREDCATED - use resultset() instead
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn value(&self) -> #resultset_name {
                 #resultset_name(self.0.resultset())
             }
 
             /// reading this will track the error signal, so updates will cause the (React)Observer to be notified
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn error(&self) -> Option<String> {
                 use ::ankurah::signals::Get;
                 // TODO maybe don't make a new map signal each time this is called?
@@ -278,13 +278,13 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             }
 
             /// Get the current selection as a string, tracked by the observer
-            #[wasm_bindgen(getter, js_name = currentSelection)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter, js_name = currentSelection)]
             pub fn current_selection(&self) -> String {
                 use ::ankurah::signals::With;
                 self.0.selection().with(|(sel, _version)| sel.to_string())
             }
 
-            #[wasm_bindgen(skip_typescript)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, skip_typescript)]
             pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function, immediate: Option<bool>) -> ::ankurah::signals::SubscriptionGuard {
                 ::ankurah::core::model::js_livequery_subscribe(
                     &self.0,
@@ -295,18 +295,18 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
             }
 
             /// Update the predicate for this query and return a promise that resolves when complete
-            #[wasm_bindgen(js_name = updateSelection, variadic, skip_typescript)]
-            pub async fn update_selection(&self, new_selection: String, substitution_values: &JsValue) -> Result<(), ::wasm_bindgen::JsValue> {
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = updateSelection, variadic, skip_typescript)]
+            pub async fn update_selection(&self, new_selection: String, substitution_values: &JsValue) -> Result<(), JsValue> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(new_selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
                 let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                    .map_err(|_| JsValue::from_str("Invalid arguments array"))?;
                 selection.predicate = selection.predicate.populate(args_array)?;
 
                 self.0.update_selection_wait(selection)
                     .await
-                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
+                    .map_err(|e| JsValue::from(e.to_string()))
             }
         }
     }
@@ -322,26 +322,26 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
 /// Uses short wasm_bindgen path from module-level import in lib.rs
 pub fn wasm_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -> TokenStream {
     quote! {
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         pub struct #ref_name(::ankurah::property::Ref<#model_name>);
 
-        #[wasm_bindgen]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
         impl #ref_name {
             /// Fetch the referenced entity
-            #[wasm_bindgen]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen)]
             pub async fn get(&self, ctx: &::ankurah::core::context::Context) -> Result<#view_name, JsValue> {
                 use ::ankurah::model::Model;
                 self.0.get(ctx).await.map_err(|e| JsValue::from(e.to_string()))
             }
 
             /// Get the raw EntityId
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn id(&self) -> ::ankurah::proto::EntityId {
                 self.0.id()
             }
 
             /// Create a reference from a View
-            #[wasm_bindgen(js_name = "from")]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = "from")]
             pub fn from_view(view: &#view_name) -> Self {
                 #ref_name(view.r())
             }
@@ -407,57 +407,57 @@ pub fn wasm_model_namespace(
     );
 
     quote! {
-        #[wasm_bindgen(typescript_custom_section)]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, typescript_custom_section)]
         const TS_APPEND_CONTENT: &'static str = #static_methods_ts;
 
         // These methods are only available via wasm bindgen, so it's ok that we're inside a const block
-        #[wasm_bindgen(js_name = #name, skip_typescript)]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = #name, skip_typescript)]
         pub struct #namespace_struct {}
 
-        fn js_to_model(me: ::wasm_bindgen::JsValue) -> Result<#name, ::wasm_bindgen::JsValue> {
+        fn js_to_model(me: JsValue) -> Result<#name, JsValue> {
             let js_value = me;
             #(#preprocess_calls)*
             <#name as ::ankurah::core::model::tsify::Tsify>::from_js(js_value)
-                .map_err(|e| ::wasm_bindgen::JsValue::from_str(&e.to_string()))
+                .map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
-        #[wasm_bindgen(js_class = #name)]
+        #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_class = #name)]
         impl #namespace_struct {
-            pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::EntityId) -> Result<#view_name, ::wasm_bindgen::JsValue> {
-                context.get(id).await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))
+            pub async fn get (context: &::ankurah::core::context::Context, id: ::ankurah::EntityId) -> Result<#view_name, JsValue> {
+                context.get(id).await.map_err(|e| JsValue::from(e.to_string()))
             }
 
-            #[wasm_bindgen(variadic)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, variadic)]
             pub async fn fetch (
                 context: &::ankurah::core::context::Context,
                 selection: String,
                 substitution_values: &JsValue
-            ) -> Result<Vec<#view_name>, ::wasm_bindgen::JsValue> {
+            ) -> Result<Vec<#view_name>, JsValue> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
                 let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                    .map_err(|_| JsValue::from_str("Invalid arguments array"))?;
                 selection.predicate = selection.predicate.populate(args_array)?;
 
                 let items = context
                     .fetch::<#view_name>(selection)
                     .await
-                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                    .map_err(|e| JsValue::from(e.to_string()))?;
                 Ok(items)
             }
 
-            #[wasm_bindgen(variadic)]
-            pub fn query (context: &ankurah::core::context::Context, selection: String, substitution_values: &JsValue) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, variadic)]
+            pub fn query (context: &ankurah::core::context::Context, selection: String, substitution_values: &JsValue) -> Result<#livequery_name, JsValue> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
                 let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                    .map_err(|_| JsValue::from_str("Invalid arguments array"))?;
                 selection.predicate = selection.predicate.populate(args_array)?;
 
                 let livequery = context.query::<#view_name>(selection)
-                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                    .map_err(|e| JsValue::from(e.to_string()))?;
                 Ok(#livequery_name(livequery))
             }
 
@@ -465,35 +465,35 @@ pub fn wasm_model_namespace(
             /// appear as `Initial` in the first changeset. Items added after subscription is initialized
             /// will be reported as `Add`.
             /// TODO: May be replaced with a NOCACHE pragma in the selection string when MatchArgs parsing is implemented.
-            #[wasm_bindgen(variadic)]
-            pub fn query_nocache (context: &ankurah::core::context::Context, selection: String, substitution_values: &JsValue) -> Result<#livequery_name, ::wasm_bindgen::JsValue> {
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, variadic)]
+            pub fn query_nocache (context: &ankurah::core::context::Context, selection: String, substitution_values: &JsValue) -> Result<#livequery_name, JsValue> {
                 let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
                 let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+                    .map_err(|_| JsValue::from_str("Invalid arguments array"))?;
                 selection.predicate = selection.predicate.populate(args_array)?;
 
                 let args = ::ankurah::MatchArgs { selection, cached: false };
                 let livequery = context.query::<#view_name>(args)
-                    .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                    .map_err(|e| JsValue::from(e.to_string()))?;
                 Ok(#livequery_name(livequery))
             }
 
-            pub async fn create(transaction: &::ankurah::transaction::Transaction, me: ::wasm_bindgen::JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+            pub async fn create(transaction: &::ankurah::transaction::Transaction, me: JsValue) -> Result<#view_name, JsValue> {
                 use ankurah::Mutable;
                 let model = js_to_model(me)?;
                 let mutable_entity = transaction.create(&model).await?;
                 Ok(mutable_entity.read())
             }
 
-            pub async fn create_one(context: &::ankurah::core::context::Context, me: ::wasm_bindgen::JsValue) -> Result<#view_name, ::wasm_bindgen::JsValue> {
+            pub async fn create_one(context: &::ankurah::core::context::Context, me: JsValue) -> Result<#view_name, JsValue> {
                 use ankurah::Mutable;
                 let tx = context.begin();
                 let model = js_to_model(me)?;
                 let mutable_entity = tx.create(&model).await?;
                 let read = mutable_entity.read();
-                tx.commit().await.map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
+                tx.commit().await.map_err(|e| JsValue::from(e.to_string()))?;
                 Ok(read)
             }
         }

@@ -35,7 +35,7 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
         #[::ankurah::derive_deps::wasm_bindgen::prelude::wasm_bindgen]
         impl #wrapper_name {
 
-            #[wasm_bindgen(js_name = "subscribe", skip_typescript)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, js_name = "subscribe", skip_typescript)]
             pub fn subscribe(&self, callback: ::ankurah::derive_deps::js_sys::Function) -> ::ankurah::signals::SubscriptionGuard {
                 use ::ankurah::signals::DynSubscribe;
                 let callback = ::ankurah::derive_deps::send_wrapper::SendWrapper::new(callback);
@@ -49,13 +49,13 @@ pub fn derive_wasm_signal_impl(input: TokenStream) -> TokenStream {
                 }))
             }
 
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn value(&self) -> #name {
                 use ::ankurah::signals::Get;
                 self.sig.get()
             }
 
-            #[wasm_bindgen(getter)]
+            #[wasm_bindgen(wasm_bindgen = ::ankurah::derive_deps::wasm_bindgen, getter)]
             pub fn peek(&self) -> #name {
                 use ::ankurah::signals::Peek;
                 self.sig.peek()

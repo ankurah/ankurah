@@ -297,13 +297,13 @@ impl ActiveTypeDesc {
                     let inner = return_type_str.strip_prefix("Result<").unwrap().strip_suffix(">").unwrap();
                     let ok_type = inner.split(", ").next().unwrap();
                     let call = if return_has_option_ref {
-                        quote! { self.0.#method_name(#(#converted_args),*).map(|opt| opt.map(Into::into)).map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string())) }
+                        quote! { self.0.#method_name(#(#converted_args),*).map(|opt| opt.map(Into::into)).map_err(|e| JsValue::from(e.to_string())) }
                     } else if return_has_ref {
-                        quote! { self.0.#method_name(#(#converted_args),*).map(Into::into).map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string())) }
+                        quote! { self.0.#method_name(#(#converted_args),*).map(Into::into).map_err(|e| JsValue::from(e.to_string())) }
                     } else {
-                        quote! { self.0.#method_name(#(#converted_args),*).map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string())) }
+                        quote! { self.0.#method_name(#(#converted_args),*).map_err(|e| JsValue::from(e.to_string())) }
                     };
-                    (format!("Result<{}, ::wasm_bindgen::JsValue>", ok_type), call)
+                    (format!("Result<{}, JsValue>", ok_type), call)
                 } else if return_has_option_ref {
                     (return_type_str.clone(), quote! { self.0.#method_name(#(#converted_args),*).map(Into::into) })
                 } else if return_has_ref {
