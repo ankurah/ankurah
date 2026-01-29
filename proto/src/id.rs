@@ -6,7 +6,7 @@ use ulid::Ulid;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::error::{DecodeError, IdParseError};
+use crate::error::DecodeError;
 // TODO - split out the different id types. Presently there's a lot of not-entities that are using this type for their ID
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 #[cfg_attr(feature = "wasm", wasm_bindgen)]

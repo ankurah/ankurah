@@ -1,7 +1,7 @@
 use crate::{
     changes::EntityChange,
     entity::Entity,
-    error::{MutationError, RetrievalError},
+    error::{InternalError, MutationError, NotFound, RequestError, RetrievalError, StorageError},
     livequery::{EntityLiveQuery, LiveQuery},
     model::View,
     node::{MatchArgs, Node},
@@ -9,6 +9,16 @@ use crate::{
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
+use error_stack::Report;
+
+/// Convert StorageError to RetrievalError at API boundary
+fn storage_to_retrieval(e: StorageError) -> RetrievalError {
+    match e {
+        StorageError::EntityNotFound(id) => RetrievalError::NotFound(NotFound::Entity(id)),
+        StorageError::CollectionNotFound(id) => RetrievalError::NotFound(NotFound::Collection(id)),
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
+}
 use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -184,7 +194,7 @@ where
             // Fetch from peers and commit first response
             match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
                 Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if cached => (),
+                Err(RetrievalError::Timeout) if cached => (),
                 Err(e) => {
                     return Err(e);
                 }
@@ -197,7 +207,7 @@ where
         }
         debug!("{}.get_entity fetching from storage", self.node);
 
-        let collection = self.node.collections.get(collection_id).await?;
+        let collection = self.node.collections.get(collection_id).await.map_err(storage_to_retrieval)?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
@@ -205,12 +215,12 @@ where
                     self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;
                 Ok(entity)
             }
-            Err(RetrievalError::EntityNotFound(id)) => {
+            Err(StorageError::EntityNotFound(id)) => {
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_, entity) = self.node.entities.with_state(&retriever, id, collection_id.clone(), proto::State::default()).await?;
                 Ok(entity)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(storage_to_retrieval(e)),
         }
     }
     /// Fetch a list of entities based on a selection
@@ -228,8 +238,8 @@ where
             // Fetch from peers and commit first response
             Ok(self.fetch_from_peer(collection_id, args.selection).await?)
         } else {
-            let storage_collection = self.node.collections.get(collection_id).await?;
-            let states = storage_collection.fetch_states(&args.selection).await?;
+            let storage_collection = self.node.collections.get(collection_id).await.map_err(storage_to_retrieval)?;
+            let states = storage_collection.fetch_states(&args.selection).await.map_err(storage_to_retrieval)?;
 
             // Convert states to entities
             let mut entities = Vec::new();
@@ -251,7 +261,7 @@ where
         // Atomically mark transaction as no longer alive, preventing double-commit.
         // compare_exchange returns Err if the value was already false (already committed/rolled back).
         if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return Err(MutationError::General("Transaction already committed or rolled back".into()));
+            return Err(MutationError::InvalidUpdate("Transaction already committed or rolled back".into()));
         }
 
         // Generate events from the transaction entities
@@ -293,8 +303,13 @@ where
 
         // Store events and update heads BEFORE relaying (makes entities visible to server echo)
         for (entity, attested_event) in &entity_attested_events {
-            let collection = self.node.collections.get(&attested_event.payload.collection).await?;
-            collection.add_event(&attested_event).await?;
+            let collection = self
+                .node
+                .collections
+                .get(&attested_event.payload.collection)
+                .await
+                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
+            collection.add_event(&attested_event).await.map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
             entity.commit_head(Clock::new([attested_event.payload.id()]));
         }
 
@@ -305,7 +320,12 @@ where
         let mut changes: Vec<EntityChange> = Vec::new();
         for (entity, attested_event) in entity_attested_events {
             let collection_id = &attested_event.payload.collection;
-            let collection = self.node.collections.get(collection_id).await?;
+            let collection = self
+                .node
+                .collections
+                .get(collection_id)
+                .await
+                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
 
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
@@ -317,14 +337,22 @@ where
                 crate::entity::EntityKind::Primary => entity,
             };
 
-            let state = canonical_entity.to_state()?;
+            let state = canonical_entity
+                .to_state()
+                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
 
             let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
             let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(attested).await?;
+            collection
+                .set_state(attested)
+                .await
+                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
 
-            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
+            changes.push(
+                EntityChange::new(canonical_entity, vec![attested_event])
+                    .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?,
+            );
         }
 
         // Notify reactor of ALL changes
@@ -338,7 +366,7 @@ where
         collection_id: &proto::CollectionId,
         selection: ankql::ast::Selection,
     ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
-        let peer_id = self.node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
+        let peer_id = self.node.get_durable_peer_random().ok_or(RetrievalError::Timeout)?;
 
         // 1. Pre-fetch known_matches from local storage
         let known_matched_entities = self.node.fetch_entities_from_local(collection_id, &selection).await?;
@@ -350,17 +378,21 @@ where
 
         // 2. Send fetch request with known_matches
         let selection_clone = selection.clone();
-        match self
+        let response = self
             .node
             .request(peer_id, &self.cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
-            .await?
-        {
+            .await
+            .map_err(|e| RetrievalError::Failure(Report::new(e).change_context(InternalError)))?;
+
+        match response {
             proto::NodeResponseBody::Fetch(deltas) => {
                 // TASK: Clarify retriever semantics for durable vs ephemeral nodes https://github.com/ankurah/ankurah/issues/144
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
 
                 // 3. Apply deltas to local storage using NodeApplier
-                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &retriever).await?;
+                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &retriever)
+                    .await
+                    .map_err(|e| RetrievalError::Failure(Report::new(e).change_context(InternalError)))?;
                 // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
 
                 // 4. Re-fetch entities from local storage after applying deltas
@@ -368,11 +400,15 @@ where
             }
             proto::NodeResponseBody::Error(e) => {
                 tracing::debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
+                Err(RetrievalError::Failure(
+                    Report::new(RequestError::ServerError(e)).change_context(InternalError),
+                ))
             }
-            _ => {
+            other => {
                 tracing::debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
+                Err(RetrievalError::Failure(
+                    Report::new(RequestError::UnexpectedResponse(other)).change_context(InternalError),
+                ))
             }
         }
     }

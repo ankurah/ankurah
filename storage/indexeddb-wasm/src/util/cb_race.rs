@@ -1,4 +1,4 @@
-use ankurah_core::error::RetrievalError;
+use ankurah_core::error::StorageError;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -73,6 +73,6 @@ impl From<TakeError> for wasm_bindgen::JsValue {
     fn from(val: TakeError) -> Self { wasm_bindgen::JsValue::from_str(&val.to_string()) }
 }
 
-impl From<TakeError> for RetrievalError {
-    fn from(val: TakeError) -> Self { RetrievalError::StorageError(Box::new(val)) }
+impl From<TakeError> for StorageError {
+    fn from(val: TakeError) -> Self { StorageError::BackendError(Box::new(val)) }
 }

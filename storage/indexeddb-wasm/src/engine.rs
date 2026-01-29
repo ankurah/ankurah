@@ -1,5 +1,5 @@
 use ankurah_core::{
-    error::{MutationError, RetrievalError},
+    error::StorageError,
     storage::{StorageCollection, StorageEngine},
 };
 use ankurah_proto::{self as proto};
@@ -52,7 +52,7 @@ impl IndexedDBStorageEngine {
 #[async_trait]
 impl StorageEngine for IndexedDBStorageEngine {
     type Value = JsValue;
-    async fn collection(&self, collection_id: &proto::CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+    async fn collection(&self, collection_id: &proto::CollectionId) -> Result<Arc<dyn StorageCollection>, StorageError> {
         Ok(Arc::new(IndexedDBBucket {
             db: self.db.clone(),
             collection_id: collection_id.clone(),
@@ -63,7 +63,7 @@ impl StorageEngine for IndexedDBStorageEngine {
         }))
     }
 
-    async fn delete_all_collections(&self) -> Result<bool, MutationError> {
+    async fn delete_all_collections(&self) -> Result<bool, StorageError> {
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
             // Clear entities store

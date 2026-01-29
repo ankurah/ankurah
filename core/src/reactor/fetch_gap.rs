@@ -1,6 +1,6 @@
 use crate::{
     context::NodeAndContext,
-    error::RetrievalError,
+    error::{AnyhowWrapper, InternalError, RetrievalError},
     node::{MatchArgs, Node, NodeInner},
     policy::PolicyAgent,
     reactor::AbstractEntity,
@@ -9,7 +9,13 @@ use crate::{
 };
 use ankurah_proto as proto;
 use async_trait::async_trait;
+use error_stack::Report;
 use std::sync::{Arc, Weak};
+
+/// Create a Failure RetrievalError from a string message
+fn string_error(msg: impl Into<String>) -> RetrievalError {
+    RetrievalError::Failure(Report::new(AnyhowWrapper::from(msg.into())).change_context(InternalError))
+}
 
 /// Trait for fetching entities to fill gaps when LIMIT causes entities to be evicted
 #[async_trait]
@@ -69,7 +75,7 @@ where
         let node_inner = self
             .weak_node
             .upgrade()
-            .ok_or_else(|| RetrievalError::storage(std::io::Error::other("Node has been dropped, cannot fill gap")))?;
+            .ok_or_else(|| string_error("Node has been dropped, cannot fill gap"))?;
 
         // Create a Node wrapper and NodeAndContext
         let node = Node(node_inner);
@@ -79,7 +85,7 @@ where
         let gap_selection = if let Some(last) = last_entity {
             let gap_predicate = if let Some(ref order_by) = selection.order_by {
                 build_continuation_predicate(&selection.predicate, order_by, last)
-                    .map_err(|e| RetrievalError::storage(std::io::Error::other(e)))?
+                    .map_err(|e| string_error(e))?
             } else {
                 selection.predicate.clone()
             };

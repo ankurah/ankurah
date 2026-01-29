@@ -1,6 +1,9 @@
 use crate::{
     changes::EntityChange,
-    error::{ApplyError, ApplyErrorItem, MutationError},
+    error::{
+        internal::{ApplyError, ApplyErrorCause, ApplyErrorItem},
+        MutationError, RetrievalError,
+    },
     lineage::Retrieve,
     node::Node,
     policy::PolicyAgent,
@@ -10,6 +13,22 @@ use crate::{
 use ankurah_proto::{self as proto, Event, EventId};
 use futures::stream::StreamExt;
 use proto::Attested;
+
+/// Helper to convert RetrievalError to ApplyErrorCause (for retriever methods that still use RetrievalError)
+fn retrieval_to_cause(e: RetrievalError) -> ApplyErrorCause {
+    match e {
+        RetrievalError::AccessDenied(ad) => ApplyErrorCause::AccessDenied(ad),
+        other => ApplyErrorCause::Other(Box::new(other)),
+    }
+}
+
+/// Helper to convert MutationError to ApplyErrorCause
+fn mutation_to_cause(e: MutationError) -> ApplyErrorCause {
+    match e {
+        MutationError::AccessDenied(ad) => ApplyErrorCause::AccessDenied(ad),
+        other => ApplyErrorCause::Other(Box::new(other)),
+    }
+}
 
 /// Consolidates all logic for applying remote updates to a node
 /// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
@@ -22,7 +41,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> Result<(), MutationError>
+    ) -> Result<(), ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -32,22 +51,37 @@ impl NodeApplier {
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
         // but this feels brittle, because failure to apply this event would affect the other contexts on this node.
         let Some(relay) = &node.subscription_relay else {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay"));
+            return Err(ApplyError::Other("Should not be receiving updates without a subscription relay".into()));
         };
         let cdata = relay.get_contexts_for_peer(from_peer_id);
         if cdata.is_empty() {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
+            return Err(ApplyError::Other("Should not be receiving updates without at least predicate context".into()));
         }
 
         // Apply all updates and notify reactor
         let mut changes = Vec::new();
+        let mut all_errors = Vec::new();
         for update in items {
-            let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
-            Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
-            retriever.store_used_events().await?;
+            let entity_id = update.entity_id;
+            let collection = update.collection.clone();
+            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection.clone(), node, &cdata);
+            match Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await {
+                Ok(()) => {
+                    if let Err(e) = retriever.store_used_events().await {
+                        all_errors.push(ApplyErrorItem { entity_id, collection, cause: mutation_to_cause(e) });
+                    }
+                }
+                Err(cause) => {
+                    all_errors.push(ApplyErrorItem { entity_id, collection, cause });
+                }
+            }
         }
 
         node.reactor.notify_change(changes).await;
+
+        if !all_errors.is_empty() {
+            return Err(ApplyError::Items(all_errors));
+        }
 
         Ok(())
     }
@@ -59,7 +93,7 @@ impl NodeApplier {
         retriever: &R,
         changes: &mut Vec<EntityChange>,
         entities: &mut impl Pushable<crate::entity::Entity>,
-    ) -> Result<(), MutationError>
+    ) -> Result<(), ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -76,19 +110,19 @@ impl NodeApplier {
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
                 // TODO update the retriever to support bulk retrieval for multiple entities at once
                 // this will require a queuing phase and a batch retrieval phase
-                let entity = node.entities.get_retrieve_or_create(retriever, &collection_id, &entity_id).await?;
+                let entity = node.entities.get_retrieve_or_create(retriever, &collection_id, &entity_id).await.map_err(retrieval_to_cause)?;
                 entities.push(entity.clone());
 
                 let mut applied_events = Vec::new();
                 for event in events {
                     // Events should always be appliable sequentially
-                    if entity.apply_event(retriever, &event.payload).await? {
+                    if entity.apply_event(retriever, &event.payload).await.map_err(mutation_to_cause)? {
                         applied_events.push(event);
                     }
                 }
 
                 if !applied_events.is_empty() {
-                    changes.push(EntityChange::new(entity, applied_events)?);
+                    changes.push(EntityChange::new(entity, applied_events).map_err(mutation_to_cause)?);
                 }
             }
 
@@ -99,13 +133,13 @@ impl NodeApplier {
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
-                let (changed, entity) = node.entities.with_state(retriever, entity_id, collection_id, state.payload.state).await?;
+                let (changed, entity) = node.entities.with_state(retriever, entity_id, collection_id, state.payload.state).await.map_err(retrieval_to_cause)?;
                 entities.push(entity.clone());
 
                 // TODO: get the list of events that where actually applied - don't just pass them all through blindly
                 if matches!(changed, Some(true) | None) {
                     Self::save_state(node, &entity, &collection).await?;
-                    changes.push(EntityChange::new(entity, events)?);
+                    changes.push(EntityChange::new(entity, events).map_err(mutation_to_cause)?);
                 }
             }
         }
@@ -121,7 +155,7 @@ impl NodeApplier {
         collection_id: &proto::CollectionId,
         fragments: Vec<proto::EventFragment>,
         collection: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<Vec<Attested<proto::Event>>, MutationError>
+    ) -> Result<Vec<Attested<proto::Event>>, ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -143,7 +177,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         entity: &crate::entity::Entity,
         collection_wrapper: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<(), MutationError>
+    ) -> Result<(), ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -227,7 +261,7 @@ impl NodeApplier {
         from_peer_id: &proto::EntityId,
         delta: proto::EntityDelta,
         retriever: &R,
-    ) -> Result<Option<EntityChange>, MutationError>
+    ) -> Result<Option<EntityChange>, ApplyErrorCause>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -241,13 +275,13 @@ impl NodeApplier {
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
                 let (_, entity) =
-                    node.entities.with_state(retriever, delta.entity_id, delta.collection, attested_state.payload.state).await?;
+                    node.entities.with_state(retriever, delta.entity_id, delta.collection, attested_state.payload.state).await.map_err(retrieval_to_cause)?;
 
                 // Save state to storage
                 Self::save_state(node, &entity, &collection).await?;
 
                 // Phase 1: Return EntityChange with empty events
-                Ok(Some(EntityChange::new(entity, Vec::new())?))
+                Ok(Some(EntityChange::new(entity, Vec::new()).map_err(mutation_to_cause)?))
             }
 
             proto::DeltaContent::EventBridge { events } => {
@@ -256,12 +290,12 @@ impl NodeApplier {
 
                 retriever.stage_events(attested_events.clone());
                 // Get or create entity
-                let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
+                let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await.map_err(retrieval_to_cause)?;
 
                 // HACK - applying events in reverse order to avoid triggering the NotDescends bug
                 // in apply_event where the event is wrongly made concurrent
                 for event in attested_events.into_iter().rev() {
-                    entity.apply_event(retriever, &event.payload).await?;
+                    entity.apply_event(retriever, &event.payload).await.map_err(mutation_to_cause)?;
                     retriever.mark_event_used(&event.payload.id());
                 }
 
@@ -269,7 +303,7 @@ impl NodeApplier {
                 Self::save_state(node, &entity, &collection).await?;
 
                 // Phase 1: Return EntityChange with empty events
-                Ok(Some(EntityChange::new(entity, Vec::new())?))
+                Ok(Some(EntityChange::new(entity, Vec::new()).map_err(mutation_to_cause)?))
             }
 
             proto::DeltaContent::StateAndRelation { state: _, relation: _ } => {

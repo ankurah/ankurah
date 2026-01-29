@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicUsize;
 
 use ankurah_core::{
     action_debug,
-    error::{MutationError, RetrievalError},
+    error::StorageError,
     selection::filter::{evaluate_predicate, Filterable},
     storage::StorageCollection,
 };
@@ -37,7 +37,7 @@ impl std::fmt::Display for IndexedDBBucket {
 
 #[async_trait]
 impl StorageCollection for IndexedDBBucket {
-    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, StorageError> {
         self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Lock the mutex to prevent concurrent updates
         let _lock = self.mutex.lock().await;
@@ -91,7 +91,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_state(&self, id: proto::EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+    async fn get_state(&self, id: proto::EntityId) -> Result<Attested<EntityState>, StorageError> {
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
             // Create transaction and get object store
@@ -105,7 +105,7 @@ impl StorageCollection for IndexedDBBucket {
 
             // Check if the entity exists
             if result.is_undefined() || result.is_null() {
-                return Err(RetrievalError::EntityNotFound(id));
+                return Err(StorageError::EntityNotFound(id));
             }
 
             let entity = Object::new(result);
@@ -122,7 +122,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, StorageError> {
         let _invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _lock = self.mutex.lock().await; // TODO why are we locking here?
 
@@ -134,7 +134,7 @@ impl StorageCollection for IndexedDBBucket {
         let plans = planner.plan(&amended_selection, "id");
 
         // Step 3: Pick the first plan (always)
-        let plan = plans.first().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
+        let plan = plans.first().ok_or_else(|| StorageError::BackendError("No plan generated".into()))?;
 
         // Handle Plan enum
         match plan {
@@ -147,7 +147,7 @@ impl StorageCollection for IndexedDBBucket {
                 self.db
                     .assure_index_exists(index_spec)
                     .await
-                    .map_err(|e| RetrievalError::StorageError(format!("ensure index exists: {}", e).into()))?;
+                    .map_err(|e| StorageError::BackendError(format!("ensure index exists: {}", e).into()))?;
 
                 // Step 6: Execute the query using the plan
                 let db_connection = self.db.get_connection().await;
@@ -164,7 +164,7 @@ impl StorageCollection for IndexedDBBucket {
                     // Convert plan bounds to IndexedDB key range using new pipeline
                     let (key_range, upper_open_ended, eq_prefix_len, eq_prefix_values) =
                         crate::planner_integration::plan_bounds_to_idb_range(bounds, scan_direction)
-                            .map_err(|e| RetrievalError::StorageError(format!("bounds conversion: {}", e).into()))?;
+                            .map_err(|e| StorageError::BackendError(format!("bounds conversion: {}", e).into()))?;
                     // Convert scan direction to cursor direction
                     let cursor_direction = crate::planner_integration::scan_direction_to_cursor_direction(scan_direction);
 
@@ -195,7 +195,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn add_event(&self, attested_event: &Attested<ankurah_proto::Event>) -> Result<bool, MutationError> {
+    async fn add_event(&self, attested_event: &Attested<ankurah_proto::Event>) -> Result<bool, StorageError> {
         let invocation = self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("IndexedDBBucket({}).add_event({})", self.collection_id, invocation);
         let _lock = self.mutex.lock().await;
@@ -228,7 +228,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<ankurah_proto::Event>>, StorageError> {
         if event_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -269,7 +269,7 @@ impl StorageCollection for IndexedDBBucket {
         .await
     }
 
-    async fn dump_entity_events(&self, id: ankurah_proto::EntityId) -> Result<Vec<Attested<ankurah_proto::Event>>, RetrievalError> {
+    async fn dump_entity_events(&self, id: ankurah_proto::EntityId) -> Result<Vec<Attested<ankurah_proto::Event>>, StorageError> {
         let db_connection = self.db.get_connection().await;
         SendWrapper::new(async move {
             let transaction = db_connection.transaction_with_str("events").require("create transaction")?;
@@ -338,7 +338,7 @@ impl IndexedDBBucket {
         eq_prefix_len: usize,
         eq_prefix_values: Vec<ankurah_core::value::Value>,
         order_by_spill: &OrderByComponents,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    ) -> Result<Vec<Attested<EntityState>>, StorageError> {
         let needs_spill_sort = !order_by_spill.spill.is_empty();
 
         // Determine effective prefix guard config (can be disabled in debug builds for testing)
@@ -372,7 +372,7 @@ impl IndexedDBBucket {
 
             // Apply predicate filtering (uses lazy extraction from IdbRecord)
             if evaluate_predicate(&record, predicate)
-                .map_err(|e| RetrievalError::StorageError(format!("Predicate evaluation failed: {}", e).into()))?
+                .map_err(|e| StorageError::BackendError(format!("Predicate evaluation failed: {}", e).into()))?
             {
                 if needs_spill_sort {
                     // Collect for sorting
@@ -433,13 +433,13 @@ struct IdbRecord {
 
 impl IdbRecord {
     /// Create a new IdbRecord from a JS object
-    fn new(object: Object, collection_id: ankurah_proto::CollectionId) -> Result<Self, RetrievalError> {
+    fn new(object: Object, collection_id: ankurah_proto::CollectionId) -> Result<Self, StorageError> {
         let id: ankurah_proto::EntityId = object.get(&ID_KEY)?;
         Ok(Self { id, object, collection_id })
     }
 
     /// Get the entity state (converts from JS object on demand)
-    fn entity_state(&self) -> Result<Attested<EntityState>, RetrievalError> { js_object_to_entity_state(&self.object, &self.collection_id) }
+    fn entity_state(&self) -> Result<Attested<EntityState>, StorageError> { js_object_to_entity_state(&self.object, &self.collection_id) }
 
     /// Extract property values needed for sorting
     fn extract_sort_properties(&self, order_by: &OrderByComponents) -> std::collections::BTreeMap<String, ankurah_core::value::Value> {
@@ -487,7 +487,7 @@ fn extract_sort_properties(
 fn js_object_to_entity_state(
     entity_obj: &Object,
     collection_id: &ankurah_proto::CollectionId,
-) -> Result<Attested<EntityState>, RetrievalError> {
+) -> Result<Attested<EntityState>, StorageError> {
     use crate::statics::{ATTESTATIONS_KEY, HEAD_KEY, ID_KEY, STATE_BUFFER_KEY};
     use ankurah_proto::{Attested, EntityId, EntityState, State};
 
@@ -507,7 +507,7 @@ fn js_object_to_entity_state(
 }
 
 /// Extract all fields from entity state and set them directly on the IndexedDB entity object
-fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result<(), MutationError> {
+fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result<(), StorageError> {
     use ankurah_core::property::backend::backend_from_string;
     use std::collections::HashSet;
 
@@ -515,7 +515,7 @@ fn extract_all_fields(entity_obj: &Object, entity_state: &EntityState) -> Result
 
     // Process all property values from state buffers
     for (backend_name, state_buffer) in entity_state.state.state_buffers.iter() {
-        let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| MutationError::General(Box::new(e)))?;
+        let backend = backend_from_string(backend_name, Some(state_buffer)).map_err(|e| StorageError::BackendError(Box::new(e)))?;
 
         for (field_name, value) in backend.property_values() {
             // Use first occurrence (like Postgres) to handle field name collisions

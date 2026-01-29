@@ -1,5 +1,15 @@
-use crate::error::RetrievalError;
+use crate::error::{InternalError, NotFound, RetrievalError, StorageError};
 use ankurah_proto as proto;
+use error_stack::Report;
+
+/// Convert StorageError to RetrievalError
+fn storage_to_retrieval(e: StorageError) -> RetrievalError {
+    match e {
+        StorageError::EntityNotFound(id) => RetrievalError::NotFound(NotFound::Entity(id)),
+        StorageError::CollectionNotFound(id) => RetrievalError::NotFound(NotFound::Collection(id)),
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
+}
 
 /// Expand initial_states to include additional entities that weren't in the predicate results.
 /// This ensures we can generate proper deltas for entities that may no longer match the predicate.
@@ -21,12 +31,12 @@ pub async fn expand_states(
                     states.push(state);
                     entity_map.insert(entity_id);
                 }
-                Err(RetrievalError::EntityNotFound(_)) => {
+                Err(StorageError::EntityNotFound(_)) => {
                     // Entity was deleted - silently ignore
                 }
                 Err(e) => {
                     // Other errors (storage failures, etc.) should be propagated
-                    return Err(e);
+                    return Err(storage_to_retrieval(e));
                 }
             }
         }

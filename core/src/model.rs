@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ankurah_proto::{CollectionId, EntityId, State};
 
 use crate::entity::Entity;
-use crate::error::StateError;
+use crate::error::internal::StateError;
 
 use crate::property::PropertyError;
 

@@ -5,7 +5,7 @@ use ankql::ast::Predicate;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
     entity::TemporaryEntity,
-    error::{MutationError, RetrievalError},
+    error::StorageError,
     storage::StorageCollection,
     EntityId,
 };
@@ -60,35 +60,35 @@ impl SledStorageCollection {
 impl StorageCollection for SledStorageCollection {
     // stub functions in the trait impl should all call out to their blocking counterparts
     // in order to keep this tidy
-    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, StorageError> {
         let inner = self.0.clone();
         // Use spawn_blocking since sled operations are not async
         Ok(task::spawn_blocking(move || inner.set_state_blocking(state)).await??)
     }
 
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, StorageError> {
         let inner = self.0.clone();
         Ok(task::spawn_blocking(move || inner.get_state_blocking(id)).await??)
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, StorageError> {
         let inner = self.0.clone();
         let selection = selection.clone();
         Ok(task::spawn_blocking(move || inner.fetch_states_blocking(selection)).await??)
     }
 
-    async fn add_event(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
+    async fn add_event(&self, event: &Attested<Event>) -> Result<bool, StorageError> {
         let inner = self.0.clone();
         let event = event.clone();
         Ok(task::spawn_blocking(move || inner.add_event_blocking(&event)).await??)
     }
 
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, StorageError> {
         let inner = self.0.clone();
         Ok(task::spawn_blocking(move || inner.get_events_blocking(event_ids)).await??)
     }
 
-    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
+    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, StorageError> {
         let inner = self.0.clone();
         Ok(task::spawn_blocking(move || inner.dump_entity_events_blocking(entity_id)).await??)
     }
@@ -96,10 +96,10 @@ impl StorageCollection for SledStorageCollection {
 
 impl SledStorageCollectionInner {
     // I think this one is done - did it myself
-    fn set_state_blocking(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
+    fn set_state_blocking(&self, state: Attested<EntityState>) -> Result<bool, StorageError> {
         let (entity_id, collection, sfrag) = state.to_parts();
         if self.collection_id != collection {
-            return Err(MutationError::General(anyhow::anyhow!("Collection ID mismatch").into()));
+            return Err(StorageError::BackendError(anyhow::anyhow!("Collection ID mismatch").into()));
         }
 
         let binary_state = bincode::serialize(&sfrag)?;
@@ -120,7 +120,7 @@ impl SledStorageCollectionInner {
         }
 
         let mat_bytes = bincode::serialize(&mat)?;
-        let old_mat_bytes = self.tree.insert(entity_id.to_bytes(), mat_bytes).map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
+        let old_mat_bytes = self.tree.insert(entity_id.to_bytes(), mat_bytes).map_err(|e| StorageError::BackendError(Box::new(e)))?;
         let old_mat = match old_mat_bytes {
             Some(ivec) => Some(bincode::deserialize::<Vec<(u32, ankurah_core::value::Value)>>(&ivec)?),
             None => None,
@@ -132,14 +132,14 @@ impl SledStorageCollectionInner {
         Ok(changed)
     }
     // I think this one is done - did it myself
-    fn get_state_blocking(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+    fn get_state_blocking(&self, id: EntityId) -> Result<Attested<EntityState>, StorageError> {
         match self.database.entities_tree.get(id.to_bytes()).map_err(sled_error)? {
             Some(ivec) => {
                 let sfrag: StateFragment = bincode::deserialize(ivec.as_ref())?;
                 let es = Attested::<EntityState>::from_parts(id, self.collection_id.clone(), sfrag);
                 Ok(es)
             }
-            None => Err(RetrievalError::EntityNotFound(id)),
+            None => Err(StorageError::EntityNotFound(id)),
         }
     }
     // this is the one that needs the most work
@@ -154,14 +154,14 @@ impl SledStorageCollectionInner {
     // They BOTH need to then do a secondary lookup in the entities tree to get the state fragment
     // (and we need to make sure that both are using industry best practices for that sort of index -> record scan)
 
-    fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    fn fetch_states_blocking(&self, selection: ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, StorageError> {
         // Type resolution (Literal -> Json for non-simple paths) is handled by TypeResolver
         // at the entry points (Context/Node). The selection here is already type-resolved.
 
         // Generate query plans and choose the first non-empty one
         let plans = Planner::new(PlannerConfig::full_support()).plan(&selection, "id");
 
-        let plan = plans.into_iter().next().ok_or_else(|| RetrievalError::StorageError("No plan generated".into()))?;
+        let plan = plans.into_iter().next().ok_or_else(|| StorageError::BackendError("No plan generated".into()))?;
 
         // Execute the chosen plan using streaming pipeline architecture
         match plan {
@@ -186,7 +186,7 @@ impl SledStorageCollectionInner {
         remaining_predicate: Predicate,
         order_by_spill: OrderByComponents,
         limit: Option<u64>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    ) -> Result<Vec<Attested<EntityState>>, StorageError> {
         // Debug flag for disabling equality-prefix guard (testing only)
         let prefix_guard_disabled = {
             #[cfg(debug_assertions)]
@@ -259,7 +259,7 @@ impl SledStorageCollectionInner {
         remaining_predicate: Predicate,
         order_by_spill: OrderByComponents,
         limit: Option<u64>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    ) -> Result<Vec<Attested<EntityState>>, StorageError> {
         if remaining_predicate == Predicate::True && order_by_spill.is_satisfied() {
             let ids = SledCollectionKeyScanner::new(&self.tree, &bounds, scan_direction)?;
             let states = SledEntityLookup::new(&self.database.entities_tree, &self.collection_id, ids.limit(limit));
@@ -310,7 +310,7 @@ impl SledStorageCollectionInner {
         }
     }
 
-    fn get_events_blocking(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+    fn get_events_blocking(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, StorageError> {
         let mut events = Vec::new();
         for event_id in event_ids {
             match self.database.events_tree.get(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)? {
@@ -324,7 +324,7 @@ impl SledStorageCollectionInner {
         Ok(events)
     }
 
-    fn dump_entity_events_blocking(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
+    fn dump_entity_events_blocking(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, StorageError> {
         let mut events = Vec::new();
 
         // TODO: this is a full table scan. If we actually need this for more than just tests, we should index the events by entity_id
@@ -339,14 +339,14 @@ impl SledStorageCollectionInner {
         Ok(events)
     }
 
-    fn add_event_blocking(&self, event: &Attested<Event>) -> Result<bool, MutationError> {
+    fn add_event_blocking(&self, event: &Attested<Event>) -> Result<bool, StorageError> {
         let binary_state = bincode::serialize(event)?;
 
         let last = self
             .database
             .events_tree
             .insert(event.payload.id().as_bytes(), binary_state.clone())
-            .map_err(|err| MutationError::UpdateFailed(Box::new(err)))?;
+            .map_err(|err| StorageError::BackendError(Box::new(err)))?;
 
         if let Some(last_bytes) = last {
             Ok(last_bytes != binary_state)

@@ -1,4 +1,4 @@
-use ankurah_core::error::{MutationError, RetrievalError};
+use ankurah_core::error::StorageError;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::JsValue;
 
@@ -13,36 +13,36 @@ impl std::ops::Deref for Object {
 
 impl Object {
     pub fn new(obj: JsValue) -> Self { Self { obj: SendWrapper::new(obj) } }
-    pub fn get<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<T, RetrievalError> {
+    pub fn get<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<T, StorageError> {
         let v = js_sys::Reflect::get(&self.obj, key)
-            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
+            .map_err(|_e| StorageError::BackendError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
         // if v.is_null() || v.is_undefined() {
-        //     return Err(RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key).into()));
+        //     return Err(StorageError::BackendError(anyhow::anyhow!("Failed to get {}", key).into()));
         // }
         v.try_into()
-            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into()))
+            .map_err(|_e| StorageError::BackendError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into()))
     }
-    pub fn get_opt<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<Option<T>, RetrievalError> {
+    pub fn get_opt<T: TryFrom<JsValue>>(&self, key: &JsValue) -> Result<Option<T>, StorageError> {
         let v = js_sys::Reflect::get(&self.obj, key)
-            .map_err(|_e| RetrievalError::StorageError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
+            .map_err(|_e| StorageError::BackendError(anyhow::anyhow!("Failed to get {}", key.as_string().unwrap_or_default()).into()))?;
         if v.is_null() || v.is_undefined() {
             return Ok(None);
         }
         Ok(Some(v.try_into().map_err(|_e| {
-            RetrievalError::StorageError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into())
+            StorageError::BackendError(anyhow::anyhow!("Failed to convert {}", key.as_string().unwrap_or_default()).into())
         })?))
     }
 
-    pub fn set<K, V>(&self, key: K, value: V) -> Result<bool, MutationError>
+    pub fn set<K, V>(&self, key: K, value: V) -> Result<bool, StorageError>
     where
         K: Into<JsValue>,
         V: TryInto<JsValue>,
         V::Error: std::error::Error + Send + Sync + 'static,
     {
         let js_key = key.into();
-        let js_value = value.try_into().map_err(|e| MutationError::General(Box::new(e)))?;
+        let js_value = value.try_into().map_err(|e| StorageError::BackendError(Box::new(e)))?;
         js_sys::Reflect::set(&self.obj, &js_key, &js_value)
-            .map_err(|_e| MutationError::FailedToSetProperty("field", js_value.as_string().unwrap_or_default()))
+            .map_err(|_e| StorageError::BackendError(format!("Failed to set property: {}", js_value.as_string().unwrap_or_default()).into()))
     }
 }
 

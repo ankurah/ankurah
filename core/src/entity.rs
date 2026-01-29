@@ -1,12 +1,21 @@
 use crate::lineage::{self, GetEvents, Retrieve};
 use crate::selection::filter::Filterable;
 use crate::{
-    error::{LineageError, MutationError, RetrievalError, StateError},
+    error::{internal::{LineageError, StateError}, AnyhowWrapper, InternalError, MutationError, RetrievalError},
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
     value::Value,
 };
+use error_stack::Report;
+
+/// Convert RetrievalError to MutationError
+fn retrieval_to_mutation(e: RetrievalError) -> MutationError {
+    match e {
+        RetrievalError::AccessDenied(ad) => MutationError::AccessDenied(ad),
+        other => MutationError::Failure(Report::new(AnyhowWrapper::from(format!("{}", other))).change_context(InternalError)),
+    }
+}
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +46,7 @@ impl EntityInnerState {
         if let Some(backend) = self.backends.get(&backend_name) {
             backend.apply_operations(operations)?;
         } else {
-            let backend = backend_from_string(&backend_name, None)?;
+            let backend = backend_from_string(&backend_name, None).map_err(retrieval_to_mutation)?;
             backend.apply_operations(operations)?;
             self.backends.insert(backend_name, backend);
         }
@@ -232,7 +241,10 @@ impl Entity {
         let budget = 100;
 
         for attempt in 0..MAX_RETRIES {
-            let new_head: Clock = match crate::lineage::compare_unstored_event(getter, event, &head, budget).await? {
+            let comparison = crate::lineage::compare_unstored_event(getter, event, &head, budget)
+                .await
+                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
+            let new_head: Clock = match comparison {
                 lineage::Ordering::Equal => return Ok(false),
                 lineage::Ordering::Descends => event.id().into(),
                 lineage::Ordering::NotDescends { meet: _ } => {
@@ -240,10 +252,10 @@ impl Entity {
                     head.with_event(event.id())
                 }
                 lineage::Ordering::Incomparable => {
-                    return Err(LineageError::Incomparable.into());
+                    return Err(MutationError::Failure(Report::new(LineageError::Incomparable).change_context(InternalError)));
                 }
                 lineage::Ordering::PartiallyDescends { meet } => {
-                    return Err(LineageError::PartiallyDescends { meet }.into());
+                    return Err(MutationError::Failure(Report::new(LineageError::PartiallyDescends { meet }).change_context(InternalError)));
                 }
                 lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
                     warn!(
@@ -269,7 +281,7 @@ impl Entity {
         }
 
         warn!("apply_event retries exhausted while chasing moving head; applying event as Descends");
-        Err(MutationError::TOCTOUAttemptsExhausted)
+        Err(MutationError::InvalidUpdate("TOCTOU attempts exhausted".into()))
     }
 
     pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
@@ -282,12 +294,15 @@ impl Entity {
         const MAX_RETRIES: usize = 5;
 
         for _attempt in 0..MAX_RETRIES {
-            let apply = match crate::lineage::compare(getter, &new_head, &head, budget).await? {
+            let comparison = crate::lineage::compare(getter, &new_head, &head, budget)
+                .await
+                .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
+            let apply = match comparison {
                 lineage::Ordering::Equal => return Ok(false),
                 lineage::Ordering::Descends => true,
                 lineage::Ordering::NotDescends { meet: _ } => return Ok(false),
-                lineage::Ordering::Incomparable => return Err(LineageError::Incomparable.into()),
-                lineage::Ordering::PartiallyDescends { meet } => return Err(LineageError::PartiallyDescends { meet }.into()),
+                lineage::Ordering::Incomparable => return Err(MutationError::Failure(Report::new(LineageError::Incomparable).change_context(InternalError))),
+                lineage::Ordering::PartiallyDescends { meet } => return Err(MutationError::Failure(Report::new(LineageError::PartiallyDescends { meet }).change_context(InternalError))),
                 lineage::Ordering::BudgetExceeded { subject_frontier, other_frontier } => {
                     warn!(
                         "{self} apply_state - budget exhausted after {budget} events. Assuming Descends. subject: {subject_frontier:?}, other: {other_frontier:?}"
@@ -299,7 +314,8 @@ impl Entity {
             if apply {
                 if self.try_mutate::<_, MutationError>(&mut head, |es| -> Result<(), MutationError> {
                     for (name, state_buffer) in state.state_buffers.iter() {
-                        let backend = backend_from_string(name, Some(state_buffer))?;
+                        let backend = backend_from_string(name, Some(state_buffer))
+                            .map_err(|e| MutationError::Failure(Report::new(e).change_context(InternalError)))?;
                         es.backends.insert(name.to_owned(), backend);
                     }
                     es.head = state.head.clone();
@@ -313,7 +329,7 @@ impl Entity {
         }
 
         warn!("{self} apply_state retries exhausted while chasing moving head");
-        Err(MutationError::TOCTOUAttemptsExhausted)
+        Err(MutationError::InvalidUpdate("TOCTOU attempts exhausted".into()))
     }
 
     /// Create a snapshot of the Entity which is detached from this one, and will not receive the updates this one does
@@ -576,7 +592,10 @@ impl WeakEntitySet {
         };
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let changed = entity.apply_state(retriever, &state).await?;
+        let changed = entity
+            .apply_state(retriever, &state)
+            .await
+            .map_err(|e| RetrievalError::Failure(Report::new(e).change_context(InternalError)))?;
         Ok((Some(changed), entity))
     }
 }

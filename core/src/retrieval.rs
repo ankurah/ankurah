@@ -7,12 +7,43 @@ use std::{
 };
 
 use crate::{
-    error::{MutationError, RetrievalError},
+    error::{InternalError, MutationError, NotFound, RetrievalError, StorageError},
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
     util::Iterable,
     Node,
 };
+use error_stack::Report;
+
+/// Convert StorageError to RetrievalError
+fn storage_to_retrieval(e: StorageError) -> RetrievalError {
+    match e {
+        StorageError::EntityNotFound(id) => RetrievalError::NotFound(NotFound::Entity(id)),
+        StorageError::CollectionNotFound(id) => RetrievalError::NotFound(NotFound::Collection(id)),
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
+}
+
+/// Convert StorageError to MutationError
+fn storage_to_mutation(e: StorageError) -> MutationError {
+    MutationError::Failure(Report::new(e).change_context(InternalError))
+}
+
+/// Convert RetrievalError to MutationError
+fn retrieval_to_mutation(e: RetrievalError) -> MutationError {
+    match e {
+        RetrievalError::AccessDenied(ad) => MutationError::AccessDenied(ad),
+        other => MutationError::Failure(Report::new(crate::error::AnyhowWrapper::from(format!("{}", other))).change_context(InternalError)),
+    }
+}
+
+/// Convert RequestError to RetrievalError
+fn request_to_retrieval(e: crate::error::RequestError) -> RetrievalError {
+    match e {
+        crate::error::RequestError::AccessDenied(ad) => RetrievalError::AccessDenied(ad),
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
+}
 use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event, EventId};
 use async_trait::async_trait;
 
@@ -92,7 +123,7 @@ impl LocalRetriever {
         if let Some(staged) = staged {
             for (_id, (event, used)) in staged.iter() {
                 if *used {
-                    self.0.collection.add_event(event).await?;
+                    self.0.collection.add_event(event).await.map_err(storage_to_retrieval)?;
                 }
             }
         }
@@ -133,7 +164,7 @@ impl GetEvents for LocalRetriever {
         // cost for local retrieval is 1 per batch
 
         // Then retrieve from storage if needed
-        let stored_events = self.0.collection.get_events(event_ids.into_iter().collect()).await?;
+        let stored_events = self.0.collection.get_events(event_ids.into_iter().collect()).await.map_err(storage_to_retrieval)?;
         events.extend(stored_events);
 
         // TODO: push the consumption figure to the store, because its not necessarily the same for all stores
@@ -163,8 +194,8 @@ impl Retrieve for LocalRetriever {
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
         match self.0.collection.get_state(entity_id).await {
             Ok(state) => Ok(Some(state)),
-            Err(RetrievalError::EntityNotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+            Err(StorageError::EntityNotFound(_)) => Ok(None),
+            Err(e) => Err(storage_to_retrieval(e)),
         }
     }
 }
@@ -199,10 +230,10 @@ where
         if let Some(staged) = staged {
             // For ephemeral nodes, storing events is optional
             // Only store if we actually want to persist them
-            let collection = self.node.system.collection(&self.collection).await?;
+            let collection = self.node.system.collection(&self.collection).await.map_err(retrieval_to_mutation)?;
             for (_id, (event, used)) in staged.iter() {
                 if *used {
-                    collection.add_event(event).await?;
+                    collection.add_event(event).await.map_err(storage_to_mutation)?;
                 }
             }
         }
@@ -251,7 +282,7 @@ where
         // Then try to get events from local storage
         let collection = self.node.system.collection(&self.collection).await?;
         // TODO update get_events to take &HashSet
-        for event in collection.get_events(event_ids.iter().cloned().collect()).await? {
+        for event in collection.get_events(event_ids.iter().cloned().collect()).await.map_err(storage_to_retrieval)? {
             event_ids.remove(&event.payload.id());
             events.push(event);
         }
@@ -272,19 +303,19 @@ where
                 self.cdata,
                 proto::NodeRequestBody::GetEvents { collection: self.collection.clone(), event_ids: event_ids.into_iter().collect() }, // TODO update ::GetEvents to take HashSet
             )
-            .await?
-            // .map_err(|e| RetrievalError::StorageError(format!("Request failed: {}", e).into()))?
+            .await
+            .map_err(request_to_retrieval)?
         {
             proto::NodeResponseBody::GetEvents(peer_events) => {
                 for event in peer_events.iter() {
-                    collection.add_event(event).await?;
+                    collection.add_event(event).await.map_err(storage_to_retrieval)?;
                 }
                 events.extend(peer_events);
             }
             proto::NodeResponseBody::Error(e) => {
-                return Err(RetrievalError::StorageError(format!("Error from peer: {}", e).into()));
+                return Err(request_to_retrieval(crate::error::RequestError::ServerError(e)));
             }
-            _ => return Err(RetrievalError::StorageError("Unexpected response type from peer".into())),
+            other => return Err(request_to_retrieval(crate::error::RequestError::UnexpectedResponse(other))),
         }
         Ok((5, events))
     }
@@ -315,11 +346,11 @@ where
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
     async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, RetrievalError> {
-        let collection = self.node.collections.get(&self.collection).await?;
+        let collection = self.node.collections.get(&self.collection).await.map_err(storage_to_retrieval)?;
         match collection.get_state(entity_id).await {
             Ok(state) => Ok(Some(state)),
-            Err(RetrievalError::EntityNotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+            Err(StorageError::EntityNotFound(_)) => Ok(None),
+            Err(e) => Err(storage_to_retrieval(e)),
         }
     }
 }

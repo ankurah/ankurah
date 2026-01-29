@@ -8,9 +8,23 @@ use tracing::{error, warn};
 
 use crate::collectionset::CollectionSet;
 use crate::entity::{Entity, WeakEntitySet};
-use crate::error::MutationError;
-use crate::error::RetrievalError;
+use crate::error::{InternalError, MutationError, NotFound, RetrievalError, StorageError};
 use crate::notice_info;
+use error_stack::Report;
+
+/// Convert StorageError to RetrievalError
+fn storage_to_retrieval(e: StorageError) -> RetrievalError {
+    match e {
+        StorageError::EntityNotFound(id) => RetrievalError::NotFound(NotFound::Entity(id)),
+        StorageError::CollectionNotFound(id) => RetrievalError::NotFound(NotFound::Collection(id)),
+        other => RetrievalError::Failure(Report::new(other).change_context(InternalError)),
+    }
+}
+
+/// Convert StorageError to MutationError
+fn storage_to_mutation(e: StorageError) -> MutationError {
+    MutationError::Failure(Report::new(e).change_context(InternalError))
+}
 use crate::policy::PolicyAgent;
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
@@ -87,7 +101,7 @@ where
         // TODO - update the system catalog to create an entity for this collection
 
         // Return the collection wrapper
-        self.0.collectionset.get(id).await
+        self.0.collectionset.get(id).await.map_err(storage_to_retrieval)
     }
 
     /// Returns true if we've successfully initialized or joined a system
@@ -158,7 +172,7 @@ where
         // If node is durable, fail - durable nodes should not join an existing system
         if self.0.durable {
             warn!("Durable node attempted to join system - this is not allowed");
-            return Err(MutationError::General(Box::new(std::io::Error::other("Durable nodes cannot join an existing system"))));
+            return Err(MutationError::InvalidUpdate("Durable nodes cannot join an existing system".to_string()));
         }
 
         let root_state = self.root();
@@ -180,14 +194,14 @@ where
                 let mut root = self.0.root.write().expect("Root lock poisoned");
                 *root = None;
             }
-            self.hard_reset().await.map_err(|e| MutationError::General(Box::new(std::io::Error::other(e.to_string()))))?;
+            self.hard_reset().await.map_err(|e| MutationError::Failure(Report::new(crate::error::AnyhowWrapper::from(e)).change_context(InternalError)))?;
         }
 
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
-        let storage = self.0.collectionset.get(&collection_id).await?;
+        let storage = self.0.collectionset.get(&collection_id).await.map_err(storage_to_mutation)?;
 
         // Set the state
-        storage.set_state(state.clone()).await?;
+        storage.set_state(state.clone()).await.map_err(storage_to_mutation)?;
 
         // Set root and mark system as ready
         {

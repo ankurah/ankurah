@@ -1,4 +1,5 @@
-use crate::error::RetrievalError;
+use crate::error::{InternalError, RetrievalError, StorageError};
+use error_stack::Report;
 use crate::retrieval::{TClock, TEvent};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -330,7 +331,12 @@ where
             }
         }
         if !result_checklist.is_empty() {
-            return Err(RetrievalError::StorageError(format!("Events not found: {:?}", result_checklist).into()));
+            // Format IDs for the error message
+            let id_strs: Vec<String> = result_checklist.iter().map(|id| format!("{}", id)).collect();
+            return Err(RetrievalError::Failure(
+                Report::new(StorageError::BackendError(format!("Events not found: {:?}", id_strs).into()))
+                    .change_context(InternalError),
+            ));
         }
 
         if let Some(ordering) = self.check_result() {

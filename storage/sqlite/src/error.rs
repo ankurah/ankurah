@@ -26,14 +26,6 @@ pub enum SqliteError {
     TaskJoin(String),
 }
 
-impl From<SqliteError> for ankurah_core::error::RetrievalError {
-    fn from(err: SqliteError) -> Self { ankurah_core::error::RetrievalError::StorageError(Box::new(err)) }
-}
-
-impl From<SqliteError> for ankurah_core::error::MutationError {
-    fn from(err: SqliteError) -> Self { ankurah_core::error::MutationError::General(Box::new(err)) }
-}
-
-impl From<SqliteError> for ankurah_core::error::StateError {
-    fn from(err: SqliteError) -> Self { ankurah_core::error::StateError::DDLError(Box::new(err)) }
+impl From<SqliteError> for ankurah_core::error::StorageError {
+    fn from(err: SqliteError) -> Self { ankurah_core::error::StorageError::BackendError(Box::new(err)) }
 }
