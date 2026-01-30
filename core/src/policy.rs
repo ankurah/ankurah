@@ -1,7 +1,7 @@
 use crate::util::Iterable;
 use crate::{
     entity::Entity,
-    error::ValidationError,
+    error::internal::ValidationError,
     node::{ContextData, Node, NodeInner},
     property::PropertyError,
     proto::{self},

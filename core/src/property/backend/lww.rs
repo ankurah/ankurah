@@ -10,9 +10,20 @@ use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{MutationError, StateError},
+    error::{AnyhowWrapper, InternalError, MutationError, RetrievalError, StateError},
     property::{backend::PropertyBackend, PropertyName, Value},
 };
+use error_stack::Report;
+
+/// Convert bincode error to RetrievalError
+fn bincode_to_retrieval(e: bincode::Error) -> RetrievalError {
+    RetrievalError::Failure(Report::new(AnyhowWrapper::from(format!("bincode error: {}", e))).change_context(InternalError))
+}
+
+/// Convert bincode error to MutationError
+fn bincode_to_mutation(e: bincode::Error) -> MutationError {
+    MutationError::Failure(Report::new(AnyhowWrapper::from(format!("bincode error: {}", e))).change_context(InternalError))
+}
 
 const LWW_DIFF_VERSION: u8 = 1;
 
@@ -92,7 +103,7 @@ impl PropertyBackend for LWWBackend {
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
+        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer).map_err(bincode_to_retrieval)?;
         let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
@@ -113,7 +124,7 @@ impl PropertyBackend for LWWBackend {
         }
 
         Ok(Some(vec![Operation {
-            diff: bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&changed_values)? })?,
+            diff: bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&changed_values).map_err(bincode_to_mutation)? }).map_err(bincode_to_mutation)?,
         }]))
     }
 
@@ -121,10 +132,10 @@ impl PropertyBackend for LWWBackend {
         let mut changed_fields = Vec::new();
 
         for operation in operations {
-            let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
+            let LWWDiff { version, data } = bincode::deserialize(&operation.diff).map_err(bincode_to_mutation)?;
             match version {
                 1 => {
-                    let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
+                    let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data).map_err(bincode_to_mutation)?;
 
                     let mut values = self.values.write().unwrap();
                     for (property_name, new_value) in changes {
@@ -133,7 +144,7 @@ impl PropertyBackend for LWWBackend {
                         changed_fields.push(property_name);
                     }
                 }
-                version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
+                version => return Err(MutationError::InvalidUpdate(format!("Unknown LWW operation version: {:?}", version))),
             }
         }
 

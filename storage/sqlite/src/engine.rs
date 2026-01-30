@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ankurah_core::entity::TemporaryEntity;
-use ankurah_core::error::{MutationError, RetrievalError};
+use ankurah_core::error::StorageError;
 use ankurah_core::property::backend::backend_from_string;
 use ankurah_core::selection::filter::evaluate_predicate;
 use ankurah_core::storage::{StorageCollection, StorageEngine};
@@ -68,12 +68,12 @@ impl SqliteStorageEngine {
 impl StorageEngine for SqliteStorageEngine {
     type Value = SqliteValue;
 
-    async fn collection(&self, collection_id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
+    async fn collection(&self, collection_id: &CollectionId) -> Result<Arc<dyn StorageCollection>, StorageError> {
         if !Self::sane_name(collection_id.as_str()) {
-            return Err(RetrievalError::InvalidBucketName);
+            return Err(StorageError::InvalidCollectionName(collection_id.clone()));
         }
 
-        let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
+        let conn = self.pool.get().await.map_err(|e| StorageError::BackendError(Box::new(SqliteError::Pool(e.to_string()))))?;
 
         let bucket = SqliteBucket::new(self.pool.clone(), collection_id.clone());
 
@@ -92,8 +92,8 @@ impl StorageEngine for SqliteStorageEngine {
         Ok(Arc::new(bucket))
     }
 
-    async fn delete_all_collections(&self) -> Result<bool, MutationError> {
-        let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
+    async fn delete_all_collections(&self) -> Result<bool, StorageError> {
+        let conn = self.pool.get().await.map_err(|e| StorageError::BackendError(Box::new(SqliteError::Pool(e.to_string()))))?;
 
         conn.with_connection(|c| {
             // Get all table names
@@ -111,7 +111,7 @@ impl StorageEngine for SqliteStorageEngine {
             Ok(true)
         })
         .await
-        .map_err(|e| MutationError::General(Box::new(e)))
+        .map_err(|e| StorageError::BackendError(Box::new(e)))
     }
 }
 
@@ -257,8 +257,8 @@ impl SqliteBucket {
 
 #[async_trait]
 impl StorageCollection for SqliteBucket {
-    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, MutationError> {
-        let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
+    async fn set_state(&self, state: Attested<EntityState>) -> Result<bool, StorageError> {
+        let conn = self.pool.get().await.map_err(|e| StorageError::BackendError(Box::new(SqliteError::Pool(e.to_string()))))?;
 
         // Ensure head is not empty for new records
         if state.payload.state.head.is_empty() {
@@ -266,7 +266,7 @@ impl StorageCollection for SqliteBucket {
         }
 
         let state_buffers = bincode::serialize(&state.payload.state.state_buffers)?;
-        let head_json = serde_json::to_string(&state.payload.state.head).map_err(|e| MutationError::General(Box::new(e)))?;
+        let head_json = serde_json::to_string(&state.payload.state.head).map_err(|e| StorageError::SerializationError(Box::new(e)))?;
         let attestations_blob = bincode::serialize(&state.attestations)?;
         let id = state.payload.entity_id.to_base64();
         let id_clone = id.clone(); // Clone for use in closure
@@ -380,7 +380,7 @@ impl StorageCollection for SqliteBucket {
         Ok(changed)
     }
 
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, StorageError> {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
         let table_name = self.state_table().to_owned();
@@ -427,14 +427,14 @@ impl StorageCollection for SqliteBucket {
             })
             .await
             .map_err(|e| match e {
-                SqliteError::Rusqlite(rusqlite::Error::QueryReturnedNoRows) => RetrievalError::EntityNotFound(id),
-                _ => RetrievalError::StorageError(Box::new(e)),
+                SqliteError::Rusqlite(rusqlite::Error::QueryReturnedNoRows) => StorageError::EntityNotFound(id),
+                _ => StorageError::BackendError(Box::new(e)),
             })?;
 
         Ok(result)
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection) -> Result<Vec<Attested<EntityState>>, StorageError> {
         debug!("SqliteBucket({}).fetch_states: {:?}", self.collection_id, selection);
 
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
@@ -545,12 +545,12 @@ impl StorageCollection for SqliteBucket {
         Ok(results)
     }
 
-    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, MutationError> {
-        let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
+    async fn add_event(&self, entity_event: &Attested<Event>) -> Result<bool, StorageError> {
+        let conn = self.pool.get().await.map_err(|e| StorageError::BackendError(Box::new(SqliteError::Pool(e.to_string()))))?;
 
         let operations = bincode::serialize(&entity_event.payload.operations)?;
         let attestations = bincode::serialize(&entity_event.attestations)?;
-        let parent_json = serde_json::to_string(&entity_event.payload.parent).map_err(|e| MutationError::General(Box::new(e)))?;
+        let parent_json = serde_json::to_string(&entity_event.payload.parent).map_err(|e| StorageError::SerializationError(Box::new(e)))?;
 
         let table_name = self.event_table();
         let event_id = entity_event.payload.id().to_base64();
@@ -567,10 +567,10 @@ impl StorageCollection for SqliteBucket {
             Ok(affected > 0)
         })
         .await
-        .map_err(|e| MutationError::General(Box::new(e)))
+        .map_err(|e| StorageError::BackendError(Box::new(e)))
     }
 
-    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+    async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, StorageError> {
         if event_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -623,10 +623,10 @@ impl StorageCollection for SqliteBucket {
             Ok(events)
         })
         .await
-        .map_err(|e| RetrievalError::StorageError(Box::new(e)))
+        .map_err(|e| StorageError::BackendError(Box::new(e)))
     }
 
-    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
+    async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, StorageError> {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
         let table_name = self.event_table().to_owned();
@@ -665,7 +665,7 @@ impl StorageCollection for SqliteBucket {
             Ok(events)
         })
         .await
-        .map_err(|e| RetrievalError::StorageError(Box::new(e)))
+        .map_err(|e| StorageError::BackendError(Box::new(e)))
     }
 }
 

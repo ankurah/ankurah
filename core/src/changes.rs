@@ -25,10 +25,10 @@ impl EntityChange {
         for event in &events {
             let head = entity.head();
             if event.payload.entity_id != entity.id {
-                return Err(MutationError::InvalidEvent);
+                return Err(MutationError::InvalidUpdate("event entity_id mismatch".to_string()));
             }
             if !head.contains(&event.payload.id()) {
-                return Err(MutationError::InvalidEvent);
+                return Err(MutationError::InvalidUpdate("event id not in entity head clock".to_string()));
             }
         }
         Ok(Self { entity, events })

@@ -3,7 +3,7 @@ use crate::planner_integration::{key_bounds_to_sled_range, SledRangeBounds};
 use crate::property::PropertyManager;
 use ankurah_core::indexing::{IndexDirection, IndexKeyPart, KeySpec};
 use ankurah_core::value::ValueType;
-use ankurah_core::{error::RetrievalError, EntityId};
+use ankurah_core::{error::StorageError, EntityId};
 use ankurah_storage_common::{traits::EntityIdStream, KeyBounds, ScanDirection};
 use futures::Stream;
 use std::pin::Pin;
@@ -69,13 +69,13 @@ impl<'a> SledCollectionKeyScanner<'a> {
 impl Unpin for SledCollectionKeyScanner<'_> {}
 
 impl Stream for SledCollectionKeyScanner<'_> {
-    type Item = Result<EntityId, RetrievalError>;
+    type Item = Result<EntityId, StorageError>;
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Synchronous implementation - always returns Ready
         let (key_bytes, _value_bytes) = match self.iter.next() {
             Some(Ok(kv)) => kv,
-            Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::StorageError(e.to_string().into())))),
+            Some(Err(e)) => return Poll::Ready(Some(Err(StorageError::BackendError(Box::new(e))))),
             None => return Poll::Ready(None),
         };
 

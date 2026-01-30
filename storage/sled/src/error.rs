@@ -1,8 +1,5 @@
 use ankurah_core::value::ValueType;
-use ankurah_core::{
-    error::{MutationError, RetrievalError},
-    EntityId,
-};
+use ankurah_core::{error::StorageError, EntityId};
 use ankurah_proto::EventId;
 use thiserror::Error;
 
@@ -17,13 +14,13 @@ impl From<sled::Error> for SledRetrievalError {
     fn from(val: sled::Error) -> Self { SledRetrievalError::StorageError(val) }
 }
 
-impl From<SledRetrievalError> for RetrievalError {
+impl From<SledRetrievalError> for StorageError {
     fn from(err: SledRetrievalError) -> Self {
         match err {
-            SledRetrievalError::StorageError(e) => RetrievalError::StorageError(Box::new(e)),
-            SledRetrievalError::EntityNotFound(id) => RetrievalError::EntityNotFound(id),
-            SledRetrievalError::EventNotFound(id) => RetrievalError::EventNotFound(id),
-            SledRetrievalError::Other(e) => RetrievalError::StorageError(e),
+            SledRetrievalError::StorageError(e) => StorageError::BackendError(Box::new(e)),
+            SledRetrievalError::EntityNotFound(id) => StorageError::EntityNotFound(id),
+            SledRetrievalError::EventNotFound(id) => StorageError::EventsNotFound(vec![id]),
+            SledRetrievalError::Other(e) => StorageError::BackendError(e),
         }
     }
 }
@@ -44,12 +41,8 @@ pub enum IndexError {
     TypeMismatch(ValueType, ValueType),
 }
 
-impl From<IndexError> for RetrievalError {
-    fn from(err: IndexError) -> Self { RetrievalError::StorageError(Box::new(err)) }
+impl From<IndexError> for StorageError {
+    fn from(err: IndexError) -> Self { StorageError::BackendError(Box::new(err)) }
 }
 
-impl From<IndexError> for MutationError {
-    fn from(err: IndexError) -> Self { MutationError::General(Box::new(err)) }
-}
-
-pub fn sled_error(err: sled::Error) -> RetrievalError { SledRetrievalError::StorageError(err).into() }
+pub fn sled_error(err: sled::Error) -> StorageError { SledRetrievalError::StorageError(err).into() }

@@ -3,7 +3,7 @@ use crate::{
     planner_integration::{key_bounds_to_sled_range, SledRangeBounds},
 };
 use ankurah_core::indexing::IndexSpecMatch;
-use ankurah_core::{error::RetrievalError, EntityId};
+use ankurah_core::{error::StorageError, EntityId};
 use ankurah_storage_common::{KeyBounds, ScanDirection};
 use futures::Stream;
 use std::pin::Pin;
@@ -91,14 +91,14 @@ impl<'a> SledIndexScanner<'a> {
 impl Unpin for SledIndexScanner<'_> {}
 
 impl Stream for SledIndexScanner<'_> {
-    type Item = Result<EntityId, RetrievalError>;
+    type Item = Result<EntityId, StorageError>;
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Synchronous implementation - always returns Ready
         loop {
             let (key_bytes, _value_bytes) = match self.iter.next() {
                 Some(Ok(kv)) => kv,
-                Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::StorageError(e.to_string().into())))),
+                Some(Err(e)) => return Poll::Ready(Some(Err(StorageError::BackendError(Box::new(e))))),
                 None => return Poll::Ready(None),
             };
 
@@ -116,16 +116,16 @@ impl Stream for SledIndexScanner<'_> {
     }
 }
 
-// EntityIdStream is automatically implemented via blanket impl since our scanners emit Result<EntityId, RetrievalError>
+// EntityIdStream is automatically implemented via blanket impl since our scanners emit Result<EntityId, StorageError>
 
 // TODO: Add extract_ids method for streams that need to convert back to EntityId streams
 
 /// Decode EntityId from index key suffix (last 16 bytes)
-pub fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, RetrievalError> {
+pub fn decode_entity_id_from_index_key(key: &[u8]) -> Result<EntityId, StorageError> {
     if key.len() < 1 + 16 {
-        return Err(RetrievalError::StorageError("index key too short".into()));
+        return Err(StorageError::BackendError("index key too short".into()));
     }
     let eid_bytes: [u8; 16] =
-        key[key.len() - 16..].try_into().map_err(|_| RetrievalError::StorageError("invalid entity id suffix".into()))?;
+        key[key.len() - 16..].try_into().map_err(|_| StorageError::BackendError("invalid entity id suffix".into()))?;
     Ok(EntityId::from_bytes(eid_bytes))
 }

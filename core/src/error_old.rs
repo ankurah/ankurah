@@ -47,6 +47,8 @@ pub enum RetrievalError {
     PropertyError(Box<crate::property::PropertyError>),
     #[error("Request error: {0}")]
     RequestError(RequestError),
+    #[error("{context}: {source}")]
+    Context { context: &'static str, source: Box<RetrievalError> },
     #[error("Apply error: {0}")]
     ApplyError(ApplyError),
 }
@@ -69,6 +71,16 @@ impl From<MutationError> for RetrievalError {
 
 impl RetrievalError {
     pub fn storage(err: impl std::error::Error + Send + Sync + 'static) -> Self { RetrievalError::StorageError(Box::new(err)) }
+
+    pub fn with_context(self, context: &'static str) -> Self { RetrievalError::Context { context, source: Box::new(self) } }
+
+    pub fn root(&self) -> &RetrievalError {
+        let mut current = self;
+        while let RetrievalError::Context { source, .. } = current {
+            current = source;
+        }
+        current
+    }
 }
 
 impl From<bincode::Error> for RetrievalError {

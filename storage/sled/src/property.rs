@@ -1,5 +1,5 @@
 use crate::error::sled_error;
-use ankurah_core::error::RetrievalError;
+use ankurah_core::error::StorageError;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ impl PropertyManager {
 
     /// Gets or creates a property ID for the given property name.
     /// Uses compare_and_swap for atomic insert-if-absent to avoid race conditions.
-    pub fn get_property_id(&self, name: &str) -> Result<u32, RetrievalError> {
+    pub fn get_property_id(&self, name: &str) -> Result<u32, StorageError> {
         // Fast path: check if already exists
         if let Some(ivec) = self.0.property_config_tree.get(name.as_bytes()).map_err(sled_error)? {
             let mut arr = [0u8; 4];
