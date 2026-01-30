@@ -1,3 +1,4 @@
+0.7.19  WASM PropertyError::Missing now includes property and model name for easier debugging
 0.7.18  Fix IndexedDB CBStream drop to remove event listeners before closures are freed
 0.7.17  WASM create/create_one accept JsValue with catchable deserialization errors
 0.7.16  SQLite Storage Engine; move postgres tests to storage/postgres/tests/; use default-members for wasm crates in workspace
