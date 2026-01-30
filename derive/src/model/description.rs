@@ -177,50 +177,47 @@ impl ModelDescription {
             }
         };
 
-        let field_getters = self.active_fields
-            .iter()
-            .map(|field| {
-                let field_name = field.ident.as_ref().unwrap();
-                let wasm_method_name = format_ident!("__wasm_{}", field_name);
-                let is_ref = ref_field_names.contains(&field_name.to_string());
+        let field_getters = self.active_fields.iter().map(|field| {
+            let field_name = field.ident.as_ref().unwrap();
+            let wasm_method_name = format_ident!("__wasm_{}", field_name);
+            let is_ref = ref_field_names.contains(&field_name.to_string());
 
-                let field_name_str = field_name.to_string();
-                let model_name_str = model_name.to_string();
+            let field_name_str = field_name.to_string();
+            let model_name_str = model_name.to_string();
 
-                if is_ref {
-                    // Ref<T> field: return RefModel wrapper
-                    let inner_model = Self::extract_ref_inner_type(&field.ty)
-                        .expect("ref_fields should only contain Ref<T> types");
-                    quote! {
-                        #[doc(hidden)]
-                        #[wasm_bindgen(getter, js_name = #field_name)]
-                        pub fn #wasm_method_name(&self) -> Result<<#inner_model as ::ankurah::model::Model>::RefWrapper, JsValue> {
-                            ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
-                                .map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r))
-                        }
-                    }
-                } else if let Some(inner_model) = Self::extract_option_ref_inner_type(&field.ty) {
-                    // Option<Ref<T>> field: return Option<RefModel>
-                    quote! {
-                        #[doc(hidden)]
-                        #[wasm_bindgen(getter, js_name = #field_name)]
-                        pub fn #wasm_method_name(&self) -> Result<Option<<#inner_model as ::ankurah::model::Model>::RefWrapper>, JsValue> {
-                            ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
-                                .map(|opt| opt.map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r)))
-                        }
-                    }
-                } else {
-                    // Non-Ref field: simple wrapper
-                    let projected_type = &field.ty;
-                    quote! {
-                        #[doc(hidden)]
-                        #[wasm_bindgen(getter, js_name = #field_name)]
-                        pub fn #wasm_method_name(&self) -> Result<#projected_type, JsValue> {
-                            ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
-                        }
+            if is_ref {
+                // Ref<T> field: return RefModel wrapper
+                let inner_model = Self::extract_ref_inner_type(&field.ty).expect("ref_fields should only contain Ref<T> types");
+                quote! {
+                    #[doc(hidden)]
+                    #[wasm_bindgen(getter, js_name = #field_name)]
+                    pub fn #wasm_method_name(&self) -> Result<<#inner_model as ::ankurah::model::Model>::RefWrapper, JsValue> {
+                        ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
+                            .map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r))
                     }
                 }
-            });
+            } else if let Some(inner_model) = Self::extract_option_ref_inner_type(&field.ty) {
+                // Option<Ref<T>> field: return Option<RefModel>
+                quote! {
+                    #[doc(hidden)]
+                    #[wasm_bindgen(getter, js_name = #field_name)]
+                    pub fn #wasm_method_name(&self) -> Result<Option<<#inner_model as ::ankurah::model::Model>::RefWrapper>, JsValue> {
+                        ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
+                            .map(|opt| opt.map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r)))
+                    }
+                }
+            } else {
+                // Non-Ref field: simple wrapper
+                let projected_type = &field.ty;
+                quote! {
+                    #[doc(hidden)]
+                    #[wasm_bindgen(getter, js_name = #field_name)]
+                    pub fn #wasm_method_name(&self) -> Result<#projected_type, JsValue> {
+                        ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
+                    }
+                }
+            }
+        });
 
         std::iter::once(r_method).chain(field_getters).collect()
     }

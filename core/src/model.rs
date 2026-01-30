@@ -104,9 +104,7 @@ pub trait Mutable {
 #[cfg(feature = "wasm")]
 pub fn wasm_prop<T>(result: Result<T, PropertyError>, property: &'static str, model: &'static str) -> Result<T, wasm_bindgen::JsValue> {
     result.map_err(|err| match err {
-        PropertyError::Missing => {
-            wasm_bindgen::JsValue::from_str(&format!("property '{}' is missing in model '{}'", property, model))
-        }
+        PropertyError::Missing => wasm_bindgen::JsValue::from_str(&format!("property '{}' is missing in model '{}'", property, model)),
         _ => wasm_bindgen::JsValue::from_str(&err.to_string()),
     })
 }
