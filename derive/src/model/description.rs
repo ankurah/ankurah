@@ -184,6 +184,9 @@ impl ModelDescription {
                 let wasm_method_name = format_ident!("__wasm_{}", field_name);
                 let is_ref = ref_field_names.contains(&field_name.to_string());
 
+                let field_name_str = field_name.to_string();
+                let model_name_str = model_name.to_string();
+
                 if is_ref {
                     // Ref<T> field: return RefModel wrapper
                     let inner_model = Self::extract_ref_inner_type(&field.ty)
@@ -192,7 +195,8 @@ impl ModelDescription {
                         #[doc(hidden)]
                         #[wasm_bindgen(getter, js_name = #field_name)]
                         pub fn #wasm_method_name(&self) -> Result<<#inner_model as ::ankurah::model::Model>::RefWrapper, JsValue> {
-                            self.#field_name().map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r)).map_err(|e| JsValue::from(e.to_string()))
+                            ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
+                                .map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r))
                         }
                     }
                 } else if let Some(inner_model) = Self::extract_option_ref_inner_type(&field.ty) {
@@ -201,7 +205,8 @@ impl ModelDescription {
                         #[doc(hidden)]
                         #[wasm_bindgen(getter, js_name = #field_name)]
                         pub fn #wasm_method_name(&self) -> Result<Option<<#inner_model as ::ankurah::model::Model>::RefWrapper>, JsValue> {
-                            self.#field_name().map(|opt| opt.map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r))).map_err(|e| JsValue::from(e.to_string()))
+                            ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
+                                .map(|opt| opt.map(|r| <#inner_model as ::ankurah::model::Model>::RefWrapper::from(r)))
                         }
                     }
                 } else {
@@ -211,7 +216,7 @@ impl ModelDescription {
                         #[doc(hidden)]
                         #[wasm_bindgen(getter, js_name = #field_name)]
                         pub fn #wasm_method_name(&self) -> Result<#projected_type, JsValue> {
-                            self.#field_name().map_err(|e| JsValue::from(e.to_string()))
+                            ::ankurah::core::model::wasm_prop(self.#field_name(), #field_name_str, #model_name_str)
                         }
                     }
                 }
