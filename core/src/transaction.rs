@@ -27,6 +27,10 @@ pub struct Transaction {
     pub(crate) id: proto::TransactionId,
     pub(crate) entities: AppendOnlyVec<Entity>,
     pub(crate) alive: Arc<AtomicBool>,
+    /// Entity IDs that were created in this transaction via create().
+    /// Used to validate that creation events (empty parent) are only for entities
+    /// that were actually created in this transaction, not phantom entities.
+    pub(crate) created_entity_ids: std::sync::RwLock<std::collections::HashSet<EntityId>>,
 }
 
 #[cfg(feature = "wasm")]
@@ -41,7 +45,13 @@ impl Transaction {
 
 impl Transaction {
     pub(crate) fn new(dyncontext: Arc<dyn TContext + Send + Sync + 'static>) -> Self {
-        Self { dyncontext, id: proto::TransactionId::new(), entities: AppendOnlyVec::new(), alive: Arc::new(AtomicBool::new(true)) }
+        Self {
+            dyncontext,
+            id: proto::TransactionId::new(),
+            entities: AppendOnlyVec::new(),
+            alive: Arc::new(AtomicBool::new(true)),
+            created_entity_ids: std::sync::RwLock::new(std::collections::HashSet::new()),
+        }
     }
 
     pub(crate) fn add_entity(&self, entity: Entity) -> &Entity {
@@ -53,6 +63,9 @@ impl Transaction {
         let entity = self.dyncontext.create_entity(M::collection(), self.alive.clone());
         model.initialize_new_entity(&entity);
         self.dyncontext.check_write(&entity)?;
+
+        // Track that this entity was created in this transaction
+        self.created_entity_ids.write().unwrap().insert(entity.id);
 
         let entity_ref = self.add_entity(entity);
         Ok(MutableBorrow::new(entity_ref))

@@ -205,11 +205,6 @@ where
                     self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;
                 Ok(entity)
             }
-            Err(RetrievalError::EntityNotFound(id)) => {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
-                let (_, entity) = self.node.entities.with_state(&retriever, id, collection_id.clone(), proto::State::default()).await?;
-                Ok(entity)
-            }
             Err(e) => Err(e),
         }
     }
@@ -259,6 +254,21 @@ where
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
             if let Some(event) = entity.generate_commit_event()? {
+                // Validate creation events: if parent is empty, this is a creation event
+                // and the entity must have been created in this transaction via create()
+                if event.is_entity_create() {
+                    let created_ids = trx.created_entity_ids.read().unwrap();
+                    if !created_ids.contains(&entity.id) {
+                        return Err(MutationError::General(
+                            format!(
+                                "Cannot commit phantom entity {}: entity has empty parent (creation event) \
+                             but was not created in this transaction via create()",
+                                entity.id
+                            )
+                            .into(),
+                        ));
+                    }
+                }
                 entity_events.push((entity.clone(), event));
             }
         }

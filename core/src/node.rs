@@ -747,6 +747,20 @@ where
 
     /// Get all durable peer node IDs
     pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.durable_peers.to_vec() }
+
+    /// TEST ONLY: Create a phantom entity with a specific ID.
+    ///
+    /// This creates an entity that was never properly created via Transaction::create(),
+    /// has no creation event, and has an empty state. Used for adversarial testing to
+    /// verify that commit paths properly reject such phantom entities.
+    ///
+    /// WARNING: This bypasses all normal entity creation validation. Only use in tests.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub fn conjure_evil_phantom(&self, id: proto::EntityId, collection: proto::CollectionId) -> crate::entity::Entity {
+        self.entities.conjure_evil_phantom(id, collection)
+    }
 }
 
 impl<SE, PA> NodeInner<SE, PA>

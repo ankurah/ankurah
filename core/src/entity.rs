@@ -526,6 +526,24 @@ impl WeakEntitySet {
         entity
     }
 
+    /// TEST ONLY: Create a phantom entity with a specific ID.
+    ///
+    /// This creates an entity that was never properly created via Transaction::create(),
+    /// has no creation event, and has an empty state. Used for adversarial testing to
+    /// verify that commit paths properly reject such entities.
+    ///
+    /// WARNING: This bypasses all normal entity creation validation. Only use in tests
+    /// to verify security properties.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub fn conjure_evil_phantom(&self, id: EntityId, collection: CollectionId) -> Entity {
+        let mut entities = self.0.write().unwrap();
+        let entity = Entity::create(id, collection);
+        entities.insert(id, entity.weak());
+        entity
+    }
+
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
     fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
