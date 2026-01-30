@@ -41,7 +41,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> Result<(), ApplyError>
+    ) -> Result<(), ApplyErrorChangeMe>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -93,7 +93,7 @@ impl NodeApplier {
         retriever: &R,
         changes: &mut Vec<EntityChange>,
         entities: &mut impl Pushable<crate::entity::Entity>,
-    ) -> Result<(), ApplyErrorCause>
+    ) -> Result<(), ApplyErrorCauseChangeMe>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -155,7 +155,7 @@ impl NodeApplier {
         collection_id: &proto::CollectionId,
         fragments: Vec<proto::EventFragment>,
         collection: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<Vec<Attested<proto::Event>>, ApplyErrorCause>
+    ) -> Result<Vec<Attested<proto::Event>>, ApplyErrorCauseChangeMe>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -177,7 +177,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         entity: &crate::entity::Entity,
         collection_wrapper: &crate::storage::StorageCollectionWrapper,
-    ) -> Result<(), ApplyErrorCause>
+    ) -> Result<(), ApplyErrorCauseChangeMe>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -198,7 +198,7 @@ impl NodeApplier {
         from_peer_id: &proto::EntityId,
         deltas: Vec<proto::EntityDelta>,
         retriever: &R,
-    ) -> Result<(), ApplyError>
+    ) -> Result<(), ApplyErrorChangeMe>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -261,7 +261,7 @@ impl NodeApplier {
         from_peer_id: &proto::EntityId,
         delta: proto::EntityDelta,
         retriever: &R,
-    ) -> Result<Option<EntityChange>, ApplyErrorCause>
+    ) -> Result<Option<EntityChange>, ApplyErrorCauseChangeMe>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,

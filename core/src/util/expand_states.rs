@@ -20,7 +20,7 @@ pub async fn expand_states(
     mut states: Vec<proto::Attested<proto::EntityState>>,
     additional_entity_ids: impl IntoIterator<Item = proto::EntityId>,
     collection: &crate::storage::StorageCollectionWrapper,
-) -> Result<Vec<proto::Attested<proto::EntityState>>, RetrievalError> {
+) -> Result<Vec<proto::Attested<proto::EntityState>>, RetrievalErrorChangeMe> {
     let mut entity_map: std::collections::HashSet<_> = states.iter().map(|s| s.payload.entity_id).collect();
 
     for entity_id in additional_entity_ids {

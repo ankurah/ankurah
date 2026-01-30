@@ -38,19 +38,19 @@ impl<Projected> YrsString<Projected> {
         Self { property_name, backend, entity, phantom: PhantomData }
     }
     pub fn value(&self) -> Option<String> { self.backend.get_string(&self.property_name) }
-    pub fn insert(&self, index: u32, value: &str) -> Result<(), MutationError> {
+    pub fn insert(&self, index: u32, value: &str) -> Result<(), PropertyError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
         self.backend.insert(&self.property_name, index, value)
     }
-    pub fn delete(&self, index: u32, length: u32) -> Result<(), MutationError> {
+    pub fn delete(&self, index: u32, length: u32) -> Result<(), PropertyError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
         self.backend.delete(&self.property_name, index, length)
     }
-    pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), MutationError> {
+    pub fn overwrite(&self, start: u32, length: u32, value: &str) -> Result<(), PropertyError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
@@ -58,7 +58,7 @@ impl<Projected> YrsString<Projected> {
         self.backend.insert(&self.property_name, start, value)?;
         Ok(())
     }
-    pub fn replace(&self, value: &str) -> Result<(), MutationError> {
+    pub fn replace(&self, value: &str) -> Result<(), PropertyError> {
         if !self.entity.is_writable() {
             return Err(PropertyError::TransactionClosed.into());
         }
@@ -76,7 +76,7 @@ impl<Projected> FromEntity for YrsString<Projected> {
 }
 
 impl<Projected, S: FromActiveType<YrsString<Projected>>> FromActiveType<YrsString<Projected>> for Option<S> {
-    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
+    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyErrorChangeMe> {
         match S::from_active(active) {
             Ok(value) => Ok(Some(value)),
             Err(PropertyError::Missing) => Ok(None),
@@ -86,7 +86,7 @@ impl<Projected, S: FromActiveType<YrsString<Projected>>> FromActiveType<YrsStrin
 }
 
 impl<Projected> FromActiveType<YrsString<Projected>> for String {
-    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
+    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyErrorChangeMe> {
         match active.value() {
             Some(value) => Ok(value),
             None => Err(PropertyError::Missing),
@@ -95,7 +95,7 @@ impl<Projected> FromActiveType<YrsString<Projected>> for String {
 }
 
 impl<'a, Projected> FromActiveType<YrsString<Projected>> for std::borrow::Cow<'a, str> {
-    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
+    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyErrorChangeMe> {
         match active.value() {
             Some(value) => Ok(Self::from(value)),
             None => Err(PropertyError::Missing),

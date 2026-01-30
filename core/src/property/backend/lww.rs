@@ -90,20 +90,20 @@ impl PropertyBackend for LWWBackend {
 
     fn property_backend_name() -> String { "lww".to_owned() }
 
-    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateErrorChangeMe> {
         let property_values = self.property_values();
         let state_buffer = bincode::serialize(&property_values)?;
         Ok(state_buffer)
     }
 
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageError>
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageErrorChangeMe>
     where Self: Sized {
         let raw_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)?;
         let map = raw_map.into_iter().map(|(k, v)| (k, ValueEntry { value: v, committed: true })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
-    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError> {
+    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationErrorChangeMe> {
         let mut values = self.values.write().unwrap();
         let mut changed_values = BTreeMap::new();
 
@@ -123,7 +123,7 @@ impl PropertyBackend for LWWBackend {
         }]))
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
+    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationErrorChangeMe> {
         let mut changed_fields = Vec::new();
 
         for operation in operations {

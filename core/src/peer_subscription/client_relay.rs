@@ -528,7 +528,7 @@ pub trait TNode<CD: ContextData>: Send + Sync {
         selection: ankql::ast::Selection,
         context_data: &CD,
         version: u32,
-    ) -> Result<(), RetrievalError>;
+    ) -> Result<(), RetrievalErrorChangeMe>;
 
     /// Send a predicate unregistration message to a remote peer
     /// This is a one-way message, no response expected
@@ -550,7 +550,7 @@ where
         selection: ankql::ast::Selection,
         context_data: &PA::ContextData,
         version: u32,
-    ) -> Result<(), RetrievalError> {
+    ) -> Result<(), RetrievalErrorChangeMe> {
         let node = self.upgrade().ok_or_else(|| RetrievalError::Failure(Report::new(AnyhowWrapper::from("Node has been dropped".to_string())).change_context(InternalError)))?;
 
         // 1. Pre-fetch known_matches from local storage
@@ -665,7 +665,7 @@ mod tests {
             selection: ankql::ast::Selection,
             _context_data: &CD,
             _version: u32,
-        ) -> Result<(), RetrievalError> {
+        ) -> Result<(), RetrievalErrorChangeMe> {
             self.sent_requests.lock().unwrap().push((peer_id, query_id, collection_id.clone(), selection.clone()));
 
             // Check if there's an error to fail with

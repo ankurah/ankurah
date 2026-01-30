@@ -54,7 +54,7 @@ impl SubscriptionHandler {
     pub fn subscription(&self) -> &ReactorSubscription { &self.subscription }
 
     /// Remove a predicate from this peer's subscription.
-    pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
+    pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionErrorChangeMe> {
         self.subscription.remove_predicate(query_id)?;
         Ok(())
     }

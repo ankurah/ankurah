@@ -529,7 +529,7 @@ mod tests {
         type Id = TestId;
         type Event = TestEvent;
 
-        async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageError> {
+        async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageErrorChangeMe> {
             let mut result = Vec::new();
             for id in event_ids {
                 if let Some(event) = self.events.get(&id) {

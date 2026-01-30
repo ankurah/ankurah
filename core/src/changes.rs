@@ -19,7 +19,7 @@ impl ChangeNotification for EntityChange {
 
 // TODO consider a flattened version of EntityChange that includes the entity and Vec<(operations, parent, attestations)> rather than a Vec<Attested<Event>>
 impl EntityChange {
-    pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationError> {
+    pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationErrorChangeMe> {
         // validate that all events have the same entity id as the entity
         // and that the event ids are present in the entity's head clock
         for event in &events {

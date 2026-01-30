@@ -1,7 +1,7 @@
 use crate::lineage::{self, GetEvents, Retrieve};
 use crate::selection::filter::Filterable;
 use crate::{
-    error::{internal::{LineageError, StateError, WithStateError}, AnyhowWrapper, InternalError, MutationError, RetrievalError},
+    error::{internal::{LineageError, StateError, WithStateError}, AnyhowWrapper, InternalError, MutationError, RetrievalError, StorageError},
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
@@ -43,11 +43,11 @@ struct EntityInnerState {
 impl EntityInnerState {
     /// Apply operations to a specific backend within this state
     /// TODO: backends currently rely on interior mutability; refactor to externalize mutability
-    fn apply_operations(&mut self, backend_name: String, operations: &Vec<ankurah_proto::Operation>) -> Result<(), MutationError> {
+    fn apply_operations(&mut self, backend_name: String, operations: &Vec<ankurah_proto::Operation>) -> Result<(), MutationErrorChangeMe> {
         if let Some(backend) = self.backends.get(&backend_name) {
             backend.apply_operations(operations)?;
         } else {
-            let backend = backend_from_string(&backend_name, None).map_err(retrieval_to_mutation)?;
+            let backend = backend_from_string(&backend_name, None)?;
             backend.apply_operations(operations)?;
             self.backends.insert(backend_name, backend);
         }
@@ -113,7 +113,7 @@ impl Entity {
         }
     }
 
-    pub fn to_state(&self) -> Result<State, StateError> {
+    pub fn to_state(&self) -> Result<State, StateErrorChangeMe> {
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut state_buffers = BTreeMap::default();
         for (name, backend) in &state.backends {
@@ -124,7 +124,7 @@ impl Entity {
         Ok(State { state_buffers, head: state.head.clone() })
     }
 
-    pub fn to_entity_state(&self) -> Result<EntityState, StateError> {
+    pub fn to_entity_state(&self) -> Result<EntityState, StateErrorChangeMe> {
         let state = self.to_state()?;
         Ok(EntityState { entity_id: self.id(), collection: self.collection.clone(), state })
     }
@@ -141,7 +141,7 @@ impl Entity {
     }
 
     /// This must remain private - ONLY WeakEntitySet should be constructing Entities
-    fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    fn from_state(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, StorageErrorChangeMe> {
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
@@ -160,7 +160,7 @@ impl Entity {
     /// Generate an event which contains all operations for all backends since the last time they were collected
     /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
     /// using commit_head
-    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationErrorChangeMe> {
         let state = self.state.read().expect("other thread panicked, panic here too");
         let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
         for (name, backend) in &state.backends {
@@ -214,7 +214,7 @@ impl Entity {
 
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
-    pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
+    pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationErrorChangeMe>
     where G: GetEvents<Id = EventId, Event = Event> {
         debug!("apply_event head: {event} to {self}");
 
@@ -268,7 +268,7 @@ impl Entity {
                 }
             };
 
-            if self.try_mutate(&mut head, move |state| -> Result<(), MutationError> {
+            if self.try_mutate(&mut head, move |state| -> Result<(), MutationErrorChangeMe> {
                 for (backend_name, operations) in event.operations.iter() {
                     state.apply_operations(backend_name.clone(), operations)?;
                 }
@@ -358,7 +358,7 @@ impl Entity {
     pub fn broadcast(&self) -> &ankurah_signals::broadcast::Broadcast { &self.broadcast }
 
     /// Get a specific backend, creating it if it doesn't exist
-    pub fn get_backend<P: PropertyBackend>(&self) -> Result<Arc<P>, RetrievalError> {
+    pub fn get_backend<P: PropertyBackend>(&self) -> Result<Arc<P>, MutationErrorChangeMe> {
         let backend_name = P::property_backend_name();
         let mut state = self.state.write().expect("other thread panicked, panic here too");
         if let Some(backend) = state.backends.get(&backend_name) {
@@ -427,7 +427,7 @@ impl Filterable for Entity {
 }
 
 impl TemporaryEntity {
-    pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalError> {
+    pub fn new(id: EntityId, collection: CollectionId, state: &State) -> Result<Self, RetrievalErrorChangeMe> {
         // Inline from_state_buffers logic
         let mut backends = BTreeMap::new();
         for (name, state_buffer) in state.state_buffers.iter() {
@@ -491,7 +491,7 @@ impl WeakEntitySet {
         retriever: &R,
         collection_id: &CollectionId,
         id: &EntityId,
-    ) -> Result<Option<Entity>, RetrievalError>
+    ) -> Result<Option<Entity>, RetrievalErrorChangeMe>
     where
         R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
     {
@@ -517,7 +517,7 @@ impl WeakEntitySet {
         retriever: &R,
         collection_id: &CollectionId,
         id: &EntityId,
-    ) -> Result<Entity, RetrievalError>
+    ) -> Result<Entity, RetrievalErrorChangeMe>
     where
         R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
     {
@@ -548,7 +548,7 @@ impl WeakEntitySet {
 
     /// Get or create entity after async operations, checking for race conditions
     /// Returns (existed, entity) where existed is true if the entity was already present
-    fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), RetrievalError> {
+    fn private_get_or_create(&self, id: EntityId, collection_id: &CollectionId, state: &State) -> Result<(bool, Entity), StorageErrorChangeMe> {
         let mut entities = self.0.write().unwrap();
         if let Some(existing_weak) = entities.get(&id) {
             if let Some(existing_entity) = existing_weak.upgrade() {
@@ -598,7 +598,7 @@ impl WeakEntitySet {
         // if we're here, we've retrieved the entity from the set and need to apply the state
         let changed = entity.apply_state(retriever, &state)
             .await
-            .map_err(|e| Report::new(WithStateError::Lineage(e)))?;
+            .change_context(WithStateError::Lineage)?;
         Ok((Some(changed), entity))
     }
 }

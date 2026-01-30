@@ -101,7 +101,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 
     /// Remove a subscription and all its predicates
-    pub(crate) fn unsubscribe(&self, sub_id: ReactorSubscriptionId) -> Result<(), SubscriptionError> {
+    pub(crate) fn unsubscribe(&self, sub_id: ReactorSubscriptionId) -> Result<(), SubscriptionErrorChangeMe> {
         let subscription = {
             let mut subscriptions = self.0.subscriptions.lock().unwrap();
             subscriptions.remove(&sub_id).ok_or(SubscriptionError::SubscriptionNotFound)?
@@ -132,7 +132,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 
     /// Remove a predicate from a subscription
-    pub fn remove_query(&self, subscription_id: ReactorSubscriptionId, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
+    pub fn remove_query(&self, subscription_id: ReactorSubscriptionId, query_id: proto::QueryId) -> Result<(), SubscriptionErrorChangeMe> {
         let subscription = {
             let subscriptions = self.0.subscriptions.lock().unwrap();
             subscriptions.get(&subscription_id).cloned().ok_or(SubscriptionError::SubscriptionNotFound)?

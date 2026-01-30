@@ -33,15 +33,15 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     where Self: Sized;
 
     /// Get the latest state buffer for this property backend.
-    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError>;
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateErrorChangeMe>;
     /// Construct a property backend from a state buffer.
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageError>
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageErrorChangeMe>
     where Self: Sized;
 
     /// Retrieve operations applied to this backend since the last time we called this method.
-    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError>;
+    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationErrorChangeMe>;
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError>;
+    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationErrorChangeMe>;
 
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
@@ -58,7 +58,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 // or if they can take a generic, they should also take a `Vec<u8>`.
 
 // TODO: Implement a property backend type registry rather than this hardcoded nonsense.
-pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, StorageError> {
+pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, StorageErrorChangeMe> {
     if name == "yrs" {
         let backend = match buffer {
             Some(buffer) => YrsBackend::from_state_buffer(buffer)?,

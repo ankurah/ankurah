@@ -62,14 +62,14 @@ pub trait FromEntity {
 }
 
 pub trait FromActiveType<A> {
-    fn from_active(active: A) -> Result<Self, PropertyError>
+    fn from_active(active: A) -> Result<Self, PropertyErrorChangeMe>
     where Self: Sized;
 }
 
 /*
 impl<A, T> FromActiveType<A> for Option<T>
 where T: FromActiveType<A> {
-    fn from_active(active: Result<A, PropertyError>) -> Result<Option<T>, PropertyError> {
+    fn from_active(active: Result<A, PropertyErrorChangeMe>) -> Result<Option<T>, PropertyErrorChangeMe> {
         match T::from_active(active) {
             Ok(projected) => {
                 Ok(Some(projected))

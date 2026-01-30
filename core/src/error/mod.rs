@@ -184,6 +184,18 @@ impl From<AccessDenied> for MutationError {
     }
 }
 
+impl From<StorageError> for MutationError {
+    fn from(err: StorageError) -> Self {
+        MutationError::Failure(Report::new(err).change_context(InternalError))
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<Report<E>> for MutationError {
+    fn from(r: Report<E>) -> Self {
+        MutationError::Failure(r.change_context(InternalError))
+    }
+}
+
 impl From<AccessDenied> for RetrievalError {
     fn from(err: AccessDenied) -> Self {
         RetrievalError::AccessDenied(err)

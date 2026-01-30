@@ -80,7 +80,7 @@ pub trait GetEvents {
     }
 
     /// retrieve the events from the store OR the remote peer
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageError>;
+    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageErrorChangeMe>;
 
     /// Stage events for immediate retrieval without storage. Used when applying EventBridge deltas.
     /// Staged events are available for lineage comparison at zero budget cost before being persisted.
@@ -93,7 +93,7 @@ pub trait GetEvents {
 #[async_trait]
 pub trait Retrieve: GetEvents {
     // Each implementation of Retrieve determines whether to use local or remote storage
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, StorageError>;
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, StorageErrorChangeMe>;
 }
 
 /// Durable node retriever - retrieves everything locally from storage
@@ -110,7 +110,7 @@ impl LocalRetriever {
         Self(Arc::new(LocalRetrieverInner { collection, staged_events: Mutex::new(Some(HashMap::new())) }))
     }
 
-    pub async fn store_used_events(&mut self) -> Result<(), RetrievalError> {
+    pub async fn store_used_events(&mut self) -> Result<(), RetrievalErrorChangeMe> {
         let staged = { self.0.staged_events.lock().unwrap().take() };
 
         if let Some(staged) = staged {
@@ -130,7 +130,7 @@ impl GetEvents for LocalRetriever {
     type Id = EventId;
     type Event = ankurah_proto::Event;
 
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageError> {
+    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageErrorChangeMe> {
         let mut events = Vec::with_capacity(event_ids.len());
         let mut event_ids: HashSet<Self::Id> = event_ids.into_iter().collect();
 
@@ -184,7 +184,7 @@ impl GetEvents for LocalRetriever {
 
 #[async_trait]
 impl Retrieve for LocalRetriever {
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, StorageError> {
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, StorageErrorChangeMe> {
         match self.0.collection.get_state(entity_id).await {
             Ok(state) => Ok(Some(state)),
             Err(StorageError::EntityNotFound(_)) => Ok(None),
@@ -217,7 +217,7 @@ where
         Self { collection, node, cdata, staged_events: Mutex::new(Some(HashMap::new())) }
     }
 
-    pub async fn store_used_events(&self) -> Result<(), MutationError> {
+    pub async fn store_used_events(&self) -> Result<(), MutationErrorChangeMe> {
         let staged = { self.staged_events.lock().unwrap().take() };
 
         if let Some(staged) = staged {
@@ -245,7 +245,7 @@ where
     type Id = EventId;
     type Event = Event;
 
-    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageError> {
+    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), StorageErrorChangeMe> {
         let mut events = Vec::with_capacity(event_ids.len());
         let mut event_ids: HashSet<Self::Id> = event_ids.into_iter().collect();
 
@@ -273,7 +273,7 @@ where
         // cost for remote retrieval is 5 per batch
 
         // Then try to get events from local storage
-        let collection = self.node.system.collection(&self.collection).await.map_err(StorageError::from)?;
+        let collection = self.node.collections.get(&self.collection).await?;
         // TODO update get_events to take &HashSet
         for event in collection.get_events(event_ids.iter().cloned().collect()).await? {
             event_ids.remove(&event.payload.id());
@@ -338,7 +338,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, StorageError> {
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<EntityState>>, StorageErrorChangeMe> {
         let collection = self.node.collections.get(&self.collection).await?;
         match collection.get_state(entity_id).await {
             Ok(state) => Ok(Some(state)),

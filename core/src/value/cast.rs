@@ -38,7 +38,7 @@ impl std::error::Error for CastError {}
 
 impl Value {
     /// Cast this value to the specified target type
-    pub fn cast_to(&self, target_type: ValueType) -> Result<Value, CastError> {
+    pub fn cast_to(&self, target_type: ValueType) -> Result<Value, CastErrorChangeMe> {
         let source_type = ValueType::of(self);
 
         // If already the target type, return clone

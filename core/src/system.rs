@@ -96,7 +96,7 @@ where
 
     /// get an existing collection if it's defined in the system catalog, else insert a SysItem::Collection
     /// then return collections.get to get the StorageCollectionWrapper
-    pub async fn collection(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+    pub async fn collection(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalErrorChangeMe> {
         self.wait_loaded().await;
         // TODO - update the system catalog to create an entity for this collection
 
@@ -165,7 +165,7 @@ where
     }
 
     /// Joins an existing system. This should only be called by ephemeral nodes.
-    pub async fn join_system(&self, state: Attested<EntityState>) -> Result<(), MutationError> {
+    pub async fn join_system(&self, state: Attested<EntityState>) -> Result<(), MutationErrorChangeMe> {
         // Wait for catalog to be loaded before proceeding
         self.wait_loaded().await;
 

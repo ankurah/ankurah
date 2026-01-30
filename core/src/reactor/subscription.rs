@@ -62,7 +62,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     // This creates an inactive predicate that does nothing until initialize() is called
 
     /// Remove a predicate from this subscription
-    pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
+    pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionErrorChangeMe> {
         self.0.reactor.remove_query(self.0.subscription_id, query_id)?;
         Ok(())
     }

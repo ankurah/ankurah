@@ -10,7 +10,7 @@ fn field_error_to_retrieval(e: crate::property::PropertyError) -> RetrievalError
 }
 
 /// Cast all literals in a predicate based on field names using a CollectionSchema
-pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &S) -> Result<Predicate, RetrievalError> {
+pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &S) -> Result<Predicate, RetrievalErrorChangeMe> {
     match predicate {
         Predicate::Comparison { left, operator, right } => {
             // Handle both cases: field = literal AND literal = field
@@ -48,7 +48,7 @@ pub fn cast_predicate_types<S: CollectionSchema>(predicate: Predicate, schema: &
 }
 
 /// Cast all literals in an expression based on field names
-fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, RetrievalError> {
+fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, RetrievalErrorChangeMe> {
     match expr {
         Expr::Literal(literal) => Ok(Expr::Literal(literal)), // Literals are cast in context
         Expr::Path(path) => Ok(Expr::Path(path)),
@@ -67,7 +67,7 @@ fn cast_expr_types<S: CollectionSchema>(expr: Expr, schema: &S) -> Result<Expr, 
 }
 
 /// Cast a literal to a specific type using the Value casting system
-fn cast_literal_to_type(literal: Literal, target_type: ValueType) -> Result<Expr, RetrievalError> {
+fn cast_literal_to_type(literal: Literal, target_type: ValueType) -> Result<Expr, RetrievalErrorChangeMe> {
     // Convert Literal -> Value -> cast -> Literal -> Expr
     let value: Value = literal.into();
     let cast_value = value.cast_to(target_type).map_err(|e| RetrievalError::InvalidQuery(QueryError::Filter(format!("Type casting error: {}", e))))?;
@@ -86,7 +86,7 @@ mod tests {
     struct TestSchema;
 
     impl CollectionSchema for TestSchema {
-        fn field_type(&self, path: &PathExpr) -> Result<ValueType, PropertyError> {
+        fn field_type(&self, path: &PathExpr) -> Result<ValueType, PropertyErrorChangeMe> {
             // Use property name (last step) for type lookup
             let property_name = path.property();
             match property_name {

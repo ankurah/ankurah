@@ -53,7 +53,7 @@ where I: Into<PNValue> + From<PNValue> + Copy + Clone
 impl<I> FromActiveType<PNCounter<I>> for I
 where I: Into<PNValue> + From<PNValue> + Copy + Clone
 {
-    fn from_active(active: PNCounter<I>) -> Result<Self, PropertyError>
+    fn from_active(active: PNCounter<I>) -> Result<Self, PropertyErrorChangeMe>
     where Self: Sized {
         Ok(active.value())
     }

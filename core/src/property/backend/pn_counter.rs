@@ -88,7 +88,7 @@ impl PropertyBackend for PNBackend {
         Ok(Self { values: Arc::new(RwLock::new(values)) })
     }
 
-    fn to_operations(&self) -> Result<Vec<Operation>, MutationError> {
+    fn to_operations(&self) -> Result<Vec<Operation>, MutationErrorChangeMe> {
         let values = self.values.read().unwrap();
         let diffs = values.iter().map(|(key, value)| (key, value.diff())).collect::<BTreeMap<_, _>>();
 
@@ -102,7 +102,7 @@ impl PropertyBackend for PNBackend {
         _current_head: &Clock,
         _event_head: &Clock,
         // _context: &Box<dyn TContext>,
-    ) -> Result<(), MutationError> {
+    ) -> Result<(), MutationErrorChangeMe> {
         for operation in operations {
             let diffs = bincode::deserialize::<BTreeMap<PropertyName, i64>>(&operation.diff)?;
 

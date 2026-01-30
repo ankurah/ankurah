@@ -66,12 +66,12 @@ pub struct PeerState {
     sender: Box<dyn PeerSender>,
     _durable: bool,
     subscription_handler: SubscriptionHandler,
-    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-    pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestErrorChangeMe>>>,
+    pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestErrorChangeMe>>>,
 }
 
 impl PeerState {
-    pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
+    pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendErrorChangeMe> { self.sender.send_message(message) }
 }
 
 pub struct MatchArgs {
@@ -300,11 +300,11 @@ where
         node_id: proto::EntityId,
         cdata: &C,
         request_body: proto::NodeRequestBody,
-    ) -> Result<proto::NodeResponseBody, RequestError>
+    ) -> Result<proto::NodeResponseBody, RequestErrorChangeMe>
     where
         C: Iterable<PA::ContextData>,
     {
-        let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
+        let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestErrorChangeMe>>();
         let request_id = proto::RequestId::new();
 
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
@@ -324,7 +324,7 @@ where
     pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
         // same as request, minus cdata and the sign_request step
         debug!("{self}.send_update({node_id:#}, {notification})");
-        let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
+        let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestErrorChangeMe>>();
         let id = proto::UpdateId::new();
 
         // Get the peer connection
@@ -541,7 +541,7 @@ where
         cdata: &PA::ContextData,
         id: proto::TransactionId,
         events: &[Attested<proto::Event>],
-    ) -> Result<(), MutationError> {
+    ) -> Result<(), MutationErrorChangeMe> {
         // TODO determine how many durable peers need to respond before we can proceed. The others should continue in the background.
         // as of this writing, we only have one durable peer, so we can just await the response from "all" of them
         for peer_id in self.get_durable_peers() {
@@ -571,7 +571,7 @@ where
         cdata: &PA::ContextData,
         id: proto::TransactionId,
         mut events: Vec<Attested<proto::Event>>,
-    ) -> Result<(), MutationError> {
+    ) -> Result<(), MutationErrorChangeMe> {
         debug!("{self} commiting transaction {id} with {} events", events.len());
         let mut changes = Vec::new();
 
@@ -734,7 +734,7 @@ where
         collection_id: &CollectionId,
         ids: Vec<proto::EntityId>,
         cdata: &PA::ContextData,
-    ) -> Result<(), RetrievalError> {
+    ) -> Result<(), RetrievalErrorChangeMe> {
         let peer_id = self.get_durable_peer_random().ok_or_else(|| {
             RetrievalError::Failure(Report::new(RequestError::PeerNotConnected).change_context(InternalError))
         })?;
@@ -834,7 +834,7 @@ where
         &self,
         collection_id: &CollectionId,
         selection: &ankql::ast::Selection,
-    ) -> Result<Vec<Entity>, RetrievalError> {
+    ) -> Result<Vec<Entity>, RetrievalErrorChangeMe> {
         let storage_collection = self.collections.get(collection_id).await.map_err(storage_to_retrieval)?;
         let initial_states = storage_collection.fetch_states(selection).await.map_err(storage_to_retrieval)?;
         let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
@@ -856,7 +856,7 @@ pub trait TNodeErased<E: AbstractEntity + Filterable + Send + 'static = Entity>:
         &self,
         collection_id: &CollectionId,
         selection: &ankql::ast::Selection,
-    ) -> Result<Vec<E>, RetrievalError>;
+    ) -> Result<Vec<E>, RetrievalErrorChangeMe>;
     fn reactor(&self) -> &Reactor<E>;
     fn has_subscription_relay(&self) -> bool;
 }
@@ -890,7 +890,7 @@ where
         &self,
         collection_id: &CollectionId,
         selection: &ankql::ast::Selection,
-    ) -> Result<Vec<Entity>, RetrievalError> {
+    ) -> Result<Vec<Entity>, RetrievalErrorChangeMe> {
         Node::fetch_entities_from_local(self, collection_id, selection).await
     }
 

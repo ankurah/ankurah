@@ -36,7 +36,7 @@ pub trait GapFetcher<E: AbstractEntity>: Send + Sync + 'static {
         selection: &ankql::ast::Selection,
         last_entity: Option<&E>,
         gap_size: usize,
-    ) -> Result<Vec<E>, RetrievalError>;
+    ) -> Result<Vec<E>, RetrievalErrorChangeMe>;
 }
 
 /// Concrete implementation of GapFetcher using a WeakNode and typed ContextData
@@ -70,7 +70,7 @@ where
         selection: &ankql::ast::Selection,
         last_entity: Option<&crate::entity::Entity>,
         gap_size: usize,
-    ) -> Result<Vec<crate::entity::Entity>, RetrievalError> {
+    ) -> Result<Vec<crate::entity::Entity>, RetrievalErrorChangeMe> {
         // Try to upgrade the weak reference to the node
         let node_inner = self
             .weak_node

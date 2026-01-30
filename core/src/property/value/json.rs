@@ -152,9 +152,9 @@ impl wasm_bindgen::convert::FromWasmAbi for Json {
 });
 
 impl Property for Json {
-    fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::Json(self.0.clone()))) }
+    fn into_value(&self) -> Result<Option<Value>, PropertyErrorChangeMe> { Ok(Some(Value::Json(self.0.clone()))) }
 
-    fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {
+    fn from_value(value: Option<Value>) -> Result<Self, PropertyErrorChangeMe> {
         match value {
             Some(Value::Json(json)) => Ok(Json(json)),
             Some(Value::Binary(bytes)) => {

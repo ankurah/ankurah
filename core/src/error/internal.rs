@@ -22,6 +22,12 @@ pub enum WithStateError {
     Lineage,
 }
 
+impl From<StorageError> for Report<WithStateError> {
+    fn from(e: StorageError) -> Self {
+        Report::new(e).change_context(WithStateError::Storage)
+    }
+}
+
 #[derive(Debug)]
 pub enum LineageError {
     Incomparable,

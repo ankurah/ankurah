@@ -41,21 +41,21 @@ impl YrsBackend {
         text.map(|t| t.get_string(&txn))
     }
 
-    pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) -> Result<(), MutationError> {
+    pub fn insert(&self, property_name: impl AsRef<str>, index: u32, value: &str) -> Result<(), MutationErrorChangeMe> {
         let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.insert(&mut ytx, index, value);
         Ok(())
     }
 
-    pub fn delete(&self, property_name: impl AsRef<str>, index: u32, length: u32) -> Result<(), MutationError> {
+    pub fn delete(&self, property_name: impl AsRef<str>, index: u32, length: u32) -> Result<(), MutationErrorChangeMe> {
         let text = self.doc.get_or_insert_text(property_name.as_ref()); // We only have one field in the yrs doc
         let mut ytx = self.doc.transact_mut();
         text.remove_range(&mut ytx, index, length);
         Ok(())
     }
 
-    fn apply_update(&self, update: &[u8], changed_fields: &Arc<Mutex<std::collections::HashSet<String>>>) -> Result<(), MutationError> {
+    fn apply_update(&self, update: &[u8], changed_fields: &Arc<Mutex<std::collections::HashSet<String>>>) -> Result<(), MutationErrorChangeMe> {
         let mut txn = self.doc.transact_mut();
 
         // TODO: There's gotta be a better way to do this - but I don't see it at the time of this writing
@@ -132,7 +132,7 @@ impl PropertyBackend for YrsBackend {
 
     fn property_backend_name() -> String { "yrs".to_owned() }
 
-    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
+    fn to_state_buffer(&self) -> Result<Vec<u8>, StateErrorChangeMe> {
         let txn = self.doc.transact();
         // The yrs docs aren't great about how to encode all state as an update.
         // the state vector is just a clock reading. It doesn't contain all updates
@@ -140,7 +140,7 @@ impl PropertyBackend for YrsBackend {
         Ok(state_buffer)
     }
 
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageError> {
+    fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, StorageErrorChangeMe> {
         let doc = yrs::Doc::new();
         let mut txn = doc.transact_mut();
         let update = yrs::Update::decode_v2(state_buffer)
@@ -154,7 +154,7 @@ impl PropertyBackend for YrsBackend {
         Ok(Self { doc, previous_state: Mutex::new(starting_state), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
-    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError> {
+    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationErrorChangeMe> {
         let mut previous_state = self.previous_state.lock().unwrap();
 
         let txn = self.doc.transact_mut();
@@ -169,7 +169,7 @@ impl PropertyBackend for YrsBackend {
         }
     }
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError> {
+    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationErrorChangeMe> {
         let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));
         for operation in operations {
             self.apply_update(&operation.diff, &changed_fields)?;
