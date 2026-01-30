@@ -22,6 +22,8 @@ wasm = [
 uniffi = ["dep:uniffi", "ankurah-proto/uniffi", "ankurah-derive"]
 default = []
 instrument = []
+# Enables test helper methods for adversarial testing (e.g., creating phantom entities)
+test-helpers = []
 
 [dependencies]
 # Internal dependencies
