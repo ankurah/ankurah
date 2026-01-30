@@ -168,6 +168,41 @@ impl ValueType {
     }
 }
 
+// Conversions between core::ValueType and proto::sys::ValueType
+impl From<proto::sys::ValueType> for ValueType {
+    fn from(v: proto::sys::ValueType) -> Self {
+        match v {
+            proto::sys::ValueType::I16 => ValueType::I16,
+            proto::sys::ValueType::I32 => ValueType::I32,
+            proto::sys::ValueType::I64 => ValueType::I64,
+            proto::sys::ValueType::F64 => ValueType::F64,
+            proto::sys::ValueType::Bool => ValueType::Bool,
+            proto::sys::ValueType::String => ValueType::String,
+            proto::sys::ValueType::EntityId => ValueType::EntityId,
+            proto::sys::ValueType::Object => ValueType::Object,
+            proto::sys::ValueType::Binary => ValueType::Binary,
+            proto::sys::ValueType::Json => ValueType::Json,
+        }
+    }
+}
+
+impl From<ValueType> for proto::sys::ValueType {
+    fn from(v: ValueType) -> Self {
+        match v {
+            ValueType::I16 => proto::sys::ValueType::I16,
+            ValueType::I32 => proto::sys::ValueType::I32,
+            ValueType::I64 => proto::sys::ValueType::I64,
+            ValueType::F64 => proto::sys::ValueType::F64,
+            ValueType::Bool => proto::sys::ValueType::Bool,
+            ValueType::String => proto::sys::ValueType::String,
+            ValueType::EntityId => proto::sys::ValueType::EntityId,
+            ValueType::Object => proto::sys::ValueType::Object,
+            ValueType::Binary => proto::sys::ValueType::Binary,
+            ValueType::Json => proto::sys::ValueType::Json,
+        }
+    }
+}
+
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {

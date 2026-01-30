@@ -56,21 +56,23 @@ enum ValueType {
 
 For `yrs_*` backends, the value_type may be implied or have different semantics.
 
+Note: `proto::sys::ValueType` mirrors `core::value::ValueType` exactly and has bidirectional From conversions.
+
 ### Rust Type Mappings
 
 | Rust Type | backend | value_type | optional |
 |-----------|---------|------------|----------|
-| `String` (via YrsString) | `yrs_text` | `string` | false |
-| `Option<String>` (via YrsString) | `yrs_text` | `string` | true |
-| `LWW<String>` | `lww` | `string` | false |
-| `LWW<i32>` | `lww` | `int32` | false |
-| `LWW<i64>` | `lww` | `int64` | false |
-| `LWW<f32>` | `lww` | `float32` | false |
-| `LWW<f64>` | `lww` | `float64` | false |
-| `LWW<bool>` | `lww` | `bool` | false |
-| `LWW<Json>` | `lww` | `json` | false |
-| `Ref<T>` | `lww` | `ref` | false |
-| `Option<Ref<T>>` | `lww` | `ref` | true |
+| `String` (via YrsString) | `YrsText` | `String` | false |
+| `Option<String>` (via YrsString) | `YrsText` | `String` | true |
+| `LWW<String>` | `Lww` | `String` | false |
+| `LWW<i16>` | `Lww` | `I16` | false |
+| `LWW<i32>` | `Lww` | `I32` | false |
+| `LWW<i64>` | `Lww` | `I64` | false |
+| `LWW<f64>` | `Lww` | `F64` | false |
+| `LWW<bool>` | `Lww` | `Bool` | false |
+| `LWW<Json>` | `Lww` | `Json` | false |
+| `Ref<T>` | `Lww` | `EntityId` | false |
+| `Option<Ref<T>>` | `Lww` | `EntityId` | true |
 
 ## Backend Changes
 
