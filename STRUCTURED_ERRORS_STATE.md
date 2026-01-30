@@ -2,124 +2,122 @@
 
 ## Goal
 
-Remove public error types (`RetrievalError`, `MutationError`, `PropertyError`) from internal code. Only true public API methods should return these types. Internal methods should use internal error types like `StorageError`, `StateError`, `Report<_>`, etc.
+Public error types (`RetrievalError`, `MutationError`, `PropertyError`) should ONLY be returned from true public API methods. Internal methods must use internal error types (`StorageError`, `StateError`, `Report<_>`, etc.).
 
-## What's Been Done
+## Current Approach
 
-1. Added `ChangeMe` suffix to ALL Result error types in `core/src/` (except `Report<_>`)
-2. Restored proper public error types for PUBLIC API methods (checked off)
-3. Remaining `ChangeMe` suffixes mark INTERNAL methods that need proper internal error types
-
-## How to See What's Left
+We added `ChangeMe` suffix to all Result error types. Public API methods have been restored. Remaining `ChangeMe` suffixes mark internal code that needs fixing.
 
 ```bash
 grep -rn "ChangeMe" core/src --include="*.rs"
 ```
 
-## Public API Methods (DONE - use public error types)
+## Public API Methods (DONE)
 
-These have been restored to use proper public error types:
+These return public error types - no changes needed:
 
-- `Context::get`, `get_cached`, `fetch`, `query`, `collection` → `RetrievalError`
-- `Transaction::create` → `MutationError`
-- `Transaction::get` → `RetrievalError`
-- `Transaction::commit`, `uniffi_commit` → `MutationError`
-- `LWW::set`, `LWW::get` → `PropertyError`
-- `YrsString::insert`, `delete`, `overwrite`, `replace` → `PropertyError`
-- `Ref::get` → `RetrievalError`
-- `LiveQuery::update_selection`, `update_selection_wait` → `RetrievalError`
-- `View::to_model` → `PropertyError`
+| Method | Error Type |
+|--------|------------|
+| `Context::get`, `get_cached`, `fetch`, `query`, `collection` | `RetrievalError` |
+| `Transaction::create` | `MutationError` |
+| `Transaction::get` | `RetrievalError` |
+| `Transaction::commit`, `uniffi_commit` | `MutationError` |
+| `LWW::set`, `LWW::get` | `PropertyError` |
+| `YrsString::insert`, `delete`, `overwrite`, `replace` | `PropertyError` |
+| `Ref::get` | `RetrievalError` |
+| `LiveQuery::update_selection`, `update_selection_wait` | `RetrievalError` |
+| `View::to_model` | `PropertyError` |
 
-## Internal Methods - Categorized by Target Error Type
+## Internal Methods - By Target Error Type
 
-### StorageError (storage operations)
-```
-storage.rs:17,19,24,25,28,30,37,51,54,57  - StorageEngine/StorageCollection traits
-collectionset.rs:28,48,54                 - CollectionSet methods
-retrieval.rs:83,96,133,187,248,341        - GetEvents/Retrieve traits
-retrieval.rs:113,220                      - store_used_events
-lineage.rs:532                            - test mock retrieve_event
-entity.rs:144,551                         - from_state, private_get_or_create
-property/backend/mod.rs:38,61             - from_state_buffer, backend_from_string
-property/backend/lww.rs:99                - from_state_buffer
-property/backend/yrs.rs:143               - from_state_buffer
-util/expand_states.rs:23                  - expand_states
-```
+### → StorageError
+Storage/retrieval operations. Already exists in `error/internal.rs`.
 
-### StateError (serialization)
-```
-entity.rs:116,127                         - to_state, to_entity_state
-property/backend/mod.rs:36                - to_state_buffer trait
-property/backend/lww.rs:93                - to_state_buffer
-property/backend/yrs.rs:135               - to_state_buffer
-```
+- `storage.rs` - `StorageEngine`, `StorageCollection` trait methods
+- `collectionset.rs` - `CollectionSet::get`, `list_collections`, `delete_all_collections`
+- `retrieval.rs` - `GetEvents::retrieve_event`, `Retrieve::get_state`, `store_used_events`
+- `lineage.rs` - test mock `retrieve_event`
+- `entity.rs` - `Entity::from_state`, `private_get_or_create`
+- `property/backend/*.rs` - `from_state_buffer`
+- `property/backend/mod.rs` - `backend_from_string`
+- `util/expand_states.rs` - `expand_states`
 
-### Report<BackendError> or new internal type (backend mutations)
-```
-property/backend/mod.rs:42,44             - to_operations, apply_operations trait
-property/backend/lww.rs:106,126           - to_operations, apply_operations
-property/backend/yrs.rs:44,51,58,157,172  - insert, delete, apply_update, to_operations, apply_operations
-property/backend/pn_counter.rs:91,105     - to_operations, apply_operations
-entity.rs:46,163,217,271,361              - apply_operations, generate_commit_event, apply_event, get_backend
-```
+### → StateError
+Serialization operations. Already exists in `error/internal.rs`.
 
-### PropertyError (internal, from traits.rs) - keep but consolidate with error/mod.rs
-```
-property/mod.rs:15,16,22,28,40,41,65,67   - Property trait
-property/traits.rs:65,72                  - FromActiveType trait
-property/value/yrs.rs:79,89,98            - FromActiveType impls
-property/value/json.rs:155,157            - Property impl
-property/value/pn_counter.rs:56           - FromActiveType impl
-schema.rs:8                               - CollectionSchema trait
-value/cast_predicate.rs:89                - test schema impl
-```
+- `entity.rs` - `to_state`, `to_entity_state`
+- `property/backend/*.rs` - `to_state_buffer`
 
-### RequestError/SendError (networking)
-```
-node.rs:69,70,74,303,307,327              - request channels, send_message
-connector.rs:13                           - PeerSender trait
-```
+### → StorageError (backend mutations)
+Backend operation errors. Use `StorageError::BackendError` variant.
 
-### SubscriptionError (subscriptions)
-```
-reactor.rs:104,135                        - unsubscribe, remove_query
-reactor/subscription.rs:65                - remove_predicate
-peer_subscription/server.rs:57            - remove_predicate
-```
+- `property/backend/*.rs` - `to_operations`, `apply_operations`, `insert`, `delete`, `apply_update`
+- `entity.rs` - `apply_operations`, `generate_commit_event`, `apply_event`, `get_backend`
 
-### ApplyError/ApplyErrorCause (already correct internal types)
-```
-node_applier.rs:44,96,158,180,201,264     - all apply methods
-```
+### → PropertyError (keep the traits.rs version for now)
+**Note**: There are TWO `PropertyError` types:
+- `error/mod.rs::PropertyError` - public, has `Failure` variant
+- `property/traits.rs::PropertyError` - internal, used everywhere
 
-### Needs Decision (internal plumbing)
-```
-node.rs:544,574,737,837,859,893           - relay_to_peers, commit_remote, get_from_peer, fetch_entities
-system.rs:99,168                          - collection, join_system
-changes.rs:22                             - EntityChange::new
-peer_subscription/client_relay.rs:531,553,668 - subscription methods
-reactor/fetch_gap.rs:39,73                - GapFetcher trait
-context.rs:60,80,262                      - TContext::commit_local_trx (internal trait)
-value/cast_predicate.rs:13,51,70          - cast functions
-value/cast.rs:41                          - Value::cast_to
-```
+For now, keep using `property/traits.rs::PropertyError`. Consolidation is a separate task.
 
-## Next Steps
+- `property/mod.rs` - `Property` trait (`into_value`, `from_value`)
+- `property/traits.rs` - `FromActiveType` trait
+- `property/value/*.rs` - `FromActiveType` impls
+- `schema.rs` - `CollectionSchema::field_type`
 
-1. For each category above, remove the `ChangeMe` suffix and use the proper internal error type
-2. Update the `From` impls in `error/mod.rs` and `error/internal.rs` as needed
-3. Some internal error types may need new variants or new types created
-4. Run `cargo check` after each batch to verify the changes compile
-5. The goal is zero `ChangeMe` suffixes remaining
+### → RequestError / SendError
+Networking errors. Already exist in `error/internal.rs`.
+
+- `node.rs` - `request`, pending channels
+- `connector.rs` - `PeerSender::send_message`
+
+### → SubscriptionError
+Subscription errors. Already exists in `error/internal.rs`.
+
+- `reactor.rs` - `unsubscribe`, `remove_query`
+- `reactor/subscription.rs` - `remove_predicate`
+- `peer_subscription/server.rs` - `remove_predicate`
+
+### → ApplyError / ApplyErrorCause
+Already correct internal types in `error/internal.rs`.
+
+- `node_applier.rs` - all methods (just remove `ChangeMe` suffix)
+
+### → Needs Decision
+These are internal but unclear what error type to use:
+
+- `node.rs` - `relay_to_required_peers`, `commit_remote_transaction`, `get_from_peer`, `fetch_entities_from_local`
+- `system.rs` - `collection`, `join_system`
+- `changes.rs` - `EntityChange::new`
+- `peer_subscription/client_relay.rs` - subscription methods
+- `reactor/fetch_gap.rs` - `GapFetcher` trait (internal plumbing for LiveQuery)
+- `context.rs` - `TContext::commit_local_trx` (internal trait)
+- `value/cast_predicate.rs` - cast functions (should probably be `QueryError`)
+- `value/cast.rs` - `Value::cast_to` (should probably be `CastError`)
+
+## How to Fix Each Category
+
+1. **Simple cases** (StorageError, StateError, etc.): Just remove `ChangeMe` suffix
+2. **Need From impls**: Some conversions may need `From` impls added to `error/internal.rs`
+3. **"Needs Decision"**: Read the code, understand what errors can occur, pick appropriate internal type
+
+## Key Files
+
+- `core/src/error/mod.rs` - Public error types (RetrievalError, MutationError, PropertyError)
+- `core/src/error/internal.rs` - Internal error types (StorageError, StateError, etc.)
+- `specs/structured-errors/*.md` - Background (some details stale, but principles are correct)
 
 ## Key Principle
 
-Internal code uses `Report<InternalType>` or direct internal error types. Conversion to public errors (`RetrievalError`, `MutationError`, `PropertyError`) happens ONLY at public API method boundaries via `From` impls.
+```rust
+// INTERNAL method - uses internal error type
+fn internal_helper() -> Result<T, StorageError> { ... }
 
-## Reference Files
+// PUBLIC method - converts at boundary via From impl
+pub fn public_api() -> Result<T, RetrievalError> {
+    self.internal_helper()?  // ? uses From<StorageError> for RetrievalError
+}
+```
 
-- `specs/structured-errors/spec.md` - Overall spec
-- `specs/structured-errors/plan.md` - Design decisions
-- `specs/structured-errors/tasks.md` - Detailed task list
-- `core/src/error/mod.rs` - Public error types
-- `core/src/error/internal.rs` - Internal error types
+The `From` impls in `error/mod.rs` extract soft errors (NotFound, AccessDenied) as matchable variants and wrap everything else in `Failure(Report<InternalError>)`.
