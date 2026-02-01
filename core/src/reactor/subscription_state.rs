@@ -300,9 +300,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         // Unpause now that update is complete
         query_state.paused = false;
         query_state.version = version;
-        query_state.resultset.set_loaded(true);
 
-        // Drop write guard to apply changes
+        // Set loaded as part of the write transaction - flag is set while lock held,
+        // then drop releases lock and broadcasts. Subscribers see consistent state.
+        rw_resultset.set_loaded(true);
         drop(rw_resultset);
 
         // Drop state lock before updating watchers
