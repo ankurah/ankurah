@@ -150,7 +150,17 @@ impl JsValueCalculated {
     pub fn new(compute: js_sys::Function) -> Self {
         let compute = SendWrapper::new(compute);
         Self(Calculated::new(move || {
-            let result = compute.call0(&JsValue::NULL).unwrap_or(JsValue::UNDEFINED);
+            let result = compute.call0(&JsValue::NULL).unwrap_or_else(|e| {
+                let msg = e.as_string().unwrap_or_else(|| {
+                    // Try to get the stack property from Error objects
+                    js_sys::Reflect::get(&e, &JsValue::from_str("stack"))
+                        .ok()
+                        .and_then(|s| s.as_string())
+                        .unwrap_or_else(|| format!("{:?}", e))
+                });
+                tracing::error!("JsValueCalculated compute function threw: {}", msg);
+                JsValue::UNDEFINED
+            });
             SendWrapper::new(result)
         }))
     }
