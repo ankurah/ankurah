@@ -322,6 +322,14 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         let encoded = encode_tuple_values_with_key_spec(&values, key_spec).unwrap_or_default();
         IVec::from(encoded)
     }
+
+    /// Set the loaded flag as part of this write transaction.
+    /// The flag is set while the lock is held, ensuring subscribers see
+    /// consistent state (both content and loaded flag) when notified.
+    pub fn set_loaded(&mut self, loaded: bool) {
+        self.resultset.0.loaded.store(loaded, std::sync::atomic::Ordering::Relaxed);
+        self.changed = true; // Ensure we broadcast on drop
+    }
 }
 
 impl<'a, E: AbstractEntity> Drop for ResultSetWrite<'a, E> {
