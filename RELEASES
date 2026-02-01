@@ -1,3 +1,4 @@
+0.7.21  Calculated signal type for derived computations; fix WASM by_id to not consume EntityId; fix recursive mutex in ResultSet loaded flag; JsValueCalculated error logging with stack traces
 0.7.20  Fix local node phantom entity bugs and add validation tests for adversarial local and remote cases
 0.7.19  WASM PropertyError::Missing now includes property and model name for easier debugging
 0.7.18  Fix IndexedDB CBStream drop to remove event listeners before closures are freed
