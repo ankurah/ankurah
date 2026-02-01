@@ -10,6 +10,9 @@ use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+// Re-export signal types for testing
+pub use ankurah_signals::{JsValueCalculated, JsValueMut, JsValueRead};
+
 /// Initialize console_error_panic_hook for better error messages
 #[wasm_bindgen(start)]
 pub fn init() { console_error_panic_hook::set_once(); }

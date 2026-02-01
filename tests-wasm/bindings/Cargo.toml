@@ -8,6 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ankurah                        = { path = "../../ankurah", features = ["wasm"] }
+ankurah-signals                = { path = "../../signals", features = ["jsvalue"] }
 ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm" }
 console_error_panic_hook       = "0.1"
 serde                          = { version = "1", features = ["derive"] }
