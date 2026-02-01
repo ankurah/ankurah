@@ -131,4 +131,32 @@ describe("JsValueCalculated", () => {
         expect(result.get()).toBe(102); // Still uses cached value
         expect(computeCount).toBe(2); // No recompute
     });
+
+    it("handles exceptions in compute function gracefully", () => {
+        const trigger = new JsValueMut(0);
+        let shouldThrow = false;
+
+        const computed = new JsValueCalculated(() => {
+            trigger.get(); // track the trigger
+            if (shouldThrow) {
+                throw new Error("Test error from compute");
+            }
+            return "success";
+        });
+
+        // Initial compute succeeds
+        expect(computed.get()).toBe("success");
+
+        // Trigger recompute that throws
+        shouldThrow = true;
+        trigger.set(1);
+
+        // Should return undefined (not crash) and log the error
+        expect(computed.get()).toBe(undefined);
+
+        // Can recover on next compute
+        shouldThrow = false;
+        trigger.set(2);
+        expect(computed.get()).toBe("success");
+    });
 });
