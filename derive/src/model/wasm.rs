@@ -119,9 +119,9 @@ pub fn wasm_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> Toke
                 use ::ankurah::signals::Get;
                 self.0.get()
             }
-            pub fn by_id(&self, id: ::ankurah::proto::EntityId) -> Option<#view_name> {
+            pub fn by_id(&self, id: &::ankurah::proto::EntityId) -> Option<#view_name> {
                 ::ankurah::signals::CurrentObserver::track(&self);
-                self.0.by_id(&id)
+                self.0.by_id(id)
             }
             #[wasm_bindgen(getter)]
             pub fn loaded(&self) -> bool {
