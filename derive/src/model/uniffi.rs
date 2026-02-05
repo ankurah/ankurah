@@ -119,6 +119,7 @@ pub fn uniffi_mutable_field_methods(model: &crate::model::description::ModelDesc
 /// but use UniFFI attributes.
 pub fn uniffi_custom_wrappers(model: &crate::model::description::ModelDescription) -> TokenStream {
     let model_name_str = model.name().to_string();
+    let mut seen_wrappers = std::collections::HashSet::new();
 
     let wrappers: Vec<TokenStream> = model
         .active_fields()
@@ -131,6 +132,13 @@ pub fn uniffi_custom_wrappers(model: &crate::model::description::ModelDescriptio
             if backend_desc.is_provided_type() {
                 return None;
             }
+
+            // Avoid generating duplicate wrappers for same type within this model
+            let wrapper_name = backend_desc.wrapper_type_name_for_model(&model_name_str);
+            if seen_wrappers.contains(&wrapper_name) {
+                return None;
+            }
+            seen_wrappers.insert(wrapper_name);
 
             Some(backend_desc.uniffi_wrapper("external", Some(&model_name_str)))
         })
@@ -149,6 +157,21 @@ fn is_ref_type(ty: &syn::Type) -> Option<Ident> {
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) = args.args.first() {
                     return Some(inner_path.path.segments.last()?.ident.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if a type is Option<Ref<T>> and extract the inner type name
+fn is_option_ref_type(ty: &syn::Type) -> Option<Ident> {
+    if let syn::Type::Path(type_path) = ty {
+        let segment = type_path.path.segments.last()?;
+        if segment.ident == "Option" {
+            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                    return is_ref_type(inner_ty);
                 }
             }
         }
@@ -250,7 +273,7 @@ fn uniffi_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -
 fn uniffi_input_record(model: &crate::model::description::ModelDescription, input_name: &Ident, model_name: &Ident) -> TokenStream {
     let fields = model.active_fields();
 
-    // Generate Input Record fields - Ref<T> becomes String (base64 EntityId)
+    // Generate Input Record fields - Ref<T> becomes String, Option<Ref<T>> becomes Option<String>
     let input_fields: Vec<_> = fields
         .iter()
         .map(|field| {
@@ -259,6 +282,8 @@ fn uniffi_input_record(model: &crate::model::description::ModelDescription, inpu
 
             if is_ref_type(&field.ty).is_some() {
                 quote! { #field_vis #field_name: String }
+            } else if is_option_ref_type(&field.ty).is_some() {
+                quote! { #field_vis #field_name: Option<String> }
             } else {
                 let field_ty = &field.ty;
                 quote! { #field_vis #field_name: #field_ty }
@@ -279,6 +304,16 @@ fn uniffi_input_record(model: &crate::model::description::ModelDescription, inpu
                     #field_name: ::ankurah::property::Ref::from(
                         ::ankurah::proto::EntityId::from_base64(&input.#field_name)?
                     )
+                }
+            } else if is_option_ref_type(&field.ty).is_some() {
+                // Parse optional base64 string to Option<Ref<T>>
+                quote! {
+                    #field_name: match &input.#field_name {
+                        Some(s) => Some(::ankurah::property::Ref::from(
+                            ::ankurah::proto::EntityId::from_base64(s)?
+                        )),
+                        None => None,
+                    }
                 }
             } else {
                 quote! { #field_name: input.#field_name }

@@ -223,7 +223,7 @@ impl ModelDescription {
     }
 
     /// Extract the inner type from Ref<T>, returning the T as a syn::Type
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", feature = "uniffi"))]
     fn extract_ref_inner_type(ty: &Type) -> Option<Type> {
         if let Type::Path(type_path) = ty {
             let segment = type_path.path.segments.last()?;
@@ -239,7 +239,7 @@ impl ModelDescription {
     }
 
     /// Extract the inner model type from Option<Ref<T>>, returning T as a syn::Type
-    #[cfg(feature = "wasm")]
+    #[cfg(any(feature = "wasm", feature = "uniffi"))]
     fn extract_option_ref_inner_type(ty: &Type) -> Option<Type> {
         if let Type::Path(type_path) = ty {
             let segment = type_path.path.segments.last()?;
@@ -269,23 +269,22 @@ impl ModelDescription {
                 let uniffi_method_name = format_ident!("uniffi_{}", field_name);
                 let field_name_str = field_name.to_string();
                 let projected_type = &field.ty;
-                let type_str = quote!(#projected_type).to_string();
 
-                // Check if it's a Ref<T> type
-                if type_str.contains("Ref <") || type_str.starts_with("Ref<") {
-                    // Ref<T> -> return base64 String
-                    quote! {
-                        #[uniffi::method(name = #field_name_str)]
-                        pub fn #uniffi_method_name(&self) -> Result<String, ::ankurah::property::PropertyError> {
-                            self.#field_name().map(|r| r.id().to_base64())
-                        }
-                    }
-                } else if type_str.contains("Option < Ref") || type_str.contains("Option<Ref") {
+                // Check if it's Option<Ref<T>> using AST matching (must check before Ref<T>)
+                if Self::extract_option_ref_inner_type(&field.ty).is_some() {
                     // Option<Ref<T>> -> return Option<String>
                     quote! {
                         #[uniffi::method(name = #field_name_str)]
                         pub fn #uniffi_method_name(&self) -> Result<Option<String>, ::ankurah::property::PropertyError> {
                             self.#field_name().map(|opt| opt.map(|r| r.id().to_base64()))
+                        }
+                    }
+                } else if Self::extract_ref_inner_type(&field.ty).is_some() {
+                    // Ref<T> -> return base64 String
+                    quote! {
+                        #[uniffi::method(name = #field_name_str)]
+                        pub fn #uniffi_method_name(&self) -> Result<String, ::ankurah::property::PropertyError> {
+                            self.#field_name().map(|r| r.id().to_base64())
                         }
                     }
                 } else {
