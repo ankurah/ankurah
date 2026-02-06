@@ -50,6 +50,15 @@ The plan describes the target. This is what exists today — the delta you're wo
 **`core/src/error.rs`** — `MutationError` exists, no `DuplicateCreation` variant
 **`core/Cargo.toml`** — no `lru` crate
 
+### Known Test Regressions (introduced by PR #201, not yet fixed)
+
+`cargo test` currently has 2 failures in `tests/tests/nonexistent_entity.rs` — these pass on main:
+
+- **`server_rejects_update_for_nonexistent`** — fake event with bogus parent is accepted instead of rejected
+- **`server_rejects_create_for_existing`** — duplicate creation event is accepted instead of rejected
+
+Both are the exact bugs the plan fixes (idempotency guard + creation uniqueness guard in Phase 3). They should pass after Phase 3.
+
 ---
 
 ## Phase Execution
