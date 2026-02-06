@@ -299,7 +299,9 @@ impl<R: Retrieve> EventLayers<R> {
     }
 
     /// Get next layer (async - stores events during fetch).
-    /// Returns layers in causal order (layer 0 is closest to meet).
+    /// Returns layers in topological order (earliest layer first, given the
+    /// DAG slice). Each layer is a frontier of events with no unprocessed
+    /// in-DAG parents.
     pub async fn next(&mut self) -> Result<Option<EventLayer<EventId, Event>>, RetrievalError> {
         if self.frontier.is_empty() {
             return Ok(None);
@@ -395,7 +397,10 @@ fn compute_ancestry_from_dag(
 
 ```rust
 /// A layer of concurrent events for unified backend application.
-/// All events in a layer are mutually concurrent (same causal depth from meet).
+/// All events in a layer have no in-DAG ancestor/descendant relation with each
+/// other — they form a topological wave. (With the generalized frontier seed,
+/// a layer may include events from different branches at varying distances from
+/// the meet; "same depth" is not strictly guaranteed.)
 ///
 /// Carries a shared reference to the accumulated DAG structure (parent pointers
 /// only, not full events) for causal comparison within the layer. This avoids
