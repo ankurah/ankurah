@@ -285,6 +285,11 @@ pub struct EventLayer {
 }
 
 impl EventLayer {
+    /// Create a new EventLayer with the given events and DAG structure.
+    pub fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag: Arc<BTreeMap<EventId, Vec<EventId>>>) -> Self {
+        Self { already_applied, to_apply, dag }
+    }
+
     /// Check whether an event_id is present in the accumulated DAG.
     /// Used by LWW to implement the "older than meet" rule.
     pub fn dag_contains(&self, id: &EventId) -> bool {

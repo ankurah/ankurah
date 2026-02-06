@@ -1025,7 +1025,7 @@ async fn test_event_in_history_not_at_head() {
 
 #[cfg(test)]
 mod lww_layer_tests {
-    use crate::event_dag::EventLayer;
+    use crate::event_dag::accumulator::EventLayer;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use crate::value::Value;
@@ -1058,19 +1058,19 @@ mod lww_layer_tests {
         already_applied: &[&Event],
         to_apply: &[&Event],
         context_events: &[&Event],
-    ) -> EventLayer<EventId, Event> {
-        let mut events = BTreeMap::new();
+    ) -> EventLayer {
+        let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            events.insert(event.id(), (*event).clone());
+            dag.insert(event.id(), event.parent.as_slice().to_vec());
         }
-        EventLayer::new_with_context(
+        EventLayer::new(
             already_applied.iter().map(|e| (*e).clone()).collect(),
             to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(events),
+            Arc::new(dag),
         )
     }
 
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
         layer_from_refs_with_context(already_applied, to_apply, &[])
     }
 
@@ -1202,7 +1202,7 @@ mod lww_layer_tests {
 
 #[cfg(test)]
 mod yrs_layer_tests {
-    use crate::event_dag::EventLayer;
+    use crate::event_dag::accumulator::EventLayer;
     use crate::property::backend::yrs::YrsBackend;
     use crate::property::backend::PropertyBackend;
     use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
@@ -1232,19 +1232,19 @@ mod yrs_layer_tests {
         already_applied: &[&Event],
         to_apply: &[&Event],
         context_events: &[&Event],
-    ) -> EventLayer<EventId, Event> {
-        let mut events = BTreeMap::new();
+    ) -> EventLayer {
+        let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            events.insert(event.id(), (*event).clone());
+            dag.insert(event.id(), event.parent.as_slice().to_vec());
         }
-        EventLayer::new_with_context(
+        EventLayer::new(
             already_applied.iter().map(|e| (*e).clone()).collect(),
             to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(events),
+            Arc::new(dag),
         )
     }
 
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
         layer_from_refs_with_context(already_applied, to_apply, &[])
     }
 
@@ -1350,7 +1350,7 @@ mod yrs_layer_tests {
 
 #[cfg(test)]
 mod determinism_tests {
-    use crate::event_dag::EventLayer;
+    use crate::event_dag::accumulator::EventLayer;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use crate::value::Value;
@@ -1380,19 +1380,19 @@ mod determinism_tests {
         already_applied: &[&Event],
         to_apply: &[&Event],
         context_events: &[&Event],
-    ) -> EventLayer<EventId, Event> {
-        let mut events = BTreeMap::new();
+    ) -> EventLayer {
+        let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            events.insert(event.id(), (*event).clone());
+            dag.insert(event.id(), event.parent.as_slice().to_vec());
         }
-        EventLayer::new_with_context(
+        EventLayer::new(
             already_applied.iter().map(|e| (*e).clone()).collect(),
             to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(events),
+            Arc::new(dag),
         )
     }
 
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
         layer_from_refs_with_context(already_applied, to_apply, &[])
     }
 
@@ -1495,7 +1495,7 @@ mod determinism_tests {
 
 #[cfg(test)]
 mod edge_case_tests {
-    use crate::event_dag::EventLayer;
+    use crate::event_dag::accumulator::EventLayer;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use crate::value::Value;
@@ -1525,23 +1525,23 @@ mod edge_case_tests {
         already_applied: &[&Event],
         to_apply: &[&Event],
         context_events: &[&Event],
-    ) -> EventLayer<EventId, Event> {
-        let mut events = BTreeMap::new();
+    ) -> EventLayer {
+        let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            events.insert(event.id(), (*event).clone());
+            dag.insert(event.id(), event.parent.as_slice().to_vec());
         }
-        EventLayer::new_with_context(
+        EventLayer::new(
             already_applied.iter().map(|e| (*e).clone()).collect(),
             to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(events),
+            Arc::new(dag),
         )
     }
 
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer<EventId, Event> {
+    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
         layer_from_refs_with_context(already_applied, to_apply, &[])
     }
 
-    fn empty_layer() -> EventLayer<EventId, Event> { EventLayer::new_with_context(Vec::new(), Vec::new(), Arc::new(BTreeMap::new())) }
+    fn empty_layer() -> EventLayer { EventLayer::new(Vec::new(), Vec::new(), Arc::new(BTreeMap::new())) }
 
     #[test]
     fn test_empty_layer_application() {

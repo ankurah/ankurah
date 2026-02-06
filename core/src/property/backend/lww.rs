@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
-    event_dag::{CausalRelation, EventLayer},
+    event_dag::accumulator::{CausalRelation, EventLayer},
     property::{backend::PropertyBackend, PropertyName, Value},
 };
 
@@ -166,12 +166,13 @@ impl PropertyBackend for LWWBackend {
         self.apply_operations_internal(operations, Some(event_id))
     }
 
-    fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), MutationError> {
+    fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError> {
         #[derive(Clone)]
         struct Candidate {
             value: Option<Value>,
             event_id: EventId,
             from_to_apply: bool,
+            older_than_meet: bool,
         }
 
         let mut winners: BTreeMap<PropertyName, Candidate> = BTreeMap::new();
@@ -185,7 +186,18 @@ impl PropertyBackend for LWWBackend {
                         anyhow::anyhow!("LWW candidate missing event_id for property {}", prop).into(),
                     ));
                 };
-                winners.insert(prop.clone(), Candidate { value: entry.value(), event_id, from_to_apply: false });
+
+                // KEY RULE: If stored event_id is NOT in the accumulated DAG,
+                // it is strictly older than the meet. Any layer candidate wins.
+                // We still seed it so it participates if no layer event touches
+                // this property, but mark it as auto-losable.
+                let known_in_dag = layer.dag_contains(&event_id);
+                winners.insert(prop.clone(), Candidate {
+                    value: entry.value(),
+                    event_id,
+                    from_to_apply: false,
+                    older_than_meet: !known_in_dag,
+                });
             }
         }
 
@@ -198,22 +210,23 @@ impl PropertyBackend for LWWBackend {
                         1 => {
                             let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
                             for (prop, value) in changes {
-                                let candidate = Candidate { value, event_id: event.id(), from_to_apply };
+                                let candidate = Candidate { value, event_id: event.id(), from_to_apply, older_than_meet: false };
                                 if let Some(current) = winners.get_mut(&prop) {
-                                    let relation = layer.compare(&candidate.event_id, &current.event_id).map_err(|_err| {
-                                        MutationError::InsufficientCausalInfo {
-                                            event_a: candidate.event_id.clone(),
-                                            event_b: current.event_id.clone(),
-                                        }
-                                    })?;
-                                    match relation {
-                                        CausalRelation::Descends => {
-                                            *current = candidate;
-                                        }
-                                        CausalRelation::Ascends => {}
-                                        CausalRelation::Concurrent => {
-                                            if candidate.event_id > current.event_id {
+                                    if current.older_than_meet {
+                                        // Stored value is below meet -- any layer candidate wins
+                                        *current = candidate;
+                                    } else {
+                                        // Both in accumulated set -- use causal comparison (infallible)
+                                        let relation = layer.compare(&candidate.event_id, &current.event_id);
+                                        match relation {
+                                            CausalRelation::Descends => {
                                                 *current = candidate;
+                                            }
+                                            CausalRelation::Ascends => {}
+                                            CausalRelation::Concurrent => {
+                                                if candidate.event_id > current.event_id {
+                                                    *current = candidate;
+                                                }
                                             }
                                         }
                                     }
