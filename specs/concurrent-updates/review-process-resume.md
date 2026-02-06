@@ -84,36 +84,50 @@ Codex independently produced `spec-additions-codex.md` (8 recommended spec chang
 
 ### Revised plan
 The combined insights were written into the revised `event-accumulator-refactor-plan.md`. Major additions:
-- "Behavioral Rules" section (4 rules: older-than-meet, idempotency, causal delivery, creation uniqueness)
+- "Behavioral Rules" section (5 rules: older-than-meet, idempotency, causal delivery, creation uniqueness, mixed-parent spanning meet)
 - `EventLayer` carries `dag: Arc<BTreeMap<Id, Vec<Id>>>` (parent pointers) instead of full events
-- `EventLayers` pre-builds parent->children index, correct forward expansion
-- `compare()` requires `R: Clone` for budget-escalation retry
-- `apply_event` sketch with idempotency guard, creation guard, backend replay, budget escalation
+- `EventLayers` pre-builds parent->children index, generalized topological-sort frontier seed
+- Budget escalation internal to `Comparison` (no `R: Clone` requirement)
+- `apply_event` sketch with idempotency guard, creation guard, backend replay
 - `StateApplyResult` enum replacing `bool`
 - LWW `apply_layer` sketch with `dag_contains()` / `older_than_meet` flag
-- Migration phases expanded with correctness fixes and 6 specific test cases
+- Eager event storage model (no seeded events, no store_event)
+- Migration phases expanded with correctness fixes and 8 specific test cases
 - All 12 design questions resolved (no open questions remain)
 
-### Codex review of revised plan (round 1)
-Codex reviewed the revision and found 5 issues (all fixed in the plan):
+---
 
-1. **High: EventLayer/events map inconsistency** — `EventLayers::next()` didn't provide the `events` field. Fixed: EventLayer now carries `dag: Arc<BTreeMap<Id, Vec<Id>>>`, `next()` passes `Arc::clone(&self.dag)`.
-2. **High: LWW plumbing** — Same root cause. Fixed: `layer.dag_contains()` replaces `layer.events.contains_key()`.
-3. **Medium: O(n^2) frontier expansion** — `next()` iterated all processed nodes. Fixed: expand only from current frontier.
-4. **Medium: retriever ownership** — `compare()` took `R` by value, retry impossible. Fixed: `R: Clone` bound, explicit `retriever.clone()`.
-5. **Low: `compute_ancestry_from_dag` undefined** — Fixed: full definition added.
+## Phase 3: Iterative Review & Refinement (session 4 — current)
 
-### Codex review of revised plan (round 2)
-Codex did a second pass (`plan-review-codex-followup.md`) and confirmed the plan is **internally coherent** with **no new blockers**. Four remaining nits were identified — these are NOT yet applied to the plan and should be considered by the implementing agent:
+### Codex nits (round 2) — all applied
+4 documentation nits from `plan-review-codex-followup.md`:
+1. DAG completeness invariant on `EventLayers::new()` — added precondition doc
+2. `compare()` precondition — tightened contract (both IDs must be in DAG)
+3. Budget escalation = fresh comparison — clarified in code sketch
+4. `compute_ancestry_from_dag` scoping — documented as intentional
+5. Rename `current_frontier` → `layer_frontier` — applied
 
-1. **DAG completeness invariant** — Add explicit note: all events from heads to meet must already be in `dag` before `EventLayers` is constructed. (The architecture guarantees this, but the invariant should be documented.)
-2. **EventLayer.compare precondition** — Add note: callers must only call `compare()` when both IDs are in the DAG. (LWW enforces this via `dag_contains()`, but should be stated as a contract.)
-3. **Budget escalation = fresh comparison** — Clarify that retry creates a new `Comparison` with a new `EventAccumulator`, not a resumed one.
-4. **Ancestry computation scope** — Note that `compute_ancestry_from_dag` is scoped to the comparison DAG by design.
+### Mixed-parent spanning meet (correctness fix)
+Codex identified that merge events with parents from non-meet branches stall forever. Fix: generalized frontier initialization (topological-sort seed from all ready events, not just children of meet) + parent-readiness check ignores out-of-DAG parents. Added behavioral rule and test case.
 
-Codex also suggested two optional elegance tweaks:
-- A `compare_or_assume_older(stored_id, candidate_id)` helper on `EventLayer` to centralize the older-than-meet rule
-- Rename `current_frontier` to `layer_frontier` for readability
+### Layer semantics wording
+Updated "same causal depth from meet" → "no in-DAG ancestor/descendant relation within a layer" to reflect the generalized frontier.
+
+### `is_descendant_dag` DAG boundary fix
+Final review (comprehensive agent) identified that `is_descendant_dag` would error when backward traversal reaches parents below the meet. Fixed: uses `if let Some` / `else { continue }` pattern (dead end, not error). `compare()` now returns `CausalRelation` directly (no `Result`).
+
+### Budget escalation moved inside `Comparison`
+Codex recommended moving budget escalation from caller-side (requiring `R: Clone`) to internal to `Comparison` (reset traversal state, retain accumulator cache). Eliminates `R: Clone` from all public APIs. `EphemeralNodeRetriever` (lifetime borrows) now compatible without restructuring.
+
+### Eager event storage
+Daniel questioned why `store_event` exists on `Retrieve` when events are already stored on receipt. Analysis + Codex collaboration identified a correctness pitfall with lazy storage: LRU cache eviction could drop unstored event bodies before persistence. Resolution: adopt eager storage model. Removed `seeded` map, `seed()`, `get_and_store_event()`, `store_event` from plan. `EventAccumulator` simplified to DAG tracker + read-through LRU cache.
+
+Key invariant: `Retrieve::get_event` guarantees the returned event is in local storage (either already there, or fetched from peer and stored before returning). Locally created events don't need to be stored before comparison — the BFS walks backward through the event's parents (already stored), never the event itself.
+
+`event_exists` should preferably be a storage-level `has_event(id)` rather than a wrapper over `get_event`, to avoid the fetch-and-store side-effect of `EphemeralNodeRetriever::get_event`.
+
+### PR comment cleanup
+Deleted 10 outdated line-level review comments and 17 outdated issue comments. Kept 1 (EventAccumulator plan announcement). 9 review submission objects remain (can't be deleted via API).
 
 ---
 
@@ -128,10 +142,12 @@ Codex also suggested two optional elegance tweaks:
 - `specs/concurrent-updates/spec-additions-codex.md` — Codex's independent spec recommendations
 - `specs/concurrent-updates/plan-review-and-recommendations.md` — Claude's initial plan review (pre-Codex-merge)
 - `specs/concurrent-updates/plan-review-codex-followup.md` — Codex's second-pass review with 4 remaining nits
+- `specs/concurrent-updates/codex-review-response.md` — Response to Codex re-review (mixed-parent fix)
+- `specs/concurrent-updates/final-plan-review.md` — Comprehensive final review report
 - `specs/concurrent-updates/event-accumulator-research.md` — Supporting research
 
 ### Active plan (revised, current)
-- **`specs/concurrent-updates/event-accumulator-refactor-plan.md`** — The revised plan incorporating all review feedback. This is the document to implement from. Codex's 4 remaining nits from `plan-review-codex-followup.md` should be incorporated as minor doc additions during implementation.
+- **`specs/concurrent-updates/event-accumulator-refactor-plan.md`** — The plan incorporating all review feedback across 4 sessions. This is the document to implement from. Codex and Claude have confirmed no remaining correctness issues.
 
 ### Spec documents
 - `specs/concurrent-updates/spec.md` — Authoritative feature spec (needs updates per plan's "Spec Alignment Notes" section)
@@ -155,13 +171,11 @@ Codex also suggested two optional elegance tweaks:
 
 ## What Comes Next
 
-The revised plan is ready for implementation. No open design questions remain. The migration path has 4 phases:
+The plan is ready for implementation. No open design questions remain. The migration path has 4 phases:
 
-1. **Phase 1:** Add new types (EventAccumulator, EventLayers, ComparisonResult, StateApplyResult, `store_event` + `event_exists` on Retrieve trait)
-2. **Phase 2:** Modify Comparison internals (embed EventAccumulator, return ComparisonResult) + increase budget to 1000 + add escalation
+1. **Phase 1:** Add new types (EventAccumulator, EventLayers, ComparisonResult, StateApplyResult, `get_event` + `event_exists` on Retrieve trait, `lru` crate)
+2. **Phase 2:** Modify Comparison internals (embed EventAccumulator, return ComparisonResult, internal budget escalation) + increase budget to 1000
 3. **Phase 3:** Update callers + all correctness fixes (idempotency guard, creation race guard, backend replay across layers, LWW older-than-meet rule, StateApplyResult enum)
-4. **Phase 4:** Cleanup (remove AccumulatingNavigator, CausalNavigator, staged_events, standalone compute_layers/compute_ancestry) + 6 specific test cases
+4. **Phase 4:** Cleanup (remove AccumulatingNavigator, CausalNavigator, staged_events, standalone compute_layers/compute_ancestry) + 8 specific test cases + Retrieve trait scope assessment
 
-Before implementing, also incorporate Codex's 4 remaining nits from `plan-review-codex-followup.md` as documentation additions to the plan or inline code comments.
-
-The user has not yet asked for implementation. The next likely request is either to begin implementing the plan or to do further review/refinement.
+The next step is implementation.
