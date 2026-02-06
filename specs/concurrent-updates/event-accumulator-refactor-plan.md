@@ -98,6 +98,14 @@ This preserves safety (don't accept unknown candidates) while allowing legitimat
 
 An entity may have at most one creation event (empty parent clock). If a second creation event arrives after the entity already has a non-empty head, it must be rejected. Otherwise, the entity ends up with two genesis events and all future comparisons may return `Disjoint`.
 
+### Mixed-Parent Events Spanning the Meet Boundary
+
+A merge event may have parents from multiple branches, where only some branches descend from the meet. For example, event E with parents [C, D] where D is the meet but C descends from an independent lineage (C ← A ← G). The forward layer expansion must not assume all events above the meet are reachable by forward expansion from the meet alone.
+
+**Rule:** During layer computation, parents that are not present in the accumulated DAG are below the meet and treated as implicitly processed. The initial frontier is seeded from ALL events in the DAG whose in-DAG parents are all processed (a generalized topological-sort seed), not just children of the meet. This ensures merge events that bring in non-meet branches are correctly reached and their operations are applied.
+
+Without this rule, events with mixed-parent lineages stall forever in the frontier and their operations are silently dropped.
+
 ## New Types
 
 ### EventAccumulator
@@ -230,6 +238,7 @@ impl<R: Retrieve> EventLayers<R> {
     /// heads to the meet. This is guaranteed by construction — the backward BFS
     /// in Comparison is the only pathway that populates the accumulator, and it
     /// walks both frontiers to convergence before returning DivergedSince.
+    /// (Does not hold for BudgetExceeded results — those never reach this path.)
     fn new(
         accumulator: EventAccumulator<R>,
         meet: Vec<EventId>,
@@ -251,11 +260,31 @@ impl<R: Retrieve> EventLayers<R> {
         // Snapshot the DAG structure into an Arc for sharing with EventLayers
         let dag = Arc::new(accumulator.dag.clone());
 
-        // Initialize frontier with children of meet (forward direction)
-        let meet_set: BTreeSet<_> = meet.iter().cloned().collect();
-        let frontier: BTreeSet<EventId> = meet.iter()
-            .flat_map(|m| children_index.get(m).cloned().unwrap_or_default())
-            .filter(|id| !meet_set.contains(id))
+        // Initialize frontier: all events in the DAG whose in-DAG parents are
+        // all processed. This is a generalized topological-sort seed — not just
+        // children of the meet — because merge events can bring in branches that
+        // are NOT descendants of the meet (e.g., event E with parents [C, D]
+        // where D is the meet but C descends from a separate lineage). Parents
+        // outside the DAG are below the meet and treated as implicitly processed.
+        // This may introduce layers that are not descendants of the meet; those
+        // represent concurrently introduced branches and must still be ordered
+        // causally. The O(N) scan is a one-time cost, comparable to building the
+        // children_index above.
+        //
+        // Note: meet is assumed to be a frontier — no meet member is an ancestor
+        // of another. The comparison algorithm guarantees this (meet candidates
+        // are the closest common ancestors, not arbitrary common ancestors).
+        let processed: BTreeSet<_> = meet.iter().cloned().collect();
+        let frontier: BTreeSet<EventId> = accumulator.dag.keys()
+            .filter(|id| !processed.contains(id))
+            .filter(|id| {
+                accumulator.dag.get(id)
+                    .map(|ps| ps.iter().all(|p|
+                        processed.contains(p) || !accumulator.dag.contains_key(p)
+                    ))
+                    .unwrap_or(true)
+            })
+            .cloned()
             .collect();
 
         Self {
@@ -300,7 +329,8 @@ impl<R: Retrieve> EventLayers<R> {
 
         // Advance to next frontier: expand only from nodes processed THIS step.
         // For each node just processed, check its children via the pre-built index.
-        // A child is ready when ALL its parents have been processed.
+        // A child is ready when ALL its in-DAG parents have been processed.
+        // Parents outside the DAG are below the meet and implicitly satisfied.
         // Cost: O(|layer_frontier| × max_children) per step, not O(|processed|).
         let mut next_frontier = BTreeSet::new();
         for id in &layer_frontier {
@@ -308,7 +338,9 @@ impl<R: Retrieve> EventLayers<R> {
                 for child in children {
                     if !self.processed.contains(child) && !next_frontier.contains(child) {
                         let all_parents_done = self.accumulator.dag.get(child)
-                            .map(|ps| ps.iter().all(|p| self.processed.contains(p)))
+                            .map(|ps| ps.iter().all(|p|
+                                self.processed.contains(p) || !self.accumulator.dag.contains_key(p)
+                            ))
                             .unwrap_or(false);
                         if all_parents_done {
                             next_frontier.insert(child.clone());
@@ -710,6 +742,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - [ ] Add test: backend first seen at Layer N gets Layers 1..N-1 replayed
 - [ ] Add test: budget escalation succeeds where initial budget fails
 - [ ] Add test: TOCTOU retry exhaustion produces clean error
+- [ ] Add test: merge event with parent from non-meet branch is correctly layered (mixed-parent spanning meet)
 
 ## Resolved Design Questions
 
