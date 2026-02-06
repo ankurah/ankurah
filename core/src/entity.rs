@@ -2,7 +2,7 @@ use crate::retrieval::Retrieve;
 use crate::selection::filter::Filterable;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
-    event_dag::{compute_ancestry, compute_layers, AbstractCausalRelation},
+    event_dag::AbstractCausalRelation,
     model::View,
     property::backend::{backend_from_string, PropertyBackend},
     reactor::AbstractEntity,
@@ -231,6 +231,31 @@ impl Entity {
         tracing::info!("[TRACE-AE] apply_event called for entity={}, event_id={}, event_parent={}", self.id(), event.id(), event.parent);
         debug!("apply_event head: {event} to {self}");
 
+        // Budget for DAG traversal - should be large enough for typical histories
+        // but bounded to prevent runaway traversal on malicious/corrupted data.
+        // Budget escalation is handled internally by compare_unstored_event (up to 4x).
+        const DEFAULT_BUDGET: usize = 1000;
+
+        // Idempotency is handled by the comparison algorithm:
+        // - Event already in head -> Equal -> no-op (Ok(false))
+        // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
+        // - Event re-delivered but already integrated -> BFS finds it -> StrictAscends
+        // An explicit event_exists() check is not used here because callers
+        // (node_applier, system.rs) store events to storage BEFORE calling
+        // apply_event (so BFS can find them), which would cause false positives.
+
+        // Entity creation uniqueness guard: at most one creation event per entity.
+        // If a creation event arrives for an entity that already has a non-empty head:
+        // - If this specific event is already in storage, it's a re-delivery -> idempotent no-op
+        // - If it's a different creation event, reject to prevent disjoint genesis
+        if event.is_entity_create() && !self.head().is_empty() {
+            if getter.event_exists(&event.id()).await? {
+                // Re-delivery of the same creation event that already established this entity
+                return Ok(false);
+            }
+            return Err(MutationError::DuplicateCreation);
+        }
+
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
             let mut state = self.state.write().unwrap();
@@ -252,14 +277,11 @@ impl Entity {
         let mut head = self.head();
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;
-        // Budget for DAG traversal - should be large enough for typical histories
-        // but bounded to prevent runaway traversal on malicious/corrupted data
-        const COMPARISON_BUDGET: usize = 100;
 
         for attempt in 0..MAX_RETRIES {
             // compare_unstored_event takes retriever by value; pass a reference
             // (blanket Retrieve impl for &R allows this without cloning)
-            let comparison_result = crate::event_dag::compare_unstored_event(getter, event, &head, COMPARISON_BUDGET).await?;
+            let comparison_result = crate::event_dag::compare_unstored_event(getter, event, &head, DEFAULT_BUDGET).await?;
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
@@ -291,30 +313,21 @@ impl Entity {
 
                     let meet = meet.clone();
 
-                    // Get accumulated events from the accumulator's DAG and cache,
-                    // and add the incoming event
-                    let accumulator = comparison_result.accumulator();
-                    let dag_ids: Vec<EventId> = accumulator.dag().keys().cloned().collect();
+                    // Decompose the result to get the accumulator.
+                    // We need to add the incoming event to the DAG before computing layers,
+                    // because compare_unstored_event starts BFS from the event's parent clock,
+                    // so the event itself is NOT in the accumulated DAG.
+                    let (_relation, mut accumulator) = comparison_result.into_parts();
+                    accumulator.accumulate(event);
+                    let mut layers = accumulator.into_layers(meet.clone(), head.as_slice().to_vec());
 
-                    // Build events map from DAG for layer computation
-                    // The accumulator has cached events from the BFS traversal
-                    let mut events = BTreeMap::new();
-                    events.insert(event.id(), event.clone());
+                    let mut applied_layers: Vec<crate::event_dag::accumulator::EventLayer> = Vec::new();
 
-                    // We need to reconstruct the events map from DAG for backward compat with compute_layers.
-                    // For now, fetch events from the accumulator's cache via the getter.
-                    // TODO: Phase 4 will switch to EventAccumulator.into_layers() which avoids this.
-                    for id in &dag_ids {
-                        if let Ok(ev) = getter.get_event(id).await {
-                            events.insert(ev.id(), ev);
-                        }
+                    // Collect all layers first, then apply under lock
+                    let mut all_layers = Vec::new();
+                    while let Some(layer) = layers.next().await? {
+                        all_layers.push(layer);
                     }
-
-                    // Compute current head's ancestry for partitioning
-                    let current_ancestry = compute_ancestry(&events, head.as_slice());
-
-                    // Compute layers from meet point
-                    let layers = compute_layers(&events, &meet, &current_ancestry);
 
                     // Atomic update: apply layers and augment head under single lock
                     {
@@ -327,23 +340,26 @@ impl Entity {
                         }
 
                         // Apply layers in causal order
-                        for layer in &layers {
-                            // Collect event references for already_applied and to_apply
-                            // Apply to all backends
-                            for (_backend_name, backend) in state.backends.iter() {
-                                backend.apply_layer(layer)?;
-                            }
-
-                            // Create backends for operations in to_apply events that don't exist yet
+                        for layer in all_layers {
+                            // Check for backends that first appear in this layer's to_apply events
                             for evt in &layer.to_apply {
                                 for (backend_name, _) in evt.operations.iter() {
                                     if !state.backends.contains_key(backend_name) {
                                         let backend = backend_from_string(backend_name, None)?;
-                                        backend.apply_layer(layer)?;
+                                        // Replay earlier layers for this newly-created backend
+                                        for earlier in &applied_layers {
+                                            backend.apply_layer(earlier)?;
+                                        }
                                         state.backends.insert(backend_name.clone(), backend);
                                     }
                                 }
                             }
+
+                            // Apply to all backends
+                            for (_backend_name, backend) in state.backends.iter() {
+                                backend.apply_layer(&layer)?;
+                            }
+                            applied_layers.push(layer);
                         }
 
                         // Update head: remove superseded tips, add new event
@@ -362,7 +378,7 @@ impl Entity {
                 }
                 AbstractCausalRelation::BudgetExceeded { subject, other } => {
                     return Err(LineageError::BudgetExceeded {
-                        original_budget: COMPARISON_BUDGET,
+                        original_budget: DEFAULT_BUDGET,
                         subject_frontier: subject,
                         other_frontier: other,
                     }
@@ -375,20 +391,24 @@ impl Entity {
         Err(MutationError::TOCTOUAttemptsExhausted)
     }
 
-    // FIXME - apply_state needs a detailed doc comment about its semantics and usage
-    // for example, what does false mean?
-    // FIXME 2 - should we be applying the events in here rather than returning false?
-    pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
+    /// Apply a state snapshot to this entity.
+    ///
+    /// Returns `StateApplyResult` indicating what happened:
+    /// - `Applied` — state was newer and applied directly (StrictDescends)
+    /// - `AlreadyApplied` — state matches current head (Equal)
+    /// - `Older` — incoming state is older than current (StrictAscends), no-op
+    /// - `DivergedRequiresEvents` — state diverged, events needed for proper merge
+    pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<StateApplyResult, MutationError>
     where G: Retrieve + Send + Sync {
         let mut head = self.head();
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
         const MAX_RETRIES: usize = 5;
-        const COMPARISON_BUDGET: usize = 100;
+        const DEFAULT_BUDGET: usize = 1000;
 
         for attempt in 0..MAX_RETRIES {
-            let comparison_result = crate::event_dag::compare(getter, &new_head, &head, COMPARISON_BUDGET).await?;
+            let comparison_result = crate::event_dag::compare(getter, &new_head, &head, DEFAULT_BUDGET).await?;
             tracing::info!(
                 "[TRACE-AS] apply_state comparing new_head={} vs current_head={}, result={:?}",
                 new_head,
@@ -398,7 +418,7 @@ impl Entity {
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("{self} apply_state - heads are equal, skipping");
-                    return Ok(false);
+                    return Ok(StateApplyResult::AlreadyApplied);
                 }
                 AbstractCausalRelation::StrictDescends { .. } => {
                     debug!("{self} apply_state - new head descends from current, applying (attempt {})", attempt + 1);
@@ -412,14 +432,14 @@ impl Entity {
                         Ok(())
                     })? {
                         self.broadcast.send(());
-                        return Ok(true);
+                        return Ok(StateApplyResult::Applied);
                     }
                     continue;
                 }
                 AbstractCausalRelation::StrictAscends => {
                     // State is older than current - no-op
                     debug!("{self} apply_state - new head {new_head} is older than current {head}, ignoring");
-                    return Ok(false);
+                    return Ok(StateApplyResult::Older);
                 }
                 AbstractCausalRelation::DivergedSince { meet, .. } => {
                     // State snapshots cannot be merged without the underlying events.
@@ -427,14 +447,11 @@ impl Entity {
                     // 1. Request the full event history and use apply_event() for each
                     // 2. Accept this state via policy if the attestation is trusted
                     // 3. Reject and resync from a known-good state
-                    //
-                    // Returning Ok(false) signals "not applied, but not an error" so the
-                    // caller can decide how to proceed based on their sync strategy.
                     warn!(
                         "{self} apply_state - new head {new_head} diverged from {head}, meet: {meet:?}. \
                         State not applied; events required for proper merge."
                     );
-                    return Ok(false);
+                    return Ok(StateApplyResult::DivergedRequiresEvents);
                 }
                 AbstractCausalRelation::Disjoint { gca: _, subject_root: _, other_root: _ } => {
                     error!("{self} apply_state - heads are disjoint (different genesis)");
@@ -443,7 +460,7 @@ impl Entity {
                 AbstractCausalRelation::BudgetExceeded { subject, other } => {
                     tracing::warn!("{self} apply_state - budget exceeded. subject: {subject:?}, other: {other:?}");
                     return Err(LineageError::BudgetExceeded {
-                        original_budget: COMPARISON_BUDGET,
+                        original_budget: DEFAULT_BUDGET,
                         subject_frontier: subject,
                         other_frontier: other,
                     }
@@ -734,7 +751,8 @@ impl WeakEntitySet {
         };
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let changed = entity.apply_state(retriever, &state).await?;
+        let result = entity.apply_state(retriever, &state).await?;
+        let changed = matches!(result, StateApplyResult::Applied);
         Ok((Some(changed), entity))
     }
 }

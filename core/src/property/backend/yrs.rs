@@ -183,7 +183,7 @@ impl PropertyBackend for YrsBackend {
         Ok(())
     }
 
-    fn apply_layer(&self, layer: &crate::event_dag::EventLayer<ankurah_proto::EventId, ankurah_proto::Event>) -> Result<(), MutationError> {
+    fn apply_layer(&self, layer: &crate::event_dag::accumulator::EventLayer) -> Result<(), MutationError> {
         // Order within layer doesn't matter for CRDTs - they're commutative.
         // Just apply all operations from to_apply events.
         let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));

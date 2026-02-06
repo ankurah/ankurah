@@ -8,7 +8,7 @@ pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
 use crate::error::{MutationError, RetrievalError, StateError};
-use crate::event_dag::EventLayer;
+use crate::event_dag::accumulator::EventLayer;
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -81,7 +81,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// # For CRDT backends (Yrs)
     /// Apply all operations from `to_apply` events. Order within layer doesn't
     /// matter (CRDTs are commutative). Can ignore `already_applied` and `current_head`.
-    fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), MutationError>;
+    fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError>;
 
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
