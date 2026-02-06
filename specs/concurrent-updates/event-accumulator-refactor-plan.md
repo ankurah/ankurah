@@ -700,7 +700,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - [ ] Add `EventAccumulator` to `Comparison` struct
 - [ ] Store full events in `process_event()` via `accumulator.accumulate()`
 - [ ] Return `ComparisonResult` from `compare()`
-- [ ] Update `compare_unstored_event()` — incoming event is already in storage (eager model); no seeding step needed
+- [ ] Update `compare_unstored_event()` — no seeding step needed; it compares against the event's parent clock (incoming event itself need not be stored for comparison)
 - [ ] Increase default budget from 100 to 1000
 - [ ] Add internal budget escalation in `Comparison`: on `BudgetExceeded`, reset traversal state (retain accumulator cache), retry with 4× budget up to configurable max
 
@@ -743,7 +743,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 
 5. **Storage timing** - Events are stored eagerly on receipt (during frontier expansion or peer delivery), before comparison begins. The accumulator is a read-through cache over already-stored events. This avoids a correctness pitfall with lazy storage: an LRU cache could evict unstored event bodies before they're persisted, silently losing required events. The only safe lazy design would require pinning unstored events in a non-evictable map, adding complexity for marginal benefit.
 
-6. **compare_unstored_event** - The incoming event is stored to local storage before comparison begins. The BFS discovers it and other peer events naturally via `get_event` from storage. No explicit seeding step needed
+6. **compare_unstored_event** - The BFS starts from the event's parent clock, walking backward through already-stored events. The incoming event itself is above its parents and unreachable by backward traversal, so it need not be stored before comparison. It is stored after successful comparison and application. No explicit seeding step needed
 
 7. **CausalNavigator trait** - Eliminated entirely
    - Assertions feature was never used (always returns empty)
