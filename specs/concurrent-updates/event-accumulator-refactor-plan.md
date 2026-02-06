@@ -69,7 +69,7 @@ Refactor the comparison and event accumulation architecture to:
 1. **Retriever owns storage access** - No separate storage parameter needed
 2. **Seeded events** - Incoming peer events are seeded before comparison starts; comparison must treat them as first-class in traversal (they may be the only source for a required parent in batch application)
 3. **Store during layer iteration** - Events stored as they're applied, not before
-4. **Nodes/contexts are cheap to clone** - No complex borrowing needed; `R: Clone` required (retrievers are cheap handles wrapping `Arc` internally)
+4. **No Clone requirement on retrievers** - Budget escalation is handled internally by `Comparison` (retry loop with fresh state, same retriever instance), so callers and `R` do not need `Clone`. This avoids incompatibility with lifetime-borrowing retrievers like `EphemeralNodeRetriever`
 5. **CausalNavigator eliminated** - Assertions feature was unused (returns empty)
 6. **Missing stored event_id rule** - If a stored value's `event_id` is not in the accumulated event set for a layer, it is strictly older than the meet and must lose to any layer candidate (see §Behavioral Rules)
 7. **Children index** - `EventLayers` pre-builds a parent→children index at construction for O(1) forward traversal
@@ -431,49 +431,52 @@ impl<Id: EventId, E> EventLayer<Id, E> {
 
     /// Compare two event IDs using accumulated DAG context.
     ///
-    /// Precondition: both `a` and `b` must be present in the DAG.
-    /// `is_descendant_dag` returns Err on missing IDs — this is a caller
-    /// bug, not an expected path. For stored values, use `dag_contains()`
-    /// first; absent IDs are provably below the meet and should not reach
-    /// this method (see §Behavioral Rules, "older than meet" rule).
+    /// Precondition: both `a` and `b` should be present in the DAG for
+    /// meaningful results. For stored values, use `dag_contains()` first;
+    /// absent IDs are provably below the meet and should not reach this
+    /// method (see §Behavioral Rules, "older than meet" rule).
     ///
-    /// Returns the causal relation between `a` and `b`.
-    pub fn compare(&self, a: &Id, b: &Id) -> Result<CausalRelation, RetrievalError> {
+    /// Returns the causal relation between `a` and `b`. If either ID is
+    /// not in the DAG, traversal treats missing entries as dead ends and
+    /// the result will be Concurrent (no path found).
+    pub fn compare(&self, a: &Id, b: &Id) -> CausalRelation {
         if a == b {
-            return Ok(CausalRelation::Descends);
+            return CausalRelation::Descends;
         }
-        if is_descendant_dag(&self.dag, a, b)? {
-            return Ok(CausalRelation::Descends);
+        if is_descendant_dag(&self.dag, a, b) {
+            return CausalRelation::Descends;
         }
-        if is_descendant_dag(&self.dag, b, a)? {
-            return Ok(CausalRelation::Ascends);
+        if is_descendant_dag(&self.dag, b, a) {
+            return CausalRelation::Ascends;
         }
-        Ok(CausalRelation::Concurrent)
+        CausalRelation::Concurrent
     }
 }
 
 /// Walk backward from `descendant` through parent pointers looking for `ancestor`.
 /// Operates on the DAG structure map (id → parent_ids), not full events.
+/// Missing entries are treated as dead ends (below the meet), not errors —
+/// same pattern as `compute_ancestry_from_dag`. This is correct because the
+/// DAG only contains events accumulated during comparison (above the meet);
+/// parents outside the DAG are below the meet and cannot contain the ancestor.
 fn is_descendant_dag<Id: EventId>(
     dag: &BTreeMap<Id, Vec<Id>>,
     descendant: &Id,
     ancestor: &Id,
-) -> Result<bool, RetrievalError> {
+) -> bool {
     let mut visited = BTreeSet::new();
     let mut frontier = vec![descendant.clone()];
     while let Some(id) = frontier.pop() {
         if !visited.insert(id.clone()) { continue; }
-        if &id == ancestor { return Ok(true); }
-        let parents = dag.get(&id).ok_or_else(|| {
-            RetrievalError::Other(format!("missing event for ancestry lookup: {}", id))
-        })?;
+        if &id == ancestor { return true; }
+        let Some(parents) = dag.get(&id) else { continue; };
         for parent in parents {
             if !visited.contains(parent) {
                 frontier.push(parent.clone());
             }
         }
     }
-    Ok(false)
+    false
 }
 ```
 
@@ -491,12 +494,12 @@ struct Comparison<'a, R: Retrieve> {
     // ... existing fields (frontiers, states, etc.)
 }
 
-pub struct ComparisonResult<R: Retrieve + Clone> {
+pub struct ComparisonResult<R: Retrieve> {
     pub relation: AbstractCausalRelation<EventId>,
     accumulator: EventAccumulator<R>,  // private
 }
 
-impl<R: Retrieve + Clone> ComparisonResult<R> {
+impl<R: Retrieve> ComparisonResult<R> {
     /// For DivergedSince, get layer iterator
     pub fn into_layers(
         self,
@@ -515,7 +518,7 @@ impl<R: Retrieve + Clone> ComparisonResult<R> {
 ### 2. compare() function
 
 ```rust
-pub async fn compare<R: Retrieve + Clone>(
+pub async fn compare<R: Retrieve>(
     retriever: R,
     subject: &Clock,
     comparison: &Clock,
@@ -524,9 +527,12 @@ pub async fn compare<R: Retrieve + Clone>(
 ```
 
 Note: No longer takes `navigator: &N`, takes `retriever: R` directly.
-`R: Clone` is required so the retriever can be moved into `EventAccumulator`
-while the caller retains a clone for budget-escalation retries. Retrievers are
-cheap handles (typically wrapping `Arc<StorageInner>`) so cloning is ~free.
+Budget escalation is handled internally by `Comparison`: on `BudgetExceeded`,
+it resets its internal state (frontiers, visited sets, meet candidates) and
+retries with 4× budget, up to a configurable max. The retry uses the same
+`EventAccumulator` instance (which retains its DAG structure and cache from
+the first attempt — these are still valid). The retriever does NOT need to
+be `Clone`; it stays owned by the accumulator throughout.
 
 ### 3. AccumulatingNavigator
 
@@ -548,8 +554,10 @@ if event.is_entity_create() && !self.head().is_empty() {
     return Err(MutationError::DuplicateCreation);
 }
 
-// R: Clone — retrievers are cheap Arc-wrapped handles; clone for potential retry
-let result = compare_unstored_event(retriever.clone(), event, &head, DEFAULT_BUDGET).await?;
+// Budget escalation is handled internally by compare_unstored_event —
+// no Clone needed on the retriever. If the initial budget is exhausted,
+// Comparison retries internally with 4× budget before returning BudgetExceeded.
+let result = compare_unstored_event(retriever, event, &head, DEFAULT_BUDGET).await?;
 match result.relation {
     DivergedSince { .. } => {
         let mut layers = result.into_layers(head.as_slice().to_vec()).unwrap();
@@ -578,16 +586,8 @@ match result.relation {
         }
     }
     BudgetExceeded { .. } => {
-        // Fresh comparison with escalated budget — NOT a resumption.
-        // The returned frontiers are insufficient for resumption without
-        // full internal state (see §Resolved Design Questions #11).
-        // clone() provides a fresh retriever; compare_unstored_event
-        // creates a new Comparison with a new EventAccumulator.
-        let result = compare_unstored_event(retriever.clone(), event, &head, DEFAULT_BUDGET * 4).await?;
-        match result.relation {
-            BudgetExceeded { .. } => return Err(LineageError::BudgetExceeded { .. }.into()),
-            // ... handle other cases normally
-        }
+        // Internal escalation already attempted and failed.
+        return Err(LineageError::BudgetExceeded { .. }.into());
     }
     // ... other cases unchanged
 }
@@ -606,7 +606,7 @@ pub enum StateApplyResult {
     DivergedRequiresEvents, // DivergedSince but no events available for merge
 }
 
-pub async fn apply_state<R: Retrieve + Clone>(
+pub async fn apply_state<R: Retrieve>(
     &self,
     retriever: R,
     state: &State,
@@ -642,6 +642,10 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
         let values = self.values.read().unwrap();
         for (prop, entry) in values.iter() {
             let Some(event_id) = entry.event_id() else {
+                // Pre-migration LWW values may lack event_id. This is a hard
+                // error — data must be migrated before this code path runs.
+                // If pre-migration data coexistence is needed, a fallback
+                // (e.g., treat as older_than_meet) should be added here.
                 return Err(MutationError::UpdateFailed(
                     anyhow::anyhow!("LWW candidate missing event_id for property {}", prop).into(),
                 ));
@@ -670,8 +674,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
                 *current = candidate;
             } else {
                 // Both in accumulated set — use causal comparison
-                let relation = layer.compare(&candidate.event_id, &current.event_id)
-                    .map_err(|_| MutationError::InsufficientCausalInfo { .. })?;
+                let relation = layer.compare(&candidate.event_id, &current.event_id);
                 match relation {
                     CausalRelation::Descends => { *current = candidate; }
                     CausalRelation::Ascends => {}
@@ -702,12 +705,15 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 
 - Remove `staged_events` field - replaced by `EventAccumulator.seeded`
 - Remove `EventStaging` trait methods if no longer needed
+- Does NOT need `Clone` — budget escalation is internal to `Comparison`, so retrievers with lifetime borrows remain compatible
 
 ## Migration Path
 
 ### Phase 1: Add new types (non-breaking)
+- [ ] Add `get_event` method to `Retrieve` trait (replaces `CausalNavigator` fetch)
 - [ ] Add `store_event` method to `Retrieve` trait (or create new trait)
-- [ ] Add `event_exists` method to `Retrieve` trait (for idempotency guard)
+- [ ] Add `event_exists` method to `Retrieve` trait (for idempotency guard; can delegate to `get_event` + match on `NotFound`, or add a dedicated `has_event` to the storage layer)
+- [ ] Add `lru` crate dependency to `core/Cargo.toml`
 - [ ] Add `EventAccumulator` struct in new `event_dag/accumulator.rs`
 - [ ] Add `EventLayers` struct with children index (can extend existing `layers.rs`)
 - [ ] Add `ComparisonResult` struct
@@ -722,7 +728,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - [ ] Return `ComparisonResult` from `compare()`
 - [ ] Update `compare_unstored_event()` to seed accumulator with unstored event
 - [ ] Increase default budget from 100 to 1000
-- [ ] Add budget escalation: on `BudgetExceeded`, retry with 4× budget up to configurable max
+- [ ] Add internal budget escalation in `Comparison`: on `BudgetExceeded`, reset traversal state (retain accumulator cache), retry with 4× budget up to configurable max
 
 ### Phase 3: Update callers + correctness fixes
 - [ ] Add idempotency guard to `apply_event`: check `event_exists` before comparison
@@ -748,12 +754,13 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - [ ] Add test: budget escalation succeeds where initial budget fails
 - [ ] Add test: TOCTOU retry exhaustion produces clean error
 - [ ] Add test: merge event with parent from non-meet branch is correctly layered (mixed-parent spanning meet)
+- [ ] Add test: seeded event is visible during comparison traversal (validates seed mechanism)
 
 ## Resolved Design Questions
 
 1. **LRU cache size** - Default to 1000, make configurable via builder pattern
 
-2. **Retriever trait** - Needs `store_event(&Event)` and `event_exists(&EventId)` methods added; must be `Clone` (cheap — wraps `Arc`)
+2. **Retriever trait** - Needs `get_event(&EventId)`, `store_event(&Event)`, and `event_exists(&EventId)` methods added. Does NOT require `Clone` — budget escalation is internal to `Comparison`. `event_exists` can be implemented as a thin wrapper over `get_event` returning `Ok(false)` on `NotFound`, or as a dedicated storage-level `has_event(id)` method for efficiency
 
 3. **Async iterator ergonomics** - Use `async fn next()` for simplicity, avoid `futures::Stream` complexity
 
@@ -787,7 +794,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
     - `Older` - StrictAscends, no-op
     - `DivergedRequiresEvents` - divergence, but no events for merge
 
-11. **BudgetExceeded resumption** - Not implemented. The returned frontiers are insufficient for resumption without full internal state (frontiers + visited sets + meet candidates + counters). Callers must treat as hard error or retry with larger budget. True resumption is a future enhancement.
+11. **BudgetExceeded handling** - Budget escalation is internal to `Comparison`. On first `BudgetExceeded`, `Comparison` resets its traversal state (frontiers, visited sets, meet candidates, counters) but retains the `EventAccumulator` (DAG structure and cache are still valid), then retries with 4× budget. If the escalated attempt also exceeds budget, `BudgetExceeded` is returned to the caller as a hard error. True resumption (continuing from partial state) is not feasible — the returned frontiers are insufficient without full internal state. The accumulator's DAG cache provides a warm start for the retry, avoiding redundant fetches
 
 12. **Backward compatibility** - Breaking change. The old APIs (`AccumulatingNavigator`, `CausalNavigator`, `compute_layers`) are removed in Phase 4, not deprecated.
 
