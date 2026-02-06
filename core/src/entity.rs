@@ -1,4 +1,3 @@
-use crate::event_dag::{AccumulatingNavigator, CausalNavigator};
 use crate::retrieval::Retrieve;
 use crate::selection::filter::Filterable;
 use crate::{
@@ -14,6 +13,18 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, error, warn};
+
+/// Result of applying a state snapshot to an entity.
+pub enum StateApplyResult {
+    /// StrictDescends — state applied directly
+    Applied,
+    /// DivergedSince — cannot merge without events
+    DivergedRequiresEvents,
+    /// Equal — no-op, state already matches
+    AlreadyApplied,
+    /// StrictAscends — incoming state is older, no-op
+    Older,
+}
 
 /// An entity represents a unique thing within a collection. Entity can only be constructed via a WeakEntitySet
 /// which provides duplication guarantees.
@@ -216,7 +227,7 @@ impl Entity {
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
-    where G: CausalNavigator<EID = EventId, Event = Event> + Send + Sync {
+    where G: Retrieve + Send + Sync {
         tracing::info!("[TRACE-AE] apply_event called for entity={}, event_id={}, event_parent={}", self.id(), event.id(), event.parent);
         debug!("apply_event head: {event} to {self}");
 
@@ -246,9 +257,10 @@ impl Entity {
         const COMPARISON_BUDGET: usize = 100;
 
         for attempt in 0..MAX_RETRIES {
-            // Use AccumulatingNavigator to collect events during BFS traversal
-            let acc_navigator = AccumulatingNavigator::new(getter);
-            match crate::event_dag::compare_unstored_event(&acc_navigator, event, &head, COMPARISON_BUDGET).await? {
+            // compare_unstored_event takes retriever by value; pass a reference
+            // (blanket Retrieve impl for &R allows this without cloning)
+            let comparison_result = crate::event_dag::compare_unstored_event(getter, event, &head, COMPARISON_BUDGET).await?;
+            match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
                     return Ok(false);
@@ -274,12 +286,29 @@ impl Entity {
                     debug!("StrictAscends - incoming event is older, ignoring");
                     return Ok(false);
                 }
-                AbstractCausalRelation::DivergedSince { meet, .. } => {
+                AbstractCausalRelation::DivergedSince { ref meet, .. } => {
                     debug!("DivergedSince - true concurrency, applying via layers (attempt {})", attempt + 1);
 
-                    // Get accumulated events from navigator and add incoming event
-                    let mut events = acc_navigator.get_events();
+                    let meet = meet.clone();
+
+                    // Get accumulated events from the accumulator's DAG and cache,
+                    // and add the incoming event
+                    let accumulator = comparison_result.accumulator();
+                    let dag_ids: Vec<EventId> = accumulator.dag().keys().cloned().collect();
+
+                    // Build events map from DAG for layer computation
+                    // The accumulator has cached events from the BFS traversal
+                    let mut events = BTreeMap::new();
                     events.insert(event.id(), event.clone());
+
+                    // We need to reconstruct the events map from DAG for backward compat with compute_layers.
+                    // For now, fetch events from the accumulator's cache via the getter.
+                    // TODO: Phase 4 will switch to EventAccumulator.into_layers() which avoids this.
+                    for id in &dag_ids {
+                        if let Ok(ev) = getter.get_event(id).await {
+                            events.insert(ev.id(), ev);
+                        }
+                    }
 
                     // Compute current head's ancestry for partitioning
                     let current_ancestry = compute_ancestry(&events, head.as_slice());
@@ -350,7 +379,7 @@ impl Entity {
     // for example, what does false mean?
     // FIXME 2 - should we be applying the events in here rather than returning false?
     pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
-    where G: CausalNavigator<EID = EventId, Event = Event> + Send + Sync {
+    where G: Retrieve + Send + Sync {
         let mut head = self.head();
         let new_head = state.head.clone();
 
@@ -364,9 +393,9 @@ impl Entity {
                 "[TRACE-AS] apply_state comparing new_head={} vs current_head={}, result={:?}",
                 new_head,
                 head,
-                comparison_result
+                comparison_result.relation
             );
-            match comparison_result {
+            match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("{self} apply_state - heads are equal, skipping");
                     return Ok(false);
@@ -585,7 +614,7 @@ impl WeakEntitySet {
         id: &EntityId,
     ) -> Result<Option<Entity>, RetrievalError>
     where
-        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get(id) {
@@ -610,7 +639,7 @@ impl WeakEntitySet {
         id: &EntityId,
     ) -> Result<Entity, RetrievalError>
     where
-        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         match self.get_or_retrieve(retriever, collection_id, id).await? {
             Some(entity) => Ok(entity),
@@ -681,7 +710,7 @@ impl WeakEntitySet {
         state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where
-        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         let entity = match self.get(&id) {
             Some(entity) => entity, // already resident

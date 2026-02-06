@@ -1,7 +1,6 @@
 use crate::{
     changes::EntityChange,
     error::{ApplyError, ApplyErrorItem, MutationError},
-    event_dag::CausalNavigator,
     node::Node,
     policy::PolicyAgent,
     retrieval::{EventStaging, Retrieve},
@@ -64,7 +63,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         // TODO: do we actually need predicate_relevance?
         let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _ } = update;
@@ -203,7 +202,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + EventStaging + Send + Sync,
+        R: Retrieve + EventStaging + Send + Sync,
     {
         // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
         // if there are stragglers, they will be picked up on the next wake
@@ -248,7 +247,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + EventStaging + Send + Sync,
+        R: Retrieve + EventStaging + Send + Sync,
     {
         let entity_id = delta.entity_id;
         let collection = delta.collection.clone();
@@ -266,7 +265,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve + CausalNavigator<EID = EventId, Event = Event> + EventStaging + Send + Sync,
+        R: Retrieve + EventStaging + Send + Sync,
     {
         let collection = node.collections.get(&delta.collection).await?;
 

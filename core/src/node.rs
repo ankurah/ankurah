@@ -658,9 +658,9 @@ where
         let retriever = LocalRetriever::new(storage_collection.clone());
 
         // First check the causal relationship
-        let relation = compare(&retriever, current_head, known_head, 100000).await?;
+        let comparison_result = compare(&retriever, current_head, known_head, 100000).await?;
 
-        match relation {
+        match comparison_result.relation {
             AbstractCausalRelation::Equal => {
                 // Heads are equal - no events needed
                 Ok(vec![])
