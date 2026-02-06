@@ -274,6 +274,13 @@ impl Entity {
             // If head is no longer empty, fall through to normal lineage comparison
         }
 
+        // Non-creation event on an entity with empty heads means the entity was never created.
+        // Reject early — the DAG comparison would produce DivergedSince(meet=[]) which would
+        // incorrectly apply the update to a non-existent entity.
+        if !event.is_entity_create() && self.head().is_empty() {
+            return Err(MutationError::InvalidEvent);
+        }
+
         let mut head = self.head();
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;

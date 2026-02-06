@@ -3,7 +3,7 @@ use crate::{
     error::{ApplyError, ApplyErrorItem, MutationError},
     node::Node,
     policy::PolicyAgent,
-    retrieval::{EventStaging, Retrieve},
+    retrieval::Retrieve,
     storage::StorageEngine,
     util::ready_chunks::ReadyChunks,
 };
@@ -44,7 +44,6 @@ impl NodeApplier {
         for update in items {
             let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
             Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
-            retriever.store_used_events().await?;
         }
 
         node.reactor.notify_change(changes).await;
@@ -202,7 +201,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve + EventStaging + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
         // if there are stragglers, they will be picked up on the next wake
@@ -247,7 +246,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve + EventStaging + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         let entity_id = delta.entity_id;
         let collection = delta.collection.clone();
@@ -265,7 +264,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve + EventStaging + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         let collection = node.collections.get(&delta.collection).await?;
 
@@ -288,7 +287,11 @@ impl NodeApplier {
                 let attested_events: Vec<Attested<proto::Event>> =
                     events.into_iter().map(|f| (delta.entity_id, delta.collection.clone(), f).into()).collect();
 
-                retriever.stage_events(attested_events.clone());
+                // Eagerly store events before applying (they need to be in storage for BFS)
+                for event in &attested_events {
+                    collection.add_event(event).await?;
+                }
+
                 // Get or create entity
                 let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
 
@@ -296,7 +299,6 @@ impl NodeApplier {
                 // Events in EventBridge are already in causal order from the server
                 for event in attested_events.into_iter() {
                     entity.apply_event(retriever, &event.payload).await?;
-                    retriever.mark_event_used(&event.payload.id());
                 }
 
                 // Save updated state
