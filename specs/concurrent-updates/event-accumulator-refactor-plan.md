@@ -30,10 +30,10 @@ Refactor the comparison and event accumulation architecture to:
 │                         Comparison                               │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                   EventAccumulator<R>                    │    │
-│  │  ┌─────────────────┐  ┌─────────────────────────────┐   │    │
-│  │  │ DAG Structure   │  │  Seeded Events              │   │    │
-│  │  │ id → parents    │  │  (from peer, not stored)    │   │    │
-│  │  │ (always in mem) │  └─────────────────────────────┘   │    │
+│  │  ┌─────────────────┐                                    │    │
+│  │  │ DAG Structure   │                                    │    │
+│  │  │ id → parents    │                                    │    │
+│  │  │ (always in mem) │                                    │    │
 │  │  └─────────────────┘  ┌─────────────────────────────┐   │    │
 │  │                       │ LRU Cache (bounded)         │   │    │
 │  │                       │ EventId → Event (hot)       │   │    │
@@ -67,13 +67,12 @@ Refactor the comparison and event accumulation architecture to:
 ## Key Design Decisions
 
 1. **Retriever owns storage access** - No separate storage parameter needed
-2. **Seeded events** - Incoming peer events are seeded before comparison starts; comparison must treat them as first-class in traversal (they may be the only source for a required parent in batch application)
-3. **Store during layer iteration** - Events stored as they're applied, not before
-4. **No Clone requirement on retrievers** - Budget escalation is handled internally by `Comparison` (retry loop with fresh state, same retriever instance), so callers and `R` do not need `Clone`. This avoids incompatibility with lifetime-borrowing retrievers like `EphemeralNodeRetriever`
-5. **CausalNavigator eliminated** - Assertions feature was unused (returns empty)
-6. **Missing stored event_id rule** - If a stored value's `event_id` is not in the accumulated event set for a layer, it is strictly older than the meet and must lose to any layer candidate (see §Behavioral Rules)
-7. **Children index** - `EventLayers` pre-builds a parent→children index at construction for O(1) forward traversal
-8. **EventLayer carries DAG structure, not full events** - `EventLayer` holds `dag: Arc<BTreeMap<EventId, Vec<EventId>>>` (parent pointers only), not cloned full events. `is_descendant` only needs parent lookups; `dag.contains_key()` is sufficient for the older-than-meet check. This avoids cloning events into a second map.
+2. **Eager event storage** - Events are stored to local storage on receipt (during frontier expansion or peer delivery), before comparison begins. This eliminates the need for a separate seeded-events map and avoids a correctness pitfall: with lazy storage, an LRU cache could evict unstored event bodies before they're persisted, silently losing required events. The accumulator is purely a read-through cache over already-stored events
+3. **No Clone requirement on retrievers** - Budget escalation is handled internally by `Comparison` (retry loop with fresh state, same retriever instance), so callers and `R` do not need `Clone`. This avoids incompatibility with lifetime-borrowing retrievers like `EphemeralNodeRetriever`
+4. **CausalNavigator eliminated** - Assertions feature was unused (returns empty)
+5. **Missing stored event_id rule** - If a stored value's `event_id` is not in the accumulated event set for a layer, it is strictly older than the meet and must lose to any layer candidate (see §Behavioral Rules)
+6. **Children index** - `EventLayers` pre-builds a parent→children index at construction for O(1) forward traversal
+7. **EventLayer carries DAG structure, not full events** - `EventLayer` holds `dag: Arc<BTreeMap<EventId, Vec<EventId>>>` (parent pointers only), not cloned full events. `is_descendant` only needs parent lookups; `dag.contains_key()` is sufficient for the older-than-meet check. This avoids cloning events into a second map.
 
 ## Behavioral Rules
 
@@ -111,17 +110,19 @@ Without this rule, events with mixed-parent lineages stall forever in the fronti
 ### EventAccumulator
 
 ```rust
-/// Accumulates event DAG structure during comparison.
-/// Caches hot events in memory, falls back to retriever for misses.
-/// Handles seeded events (from peer) that need to be stored during iteration.
+/// Accumulates event DAG structure during comparison and provides
+/// read-through caching for event retrieval during layer iteration.
+///
+/// Events are assumed to be already stored in local storage before
+/// comparison begins (eager storage model). The accumulator tracks
+/// DAG structure (parent pointers) discovered during BFS and caches
+/// hot events to reduce storage round-trips. The LRU cache only
+/// holds already-stored events, so eviction is always safe.
 pub struct EventAccumulator<R: Retrieve> {
     /// DAG structure: event id → parent ids (always in memory, cheap)
     dag: BTreeMap<EventId, Vec<EventId>>,
 
-    /// Seeded events from peer (not yet stored in local storage)
-    seeded: HashMap<EventId, Event>,
-
-    /// LRU cache of actual Event objects (bounded size)
+    /// LRU cache of Event objects fetched from storage (bounded, eviction-safe)
     cache: LruCache<EventId, Event>,
 
     /// Retriever with storage access
@@ -132,25 +133,12 @@ impl<R: Retrieve> EventAccumulator<R> {
     pub fn new(retriever: R) -> Self {
         Self {
             dag: BTreeMap::new(),
-            seeded: HashMap::new(),
             cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), // configurable
             retriever,
         }
     }
 
-    /// Seed with events from peer (before comparison).
-    /// Seeded events are first-class during traversal — if a required parent
-    /// exists only in the seed set, comparison must still succeed.
-    pub fn seed(&mut self, events: impl IntoIterator<Item = Event>) {
-        for event in events {
-            let id = event.id();
-            let parents = event.parent().members().to_vec();
-            self.dag.insert(id, parents);
-            self.seeded.insert(id, event);
-        }
-    }
-
-    /// Called during BFS traversal (for events fetched during comparison)
+    /// Called during BFS traversal — records DAG structure and caches the event.
     pub fn accumulate(&mut self, event: Event) {
         let id = event.id();
         let parents = event.parent().members().to_vec();
@@ -158,33 +146,9 @@ impl<R: Retrieve> EventAccumulator<R> {
         self.cache.put(id, event);
     }
 
-    /// Get event by id, storing to storage if from seeded
-    /// Order: seeded → cache → retriever
-    pub async fn get_and_store_event(&mut self, id: &EventId) -> Result<Event, RetrievalError> {
-        // 1. Check seeded (peer events not yet stored)
-        if let Some(event) = self.seeded.remove(id) {
-            // Store to local storage via retriever
-            self.retriever.store_event(&event).await?;
-            self.cache.put(*id, event.clone());
-            return Ok(event);
-        }
-
-        // 2. Check LRU cache
-        if let Some(event) = self.cache.get(id) {
-            return Ok(event.clone());
-        }
-
-        // 3. Fetch from retriever (already in storage or from peer)
-        let event = self.retriever.get_event(id).await?;
-        self.cache.put(*id, event.clone());
-        Ok(event)
-    }
-
-    /// Get event without storing (for comparison traversal)
+    /// Get event by id: cache → retriever (storage).
+    /// All events are already in storage (eager storage model).
     pub async fn get_event(&mut self, id: &EventId) -> Result<Event, RetrievalError> {
-        if let Some(event) = self.seeded.get(id) {
-            return Ok(event.clone());
-        }
         if let Some(event) = self.cache.get(id) {
             return Ok(event.clone());
         }
@@ -216,7 +180,7 @@ impl<R: Retrieve> EventAccumulator<R> {
 /// Async iterator over EventLayer for merge application.
 /// Computes layers lazily using forward expansion from the meet point.
 /// Pre-builds a parent→children index at construction for O(1) lookups.
-/// Events are stored to local storage as they are fetched for application.
+/// Events are read from storage via the accumulator's cache → retriever path.
 pub struct EventLayers<R: Retrieve> {
     accumulator: EventAccumulator<R>,
     meet: Vec<EventId>,
@@ -318,8 +282,8 @@ impl<R: Retrieve> EventLayers<R> {
             }
             self.processed.insert(*id);
 
-            // get_and_store_event: stores seeded events during iteration
-            let event = self.accumulator.get_and_store_event(id).await?;
+            // Events are already in storage (eager storage model)
+            let event = self.accumulator.get_event(id).await?;
 
             // Partition based on whether already in local head ancestry
             if self.current_head_ancestry.contains(id) {
@@ -703,17 +667,17 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 
 ### 8. EphemeralNodeRetriever
 
-- Remove `staged_events` field - replaced by `EventAccumulator.seeded`
+- Remove `staged_events` field — no longer needed (events stored eagerly, not staged)
 - Remove `EventStaging` trait methods if no longer needed
 - Does NOT need `Clone` — budget escalation is internal to `Comparison`, so retrievers with lifetime borrows remain compatible
+- Existing eager storage behavior in `expand_frontier` (calls `collection.add_event()` on receipt from peers) is the correct pattern and should be preserved
 
 ## Migration Path
 
 ### Phase 1: Add new types (non-breaking)
 - [ ] Add `get_event` method to `Retrieve` trait (replaces `CausalNavigator` fetch)
-- [ ] Add `store_event` method to `Retrieve` trait (or create new trait)
 - [ ] Add `event_exists` method to `Retrieve` trait (for idempotency guard; can delegate to `get_event` + match on `NotFound`, or add a dedicated `has_event` to the storage layer)
-- [ ] Add `lru` crate dependency to `core/Cargo.toml`
+- [ ] Add `lru` crate dependency to `core/Cargo.toml` (optional — LRU cache can be deferred to a later phase if desired; accumulator works without it, just slower)
 - [ ] Add `EventAccumulator` struct in new `event_dag/accumulator.rs`
 - [ ] Add `EventLayers` struct with children index (can extend existing `layers.rs`)
 - [ ] Add `ComparisonResult` struct
@@ -726,7 +690,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - [ ] Add `EventAccumulator` to `Comparison` struct
 - [ ] Store full events in `process_event()` via `accumulator.accumulate()`
 - [ ] Return `ComparisonResult` from `compare()`
-- [ ] Update `compare_unstored_event()` to seed accumulator with unstored event
+- [ ] Update `compare_unstored_event()` — incoming event is already in storage (eager model); no seeding step needed
 - [ ] Increase default budget from 100 to 1000
 - [ ] Add internal budget escalation in `Comparison`: on `BudgetExceeded`, reset traversal state (retain accumulator cache), retry with 4× budget up to configurable max
 
@@ -754,33 +718,28 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - [ ] Add test: budget escalation succeeds where initial budget fails
 - [ ] Add test: TOCTOU retry exhaustion produces clean error
 - [ ] Add test: merge event with parent from non-meet branch is correctly layered (mixed-parent spanning meet)
-- [ ] Add test: seeded event is visible during comparison traversal (validates seed mechanism)
-- [ ] Cleanup: assess `Retrieve` trait scope — it now spans state retrieval (`get_state`), event access (`get_event`, `event_exists`), and event storage (`store_event`), collapsing the original local-only vs network-fallback separation that `CausalNavigator` provided. Consider renaming or splitting the trait to reflect its expanded role. The original design had `Retrieve` as local-only state access and `CausalNavigator` as the (optionally network-aware) event traversal layer; that bifurcation is lost. Low priority but worth addressing for API clarity
+- [ ] Add test: eagerly stored peer events are discoverable by BFS during comparison
+- [ ] Cleanup: assess `Retrieve` trait scope — it now spans state retrieval (`get_state`) and event access (`get_event`, `event_exists`), collapsing the original local-only vs network-fallback separation that `CausalNavigator` provided. Consider renaming or splitting the trait to reflect its expanded role. The original design had `Retrieve` as local-only state access and `CausalNavigator` as the (optionally network-aware) event traversal layer; that bifurcation is lost. Low priority but worth addressing for API clarity
 
 ## Resolved Design Questions
 
 1. **LRU cache size** - Default to 1000, make configurable via builder pattern
 
-2. **Retriever trait** - Needs `get_event(&EventId)`, `store_event(&Event)`, and `event_exists(&EventId)` methods added. Does NOT require `Clone` — budget escalation is internal to `Comparison`. `event_exists` can be implemented as a thin wrapper over `get_event` returning `Ok(false)` on `NotFound`, or as a dedicated storage-level `has_event(id)` method for efficiency
+2. **Retriever trait** - Needs `get_event(&EventId)` and `event_exists(&EventId)` methods added. Does NOT require `Clone` — budget escalation is internal to `Comparison`. `event_exists` can be implemented as a thin wrapper over `get_event` returning `Ok(false)` on `NotFound`, or as a dedicated storage-level `has_event(id)` method for efficiency. `store_event` is NOT needed — events are stored eagerly on receipt, before comparison begins
 
 3. **Async iterator ergonomics** - Use `async fn next()` for simplicity, avoid `futures::Stream` complexity
 
 4. **Error handling in layers** - Propagate errors, caller handles (keep it simple)
 
-5. **Storage timing** - Events stored during `EventLayers` iteration via `get_and_store_event()`
-   - Seeded events are stored exactly when they're needed for layer application
-   - This is the natural filter - only events that are actually applied get stored
+5. **Storage timing** - Events are stored eagerly on receipt (during frontier expansion or peer delivery), before comparison begins. The accumulator is a read-through cache over already-stored events. This avoids a correctness pitfall with lazy storage: an LRU cache could evict unstored event bodies before they're persisted, silently losing required events. The only safe lazy design would require pinning unstored events in a non-evictable map, adding complexity for marginal benefit.
 
-6. **compare_unstored_event** - Seed the accumulator with the unstored event before comparison
-   - `accumulator.seed(vec![event.clone()])`
-   - Comparison can then find and use the event normally
+6. **compare_unstored_event** - The incoming event is stored to local storage before comparison begins. The BFS discovers it and other peer events naturally via `get_event` from storage. No explicit seeding step needed
 
 7. **CausalNavigator trait** - Eliminated entirely
    - Assertions feature was never used (always returns empty)
    - If needed in future, can be added back as optional callback
 
-8. **staged_events in EphemeralNodeRetriever** - Replaced by EventAccumulator.seeded
-   - Cleaner separation: seeded = not-yet-stored, cache = hot events
+8. **staged_events in EphemeralNodeRetriever** - Removed entirely. With eager storage, events are persisted on receipt — no in-memory staging needed. The accumulator's LRU cache serves as a hot-event read-through cache over storage
 
 9. **InsufficientCausalInfo for stored values** - Resolved by the "older than meet" rule
    - Stored event_id absent from accumulated DAG → provably below meet → always loses
@@ -813,7 +772,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - `core/src/event_dag/comparison.rs` - Embed `EventAccumulator`, return `ComparisonResult`
 - `core/src/event_dag/layers.rs` - Update `EventLayers` to use accumulator + children index
 - `core/src/entity.rs` - Update `apply_event` (idempotency, creation guard, backend replay, budget), `apply_state` (rich return type)
-- `core/src/retrieval.rs` - Add `store_event`, `event_exists` to `Retrieve` trait
+- `core/src/retrieval.rs` - Add `get_event`, `event_exists` to `Retrieve` trait
 - `core/src/property/backend/lww.rs` - Implement older_than_meet rule in `apply_layer`
 
 ### Minor Changes
