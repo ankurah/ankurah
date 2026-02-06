@@ -508,7 +508,11 @@ be `Clone`; it stays owned by the accumulator throughout.
 ```rust
 const DEFAULT_BUDGET: usize = 1000;
 
-// Idempotency guard: reject events already in storage
+// Idempotency guard: reject events already in storage.
+// Note: prefer a storage-level has_event(id) for this check rather than
+// get_event + match, to avoid fetching the full event body and to avoid
+// side-effects (EphemeralNodeRetriever::get_event may fetch-and-store
+// from a peer, which is correct but unnecessarily heavy for an existence check).
 if retriever.event_exists(&event.id()).await? {
     return Ok(false);
 }
@@ -518,6 +522,12 @@ if event.is_entity_create() && !self.head().is_empty() {
     return Err(MutationError::DuplicateCreation);
 }
 
+// The incoming event does NOT need to be stored before comparison.
+// compare_unstored_event starts the BFS from the event's PARENT clock
+// (not the event itself), walking backward through already-stored events.
+// The event itself is above its parents and unreachable by backward traversal.
+// It is stored after successful comparison and application.
+//
 // Budget escalation is handled internally by compare_unstored_event —
 // no Clone needed on the retriever. If the initial budget is exhausted,
 // Comparison retries internally with 4× budget before returning BudgetExceeded.
@@ -725,7 +735,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 
 1. **LRU cache size** - Default to 1000, make configurable via builder pattern
 
-2. **Retriever trait** - Needs `get_event(&EventId)` and `event_exists(&EventId)` methods added. Does NOT require `Clone` — budget escalation is internal to `Comparison`. `event_exists` can be implemented as a thin wrapper over `get_event` returning `Ok(false)` on `NotFound`, or as a dedicated storage-level `has_event(id)` method for efficiency. `store_event` is NOT needed — events are stored eagerly on receipt, before comparison begins
+2. **Retriever trait** - Needs `get_event(&EventId)` and `event_exists(&EventId)` methods added. Does NOT require `Clone` — budget escalation is internal to `Comparison`. `event_exists` should preferably be a dedicated storage-level `has_event(id)` method rather than a wrapper over `get_event`, because `EphemeralNodeRetriever::get_event` has a fetch-and-store side-effect (fetches from peer on local miss, stores locally before returning). Using `get_event` for an existence check would unnecessarily fetch the full event body and trigger peer storage. A pure `has_event` avoids both. `store_event` is NOT needed — events are stored eagerly on receipt, before comparison begins
 
 3. **Async iterator ergonomics** - Use `async fn next()` for simplicity, avoid `futures::Stream` complexity
 
