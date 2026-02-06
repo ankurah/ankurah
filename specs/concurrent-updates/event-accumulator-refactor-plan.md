@@ -18,7 +18,7 @@ Refactor the comparison and event accumulation architecture to:
 4. **After comparison**, caller manually extracts events and wires to relation
 5. **`apply_state`** doesn't use accumulator, can't handle divergence
 6. **`EphemeralNodeRetriever.staged_events`** is awkward separate staging mechanism
-7. **`is_descendant` in `EventLayer.compare()`** operates on a static `BTreeMap` snapshot from BFS — stored property `event_id`s below the meet point are absent, causing `InsufficientCausalInfo` hard errors on legitimate concurrent updates
+7. **Stored property `event_id`s below the meet point** are absent from the accumulated DAG — LWW `apply_layer` must detect these and treat them as "older than meet" rather than attempting causal comparison (which would find no path and return `Concurrent` incorrectly)
 8. **No idempotency guard** — re-delivery of historical events creates spurious multi-head states
 9. **O(n²) `children_of`** — linear scan over all events for each parent lookup during layer computation
 10. **Budget of 100** — too small for real-world DAGs, no escalation on exhaustion
@@ -755,6 +755,7 @@ fn apply_layer(&self, layer: &EventLayer<EventId, Event>) -> Result<(), Mutation
 - [ ] Add test: TOCTOU retry exhaustion produces clean error
 - [ ] Add test: merge event with parent from non-meet branch is correctly layered (mixed-parent spanning meet)
 - [ ] Add test: seeded event is visible during comparison traversal (validates seed mechanism)
+- [ ] Cleanup: assess `Retrieve` trait scope — it now spans state retrieval (`get_state`), event access (`get_event`, `event_exists`), and event storage (`store_event`), collapsing the original local-only vs network-fallback separation that `CausalNavigator` provided. Consider renaming or splitting the trait to reflect its expanded role. The original design had `Retrieve` as local-only state access and `CausalNavigator` as the (optionally network-aware) event traversal layer; that bifurcation is lost. Low priority but worth addressing for API clarity
 
 ## Resolved Design Questions
 
