@@ -1,798 +1,508 @@
 #![cfg(test)]
 
 use crate::error::RetrievalError;
-use ankurah_proto::{AttestationSet, Attested};
+use crate::retrieval::Retrieve;
 
-use super::*;
+use super::comparison::{compare, compare_unstored_event};
+use super::relation::AbstractCausalRelation;
+use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
 use async_trait::async_trait;
-use std::collections::{BTreeSet, HashMap};
-use std::sync::RwLock;
+use std::collections::{BTreeMap, HashMap};
 
-// Simple test types
-type TestId = u32;
+// ============================================================================
+// TEST INFRASTRUCTURE
+// ============================================================================
 
-#[derive(Clone, Debug)]
-struct TestClock {
-    members: Vec<TestId>,
-}
-
+/// Mock retriever implementing `Retrieve` for comparison tests.
+/// Stores events by EventId and returns them on demand.
 #[derive(Clone)]
-struct TestEvent {
-    id: TestId,
-    parent_clock: TestClock,
+struct MockRetriever {
+    events: HashMap<EventId, Event>,
 }
 
-impl TClock for TestClock {
-    type Id = TestId;
-    fn members(&self) -> &[Self::Id] { &self.members }
-}
+impl MockRetriever {
+    fn new() -> Self { Self { events: HashMap::new() } }
 
-impl TEvent for TestEvent {
-    type Id = TestId;
-    type Parent = TestClock;
-
-    fn id(&self) -> TestId { self.id }
-    fn parent(&self) -> &TestClock { &self.parent_clock }
-}
-
-impl std::fmt::Display for TestEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Event({})", self.id) }
-}
-
-// Test causal assertion - like proto::CausalAssertion but for test IDs
-#[derive(Debug, Clone)]
-struct TestCausalAssertion {
-    subject_head: TestClock,
-    comparison_head: TestClock,
-    relation: TestAssertionRelation,
-}
-
-#[derive(Debug, Clone)]
-enum TestAssertionRelation {
-    Descends,
-    NotDescends { meet: Vec<TestId> },
-    PartiallyDescends { meet: Vec<TestId> },
-    Incomparable,
-}
-
-// Mock navigator with both events and causal assertions
-struct MockEventStore {
-    events: HashMap<TestId, Attested<TestEvent>>,
-    assertions: Vec<TestCausalAssertion>,
-    /// Tracks the sequence of event fetch batches for testing
-    pub event_fetch_log: RwLock<Vec<Vec<TestId>>>,
-}
-
-impl MockEventStore {
-    fn new() -> Self { Self { events: HashMap::new(), assertions: Vec::new(), event_fetch_log: RwLock::new(Vec::new()) } }
-
-    /// Convenient constructor from event list
-    fn from_events(events: Vec<(TestId, Vec<TestId>)>) -> Self {
-        let mut store = Self::new();
-        for (id, parent_ids) in events {
-            store.add(id, &parent_ids);
-        }
-        store
+    fn add_event(&mut self, event: Event) {
+        self.events.insert(event.id(), event);
     }
-
-    fn add(&mut self, id: TestId, parent_ids: &[TestId]) {
-        let event = TestEvent { id, parent_clock: TestClock { members: parent_ids.to_vec() } };
-        let attested = Attested { payload: event, attestations: AttestationSet::default() };
-        self.events.insert(id, attested);
-    }
-
-    fn add_assertion(&mut self, subject_head: TestClock, comparison_head: TestClock, relation: TestAssertionRelation) {
-        self.assertions.push(TestCausalAssertion { subject_head, comparison_head, relation });
-    }
-
-    /// Get a clone of the event fetch log for testing
-    fn get_fetch_log(&self) -> Vec<Vec<TestId>> { self.event_fetch_log.read().unwrap().clone() }
 }
 
 #[async_trait]
-impl CausalNavigator for MockEventStore {
-    type EID = TestId;
-    type Event = TestEvent;
-
-    async fn expand_frontier(
+impl Retrieve for MockRetriever {
+    async fn get_state(
         &self,
-        frontier_ids: &[Self::EID],
-        _budget: usize,
-    ) -> Result<NavigationStep<Self::EID, Self::Event>, RetrievalError> {
-        // Log this fetch batch (only if we're actually fetching events)
-        let mut fetched_ids = Vec::new();
-        let mut events = Vec::new();
+        _entity_id: ankurah_proto::EntityId,
+    ) -> Result<Option<ankurah_proto::Attested<ankurah_proto::EntityState>>, RetrievalError> {
+        Ok(None) // Not needed for comparison tests
+    }
 
-        for id in frontier_ids {
-            if let Some(event) = self.events.get(id) {
-                events.push(event.payload.clone());
-                fetched_ids.push(*id);
-            }
-        }
-
-        // Only log if we actually fetched events
-        if !fetched_ids.is_empty() {
-            fetched_ids.sort(); // Sort for consistent test assertions
-            self.event_fetch_log.write().unwrap().push(fetched_ids);
-        }
-
-        // Check for matching assertions
-        let mut assertion_results = Vec::new();
-        for assertion in &self.assertions {
-            // Check if any frontier_id matches the subject_head of this assertion
-            for frontier_id in frontier_ids {
-                if assertion.subject_head.members().contains(frontier_id) {
-                    // Convert TestAssertionRelation to AssertionRelation
-                    let relation = match &assertion.relation {
-                        TestAssertionRelation::Descends => AssertionRelation::Descends,
-                        TestAssertionRelation::NotDescends { meet } => AssertionRelation::NotDescends { meet: meet.clone() },
-                        TestAssertionRelation::PartiallyDescends { meet } => AssertionRelation::PartiallyDescends { meet: meet.clone() },
-                        TestAssertionRelation::Incomparable => AssertionRelation::Incomparable,
-                    };
-
-                    assertion_results.push(AssertionResult {
-                        from: *frontier_id,
-                        to: assertion.comparison_head.members().first().cloned(),
-                        relation,
-                    });
-                }
-            }
-        }
-
-        let consumed_budget = 1; // Match the real implementation pattern
-        Ok(NavigationStep { events, assertions: assertion_results, consumed_budget })
+    async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+        self.events
+            .get(event_id)
+            .cloned()
+            .ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
     }
 }
 
+/// Create a test event with deterministic content-hashed IDs.
+/// The seed differentiates events; parent_ids determine the parent clock.
+/// Returns the event (call `.id()` on it to get the computed EventId).
+fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
+    let mut entity_id_bytes = [0u8; 16];
+    entity_id_bytes[0] = seed;
+    let entity_id = EntityId::from_bytes(entity_id_bytes);
+
+    Event {
+        entity_id,
+        collection: "test".into(),
+        parent: Clock::from(parent_ids.to_vec()),
+        operations: OperationSet(BTreeMap::new()),
+    }
+}
+
+/// Helper to create an event and register it, returning the EventId.
+/// Avoids verbose boilerplate in tests.
+fn add_event(retriever: &mut MockRetriever, seed: u8, parent_ids: &[EventId]) -> EventId {
+    let ev = make_test_event(seed, parent_ids);
+    let id = ev.id();
+    retriever.add_event(ev);
+    id
+}
+
+/// Create a Clock from EventIds without consuming them.
+macro_rules! clock {
+    ($($id:expr),* $(,)?) => {
+        Clock::from(vec![$($id.clone()),*])
+    };
+}
+
+// ============================================================================
+// BASIC COMPARISON TESTS
+// ============================================================================
+
 #[tokio::test]
 async fn test_linear_history() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    // Create a linear chain: 1 <- 2 <- 3
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[2]);
+    // Create a linear chain: ev1 <- ev2 <- ev3
+    let ev1 = make_test_event(1, &[]);
+    let id1 = ev1.id();
+    retriever.add_event(ev1);
 
-    let ancestor = TestClock { members: vec![1] };
-    let descendant = TestClock { members: vec![3] };
+    let ev2 = make_test_event(2, &[id1.clone()]);
+    let id2 = ev2.id();
+    retriever.add_event(ev2);
+
+    let ev3 = make_test_event(3, &[id2]);
+    let id3 = ev3.id();
+    retriever.add_event(ev3);
+
+    let ancestor = clock!(id1);
+    let descendant = clock!(id3);
 
     // descendant descends from ancestor
-    assert!(matches!(compare(&store, &descendant, &ancestor, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
+    let result = compare(retriever.clone(), &descendant, &ancestor, 100).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
 
     // ancestor is strictly before descendant (subject is older)
-    assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), AbstractCausalRelation::StrictAscends);
+    let result = compare(retriever.clone(), &ancestor, &descendant, 100).await.unwrap();
+    assert_eq!(result.relation, AbstractCausalRelation::StrictAscends);
 }
 
 #[tokio::test]
 async fn test_concurrent_history() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Example history (arrows represent descendency not reference, which is the reverse direction):
     //      1
     //   ↙  ↓  ↘
     //  2   3   4  - at this point, we have a non-ancestral concurrency (1 is not concurrent)
     //   ↘ ↙ ↘ ↙
-    //    5   6    - ancestral concurrency introduced (is 5+6 = 2+3+4?) LATER determine if we allow this
+    //    5   6    - ancestral concurrency introduced
     //     ↘ ↙
     //      7
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[1]);
-    store.add(4, &[1]);
-    store.add(5, &[2, 3]);
-    store.add(6, &[3, 4]);
-    store.add(7, &[5, 6]);
+    let ev1 = make_test_event(1, &[]);
+    let id1 = ev1.id();
+    retriever.add_event(ev1);
+
+    let ev2 = make_test_event(2, &[id1.clone()]);
+    let id2 = ev2.id();
+    retriever.add_event(ev2);
+
+    let ev3 = make_test_event(3, &[id1.clone()]);
+    let id3 = ev3.id();
+    retriever.add_event(ev3);
+
+    let ev4 = make_test_event(4, &[id1.clone()]);
+    let id4 = ev4.id();
+    retriever.add_event(ev4);
+
+    let ev5 = make_test_event(5, &[id2.clone(), id3.clone()]);
+    let id5 = ev5.id();
+    retriever.add_event(ev5);
+
+    let ev6 = make_test_event(6, &[id3.clone(), id4]);
+    let id6 = ev6.id();
+    retriever.add_event(ev6);
+
+    let ev7 = make_test_event(7, &[id5.clone(), id6.clone()]);
+    let _id7 = ev7.id();
+    retriever.add_event(ev7);
 
     {
         // concurrency in lineage *between* clocks, but the descendant clock fully descends from the ancestor clock
-        let ancestor = TestClock { members: vec![1] };
-        let descendant = TestClock { members: vec![5] };
-        assert!(matches!(compare(&store, &descendant, &ancestor, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
+        let ancestor = clock!(id1);
+        let descendant = clock!(id5);
+        let result = compare(retriever.clone(), &descendant, &ancestor, 100).await.unwrap();
+        assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
         // ancestor is strictly before descendant
-        assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), AbstractCausalRelation::StrictAscends);
+        let result = compare(retriever.clone(), &ancestor, &descendant, 100).await.unwrap();
+        assert_eq!(result.relation, AbstractCausalRelation::StrictAscends);
     }
     {
         // this ancestor clock has internal concurrency, but is fully descended by the descendant clock
-        let ancestor = TestClock { members: vec![2, 3] };
-        let descendant = TestClock { members: vec![5] };
+        let ancestor = clock!(id2, id3);
+        let descendant = clock!(id5);
 
-        assert!(matches!(compare(&store, &descendant, &ancestor, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
+        let result = compare(retriever.clone(), &descendant, &ancestor, 100).await.unwrap();
+        assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
         // ancestor is strictly before descendant
-        assert_eq!(compare(&store, &ancestor, &descendant, 100).await.unwrap(), AbstractCausalRelation::StrictAscends);
+        let result = compare(retriever.clone(), &ancestor, &descendant, 100).await.unwrap();
+        assert_eq!(result.relation, AbstractCausalRelation::StrictAscends);
     }
 
     {
         // a and b are fully concurrent, but still comparable
-        let a = TestClock { members: vec![2] };
-        let b = TestClock { members: vec![3] };
+        let a = clock!(id2);
+        let b = clock!(id3);
+        let result = compare(retriever.clone(), &a, &b, 100).await.unwrap();
         assert!(matches!(
-            compare(&store, &a, &b, 100).await.unwrap(),
-            AbstractCausalRelation::DivergedSince { meet, .. } if meet == vec![1]
+            result.relation,
+            AbstractCausalRelation::DivergedSince { ref meet, .. } if meet == &vec![id1.clone()]
         ));
+        let result = compare(retriever.clone(), &b, &a, 100).await.unwrap();
         assert!(matches!(
-            compare(&store, &b, &a, 100).await.unwrap(),
-            AbstractCausalRelation::DivergedSince { meet, .. } if meet == vec![1]
+            result.relation,
+            AbstractCausalRelation::DivergedSince { ref meet, .. } if meet == &vec![id1.clone()]
         ));
     }
 
     {
         // a partially descends from b, but b has a component that is not in a
-        let a = TestClock { members: vec![6] };
-        let b = TestClock { members: vec![2, 3] };
+        let a = clock!(id6);
+        let b = clock!(id2, id3);
+        let result = compare(retriever.clone(), &a, &b, 100).await.unwrap();
         assert!(matches!(
-            compare(&store, &a, &b, 100).await.unwrap(),
-            // concurrent_events 2 is fairly conclusively correct
-            // It's a little less clear whether common_ancestor should be 1, or 1,3, because 3 is not an "ancestor" of 2,3 per se
-            // but this would be consistent with the internal concurrency ancestor test above. maybe `common` is a better term
-            AbstractCausalRelation::DivergedSince { meet, .. } if meet == vec![3]
+            result.relation,
+            AbstractCausalRelation::DivergedSince { ref meet, .. } if meet == &vec![id3.clone()]
         ));
     }
 }
 
 #[tokio::test]
 async fn test_incomparable() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     //   1        6
     //   ↓  ↘     ↓
     //   2   4    7
     //   ↓   ↓    ↓
     //   3   5    8
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[2]);
-    store.add(4, &[1]);
-    store.add(5, &[4]);
+    let ev1 = make_test_event(1, &[]);
+    let id1 = ev1.id();
+    retriever.add_event(ev1);
+
+    let ev2 = make_test_event(2, &[id1.clone()]);
+    let id2 = ev2.id();
+    retriever.add_event(ev2);
+
+    let ev3 = make_test_event(3, &[id2.clone()]);
+    let id3 = ev3.id();
+    retriever.add_event(ev3);
+
+    let ev4 = make_test_event(4, &[id1.clone()]);
+    let _id4 = ev4.id();
+    retriever.add_event(ev4);
+
+    let ev5 = make_test_event(5, &[_id4]);
+    let id5 = ev5.id();
+    retriever.add_event(ev5);
 
     // 6 is an unrelated root event
-    store.add(6, &[]);
-    store.add(7, &[6]);
-    store.add(8, &[7]);
+    let ev6 = make_test_event(6, &[]);
+    let id6 = ev6.id();
+    retriever.add_event(ev6);
+
+    let ev7 = make_test_event(7, &[id6.clone()]);
+    let id7 = ev7.id();
+    retriever.add_event(ev7);
+
+    let ev8 = make_test_event(8, &[id7]);
+    let id8 = ev8.id();
+    retriever.add_event(ev8);
 
     {
-        // fully incomparable (different roots) - now properly returns Disjoint
-        let a = TestClock { members: vec![3] };
-        let b = TestClock { members: vec![8] };
+        // fully incomparable (different roots) - properly returns Disjoint
+        let a = clock!(id3);
+        let b = clock!(id8);
+        let result = compare(retriever.clone(), &a, &b, 100).await.unwrap();
         assert!(matches!(
-            compare(&store, &a, &b, 100).await.unwrap(),
-            AbstractCausalRelation::Disjoint { subject_root: 1, other_root: 6, .. }
+            result.relation,
+            AbstractCausalRelation::Disjoint { ref subject_root, ref other_root, .. }
+                if *subject_root == id1 && *other_root == id6
         ));
     }
     {
-        // fully incomparable (just a different tier) - now properly returns Disjoint
-        let a = TestClock { members: vec![2] };
-        let b = TestClock { members: vec![8] };
+        // fully incomparable (just a different tier) - properly returns Disjoint
+        let a = clock!(id2);
+        let b = clock!(id8);
+        let result = compare(retriever.clone(), &a, &b, 100).await.unwrap();
         assert!(matches!(
-            compare(&store, &a, &b, 100).await.unwrap(),
-            AbstractCausalRelation::Disjoint { subject_root: 1, other_root: 6, .. }
+            result.relation,
+            AbstractCausalRelation::Disjoint { ref subject_root, ref other_root, .. }
+                if *subject_root == id1 && *other_root == id6
         ));
     }
     {
         // partially incomparable: [3] shares root 1 with [5], but [8] has different root 6
-        // This is a complex case - the roots discovered depend on traversal order
-        // Since [5]'s root (1) may be discovered before [8]'s root (6), and subject also has root 1,
-        // this returns DivergedSince with empty meet rather than Disjoint
-        let a = TestClock { members: vec![3] };
-        let b = TestClock { members: vec![5, 8] };
+        let a = clock!(id3);
+        let b = clock!(id5, id8);
+        let result = compare(retriever.clone(), &a, &b, 100).await.unwrap();
         assert!(matches!(
-            compare(&store, &a, &b, 100).await.unwrap(),
-            AbstractCausalRelation::DivergedSince { meet, .. } if meet.is_empty()
+            result.relation,
+            AbstractCausalRelation::DivergedSince { ref meet, .. } if meet.is_empty()
         ));
     }
 }
 
 #[tokio::test]
 async fn test_empty_clocks() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    store.add(1, &[]);
+    let ev1 = make_test_event(1, &[]);
+    let id1 = ev1.id();
+    retriever.add_event(ev1);
 
-    let empty = TestClock { members: vec![] };
-    let non_empty = TestClock { members: vec![1] };
+    let empty = Clock::default();
+    let non_empty = clock!(id1);
 
-    assert_eq!(
-        compare(&store, &empty, &empty, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet: vec![], subject: vec![], other: vec![], subject_chain: vec![], other_chain: vec![] }
-    );
-    assert_eq!(
-        compare(&store, &non_empty, &empty, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet: vec![], subject: vec![], other: vec![], subject_chain: vec![], other_chain: vec![] }
-    );
-    assert_eq!(
-        compare(&store, &empty, &non_empty, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet: vec![], subject: vec![], other: vec![], subject_chain: vec![], other_chain: vec![] }
-    );
+    let expected = AbstractCausalRelation::DivergedSince {
+        meet: vec![],
+        subject: vec![],
+        other: vec![],
+        subject_chain: vec![],
+        other_chain: vec![],
+    };
+
+    let result = compare(retriever.clone(), &empty, &empty, 100).await.unwrap();
+    assert_eq!(result.relation, expected);
+    let result = compare(retriever.clone(), &non_empty, &empty, 100).await.unwrap();
+    assert_eq!(result.relation, expected);
+    let result = compare(retriever.clone(), &empty, &non_empty, 100).await.unwrap();
+    assert_eq!(result.relation, expected);
 }
 
 #[tokio::test]
 async fn test_budget_exceeded() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    //   1
-    //   ↓  ↘
-    //   2   5
-    //   ↓   ↓  ↘
-    //   3   6   8
-    //   ↓   ↓
-    //   4   7
-
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[2]);
-    store.add(4, &[3]);
-    store.add(5, &[1]);
-    store.add(6, &[5]);
-    store.add(7, &[6]);
-    store.add(8, &[5]);
-
-    {
-        // simple linear chain
-        let ancestor = TestClock { members: vec![1] };
-        let descendant = TestClock { members: vec![4] };
-
-        assert_eq!(
-            compare(&store, &descendant, &ancestor, 2).await.unwrap(),
-            AbstractCausalRelation::BudgetExceeded { subject: [2].into(), other: [].into() }
-        );
+    // Create a long chain: ev1 <- ev2 <- ... <- ev20
+    // With budget=1, max_budget=4, a chain of 20 events will still exceed
+    let mut ids: Vec<EventId> = Vec::new();
+    for i in 0..20u8 {
+        let parents = if i == 0 { vec![] } else { vec![ids[i as usize - 1].clone()] };
+        let ev = make_test_event(i + 1, &parents);
+        ids.push(ev.id());
+        retriever.add_event(ev);
     }
-    {
-        let ancestor = TestClock { members: vec![1] };
-        let descendant = TestClock { members: vec![4, 5] };
 
-        //  with a high enough budget, we can see that the descendant fully descends from the ancestor
-        assert!(matches!(compare(&store, &descendant, &ancestor, 10).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
+    let ancestor = clock!(ids[0].clone());
+    let descendant = clock!(ids[19].clone());
 
-        // ancestor [1] is strictly before descendant [4, 5] - determined quickly because
-        // expanding [4, 5] immediately sees [1] in event 5's parent
-        assert_eq!(compare(&store, &ancestor, &descendant, 2).await.unwrap(), AbstractCausalRelation::StrictAscends);
-    }
+    // With budget=1 (escalates to max 4), a 20-long chain will exceed
+    let result = compare(retriever.clone(), &descendant, &ancestor, 1).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::BudgetExceeded { .. }));
+
+    // With high budget, should resolve
+    let result = compare(retriever.clone(), &descendant, &ancestor, 100).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+
+    // ancestor is strictly before descendant - determined quickly because
+    // expanding descendant immediately walks backward toward ancestor
+    let result = compare(retriever.clone(), &ancestor, &descendant, 100).await.unwrap();
+    assert_eq!(result.relation, AbstractCausalRelation::StrictAscends);
 }
 
 #[tokio::test]
 async fn test_self_comparison() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create a simple event to compare with itself
-    store.add(1, &[]);
-    let clock = TestClock { members: vec![1] };
+    let ev1 = make_test_event(1, &[]);
+    let id1 = ev1.id();
+    retriever.add_event(ev1);
+
+    let clock = clock!(id1);
 
     // A clock does NOT descend itself
-    assert_eq!(compare(&store, &clock, &clock, 100).await.unwrap(), AbstractCausalRelation::Equal);
+    let result = compare(retriever.clone(), &clock, &clock, 100).await.unwrap();
+    assert_eq!(result.relation, AbstractCausalRelation::Equal);
 }
 
 #[tokio::test]
 async fn multiple_roots() {
-    //   1   2   3   4   5   6  ← six independent roots
-    //   ↓   ↓   ↓   ↓   ↓   ↓
-    //   ╰───────────────────╯
-    //           ↓
-    //           7
-    //           ↓
-    //           8
-    //
-    // This test is supposed to stress two aspects of the design:
-    // 1. The merge node 7 carries six origin tags upward, forcing a heap spill in the SmallVec‐based Origins
-    // 2. All six heads are removed from outstanding_heads in a single step when they become common
-    // TODO: validate this empirically
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    // six independent roots
-    for id in 1..=6 {
-        store.add(id, &[]);
+    // Six independent roots
+    let mut root_ids = Vec::new();
+    for i in 1..=6u8 {
+        let ev = make_test_event(i, &[]);
+        root_ids.push(ev.id());
+        retriever.add_event(ev);
     }
 
     // merge-point 7 references all six heads
-    store.add(7, &[1, 2, 3, 4, 5, 6]);
+    let ev7 = make_test_event(7, &root_ids);
+    let id7 = ev7.id();
+    retriever.add_event(ev7);
 
     // subject head 8 descends only from 7
-    store.add(8, &[7]);
+    let ev8 = make_test_event(8, &[id7]);
+    let id8 = ev8.id();
+    retriever.add_event(ev8);
 
-    let subject = TestClock { members: vec![8] };
-    let big_other = TestClock { members: vec![1, 2, 3, 4, 5, 6] };
+    let subject = clock!(id8);
+    let big_other = Clock::from(root_ids.clone());
 
     // 8 descends from all heads in big_other via 7
-    assert!(matches!(compare(&store, &subject, &big_other, 1_000).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
+    let result = compare(retriever.clone(), &subject, &big_other, 1_000).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
 
-    // In the opposite direction, big_other is strictly before subject (all roots are ancestors of 8)
-    assert_eq!(compare(&store, &big_other, &subject, 1_000).await.unwrap(), AbstractCausalRelation::StrictAscends);
+    // In the opposite direction, big_other is strictly before subject
+    let result = compare(retriever.clone(), &big_other, &subject, 1_000).await.unwrap();
+    assert_eq!(result.relation, AbstractCausalRelation::StrictAscends);
 }
 
 #[tokio::test]
 async fn test_compare_event_unstored() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    // Create a chain: 1 <- 2 <- 3 (stored)
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[2]);
+    // Create a chain: ev1 <- ev2 <- ev3 (stored)
+    let ev1 = make_test_event(1, &[]);
+    let id1 = ev1.id();
+    retriever.add_event(ev1);
 
-    // Create an unstored event 4 that would descend from 3
-    let unstored_event = TestEvent { id: 4, parent_clock: TestClock { members: vec![3] } };
+    let ev2 = make_test_event(2, &[id1.clone()]);
+    let id2 = ev2.id();
+    retriever.add_event(ev2);
 
-    // Test cases for the unstored event
-    let clock_1 = TestClock { members: vec![1] };
-    let clock_2 = TestClock { members: vec![2] };
-    let clock_3 = TestClock { members: vec![3] };
+    let ev3 = make_test_event(3, &[id2.clone()]);
+    let id3 = ev3.id();
+    retriever.add_event(ev3);
+
+    // Create an unstored event that would descend from ev3
+    let unstored_event = make_test_event(4, &[id3.clone()]);
+
+    let clock_1 = clock!(id1);
+    let clock_2 = clock!(id2);
+    let clock_3 = clock!(id3);
 
     // The unstored event should descend from all ancestors
-    assert!(matches!(
-        compare_unstored_event(&store, &unstored_event, &clock_1, 100).await.unwrap(),
-        AbstractCausalRelation::StrictDescends { .. }
-    ));
-    assert!(matches!(
-        compare_unstored_event(&store, &unstored_event, &clock_2, 100).await.unwrap(),
-        AbstractCausalRelation::StrictDescends { .. }
-    ));
-    assert!(matches!(
-        compare_unstored_event(&store, &unstored_event, &clock_3, 100).await.unwrap(),
-        AbstractCausalRelation::StrictDescends { .. }
-    ));
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &clock_1, 100).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &clock_2, 100).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
+
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &clock_3, 100).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
 
     // Test with an unstored event that has multiple parents
-    let unstored_merge_event = TestEvent { id: 5, parent_clock: TestClock { members: vec![2, 3] } };
+    let unstored_merge_event = make_test_event(5, &[id2.clone(), id3.clone()]);
 
-    assert!(matches!(
-        compare_unstored_event(&store, &unstored_merge_event, &clock_1, 100).await.unwrap(),
-        AbstractCausalRelation::StrictDescends { .. }
-    ));
+    let result = compare_unstored_event(retriever.clone(), &unstored_merge_event, &clock_1, 100).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
 
     // Test with an incomparable case - different roots should return Disjoint
-    store.add(10, &[]); // Independent root
-    let incomparable_clock = TestClock { members: vec![10] };
+    let ev10 = make_test_event(10, &[]); // Independent root
+    let id10 = ev10.id();
+    retriever.add_event(ev10);
+    let incomparable_clock = clock!(id10);
 
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &incomparable_clock, 100).await.unwrap();
     assert!(matches!(
-        compare_unstored_event(&store, &unstored_event, &incomparable_clock, 100).await.unwrap(),
-        AbstractCausalRelation::Disjoint { subject_root: 1, other_root: 10, .. }
+        result.relation,
+        AbstractCausalRelation::Disjoint { ref subject_root, ref other_root, .. }
+            if *subject_root == id1 && *other_root == id10
     ));
 
     // Test root event case
-    let root_event = TestEvent { id: 11, parent_clock: TestClock { members: vec![] } };
+    let root_event = make_test_event(11, &[]);
 
-    let empty_clock = TestClock { members: vec![] };
+    let empty_clock = Clock::default();
+    let result = compare_unstored_event(retriever.clone(), &root_event, &empty_clock, 100).await.unwrap();
     assert!(matches!(
-        compare_unstored_event(&store, &root_event, &empty_clock, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet, .. } if meet.is_empty()
+        result.relation,
+        AbstractCausalRelation::DivergedSince { ref meet, .. } if meet.is_empty()
     ));
 
+    let result = compare_unstored_event(retriever.clone(), &root_event, &clock_1, 100).await.unwrap();
     assert!(matches!(
-        compare_unstored_event(&store, &root_event, &clock_1, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet, .. } if meet.is_empty()
+        result.relation,
+        AbstractCausalRelation::DivergedSince { ref meet, .. } if meet.is_empty()
     ));
 
     // Test that a non-empty unstored event does not descend from an empty clock
-    let empty_clock = TestClock { members: vec![] };
+    let empty_clock = Clock::default();
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &empty_clock, 100).await.unwrap();
     assert!(matches!(
-        compare_unstored_event(&store, &unstored_event, &empty_clock, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet, .. } if meet.is_empty()
+        result.relation,
+        AbstractCausalRelation::DivergedSince { ref meet, .. } if meet.is_empty()
     ));
 }
 
 #[tokio::test]
 async fn test_compare_event_redundant_delivery() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    // Create a chain: 1 <- 2 <- 3 (stored)
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[2]);
+    // Create a chain: ev1 <- ev2 <- ev3 (stored)
+    let ev1 = make_test_event(1, &[]);
+    let id1 = ev1.id();
+    retriever.add_event(ev1);
 
-    // Create an unstored event 4 that would descend from 3
-    let unstored_event = TestEvent { id: 4, parent_clock: TestClock { members: vec![3] } };
+    let ev2 = make_test_event(2, &[id1]);
+    let id2 = ev2.id();
+    retriever.add_event(ev2);
+
+    let ev3 = make_test_event(3, &[id2]);
+    let id3 = ev3.id();
+    retriever.add_event(ev3);
+
+    // Create an unstored event that would descend from ev3
+    let unstored_event = make_test_event(4, &[id3.clone()]);
+    let id4 = unstored_event.id();
 
     // Test the normal case first
-    let clock_3 = TestClock { members: vec![3] };
-    assert!(matches!(
-        compare_unstored_event(&store, &unstored_event, &clock_3, 100).await.unwrap(),
-        AbstractCausalRelation::StrictDescends { .. }
-    ));
+    let clock_3 = clock!(id3);
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &clock_3, 100).await.unwrap();
+    assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
 
     // Now store event 4 to simulate it being applied
-    store.add(4, &[3]);
+    let ev4_stored = make_test_event(4, &[id3.clone()]);
+    retriever.add_event(ev4_stored);
 
     // Test redundant delivery: the event is already in the clock (exact match)
-    let clock_with_event = TestClock { members: vec![4] };
+    let clock_with_event = clock!(id4);
     // The equality check should catch this case and return Equal
-    assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_with_event, 100).await.unwrap(), AbstractCausalRelation::Equal);
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &clock_with_event, 100).await.unwrap();
+    assert_eq!(result.relation, AbstractCausalRelation::Equal);
 
     // Test case where the event is in the clock but with other events too
-    let clock_with_multiple = TestClock { members: vec![3, 4] };
+    let clock_with_multiple = clock!(id3, id4);
     // Event 4 is already in the head [3, 4], so this is redundant delivery
-    assert_eq!(compare_unstored_event(&store, &unstored_event, &clock_with_multiple, 100).await.unwrap(), AbstractCausalRelation::Equal);
-}
-
-// ============================================================================
-// ASSERTION TESTS
-// ============================================================================
-
-#[tokio::test]
-async fn test_assertion_perfect_match_zero_fetch() {
-    let mut store = MockEventStore::new();
-
-    // Create a simple chain: 1 <- 2 <- 3 <- 4 <- 5
-    for i in 1..=5 {
-        let parent = if i == 1 { vec![] } else { vec![i - 1] };
-        store.add(i, &parent);
-    }
-
-    // Add assertion that perfectly bridges the gap: [5] descends from [2]
-    store.add_assertion(TestClock { members: vec![5] }, TestClock { members: vec![2] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![5] };
-    let comparison = TestClock { members: vec![2] };
-
-    // The assertion bridges the gap, result should be StrictDescends
-    // NOTE: With chain accumulation, we may fetch events to build the chain even with assertions
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-}
-
-#[tokio::test]
-async fn test_assertion_falls_short_minimal_fetch() {
-    let mut store = MockEventStore::new();
-
-    // Create chain: 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8 <- 9 <- 10
-    for i in 1..=10 {
-        let parent = if i == 1 { vec![] } else { vec![i - 1] };
-        store.add(i, &parent);
-    }
-
-    // Assertion gets us partway: [10] descends from [5]
-    store.add_assertion(TestClock { members: vec![10] }, TestClock { members: vec![5] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![10] };
-    let comparison = TestClock { members: vec![3] };
-
-    // Should fetch: [10] from event frontier, [5] from assertion frontier,
-    // then [9], [4], then [8], [3] - finding the match at [3]
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-    // TODO: Update expected fetch sequence once multi-frontier is implemented
-    // Expected: vec![vec![10], vec![5], vec![9], vec![4], vec![8], vec![3]]
-    // For now, just verify we fetched some events
-    assert!(!store.get_fetch_log().is_empty());
-}
-
-#[tokio::test]
-async fn test_assertion_overshoots_finds_minimal_meet() {
-    let mut store = MockEventStore::new();
-
-    // Create chain: 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8 <- 9 <- 10
-    for i in 1..=10 {
-        let parent = if i == 1 { vec![] } else { vec![i - 1] };
-        store.add(i, &parent);
-    }
-
-    // Assertion overshoots: [10] descends from [4] (skips past [7])
-    store.add_assertion(TestClock { members: vec![10] }, TestClock { members: vec![4] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![10] };
-    let comparison = TestClock { members: vec![7] };
-
-    // Event frontier should find [7] as the meet, even though assertion goes to [4]
-    // The assertion frontier continues but doesn't affect the result
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-    // TODO: Update expected fetch sequence once multi-frontier is implemented
-    // Expected: event frontier fetches [10, 9, 8, 7] while assertion frontier fetches [4, 3, 2, 1]
-    assert!(!store.get_fetch_log().is_empty());
-}
-
-#[tokio::test]
-async fn test_assertion_chaining() {
-    let mut store = MockEventStore::new();
-
-    // Create chain: 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8 <- 9 <- 10
-    for i in 1..=10 {
-        let parent = if i == 1 { vec![] } else { vec![i - 1] };
-        store.add(i, &parent);
-    }
-
-    // Add two assertions that can chain:
-    // [10] descends from [6]
-    store.add_assertion(TestClock { members: vec![10] }, TestClock { members: vec![6] }, TestAssertionRelation::Descends);
-
-    // [6] descends from [2]
-    store.add_assertion(TestClock { members: vec![6] }, TestClock { members: vec![2] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![10] };
-    let comparison = TestClock { members: vec![2] };
-
-    // Should chain assertions: [10]→[6]→[2] with minimal fetches
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-}
-
-#[tokio::test]
-async fn test_multiple_assertions_different_paths() {
-    let mut store = MockEventStore::new();
-
-    // Create a DAG with multiple paths:
-    //      1
-    //     / \
-    //    2   3
-    //   / \ / \
-    //  4   5   6
-    //   \ | /
-    //     7
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[1]);
-    store.add(4, &[2]);
-    store.add(5, &[2, 3]);
-    store.add(6, &[3]);
-    store.add(7, &[4, 5, 6]);
-
-    // Add assertions for different paths:
-    // [7] descends from [4]
-    store.add_assertion(TestClock { members: vec![7] }, TestClock { members: vec![4] }, TestAssertionRelation::Descends);
-
-    // [7] descends from [6]
-    store.add_assertion(TestClock { members: vec![7] }, TestClock { members: vec![6] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![7] };
-    let comparison = TestClock { members: vec![2] };
-
-    // Should explore both assertion paths and find that [7] descends from [2]
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-}
-
-#[tokio::test]
-async fn test_single_assertion_descends() {
-    let mut store = MockEventStore::new();
-
-    // Create a long chain: 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8 <- 9 <- 10
-    for i in 1..=10 {
-        let parent = if i == 1 { vec![] } else { vec![i - 1] };
-        store.add(i, &parent);
-    }
-
-    // Add assertion: [10] descends from [5] (skipping events 6,7,8,9)
-    store.add_assertion(TestClock { members: vec![10] }, TestClock { members: vec![5] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![10] };
-    let comparison = TestClock { members: vec![1] };
-
-    // Without assertion, this would require fetching events 10,9,8,7,6,5,4,3,2,1
-    // With assertion, we can shortcut from 10 to 5, then continue normally
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-}
-
-#[tokio::test]
-async fn test_single_assertion_not_descends() {
-    let mut store = MockEventStore::new();
-
-    // Create two divergent branches:
-    // 1 <- 2 <- 3
-    // 1 <- 4 <- 5
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[2]);
-    store.add(4, &[1]);
-    store.add(5, &[4]);
-
-    // Add assertion: [5] does not descend from [3], meet at [1]
-    store.add_assertion(
-        TestClock { members: vec![5] },
-        TestClock { members: vec![3] },
-        TestAssertionRelation::NotDescends { meet: vec![1] },
-    );
-
-    let subject = TestClock { members: vec![5] };
-    let comparison = TestClock { members: vec![3] };
-
-    // The assertion should provide the meet directly
-    assert!(matches!(
-        compare(&store, &subject, &comparison, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet, .. } if meet == vec![1]
-    ));
-}
-
-#[tokio::test]
-async fn test_multiple_non_overlapping_assertions() {
-    let mut store = MockEventStore::new();
-
-    // Create a complex DAG:
-    // 1 <- 2 <- 3 <- 4 <- 5
-    // 1 <- 6 <- 7 <- 8 <- 9
-    for i in 1..=5 {
-        let parent = if i == 1 { vec![] } else { vec![i - 1] };
-        store.add(i, &parent);
-    }
-    store.add(6, &[1]);
-    for i in 7..=9 {
-        store.add(i, &[i - 1]);
-    }
-
-    // Add two non-overlapping assertions:
-    // [5] descends from [3] (shortcuts 4)
-    store.add_assertion(TestClock { members: vec![5] }, TestClock { members: vec![3] }, TestAssertionRelation::Descends);
-
-    // [9] descends from [7] (shortcuts 8)
-    store.add_assertion(TestClock { members: vec![9] }, TestClock { members: vec![7] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![5] };
-    let comparison = TestClock { members: vec![9] };
-
-    // Both branches should trace back to common ancestor [1]
-    assert!(matches!(
-        compare(&store, &subject, &comparison, 100).await.unwrap(),
-        AbstractCausalRelation::DivergedSince { meet, .. } if meet == vec![1]
-    ));
-}
-
-#[tokio::test]
-async fn test_multiple_overlapping_assertions() {
-    let mut store = MockEventStore::new();
-
-    // Create a chain: 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8
-    for i in 1..=8 {
-        let parent = if i == 1 { vec![] } else { vec![i - 1] };
-        store.add(i, &parent);
-    }
-
-    // Add overlapping assertions:
-    // [8] descends from [5] (shortcuts 7,6)
-    store.add_assertion(TestClock { members: vec![8] }, TestClock { members: vec![5] }, TestAssertionRelation::Descends);
-
-    // [6] descends from [3] (shortcuts 5,4)
-    store.add_assertion(TestClock { members: vec![6] }, TestClock { members: vec![3] }, TestAssertionRelation::Descends);
-
-    let subject = TestClock { members: vec![8] };
-    let comparison = TestClock { members: vec![1] };
-
-    // Should be able to use both assertions: 8->5 (via assertion), then 5->3 (via assertion), then 3->2->1 (via events)
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-}
-
-#[tokio::test]
-async fn test_assertion_with_partial_descent() {
-    let mut store = MockEventStore::new();
-
-    // Create a merge scenario:
-    //   1 <- 2 <- 4
-    //   1 <- 3 <- 4 (4 has parents [2,3])
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[1]);
-    store.add(4, &[2, 3]);
-
-    // Add assertion: [4] partially descends from [2], meet at [2]
-    store.add_assertion(
-        TestClock { members: vec![4] },
-        TestClock { members: vec![2] },
-        TestAssertionRelation::PartiallyDescends { meet: vec![2] },
-    );
-
-    let subject = TestClock { members: vec![4] };
-    let comparison = TestClock { members: vec![2] };
-
-    // Although the assertion says "PartiallyDescends", the actual DAG relationship is:
-    // 4 has parents [2, 3], so 4 directly descends from 2.
-    // The comparison algorithm correctly identifies this as StrictDescends.
-    assert!(matches!(compare(&store, &subject, &comparison, 100).await.unwrap(), AbstractCausalRelation::StrictDescends { .. }));
-}
-
-#[tokio::test]
-async fn test_assertion_incomparable() {
-    let mut store = MockEventStore::new();
-
-    // Create two completely separate chains:
-    // Chain A: 1 <- 2 <- 3
-    // Chain B: 4 <- 5 <- 6
-    store.add(1, &[]);
-    store.add(2, &[1]);
-    store.add(3, &[2]);
-    store.add(4, &[]);
-    store.add(5, &[4]);
-    store.add(6, &[5]);
-
-    // Add assertion: [6] is incomparable to [3]
-    store.add_assertion(TestClock { members: vec![6] }, TestClock { members: vec![3] }, TestAssertionRelation::Incomparable);
-
-    let subject = TestClock { members: vec![6] };
-    let comparison = TestClock { members: vec![3] };
-
-    // The assertion should provide the incomparable relationship - with different roots, returns Disjoint
-    assert!(matches!(
-        compare(&store, &subject, &comparison, 100).await.unwrap(),
-        AbstractCausalRelation::Disjoint { subject_root: 4, other_root: 1, .. }
-    ));
+    let result = compare_unstored_event(retriever.clone(), &unstored_event, &clock_with_multiple, 100).await.unwrap();
+    assert_eq!(result.relation, AbstractCausalRelation::Equal);
 }
 
 // ============================================================================
@@ -801,98 +511,133 @@ async fn test_assertion_incomparable() {
 
 #[tokio::test]
 async fn test_multihead_event_extends_one_tip() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create:
-    //     A (1)
+    //     A
     //    / \
-    //   B   C   ← entity head is [B, C] = [2, 3]
+    //   B   C   <- entity head is [B, C]
     //       |
-    //       D   ← incoming event with parent [C] = [3]
-    store.add(1, &[]); // A (genesis)
-    store.add(2, &[1]); // B
-    store.add(3, &[1]); // C
+    //       D   <- incoming event with parent [C]
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
+
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
+
+    let ev_c = make_test_event(3, &[id_a]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
 
     // Event D extends C
-    let event_d = TestEvent { id: 4, parent_clock: TestClock { members: vec![3] } };
+    let event_d = make_test_event(4, &[id_c.clone()]);
 
-    // Entity head is [B, C] = [2, 3]
-    let entity_head = TestClock { members: vec![2, 3] };
+    // Entity head is [B, C]
+    let entity_head = clock!(id_b, id_c);
 
     // D should NOT return StrictAscends - it should be DivergedSince
     // because D extends C which is a tip, and is concurrent with B
-    let result = compare_unstored_event(&store, &event_d, &entity_head, 100).await.unwrap();
+    let result = compare_unstored_event(retriever.clone(), &event_d, &entity_head, 100).await.unwrap();
 
-    // The meet should be [C] = [3], and other should be [B] = [2]
-    assert!(matches!(result, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result);
+    // The meet should be [C], and other should be [B]
+    assert!(
+        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
+        "Expected DivergedSince, got {:?}",
+        result.relation
+    );
 
     // Verify the meet and other fields
-    if let AbstractCausalRelation::DivergedSince { meet, other, .. } = result {
-        assert_eq!(meet, vec![3], "Meet should be [C] = [3]");
-        assert_eq!(other, vec![2], "Other should be [B] = [2]");
+    if let AbstractCausalRelation::DivergedSince { meet, other, .. } = &result.relation {
+        assert_eq!(meet, &vec![id_c], "Meet should be [C]");
+        assert_eq!(other, &vec![id_b], "Other should be [B]");
     }
 }
 
 #[tokio::test]
 async fn test_multihead_event_extends_multiple_tips() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create:
-    //     A (1)
+    //     A
     //    / \
-    //   B   C   ← entity head is [B, C] = [2, 3]
+    //   B   C   <- entity head is [B, C]
     //    \ /
-    //     D   ← incoming event with parent [B, C] = [2, 3]
-    store.add(1, &[]); // A (genesis)
-    store.add(2, &[1]); // B
-    store.add(3, &[1]); // C
+    //     D   <- incoming event with parent [B, C]
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
+
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
+
+    let ev_c = make_test_event(3, &[id_a]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
 
     // Event D merges both tips
-    let event_d = TestEvent { id: 4, parent_clock: TestClock { members: vec![2, 3] } };
+    let event_d = make_test_event(4, &[id_b.clone(), id_c.clone()]);
 
-    // Entity head is [B, C] = [2, 3]
-    let entity_head = TestClock { members: vec![2, 3] };
+    // Entity head is [B, C]
+    let entity_head = clock!(id_b, id_c);
 
     // D's parent equals entity head, so this should be StrictDescends
-    let result = compare_unstored_event(&store, &event_d, &entity_head, 100).await.unwrap();
+    let result = compare_unstored_event(retriever.clone(), &event_d, &entity_head, 100).await.unwrap();
 
     assert!(
-        matches!(result, AbstractCausalRelation::StrictDescends { .. }),
+        matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }),
         "Expected StrictDescends when event merges all tips, got {:?}",
-        result
+        result.relation
     );
 }
 
 #[tokio::test]
 async fn test_multihead_three_way_concurrency() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create:
-    //       A (1)
+    //       A
     //      /|\
-    //     B C D   ← entity head is [B, C, D] = [2, 3, 4]
+    //     B C D   <- entity head is [B, C, D]
     //     |
-    //     E       ← incoming event with parent [B] = [2]
-    store.add(1, &[]); // A (genesis)
-    store.add(2, &[1]); // B
-    store.add(3, &[1]); // C
-    store.add(4, &[1]); // D
+    //     E       <- incoming event with parent [B]
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
+
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
+
+    let ev_c = make_test_event(3, &[id_a.clone()]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
+
+    let ev_d = make_test_event(4, &[id_a]);
+    let id_d = ev_d.id();
+    retriever.add_event(ev_d);
 
     // Event E extends only B
-    let event_e = TestEvent { id: 5, parent_clock: TestClock { members: vec![2] } };
+    let event_e = make_test_event(5, &[id_b.clone()]);
 
-    // Entity head is [B, C, D] = [2, 3, 4]
-    let entity_head = TestClock { members: vec![2, 3, 4] };
+    // Entity head is [B, C, D]
+    let entity_head = clock!(id_b, id_c, id_d);
 
-    let result = compare_unstored_event(&store, &event_e, &entity_head, 100).await.unwrap();
+    let result = compare_unstored_event(retriever.clone(), &event_e, &entity_head, 100).await.unwrap();
 
     // Should be DivergedSince because E extends B but is concurrent with C and D
-    assert!(matches!(result, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result);
+    assert!(
+        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
+        "Expected DivergedSince, got {:?}",
+        result.relation
+    );
 
-    if let AbstractCausalRelation::DivergedSince { meet, other, .. } = result {
-        assert_eq!(meet, vec![2], "Meet should be [B] = [2]");
-        // Other should be C and D = [3, 4]
-        assert!(other.contains(&3) && other.contains(&4), "Other should contain C and D, got {:?}", other);
+    if let AbstractCausalRelation::DivergedSince { meet, other, .. } = &result.relation {
+        assert_eq!(meet, &vec![id_b], "Meet should be [B]");
+        // Other should be C and D
+        assert!(other.contains(&id_c) && other.contains(&id_d), "Other should contain C and D, got {:?}", other);
     }
 }
 
@@ -902,10 +647,10 @@ async fn test_multihead_three_way_concurrency() {
 
 #[tokio::test]
 async fn test_deep_diamond_asymmetric_branches() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create asymmetric diamond:
-    //       A (1)
+    //       A
     //      / \
     //     B   C
     //     |   |
@@ -916,25 +661,55 @@ async fn test_deep_diamond_asymmetric_branches() {
     //     H   I
     //
     // Compare H vs I - meet should be A
-    store.add(1, &[]); // A (genesis)
-    store.add(2, &[1]); // B
-    store.add(3, &[1]); // C
-    store.add(4, &[2]); // D
-    store.add(5, &[3]); // E
-    store.add(6, &[4]); // F
-    store.add(7, &[5]); // G
-    store.add(8, &[6]); // H
-    store.add(9, &[7]); // I
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
 
-    let clock_h = TestClock { members: vec![8] };
-    let clock_i = TestClock { members: vec![9] };
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
 
-    let result = compare(&store, &clock_h, &clock_i, 100).await.unwrap();
+    let ev_c = make_test_event(3, &[id_a.clone()]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
 
-    assert!(matches!(result, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result);
+    let ev_d = make_test_event(4, &[id_b]);
+    let id_d = ev_d.id();
+    retriever.add_event(ev_d);
 
-    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = result {
-        assert_eq!(meet, vec![1], "Meet should be A = [1]");
+    let ev_e = make_test_event(5, &[id_c]);
+    let id_e = ev_e.id();
+    retriever.add_event(ev_e);
+
+    let ev_f = make_test_event(6, &[id_d]);
+    let id_f = ev_f.id();
+    retriever.add_event(ev_f);
+
+    let ev_g = make_test_event(7, &[id_e]);
+    let id_g = ev_g.id();
+    retriever.add_event(ev_g);
+
+    let ev_h = make_test_event(8, &[id_f]);
+    let id_h = ev_h.id();
+    retriever.add_event(ev_h);
+
+    let ev_i = make_test_event(9, &[id_g]);
+    let id_i = ev_i.id();
+    retriever.add_event(ev_i);
+
+    let clock_h = clock!(id_h);
+    let clock_i = clock!(id_i);
+
+    let result = compare(retriever.clone(), &clock_h, &clock_i, 100).await.unwrap();
+
+    assert!(
+        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
+        "Expected DivergedSince, got {:?}",
+        result.relation
+    );
+
+    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = &result.relation {
+        assert_eq!(meet, &vec![id_a], "Meet should be A");
         // subject_chain should go from A to H: B, D, F, H
         assert_eq!(subject_chain.len(), 4, "Subject chain should have 4 events");
         // other_chain should go from A to I: C, E, G, I
@@ -944,50 +719,78 @@ async fn test_deep_diamond_asymmetric_branches() {
 
 #[tokio::test]
 async fn test_short_branch_from_deep_point() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create:
-    // A → B → C → D → E → F → G → H (long chain, head)
+    // A -> B -> C -> D -> E -> F -> G -> H (long chain, head)
     //             |
-    //             X → Y (short branch from D, arrives late)
+    //             X -> Y (short branch from D, arrives late)
     //
     // Compare Y vs H - meet should be D, NOT genesis A!
-    store.add(1, &[]); // A (genesis)
-    store.add(2, &[1]); // B
-    store.add(3, &[2]); // C
-    store.add(4, &[3]); // D
-    store.add(5, &[4]); // E
-    store.add(6, &[5]); // F
-    store.add(7, &[6]); // G
-    store.add(8, &[7]); // H
-                        // Short branch from D
-    store.add(9, &[4]); // X (parent is D)
-    store.add(10, &[9]); // Y
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
 
-    let clock_h = TestClock { members: vec![8] };
+    let ev_b = make_test_event(2, &[id_a]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
+
+    let ev_c = make_test_event(3, &[id_b]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
+
+    let ev_d = make_test_event(4, &[id_c]);
+    let id_d = ev_d.id();
+    retriever.add_event(ev_d);
+
+    let ev_e = make_test_event(5, &[id_d.clone()]);
+    let id_e = ev_e.id();
+    retriever.add_event(ev_e);
+
+    let ev_f = make_test_event(6, &[id_e]);
+    let id_f = ev_f.id();
+    retriever.add_event(ev_f);
+
+    let ev_g = make_test_event(7, &[id_f]);
+    let id_g = ev_g.id();
+    retriever.add_event(ev_g);
+
+    let ev_h = make_test_event(8, &[id_g]);
+    let id_h = ev_h.id();
+    retriever.add_event(ev_h);
+
+    // Short branch from D
+    let ev_x = make_test_event(9, &[id_d]); // X (parent is D)
+    let id_x = ev_x.id();
+    retriever.add_event(ev_x);
+
+    let ev_y = make_test_event(10, &[id_x]); // Y
+    let _id_y = ev_y.id();
+
+    let clock_h = clock!(id_h);
 
     // Event Y arrives late, with parent X
-    let event_y = TestEvent { id: 10, parent_clock: TestClock { members: vec![9] } };
+    let result = compare_unstored_event(retriever.clone(), &ev_y, &clock_h, 100).await.unwrap();
 
-    let result = compare_unstored_event(&store, &event_y, &clock_h, 100).await.unwrap();
+    assert!(
+        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
+        "Expected DivergedSince, got {:?}",
+        result.relation
+    );
 
-    assert!(matches!(result, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result);
-
-    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = result {
-        // Meet should be D = [4], not A = [1]!
-        // Note: For unstored event comparison, the meet comes from comparing X's parent clock
-        // The actual stored comparison is between X and H
+    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = &result.relation {
+        // Meet should not be empty
         assert!(!meet.is_empty(), "Meet should not be empty");
         // Subject chain: just Y (since we're comparing unstored event)
         assert!(!subject_chain.is_empty(), "Subject chain should not be empty");
-        // Other chain: E, F, G, H (from meet D to head H)
+        // Other chain: events from meet to head H
         assert!(!other_chain.is_empty(), "Other chain should not be empty");
     }
 }
 
 #[tokio::test]
 async fn test_late_arrival_long_branch_from_genesis() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create:
     //     A (genesis)
@@ -998,25 +801,49 @@ async fn test_late_arrival_long_branch_from_genesis() {
     //   |   |
     //   D   Z
     //
-    // Entity at [D], then X→Y→Z branch arrives
-    store.add(1, &[]); // A (genesis)
-    store.add(2, &[1]); // B
-    store.add(3, &[2]); // C
-    store.add(4, &[3]); // D
-                        // Long branch from genesis
-    store.add(5, &[1]); // X
-    store.add(6, &[5]); // Y
-    store.add(7, &[6]); // Z
+    // Entity at [D], then X->Y->Z branch arrives
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
 
-    let clock_d = TestClock { members: vec![4] };
-    let clock_z = TestClock { members: vec![7] };
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
 
-    let result = compare(&store, &clock_d, &clock_z, 100).await.unwrap();
+    let ev_c = make_test_event(3, &[id_b]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
 
-    assert!(matches!(result, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result);
+    let ev_d = make_test_event(4, &[id_c]);
+    let id_d = ev_d.id();
+    retriever.add_event(ev_d);
 
-    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = result {
-        assert_eq!(meet, vec![1], "Meet should be A = [1] (genesis)");
+    // Long branch from genesis
+    let ev_x = make_test_event(5, &[id_a.clone()]);
+    let id_x = ev_x.id();
+    retriever.add_event(ev_x);
+
+    let ev_y = make_test_event(6, &[id_x]);
+    let id_y = ev_y.id();
+    retriever.add_event(ev_y);
+
+    let ev_z = make_test_event(7, &[id_y]);
+    let id_z = ev_z.id();
+    retriever.add_event(ev_z);
+
+    let clock_d = clock!(id_d);
+    let clock_z = clock!(id_z);
+
+    let result = compare(retriever.clone(), &clock_d, &clock_z, 100).await.unwrap();
+
+    assert!(
+        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
+        "Expected DivergedSince, got {:?}",
+        result.relation
+    );
+
+    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = &result.relation {
+        assert_eq!(meet, &vec![id_a], "Meet should be A (genesis)");
         // Both chains should have 3 events
         assert_eq!(subject_chain.len(), 3, "Subject chain B, C, D should have 3 events");
         assert_eq!(other_chain.len(), 3, "Other chain X, Y, Z should have 3 events");
@@ -1029,61 +856,89 @@ async fn test_late_arrival_long_branch_from_genesis() {
 
 #[tokio::test]
 async fn test_forward_chain_ordering() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    // Create: A → B → C → D → E
-    store.add(1, &[]); // A
-    store.add(2, &[1]); // B
-    store.add(3, &[2]); // C
-    store.add(4, &[3]); // D
-    store.add(5, &[4]); // E
+    // Create: A -> B -> C -> D -> E
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
 
-    let clock_a = TestClock { members: vec![1] };
-    let clock_e = TestClock { members: vec![5] };
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
 
-    let result = compare(&store, &clock_e, &clock_a, 100).await.unwrap();
+    let ev_c = make_test_event(3, &[id_b.clone()]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
+
+    let ev_d = make_test_event(4, &[id_c.clone()]);
+    let id_d = ev_d.id();
+    retriever.add_event(ev_d);
+
+    let ev_e = make_test_event(5, &[id_d.clone()]);
+    let id_e = ev_e.id();
+    retriever.add_event(ev_e);
+
+    let clock_a = clock!(id_a);
+    let clock_e = clock!(id_e);
+
+    let result = compare(retriever.clone(), &clock_e, &clock_a, 100).await.unwrap();
 
     // E strictly descends from A
-    if let AbstractCausalRelation::StrictDescends { chain } = result {
+    if let AbstractCausalRelation::StrictDescends { chain } = &result.relation {
         // Chain should be in forward (causal) order: B, C, D, E (from A toward E)
         assert_eq!(chain.len(), 4, "Chain should have 4 events");
-        assert_eq!(chain, vec![2, 3, 4, 5], "Chain should be [B, C, D, E] in causal order");
+        assert_eq!(chain, &vec![id_b, id_c, id_d, id_e], "Chain should be [B, C, D, E] in causal order");
     } else {
-        panic!("Expected StrictDescends, got {:?}", result);
+        panic!("Expected StrictDescends, got {:?}", result.relation);
     }
 }
 
 #[tokio::test]
 async fn test_diverged_chains_ordering() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
     // Create:
-    //     A (1)
+    //     A
     //    / \
     //   B   C
     //   |   |
     //   D   E
     //
     // Compare D vs E - both chains should be in forward order from meet A
-    store.add(1, &[]); // A
-    store.add(2, &[1]); // B
-    store.add(3, &[1]); // C
-    store.add(4, &[2]); // D
-    store.add(5, &[3]); // E
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
 
-    let clock_d = TestClock { members: vec![4] };
-    let clock_e = TestClock { members: vec![5] };
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
 
-    let result = compare(&store, &clock_d, &clock_e, 100).await.unwrap();
+    let ev_c = make_test_event(3, &[id_a.clone()]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
 
-    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = result {
-        assert_eq!(meet, vec![1], "Meet should be A");
+    let ev_d = make_test_event(4, &[id_b.clone()]);
+    let id_d = ev_d.id();
+    retriever.add_event(ev_d);
+
+    let ev_e = make_test_event(5, &[id_c.clone()]);
+    let id_e = ev_e.id();
+    retriever.add_event(ev_e);
+
+    let clock_d = clock!(id_d);
+    let clock_e = clock!(id_e);
+
+    let result = compare(retriever.clone(), &clock_d, &clock_e, 100).await.unwrap();
+
+    if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = &result.relation {
+        assert_eq!(meet, &vec![id_a], "Meet should be A");
         // Subject chain: B, D (from A toward D)
-        assert_eq!(subject_chain, vec![2, 4], "Subject chain should be [B, D]");
+        assert_eq!(subject_chain, &vec![id_b, id_d], "Subject chain should be [B, D]");
         // Other chain: C, E (from A toward E)
-        assert_eq!(other_chain, vec![3, 5], "Other chain should be [C, E]");
+        assert_eq!(other_chain, &vec![id_c, id_e], "Other chain should be [C, E]");
     } else {
-        panic!("Expected DivergedSince, got {:?}", result);
+        panic!("Expected DivergedSince, got {:?}", result.relation);
     }
 }
 
@@ -1093,44 +948,64 @@ async fn test_diverged_chains_ordering() {
 
 #[tokio::test]
 async fn test_same_event_redundant_delivery() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    // Create: A → B → C
-    store.add(1, &[]); // A
-    store.add(2, &[1]); // B
-    store.add(3, &[2]); // C
+    // Create: A -> B -> C
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
+
+    let ev_b = make_test_event(2, &[id_a]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
+
+    let ev_c = make_test_event(3, &[id_b.clone()]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c.clone());
 
     // Entity head is at C
-    let entity_head = TestClock { members: vec![3] };
+    let entity_head = clock!(id_c);
 
-    // Event C is delivered again (redundant)
-    let event_c_again = TestEvent { id: 3, parent_clock: TestClock { members: vec![2] } };
+    // Event C is delivered again (redundant) - recreate same event
+    let event_c_again = make_test_event(3, &[id_b]);
 
-    let result = compare_unstored_event(&store, &event_c_again, &entity_head, 100).await.unwrap();
+    let result = compare_unstored_event(retriever.clone(), &event_c_again, &entity_head, 100).await.unwrap();
 
     // Should be Equal since event is already at head
-    assert!(matches!(result, AbstractCausalRelation::Equal), "Redundant delivery of head event should return Equal, got {:?}", result);
+    assert!(
+        matches!(result.relation, AbstractCausalRelation::Equal),
+        "Redundant delivery of head event should return Equal, got {:?}",
+        result.relation
+    );
 }
 
 #[tokio::test]
 async fn test_event_in_history_not_at_head() {
-    let mut store = MockEventStore::new();
+    let mut retriever = MockRetriever::new();
 
-    // Create: A → B → C
-    store.add(1, &[]); // A
-    store.add(2, &[1]); // B
-    store.add(3, &[2]); // C
+    // Create: A -> B -> C
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
+
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
+
+    let ev_c = make_test_event(3, &[id_b]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
 
     // Entity head is at C
-    let entity_head = TestClock { members: vec![3] };
+    let entity_head = clock!(id_c);
 
     // Event B (in history but not at head) is delivered
     // Note: compare_unstored_event can't know B is in history - it only checks
     // if the event's ID is at the head (Equal case) or compares the parent clock.
     // Since B's parent (A) is older than C, this looks like a concurrent event.
-    let event_b = TestEvent { id: 2, parent_clock: TestClock { members: vec![1] } };
+    let event_b = make_test_event(2, &[id_a]);
 
-    let result = compare_unstored_event(&store, &event_b, &entity_head, 100).await.unwrap();
+    let result = compare_unstored_event(retriever.clone(), &event_b, &entity_head, 100).await.unwrap();
 
     // Returns DivergedSince because from the algorithm's perspective:
     // - B's parent (A) is older than head (C)
@@ -1138,9 +1013,9 @@ async fn test_event_in_history_not_at_head() {
     // In practice, the caller should check if the event is already stored before
     // calling compare_unstored_event to avoid this false positive.
     assert!(
-        matches!(result, AbstractCausalRelation::DivergedSince { .. }),
+        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
         "Event with older parent returns DivergedSince, got {:?}",
-        result
+        result.relation
     );
 }
 

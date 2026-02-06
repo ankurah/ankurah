@@ -18,7 +18,7 @@
 //! ## Process
 //!
 //! 1. **Initialize**: Start with two frontiers = {subject_head} and {other_head}
-//! 2. **Expand**: Ask `CausalNavigator` to fetch events at current frontier positions
+//! 2. **Expand**: Fetch events at current frontier positions via `EventAccumulator`
 //! 3. **Process**: For each returned event:
 //!    - Remove it from its frontier
 //!    - Add its parents to the frontier (moving backward)
@@ -27,49 +27,73 @@
 //! 5. **Repeat** until: relationship determined, frontiers empty, or budget exhausted
 
 use super::{
-    frontier::{Frontier, FrontierState, TaintReason},
-    navigator::{AssertionRelation, CausalNavigator, NavigationStep},
-    AbstractCausalRelation, TClock, TEvent,
+    accumulator::{ComparisonResult, EventAccumulator},
+    frontier::Frontier,
+    relation::AbstractCausalRelation,
 };
 use crate::error::RetrievalError;
+use crate::retrieval::Retrieve;
+use ankurah_proto::{Clock, Event, EventId};
 use std::collections::{BTreeSet, HashMap};
 
 /// Compare two clocks to determine their causal relationship.
 ///
 /// Performs a simultaneous backward breadth-first search from both heads,
 /// looking for common ancestors or divergence.
-pub async fn compare<N, C>(
-    navigator: &N,
-    subject: &C,
-    comparison: &C,
+///
+/// Takes ownership of the retriever, wrapping it in an `EventAccumulator`.
+/// Returns a `ComparisonResult` containing both the relation and the accumulated DAG.
+///
+/// Budget escalation: if the initial budget is exhausted, retries internally
+/// with up to 4x the initial budget before returning `BudgetExceeded`.
+pub async fn compare<R: Retrieve>(
+    retriever: R,
+    subject: &Clock,
+    comparison: &Clock,
     budget: usize,
-) -> Result<AbstractCausalRelation<N::EID>, RetrievalError>
-where
-    N: CausalNavigator,
-    C: TClock<Id = N::EID>,
-    N::EID: std::hash::Hash + Ord + Clone,
-{
+) -> Result<ComparisonResult<R>, RetrievalError> {
     // Early exit for obvious cases - empty clocks are disjoint
-    if subject.members().is_empty() || comparison.members().is_empty() {
-        // Empty clocks have no common ancestors - treat as DivergedSince with empty meet
-        return Ok(AbstractCausalRelation::DivergedSince {
-            meet: vec![],
-            subject: vec![],
-            other: vec![],
-            subject_chain: vec![],
-            other_chain: vec![],
-        });
+    if subject.as_slice().is_empty() || comparison.as_slice().is_empty() {
+        let accumulator = EventAccumulator::new(retriever);
+        return Ok(ComparisonResult::new(
+            AbstractCausalRelation::DivergedSince {
+                meet: vec![],
+                subject: vec![],
+                other: vec![],
+                subject_chain: vec![],
+                other_chain: vec![],
+            },
+            accumulator,
+        ));
     }
 
-    if subject.members() == comparison.members() {
-        return Ok(AbstractCausalRelation::Equal);
+    if subject.as_slice() == comparison.as_slice() {
+        let accumulator = EventAccumulator::new(retriever);
+        return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
     }
 
-    let mut comparison = Comparison::new(navigator, subject, comparison, budget);
+    let initial_budget = budget;
+    let max_budget = initial_budget * 4;
+    let mut current_budget = initial_budget;
+    let mut accumulator = EventAccumulator::new(retriever);
 
     loop {
-        if let Some(relation) = comparison.step().await? {
-            return Ok(relation);
+        let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget);
+        let relation = loop {
+            if let Some(relation) = comp.step().await? {
+                break relation;
+            }
+        };
+
+        match &relation {
+            AbstractCausalRelation::BudgetExceeded { .. } if current_budget < max_budget => {
+                current_budget = (current_budget * 4).min(max_budget);
+                // accumulator retains its DAG and cache - warm start for retry
+                continue;
+            }
+            _ => {
+                return Ok(ComparisonResult::new(relation, accumulator));
+            }
         }
     }
 }
@@ -78,29 +102,27 @@ where
 ///
 /// This is a special case where we start from the event's parent clock
 /// rather than the event itself (which isn't stored yet).
-pub async fn compare_unstored_event<N, E>(
-    navigator: &N,
-    event: &E,
-    comparison: &E::Parent,
+pub async fn compare_unstored_event<R: Retrieve>(
+    retriever: R,
+    event: &Event,
+    comparison: &Clock,
     budget: usize,
-) -> Result<AbstractCausalRelation<N::EID>, RetrievalError>
-where
-    N: CausalNavigator,
-    E: TEvent<Id = N::EID>,
-    E::Parent: TClock<Id = N::EID>,
-    N::EID: std::hash::Hash + Ord + Clone,
-{
+) -> Result<ComparisonResult<R>, RetrievalError> {
     // Special case: redundant delivery check - event already in comparison head
     // This handles both single-head (comparison == [event_id]) and multi-head cases
-    if comparison.members().contains(&event.id()) {
-        return Ok(AbstractCausalRelation::Equal);
+    if comparison.as_slice().contains(&event.id()) {
+        let accumulator = EventAccumulator::new(retriever);
+        return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
     }
 
     // Compare event's parent against the comparison clock
-    let result = compare(navigator, event.parent(), comparison, budget).await?;
+    let result = compare(retriever, &event.parent, comparison, budget).await?;
+
+    // Destructure to get relation and accumulator separately
+    let (relation, accumulator) = result.into_parts();
 
     // Transform the result based on what it means for event application
-    Ok(match result {
+    let new_relation = match relation {
         AbstractCausalRelation::Equal => {
             // Parent equals comparison => event directly extends the head
             // Chain is just this single event
@@ -124,8 +146,8 @@ where
             // Example 2: Entity head = [B], Event parent = [A] where A→B
             // compare([A], [B]) returns StrictAscends because Past([A]) ⊂ Past([B])
             // The event creates a concurrent branch from A - DivergedSince with meet at [A]
-            let parent_members: BTreeSet<_> = event.parent().members().iter().cloned().collect();
-            let comparison_members: BTreeSet<_> = comparison.members().iter().cloned().collect();
+            let parent_members: BTreeSet<_> = event.parent.as_slice().iter().cloned().collect();
+            let comparison_members: BTreeSet<_> = comparison.as_slice().iter().cloned().collect();
 
             // Meet is the parent clock (where this event's branch diverges from the head)
             let meet: Vec<_> = parent_members.iter().cloned().collect();
@@ -154,25 +176,27 @@ where
             AbstractCausalRelation::DivergedSince { meet, subject, other, subject_chain, other_chain }
         }
         other => other,
-    })
+    };
+
+    Ok(ComparisonResult::new(new_relation, accumulator))
 }
 
 /// Internal state machine for the comparison algorithm.
-struct Comparison<'a, N: CausalNavigator> {
-    navigator: &'a N,
+struct Comparison<'a, R: Retrieve> {
+    accumulator: &'a mut EventAccumulator<R>,
 
     // Frontiers being explored
-    subject_frontier: Frontier<N::EID>,
-    comparison_frontier: Frontier<N::EID>,
+    subject_frontier: Frontier<EventId>,
+    comparison_frontier: Frontier<EventId>,
 
     // Original heads (for tracking strict descent/ascent)
-    original_subject: BTreeSet<N::EID>,
-    original_comparison: BTreeSet<N::EID>,
+    original_subject: BTreeSet<EventId>,
+    original_comparison: BTreeSet<EventId>,
 
     // Tracking state
-    states: HashMap<N::EID, NodeState<N::EID>>,
-    meet_candidates: BTreeSet<N::EID>,
-    outstanding_heads: BTreeSet<N::EID>,
+    states: HashMap<EventId, NodeState>,
+    meet_candidates: BTreeSet<EventId>,
+    outstanding_heads: BTreeSet<EventId>,
 
     // Progress tracking
     remaining_budget: usize,
@@ -180,33 +204,32 @@ struct Comparison<'a, N: CausalNavigator> {
     unseen_comparison_heads: usize,
     /// Count of subject heads not yet seen by comparison's traversal (for StrictAscends)
     unseen_subject_heads: usize,
-    // head_overlap: bool,  // Currently unused - unseen_comparison_heads == 0 captures this
     any_common: bool,
 
     // Chain tracking (for forward chain accumulation)
     /// Events visited from subject's traversal (child→parent order during traversal)
-    subject_visited: Vec<N::EID>,
+    subject_visited: Vec<EventId>,
     /// Events visited from comparison's traversal (child→parent order during traversal)
-    other_visited: Vec<N::EID>,
+    other_visited: Vec<EventId>,
 
     // Root tracking (for Disjoint detection)
     /// Genesis event found in subject's traversal (event with empty parents)
-    subject_root: Option<N::EID>,
+    subject_root: Option<EventId>,
     /// Genesis event found in comparison's traversal (event with empty parents)
-    other_root: Option<N::EID>,
+    other_root: Option<EventId>,
 }
 
 #[derive(Clone)]
-struct NodeState<Id: Clone> {
+struct NodeState {
     seen_from_subject: bool,
     seen_from_comparison: bool,
     common_child_count: usize,
-    origins: Vec<Id>,          // Tracks which comparison heads reach this node
-    subject_children: Vec<Id>, // Children from subject's traversal
-    other_children: Vec<Id>,   // Children from comparison's traversal
+    origins: Vec<EventId>,          // Tracks which comparison heads reach this node
+    subject_children: Vec<EventId>, // Children from subject's traversal
+    other_children: Vec<EventId>,   // Children from comparison's traversal
 }
 
-impl<Id: Clone> NodeState<Id> {
+impl NodeState {
     fn new() -> Self {
         Self {
             seen_from_subject: false,
@@ -229,7 +252,7 @@ impl<Id: Clone> NodeState<Id> {
         }
     }
 
-    fn add_child(&mut self, child: Id, from_subject: bool, from_comparison: bool) {
+    fn add_child(&mut self, child: EventId, from_subject: bool, from_comparison: bool) {
         if from_subject {
             self.subject_children.push(child.clone());
         }
@@ -239,17 +262,13 @@ impl<Id: Clone> NodeState<Id> {
     }
 }
 
-impl<'a, N> Comparison<'a, N>
-where
-    N: CausalNavigator,
-    N::EID: std::hash::Hash + Ord + Clone,
-{
-    fn new<C: TClock<Id = N::EID>>(navigator: &'a N, subject: &C, comparison: &C, budget: usize) -> Self {
-        let subject_ids: BTreeSet<_> = subject.members().iter().cloned().collect();
-        let comparison_ids: BTreeSet<_> = comparison.members().iter().cloned().collect();
+impl<'a, R: Retrieve> Comparison<'a, R> {
+    fn new(accumulator: &'a mut EventAccumulator<R>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
+        let subject_ids: BTreeSet<EventId> = subject.as_slice().iter().cloned().collect();
+        let comparison_ids: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
 
         Self {
-            navigator,
+            accumulator,
             subject_frontier: Frontier::new(subject_ids.clone()),
             comparison_frontier: Frontier::new(comparison_ids.clone()),
             original_subject: subject_ids.clone(),
@@ -260,7 +279,6 @@ where
             remaining_budget: budget,
             unseen_comparison_heads: comparison_ids.len(),
             unseen_subject_heads: subject_ids.len(),
-            // head_overlap: false,
             any_common: false,
             subject_visited: Vec::new(),
             other_visited: Vec::new(),
@@ -269,34 +287,29 @@ where
         }
     }
 
-    async fn step(&mut self) -> Result<Option<AbstractCausalRelation<N::EID>>, RetrievalError> {
-        // Collect frontier IDs from both frontiers (preserving original budget behavior)
+    async fn step(&mut self) -> Result<Option<AbstractCausalRelation<EventId>>, RetrievalError> {
+        // Collect frontier IDs from both frontiers
         let mut all_frontier_ids = Vec::new();
         all_frontier_ids.extend(self.subject_frontier.ids.iter().cloned());
         all_frontier_ids.extend(self.comparison_frontier.ids.iter().cloned());
 
-        // Ask navigator to expand - this should match the original budget consumption
-        let NavigationStep { events, assertions, consumed_budget } =
-            self.navigator.expand_frontier(&all_frontier_ids, self.remaining_budget).await?;
-
-        // Deduct budget for fetched events
-        self.remaining_budget = self.remaining_budget.saturating_sub(consumed_budget);
-
-        // Process fetched events
-        for event in events {
-            self.process_event(event.id(), event.parent().members());
-        }
-
-        // Process assertion results
-        for assertion in assertions {
-            self.process_assertion(assertion.from, assertion.to, assertion.relation);
+        // Fetch events individually via accumulator (replaces batch expand_frontier)
+        for id in &all_frontier_ids {
+            let event = match self.accumulator.get_event(id).await {
+                Ok(event) => event,
+                Err(RetrievalError::EventNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            self.accumulator.accumulate(&event);
+            self.remaining_budget = self.remaining_budget.saturating_sub(1);
+            self.process_event(event.id(), event.parent.as_slice());
         }
 
         // Check if we have a result
         Ok(self.check_result())
     }
 
-    fn process_event(&mut self, id: N::EID, parents: &[N::EID]) {
+    fn process_event(&mut self, id: EventId, parents: &[EventId]) {
         let from_subject = self.subject_frontier.remove(&id);
         let from_comparison = self.comparison_frontier.remove(&id);
 
@@ -367,8 +380,7 @@ where
 
             // Check if subject's traversal reached a comparison head
             if self.original_comparison.contains(&id) {
-                self.unseen_comparison_heads -= 1;
-                // head_overlap would be set here, but unseen_comparison_heads == 0 captures the same info
+                self.unseen_comparison_heads = self.unseen_comparison_heads.saturating_sub(1);
             }
         }
 
@@ -377,74 +389,14 @@ where
 
             // Check if comparison's traversal reached a subject head
             if self.original_subject.contains(&id) {
-                self.unseen_subject_heads -= 1;
-            }
-        }
-    }
-
-    fn process_assertion(&mut self, from: N::EID, to: Option<N::EID>, relation: AssertionRelation<N::EID>) {
-        // Determine which frontier(s) contain this ID
-        let in_subject = self.subject_frontier.ids.contains(&from);
-        let in_comparison = self.comparison_frontier.ids.contains(&from);
-
-        match relation {
-            AssertionRelation::Descends => {
-                // Add shortcut target to appropriate frontier(s)
-                if let Some(target) = to {
-                    if in_subject {
-                        self.subject_frontier.insert(target.clone());
-                    }
-                    if in_comparison {
-                        self.comparison_frontier.insert(target);
-                    }
-                }
-            }
-            AssertionRelation::NotDescends { .. } => {
-                // Taint the frontier(s) containing this ID
-                if in_subject {
-                    self.subject_frontier.taint(TaintReason::NotDescends);
-                }
-                if in_comparison {
-                    self.comparison_frontier.taint(TaintReason::NotDescends);
-                }
-            }
-            AssertionRelation::PartiallyDescends { meet } => {
-                // Taint but continue exploration
-                if in_subject {
-                    self.subject_frontier.taint(TaintReason::PartiallyDescends);
-                }
-                if in_comparison {
-                    self.comparison_frontier.taint(TaintReason::PartiallyDescends);
-                }
-                // Add meet candidates from assertion
-                for meet_id in meet {
-                    self.meet_candidates.insert(meet_id);
-                }
-                // Still add target if provided
-                if let Some(target) = to {
-                    if in_subject {
-                        self.subject_frontier.insert(target.clone());
-                    }
-                    if in_comparison {
-                        self.comparison_frontier.insert(target);
-                    }
-                }
-            }
-            AssertionRelation::Incomparable => {
-                // Taint and stop exploration
-                if in_subject {
-                    self.subject_frontier.taint(TaintReason::Incomparable);
-                }
-                if in_comparison {
-                    self.comparison_frontier.taint(TaintReason::Incomparable);
-                }
+                self.unseen_subject_heads = self.unseen_subject_heads.saturating_sub(1);
             }
         }
     }
 
     /// Build forward chain from visited events, trimmed to start after meet.
     /// Visited is in child→parent order, so we reverse and filter.
-    fn build_forward_chain(&self, visited: &[N::EID], meet: &BTreeSet<N::EID>) -> Vec<N::EID> {
+    fn build_forward_chain(&self, visited: &[EventId], meet: &BTreeSet<EventId>) -> Vec<EventId> {
         // Reverse to get parent→child (causal) order
         let mut chain: Vec<_> = visited.iter().rev().cloned().collect();
 
@@ -461,7 +413,7 @@ where
 
     /// Collect immediate children of the meet nodes toward subject and other sides.
     /// Returns (subject_immediate, other_immediate) - events whose parent is a meet node.
-    fn collect_immediate_children(&self, meet: &[N::EID]) -> (Vec<N::EID>, Vec<N::EID>) {
+    fn collect_immediate_children(&self, meet: &[EventId]) -> (Vec<EventId>, Vec<EventId>) {
         let mut subject_immediate = BTreeSet::new();
         let mut other_immediate = BTreeSet::new();
 
@@ -486,58 +438,7 @@ where
         (subject_immediate.into_iter().collect(), other_immediate.into_iter().collect())
     }
 
-    fn check_result(&mut self) -> Option<AbstractCausalRelation<N::EID>> {
-        // Check for assertion-based tainting first (takes precedence)
-        if self.subject_frontier.is_tainted() {
-            match &self.subject_frontier.state {
-                FrontierState::Tainted { reason: TaintReason::PartiallyDescends } => {
-                    // Return DivergedSince with meet candidates from assertions
-                    let meet: Vec<_> = self.meet_candidates.iter().cloned().collect();
-                    let meet_set: BTreeSet<_> = meet.iter().cloned().collect();
-                    let subject_chain = self.build_forward_chain(&self.subject_visited, &meet_set);
-                    let other_chain = self.build_forward_chain(&self.other_visited, &meet_set);
-                    let (subject_immediate, other_immediate) = self.collect_immediate_children(&meet);
-                    return Some(AbstractCausalRelation::DivergedSince {
-                        meet,
-                        subject: subject_immediate,
-                        other: other_immediate,
-                        subject_chain,
-                        other_chain,
-                    });
-                }
-                FrontierState::Tainted { reason: TaintReason::NotDescends } => {
-                    return Some(AbstractCausalRelation::DivergedSince {
-                        meet: vec![],
-                        subject: vec![],
-                        other: vec![],
-                        subject_chain: vec![],
-                        other_chain: vec![],
-                    });
-                }
-                FrontierState::Tainted { reason: TaintReason::Incomparable } => {
-                    // Incomparable assertion indicates different lineages - check for Disjoint
-                    if let (Some(subject_root), Some(other_root)) = (&self.subject_root, &self.other_root) {
-                        if subject_root != other_root {
-                            return Some(AbstractCausalRelation::Disjoint {
-                                gca: None,
-                                subject_root: subject_root.clone(),
-                                other_root: other_root.clone(),
-                            });
-                        }
-                    }
-                    // Fall back to DivergedSince with empty meet
-                    return Some(AbstractCausalRelation::DivergedSince {
-                        meet: vec![],
-                        subject: vec![],
-                        other: vec![],
-                        subject_chain: vec![],
-                        other_chain: vec![],
-                    });
-                }
-                _ => {}
-            }
-        }
-
+    fn check_result(&mut self) -> Option<AbstractCausalRelation<EventId>> {
         // Check for complete descent (only if not tainted)
         // StrictDescends: subject's traversal has seen all comparison heads
         if self.unseen_comparison_heads == 0 {
