@@ -1,9 +1,9 @@
 use crate::{
     changes::EntityChange,
     error::{ApplyError, ApplyErrorItem, MutationError},
-    lineage::Retrieve,
     node::Node,
     policy::PolicyAgent,
+    retrieval::Retrieve,
     storage::StorageEngine,
     util::ready_chunks::ReadyChunks,
 };
@@ -44,7 +44,6 @@ impl NodeApplier {
         for update in items {
             let retriever = crate::retrieval::EphemeralNodeRetriever::new(update.collection.clone(), node, &cdata);
             Self::apply_update(node, from_peer_id, update, &retriever, &mut changes, &mut ()).await?;
-            retriever.store_used_events().await?;
         }
 
         node.reactor.notify_change(changes).await;
@@ -63,7 +62,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         // TODO: do we actually need predicate_relevance?
         let proto::SubscriptionUpdateItem { entity_id, collection: collection_id, content, predicate_relevance: _ } = update;
@@ -94,18 +93,52 @@ impl NodeApplier {
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
+                tracing::info!(
+                    "[TRACE-SAE] StateAndEvent received for entity {} from peer {}, incoming_head={}, event_count={}",
+                    entity_id,
+                    from_peer_id,
+                    state_fragment.state.head,
+                    event_fragments.len()
+                );
                 let events = Self::save_events(node, from_peer_id, entity_id, &collection_id, event_fragments, &collection).await?;
-                let state = (entity_id, collection_id.clone(), state_fragment.clone()).into();
+                let state: ankurah_proto::Attested<ankurah_proto::EntityState> =
+                    (entity_id, collection_id.clone(), state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
-                let (changed, entity) = node.entities.with_state(retriever, entity_id, collection_id, state.payload.state).await?;
+                let (changed, entity) = node.entities.with_state(retriever, entity_id, collection_id.clone(), state.payload.state).await?;
+                tracing::info!(
+                    "[TRACE-SAE] with_state returned changed={:?} for entity {}, entity_head={:?}",
+                    changed,
+                    entity_id,
+                    entity.head()
+                );
                 entities.push(entity.clone());
 
-                // TODO: get the list of events that where actually applied - don't just pass them all through blindly
                 if matches!(changed, Some(true) | None) {
+                    // State applied successfully (new entity or strictly descends)
+                    tracing::info!("[TRACE-SAE] Saving state for entity {}", entity_id);
                     Self::save_state(node, &entity, &collection).await?;
                     changes.push(EntityChange::new(entity, events)?);
+                } else {
+                    // State not applied (divergence or older) - fall back to event-by-event application
+                    // This handles DivergedSince where we need to merge concurrent branches
+                    tracing::info!(
+                        "[TRACE-SAE] State not applied for entity {} (changed={:?}), falling back to event-by-event application",
+                        entity_id,
+                        changed
+                    );
+                    let mut applied_events = Vec::new();
+                    for event in events {
+                        if entity.apply_event(retriever, &event.payload).await? {
+                            applied_events.push(event);
+                        }
+                    }
+                    if !applied_events.is_empty() {
+                        tracing::info!("[TRACE-SAE] Applied {} events via fallback for entity {}", applied_events.len(), entity_id);
+                        Self::save_state(node, &entity, &collection).await?;
+                        changes.push(EntityChange::new(entity, applied_events)?);
+                    }
                 }
             }
         }
@@ -168,7 +201,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
         // if there are stragglers, they will be picked up on the next wake
@@ -213,7 +246,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         let entity_id = delta.entity_id;
         let collection = delta.collection.clone();
@@ -231,7 +264,7 @@ impl NodeApplier {
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
-        R: Retrieve<Id = EventId, Event = Event> + Send + Sync,
+        R: Retrieve + Send + Sync,
     {
         let collection = node.collections.get(&delta.collection).await?;
 
@@ -254,15 +287,18 @@ impl NodeApplier {
                 let attested_events: Vec<Attested<proto::Event>> =
                     events.into_iter().map(|f| (delta.entity_id, delta.collection.clone(), f).into()).collect();
 
-                retriever.stage_events(attested_events.clone());
+                // Eagerly store events before applying (they need to be in storage for BFS)
+                for event in &attested_events {
+                    collection.add_event(event).await?;
+                }
+
                 // Get or create entity
                 let entity = node.entities.get_retrieve_or_create(retriever, &delta.collection, &delta.entity_id).await?;
 
-                // HACK - applying events in reverse order to avoid triggering the NotDescends bug
-                // in apply_event where the event is wrongly made concurrent
-                for event in attested_events.into_iter().rev() {
+                // Apply events in forward (causal) order - oldest first
+                // Events in EventBridge are already in causal order from the server
+                for event in attested_events.into_iter() {
                     entity.apply_event(retriever, &event.payload).await?;
-                    retriever.mark_event_used(&event.payload.id());
                 }
 
                 // Save updated state

@@ -167,6 +167,10 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
+    #[error("duplicate creation event for entity that already has a non-empty head")]
+    DuplicateCreation,
+    #[error("insufficient causal info: cannot determine relationship between {event_a:?} and {event_b:?}")]
+    InsufficientCausalInfo { event_a: EventId, event_b: EventId },
 }
 
 impl From<tokio::task::JoinError> for MutationError {
@@ -179,20 +183,16 @@ impl From<anyhow::Error> for MutationError {
 
 #[derive(Debug)]
 pub enum LineageError {
-    Incomparable,
-    PartiallyDescends { meet: Vec<EventId> },
+    /// Proven different genesis events (single-root invariant violated)
+    Disjoint,
+    /// Recursion budget exceeded before determination could be made
     BudgetExceeded { original_budget: usize, subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
 }
 
 impl std::fmt::Display for LineageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LineageError::Incomparable => write!(f, "incomparable"),
-            LineageError::PartiallyDescends { meet } => {
-                write!(f, "partially descends: [")?;
-                let meets: Vec<_> = meet.iter().map(|id| id.to_base64_short()).collect();
-                write!(f, "{}]", meets.join(", "))
-            }
+            LineageError::Disjoint => write!(f, "disjoint (different genesis events)"),
             LineageError::BudgetExceeded { original_budget, subject_frontier, other_frontier } => {
                 let subject: Vec<_> = subject_frontier.iter().map(|id| id.to_base64_short()).collect();
                 let other: Vec<_> = other_frontier.iter().map(|id| id.to_base64_short()).collect();

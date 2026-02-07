@@ -538,7 +538,7 @@ where
             .await
             .map_err(|e| RetrievalError::RequestError(e))?
         {
-            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, deltas } => deltas,
+            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, initial: deltas } => deltas,
             ankurah_proto::NodeResponseBody::Error(e) => return Err(RetrievalError::RequestError(RequestError::ServerError(e))),
             other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
         };
@@ -551,11 +551,7 @@ where
         );
         // 3. Apply deltas to local node using NodeApplier
         let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id, &node, context_data);
-        let apply_result = crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &retriever).await;
-        let event_store_result = retriever.store_used_events().await;
-
-        apply_result?; // apply result is more important than event store result
-        event_store_result?;
+        crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &retriever).await?;
 
         Ok(())
     }
