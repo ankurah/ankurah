@@ -257,9 +257,30 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
 
         // Fetch events individually via accumulator (replaces batch expand_frontier)
         for id in &all_frontier_ids {
+            // Skip events already processed (e.g. an ID that appeared in both
+            // frontiers gets collected twice but was already handled on its
+            // first encounter).
+            if !self.subject_frontier.ids.contains(id) && !self.comparison_frontier.ids.contains(id) {
+                continue;
+            }
+
             let event = match self.accumulator.get_event(id).await {
                 Ok(event) => event,
-                Err(e @ RetrievalError::EventNotFound(_)) => return Err(e),
+                Err(RetrievalError::EventNotFound(_)) => {
+                    // Event is unfetchable. If it's currently on both frontiers,
+                    // it's a common ancestor — process with empty parents to
+                    // terminate the traversal at this point. This handles the
+                    // ephemeral node scenario where the meet point event is
+                    // unreachable from local storage.
+                    // Note: we check at processing time, not collection time,
+                    // because process_event for earlier events in this loop may
+                    // have added IDs to frontiers.
+                    if self.subject_frontier.ids.contains(id) && self.comparison_frontier.ids.contains(id) {
+                        self.process_event(id.clone(), &[]);
+                        continue;
+                    }
+                    return Err(RetrievalError::EventNotFound(id.clone()));
+                }
                 Err(e) => return Err(e),
             };
             self.accumulator.accumulate(&event);
