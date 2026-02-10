@@ -230,10 +230,7 @@ impl Entity {
     where E: GetEvents + Send + Sync {
         debug!("apply_event head: {event} to {self}");
 
-        // Budget for DAG traversal - should be large enough for typical histories
-        // but bounded to prevent runaway traversal on malicious/corrupted data.
-        // Budget escalation is handled internally by compare (up to 4x).
-        const DEFAULT_BUDGET: usize = 1000;
+        use crate::event_dag::DEFAULT_BUDGET;
 
         // Idempotency is handled by the comparison algorithm:
         // - Event already in head -> Equal -> no-op (Ok(false))
@@ -415,7 +412,7 @@ impl Entity {
 
         debug!("{self} apply_state - new head: {new_head}");
         const MAX_RETRIES: usize = 5;
-        const DEFAULT_BUDGET: usize = 1000;
+        use crate::event_dag::DEFAULT_BUDGET;
 
         for attempt in 0..MAX_RETRIES {
             let comparison_result = crate::event_dag::compare(getter, &new_head, &head, DEFAULT_BUDGET).await?;

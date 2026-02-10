@@ -46,7 +46,7 @@ use std::collections::{BTreeSet, HashMap};
 ///
 /// Budget escalation: if the initial budget is exhausted, retries internally
 /// with up to 4x the initial budget before returning `BudgetExceeded`.
-pub async fn compare<E: GetEvents>(
+pub(crate) async fn compare<E: GetEvents>(
     event_getter: E,
     subject: &Clock,
     comparison: &Clock,

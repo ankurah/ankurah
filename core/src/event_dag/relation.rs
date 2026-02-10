@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 /// Causal relationship between two clocks in the event DAG.
 /// Aligned with proto::CausalRelation for wire compatibility.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum AbstractCausalRelation<Id> {
+pub(crate) enum AbstractCausalRelation<Id> {
     /// Identical lattice points.
     Equal,
 
