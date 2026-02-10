@@ -1,147 +1,110 @@
 # Retrieval and Storage Layer
 
-This document covers the traits and concrete types in `core/src/retrieval.rs`
-that mediate between the [event DAG subsystem](event-dag.md) and persistent storage.
+The retrieval layer is the bridge between the [event DAG](event-dag.md) and
+persistent storage. Its job is to answer two questions during event
+processing: "give me this event's data" and "has this event already been
+durably stored?" These sound similar but have deliberately different
+semantics, and the layer's design follows from keeping them separate.
 
 
-## The Three Traits
+## Why Three Traits Instead of One
 
-### `GetEvents`
+The system originally had a monolithic `Retrieve` trait that bundled event
+reading, state reading, and staging/committing into a single interface. The
+problem was that [`apply_event`](entity-lifecycle.md#how-events-are-applied)
+-- the core integration function -- only needs read access to events, but
+receiving a `Retrieve` reference gave it the *ability* to stage or commit
+events. That is the caller's responsibility, not `apply_event`'s.
 
-```rust
-#[async_trait]
-pub trait GetEvents {
-    async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError>;
-    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError>;
-    fn storage_is_definitive(&self) -> bool { false }
-}
-```
+The split enforces staging discipline at the type level:
 
-The read-only event interface. This is what [`compare()`](event-dag.md#the-comparison-algorithm) and [`apply_event`](entity-lifecycle.md#apply_event-in-detail)
-accept.
+- **`GetEvents`** -- Read-only event access. This is what the
+  [BFS comparison algorithm](event-dag.md#bfs-traversal) and `apply_event`
+  accept. It exposes `get_event` (the union of staging and permanent
+  storage), `event_stored` (permanent storage only), and
+  `storage_is_definitive` (whether a negative `event_stored` result is
+  authoritative).
 
-- **`get_event`** returns the union of staging and permanent storage. On
-  [`CachedEventGetter`](#cachedeventgetter), it additionally falls back to a remote peer request.
-  This is the method the [BFS algorithm](event-dag.md#bfs-traversal) calls at every traversal step.
-- **`event_stored`** checks permanent storage only, skipping the staging map.
-  Used by the [creation-event guard](entity-lifecycle.md#guard-ordering) where the question is "has this event been
-  previously committed?" not "is this event currently discoverable?"
-- **`storage_is_definitive`** returns whether `event_stored() == false` is
-  authoritative. On [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes), all events backing the entity state are in
-  local storage, so a `false` from `event_stored` proves the event has never
-  been seen. On [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes) (where `StateSnapshot` can establish entity
-  state without storing individual events), this defaults to `false`.
+- **`GetState`** -- Entity state snapshot retrieval. Separated because state
+  has different caching characteristics and is not needed by BFS.
 
-A blanket `impl GetEvents for &R` exists because nearly every call site passes
-getters by reference.
-
-### `GetState`
-
-```rust
-#[async_trait]
-pub trait GetState {
-    async fn get_state(&self, entity_id: EntityId)
-        -> Result<Option<Attested<EntityState>>, RetrievalError>;
-}
-```
-
-Retrieves entity state snapshots from local storage. Separated from `GetEvents`
-because state retrieval has different caching characteristics and is not needed
-by the BFS comparison algorithm. Also has a blanket `&R` impl.
-
-### `SuspenseEvents`
-
-```rust
-#[async_trait]
-pub trait SuspenseEvents: GetEvents {
-    fn stage_event(&self, event: Event);
-    async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError>;
-}
-```
-
-Extends `GetEvents` with mutation capabilities. Only the outermost call site
-(e.g., `NodeApplier::apply_update`) holds a `SuspenseEvents` reference. It is
-deliberately **not** passed into [`apply_event`](entity-lifecycle.md#apply_event-in-detail) to prevent accidental staging or
-committing inside the comparison/application logic.
-
-- **`stage_event`** uses interior mutability (`&self`, not `&mut self`) via
-  `Arc<RwLock<HashMap>>`. After staging, the event is discoverable by
-  `get_event` (and therefore by BFS), but not by `event_stored`.
-- **`commit_event`** takes `&Attested<Event>` (not `&EventId`) because the
-  storage layer requires the full attested event. It persists to storage and
-  removes the event from the staging map.
+- **`SuspenseEvents`** -- Extends `GetEvents` with `stage_event` and
+  `commit_event`. Only the outermost caller (e.g., `NodeApplier`) holds
+  this; it is deliberately *not* passed into `apply_event`.
 
 
-## Concrete Types
+## Staging vs Permanent Storage
 
-### `LocalEventGetter`
+The retrieval layer maintains two tiers of event storage:
 
-Implements `GetEvents + SuspenseEvents`. Used by [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes).
+**The staging map** is an in-memory `HashMap` behind an `Arc<RwLock>`. When
+an event is staged, it becomes visible to `get_event` and therefore to BFS
+traversal, but `event_stored` will still return `false`. Staging is what
+makes the [comparison algorithm](event-dag.md#comparing-two-clocks) work
+on incoming events: the event is staged first, then `compare` uses the
+event's own ID as the subject clock, and BFS discovers the event body
+through the staging map.
 
-| Method | Behavior |
-|--------|----------|
-| `get_event` | Check staging map, then local storage |
-| `event_stored` | Check local storage only |
-| `storage_is_definitive` | Returns the `durable` flag passed at construction |
-| `stage_event` | Insert into `Arc<RwLock<HashMap>>` |
-| `commit_event` | `collection.add_event(attested)`, then remove from staging |
+**Permanent storage** is the durable backend. After `apply_event` succeeds,
+the caller commits the event -- writing it to permanent storage and removing
+it from the staging map. From this point, `event_stored` returns `true`.
 
-Constructed with a `durable` flag. On durable nodes (`durable: true`),
-`storage_is_definitive()` returns `true`, enabling the cheap [creation-event
-guard](entity-lifecycle.md#guard-ordering) in `apply_event`.
-
-### `CachedEventGetter`
-
-Implements `GetEvents + SuspenseEvents`. Used by [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes).
-
-| Method | Behavior |
-|--------|----------|
-| `get_event` | Check staging, then local storage, then request from remote peer |
-| `event_stored` | Check local storage only |
-| `storage_is_definitive` | Returns `false` (default) |
-| `stage_event` | Insert into `Arc<RwLock<HashMap>>` |
-| `commit_event` | `collection.add_event(attested)`, then remove from staging |
-
-The remote-peer fallback in `get_event` requests the event from a random [durable
-peer](node-architecture.md#durable-vs-ephemeral-nodes), stores the response locally for future access, then returns it. This is
-what allows [BFS](event-dag.md#bfs-traversal) to succeed on ephemeral nodes for events they have never locally
-committed: the [accumulator](event-dag.md#core-concepts) calls `get_event`, which transparently fetches from
-the durable peer.
-
-`CachedEventGetter` is parameterized over the storage engine, policy agent, and
-context data types, and borrows the `Node` and context data by reference.
-
-### `LocalStateGetter`
-
-Implements `GetState`. Shared by both durable and ephemeral paths.
-
-Wraps a `StorageCollectionWrapper` and translates `EntityNotFound` errors into
-`Ok(None)`.
+The distinction between `get_event` (union view) and `event_stored`
+(permanent-only) matters for the
+[creation-event guard](entity-lifecycle.md#guard-ordering): on
+[durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) where
+`storage_is_definitive()` is `true`, a `false` from `event_stored` for a
+creation event proves it has never been seen, enabling a cheap rejection
+without BFS. On [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes),
+this shortcut is unsafe because entities can arrive via `StateSnapshot`
+without their individual events being stored.
 
 
-## The Staging Lifecycle
+## Durable vs Ephemeral Lookup Strategies
 
-A typical flow in [`NodeApplier::apply_update`](node-architecture.md#streaming-updates-updatecontent) for `EventOnly` content:
+The two concrete implementations of the retrieval traits differ in how far
+they search for a missing event:
+
+**`LocalEventGetter`** -- Used by [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes).
+Checks the staging map, then local storage. If the event is not found
+locally, that is a hard error. Sets `storage_is_definitive` based on the
+`durable` flag passed at construction.
+
+**`CachedEventGetter`** -- Used by [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes).
+Adds a third lookup tier: if the event is not in staging or local storage,
+it requests the event from a random durable peer, caches the response
+locally, and returns it. This transparent remote fallback is what allows
+[BFS](event-dag.md#bfs-traversal) to succeed on ephemeral nodes that lack
+historical events. `storage_is_definitive` is always `false`.
+
+**`LocalStateGetter`** -- Shared by both paths. Wraps storage to retrieve
+entity state snapshots, translating "not found" into `Ok(None)`.
+
+
+## The Event Lifecycle: Stage, Apply, Commit, Persist
+
+A typical flow in [`NodeApplier::apply_update`](node-architecture.md#streaming-updates-updatecontent)
+for `EventOnly` content:
 
 ```text
-for each event_fragment:
-    validate_received_event(...)
-    event_getter.stage_event(event.clone())        // (1) stage
+for each event:
+    validate(event)
+    event_getter.stage_event(event)            // (1) stage
 
-entity = get_retrieve_or_create(...)
+entity = get_or_create(...)
 
 for each attested_event:
-    entity.apply_event(event_getter, &event)?      // (2) compare + apply (in memory)
-    event_getter.commit_event(&attested_event)?     // (3) commit to disk
+    entity.apply_event(event_getter, &event)   // (2) compare + apply in memory
+    event_getter.commit_event(&attested_event)  // (3) commit to disk
 
-save_state(node, &entity, &collection)?             // (4) persist entity state
+save_state(entity)                             // (4) persist entity state
 ```
 
-Steps 2 and 3 are per-event. Step 4 runs once after all events are applied.
-
-For `StateAndEvent` content, the flow first attempts [`apply_state`](entity-lifecycle.md#apply_state-in-detail). If the state
-is strictly newer, it commits all staged events and saves state. If the state
-diverges or is older, it falls back to per-event [`apply_event`](entity-lifecycle.md#apply_event-in-detail) followed by
+For `StateAndEvent` content, the flow first tries
+[`apply_state`](entity-lifecycle.md#how-state-snapshots-are-applied). If the state is
+strictly newer, all staged events are committed and state is saved. If the
+state diverges, it falls back to per-event
+[`apply_event`](entity-lifecycle.md#how-events-are-applied) followed by
 `commit_event`, then saves state.
 
 For `EventBridge` (in `apply_delta`), all events are staged upfront, then
@@ -149,26 +112,22 @@ applied and committed in causal order (oldest first), and finally the entity
 state is saved.
 
 
-## Crash Safety Properties
+## Crash Safety
 
-The ordering invariant (`commit_event` before `set_state`) provides these
-guarantees:
+The ordering invariant -- commit events before persisting state -- provides
+clean recovery in every failure scenario:
 
-**Crash after `commit_event`, before `set_state`:** The event is in permanent
-storage but the entity state on disk still references the old head. On recovery,
-the entity loads the old state. The next time this event is delivered (or any
-descendant of it), BFS will find it in storage and integrate it correctly. No
-data loss, no corruption.
+- **Crash after commit, before state save:** The event is in storage but the
+  entity state still references the old head. On recovery, the next delivery
+  of the same event (or any descendant) integrates it via BFS. No data loss.
 
-**Crash after `stage_event`, before `commit_event`:** Neither the event nor the
-updated entity state are persisted. The staging map is in-memory only and lost
-on crash. This is a clean rollback to the last persisted state.
+- **Crash after stage, before commit:** The staging map is in-memory only
+  and lost on crash. Neither the event nor the updated state are persisted.
+  Clean rollback.
 
-**Crash after `set_state`:** The fully consistent state is on disk. Normal
-operation.
+- **Crash after state save:** Fully consistent. Normal operation.
 
-**No crash, but concurrent `apply_event` on the same entity:** The [`try_mutate`](entity-lifecycle.md#the-try_mutate-toctou-protection)
-helper in `Entity` acquires the write lock and checks that the head has not
-changed since the [BFS comparison](event-dag.md#bfs-traversal). If it has, the caller retries with the updated
-head (up to 5 attempts). This prevents TOCTOU races between comparison and head
-mutation.
+- **Concurrent `apply_event` on the same entity:** The
+  [`try_mutate`](entity-lifecycle.md#toctou-protection) helper
+  checks that the head has not changed since comparison. If it has, the
+  caller retries (up to 5 attempts), preventing TOCTOU races.
