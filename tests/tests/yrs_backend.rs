@@ -262,10 +262,11 @@ async fn test_yrs_convergence() -> Result<()> {
 }
 
 /// Test: Sequential text operations maintain order
-// TODO: Evaluate if this test is valid — creates entity with empty YrsString content,
-// may not produce a creation event. Disabled during EventAccumulator refactor (Phase 3).
+// TODO(#175): Blocked on PR #236 — Yrs does not differentiate between empty string
+// and null value. Creating an entity with content: "" produces no CRDT operations,
+// so no creation event is generated and the entity is never persisted to storage.
 #[tokio::test]
-#[ignore]
+#[ignore = "blocked on #236: Yrs empty-string treated as null"]
 async fn test_sequential_text_operations() -> Result<()> {
     let ctx = setup().await?;
     let mut dag = TestDag::new();

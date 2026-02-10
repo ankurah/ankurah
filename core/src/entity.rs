@@ -749,7 +749,7 @@ impl WeakEntitySet {
                 } else {
                     // no stored state, so we can use the given state directly
                     match self.private_get_or_create(id, &collection_id, &state)? {
-                        (true, entity) => entity, // somebody frontran us to create it, so we have to apply the new state
+                        (true, entity) => entity, // some body frontran us to create it, so we have to apply the new state
                         (false, entity) => {
                             // we just created it with the given state, so there's nothing to apply. early return
                             return Ok((None, entity));

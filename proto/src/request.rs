@@ -143,7 +143,7 @@ pub enum NodeResponseBody {
     Fetch(Vec<EntityDelta>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    QuerySubscribed { query_id: QueryId, initial: Vec<EntityDelta> },
+    QuerySubscribed { query_id: QueryId, deltas: Vec<EntityDelta> },
     Success,
     Error(String),
 }
@@ -194,7 +194,7 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::QuerySubscribed { query_id, initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
+            NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
         }

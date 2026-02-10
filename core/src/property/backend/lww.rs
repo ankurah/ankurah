@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::{Event, EventId, Operation};
+use ankurah_proto::{EventId, Operation};
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 

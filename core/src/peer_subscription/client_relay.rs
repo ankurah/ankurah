@@ -538,7 +538,7 @@ where
             .await
             .map_err(|e| RetrievalError::RequestError(e))?
         {
-            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, initial: deltas } => deltas,
+            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, deltas } => deltas,
             ankurah_proto::NodeResponseBody::Error(e) => return Err(RetrievalError::RequestError(RequestError::ServerError(e))),
             other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
         };
