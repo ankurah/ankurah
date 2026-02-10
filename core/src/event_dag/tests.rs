@@ -506,6 +506,67 @@ async fn test_compare_event_redundant_delivery() {
 }
 
 // ============================================================================
+// MISSING EVENT BUSYLOOP TESTS
+// ============================================================================
+
+/// Proves that compare() busyloops when a frontier event can't be fetched.
+///
+/// Setup: A (creation, in retriever) -> B (child of A, NOT in retriever) -> C (child of B, in retriever).
+/// compare(subject=[C], comparison=[A]) starts BFS. It fetches C (ok, parents=[B]),
+/// adds B to subject frontier. Tries to fetch B -> EventNotFound -> `continue`,
+/// which skips process_event (the only place that removes IDs from frontiers).
+/// B stays on the frontier forever -> infinite loop.
+///
+/// We run compare on a separate OS thread because the busy loop never yields
+/// to the tokio runtime (MockRetriever returns Ready immediately), so
+/// tokio::time::timeout would never get a chance to fire on a single thread.
+#[test]
+fn test_missing_event_busyloop() {
+    let mut retriever = MockRetriever::new();
+
+    // A: creation event, in retriever
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    retriever.add_event(ev_a);
+
+    // B: child of A, deliberately NOT added to retriever (missing event)
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    // Do NOT add ev_b to retriever
+
+    // C: child of B, in retriever
+    let ev_c = make_test_event(3, &[id_b.clone()]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
+
+    // compare(subject=[C], comparison=[A]):
+    // BFS fetches C (ok), adds parent B to subject frontier.
+    // BFS fetches A (ok, it's comparison frontier).
+    // BFS tries to fetch B -> EventNotFound -> continue -> B stays on frontier -> loop
+    let subject = clock!(id_c);
+    let comparison = clock!(id_a);
+
+    // Run on a separate OS thread so we can detect the timeout.
+    // The busy loop never yields (MockRetriever returns Ready), so
+    // tokio::time::timeout on a single-threaded runtime would never fire.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(compare(retriever, &subject, &comparison, 100));
+        let _ = tx.send(result);
+    });
+
+    // Wait up to 2 seconds. If it doesn't return, it's busylooping.
+    let recv_result = rx.recv_timeout(std::time::Duration::from_secs(2));
+
+    // Timeout (Err) means busyloop -- this is the bug we're documenting
+    assert!(recv_result.is_err(), "Expected timeout due to busyloop, but compare returned");
+}
+
+// ============================================================================
 // MULTI-HEAD BUG FIX TESTS (Phase 2A)
 // ============================================================================
 
