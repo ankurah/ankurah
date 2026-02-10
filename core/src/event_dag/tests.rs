@@ -1,13 +1,18 @@
 #![cfg(test)]
 
 use crate::error::RetrievalError;
+use crate::event_dag::accumulator::EventLayer;
+use crate::property::backend::lww::LWWBackend;
+use crate::property::backend::PropertyBackend;
 use crate::retrieval::GetEvents;
+use crate::value::Value;
 
 use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
 use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 // ============================================================================
 // TEST INFRASTRUCTURE
@@ -32,7 +37,9 @@ impl GetEvents for MockRetriever {
         self.events.get(event_id).cloned().ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
     }
 
-    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> { Ok(self.events.contains_key(event_id)) }
+    /// MockRetriever simulates ephemeral storage: events are retrievable via
+    /// get_event but not considered durably stored.
+    async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
 }
 
 /// Create a test event with deterministic content-hashed IDs.
@@ -51,6 +58,39 @@ macro_rules! clock {
     ($($id:expr),* $(,)?) => {
         Clock::from(vec![$($id.clone()),*])
     };
+}
+
+/// Create a test event with LWW operations.
+/// Uses a seed to create deterministic but different entity IDs for each event.
+fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
+    // Use seed for entity_id to get different event hashes
+    let mut entity_id_bytes = [0u8; 16];
+    entity_id_bytes[0] = seed;
+    let entity_id = EntityId::from_bytes(entity_id_bytes);
+
+    let backend = LWWBackend::new();
+    for (name, value) in properties {
+        backend.set(name.into(), Some(Value::String(value.into())));
+    }
+    let ops = backend.to_operations().unwrap().unwrap();
+    Event {
+        entity_id,
+        collection: "test".into(),
+        parent: Clock::default(),
+        operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+    }
+}
+
+fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
+    let mut dag = BTreeMap::new();
+    for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
+        dag.insert(event.id(), event.parent.as_slice().to_vec());
+    }
+    EventLayer::new(already_applied.iter().map(|e| (*e).clone()).collect(), to_apply.iter().map(|e| (*e).clone()).collect(), Arc::new(dag))
+}
+
+fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
+    layer_from_refs_with_context(already_applied, to_apply, &[])
 }
 
 // ============================================================================
@@ -1109,50 +1149,7 @@ async fn test_event_in_history_not_at_head() {
 
 #[cfg(test)]
 mod lww_layer_tests {
-    use crate::event_dag::accumulator::EventLayer;
-    use crate::property::backend::lww::LWWBackend;
-    use crate::property::backend::PropertyBackend;
-    use crate::value::Value;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    /// Create a test event with LWW operations.
-    /// Uses a seed to create deterministic but different entity IDs for each event.
-    fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
-        // Use seed for entity_id to get different event hashes
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = seed;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-
-        let backend = LWWBackend::new();
-        for (name, value) in properties {
-            backend.set(name.into(), Some(Value::String(value.into())));
-        }
-        let ops = backend.to_operations().unwrap().unwrap();
-        Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        }
-    }
-
-    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
-        let mut dag = BTreeMap::new();
-        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            dag.insert(event.id(), event.parent.as_slice().to_vec());
-        }
-        EventLayer::new(
-            already_applied.iter().map(|e| (*e).clone()).collect(),
-            to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(dag),
-        )
-    }
-
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
-        layer_from_refs_with_context(already_applied, to_apply, &[])
-    }
+    use super::*;
 
     #[test]
     fn test_apply_layer_higher_event_id_wins() {
@@ -1282,12 +1279,8 @@ mod lww_layer_tests {
 
 #[cfg(test)]
 mod yrs_layer_tests {
-    use crate::event_dag::accumulator::EventLayer;
+    use super::*;
     use crate::property::backend::yrs::YrsBackend;
-    use crate::property::backend::PropertyBackend;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     /// Create a test event with Yrs text operations.
     /// Each text operation inserts the given string at position 0.
@@ -1306,22 +1299,6 @@ mod yrs_layer_tests {
             parent: Clock::default(),
             operations: OperationSet(BTreeMap::from([("yrs".to_string(), ops)])),
         }
-    }
-
-    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
-        let mut dag = BTreeMap::new();
-        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            dag.insert(event.id(), event.parent.as_slice().to_vec());
-        }
-        EventLayer::new(
-            already_applied.iter().map(|e| (*e).clone()).collect(),
-            to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(dag),
-        )
-    }
-
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
-        layer_from_refs_with_context(already_applied, to_apply, &[])
     }
 
     #[test]
@@ -1426,47 +1403,7 @@ mod yrs_layer_tests {
 
 #[cfg(test)]
 mod determinism_tests {
-    use crate::event_dag::accumulator::EventLayer;
-    use crate::property::backend::lww::LWWBackend;
-    use crate::property::backend::PropertyBackend;
-    use crate::value::Value;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = seed;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-
-        let backend = LWWBackend::new();
-        for (name, value) in properties {
-            backend.set(name.into(), Some(Value::String(value.into())));
-        }
-        let ops = backend.to_operations().unwrap().unwrap();
-        Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        }
-    }
-
-    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
-        let mut dag = BTreeMap::new();
-        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            dag.insert(event.id(), event.parent.as_slice().to_vec());
-        }
-        EventLayer::new(
-            already_applied.iter().map(|e| (*e).clone()).collect(),
-            to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(dag),
-        )
-    }
-
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
-        layer_from_refs_with_context(already_applied, to_apply, &[])
-    }
+    use super::*;
 
     #[test]
     fn test_two_event_determinism() {
@@ -1567,47 +1504,7 @@ mod determinism_tests {
 
 #[cfg(test)]
 mod edge_case_tests {
-    use crate::event_dag::accumulator::EventLayer;
-    use crate::property::backend::lww::LWWBackend;
-    use crate::property::backend::PropertyBackend;
-    use crate::value::Value;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = seed;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-
-        let backend = LWWBackend::new();
-        for (name, value) in properties {
-            backend.set(name.into(), Some(Value::String(value.into())));
-        }
-        let ops = backend.to_operations().unwrap().unwrap();
-        Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        }
-    }
-
-    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
-        let mut dag = BTreeMap::new();
-        for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
-            dag.insert(event.id(), event.parent.as_slice().to_vec());
-        }
-        EventLayer::new(
-            already_applied.iter().map(|e| (*e).clone()).collect(),
-            to_apply.iter().map(|e| (*e).clone()).collect(),
-            Arc::new(dag),
-        )
-    }
-
-    fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
-        layer_from_refs_with_context(already_applied, to_apply, &[])
-    }
+    use super::*;
 
     fn empty_layer() -> EventLayer { EventLayer::new(Vec::new(), Vec::new(), Arc::new(BTreeMap::new())) }
 
@@ -1754,31 +1651,7 @@ mod edge_case_tests {
 /// event_id ordering. This tests the `older_than_meet` rule.
 #[cfg(test)]
 mod phase4_stored_below_meet {
-    use crate::event_dag::accumulator::EventLayer;
-    use crate::property::backend::lww::LWWBackend;
-    use crate::property::backend::PropertyBackend;
-    use crate::value::Value;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0] = seed;
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-
-        let backend = LWWBackend::new();
-        for (name, value) in properties {
-            backend.set(name.into(), Some(Value::String(value.into())));
-        }
-        let ops = backend.to_operations().unwrap().unwrap();
-        Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        }
-    }
+    use super::*;
 
     #[test]
     fn test_stored_event_id_below_meet_loses_to_layer_candidate() {
@@ -1880,39 +1753,11 @@ mod phase4_idempotency {
 /// be rejected with DuplicateCreation.
 #[cfg(test)]
 mod phase4_duplicate_creation {
+    use super::*;
     use crate::entity::Entity;
     use crate::error::MutationError;
-    use crate::retrieval::GetEvents;
-    use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
-    use async_trait::async_trait;
-    use std::collections::{BTreeMap, HashMap};
-
-    #[derive(Clone)]
-    struct SimpleRetriever {
-        events: HashMap<EventId, Event>,
-    }
-
-    impl SimpleRetriever {
-        fn new() -> Self { Self { events: HashMap::new() } }
-        fn add_event(&mut self, event: Event) { self.events.insert(event.id(), event); }
-    }
-
-    #[async_trait]
-    impl GetEvents for SimpleRetriever {
-        async fn get_event(&self, event_id: &EventId) -> Result<Event, crate::error::RetrievalError> {
-            self.events.get(event_id).cloned().ok_or_else(|| crate::error::RetrievalError::EventNotFound(event_id.clone()))
-        }
-
-        /// SimpleRetriever has no concept of permanent storage vs staging,
-        /// so event_stored always returns false.
-        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, crate::error::RetrievalError> { Ok(false) }
-    }
 
     fn make_creation_event(seed: u8) -> Event {
-        use crate::property::backend::lww::LWWBackend;
-        use crate::property::backend::PropertyBackend;
-        use crate::value::Value;
-
         let mut entity_id_bytes = [0u8; 16];
         entity_id_bytes[0] = 42; // Same entity for both events
         let entity_id = EntityId::from_bytes(entity_id_bytes);
@@ -1938,7 +1783,7 @@ mod phase4_duplicate_creation {
         let entity_id = EntityId::from_bytes(entity_id_bytes);
         let entity = Entity::create(entity_id, "test".into());
 
-        let mut retriever = SimpleRetriever::new();
+        let mut retriever = MockRetriever::new();
 
         // First creation event should succeed
         let creation_event_1 = make_creation_event(1);
@@ -1952,7 +1797,7 @@ mod phase4_duplicate_creation {
         assert!(!entity.head().is_empty(), "Entity head should be non-empty after creation");
 
         // Second creation event (different seed = different event) should be rejected.
-        // BFS detects two different roots → Disjoint → LineageError::Disjoint
+        // BFS detects two different roots -> Disjoint -> LineageError::Disjoint
         let creation_event_2 = make_creation_event(2);
         retriever.add_event(creation_event_2.clone());
         let result = entity.apply_event(&retriever, &creation_event_2).await;
@@ -1969,7 +1814,7 @@ mod phase4_duplicate_creation {
         let entity_id = EntityId::from_bytes(entity_id_bytes);
         let entity = Entity::create(entity_id, "test".into());
 
-        let mut retriever = SimpleRetriever::new();
+        let mut retriever = MockRetriever::new();
 
         // First creation event
         let creation_event = make_creation_event(1);
@@ -1979,7 +1824,7 @@ mod phase4_duplicate_creation {
         assert!(result.is_ok() && result.unwrap(), "First apply should succeed");
 
         // Re-deliver the SAME creation event (same content, same id)
-        // Since event_stored returns true, it should be treated as re-delivery
+        // Since event_stored returns false but event is at head, comparison returns Equal -> no-op
         let result = entity.apply_event(&retriever, &creation_event).await;
         assert!(result.is_ok(), "Re-delivery of same creation event should not error");
         assert!(!result.unwrap(), "Re-delivery should return false (no-op)");

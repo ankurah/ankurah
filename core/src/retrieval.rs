@@ -102,7 +102,7 @@ impl GetEvents for LocalEventGetter {
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
         // Check staging first
         {
-            let staging = self.staging.read().unwrap();
+            let staging = self.staging.read().unwrap_or_else(|e| e.into_inner());
             if let Some(event) = staging.get(event_id) {
                 return Ok(event.clone());
             }
@@ -124,13 +124,13 @@ impl GetEvents for LocalEventGetter {
 #[async_trait]
 impl SuspenseEvents for LocalEventGetter {
     fn stage_event(&self, event: Event) {
-        let mut staging = self.staging.write().unwrap();
+        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
         staging.insert(event.id(), event);
     }
 
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
         self.collection.add_event(attested).await?;
-        let mut staging = self.staging.write().unwrap();
+        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
         staging.remove(&attested.payload.id());
         Ok(())
     }
@@ -174,7 +174,7 @@ where
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
         // Check staging first
         {
-            let staging = self.staging.read().unwrap();
+            let staging = self.staging.read().unwrap_or_else(|e| e.into_inner());
             if let Some(event) = staging.get(event_id) {
                 return Ok(event.clone());
             }
@@ -227,13 +227,13 @@ where
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
     fn stage_event(&self, event: Event) {
-        let mut staging = self.staging.write().unwrap();
+        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
         staging.insert(event.id(), event);
     }
 
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
         self.collection.add_event(attested).await?;
-        let mut staging = self.staging.write().unwrap();
+        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
         staging.remove(&attested.payload.id());
         Ok(())
     }

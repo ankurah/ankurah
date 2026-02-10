@@ -4,7 +4,7 @@ pub mod connector;
 pub mod context;
 pub mod entity;
 pub mod error;
-pub mod event_dag;
+pub(crate) mod event_dag;
 pub mod indexing;
 pub mod livequery;
 pub mod model;

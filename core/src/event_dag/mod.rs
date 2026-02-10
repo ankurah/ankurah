@@ -4,23 +4,28 @@
 //! Attestations are handled at a higher layer - this code works only with
 //! causal assertions and event relationships.
 
-pub mod accumulator;
-pub mod comparison;
-pub mod frontier;
-pub mod layers;
-pub mod relation;
+pub(crate) mod accumulator;
+pub(crate) mod comparison;
+pub(crate) mod frontier;
+pub(crate) mod layers;
+pub(crate) mod relation;
 #[cfg(test)]
-pub mod tests;
+mod tests;
 
 // Core types
-pub use frontier::Frontier;
-pub use relation::AbstractCausalRelation;
+pub(crate) use frontier::Frontier;
+pub(crate) use relation::AbstractCausalRelation;
 
 // Comparison functions
-pub use comparison::compare;
+pub(crate) use comparison::compare;
 
 // Layer computation
-pub use layers::CausalRelation;
+pub(crate) use layers::CausalRelation;
 
 // Accumulator types
-pub use accumulator::{ComparisonResult, EventAccumulator, EventLayers};
+pub(crate) use accumulator::{ComparisonResult, EventAccumulator, EventLayers};
+
+/// Default budget for DAG traversal — large enough for typical histories
+/// but bounded to prevent runaway traversal on malicious/corrupted data.
+/// Budget escalation is handled internally by `compare` (up to 4x).
+pub(crate) const DEFAULT_BUDGET: usize = 1000;

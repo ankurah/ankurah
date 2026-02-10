@@ -15,7 +15,7 @@ use crate::retrieval::GetEvents;
 use ankurah_proto::{Event, EventId};
 
 // Re-export CausalRelation from layers (same enum, avoid duplication)
-pub use super::layers::CausalRelation;
+pub(crate) use super::layers::CausalRelation;
 
 /// Accumulates event DAG structure during comparison and provides
 /// read-through caching for event retrieval during layer iteration.
@@ -24,7 +24,7 @@ pub use super::layers::CausalRelation;
 /// comparison begins (eager storage model). The accumulator tracks
 /// DAG structure (parent pointers) discovered during BFS and caches
 /// hot events to reduce storage round-trips.
-pub struct EventAccumulator<E: GetEvents> {
+pub(crate) struct EventAccumulator<E: GetEvents> {
     /// DAG structure: event id -> parent ids (always in memory, cheap)
     dag: BTreeMap<EventId, Vec<EventId>>,
 
@@ -38,12 +38,12 @@ pub struct EventAccumulator<E: GetEvents> {
 impl<E: GetEvents> EventAccumulator<E> {
     /// Create a new accumulator with the given retriever.
     /// LRU cache defaults to 1000 entries.
-    pub fn new(event_getter: E) -> Self {
+    pub(crate) fn new(event_getter: E) -> Self {
         Self { dag: BTreeMap::new(), cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), event_getter }
     }
 
     /// Called during BFS traversal -- records DAG structure and caches the event.
-    pub fn accumulate(&mut self, event: &Event) {
+    pub(crate) fn accumulate(&mut self, event: &Event) {
         let id = event.id();
         let parents: Vec<EventId> = event.parent.as_slice().to_vec();
         self.dag.insert(id, parents);
@@ -52,7 +52,7 @@ impl<E: GetEvents> EventAccumulator<E> {
 
     /// Get event by id: cache -> retriever (storage).
     /// All events are already in storage (eager storage model).
-    pub async fn get_event(&mut self, id: &EventId) -> Result<Event, RetrievalError> {
+    pub(crate) async fn get_event(&mut self, id: &EventId) -> Result<Event, RetrievalError> {
         if let Some(event) = self.cache.get(id) {
             return Ok(event.clone());
         }
@@ -63,33 +63,35 @@ impl<E: GetEvents> EventAccumulator<E> {
 
     /// Check whether an event_id is present in the accumulated DAG structure.
     /// Used by LWW resolution to distinguish "known older" from "unknown".
-    pub fn contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
+    pub(crate) fn contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
 
     /// Get a reference to the DAG structure.
-    pub fn dag(&self) -> &BTreeMap<EventId, Vec<EventId>> { &self.dag }
+    pub(crate) fn dag(&self) -> &BTreeMap<EventId, Vec<EventId>> { &self.dag }
 
     /// Produce layer iterator for merge (consumes self).
     /// Only valid for DivergedSince results -- the DAG must be complete.
-    pub fn into_layers(self, meet: Vec<EventId>, current_head: Vec<EventId>) -> EventLayers<E> {
+    pub(crate) fn into_layers(self, meet: Vec<EventId>, current_head: Vec<EventId>) -> EventLayers<E> {
         EventLayers::new(self, meet, current_head)
     }
 }
 
 /// Result of a causal comparison, carrying the accumulated DAG.
-pub struct ComparisonResult<E: GetEvents> {
+pub(crate) struct ComparisonResult<E: GetEvents> {
     /// The causal relation between the compared clocks.
-    pub relation: AbstractCausalRelation<EventId>,
+    pub(crate) relation: AbstractCausalRelation<EventId>,
     /// The event accumulator with DAG structure (private -- access via into_layers).
     accumulator: EventAccumulator<E>,
 }
 
 impl<E: GetEvents> ComparisonResult<E> {
     /// Create a new ComparisonResult.
-    pub fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<E>) -> Self { Self { relation, accumulator } }
+    pub(crate) fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<E>) -> Self {
+        Self { relation, accumulator }
+    }
 
     /// For DivergedSince results, consume self to get a layer iterator.
     /// Returns None for non-divergent relations.
-    pub fn into_layers(self, current_head: Vec<EventId>) -> Option<EventLayers<E>> {
+    pub(crate) fn into_layers(self, current_head: Vec<EventId>) -> Option<EventLayers<E>> {
         match &self.relation {
             AbstractCausalRelation::DivergedSince { meet, .. } => Some(self.accumulator.into_layers(meet.clone(), current_head)),
             _ => None,
@@ -97,10 +99,10 @@ impl<E: GetEvents> ComparisonResult<E> {
     }
 
     /// Get a reference to the accumulator (for inspection/testing).
-    pub fn accumulator(&self) -> &EventAccumulator<E> { &self.accumulator }
+    pub(crate) fn accumulator(&self) -> &EventAccumulator<E> { &self.accumulator }
 
     /// Decompose into relation and accumulator.
-    pub fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<E>) { (self.relation, self.accumulator) }
+    pub(crate) fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<E>) { (self.relation, self.accumulator) }
 }
 
 // ---- EventLayers: async layer iterator ----
@@ -108,10 +110,8 @@ impl<E: GetEvents> ComparisonResult<E> {
 /// Async iterator over EventLayer for merge application.
 /// Computes layers lazily using forward expansion from the meet point.
 /// Pre-builds a parent->children index at construction for O(1) lookups.
-pub struct EventLayers<E: GetEvents> {
+pub(crate) struct EventLayers<E: GetEvents> {
     accumulator: EventAccumulator<E>,
-    #[allow(dead_code)]
-    meet: Vec<EventId>,
     current_head_ancestry: BTreeSet<EventId>,
 
     /// Parent->children index, built once at construction: O(N)
@@ -158,12 +158,12 @@ impl<E: GetEvents> EventLayers<E> {
             .cloned()
             .collect();
 
-        Self { accumulator, meet, current_head_ancestry, children_index, dag, processed, frontier }
+        Self { accumulator, current_head_ancestry, children_index, dag, processed, frontier }
     }
 
     /// Get next layer (async -- may fetch events from storage via accumulator).
     /// Returns layers in topological order (earliest first).
-    pub async fn next(&mut self) -> Result<Option<EventLayer>, RetrievalError> {
+    pub(crate) async fn next(&mut self) -> Result<Option<EventLayer>, RetrievalError> {
         if self.frontier.is_empty() {
             return Ok(None);
         }
@@ -226,28 +226,28 @@ impl<E: GetEvents> EventLayers<E> {
 /// rather than full event clones. The `compare()` method is infallible since
 /// it only traverses parent pointers, treating missing entries as dead ends.
 #[derive(Debug, Clone)]
-pub struct EventLayer {
-    pub already_applied: Vec<Event>,
-    pub to_apply: Vec<Event>,
+pub(crate) struct EventLayer {
+    pub(crate) already_applied: Vec<Event>,
+    pub(crate) to_apply: Vec<Event>,
     /// Shared DAG structure for causal comparison: event_id -> parent_ids.
     dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
 }
 
 impl EventLayer {
     /// Create a new EventLayer with the given events and DAG structure.
-    pub fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag: Arc<BTreeMap<EventId, Vec<EventId>>>) -> Self {
+    pub(crate) fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag: Arc<BTreeMap<EventId, Vec<EventId>>>) -> Self {
         Self { already_applied, to_apply, dag }
     }
 
     /// Check whether an event_id is present in the accumulated DAG.
     /// Used by LWW to implement the "older than meet" rule.
-    pub fn dag_contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
+    pub(crate) fn dag_contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
 
     /// Compare two event IDs using accumulated DAG context.
     ///
     /// Returns the causal relation between `a` and `b`. Missing entries
     /// are treated as dead ends (below the meet), not errors.
-    pub fn compare(&self, a: &EventId, b: &EventId) -> CausalRelation {
+    pub(crate) fn compare(&self, a: &EventId, b: &EventId) -> CausalRelation {
         if a == b {
             return CausalRelation::Descends;
         }
