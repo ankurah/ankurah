@@ -111,8 +111,7 @@ impl NodeApplier {
                     attested_events.push(attested_event);
                 }
 
-                let state: ankurah_proto::Attested<ankurah_proto::EntityState> =
-                    (entity_id, collection_id.clone(), state_fragment.clone()).into();
+                let state = (entity_id, collection_id.clone(), state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage

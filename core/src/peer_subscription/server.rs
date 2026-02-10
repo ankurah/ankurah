@@ -129,7 +129,7 @@ impl SubscriptionHandler {
             }
         }
 
-        Ok(proto::NodeResponseBody::QuerySubscribed { query_id, initial: deltas })
+        Ok(proto::NodeResponseBody::QuerySubscribed { query_id, deltas })
     }
 }
 
