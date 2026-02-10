@@ -47,8 +47,7 @@ pub trait TContext {
     async fn get_entity(&self, id: proto::EntityId, collection: &proto::CollectionId, cached: bool) -> Result<Entity, RetrievalError>;
     fn get_resident_entity(&self, id: proto::EntityId) -> Option<Entity>;
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError>;
-    async fn commit_local_trx(&self, trx: &Transaction) -> Result<(), MutationError>;
-    async fn commit_local_trx_with_events(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
+    async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
 }
@@ -68,12 +67,111 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn fetch_entities(&self, collection: &proto::CollectionId, args: MatchArgs) -> Result<Vec<Entity>, RetrievalError> {
         self.fetch_entities(collection, args).await
     }
-    async fn commit_local_trx(&self, trx: &Transaction) -> Result<(), MutationError> {
-        self.commit_local_trx_with_events(trx).await?;
-        Ok(())
-    }
-    async fn commit_local_trx_with_events(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
-        self.commit_local_trx_impl(trx).await
+    async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
+        use std::sync::atomic::Ordering;
+
+        // Atomically mark transaction as no longer alive, preventing double-commit.
+        // compare_exchange returns Err if the value was already false (already committed/rolled back).
+        if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err(MutationError::General("Transaction already committed or rolled back".into()));
+        }
+
+        // Generate events from the transaction entities
+        let trx_id = trx.id.clone();
+        let mut entity_events = Vec::new();
+        for entity in trx.entities.iter() {
+            if let Some(event) = entity.generate_commit_event()? {
+                // Validate creation events: if parent is empty, this is a creation event
+                // and the entity must have been created in this transaction via create()
+                if event.is_entity_create() {
+                    let created_ids = trx.created_entity_ids.read().unwrap();
+                    if !created_ids.contains(&entity.id) {
+                        return Err(MutationError::General(
+                            format!(
+                                "Cannot commit phantom entity {}: entity has empty parent (creation event) \
+                             but was not created in this transaction via create()",
+                                entity.id
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+                entity_events.push((entity.clone(), event));
+            }
+        }
+
+        // Now commit the events
+        let mut attested_events = Vec::new();
+        let mut entity_attested_events = Vec::new();
+
+        // Check policy and collect attestations
+        for (entity, event) in entity_events {
+            // Create a temporary fork to apply the event for validation
+            use std::sync::atomic::AtomicBool;
+            let trx_alive = Arc::new(AtomicBool::new(true));
+            let forked = entity.snapshot(trx_alive);
+
+            // Get the canonical (upstream) entity for before state
+            let entity_before = match &entity.kind {
+                crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
+                crate::entity::EntityKind::Primary => entity.clone(),
+            };
+
+            // Stage event and apply to fork for after state (no commit_event call here)
+            let collection_id = &event.collection;
+            let collection = self.node.collections.get(collection_id).await?;
+            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
+            event_getter.stage_event(event.clone());
+            forked.apply_event(&event_getter, &event).await?;
+
+            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
+            let attested = Attested::opt(event.clone(), attestation);
+
+            // Now commit the event to storage
+            event_getter.commit_event(&attested).await?;
+
+            attested_events.push(attested.clone());
+            entity_attested_events.push((entity, attested));
+        }
+
+        // Update heads BEFORE relaying (makes entities visible to server echo)
+        for (entity, attested_event) in &entity_attested_events {
+            entity.commit_head(Clock::new([attested_event.payload.id()]));
+        }
+        // Relay to peers and wait for confirmation
+        self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
+
+        // All peers confirmed, persist state to storage
+        let mut changes: Vec<EntityChange> = Vec::new();
+        for (entity, attested_event) in entity_attested_events {
+            let collection_id = &attested_event.payload.collection;
+            let collection = self.node.collections.get(collection_id).await?;
+
+            // Persist canonical entity (upstream for transactional forks, entity itself for primary)
+            let canonical_entity = match &entity.kind {
+                crate::entity::EntityKind::Transacted { upstream, .. } => {
+                    // Event is now in storage, construct fresh getter for upstream apply
+                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
+                    upstream.apply_event(&event_getter, &attested_event.payload).await?;
+                    upstream.clone()
+                }
+                crate::entity::EntityKind::Primary => entity,
+            };
+
+            let state = canonical_entity.to_state()?;
+
+            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
+            let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
+            let attested = Attested::opt(entity_state, attestation);
+            collection.set_state(attested).await?;
+
+            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
+        }
+
+        // Notify reactor of ALL changes
+        self.node.reactor.notify_change(changes).await;
+
+        Ok(attested_events.into_iter().map(|a| a.payload).collect())
     }
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError> {
         EntityLiveQuery::new(&self.node, collection_id, args, self.cdata.clone())
@@ -246,115 +344,6 @@ where
             }
             Ok(entities)
         }
-    }
-
-    /// Does all the things necessary to commit a local transaction
-    /// notably, the application of events to Entities works differently versus remote transactions
-    async fn commit_local_trx_impl(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError> {
-        use std::sync::atomic::Ordering;
-
-        // Atomically mark transaction as no longer alive, preventing double-commit.
-        // compare_exchange returns Err if the value was already false (already committed/rolled back).
-        if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return Err(MutationError::General("Transaction already committed or rolled back".into()));
-        }
-
-        // Generate events from the transaction entities
-        let trx_id = trx.id.clone();
-        let mut entity_events = Vec::new();
-        for entity in trx.entities.iter() {
-            if let Some(event) = entity.generate_commit_event()? {
-                // Validate creation events: if parent is empty, this is a creation event
-                // and the entity must have been created in this transaction via create()
-                if event.is_entity_create() {
-                    let created_ids = trx.created_entity_ids.read().unwrap();
-                    if !created_ids.contains(&entity.id) {
-                        return Err(MutationError::General(
-                            format!(
-                                "Cannot commit phantom entity {}: entity has empty parent (creation event) \
-                             but was not created in this transaction via create()",
-                                entity.id
-                            )
-                            .into(),
-                        ));
-                    }
-                }
-                entity_events.push((entity.clone(), event));
-            }
-        }
-
-        // Now commit the events
-        let mut attested_events = Vec::new();
-        let mut entity_attested_events = Vec::new();
-
-        // Check policy and collect attestations
-        for (entity, event) in entity_events {
-            // Create a temporary fork to apply the event for validation
-            use std::sync::atomic::AtomicBool;
-            let trx_alive = Arc::new(AtomicBool::new(true));
-            let forked = entity.snapshot(trx_alive);
-
-            // Get the canonical (upstream) entity for before state
-            let entity_before = match &entity.kind {
-                crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
-                crate::entity::EntityKind::Primary => entity.clone(),
-            };
-
-            // Stage event and apply to fork for after state (no commit_event call here)
-            let collection_id = &event.collection;
-            let collection = self.node.collections.get(collection_id).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.stage_event(event.clone());
-            forked.apply_event(&event_getter, &event).await?;
-
-            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
-            let attested = Attested::opt(event.clone(), attestation);
-
-            // Now commit the event to storage
-            event_getter.commit_event(&attested).await?;
-
-            attested_events.push(attested.clone());
-            entity_attested_events.push((entity, attested));
-        }
-
-        // Update heads BEFORE relaying (makes entities visible to server echo)
-        for (entity, attested_event) in &entity_attested_events {
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
-        }
-        // Relay to peers and wait for confirmation
-        self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
-
-        // All peers confirmed, persist state to storage
-        let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
-            let collection_id = &attested_event.payload.collection;
-            let collection = self.node.collections.get(collection_id).await?;
-
-            // Persist canonical entity (upstream for transactional forks, entity itself for primary)
-            let canonical_entity = match &entity.kind {
-                crate::entity::EntityKind::Transacted { upstream, .. } => {
-                    // Event is now in storage, construct fresh getter for upstream apply
-                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
-                    upstream.apply_event(&event_getter, &attested_event.payload).await?;
-                    upstream.clone()
-                }
-                crate::entity::EntityKind::Primary => entity,
-            };
-
-            let state = canonical_entity.to_state()?;
-
-            let entity_state = EntityState { entity_id: canonical_entity.id(), collection: canonical_entity.collection().clone(), state };
-            let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
-            let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(attested).await?;
-
-            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
-        }
-
-        // Notify reactor of ALL changes
-        self.node.reactor.notify_change(changes).await;
-
-        Ok(attested_events.into_iter().map(|a| a.payload).collect())
     }
 
     /// Fetch entities from the first available durable peer with known_matches support

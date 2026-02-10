@@ -76,11 +76,6 @@ impl<E: GetEvents> EventAccumulator<E> {
         &self.dag
     }
 
-    /// Get a mutable reference to the retriever.
-    pub fn event_getter_mut(&mut self) -> &mut E {
-        &mut self.event_getter
-    }
-
     /// Produce layer iterator for merge (consumes self).
     /// Only valid for DivergedSince results -- the DAG must be complete.
     pub fn into_layers(
@@ -313,10 +308,6 @@ impl EventLayer {
         CausalRelation::Concurrent
     }
 
-    /// Check if this layer has any events to apply.
-    pub fn has_work(&self) -> bool {
-        !self.to_apply.is_empty()
-    }
 }
 
 // ---- Helper functions ----

@@ -10,37 +10,12 @@ use std::collections::BTreeSet;
 pub struct Frontier<Id> {
     /// Current set of event IDs at this frontier boundary.
     pub ids: BTreeSet<Id>,
-
-    /// State tracking whether this frontier has encountered non-descending paths.
-    pub state: FrontierState,
-}
-
-/// Tracks the exploration state of a frontier.
-#[derive(Debug, Clone, PartialEq)]
-pub enum FrontierState {
-    /// Still exploring paths normally.
-    Exploring,
-
-    /// Found a non-descending assertion - frontier is tainted.
-    /// Even if other paths succeed, best result is PartiallyDescends.
-    Tainted { reason: TaintReason },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum TaintReason {
-    NotDescends,
-    Incomparable,
-    PartiallyDescends,
 }
 
 impl<Id: Ord> Frontier<Id> {
-    pub fn new(ids: impl IntoIterator<Item = Id>) -> Self { Self { ids: ids.into_iter().collect(), state: FrontierState::Exploring } }
+    pub fn new(ids: impl IntoIterator<Item = Id>) -> Self { Self { ids: ids.into_iter().collect() } }
 
     pub fn is_empty(&self) -> bool { self.ids.is_empty() }
-
-    pub fn is_tainted(&self) -> bool { matches!(self.state, FrontierState::Tainted { .. }) }
-
-    pub fn taint(&mut self, reason: TaintReason) { self.state = FrontierState::Tainted { reason }; }
 
     /// Remove an ID from the frontier (when processing an event).
     pub fn remove(&mut self, id: &Id) -> bool { self.ids.remove(id) }

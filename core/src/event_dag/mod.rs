@@ -11,12 +11,10 @@ pub mod layers;
 pub mod relation;
 #[cfg(test)]
 pub mod tests;
-pub mod traits;
 
 // Core types
-pub use frontier::{Frontier, FrontierState, TaintReason};
+pub use frontier::Frontier;
 pub use relation::AbstractCausalRelation;
-pub use traits::{EventId, TClock, TEvent};
 
 // Comparison functions
 pub use comparison::compare;
