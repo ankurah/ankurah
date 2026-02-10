@@ -1,374 +1,170 @@
 # Property Backends
 
-## Overview
+## What is a Property Backend?
 
-Each entity in ankurah stores its mutable state across one or more **property
-backends**. A backend owns a set of named properties and knows how to apply
-mutations, resolve concurrency, and serialize its state. The two shipping
-backends are:
+Every entity in ankurah stores its mutable state in one or more **property
+backends**. A backend is the layer responsible for three things: holding named
+property values, applying mutations to those values, and deciding what happens
+when two replicas change the same property concurrently.
 
-- **LWW** (Last-Writer-Wins) -- stores scalar values (strings, integers, JSON,
-  entity references). Concurrent writes to the same property are [resolved
-  deterministically](lww-merge.md): the write with the greater `EventId` wins.
-- **Yrs** -- stores collaboratively-editable text using the Yrs CRDT library.
-  Concurrent edits merge automatically because Yrs operations are commutative
-  and idempotent.
+The system ships two backends, each with a different conflict-resolution
+strategy:
 
-The backend system lives in `core/src/property/backend/`. Value-type wrappers
-that present backends to user code live in `core/src/property/value/`.
+- **LWW (Last-Writer-Wins)** -- for scalar values (strings, integers, JSON,
+  entity references). When two replicas write to the same property at the same
+  time, a single winner is [chosen deterministically](lww-merge.md) so that
+  every replica converges on the same result.
+- **Yrs** -- for collaboratively-editable text, powered by the Yrs CRDT
+  library. Concurrent edits are merged automatically; no winner needs to be
+  chosen because CRDT operations are commutative and idempotent.
+
+**When to use which:** Use LWW for any property where the value is a discrete
+whole -- a name, a count, a JSON blob, a reference to another entity. Use Yrs
+when the property is text that multiple users may edit simultaneously and you
+want their keystrokes to merge rather than overwrite each other.
 
 
 ## The PropertyBackend Trait
 
-Defined in `core/src/property/backend/mod.rs`, `PropertyBackend` is the
-interface that every backend must implement:
+Both backends implement a shared `PropertyBackend` trait (defined in
+`core/src/property/backend/mod.rs`). Rather than listing every method, the
+trait covers four responsibilities:
 
-```rust
-pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
-    fn property_backend_name() -> &'static str where Self: Sized;
-
-    // -- Mutation --
-    fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError>;
-    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError>;
-    fn apply_operations_with_event(&self, operations: &[Operation], event_id: EventId)
-        -> Result<(), MutationError>;
-    fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError>;
-
-    // -- Serialization --
-    fn to_state_buffer(&self) -> Result<Vec<u8>, StateError>;
-    fn from_state_buffer(state_buffer: &Vec<u8>) -> Result<Self, RetrievalError>
-        where Self: Sized;
-
-    // -- Query --
-    fn properties(&self) -> Vec<PropertyName>;
-    fn property_value(&self, name: &PropertyName) -> Option<Value>;
-    fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>>;
-
-    // -- Lifecycle --
-    fn fork(&self) -> Arc<dyn PropertyBackend>;
-    fn listen_field(&self, name: &PropertyName, listener: Listener) -> ListenerGuard;
-}
-```
-
-The methods break down into four groups:
-
-### Mutation methods
-
-`to_operations` collects all changes made since the last call. For LWW, it
-transitions `Uncommitted` entries to `Pending` and serializes the changed
-property-name-to-value pairs into a single `Operation`. For Yrs, it encodes the
-delta between the previous `StateVector` and the current document state using
-Yrs v2 encoding. If nothing changed, both backends return `Ok(None)`.
-
-`apply_operations` applies operations without event tracking. This is used when
-loading from a state buffer where there is no associated event.
-
-`apply_operations_with_event` applies operations and records which `EventId` set
-each property. The default implementation (used by Yrs) delegates to
-`apply_operations` and discards the event ID, since CRDTs resolve concurrency
-internally. LWW overrides this to store the `EventId` alongside each value,
-which is essential for later conflict resolution.
-
-`apply_layer` is the unified concurrency-resolution entry point, described in
-detail below and in the [LWW Merge Resolution](lww-merge.md) document.
-
-### Serialization methods
-
-`to_state_buffer` serializes the backend's current state into an opaque byte
-vector. For LWW, this is a bincode-encoded `BTreeMap<PropertyName,
-CommittedEntry>` where each `CommittedEntry` carries the value and the
-`EventId` that wrote it. If any entry lacks an `EventId` (i.e. it is still
-`Uncommitted` or `Pending`), serialization fails -- this guards against
-persisting incomplete state. For Yrs, the buffer is the document encoded as a
-Yrs v2 update from an empty `StateVector`, which captures the complete document
-history.
-
-`from_state_buffer` reconstructs a backend from a previously serialized buffer.
-
-### The StateBuffers format
-
-Entity state is persisted as a `State` struct containing a `Clock` (the [head](event-dag.md#core-concepts))
-and a `StateBuffers` map (`BTreeMap<String, Vec<u8>>`). Each key is a backend
-name (`"lww"`, `"yrs"`), and each value is the byte vector produced by that
-backend's `to_state_buffer`. This is defined in `proto/src/data.rs`. See
-[Entity State Persistence](entity-lifecycle.md#entity-state-persistence) for the full serialization flow.
+1. **Mutation** -- collect local changes into serializable operations, and
+   apply incoming operations from other replicas.
+2. **Serialization** -- snapshot the backend to a byte buffer and restore it
+   later. Entity state is persisted as a `State` containing a `Clock` (the
+   [head](event-dag.md#core-concepts)) and a `StateBuffers` map keyed by
+   backend name (`"lww"`, `"yrs"`). See
+   [Entity State Persistence](entity-lifecycle.md#entity-state-persistence).
+3. **Query** -- read the current value of any property.
+4. **Lifecycle** -- fork a copy for transaction isolation and subscribe to
+   per-field change notifications.
 
 
 ## LWW Backend
 
-Defined in `core/src/property/backend/lww.rs`.
+### Value lifecycle
 
-### Internal state
-
-LWW stores its properties in `RwLock<BTreeMap<PropertyName, ValueEntry>>`. Each
-`ValueEntry` is in one of three states:
+An LWW property value moves through three states:
 
 | State | Meaning |
 |-------|---------|
-| `Uncommitted { value }` | User called `set()` on a transaction fork; not yet collected |
-| `Pending { value }` | `to_operations()` collected it, awaiting commit |
-| `Committed { value, event_id }` | Applied from a committed event; `event_id` records the writer |
+| **Uncommitted** | User called `set()` inside a transaction; change has not been collected yet |
+| **Pending** | `to_operations()` collected the change; awaiting commit |
+| **Committed** | Applied from a committed event; an `EventId` records which event wrote it |
 
-Only `Committed` entries have an `EventId`. This invariant is enforced by
-`to_state_buffer`, which returns an error if any entry is `Uncommitted` or
-`Pending`.
+Only **Committed** entries carry an `EventId`. The backend refuses to serialize
+its state if any entry is still Uncommitted or Pending -- this prevents
+persisting incomplete state.
 
-### Conflict resolution via apply_layer
+### Conflict resolution
 
-When [concurrent branches are merged](entity-lifecycle.md#apply_event-in-detail), the entity layer calls `apply_layer` on
-every backend for each [`EventLayer`](#eventlayer-helpers) in causal order. The LWW implementation
-works as follows (see also [LWW Resolution Rules](lww-merge.md#lww-resolution-rules) for the full algorithm):
+When [concurrent branches merge](entity-lifecycle.md#apply_event-in-detail),
+the entity feeds each backend an `EventLayer` -- a batch of events in causal
+order. For each layer the LWW backend must choose a single winning value per
+property. The full algorithm is described in
+[LWW Resolution Rules](lww-merge.md#lww-resolution-rules); the conceptual
+steps are:
 
-**Step 1 -- Seed winners from stored state.** The backend reads all current
-`Committed` entries and creates a `Candidate` for each one. Each candidate
-carries the property value, the `EventId` that wrote it, and two flags:
-`from_to_apply` (false for stored values) and `older_than_meet`.
+1. **Seed winners from stored state.** Every existing Committed value becomes a
+   candidate. If its `EventId` is absent from the
+   [accumulated DAG](event-dag.md#core-concepts), the value is flagged
+   **older than meet**.
 
-The `older_than_meet` flag is set when the stored value's `EventId` is not
-present in the [accumulated DAG](event-dag.md#core-concepts) (`!layer.dag_contains(&event_id)`). This means
-the value was written by an event that is strictly older than the [meet point](event-dag.md#core-concepts).
-Any layer candidate automatically wins against such a value.
+2. **Process layer events.** Each event in the layer may write to the same
+   property. The new candidate is compared against the current winner:
+   - If the current winner is *older than meet*, the new candidate wins
+     unconditionally.
+   - Otherwise, causal ordering decides: a causally newer event replaces an
+     older one.
+   - For **concurrent** events (no causal relationship), the tie is broken by
+     lexicographic `EventId` comparison.
 
-**Step 2 -- Process layer events.** For each event in both `already_applied` and
-`to_apply`, the backend deserializes LWW operations and extracts per-property
-changes. Each change becomes a candidate. For every property, the new candidate
-is compared against the current winner:
+3. **Apply only new winners.** Winners from events not yet in the entity's
+   state are written as Committed entries; winners from already-applied events
+   need no mutation. Changed properties notify signal subscribers.
 
-- If the current winner is `older_than_meet`, the new candidate wins
-  unconditionally.
-- Otherwise, `layer.compare(&candidate_id, &current_winner_id)` determines the
-  causal relationship:
-  - `Descends` -- the candidate is causally newer; it replaces the winner.
-  - `Ascends` -- the candidate is causally older; no change.
-  - `Concurrent` -- the events are on different branches with no causal
-    ordering. The tie is broken by lexicographic `EventId` comparison:
-    `candidate.event_id > current.event_id` wins.
+### The "older than meet" rule
 
-**Step 3 -- Apply winners from to_apply.** Only candidates whose
-`from_to_apply` flag is true are written to the backend's state as `Committed`
-entries. Winners that came from `already_applied` events are already reflected
-in the current state, so no mutation is needed.
+When the stored value's `EventId` is not in the accumulated DAG, it was
+written by an event that predates the [meet point](event-dag.md#core-concepts).
+Any layer candidate is guaranteed to be at least as recent as the meet, so it
+wins unconditionally. This avoids expensive ancestry traversals to events
+outside the DAG.
 
-After writing, the backend notifies field-level signal subscribers for any
-changed properties.
-
-### Why lexicographic EventId works
+### Why lexicographic EventId comparison is safe
 
 `EventId` is a SHA-256 hash of `(entity_id, operations, parent_clock)`. The
-lexicographic ordering of these hashes has no semantic relationship to wall-clock
-time or branch depth. However, it provides a **deterministic total order** over
-events. All replicas comparing the same pair of concurrent events will pick the
-same winner, which is the property required for convergence. See
-[Determinism](lww-merge.md#determinism) for a formal argument.
+ordering of hashes has no relationship to wall-clock time, but it provides a
+**deterministic total order**: every replica comparing the same pair of
+concurrent events will pick the same winner. That is all convergence requires.
+See [Determinism](lww-merge.md#determinism) for the formal argument.
 
 
 ## Yrs Backend
 
-Defined in `core/src/property/backend/yrs.rs`.
+The Yrs backend stores a `yrs::Doc` document internally and tracks a
+`StateVector` for computing diffs.
 
-### Internal state
+Conflict resolution is far simpler than LWW: the backend applies every
+operation from new events and ignores already-applied events entirely. This
+works because:
 
-Yrs stores a `yrs::Doc` document, a `Mutex<StateVector>` tracking the previous
-state (for diff computation in `to_operations`), and per-field broadcast
-channels for change notifications.
+- **Commutativity** -- Yrs operations produce the same result regardless of
+  application order. No winner selection is needed.
+- **Idempotency** -- Yrs deduplicates operations internally via its state
+  vector. Re-applying an update is a no-op.
 
-### apply_layer for CRDTs
+### Known limitation: empty-string/null ambiguity
 
-The Yrs `apply_layer` implementation is much simpler than LWW:
-
-```rust
-fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError> {
-    for event in &layer.to_apply {
-        if let Some(operations) = event.operations.get("yrs") {
-            for operation in operations {
-                self.apply_update(&operation.diff, &changed_fields)?;
-            }
-        }
-    }
-    Ok(())
-}
-```
-
-It ignores `already_applied` events entirely and applies all operations from
-`to_apply` events. This works because:
-
-1. **Commutativity** -- Yrs operations produce the same result regardless of
-   application order. There is no need to compare candidates or pick winners.
-2. **Idempotency** -- Yrs internally deduplicates operations using its state
-   vector. Applying an already-integrated update is a no-op.
-
-The `already_applied` events are ignored because their operations are already
-reflected in the Yrs document state. Even if they were applied again, Yrs
-would deduplicate them.
-
-### The empty-string/null issue
-
-Yrs does not distinguish between a text field that has never been written and
-one that has been set to the empty string. When an entity is created with an
-empty-string Yrs property, no CRDT operations are generated, which means no
-creation event is produced and the entity may not be persisted. This is tracked
-as issue #175 (see also `tests/tests/yrs_backend.rs`, the ignored
-`test_sequential_text_operations` test and the [Known Gaps](testing.md#known-gaps-and-ignored-tests)
-section of the testing strategy).
+Yrs cannot distinguish between a text field that has never been written and one
+set to the empty string. An entity created with an empty Yrs property produces
+no CRDT operations, which can prevent persistence. This is tracked as issue
+\#175; see also [Known Gaps](testing.md#known-gaps-and-ignored-tests).
 
 
-## EventLayer Helpers
+## Backend Registration
 
-The `EventLayer` struct is defined in `core/src/event_dag/accumulator.rs`. It
-carries the events to process plus a shared reference to the [accumulated DAG](event-dag.md#core-concepts)
-structure:
+Backend instances are created on demand via `backend_from_string` in
+`core/src/property/backend/mod.rs`, which maps a name (`"lww"` or `"yrs"`) to
+a constructor.
 
-```rust
-pub struct EventLayer {
-    pub already_applied: Vec<Event>,
-    pub to_apply: Vec<Event>,
-    dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
-}
-```
-
-Two helper methods on `EventLayer` are used by the LWW backend:
-
-### dag_contains
-
-```rust
-pub fn dag_contains(&self, id: &EventId) -> bool {
-    self.dag.contains_key(id)
-}
-```
-
-Checks whether an event ID is present in the accumulated DAG. The LWW backend
-uses this to implement the "older than meet" rule: if a stored value's
-`EventId` is not in the DAG, the value was written by an event that predates
-the meet point, and any layer candidate wins against it unconditionally. This
-avoids the need for a potentially expensive ancestry traversal to an event
-outside the DAG.
-
-### compare
-
-```rust
-pub fn compare(&self, a: &EventId, b: &EventId) -> CausalRelation {
-    if a == b { return CausalRelation::Descends; }
-    if is_descendant_dag(&self.dag, a, b) { return CausalRelation::Descends; }
-    if is_descendant_dag(&self.dag, b, a) { return CausalRelation::Ascends; }
-    CausalRelation::Concurrent
-}
-```
-
-Determines the causal relationship between two events within the accumulated
-DAG. The `is_descendant_dag` helper performs a backward BFS through parent
-pointers from the candidate descendant, looking for the candidate ancestor.
-Missing entries (events below the meet that were not accumulated) are treated
-as dead ends rather than errors, making the method infallible.
-
-Note: when `a == b`, the method returns `Descends`. Semantically an event does
-not descend from itself, but in the LWW resolution context this means "same
-writer, no replacement needed," which is functionally correct.
-
-The `CausalRelation` enum has three variants (`Descends`, `Ascends`,
-`Concurrent`) and is defined in `core/src/event_dag/layers.rs`. See also
-[LWW Resolution Rules](lww-merge.md#lww-resolution-rules) for how these relations drive conflict resolution.
-
-
-## Backend Registration and Late Creation
-
-Backend instances are created on demand. The function `backend_from_string` in
-`core/src/property/backend/mod.rs` maps a name string (`"lww"` or `"yrs"`) to
-a constructor call, optionally initializing from a state buffer:
-
-```rust
-pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>)
-    -> Result<Arc<dyn PropertyBackend>, RetrievalError>
-```
-
-This is currently a hardcoded dispatch (with a TODO to implement a registry).
-
-During layer application in [`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail) (in `core/src/entity.rs`),
-the entity checks whether each `to_apply` event references a backend that does
-not yet exist in the entity's backend map. If so, a new empty backend is
-created and all previously applied layers are replayed on it before it receives
-the current layer:
-
-```rust
-for evt in &layer.to_apply {
-    for (backend_name, _) in evt.operations.iter() {
-        if !state.backends.contains_key(backend_name) {
-            let backend = backend_from_string(backend_name, None)?;
-            for earlier in &applied_layers {
-                backend.apply_layer(earlier)?;
-            }
-            state.backends.insert(backend_name.clone(), backend);
-        }
-    }
-}
-```
-
-This ensures that a backend first encountered mid-merge receives the full
-causal history from the meet point forward.
-
-When an entity is first accessed via `Entity::get_backend<P>()`, the same
-`backend_from_string` call creates a fresh backend if one does not exist. This
-is how the LWW and Yrs backends are lazily initialized on a newly created
-entity before any mutations occur.
-
-
-## Operation Diff Format
-
-### LWW
-
-LWW operations are serialized as an `LWWDiff` struct containing a version byte
-(currently `1`) and a bincode-encoded inner payload. The inner payload is a
-`BTreeMap<PropertyName, Option<Value>>` mapping each changed property to its new
-value. A `None` value represents deletion.
-
-`to_operations` collects all `Uncommitted` entries, transitions them to
-`Pending`, and returns a single `Operation` wrapping the serialized diff.
-`apply_operations_internal` deserializes the diff and writes each property into
-the backend's value map.
-
-### Yrs
-
-Yrs operations contain a single Yrs v2-encoded update diff. `to_operations`
-computes the diff between the previous `StateVector` and the current document
-state. If the diff equals `Update::EMPTY_V2`, it returns `None`.
-`apply_operations` decodes the v2 update and applies it to the Yrs document via
-`txn.apply_update`.
+During [layer application](entity-lifecycle.md#apply_event-in-detail), if an
+event references a backend that does not yet exist on the entity, a new empty
+backend is created and all earlier layers are replayed on it before the current
+layer is applied. This ensures a backend first encountered mid-merge receives
+the full causal history from the meet point forward.
 
 
 ## Value Types
 
-The value type wrappers in `core/src/property/value/` present backends to user
-code through the derive macro system:
+User code interacts with backends through value-type wrappers generated by the
+derive macro system (defined in `core/src/property/value/`):
 
 | Type | Backend | Purpose |
 |------|---------|---------|
-| `LWW<T>` | LWWBackend | Scalar property with last-writer-wins semantics. `T` implements `Property` (String, i64, Json, Ref, etc.) |
-| `YrsString<P>` | YrsBackend | Collaboratively-editable text with insert/delete/replace operations |
-| `Json` | LWWBackend (via `LWW<Json>`) | Structured JSON data stored as a scalar LWW value |
-| `Ref<T>` | LWWBackend (via `LWW<Ref<T>>`) | Typed entity reference storing an `EntityId` |
+| `LWW<T>` | LWW | Scalar property; `T` implements `Property` (String, i64, Json, Ref, etc.) |
+| `YrsString<P>` | Yrs | Collaboratively-editable text with insert/delete/replace |
+| `Json` | LWW (via `LWW<Json>`) | Structured JSON stored as a scalar |
+| `Ref<T>` | LWW (via `LWW<Ref<T>>`) | Typed entity reference storing an `EntityId` |
 
-`LWW<T>` delegates `set` and `get` to `LWWBackend::set` / `LWWBackend::get`.
-`YrsString<P>` delegates `insert`, `delete`, `replace`, and `overwrite` to the
-corresponding `YrsBackend` methods, which operate on a named Yrs `Text` type
-within the document.
-
-Both types enforce write guards: calling `set` or `insert` on a non-writable
-entity (i.e. not inside an active [transaction](entity-lifecycle.md#local-creation-transaction-path)) returns
-`PropertyError::TransactionClosed`.
+Both `LWW<T>` and `YrsString<P>` enforce write guards: calling a mutating
+method outside an active [transaction](entity-lifecycle.md#local-creation-transaction-path)
+returns `PropertyError::TransactionClosed`.
 
 
-## How It All Fits Together
+## End-to-End Merge Flow
 
-The end-to-end flow for a concurrent merge:
-
-1. A remote event arrives and is [staged](event-dag.md#the-staging-pattern). [`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail) calls
-   [`compare()`](event-dag.md#the-comparison-algorithm) which traverses the DAG and returns `DivergedSince`.
-2. The [`EventAccumulator`](event-dag.md#core-concepts) from the comparison is consumed to produce
-   [`EventLayers`](event-dag.md#core-concepts) -- an async iterator of `EventLayer` values in topological
-   order from the meet.
-3. Under the entity's write lock, each layer is applied to every backend via
-   `apply_layer`. The LWW backend [resolves per-property winners](lww-merge.md#lww-resolution-rules) using
-   [`dag_contains`](#dag_contains) and [`compare`](#compare). The Yrs backend applies CRDT updates.
-4. Late-created backends receive replayed earlier layers before the current one.
-5. The entity head is updated: meet IDs are removed and the new event ID is
-   inserted.
-6. Signal subscribers are notified of the change.
+1. A remote event arrives and is [staged](event-dag.md#the-staging-pattern).
+   [`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail) calls
+   [`compare()`](event-dag.md#the-comparison-algorithm), which returns
+   `DivergedSince`.
+2. The [`EventAccumulator`](event-dag.md#core-concepts) produces
+   [`EventLayers`](event-dag.md#core-concepts) -- topologically ordered batches
+   of events from the meet point forward.
+3. Each layer is applied to every backend: LWW
+   [resolves per-property winners](lww-merge.md#lww-resolution-rules); Yrs
+   applies CRDT updates.
+4. Late-created backends receive replayed earlier layers first.
+5. The entity head is updated and signal subscribers are notified.
