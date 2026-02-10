@@ -72,10 +72,44 @@ pub async fn compare<E: GetEvents>(
         return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
     }
 
+    let mut accumulator = EventAccumulator::new(event_getter);
+
+    // Quick check: if every comparison head appears as a parent of some subject
+    // event, then subject strictly descends from comparison (one step away).
+    // This avoids BFS entirely for the common case of a new event whose parents
+    // ARE the current head -- and crucially avoids fetching the comparison events
+    // themselves, which may not be in local storage (ephemeral node scenario).
+    {
+        let comparison_set: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
+        let mut all_parents: BTreeSet<EventId> = BTreeSet::new();
+        let mut all_fetched = true;
+
+        for id in subject.as_slice() {
+            match accumulator.get_event(id).await {
+                Ok(event) => {
+                    accumulator.accumulate(&event);
+                    all_parents.extend(event.parent.as_slice().iter().cloned());
+                }
+                Err(_) => {
+                    all_fetched = false;
+                    break;
+                }
+            }
+        }
+
+        if all_fetched && comparison_set.is_subset(&all_parents) {
+            // Subject's parents cover all comparison heads -> StrictDescends
+            let chain: Vec<EventId> = subject.as_slice().to_vec();
+            return Ok(ComparisonResult::new(
+                AbstractCausalRelation::StrictDescends { chain },
+                accumulator,
+            ));
+        }
+    }
+
     let initial_budget = budget;
     let max_budget = initial_budget * 4;
     let mut current_budget = initial_budget;
-    let mut accumulator = EventAccumulator::new(event_getter);
 
     loop {
         let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget);
