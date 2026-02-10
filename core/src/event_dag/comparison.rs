@@ -113,16 +113,9 @@ pub async fn compare<E: GetEvents>(
 
     loop {
         let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget);
-        tracing::info!("CMP 1 - starting step loop, budget={}", current_budget);
-        let mut step_count = 0u64;
         let relation = loop {
             if let Some(relation) = comp.step().await? {
-                tracing::info!("CMP 2 - done after {} steps", step_count);
                 break relation;
-            }
-            step_count += 1;
-            if step_count % 100 == 0 {
-                tracing::info!("CMP step {}", step_count);
             }
         };
 
@@ -250,10 +243,6 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         let mut all_frontier_ids = Vec::new();
         all_frontier_ids.extend(self.subject_frontier.ids.iter().cloned());
         all_frontier_ids.extend(self.comparison_frontier.ids.iter().cloned());
-        tracing::info!("STEP sf={} cf={} budget={} unseen_c={} unseen_s={} frontier={:?}",
-            self.subject_frontier.ids.len(), self.comparison_frontier.ids.len(),
-            self.remaining_budget, self.unseen_comparison_heads, self.unseen_subject_heads,
-            all_frontier_ids);
 
         // Fetch events individually via accumulator (replaces batch expand_frontier)
         for id in &all_frontier_ids {

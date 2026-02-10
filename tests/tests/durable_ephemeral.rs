@@ -5,6 +5,7 @@ use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
 use common::*;
 use std::sync::Arc;
+use tracing::info;
 
 /// Test 3.1: Ephemeral Writes, Durable Receives
 /// Ephemeral node creates concurrent events, durable node should persist them correctly
@@ -21,8 +22,10 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
     let ctx_d = durable.context(DEFAULT_CONTEXT)?;
     let ctx_e = ephemeral.context(DEFAULT_CONTEXT)?;
 
+    info!("MARK 1");
     let mut dag = TestDag::new();
 
+    info!("MARK 2");
     // 1. Create entity on durable node
     let album_id = {
         let trx = ctx_d.begin();
@@ -31,26 +34,27 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
         dag.enumerate(trx.commit_and_return_events().await?); // A
         id
     };
-
+    info!("MARK 3");
     // Wait for propagation to ephemeral
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 2. Ephemeral subscribes/fetches entity
     let album_e = ctx_e.get::<AlbumView>(album_id).await?;
-
+    info!("MARK 4");
     // 3. Ephemeral makes two concurrent writes
     let trx1 = ctx_e.begin();
     let trx2 = ctx_e.begin();
 
     album_e.edit(&trx1)?.name().replace("Name-E1")?;
     album_e.edit(&trx2)?.year().replace("2025")?;
-
+    info!("MARK 5 - committing trx1");
     dag.enumerate(trx1.commit_and_return_events().await?); // B
+    info!("MARK 5.5 - committing trx2");
     dag.enumerate(trx2.commit_and_return_events().await?); // C
 
     // Wait for propagation to durable
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
+    info!("MARK 6");
     // 4. Verify durable node has both events with correct structure
     let collection_d = ctx_d.collection(&Album::collection()).await?;
     let events = collection_d.dump_entity_events(album_id).await?;
@@ -61,7 +65,7 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
         B => [A],
         C => [A],
     });
-
+    info!("MARK 7");
     // Verify head has 2 members
     let state = collection_d.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [B, C]);

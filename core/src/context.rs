@@ -303,7 +303,7 @@ where
             // Stage event and apply to fork for after state (no commit_event call here)
             let collection_id = &event.collection;
             let collection = self.node.collections.get(collection_id).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection);
+            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
             event_getter.stage_event(event.clone());
             forked.apply_event(&event_getter, &event).await?;
 
@@ -321,7 +321,6 @@ where
         for (entity, attested_event) in &entity_attested_events {
             entity.commit_head(Clock::new([attested_event.payload.id()]));
         }
-
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
 
@@ -335,7 +334,7 @@ where
             let canonical_entity = match &entity.kind {
                 crate::entity::EntityKind::Transacted { upstream, .. } => {
                     // Event is now in storage, construct fresh getter for upstream apply
-                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone());
+                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
                     upstream.apply_event(&event_getter, &attested_event.payload).await?;
                     upstream.clone()
                 }

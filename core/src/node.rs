@@ -552,7 +552,7 @@ where
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage
-            let event_getter = LocalEventGetter::new(collection.clone());
+            let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
             let state_getter = LocalStateGetter::new(collection.clone());
             let entity = self.entities.get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id).await?;
 
@@ -662,7 +662,7 @@ where
         use crate::retrieval::LocalEventGetter;
         use std::collections::HashSet;
 
-        let event_getter = LocalEventGetter::new(storage_collection.clone());
+        let event_getter = LocalEventGetter::new(storage_collection.clone(), self.durable);
 
         // First check the causal relationship
         let comparison_result = compare(&event_getter, current_head, known_head, 100000).await?;
@@ -840,7 +840,7 @@ where
         let storage_collection = self.collections.get(collection_id).await?;
         let initial_states = storage_collection.fetch_states(selection).await?;
         let state_getter = LocalStateGetter::new(storage_collection.clone());
-        let event_getter = LocalEventGetter::new(storage_collection);
+        let event_getter = LocalEventGetter::new(storage_collection, self.durable);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
             let (_, entity) =
