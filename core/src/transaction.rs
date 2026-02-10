@@ -38,7 +38,7 @@ pub struct Transaction {
 impl Transaction {
     #[wasm_bindgen(js_name = "commit")]
     pub async fn js_commit(self) -> Result<(), JsValue> {
-        self.dyncontext.commit_local_trx(&self).await?;
+        let _ = self.dyncontext.commit_local_trx(&self).await?;
         Ok(())
     }
 }
@@ -99,7 +99,18 @@ impl Transaction {
     }
 
     #[must_use]
-    pub async fn commit(self) -> Result<(), MutationError> { self.dyncontext.commit_local_trx(&self).await }
+    pub async fn commit(self) -> Result<(), MutationError> {
+        let _ = self.dyncontext.commit_local_trx(&self).await?;
+        Ok(())
+    }
+
+    /// Commits the transaction and returns the events that were created.
+    /// This is primarily useful for testing DAG structures.
+    #[cfg(feature = "test-helpers")]
+    #[must_use]
+    pub async fn commit_and_return_events(self) -> Result<Vec<ankurah_proto::Event>, MutationError> {
+        self.dyncontext.commit_local_trx(&self).await
+    }
 
     pub fn rollback(self) {
         // Mark transaction as no longer alive
@@ -137,7 +148,10 @@ impl Transaction {
     /// Commit the transaction (UniFFI version - uses Arc<Self>)
     /// Simply borrows self and calls commit_local_trx - the alive flag prevents double commits
     #[uniffi::method(name = "commit")]
-    pub async fn uniffi_commit(self: Arc<Self>) -> Result<(), MutationError> { self.dyncontext.commit_local_trx(&self).await }
+    pub async fn uniffi_commit(self: Arc<Self>) -> Result<(), MutationError> {
+        let _ = self.dyncontext.commit_local_trx(&self).await?;
+        Ok(())
+    }
 
     /// Rollback the transaction (UniFFI version)
     #[uniffi::method(name = "rollback")]

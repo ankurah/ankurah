@@ -1,4 +1,4 @@
-use ankurah_proto::Operation;
+use ankurah_proto::{EventId, Operation};
 use anyhow::Result;
 use std::any::Any;
 use std::fmt::Debug;
@@ -8,6 +8,7 @@ pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
 use crate::error::{MutationError, RetrievalError, StateError};
+use crate::event_dag::accumulator::EventLayer;
 pub use lww::LWWBackend;
 //pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
@@ -29,7 +30,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>>;
 
     /// Unique property backend identifier.
-    fn property_backend_name() -> String
+    fn property_backend_name() -> &'static str
     where Self: Sized;
 
     /// Get the latest state buffer for this property backend.
@@ -41,7 +42,46 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     /// Retrieve operations applied to this backend since the last time we called this method.
     fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError>;
 
-    fn apply_operations(&self, operations: &Vec<Operation>) -> Result<(), MutationError>;
+    /// Apply operations without event tracking.
+    /// Used when loading from state buffer (no associated event).
+    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError>;
+
+    /// Apply operations with event tracking.
+    ///
+    /// This tracks which event set each property value, enabling per-property
+    /// conflict resolution when concurrent events arrive later.
+    ///
+    /// For CRDT backends (like Yrs), this is equivalent to `apply_operations`
+    /// since CRDTs handle concurrency internally.
+    ///
+    /// For LWW backends, this tracks the event_id for each modified property.
+    fn apply_operations_with_event(&self, operations: &[Operation], event_id: EventId) -> Result<(), MutationError> {
+        // Default implementation ignores event_id (suitable for CRDTs)
+        let _ = event_id;
+        self.apply_operations(operations)
+    }
+
+    /// Apply a layer of concurrent events.
+    ///
+    /// All events in `layer.already_applied` and `layer.to_apply` are mutually concurrent
+    /// (same causal depth from meet). The backend receives ALL events for
+    /// complete context, but only needs to mutate state for `to_apply` events.
+    ///
+    /// # Contract
+    /// - All events in the layer are mutually concurrent (no causal relationship)
+    /// - `already_applied` events are in the current state (for context/comparison)
+    /// - `to_apply` events are new and need processing
+    /// - Backend MUST implement this method (no default)
+    ///
+    /// # For LWW backends
+    /// Determine per-property winner by causal dominance among candidates,
+    /// using `layer.compare(...)` to decide causal relationship. Use
+    /// lexicographic EventId only for truly concurrent candidates.
+    ///
+    /// # For CRDT backends (Yrs)
+    /// Apply all operations from `to_apply` events. Order within layer doesn't
+    /// matter (CRDTs are commutative). Can ignore `already_applied` and `current_head`.
+    fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError>;
 
     /// Listen to changes for a specific field managed by this backend.
     /// Auto-creates the broadcast if it doesn't exist yet.
@@ -80,6 +120,6 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
         Ok(Arc::new(backend))
     } */
     else {
-        panic!("unknown backend: {:?}", name);
+        Err(RetrievalError::Other(format!("unknown backend: {}", name)))
     }
 }

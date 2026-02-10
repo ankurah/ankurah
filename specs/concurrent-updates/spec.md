@@ -1,69 +1,252 @@
-## Concurrent Updates: Functional Specification
+# Concurrent Updates Specification
 
-### Motivation
+> **Status:** Implemented in `concurrent-updates-event-dag` branch
+
+## Motivation
 
 Ephemeral and durable peers observe edits at different times. When a peer receives updates for an entity, it must determine if those updates descend from its current head, are ancestors, or represent true concurrency. The system must converge deterministically without regressions or spurious multi-heads.
 
-### Terms and Semantics
+## Core Concepts
 
-- **CausalRelation**: Semantic relation between two heads/clocks (working type in `core`, wire type in `proto`). Variants:
-  - Equal
-  - StrictDescends
-  - StrictAscends
-  - DivergedSince { meet, subject, other }
-  - Disjoint { gca?, subject_root, other_root }
-  - BudgetExceeded { subject, other }
+### Causal Relationships
 
-### Functional Requirements
+The `AbstractCausalRelation<Id>` enum represents all possible relationships between two clocks:
 
-- **Determinism and Safety**
+| Variant | Meaning | Action |
+|---------|---------|--------|
+| `Equal` | Identical lattice points | No-op |
+| `StrictDescends { chain }` | Subject strictly after other | Apply forward chain |
+| `StrictAscends` | Subject strictly before other | No-op (incoming is older) |
+| `DivergedSince { meet, subject, other, subject_chain, other_chain }` | True concurrency | Per-property LWW merge |
+| `Disjoint { gca, subject_root, other_root }` | Different genesis events | Reject per policy |
+| `BudgetExceeded { subject, other }` | Traversal budget exhausted | Resume with frontiers |
 
-  - Do not regress state. Never “apply latest” while skipping required intermediate events.
-  - Keep at most one head unless there is true concurrency. Never create multi-heads for linear histories.
-  - Final state equals the result of applying the accepted event log in order.
+### Forward Chains
 
-- **Event or State Application**
+Forward chains are event sequences in causal order (oldest to newest) from the meet point to each head. They enable:
+- **Replay**: Apply events in correct order for `StrictDescends`
+- **Merge**: Compute per-property depths for `DivergedSince` resolution
 
-  - Equal: no-op.
-  - StrictDescends:
-    - From the meet, apply the forward chain (oldest → newest) that connects the meet to the incoming head. Advance the frontier accordingly.
-  - StrictAscends: ignore (incoming is older than current head).
-  - DivergedSince { meet, subject, other } (true concurrency):
-    - From the meet, apply the subject’s forward chain in causal order. In the same step, consider the known immediate descendants of the meet that we currently have (from staged → local → remote) and prune those that are subsumed by the applied chain’s tip. Any remaining (still-unsubsumed) descendants are bubbled into the resulting frontier as concurrent head members.
-    - Apply a deterministic per-backend LWW policy for value resolution with the following precedence:
-      1. Lineage precedence relative to the meet (later along its branch wins),
-      2. Tiebreak by lexicographic ordering of event id,
-      3. Optionally, Yrs as a stronger causal metric in the future.
-    - The system MAY preserve multi-heads when unsubsumed concurrency remains. It MUST NOT create multi-heads for linear histories.
-  - Disjoint: reject (no common genesis) per policy.
-  - BudgetExceeded { subject, other }: traversal stopped early; return the frontiers to resume in a subsequent attempt.
+Chains are accumulated during backward BFS traversal and reversed before return.
 
-- **Server-Assisted Bridge for Known Matches**
+## Algorithm: Backward Breadth-First Search
 
-  - For entities present in `known_matches` whose heads are not Equal, the server SHOULD prefer sending an EventBridge (connecting chain) over a full State snapshot whenever feasible under policy budget.
-  - EventBridge MUST be applicative (oldest → newest) on the client; staged events are preferred for zero-cost lineage checks.
+The comparison algorithm walks **backward** from two clock heads toward their common ancestors:
 
-- **Budget and Retrieval Model**
+```
+Timeline:   Root → A → B → C (head)
+                   ↑   ↑   ↑
+Search:       older ← ← ← newer (we walk this direction)
+```
 
-  - Staged events: zero cost; local batch retrieval: fixed low cost; remote retrieval: higher cost.
-  - On exceeding budget, the system returns resumable frontiers that allow continuing the traversal later.
+### Process
 
-- **Atomicity and TOCTOU**
+1. **Initialize**: Two frontiers = {subject_head} and {other_head}
+2. **Expand**: Fetch events at current frontier positions
+3. **Process**: For each event:
+   - Remove from frontier, add parents
+   - Track which frontier(s) have seen it
+   - Accumulate in visited list for chain building
+4. **Detect**: Check termination conditions
+5. **Repeat** until: relationship determined, frontiers empty, or budget exhausted
 
-  - Replay/merge plans are computed without holding the entity write lock. Before applying, take the lock, verify the head is unchanged, else recompute. Apply operations and advance head under the lock.
+### Termination Conditions
 
-- **Invariants**
-  - Applied state equals replayed event operations (for EventBridge and Descends replay).
-  - Concurrency is resolved deterministically (LWW + lexicographic tiebreak). No spurious multi-heads for linear histories; unsubsumed concurrency may be bubbled to the frontier.
-  - Security: acceptance of externally attested relations is governed by `PolicyAgent` (see lineage-attestation spec).
+- `unseen_comparison_heads == 0` → `StrictDescends` (subject has seen all comparison heads)
+- `unseen_subject_heads == 0` → `StrictAscends` (comparison has seen all subject heads)
+- Frontiers empty + common ancestors found → `DivergedSince` (true concurrency)
+- Frontiers empty + different genesis roots → `Disjoint` (incompatible histories)
+- Frontiers empty + no common, can't prove disjoint → `DivergedSince` with empty meet
+- Budget exhausted → `BudgetExceeded` (return frontiers for resumption)
 
-### Ascending application semantics
+## Conflict Resolution: Layered Event Application
 
-- After determining the meet, the system SHALL apply the subject chain in causal order (oldest → newest), prune subsumed immediate descendants of the meet, and bubble any remaining unsubsumed descendants into the resulting frontier.
-- The resulting frontier MAY be a single-member clock or multi-member when unsubsumed concurrency remains.
-- The system MAY repeat this process iteratively when additional forward events become available or after resumption from BudgetExceeded; each iteration uses the previously returned frontier as the new meet/frontier.
-- The set of immediate descendants of the meet used for pruning MAY be partial depending on budget and availability; conservative bubbling is permitted until more descendants are known.
+For `DivergedSince`, the system uses a **layered event application model** with uniform backend interface.
 
-### Out of Scope (for this spec)
+### The Layer Model
 
-- Attested lineage shortcuts (`DeltaContent::StateAndRelation`): specified in `specs/lineage-attestation/spec.md` and implemented after this concurrent-updates spec.
+Events are applied in **layers** - sets of concurrent events at the same causal depth from the meet point:
+
+```rust
+struct EventLayer {
+    already_applied: Vec<Event>,  // Context: events already in our state
+    to_apply: Vec<Event>,         // New: events to process
+    events: Arc<BTreeMap<EventId, Event>>, // DAG context for causal comparison
+}
+```
+
+**Key insight:** Events in a layer are mutually concurrent, but candidates may also include values written earlier on another branch. Use causal comparison when possible; use **lexicographic EventId** only for truly concurrent candidates.
+
+### Resolution Process
+
+1. **Navigate backward** from both heads to find meet point (common ancestors)
+2. **Accumulate full events** during traversal (via AccumulatingNavigator)
+3. **Compute layers** via frontier expansion from meet
+4. **Apply layers in causal order**, calling `backend.apply_layer()` for each
+
+### Backend Interface
+
+All backends implement the same `apply_layer` method:
+
+```rust
+trait PropertyBackend {
+    fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError>;
+}
+```
+
+### LWW Resolution Within Layer
+
+For LWW backends, each layer is resolved by:
+1. Examine ALL events (already_applied + to_apply) plus the stored last-write value
+2. Per-property winner determined by `layer.compare(a, b)`:
+   - Descends/Ascends decides the winner
+   - Concurrent falls back to lexicographic EventId
+   - Missing DAG info treats the event as a dead end in traversal (not an error)
+3. Only mutate state for winners from to_apply set
+4. Track event_id per property for future conflict resolution
+
+### Example
+
+```
+        A (meet)
+       /|\
+      B C D      ← Layer 1: {already: [B], to_apply: [C, D]}
+      | | |
+      E F G      ← Layer 2: {already: [E], to_apply: [F, G]}
+      |   |
+      H   I      ← Layer 3: {already: [H], to_apply: [I]}
+
+If current head is [H] (via A→B→E→H) and events [C,D,F,G,I] arrive:
+- Layer 1: B already applied, C and D are new, all concurrent
+- Layer 2: E already applied, F and G are new, all concurrent
+- Layer 3: H already applied, I is new, concurrent
+```
+
+### Backend-Specific Behavior
+
+- **LWW backends**: Determine winner using causal comparison; only apply winners from to_apply
+- **Yrs backends**: Apply all operations from to_apply; CRDT handles idempotency internally; already_applied ignored
+
+## Key Design Decisions
+
+### 1. Multi-Head StrictAscends Transformation
+
+**Problem**: When event D with parent `[C]` arrives at entity head `[B, C]`:
+- `compare([C], [B, C])` returns `StrictAscends` (parent is subset of head)
+- But D extends tip C and is concurrent with B
+
+**Solution**: The event is staged in the event getter (`GetEvents`) before calling `compare()` with the event's own ID as the subject. BFS naturally discovers the staged event and finds the divergence:
+- Meet = event's parent clock (the divergence point)
+- Other = head tips not in parent
+- Empty `other_chain` triggers conservative resolution (current value wins)
+
+This correctly identifies "event extending one concurrent tip" as concurrency, not redundancy.
+
+### 2. Empty Other-Chain Conservative Resolution
+
+When `other_chain` is empty (StrictAscends transformation case):
+- We can't compute depths for the other branch
+- Conservative choice: keep current value if it has a tracked `event_id`
+- Rationale: Current value was set by a more recent event on the head's branch
+
+### 3. TOCTOU Retry Pattern
+
+Event application is non-atomic (comparison is async, then write lock):
+
+```rust
+for attempt in 0..MAX_RETRIES {
+    let head = entity.head();
+    let relation = compare(event, head).await;  // No lock held
+
+    let mut state = entity.state.write();       // Take lock
+    if state.head != head {                     // Head changed during comparison
+        continue;                               // Retry
+    }
+    // Apply under lock
+    break;
+}
+```
+
+### 4. Per-Property Event Tracking
+
+LWW backend stores `event_id` per property for future conflict resolution:
+
+```rust
+struct ValueEntry {
+    value: Option<Value>,
+    event_id: EventId,  // Which event set this value (required when committed)
+    committed: bool,
+}
+```
+
+Uncommitted local changes may exist in memory without an event_id, but they are never serialized to the state buffer. This enables correct resolution when concurrent events arrive at different times.
+
+## Invariants
+
+1. **No regression**: Never skip required intermediate events
+2. **Single head for linear history**: Multi-heads only for true concurrency
+3. **Deterministic convergence**: Same events → same final state
+4. **Idempotent application**: Redundant delivery is a no-op
+
+## API Reference
+
+### Compare Functions
+
+```rust
+/// Compare two clocks to determine their causal relationship.
+/// The event getter `E: GetEvents` is responsible for providing events
+/// (including any staged/unstored events) during BFS traversal.
+pub fn compare<E>(
+    subject: &Clock,
+    comparison: &Clock,
+    events: E,
+) -> Result<ComparisonResult, RetrievalError>
+```
+
+### PropertyBackend Trait
+
+```rust
+/// Apply operations with event tracking for conflict resolution
+fn apply_operations_with_event(
+    &self,
+    operations: &[Operation],
+    event_id: EventId,
+) -> Result<(), MutationError>
+
+/// Apply a layer of concurrent events (unified interface for all backends)
+fn apply_layer(
+    &self,
+    already_applied: &[&Event],  // Events at this depth already in state
+    to_apply: &[&Event],         // Events at this depth to process
+) -> Result<(), MutationError>
+```
+
+### Layer Computation
+
+```rust
+/// Layer computation is accessed via `into_layers()` on the `EventLayers`
+/// type returned by `ComparisonResult`.
+let layers: EventLayers = result.into_layers();
+```
+
+## Test Coverage
+
+The implementation includes comprehensive tests for:
+
+- Multi-head extension (event extends one tip of multi-head)
+- Deep diamond concurrency (symmetric and asymmetric branches)
+- Short branch from deep point (meet is not genesis)
+- Per-property LWW resolution (different properties, different winners)
+- Same-depth lexicographic tiebreak
+- Idempotency (redundant event delivery)
+- Chain ordering verification
+- Disjoint detection (different genesis events)
+- Layer computation (two-branch, multi-way, diamonds)
+- LWW apply_layer (winner determination, already_applied vs to_apply)
+- Yrs apply_layer (CRDT idempotency, concurrent text edits)
+
+## Future Work
+
+- **Attested lineage shortcuts**: Server-provided causal assertions (see `specs/lineage-attestation/`)
+- **Forward chain caching**: Avoid recomputation for repeated comparisons
+- **Budget resumption**: Continue interrupted traversals
