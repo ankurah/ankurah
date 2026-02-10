@@ -10,12 +10,15 @@ events to their parents. The event DAG subsystem is responsible for:
 
 1. Determining the causal relationship between any two points in this DAG.
 2. When two branches have diverged, producing a topologically ordered sequence
-   of **layers** so that property backends can merge concurrent operations.
+   of **layers** so that [property backends](property-backends.md) can merge
+   concurrent operations.
 3. Providing the caching and retrieval infrastructure that the comparison
    algorithm needs to traverse the DAG efficiently.
 
 The subsystem lives in `core/src/event_dag/` and is consumed primarily by
-`Entity::apply_event` and `Entity::apply_state` in `core/src/entity.rs`.
+[`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail) and
+[`Entity::apply_state`](entity-lifecycle.md#apply_state-in-detail) in
+`core/src/entity.rs`.
 
 
 ## Core Concepts
@@ -44,14 +47,15 @@ an ancestor of another. Events above the meet are partitioned into layers for
 merge application.
 
 **EventAccumulator** (`event_dag::accumulator::EventAccumulator`) -- Owns a
-`GetEvents` implementation and accumulates DAG structure (event-id-to-parent-ids
-mapping) plus an LRU cache of full `Event` bodies during BFS. After comparison,
-the accumulated DAG is consumed to produce `EventLayers`.
+[`GetEvents`](retrieval.md#getevents) implementation and accumulates DAG
+structure (event-id-to-parent-ids mapping) plus an LRU cache of full `Event`
+bodies during BFS. After comparison, the accumulated DAG is consumed to produce
+`EventLayers`.
 
 **EventLayers** (`event_dag::accumulator::EventLayers`) -- An async iterator
-over `EventLayer` values, computed by forward topological expansion from the
-meet. Each layer is a set of events with no unprocessed in-DAG ancestors
-relative to earlier layers.
+over [`EventLayer`](property-backends.md#eventlayer-helpers) values, computed by
+forward topological expansion from the meet. Each layer is a set of events with
+no unprocessed in-DAG ancestors relative to earlier layers.
 
 **ComparisonResult** (`event_dag::accumulator::ComparisonResult`) -- The return
 type of `compare()`. Bundles an `AbstractCausalRelation` with the
@@ -184,15 +188,16 @@ are persisted, which is a clean rollback.
 ### The trait split
 
 The monolithic `Retrieve` trait was split into three focused traits to enforce
-the staging protocol at the type level:
+the staging protocol at the type level (see [Retrieval and Storage Layer](retrieval.md)
+for full API documentation):
 
-- **`GetEvents`** -- `get_event` (union of staging + storage) and
-  `event_stored` (permanent storage only). This is what `apply_event` and the
+- **[`GetEvents`](retrieval.md#getevents)** -- `get_event` (union of staging + storage) and
+  `event_stored` (permanent storage only). This is what [`apply_event`](entity-lifecycle.md#apply_event-in-detail) and the
   comparison algorithm accept: read-only event access.
-- **`GetState`** -- `get_state` for entity state snapshots. Separated because
+- **[`GetState`](retrieval.md#getstate)** -- `get_state` for entity state snapshots. Separated because
   state retrieval has different caching and lifetime requirements than event
   retrieval.
-- **`SuspenseEvents`** -- Extends `GetEvents` with `stage_event` and
+- **[`SuspenseEvents`](retrieval.md#suspenseevents)** -- Extends `GetEvents` with `stage_event` and
   `commit_event`. Only the caller (e.g., `node_applier`) holds this; it is
   **not** passed into `apply_event`, ensuring that `apply_event` cannot
   accidentally commit or stage.
@@ -200,9 +205,9 @@ the staging protocol at the type level:
 ### `get_event` vs `event_stored`
 
 `get_event` is the **union view**: it checks the staging map first, then falls
-back to permanent storage (and on `CachedEventGetter`, to a remote peer).
+back to permanent storage (and on [`CachedEventGetter`](retrieval.md#cachedeventgetter), to a remote peer).
 `event_stored` checks **permanent storage only**. This distinction is used by
-the creation-event guard in `apply_event`: on durable nodes where
+the [creation-event guard](entity-lifecycle.md#guard-ordering) in `apply_event`: on [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) where
 `storage_is_definitive()` returns `true`, `event_stored() == false` for a
 creation event proves it has never been seen, enabling a cheap `Disjoint`
 rejection without BFS.
@@ -210,8 +215,9 @@ rejection without BFS.
 
 ## Event Application
 
-`Entity::apply_event` in `core/src/entity.rs` is the main entry point for
-integrating a new event into an entity.
+[`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail) in `core/src/entity.rs` is the main entry point for
+integrating a new event into an entity. See [Entity Lifecycle](entity-lifecycle.md)
+for the full lifecycle context.
 
 ### Guard ordering
 
@@ -243,7 +249,7 @@ After guards pass, `apply_event` enters a retry loop (up to 5 attempts):
 | `Equal` | No-op, return `Ok(false)` |
 | `StrictDescends` | Apply operations, replace head with event ID, under `try_mutate` |
 | `StrictAscends` | Incoming is older, return `Ok(false)` |
-| `DivergedSince` | Decompose result, compute layers, apply all layers under write lock, update head by removing meet IDs and inserting event ID |
+| `DivergedSince` | Decompose result, compute [layers](lww-merge.md#layer-computation), apply all layers under write lock, update head by removing meet IDs and inserting event ID |
 | `Disjoint` | Return `Err(LineageError::Disjoint)` |
 | `BudgetExceeded` | Return `Err(LineageError::BudgetExceeded)` |
 
@@ -338,10 +344,10 @@ with no special-case transform.
 
 ### Removing the `DuplicateCreation` guard
 
-An early guard in `apply_event` used `event_stored()` to detect duplicate
-creation events. On durable nodes this works: if the creation event is in
-storage, it is a re-delivery; if not, it is a different genesis. On ephemeral
-nodes that receive entities via `StateSnapshot`, the creation event is never
+An early guard in [`apply_event`](entity-lifecycle.md#apply_event-in-detail) used `event_stored()` to detect duplicate
+creation events. On [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) this works: if the creation event is in
+storage, it is a re-delivery; if not, it is a different genesis. On [ephemeral
+nodes](node-architecture.md#durable-vs-ephemeral-nodes) that receive entities via `StateSnapshot`, the creation event is never
 individually committed to event storage -- only the entity state (including the
 head clock referencing the creation event) is persisted. When the creation event
 later arrives via subscription, `event_stored()` returns `false`, causing a
@@ -356,17 +362,17 @@ On durable nodes, `storage_is_definitive()` restores the cheap fast path.
 The original monolithic `Retrieve` trait combined event access, state access,
 and staging in a single interface. This made it impossible to express "read-only
 event access" at the type level, which matters because `apply_event` must not
-commit or stage events (the caller manages staging). The split into `GetEvents`,
-`GetState`, and `SuspenseEvents` enforces this: `apply_event` takes
+commit or stage events (the caller manages staging). The split into [`GetEvents`](retrieval.md#getevents),
+[`GetState`](retrieval.md#getstate), and [`SuspenseEvents`](retrieval.md#suspenseevents) enforces this: `apply_event` takes
 `E: GetEvents`; the caller holds `E: SuspenseEvents` and calls `stage_event` /
 `commit_event` around the `apply_event` call.
 
 ### The `storage_is_definitive()` method
 
-Ephemeral nodes may have entity state (head clock) without having the underlying
+[Ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes) may have entity state (head clock) without having the underlying
 events in storage, because `StateSnapshot` delivery establishes state without
 storing individual events. On such nodes, `event_stored()` returning `false`
 does not mean the event has never been seen -- it might have been integrated via
-state snapshot. `storage_is_definitive()` lets durable nodes (which always have
+state snapshot. `storage_is_definitive()` lets [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) (which always have
 events backing their state) opt into the cheaper check, while ephemeral nodes
 default to the safe BFS path.
