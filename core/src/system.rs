@@ -1,4 +1,4 @@
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attested, CollectionId, EntityState, Event};
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -14,7 +14,7 @@ use crate::notice_info;
 use crate::policy::PolicyAgent;
 use crate::property::{Property, PropertyError};
 use crate::reactor::Reactor;
-use crate::retrieval::LocalRetriever;
+use crate::retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::storage::{StorageCollectionWrapper, StorageEngine};
 use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
@@ -128,12 +128,14 @@ where
 
         let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
 
-        // Add the event to storage first
-        storage.add_event(&event.clone().into()).await?;
+        // Stage the event, apply, then commit
+        let event_getter = LocalEventGetter::new(storage.clone());
+        event_getter.stage_event(event.clone());
 
         // Apply the creation event so LWW values are tagged with event_id before serialization.
-        let retriever = LocalRetriever::new(storage.clone());
-        system_entity.apply_event(&retriever, &event).await?;
+        system_entity.apply_event(&event_getter, &event).await?;
+        let attested_event: Attested<Event> = event.clone().into();
+        event_getter.commit_event(&attested_event).await?;
         // Now get the entity state after the head is updated
         let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
         storage.set_state(attested_state.clone()).await?;
@@ -252,13 +254,14 @@ where
         let mut entities = Vec::new();
         let mut root_state = None;
 
-        let retriever = LocalRetriever::new(storage.clone());
+        let state_getter = LocalStateGetter::new(storage.clone());
+        let event_getter = LocalEventGetter::new(storage.clone());
 
         for state in
             storage.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?
         {
             let (_entity_changed, entity) =
-                self.0.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state.clone()).await?;
+                self.0.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state.clone()).await?;
             let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");

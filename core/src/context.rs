@@ -13,6 +13,7 @@ use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, E
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
+use crate::retrieval::SuspenseEvents;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -207,9 +208,10 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
+                let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
+                let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, &self.cdata);
                 let (_changed, entity) =
-                    self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;
+                    self.node.entities.with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state).await?;
                 Ok(entity)
             }
             Err(e) => Err(e),
@@ -235,10 +237,11 @@ where
 
             // Convert states to entities
             let mut entities = Vec::new();
+            let state_getter = crate::retrieval::LocalStateGetter::new(storage_collection.clone());
+            let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), storage_collection, &self.node, &self.cdata);
             for state in states {
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_, entity) =
-                    self.node.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+                    self.node.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
                 entities.push(entity);
             }
             Ok(entities)
@@ -297,21 +300,25 @@ where
                 crate::entity::EntityKind::Primary => entity.clone(),
             };
 
-            // Apply event to fork for after state
+            // Stage event and apply to fork for after state (no commit_event call here)
             let collection_id = &event.collection;
-            let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
-            forked.apply_event(&retriever, &event).await?;
+            let collection = self.node.collections.get(collection_id).await?;
+            let event_getter = crate::retrieval::LocalEventGetter::new(collection);
+            event_getter.stage_event(event.clone());
+            forked.apply_event(&event_getter, &event).await?;
 
             let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
             let attested = Attested::opt(event.clone(), attestation);
+
+            // Now commit the event to storage
+            event_getter.commit_event(&attested).await?;
+
             attested_events.push(attested.clone());
             entity_attested_events.push((entity, attested));
         }
 
-        // Store events and update heads BEFORE relaying (makes entities visible to server echo)
+        // Update heads BEFORE relaying (makes entities visible to server echo)
         for (entity, attested_event) in &entity_attested_events {
-            let collection = self.node.collections.get(&attested_event.payload.collection).await?;
-            collection.add_event(&attested_event).await?;
             entity.commit_head(Clock::new([attested_event.payload.id()]));
         }
 
@@ -327,8 +334,9 @@ where
             // Persist canonical entity (upstream for transactional forks, entity itself for primary)
             let canonical_entity = match &entity.kind {
                 crate::entity::EntityKind::Transacted { upstream, .. } => {
-                    let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
-                    upstream.apply_event(&retriever, &attested_event.payload).await?;
+                    // Event is now in storage, construct fresh getter for upstream apply
+                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone());
+                    upstream.apply_event(&event_getter, &attested_event.payload).await?;
                     upstream.clone()
                 }
                 crate::entity::EntityKind::Primary => entity,
@@ -374,11 +382,12 @@ where
             .await?
         {
             proto::NodeResponseBody::Fetch(deltas) => {
-                // TASK: Clarify retriever semantics for durable vs ephemeral nodes https://github.com/ankurah/ankurah/issues/144
-                let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
+                let collection = self.node.collections.get(collection_id).await?;
+                let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection.clone(), &self.node, &self.cdata);
+                let state_getter = crate::retrieval::LocalStateGetter::new(collection);
 
                 // 3. Apply deltas to local storage using NodeApplier
-                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &retriever).await?;
+                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &event_getter, &state_getter).await?;
                 // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
 
                 // 4. Re-fetch entities from local storage after applying deltas

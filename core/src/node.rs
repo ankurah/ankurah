@@ -23,7 +23,7 @@ use crate::{
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
     reactor::{AbstractEntity, Reactor},
-    retrieval::LocalRetriever,
+    retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
     system::SystemManager,
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
@@ -552,20 +552,24 @@ where
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage
-            let retriever = LocalRetriever::new(collection.clone());
-            let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
+            let event_getter = LocalEventGetter::new(collection.clone());
+            let state_getter = LocalStateGetter::new(collection.clone());
+            let entity = self.entities.get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id).await?;
+
+            // Stage the event so BFS can discover it
+            event_getter.stage_event(event.payload.clone());
 
             // Handle creates vs updates differently for policy validation
             let (entity_before, entity_after, already_applied) = if event.payload.is_entity_create() && entity.head().is_empty() {
                 // Create: apply to entity directly, use as both before/after
-                entity.apply_event(&retriever, &event.payload).await?;
+                entity.apply_event(&event_getter, &event.payload).await?;
                 (entity.clone(), entity.clone(), true)
             } else {
                 // Update: snapshot, apply to fork for validation
                 use std::sync::atomic::AtomicBool;
                 let trx_alive = Arc::new(AtomicBool::new(true));
                 let forked = entity.snapshot(trx_alive);
-                forked.apply_event(&retriever, &event.payload).await?;
+                forked.apply_event(&event_getter, &event.payload).await?;
                 (entity.clone(), forked, false)
             };
 
@@ -574,15 +578,18 @@ where
                 event.attestations.push(attestation);
             }
 
+            // Commit the staged event to permanent storage
+            event_getter.commit_event(event).await?;
+
             // For updates only: apply event to real entity (creates already applied above)
-            let applied = if already_applied { true } else { entity.apply_event(&retriever, &event.payload).await? };
+            // Event is now in storage, so BFS will find it
+            let applied = if already_applied { true } else { entity.apply_event(&event_getter, &event.payload).await? };
 
             if applied {
                 let state = entity.to_state()?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
                 let attested = Attested::opt(entity_state, attestation);
-                collection.add_event(event).await?;
                 collection.set_state(attested).await?;
                 changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
             }
@@ -652,13 +659,13 @@ where
         PA: PolicyAgent + Send + Sync + 'static,
     {
         use crate::event_dag::{compare, AbstractCausalRelation};
-        use crate::retrieval::LocalRetriever;
+        use crate::retrieval::LocalEventGetter;
         use std::collections::HashSet;
 
-        let retriever = LocalRetriever::new(storage_collection.clone());
+        let event_getter = LocalEventGetter::new(storage_collection.clone());
 
         // First check the causal relationship
-        let comparison_result = compare(&retriever, current_head, known_head, 100000).await?;
+        let comparison_result = compare(&event_getter, current_head, known_head, 100000).await?;
 
         match comparison_result.relation {
             AbstractCausalRelation::Equal => {
@@ -832,11 +839,12 @@ where
     ) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
         let initial_states = storage_collection.fetch_states(selection).await?;
-        let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
+        let state_getter = LocalStateGetter::new(storage_collection.clone());
+        let event_getter = LocalEventGetter::new(storage_collection);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
             let (_, entity) =
-                self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+                self.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
             entities.push(entity);
         }
         Ok(entities)

@@ -11,7 +11,7 @@ use lru::LruCache;
 
 use crate::error::RetrievalError;
 use crate::event_dag::relation::AbstractCausalRelation;
-use crate::retrieval::Retrieve;
+use crate::retrieval::GetEvents;
 use ankurah_proto::{Event, EventId};
 
 // Re-export CausalRelation from layers (same enum, avoid duplication)
@@ -24,25 +24,25 @@ pub use super::layers::CausalRelation;
 /// comparison begins (eager storage model). The accumulator tracks
 /// DAG structure (parent pointers) discovered during BFS and caches
 /// hot events to reduce storage round-trips.
-pub struct EventAccumulator<R: Retrieve> {
+pub struct EventAccumulator<E: GetEvents> {
     /// DAG structure: event id -> parent ids (always in memory, cheap)
     dag: BTreeMap<EventId, Vec<EventId>>,
 
     /// LRU cache of Event objects fetched from storage (bounded, eviction-safe)
     cache: LruCache<EventId, Event>,
 
-    /// Retriever with storage access
-    retriever: R,
+    /// Event getter with storage access
+    event_getter: E,
 }
 
-impl<R: Retrieve> EventAccumulator<R> {
+impl<E: GetEvents> EventAccumulator<E> {
     /// Create a new accumulator with the given retriever.
     /// LRU cache defaults to 1000 entries.
-    pub fn new(retriever: R) -> Self {
+    pub fn new(event_getter: E) -> Self {
         Self {
             dag: BTreeMap::new(),
             cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
-            retriever,
+            event_getter,
         }
     }
 
@@ -60,7 +60,7 @@ impl<R: Retrieve> EventAccumulator<R> {
         if let Some(event) = self.cache.get(id) {
             return Ok(event.clone());
         }
-        let event = self.retriever.get_event(id).await?;
+        let event = self.event_getter.get_event(id).await?;
         self.cache.put(id.clone(), event.clone());
         Ok(event)
     }
@@ -77,8 +77,8 @@ impl<R: Retrieve> EventAccumulator<R> {
     }
 
     /// Get a mutable reference to the retriever.
-    pub fn retriever_mut(&mut self) -> &mut R {
-        &mut self.retriever
+    pub fn event_getter_mut(&mut self) -> &mut E {
+        &mut self.event_getter
     }
 
     /// Produce layer iterator for merge (consumes self).
@@ -87,28 +87,28 @@ impl<R: Retrieve> EventAccumulator<R> {
         self,
         meet: Vec<EventId>,
         current_head: Vec<EventId>,
-    ) -> EventLayers<R> {
+    ) -> EventLayers<E> {
         EventLayers::new(self, meet, current_head)
     }
 }
 
 /// Result of a causal comparison, carrying the accumulated DAG.
-pub struct ComparisonResult<R: Retrieve> {
+pub struct ComparisonResult<E: GetEvents> {
     /// The causal relation between the compared clocks.
     pub relation: AbstractCausalRelation<EventId>,
     /// The event accumulator with DAG structure (private -- access via into_layers).
-    accumulator: EventAccumulator<R>,
+    accumulator: EventAccumulator<E>,
 }
 
-impl<R: Retrieve> ComparisonResult<R> {
+impl<E: GetEvents> ComparisonResult<E> {
     /// Create a new ComparisonResult.
-    pub fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<R>) -> Self {
+    pub fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<E>) -> Self {
         Self { relation, accumulator }
     }
 
     /// For DivergedSince results, consume self to get a layer iterator.
     /// Returns None for non-divergent relations.
-    pub fn into_layers(self, current_head: Vec<EventId>) -> Option<EventLayers<R>> {
+    pub fn into_layers(self, current_head: Vec<EventId>) -> Option<EventLayers<E>> {
         match &self.relation {
             AbstractCausalRelation::DivergedSince { meet, .. } => {
                 Some(self.accumulator.into_layers(meet.clone(), current_head))
@@ -118,12 +118,12 @@ impl<R: Retrieve> ComparisonResult<R> {
     }
 
     /// Get a reference to the accumulator (for inspection/testing).
-    pub fn accumulator(&self) -> &EventAccumulator<R> {
+    pub fn accumulator(&self) -> &EventAccumulator<E> {
         &self.accumulator
     }
 
-    /// Decompose into relation and accumulator (for transformation in compare_unstored_event).
-    pub fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<R>) {
+    /// Decompose into relation and accumulator.
+    pub fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<E>) {
         (self.relation, self.accumulator)
     }
 }
@@ -133,8 +133,8 @@ impl<R: Retrieve> ComparisonResult<R> {
 /// Async iterator over EventLayer for merge application.
 /// Computes layers lazily using forward expansion from the meet point.
 /// Pre-builds a parent->children index at construction for O(1) lookups.
-pub struct EventLayers<R: Retrieve> {
-    accumulator: EventAccumulator<R>,
+pub struct EventLayers<E: GetEvents> {
+    accumulator: EventAccumulator<E>,
     #[allow(dead_code)]
     meet: Vec<EventId>,
     current_head_ancestry: BTreeSet<EventId>,
@@ -150,9 +150,9 @@ pub struct EventLayers<R: Retrieve> {
     frontier: BTreeSet<EventId>,
 }
 
-impl<R: Retrieve> EventLayers<R> {
+impl<E: GetEvents> EventLayers<E> {
     fn new(
-        accumulator: EventAccumulator<R>,
+        accumulator: EventAccumulator<E>,
         meet: Vec<EventId>,
         current_head: Vec<EventId>,
     ) -> Self {
@@ -376,7 +376,7 @@ pub(crate) fn is_descendant_dag(
 mod tests {
     use super::*;
 
-    // We can't easily test EventAccumulator with a real Retrieve impl in unit tests,
+    // We can't easily test EventAccumulator with a real GetEvents impl in unit tests,
     // but we can test the helper functions and EventLayer::compare.
 
     #[test]
