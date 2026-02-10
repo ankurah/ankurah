@@ -550,8 +550,10 @@ where
             deltas.len()
         );
         // 3. Apply deltas to local node using NodeApplier
-        let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id, &node, context_data);
-        crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &retriever).await?;
+        let collection = node.collections.get(&collection_id).await?;
+        let event_getter = crate::retrieval::CachedEventGetter::new(collection_id, collection.clone(), &node, context_data);
+        let state_getter = crate::retrieval::LocalStateGetter::new(collection);
+        crate::node_applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
 
         Ok(())
     }

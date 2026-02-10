@@ -32,8 +32,8 @@ use super::{
     relation::AbstractCausalRelation,
 };
 use crate::error::RetrievalError;
-use crate::retrieval::Retrieve;
-use ankurah_proto::{Clock, Event, EventId};
+use crate::retrieval::GetEvents;
+use ankurah_proto::{Clock, EventId};
 use std::collections::{BTreeSet, HashMap};
 
 /// Compare two clocks to determine their causal relationship.
@@ -46,15 +46,15 @@ use std::collections::{BTreeSet, HashMap};
 ///
 /// Budget escalation: if the initial budget is exhausted, retries internally
 /// with up to 4x the initial budget before returning `BudgetExceeded`.
-pub async fn compare<R: Retrieve>(
-    retriever: R,
+pub async fn compare<E: GetEvents>(
+    event_getter: E,
     subject: &Clock,
     comparison: &Clock,
     budget: usize,
-) -> Result<ComparisonResult<R>, RetrievalError> {
+) -> Result<ComparisonResult<E>, RetrievalError> {
     // Early exit for obvious cases - empty clocks are disjoint
     if subject.as_slice().is_empty() || comparison.as_slice().is_empty() {
-        let accumulator = EventAccumulator::new(retriever);
+        let accumulator = EventAccumulator::new(event_getter);
         return Ok(ComparisonResult::new(
             AbstractCausalRelation::DivergedSince {
                 meet: vec![],
@@ -68,14 +68,14 @@ pub async fn compare<R: Retrieve>(
     }
 
     if subject.as_slice() == comparison.as_slice() {
-        let accumulator = EventAccumulator::new(retriever);
+        let accumulator = EventAccumulator::new(event_getter);
         return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
     }
 
     let initial_budget = budget;
     let max_budget = initial_budget * 4;
     let mut current_budget = initial_budget;
-    let mut accumulator = EventAccumulator::new(retriever);
+    let mut accumulator = EventAccumulator::new(event_getter);
 
     loop {
         let mut comp = Comparison::new(&mut accumulator, subject, comparison, current_budget);
@@ -98,92 +98,9 @@ pub async fn compare<R: Retrieve>(
     }
 }
 
-/// Compare an unstored event against a stored clock.
-///
-/// This is a special case where we start from the event's parent clock
-/// rather than the event itself (which isn't stored yet).
-pub async fn compare_unstored_event<R: Retrieve>(
-    retriever: R,
-    event: &Event,
-    comparison: &Clock,
-    budget: usize,
-) -> Result<ComparisonResult<R>, RetrievalError> {
-    // Special case: redundant delivery check - event already in comparison head
-    // This handles both single-head (comparison == [event_id]) and multi-head cases
-    if comparison.as_slice().contains(&event.id()) {
-        let accumulator = EventAccumulator::new(retriever);
-        return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
-    }
-
-    // Compare event's parent against the comparison clock
-    let result = compare(retriever, &event.parent, comparison, budget).await?;
-
-    // Destructure to get relation and accumulator separately
-    let (relation, accumulator) = result.into_parts();
-
-    // Transform the result based on what it means for event application
-    let new_relation = match relation {
-        AbstractCausalRelation::Equal => {
-            // Parent equals comparison => event directly extends the head
-            // Chain is just this single event
-            AbstractCausalRelation::StrictDescends { chain: vec![event.id()] }
-        }
-        AbstractCausalRelation::StrictDescends { mut chain } => {
-            // Parent strictly descends comparison => event also descends
-            // Add this event to the end of the chain
-            chain.push(event.id());
-            AbstractCausalRelation::StrictDescends { chain }
-        }
-        AbstractCausalRelation::StrictAscends => {
-            // Parent is "older" than comparison (Past(parent) ⊂ Past(comparison))
-            // For an UNSTORED event, this means the event is CONCURRENT with the head,
-            // not older - because the event itself is new, only its parent is older.
-            //
-            // Example 1: Entity head = [B, C], Event parent = [C]
-            // compare([C], [B, C]) returns StrictAscends because Past([C]) ⊂ Past([B, C])
-            // The event extends C, which is a tip - DivergedSince with meet at [C]
-            //
-            // Example 2: Entity head = [B], Event parent = [A] where A→B
-            // compare([A], [B]) returns StrictAscends because Past([A]) ⊂ Past([B])
-            // The event creates a concurrent branch from A - DivergedSince with meet at [A]
-            let parent_members: BTreeSet<_> = event.parent.as_slice().iter().cloned().collect();
-            let comparison_members: BTreeSet<_> = comparison.as_slice().iter().cloned().collect();
-
-            // Meet is the parent clock (where this event's branch diverges from the head)
-            let meet: Vec<_> = parent_members.iter().cloned().collect();
-            // Other is the head tips that this event's parent doesn't include
-            let other: Vec<_> = comparison_members.difference(&parent_members).cloned().collect();
-
-            // Note: other_chain is empty because we haven't traversed from meet to
-            // comparison head. LWW resolution handles this conservatively: when
-            // other_chain is empty and current value has an event_id, current wins.
-            // This is correct because:
-            // 1. The incoming event is from an older branch point (parent < head)
-            // 2. Head has more recent events that should take precedence
-            // 3. Only values with no event_id (untracked) will be overwritten
-            AbstractCausalRelation::DivergedSince {
-                meet,
-                subject: vec![], // Immediate children would need additional tracking
-                other,
-                subject_chain: vec![event.id()], // Just this incoming event
-                other_chain: vec![],             // Empty - see note above
-            }
-        }
-        AbstractCausalRelation::DivergedSince { meet, subject, other, mut subject_chain, other_chain } => {
-            // Parent is concurrent with comparison
-            // Add this event to the subject chain
-            subject_chain.push(event.id());
-            AbstractCausalRelation::DivergedSince { meet, subject, other, subject_chain, other_chain }
-        }
-        other => other,
-    };
-
-    Ok(ComparisonResult::new(new_relation, accumulator))
-}
-
 /// Internal state machine for the comparison algorithm.
-struct Comparison<'a, R: Retrieve> {
-    accumulator: &'a mut EventAccumulator<R>,
+struct Comparison<'a, E: GetEvents> {
+    accumulator: &'a mut EventAccumulator<E>,
 
     // Frontiers being explored
     subject_frontier: Frontier<EventId>,
@@ -262,8 +179,8 @@ impl NodeState {
     }
 }
 
-impl<'a, R: Retrieve> Comparison<'a, R> {
-    fn new(accumulator: &'a mut EventAccumulator<R>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
+impl<'a, E: GetEvents> Comparison<'a, E> {
+    fn new(accumulator: &'a mut EventAccumulator<E>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
         let subject_ids: BTreeSet<EventId> = subject.as_slice().iter().cloned().collect();
         let comparison_ids: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
 

@@ -19,7 +19,7 @@ pub use relation::AbstractCausalRelation;
 pub use traits::{EventId, TClock, TEvent};
 
 // Comparison functions
-pub use comparison::{compare, compare_unstored_event};
+pub use comparison::compare;
 
 // Layer computation
 pub use layers::CausalRelation;

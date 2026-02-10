@@ -1,4 +1,4 @@
-use crate::retrieval::Retrieve;
+use crate::retrieval::{GetEvents, GetState};
 use crate::selection::filter::Filterable;
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
@@ -226,21 +226,21 @@ impl Entity {
 
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
-    pub async fn apply_event<G>(&self, getter: &G, event: &Event) -> Result<bool, MutationError>
-    where G: Retrieve + Send + Sync {
+    pub async fn apply_event<E>(&self, getter: &E, event: &Event) -> Result<bool, MutationError>
+    where E: GetEvents + Send + Sync {
         tracing::info!("[TRACE-AE] apply_event called for entity={}, event_id={}, event_parent={}", self.id(), event.id(), event.parent);
         debug!("apply_event head: {event} to {self}");
 
         // Budget for DAG traversal - should be large enough for typical histories
         // but bounded to prevent runaway traversal on malicious/corrupted data.
-        // Budget escalation is handled internally by compare_unstored_event (up to 4x).
+        // Budget escalation is handled internally by compare (up to 4x).
         const DEFAULT_BUDGET: usize = 1000;
 
         // Idempotency is handled by the comparison algorithm:
         // - Event already in head -> Equal -> no-op (Ok(false))
         // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
         // - Event re-delivered but already integrated -> BFS finds it -> StrictAscends
-        // An explicit event_exists() check is not used here because callers
+        // An explicit event_stored() check is not used here because callers
         // (node_applier, system.rs) store events to storage BEFORE calling
         // apply_event (so BFS can find them), which would cause false positives.
 
@@ -249,7 +249,7 @@ impl Entity {
         // - If this specific event is already in storage, it's a re-delivery -> idempotent no-op
         // - If it's a different creation event, reject to prevent disjoint genesis
         if event.is_entity_create() && !self.head().is_empty() {
-            if getter.event_exists(&event.id()).await? {
+            if getter.event_stored(&event.id()).await? {
                 // Re-delivery of the same creation event that already established this entity
                 return Ok(false);
             }
@@ -286,9 +286,9 @@ impl Entity {
         const MAX_RETRIES: usize = 5;
 
         for attempt in 0..MAX_RETRIES {
-            // compare_unstored_event takes retriever by value; pass a reference
-            // (blanket Retrieve impl for &R allows this without cloning)
-            let comparison_result = crate::event_dag::compare_unstored_event(getter, event, &head, DEFAULT_BUDGET).await?;
+            // Stage the event so BFS can discover it, then compare event's clock vs head
+            let subject_clock: Clock = event.id().into();
+            let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
@@ -321,11 +321,8 @@ impl Entity {
                     let meet = meet.clone();
 
                     // Decompose the result to get the accumulator.
-                    // We need to add the incoming event to the DAG before computing layers,
-                    // because compare_unstored_event starts BFS from the event's parent clock,
-                    // so the event itself is NOT in the accumulated DAG.
-                    let (_relation, mut accumulator) = comparison_result.into_parts();
-                    accumulator.accumulate(event);
+                    // The event is already in the accumulated DAG (found via staging in BFS).
+                    let (_relation, accumulator) = comparison_result.into_parts();
                     let mut layers = accumulator.into_layers(meet.clone(), head.as_slice().to_vec());
 
                     let mut applied_layers: Vec<crate::event_dag::accumulator::EventLayer> = Vec::new();
@@ -405,8 +402,8 @@ impl Entity {
     /// - `AlreadyApplied` — state matches current head (Equal)
     /// - `Older` — incoming state is older than current (StrictAscends), no-op
     /// - `DivergedRequiresEvents` — state diverged, events needed for proper merge
-    pub async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<StateApplyResult, MutationError>
-    where G: Retrieve + Send + Sync {
+    pub async fn apply_state<E>(&self, getter: &E, state: &State) -> Result<StateApplyResult, MutationError>
+    where E: GetEvents + Send + Sync {
         let mut head = self.head();
         let new_head = state.head.clone();
 
@@ -631,41 +628,44 @@ impl WeakEntitySet {
         }
     }
 
-    pub async fn get_or_retrieve<R>(
+    pub async fn get_or_retrieve<S, E>(
         &self,
-        retriever: &R,
+        state_getter: &S,
+        event_getter: &E,
         collection_id: &CollectionId,
         id: &EntityId,
     ) -> Result<Option<Entity>, RetrievalError>
     where
-        R: Retrieve + Send + Sync,
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
     {
         // do it in two phases to avoid holding the lock while waiting for the collection
         match self.get(id) {
             Some(entity) => Ok(Some(entity)),
-            None => match retriever.get_state(*id).await {
-                Ok(None) => Ok(None),
-                Ok(Some(state)) => {
+            None => match state_getter.get_state(*id).await? {
+                None => Ok(None),
+                Some(state) => {
                     // technically someone could have added the entity since we last checked, so it's better to use the
                     // with_state method to re-check
-                    let (_, entity) = self.with_state(retriever, *id, collection_id.to_owned(), state.payload.state).await?;
+                    let (_, entity) = self.with_state(state_getter, event_getter, *id, collection_id.to_owned(), state.payload.state).await?;
                     Ok(Some(entity))
                 }
-                Err(e) => Err(e),
             },
         }
     }
     /// Returns a resident entity, or fetches it from storage, or finally creates if neither of the two are found
-    pub async fn get_retrieve_or_create<R>(
+    pub async fn get_retrieve_or_create<S, E>(
         &self,
-        retriever: &R,
+        state_getter: &S,
+        event_getter: &E,
         collection_id: &CollectionId,
         id: &EntityId,
     ) -> Result<Entity, RetrievalError>
     where
-        R: Retrieve + Send + Sync,
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
     {
-        match self.get_or_retrieve(retriever, collection_id, id).await? {
+        match self.get_or_retrieve(state_getter, event_getter, collection_id, id).await? {
             Some(entity) => Ok(entity),
             None => {
                 let mut entities = self.0.write().unwrap();
@@ -726,28 +726,30 @@ impl WeakEntitySet {
     /// Returns a tuple of (changed, entity)
     /// changed is Some(true) if the entity was changed, Some(false) if it already exists and the state was not applied
     /// None if the entity was not previously on the local node (either in the WeakEntitySet or in storage)
-    pub async fn with_state<R>(
+    pub async fn with_state<S, E>(
         &self,
-        retriever: &R,
+        state_getter: &S,
+        event_getter: &E,
         id: EntityId,
         collection_id: CollectionId,
         state: State,
     ) -> Result<(Option<bool>, Entity), RetrievalError>
     where
-        R: Retrieve + Send + Sync,
+        S: GetState + Send + Sync,
+        E: GetEvents + Send + Sync,
     {
         let entity = match self.get(&id) {
             Some(entity) => entity, // already resident
             None => {
                 // not yet resident. We have to retrieve our baseline state before applying the new state
-                if let Some(stored_state) = retriever.get_state(id).await? {
+                if let Some(stored_state) = state_getter.get_state(id).await? {
                     // get a resident entity for this retrieved state. It's possible somebody frontran us to create it
                     // but we don't actually care, so we ignore the created flag
                     self.private_get_or_create(id, &collection_id, &stored_state.payload.state)?.1
                 } else {
                     // no stored state, so we can use the given state directly
                     match self.private_get_or_create(id, &collection_id, &state)? {
-                        (true, entity) => entity, // some body frontran us to create it, so we have to apply the new state
+                        (true, entity) => entity, // somebody frontran us to create it, so we have to apply the new state
                         (false, entity) => {
                             // we just created it with the given state, so there's nothing to apply. early return
                             return Ok((None, entity));
@@ -758,7 +760,7 @@ impl WeakEntitySet {
         };
 
         // if we're here, we've retrieved the entity from the set and need to apply the state
-        let result = entity.apply_state(retriever, &state).await?;
+        let result = entity.apply_state(event_getter, &state).await?;
         let changed = matches!(result, StateApplyResult::Applied);
         Ok((Some(changed), entity))
     }
