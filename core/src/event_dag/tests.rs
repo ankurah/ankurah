@@ -1840,7 +1840,7 @@ mod phase4_duplicate_creation {
     use crate::entity::Entity;
     use crate::error::MutationError;
     use crate::retrieval::GetEvents;
-    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
+    use ankurah_proto::{Clock, EntityId, Event, EventId, OperationSet};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, HashMap};
 

@@ -2,18 +2,114 @@
 
 **Worktree:** `/Users/daniel/ak/ankurah-201` (branch: `concurrent-updates-event-dag`)
 **Date:** 2026-02-10
-**Status:** Phases 1-5 complete + cleanup done. Ready for commit. Spec comparison agent running (results pending).
+**Status:** Phases 1-5 complete. Phase 5 committed as `07e0b146`. Comprehensive review complete. Cleanup and fixes pending.
 
 ---
 
 ## Current State
 
 - `cargo check` — passes (no errors, no new warnings)
-- `cargo test` — all pass, 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
+- `cargo test` — unit tests pass, 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
+- Integration tests (`durable_ephemeral`) — 3 of 4 hanging (under investigation, may be pre-existing)
+- `spec.md` updated with small Phase 5 tweaks (staging pattern, infallible compare, etc.)
 - `grep -r "compare_unstored_event" core/src/` — zero hits
 - `grep -r "event_exists" core/src/` — zero hits
-- All stale comments fixed, unused imports removed, dead code removed
-- Integration tests (durable_ephemeral) are slow but passing
+
+---
+
+## Comprehensive Review Results (2026-02-09)
+
+13 review agents dispatched across 7 angles. Key findings below.
+
+### P0 Head Update Bug — FALSE ALARM
+
+The clean-room correctness review flagged `entity.rs:370-375` (DivergedSince removes `meet` IDs from head) as P0. A targeted BFS trace proved this is **correct**. The meet is filtered by `common_child_count == 0`, which guarantees that every head tip the new event descends from will always appear in the meet. Deep ancestors that aren't head tips result in harmless no-op removals.
+
+**Proof:** Head tips have no descendants in the comparison clock → BFS never visits children of head tips → no child of a head tip can be "common" → head tips always have `common_child_count == 0` → they pass the meet filter.
+
+Full trace: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a611039.output`
+
+### Invariant #6 — Overly Strict, Code Is Correct
+
+The stated invariant "`commit_event` BEFORE head update" is violated in 6 of 8 call sites. However, analysis shows the **actual safety property** is weaker and correctly maintained:
+
+> **`stage_event` before head update (in memory); `commit_event` before `set_state` (to disk).**
+
+This is sufficient because: BFS uses `get_event` which checks staging first; `set_state` always runs after `commit_event`; a crash before `commit_event` reverts the entity to a consistent prior state.
+
+**Action:** Update invariant #6 wording to reflect the actual property.
+
+Full analysis: `/private/tmp/claude-501/-Users-daniel-ak/tasks/aa7f648.output`
+Head mutation audit: `/private/tmp/claude-501/-Users-daniel-ak/tasks/aa834c7.output`
+
+### Default `event_stored` — Semantic Trap (P1)
+
+The default implementation of `GetEvents::event_stored` falls through to `get_event()`, which includes staging. This contradicts the documented "permanent storage only" semantics. All concrete impls override correctly, but any future implementor using the default gets broken creation-uniqueness semantics. `MockRetriever` and `SimpleRetriever` in tests both use the broken default.
+
+**Action:** Either remove the default impl (force all implementors to be explicit) or change the default to return an error/unimplemented.
+
+### Creation Event Applied Before Policy Check (P1)
+
+In `node.rs:commit_remote_transaction`, creation events are applied to the real entity (not a fork) before the policy check. If a non-permissive policy agent rejects, the entity is left in a poisoned state (non-empty head referencing uncommitted event, blocking all future operations). With `PermissiveAgent` (current default), this can never trigger.
+
+**Action:** Use fork/snapshot for creation events, same as the update path.
+
+Full analysis: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a99ec55.output`
+
+### CachedEventGetter Bypasses Validation (P1, Security)
+
+`CachedEventGetter::get_event` stores events fetched from remote peers directly to permanent storage during BFS, with zero validation (no `validate_received_event`, no attestation check, no response filtering). The staging bypass is defensible (these are historical context, not mutations), but the missing validation creates a hole in the security boundary with a real policy agent.
+
+**Action:** Add `validate_received_event()` to the BFS fetch path; filter responses to only store events matching requested IDs.
+
+Full analysis: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a24fd38.output`
+
+### Old Reviews Cross-Check — 83% Resolved
+
+125 findings across 16 prior review documents: 104 resolved (83%), 10 partially resolved (8%), 8 deferred (6%), 3 unresolved (2%). All P0/Critical findings from all reviews are resolved.
+
+Full report: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a45b1e5.output`
+
+### Dead Code and Diff Cleanup
+
+Minimum diff review identified ~226 lines of removable diff. Golf review (scoped to diff) found additional efficiency wins.
+
+**Dead code to remove:**
+- `traits.rs` (~55 lines) — abstract traits never used
+- `FrontierState`/`TaintReason` in `frontier.rs` (~22 lines) — never read
+- `InsufficientCausalInfo` error variant — never constructed
+- `EventLayer::has_work()`, `event_getter_mut()`, `ComparisonResult::into_layers()` — never called
+
+**Dev artifacts to remove:**
+- 7x `info!("[TRACE-AE]"...)` debug traces at info level (~25 lines)
+
+**Unrelated cleanups (consider splitting to separate commit):**
+- `property_backend_name() -> &'static str`, `&Vec<Op>` → `&[Op]`, `deltas` → `initial` rename
+
+Full reports:
+- Minimum diff: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a225c5c.output`
+- Golf v2: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a39860a.output`
+
+### Test Coverage Gaps
+
+The Phase 5 staging pattern is the least-tested part:
+1. No entity-level idempotency test (the exact Phase 5 bug scenario)
+2. Zero unit tests for `LocalEventGetter`/`CachedEventGetter`
+3. `MockRetriever` doesn't distinguish staged vs stored
+4. TOCTOU retry loop completely untested (only `#[ignore]`d stub)
+5. `InvalidEvent` guard (non-creation on empty head) — no test
+
+Full report: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a3076b6.output`
+
+### Security Review
+
+Top findings:
+- `unimplemented!()` on `StateAndRelation` (`node_applier.rs:316`) — peer can crash the node
+- No size/count limits on peer events — trivial DoS
+- `collect_event_bridge` has no traversal limit (`node.rs:680-702`)
+- `std::sync::RwLock` poisoning cascade on any panic
+
+Full report: `/private/tmp/claude-501/-Users-daniel-ak/tasks/afdb6e2.output`
 
 ---
 
@@ -96,7 +192,30 @@ pub trait SuspenseEvents: GetEvents {
 - [ ] **`build_forward_chain` multi-meet bug** (comparison.rs) — P2, chains are informational only, nil impact
 - [ ] **Missing `AppliedViaLayers` variant** in `StateApplyResult` — benign, no code path uses it
 - [ ] **`test_sequential_text_operations`**: Keep `#[ignore]` with TODO referencing PR #236 (Yrs empty-string bug)
-- [ ] **Spec comparison agent results** — dispatched, results pending. Check output at `/private/tmp/claude-501/-Users-daniel-ak/tasks/aacba98.output`
+
+---
+
+## Action Items from Review
+
+### Must Fix (before merge)
+- [ ] Remove dead code: `traits.rs`, `FrontierState`/`TaintReason`, `InsufficientCausalInfo`, unused methods
+- [ ] Remove dev trace logging (`[TRACE-AE]` etc.) or downgrade to `trace!` level
+- [ ] Fix default `event_stored` semantic trap
+- [ ] Investigate durable_ephemeral test hangs
+- [ ] Update invariant #6 wording
+
+### Should Fix (before or shortly after merge)
+- [ ] Use fork for creation events in `commit_remote_transaction` (policy check ordering)
+- [ ] Add `validate_received_event` to `CachedEventGetter` BFS fetch path
+- [ ] Convert `unimplemented!()` on `StateAndRelation` to error return
+- [ ] Add entity-level idempotency test (re-deliver ancestor, verify head unchanged)
+- [ ] Add unit tests for `LocalEventGetter`/`CachedEventGetter` staging lifecycle
+
+### Nice to Have
+- [ ] Deduplicate test helpers across inner test modules (~120 lines)
+- [ ] Remove `SimpleRetriever` (identical to `MockRetriever`)
+- [ ] Add size/count limits on peer event messages
+- [ ] Add traversal limit to `collect_event_bridge`
 
 ---
 
@@ -127,11 +246,11 @@ pub trait SuspenseEvents: GetEvents {
 - Added 7 tests (6 passing, 1 `#[ignore]`d TOCTOU stub)
 - `InvalidEvent` guard for non-creation events on empty-head entities
 
-### Phase 5: Retrieve Trait Split + Event Staging — DONE (uncommitted)
+### Phase 5: Retrieve Trait Split + Event Staging — DONE (commit `07e0b146`)
 
 See top of document.
 
-### Post-Phase-5 Cleanup — DONE (uncommitted)
+### Post-Phase-5 Cleanup — DONE (in `07e0b146`)
 
 - Fixed 5 stale comments (references to `compare_unstored_event`, `event_exists`, `Retrieve`)
 - Removed unused imports (`GetEvents`, `Event`, `EventId`, `Clock`, 6x `EventId` in test modules)
@@ -146,9 +265,10 @@ See top of document.
 3. **Out-of-DAG parents are dead ends, not errors.** Use `if let Some` / `else { continue }`.
 4. **Idempotency and creation guards go before the retry loop** in `apply_event`, not inside it.
 5. **Never call `into_layers()` on `BudgetExceeded`.** The DAG is incomplete.
-6. **`commit_event` BEFORE head update.** The head must never reference an event not in permanent storage.
+6. **`stage_event` before head update (in memory); `commit_event` before `set_state` (to disk).** The event must be discoverable by BFS (via staging or storage) at the time the head is updated. The event must be committed to permanent storage before the entity state is persisted.
 7. **`get_event` is the union view** (staging + storage). **`event_stored` is permanent-only.**
 8. **Blanket `&R` impls are required.** All call sites pass getters by reference.
+9. **Meet filter guarantees correctness.** The `common_child_count == 0` filter ensures that every head tip the new event descends from appears in the meet. Deep ancestors result in harmless no-op removals.
 
 ---
 
@@ -159,4 +279,4 @@ See top of document.
 | `d9669f9c` | Phase 1-2: EventAccumulator types + comparison rewrite |
 | `5cbc255a` | Phase 3: caller updates, correctness guards |
 | `87447a9b` | Phase 4: cleanup, remove old types, add tests |
-| (uncommitted) | Phase 5: Retrieve trait split, staging pattern, idempotency fix + cleanup |
+| `07e0b146` | Phase 5: Retrieve trait split, staging pattern, idempotency fix + cleanup |

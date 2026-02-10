@@ -101,7 +101,7 @@ For LWW backends, each layer is resolved by:
 2. Per-property winner determined by `layer.compare(a, b)`:
    - Descends/Ascends decides the winner
    - Concurrent falls back to lexicographic EventId
-   - Missing DAG info is an error (bail out)
+   - Missing DAG info treats the event as a dead end in traversal (not an error)
 3. Only mutate state for winners from to_apply set
 4. Track event_id per property for future conflict resolution
 
@@ -135,7 +135,7 @@ If current head is [H] (via A→B→E→H) and events [C,D,F,G,I] arrive:
 - `compare([C], [B, C])` returns `StrictAscends` (parent is subset of head)
 - But D extends tip C and is concurrent with B
 
-**Solution**: In `compare_unstored_event`, transform `StrictAscends` to `DivergedSince`:
+**Solution**: The event is staged in the event getter (`GetEvents`) before calling `compare()` with the event's own ID as the subject. BFS naturally discovers the staged event and finds the divergence:
 - Meet = event's parent clock (the divergence point)
 - Other = head tips not in parent
 - Empty `other_chain` triggers conservative resolution (current value wins)
@@ -193,21 +193,14 @@ Uncommitted local changes may exist in memory without an event_id, but they are 
 ### Compare Functions
 
 ```rust
-/// Compare two clocks to determine their causal relationship
-pub async fn compare<N, C>(
-    navigator: &N,
-    subject: &C,
-    comparison: &C,
-    budget: usize,
-) -> Result<AbstractCausalRelation<N::EID>, RetrievalError>
-
-/// Compare an unstored event against a stored clock
-pub async fn compare_unstored_event<N, E>(
-    navigator: &N,
-    event: &E,
-    comparison: &E::Parent,
-    budget: usize,
-) -> Result<AbstractCausalRelation<N::EID>, RetrievalError>
+/// Compare two clocks to determine their causal relationship.
+/// The event getter `E: GetEvents` is responsible for providing events
+/// (including any staged/unstored events) during BFS traversal.
+pub fn compare<E>(
+    subject: &Clock,
+    comparison: &Clock,
+    events: E,
+) -> Result<ComparisonResult, RetrievalError>
 ```
 
 ### PropertyBackend Trait
@@ -231,12 +224,9 @@ fn apply_layer(
 ### Layer Computation
 
 ```rust
-/// Compute event layers from meet point for layered application
-fn compute_layers<'a>(
-    events: &'a BTreeMap<EventId, Event>,
-    meet: &[EventId],
-    current_head_ancestry: &BTreeSet<EventId>,
-) -> Vec<EventLayer<'a>>
+/// Layer computation is accessed via `into_layers()` on the `EventLayers`
+/// type returned by `ComparisonResult`.
+let layers: EventLayers = result.into_layers();
 ```
 
 ## Test Coverage
