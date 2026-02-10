@@ -793,13 +793,8 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
 
     // Step 4: Re-deliver event B via commit_remote_transaction
     // Wrap the raw event in Attested (no attestations needed for PermissiveAgent)
-    let attested_events: Vec<ankurah::proto::Attested<ankurah::proto::Event>> = events_b
-        .into_iter()
-        .map(|e| ankurah::proto::Attested {
-            payload: e,
-            attestations: Default::default(),
-        })
-        .collect();
+    let attested_events: Vec<ankurah::proto::Attested<ankurah::proto::Event>> =
+        events_b.into_iter().map(|e| ankurah::proto::Attested { payload: e, attestations: Default::default() }).collect();
 
     let trx_id = ankurah::proto::TransactionId::new();
     node.commit_remote_transaction(&DEFAULT_CONTEXT, trx_id, attested_events).await?;

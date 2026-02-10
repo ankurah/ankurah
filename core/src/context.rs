@@ -1,3 +1,4 @@
+use crate::retrieval::SuspenseEvents;
 use crate::{
     changes::EntityChange,
     entity::Entity,
@@ -13,7 +14,6 @@ use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, E
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
-use crate::retrieval::SuspenseEvents;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
@@ -308,8 +308,11 @@ where
             Ok(entity_state) => {
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection.clone());
                 let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection, &self.node, &self.cdata);
-                let (_changed, entity) =
-                    self.node.entities.with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state).await?;
+                let (_changed, entity) = self
+                    .node
+                    .entities
+                    .with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state)
+                    .await?;
                 Ok(entity)
             }
             Err(e) => Err(e),
@@ -338,8 +341,11 @@ where
             let state_getter = crate::retrieval::LocalStateGetter::new(storage_collection.clone());
             let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), storage_collection, &self.node, &self.cdata);
             for state in states {
-                let (_, entity) =
-                    self.node.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+                let (_, entity) = self
+                    .node
+                    .entities
+                    .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
+                    .await?;
                 entities.push(entity);
             }
             Ok(entities)
@@ -371,7 +377,8 @@ where
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let collection = self.node.collections.get(collection_id).await?;
-                let event_getter = crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection.clone(), &self.node, &self.cdata);
+                let event_getter =
+                    crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection.clone(), &self.node, &self.cdata);
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection);
 
                 // 3. Apply deltas to local storage using NodeApplier

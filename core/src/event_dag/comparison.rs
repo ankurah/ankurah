@@ -100,10 +100,7 @@ pub async fn compare<E: GetEvents>(
         if all_fetched && comparison_set.is_subset(&all_parents) {
             // Subject's parents cover all comparison heads -> StrictDescends
             let chain: Vec<EventId> = subject.as_slice().to_vec();
-            return Ok(ComparisonResult::new(
-                AbstractCausalRelation::StrictDescends { chain },
-                accumulator,
-            ));
+            return Ok(ComparisonResult::new(AbstractCausalRelation::StrictDescends { chain }, accumulator));
         }
     }
 

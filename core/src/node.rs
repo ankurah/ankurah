@@ -554,7 +554,10 @@ where
             // When applying an event, we should only look at the local storage for the lineage
             let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
             let state_getter = LocalStateGetter::new(collection.clone());
-            let entity = self.entities.get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id).await?;
+            let entity = self
+                .entities
+                .get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id)
+                .await?;
 
             // Stage the event so BFS can discover it
             event_getter.stage_event(event.payload.clone());
@@ -843,8 +846,10 @@ where
         let event_getter = LocalEventGetter::new(storage_collection, self.durable);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
-            let (_, entity) =
-                self.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+            let (_, entity) = self
+                .entities
+                .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
+                .await?;
             entities.push(entity);
         }
         Ok(entities)

@@ -23,23 +23,16 @@ struct MockRetriever {
 impl MockRetriever {
     fn new() -> Self { Self { events: HashMap::new() } }
 
-    fn add_event(&mut self, event: Event) {
-        self.events.insert(event.id(), event);
-    }
+    fn add_event(&mut self, event: Event) { self.events.insert(event.id(), event); }
 }
 
 #[async_trait]
 impl GetEvents for MockRetriever {
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
-        self.events
-            .get(event_id)
-            .cloned()
-            .ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+        self.events.get(event_id).cloned().ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
     }
 
-    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
-        Ok(self.events.contains_key(event_id))
-    }
+    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> { Ok(self.events.contains_key(event_id)) }
 }
 
 /// Create a test event with deterministic content-hashed IDs.
@@ -50,12 +43,7 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     entity_id_bytes[0] = seed;
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-    Event {
-        entity_id,
-        collection: "test".into(),
-        parent: Clock::from(parent_ids.to_vec()),
-        operations: OperationSet(BTreeMap::new()),
-    }
+    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -275,13 +263,8 @@ async fn test_empty_clocks() {
     let empty = Clock::default();
     let non_empty = clock!(id1);
 
-    let expected = AbstractCausalRelation::DivergedSince {
-        meet: vec![],
-        subject: vec![],
-        other: vec![],
-        subject_chain: vec![],
-        other_chain: vec![],
-    };
+    let expected =
+        AbstractCausalRelation::DivergedSince { meet: vec![], subject: vec![], other: vec![], subject_chain: vec![], other_chain: vec![] };
 
     let result = compare(retriever.clone(), &empty, &empty, 100).await.unwrap();
     assert_eq!(result.relation, expected);
@@ -442,10 +425,7 @@ async fn test_compare_event_unstored() {
 
     let result = compare(retriever.clone(), &Clock::from(vec![root_event.id()]), &clock_1, 100).await.unwrap();
     // Two independent root events with different lineages should be Disjoint
-    assert!(matches!(
-        result.relation,
-        AbstractCausalRelation::Disjoint { .. }
-    ));
+    assert!(matches!(result.relation, AbstractCausalRelation::Disjoint { .. }));
 
     // Test that a non-empty unstored event does not descend from an empty clock
     let empty_clock = Clock::default();
@@ -549,7 +529,8 @@ async fn test_missing_event_busyloop() {
     let err = result.err().expect("Expected EventNotFound error for missing event B, but got Ok");
     assert!(
         matches!(err, RetrievalError::EventNotFound(ref id) if *id == id_b),
-        "Error should be EventNotFound for event B, got {:?}", err
+        "Error should be EventNotFound for event B, got {:?}",
+        err
     );
 }
 
@@ -614,7 +595,8 @@ async fn test_both_frontiers_unfetchable_meet_point() {
     let result = result.expect("Should succeed because A is on both frontiers and processed as common ancestor");
     assert!(
         matches!(result.relation, AbstractCausalRelation::DivergedSince { ref meet, .. } if meet == &vec![id_a.clone()]),
-        "Should find meet at A (the unfetchable common ancestor), got {:?}", result.relation
+        "Should find meet at A (the unfetchable common ancestor), got {:?}",
+        result.relation
     );
 }
 
@@ -659,11 +641,7 @@ async fn test_multihead_event_extends_one_tip() {
 
     // The meet should be [C]; B is concurrent (not a child of meet C) so
     // it appears in other_chain rather than the immediate-children `other` field.
-    assert!(
-        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
-        "Expected DivergedSince, got {:?}",
-        result.relation
-    );
+    assert!(matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result.relation);
 
     // Verify the meet field
     if let AbstractCausalRelation::DivergedSince { meet, .. } = &result.relation {
@@ -750,11 +728,7 @@ async fn test_multihead_three_way_concurrency() {
     let result = compare(retriever.clone(), &Clock::from(vec![event_e.id()]), &entity_head, 100).await.unwrap();
 
     // Should be DivergedSince because E extends B but is concurrent with C and D
-    assert!(
-        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
-        "Expected DivergedSince, got {:?}",
-        result.relation
-    );
+    assert!(matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result.relation);
 
     if let AbstractCausalRelation::DivergedSince { meet, .. } = &result.relation {
         assert_eq!(meet, &vec![id_b], "Meet should be [B]");
@@ -824,11 +798,7 @@ async fn test_deep_diamond_asymmetric_branches() {
 
     let result = compare(retriever.clone(), &clock_h, &clock_i, 100).await.unwrap();
 
-    assert!(
-        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
-        "Expected DivergedSince, got {:?}",
-        result.relation
-    );
+    assert!(matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result.relation);
 
     if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = &result.relation {
         assert_eq!(meet, &vec![id_a], "Meet should be A");
@@ -897,11 +867,7 @@ async fn test_short_branch_from_deep_point() {
     // Event Y arrives late, with parent X
     let result = compare(retriever.clone(), &Clock::from(vec![ev_y.id()]), &clock_h, 100).await.unwrap();
 
-    assert!(
-        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
-        "Expected DivergedSince, got {:?}",
-        result.relation
-    );
+    assert!(matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result.relation);
 
     if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = &result.relation {
         // Meet should not be empty
@@ -961,11 +927,7 @@ async fn test_late_arrival_long_branch_from_genesis() {
 
     let result = compare(retriever.clone(), &clock_d, &clock_z, 100).await.unwrap();
 
-    assert!(
-        matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }),
-        "Expected DivergedSince, got {:?}",
-        result.relation
-    );
+    assert!(matches!(result.relation, AbstractCausalRelation::DivergedSince { .. }), "Expected DivergedSince, got {:?}", result.relation);
 
     if let AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } = &result.relation {
         assert_eq!(meet, &vec![id_a], "Meet should be A (genesis)");
@@ -1176,11 +1138,7 @@ mod lww_layer_tests {
         }
     }
 
-    fn layer_from_refs_with_context(
-        already_applied: &[&Event],
-        to_apply: &[&Event],
-        context_events: &[&Event],
-    ) -> EventLayer {
+    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
         let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
             dag.insert(event.id(), event.parent.as_slice().to_vec());
@@ -1350,11 +1308,7 @@ mod yrs_layer_tests {
         }
     }
 
-    fn layer_from_refs_with_context(
-        already_applied: &[&Event],
-        to_apply: &[&Event],
-        context_events: &[&Event],
-    ) -> EventLayer {
+    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
         let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
             dag.insert(event.id(), event.parent.as_slice().to_vec());
@@ -1498,11 +1452,7 @@ mod determinism_tests {
         }
     }
 
-    fn layer_from_refs_with_context(
-        already_applied: &[&Event],
-        to_apply: &[&Event],
-        context_events: &[&Event],
-    ) -> EventLayer {
+    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
         let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
             dag.insert(event.id(), event.parent.as_slice().to_vec());
@@ -1643,11 +1593,7 @@ mod edge_case_tests {
         }
     }
 
-    fn layer_from_refs_with_context(
-        already_applied: &[&Event],
-        to_apply: &[&Event],
-        context_events: &[&Event],
-    ) -> EventLayer {
+    fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
         let mut dag = BTreeMap::new();
         for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
             dag.insert(event.id(), event.parent.as_slice().to_vec());
@@ -1845,11 +1791,7 @@ mod phase4_stored_below_meet {
         // Apply the old event as a normal layer first (so the backend tracks the event_id)
         {
             let dag = BTreeMap::from([(old_event_id.clone(), vec![])]);
-            let layer = EventLayer::new(
-                vec![],
-                vec![old_event.clone()],
-                Arc::new(dag),
-            );
+            let layer = EventLayer::new(vec![], vec![old_event.clone()], Arc::new(dag));
             backend.apply_layer(&layer).unwrap();
         }
 
@@ -1866,11 +1808,7 @@ mod phase4_stored_below_meet {
         // DAG only contains the new event, NOT the old event.
         // This means dag_contains(old_event_id) returns false => older_than_meet.
         let dag = BTreeMap::from([(new_event_id.clone(), vec![])]);
-        let layer = EventLayer::new(
-            vec![],
-            vec![new_event.clone()],
-            Arc::new(dag),
-        );
+        let layer = EventLayer::new(vec![], vec![new_event.clone()], Arc::new(dag));
 
         backend.apply_layer(&layer).unwrap();
 
@@ -1881,11 +1819,7 @@ mod phase4_stored_below_meet {
             Some(Value::String("new_value".into())),
             "Layer candidate must beat stored value whose event_id is below the meet"
         );
-        assert_eq!(
-            backend.get_event_id(&"x".into()),
-            Some(new_event_id),
-            "Winning event_id must be the new event"
-        );
+        assert_eq!(backend.get_event_id(&"x".into()), Some(new_event_id), "Winning event_id must be the new event");
     }
 }
 
@@ -1927,11 +1861,7 @@ mod phase4_idempotency {
         // Re-delivery of event C (which IS at the head) should return Equal.
         let event_c_again = make_test_event(3, &[id_b]);
         let result_c = compare(retriever.clone(), &Clock::from(vec![event_c_again.id()]), &entity_head, 100).await.unwrap();
-        assert_eq!(
-            result_c.relation,
-            AbstractCausalRelation::Equal,
-            "Re-delivery of head event must return Equal"
-        );
+        assert_eq!(result_c.relation, AbstractCausalRelation::Equal, "Re-delivery of head event must return Equal");
 
         // For event B (ancestor, not at head): with staging, the comparison can
         // now correctly identify B as an ancestor of C, returning StrictAscends.
@@ -1970,17 +1900,12 @@ mod phase4_duplicate_creation {
     #[async_trait]
     impl GetEvents for SimpleRetriever {
         async fn get_event(&self, event_id: &EventId) -> Result<Event, crate::error::RetrievalError> {
-            self.events
-                .get(event_id)
-                .cloned()
-                .ok_or_else(|| crate::error::RetrievalError::EventNotFound(event_id.clone()))
+            self.events.get(event_id).cloned().ok_or_else(|| crate::error::RetrievalError::EventNotFound(event_id.clone()))
         }
 
         /// SimpleRetriever has no concept of permanent storage vs staging,
         /// so event_stored always returns false.
-        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, crate::error::RetrievalError> {
-            Ok(false)
-        }
+        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, crate::error::RetrievalError> { Ok(false) }
     }
 
     fn make_creation_event(seed: u8) -> Event {
@@ -2034,10 +1959,7 @@ mod phase4_duplicate_creation {
 
         assert!(result.is_err(), "Second creation event should fail");
         let err = result.unwrap_err();
-        assert!(
-            matches!(err, MutationError::LineageError(crate::error::LineageError::Disjoint)),
-            "Error should be Disjoint, got: {err:?}"
-        );
+        assert!(matches!(err, MutationError::LineageError(crate::error::LineageError::Disjoint)), "Error should be Disjoint, got: {err:?}");
     }
 
     #[tokio::test]
@@ -2208,11 +2130,7 @@ mod phase4_mixed_parent_merge {
         }
 
         // Verify we got multiple layers and all events are covered
-        assert!(
-            all_layers.len() >= 2,
-            "Expected at least 2 layers for mixed-parent merge, got {}",
-            all_layers.len()
-        );
+        assert!(all_layers.len() >= 2, "Expected at least 2 layers for mixed-parent merge, got {}", all_layers.len());
 
         // Collect all event ids from all layers
         let mut all_event_ids: Vec<EventId> = Vec::new();
@@ -2232,31 +2150,23 @@ mod phase4_mixed_parent_merge {
         assert!(all_event_ids.contains(&id_e), "E (merge event) should be in layers");
 
         // E must appear in a later layer than both C and G
-        let e_layer_idx = all_layers.iter().position(|l| {
-            l.to_apply.iter().any(|ev| ev.id() == id_e) ||
-            l.already_applied.iter().any(|ev| ev.id() == id_e)
-        }).expect("E must appear in some layer");
+        let e_layer_idx = all_layers
+            .iter()
+            .position(|l| l.to_apply.iter().any(|ev| ev.id() == id_e) || l.already_applied.iter().any(|ev| ev.id() == id_e))
+            .expect("E must appear in some layer");
 
-        let g_layer_idx = all_layers.iter().position(|l| {
-            l.to_apply.iter().any(|ev| ev.id() == id_g) ||
-            l.already_applied.iter().any(|ev| ev.id() == id_g)
-        }).expect("G must appear in some layer");
+        let g_layer_idx = all_layers
+            .iter()
+            .position(|l| l.to_apply.iter().any(|ev| ev.id() == id_g) || l.already_applied.iter().any(|ev| ev.id() == id_g))
+            .expect("G must appear in some layer");
 
-        let c_layer_idx = all_layers.iter().position(|l| {
-            l.to_apply.iter().any(|ev| ev.id() == id_c) ||
-            l.already_applied.iter().any(|ev| ev.id() == id_c)
-        }).expect("C must appear in some layer");
+        let c_layer_idx = all_layers
+            .iter()
+            .position(|l| l.to_apply.iter().any(|ev| ev.id() == id_c) || l.already_applied.iter().any(|ev| ev.id() == id_c))
+            .expect("C must appear in some layer");
 
-        assert!(
-            e_layer_idx > g_layer_idx,
-            "Merge event E (layer {}) must be after G (layer {})",
-            e_layer_idx, g_layer_idx
-        );
-        assert!(
-            e_layer_idx > c_layer_idx,
-            "Merge event E (layer {}) must be after C (layer {})",
-            e_layer_idx, c_layer_idx
-        );
+        assert!(e_layer_idx > g_layer_idx, "Merge event E (layer {}) must be after G (layer {})", e_layer_idx, g_layer_idx);
+        assert!(e_layer_idx > c_layer_idx, "Merge event E (layer {}) must be after C (layer {})", e_layer_idx, c_layer_idx);
 
         // B should be in already_applied (it's in current head ancestry)
         let b_in_already = all_layers.iter().any(|l| l.already_applied.iter().any(|ev| ev.id() == id_b));
@@ -2343,10 +2253,7 @@ mod phase4_eager_storage_bfs {
         while let Some(layer) = layers.next().await.unwrap() {
             layer_count += 1;
             // Each layer should have events
-            assert!(
-                !layer.to_apply.is_empty() || !layer.already_applied.is_empty(),
-                "Layer should not be empty"
-            );
+            assert!(!layer.to_apply.is_empty() || !layer.already_applied.is_empty(), "Layer should not be empty");
         }
         assert!(layer_count > 0, "Should produce at least one layer from eagerly stored events");
     }

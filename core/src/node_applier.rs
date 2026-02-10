@@ -3,7 +3,7 @@ use crate::{
     error::{ApplyError, ApplyErrorItem, MutationError},
     node::Node,
     policy::PolicyAgent,
-    retrieval::{GetState, SuspenseEvents, CachedEventGetter, LocalStateGetter},
+    retrieval::{CachedEventGetter, GetState, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
     util::ready_chunks::ReadyChunks,
 };
@@ -115,7 +115,8 @@ impl NodeApplier {
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
-                let (changed, entity) = node.entities.with_state(state_getter, event_getter, entity_id, collection_id.clone(), state.payload.state).await?;
+                let (changed, entity) =
+                    node.entities.with_state(state_getter, event_getter, entity_id, collection_id.clone(), state.payload.state).await?;
                 entities.push(entity.clone());
 
                 if matches!(changed, Some(true) | None) {
@@ -183,7 +184,8 @@ impl NodeApplier {
         // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
         // if there are stragglers, they will be picked up on the next wake
         // this should in theory be deterministic for eventbridge cases where all events are immediately available
-        let mut ready_chunks = ReadyChunks::new(deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, event_getter, state_getter)));
+        let mut ready_chunks =
+            ReadyChunks::new(deltas.into_iter().map(|delta| Self::apply_delta(node, from_peer_id, delta, event_getter, state_getter)));
 
         let mut all_errors = Vec::new();
 
@@ -254,8 +256,10 @@ impl NodeApplier {
                 let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
-                let (_, entity) =
-                    node.entities.with_state(state_getter, event_getter, delta.entity_id, delta.collection, attested_state.payload.state).await?;
+                let (_, entity) = node
+                    .entities
+                    .with_state(state_getter, event_getter, delta.entity_id, delta.collection, attested_state.payload.state)
+                    .await?;
 
                 // Save state to storage
                 Self::save_state(node, &entity, &collection).await?;
@@ -290,9 +294,7 @@ impl NodeApplier {
                 Ok(Some(EntityChange::new(entity, Vec::new())?))
             }
 
-            proto::DeltaContent::StateAndRelation { .. } => {
-                Err(MutationError::InvalidUpdate("StateAndRelation not yet implemented"))
-            }
+            proto::DeltaContent::StateAndRelation { .. } => Err(MutationError::InvalidUpdate("StateAndRelation not yet implemented")),
         }
     }
 }

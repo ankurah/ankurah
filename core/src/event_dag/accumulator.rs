@@ -39,11 +39,7 @@ impl<E: GetEvents> EventAccumulator<E> {
     /// Create a new accumulator with the given retriever.
     /// LRU cache defaults to 1000 entries.
     pub fn new(event_getter: E) -> Self {
-        Self {
-            dag: BTreeMap::new(),
-            cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
-            event_getter,
-        }
+        Self { dag: BTreeMap::new(), cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), event_getter }
     }
 
     /// Called during BFS traversal -- records DAG structure and caches the event.
@@ -67,22 +63,14 @@ impl<E: GetEvents> EventAccumulator<E> {
 
     /// Check whether an event_id is present in the accumulated DAG structure.
     /// Used by LWW resolution to distinguish "known older" from "unknown".
-    pub fn contains(&self, id: &EventId) -> bool {
-        self.dag.contains_key(id)
-    }
+    pub fn contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
 
     /// Get a reference to the DAG structure.
-    pub fn dag(&self) -> &BTreeMap<EventId, Vec<EventId>> {
-        &self.dag
-    }
+    pub fn dag(&self) -> &BTreeMap<EventId, Vec<EventId>> { &self.dag }
 
     /// Produce layer iterator for merge (consumes self).
     /// Only valid for DivergedSince results -- the DAG must be complete.
-    pub fn into_layers(
-        self,
-        meet: Vec<EventId>,
-        current_head: Vec<EventId>,
-    ) -> EventLayers<E> {
+    pub fn into_layers(self, meet: Vec<EventId>, current_head: Vec<EventId>) -> EventLayers<E> {
         EventLayers::new(self, meet, current_head)
     }
 }
@@ -97,30 +85,22 @@ pub struct ComparisonResult<E: GetEvents> {
 
 impl<E: GetEvents> ComparisonResult<E> {
     /// Create a new ComparisonResult.
-    pub fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<E>) -> Self {
-        Self { relation, accumulator }
-    }
+    pub fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<E>) -> Self { Self { relation, accumulator } }
 
     /// For DivergedSince results, consume self to get a layer iterator.
     /// Returns None for non-divergent relations.
     pub fn into_layers(self, current_head: Vec<EventId>) -> Option<EventLayers<E>> {
         match &self.relation {
-            AbstractCausalRelation::DivergedSince { meet, .. } => {
-                Some(self.accumulator.into_layers(meet.clone(), current_head))
-            }
+            AbstractCausalRelation::DivergedSince { meet, .. } => Some(self.accumulator.into_layers(meet.clone(), current_head)),
             _ => None,
         }
     }
 
     /// Get a reference to the accumulator (for inspection/testing).
-    pub fn accumulator(&self) -> &EventAccumulator<E> {
-        &self.accumulator
-    }
+    pub fn accumulator(&self) -> &EventAccumulator<E> { &self.accumulator }
 
     /// Decompose into relation and accumulator.
-    pub fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<E>) {
-        (self.relation, self.accumulator)
-    }
+    pub fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<E>) { (self.relation, self.accumulator) }
 }
 
 // ---- EventLayers: async layer iterator ----
@@ -146,11 +126,7 @@ pub struct EventLayers<E: GetEvents> {
 }
 
 impl<E: GetEvents> EventLayers<E> {
-    fn new(
-        accumulator: EventAccumulator<E>,
-        meet: Vec<EventId>,
-        current_head: Vec<EventId>,
-    ) -> Self {
+    fn new(accumulator: EventAccumulator<E>, meet: Vec<EventId>, current_head: Vec<EventId>) -> Self {
         // Build parent->children index from accumulated DAG: O(N)
         let mut children_index: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
         for (id, parents) in &accumulator.dag {
@@ -176,24 +152,13 @@ impl<E: GetEvents> EventLayers<E> {
                 accumulator
                     .dag
                     .get(*id)
-                    .map(|ps| {
-                        ps.iter()
-                            .all(|p| processed.contains(p) || !accumulator.dag.contains_key(p))
-                    })
+                    .map(|ps| ps.iter().all(|p| processed.contains(p) || !accumulator.dag.contains_key(p)))
                     .unwrap_or(true)
             })
             .cloned()
             .collect();
 
-        Self {
-            accumulator,
-            meet,
-            current_head_ancestry,
-            children_index,
-            dag,
-            processed,
-            frontier,
-        }
+        Self { accumulator, meet, current_head_ancestry, children_index, dag, processed, frontier }
     }
 
     /// Get next layer (async -- may fetch events from storage via accumulator).
@@ -205,9 +170,7 @@ impl<E: GetEvents> EventLayers<E> {
 
         let mut to_apply = Vec::new();
         let mut already_applied = Vec::new();
-        let layer_frontier: Vec<EventId> = std::mem::take(&mut self.frontier)
-            .into_iter()
-            .collect();
+        let layer_frontier: Vec<EventId> = std::mem::take(&mut self.frontier).into_iter().collect();
 
         for id in &layer_frontier {
             if self.processed.contains(id) {
@@ -236,12 +199,7 @@ impl<E: GetEvents> EventLayers<E> {
                             .accumulator
                             .dag
                             .get(child)
-                            .map(|ps| {
-                                ps.iter().all(|p| {
-                                    self.processed.contains(p)
-                                        || !self.accumulator.dag.contains_key(p)
-                                })
-                            })
+                            .map(|ps| ps.iter().all(|p| self.processed.contains(p) || !self.accumulator.dag.contains_key(p)))
                             .unwrap_or(false);
                         if all_parents_done {
                             next_frontier.insert(child.clone());
@@ -256,11 +214,7 @@ impl<E: GetEvents> EventLayers<E> {
             return Ok(None);
         }
 
-        Ok(Some(EventLayer {
-            to_apply,
-            already_applied,
-            dag: Arc::clone(&self.dag),
-        }))
+        Ok(Some(EventLayer { to_apply, already_applied, dag: Arc::clone(&self.dag) }))
     }
 }
 
@@ -287,9 +241,7 @@ impl EventLayer {
 
     /// Check whether an event_id is present in the accumulated DAG.
     /// Used by LWW to implement the "older than meet" rule.
-    pub fn dag_contains(&self, id: &EventId) -> bool {
-        self.dag.contains_key(id)
-    }
+    pub fn dag_contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
 
     /// Compare two event IDs using accumulated DAG context.
     ///
@@ -307,17 +259,13 @@ impl EventLayer {
         }
         CausalRelation::Concurrent
     }
-
 }
 
 // ---- Helper functions ----
 
 /// Compute ancestry set by walking backward through DAG parent pointers.
 /// Returns all event IDs reachable from `head` (inclusive).
-pub(crate) fn compute_ancestry_from_dag(
-    dag: &BTreeMap<EventId, Vec<EventId>>,
-    head: &[EventId],
-) -> BTreeSet<EventId> {
+pub(crate) fn compute_ancestry_from_dag(dag: &BTreeMap<EventId, Vec<EventId>>, head: &[EventId]) -> BTreeSet<EventId> {
     let mut ancestry = BTreeSet::new();
     let mut frontier: Vec<EventId> = head.to_vec();
     while let Some(id) = frontier.pop() {
@@ -337,11 +285,7 @@ pub(crate) fn compute_ancestry_from_dag(
 
 /// Walk backward from `descendant` through parent pointers looking for `ancestor`.
 /// Missing entries are treated as dead ends (below the meet), not errors.
-pub(crate) fn is_descendant_dag(
-    dag: &BTreeMap<EventId, Vec<EventId>>,
-    descendant: &EventId,
-    ancestor: &EventId,
-) -> bool {
+pub(crate) fn is_descendant_dag(dag: &BTreeMap<EventId, Vec<EventId>>, descendant: &EventId, ancestor: &EventId) -> bool {
     let mut visited = BTreeSet::new();
     let mut frontier = vec![descendant.clone()];
     while let Some(id) = frontier.pop() {
@@ -429,11 +373,7 @@ mod tests {
         dag.insert(b.clone(), vec![a.clone()]);
         dag.insert(c.clone(), vec![a.clone()]);
 
-        let layer = EventLayer {
-            to_apply: vec![],
-            already_applied: vec![],
-            dag: Arc::new(dag),
-        };
+        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
 
         assert_eq!(layer.compare(&b, &a), CausalRelation::Descends);
         assert_eq!(layer.compare(&a, &b), CausalRelation::Ascends);
@@ -451,11 +391,7 @@ mod tests {
         dag.insert(a.clone(), vec![]);
         dag.insert(b.clone(), vec![a.clone()]);
 
-        let layer = EventLayer {
-            to_apply: vec![],
-            already_applied: vec![],
-            dag: Arc::new(dag),
-        };
+        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
 
         assert!(layer.dag_contains(&a));
         assert!(layer.dag_contains(&b));
