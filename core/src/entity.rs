@@ -244,17 +244,11 @@ impl Entity {
         // (node_applier, system.rs) store events to storage BEFORE calling
         // apply_event (so BFS can find them), which would cause false positives.
 
-        // Entity creation uniqueness guard: at most one creation event per entity.
-        // If a creation event arrives for an entity that already has a non-empty head:
-        // - If this specific event is already in storage, it's a re-delivery -> idempotent no-op
-        // - If it's a different creation event, reject to prevent disjoint genesis
-        if event.is_entity_create() && !self.head().is_empty() {
-            if getter.event_stored(&event.id()).await? {
-                // Re-delivery of the same creation event that already established this entity
-                return Ok(false);
-            }
-            return Err(MutationError::DuplicateCreation);
-        }
+        // Creation event re-delivery: if entity already has a non-empty head,
+        // this creation event is a reflection (e.g. server echo, EventBridge).
+        // The normal comparison path handles this correctly (StrictAscends → no-op),
+        // so just fall through.
+        // The TOCTOU-guarded creation check below handles the first-time case.
 
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
@@ -286,9 +280,11 @@ impl Entity {
         const MAX_RETRIES: usize = 5;
 
         for attempt in 0..MAX_RETRIES {
+            tracing::info!("AE 1 - attempt {}, head={}", attempt, head);
             // Stage the event so BFS can discover it, then compare event's clock vs head
             let subject_clock: Clock = event.id().into();
             let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;
+            tracing::info!("AE 2 - compare result: {:?}", comparison_result.relation);
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");

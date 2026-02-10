@@ -2016,15 +2016,17 @@ mod phase4_duplicate_creation {
         // Entity head should now be non-empty
         assert!(!entity.head().is_empty(), "Entity head should be non-empty after creation");
 
-        // Second creation event (different seed = different event) should be rejected
+        // Second creation event (different seed = different event) should be rejected.
+        // BFS detects two different roots → Disjoint → LineageError::Disjoint
         let creation_event_2 = make_creation_event(2);
-        // Don't store it - it's a new creation event, not the same one
+        retriever.add_event(creation_event_2.clone());
         let result = entity.apply_event(&retriever, &creation_event_2).await;
 
         assert!(result.is_err(), "Second creation event should fail");
+        let err = result.unwrap_err();
         assert!(
-            matches!(result.unwrap_err(), MutationError::DuplicateCreation),
-            "Error should be DuplicateCreation"
+            matches!(err, MutationError::LineageError(crate::error::LineageError::Disjoint)),
+            "Error should be Disjoint, got: {err:?}"
         );
     }
 
