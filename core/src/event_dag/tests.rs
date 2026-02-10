@@ -549,6 +549,71 @@ async fn test_missing_event_busyloop() {
     );
 }
 
+/// Test that an unfetchable event on BOTH frontiers is handled as a common
+/// ancestor without fetching, returning StrictDescends instead of an error.
+///
+/// DAG:  A (creation, NOT in retriever) → B (in retriever)
+/// compare(subject=[B], comparison=[A])
+///
+/// Step 1 (quick-check): fetches B, sees parent=[A]. A == comparison head,
+///   so quick-check returns StrictDescends immediately.
+///
+/// But we also test the BFS path by using a two-step chain so the quick-check
+/// doesn't short-circuit:
+///   A (NOT in retriever) → B → C (both in retriever)
+///   compare(subject=[C], comparison=[A])
+///
+/// Quick-check: fetches C, parent=[B]. B != A, so quick-check doesn't fire.
+/// BFS step 1: fetches C (subject frontier), processes it, adds B to subject frontier.
+///   Fetches/processes A (comparison frontier) — but A is unfetchable!
+///   However, A is only on comparison frontier here, not subject. So we need
+///   a scenario where A ends up on BOTH frontiers.
+///
+/// Better scenario: A (NOT in retriever) → B (in retriever)
+///   compare(subject=[B], comparison=[A])
+///   Quick-check fetches B, parent=[A]. comparison_set={A}, all_parents={A}.
+///   comparison_set ⊆ all_parents → returns StrictDescends. Never reaches BFS.
+///
+/// To actually exercise BFS both-frontiers: use a diamond.
+///   A (NOT in retriever) → B, A → C (B and C in retriever)
+///   compare(subject=[B], comparison=[C])
+///   Quick-check: fetches B, parent=[A]. comparison_set={C}. A != C. No shortcut.
+///   BFS: subject_frontier={B}, comparison_frontier={C}
+///   Step 1: fetch B (ok), parents=[A], add A to subject_frontier.
+///           fetch C (ok), parents=[A], add A to comparison_frontier.
+///   Step 2: A is on BOTH frontiers. Process with empty parents. Common ancestor found.
+///   Result: DivergedSince { meet=[A] }
+#[tokio::test]
+async fn test_both_frontiers_unfetchable_meet_point() {
+    let mut retriever = MockRetriever::new();
+
+    // A: creation event, deliberately NOT added to retriever
+    let ev_a = make_test_event(1, &[]);
+    let id_a = ev_a.id();
+    // Do NOT add ev_a to retriever
+
+    // B: child of A, in retriever
+    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let id_b = ev_b.id();
+    retriever.add_event(ev_b);
+
+    // C: child of A, in retriever
+    let ev_c = make_test_event(3, &[id_a.clone()]);
+    let id_c = ev_c.id();
+    retriever.add_event(ev_c);
+
+    // compare(subject=[B], comparison=[C])
+    // BFS will walk B and C back to A, which is on both frontiers but unfetchable.
+    // The both-frontiers optimization should process A as common ancestor with empty parents.
+    let result = compare(retriever.clone(), &clock!(id_b), &clock!(id_c), 100).await;
+
+    let result = result.expect("Should succeed because A is on both frontiers and processed as common ancestor");
+    assert!(
+        matches!(result.relation, AbstractCausalRelation::DivergedSince { ref meet, .. } if meet == &vec![id_a.clone()]),
+        "Should find meet at A (the unfetchable common ancestor), got {:?}", result.relation
+    );
+}
+
 // ============================================================================
 // MULTI-HEAD BUG FIX TESTS (Phase 2A)
 // ============================================================================
