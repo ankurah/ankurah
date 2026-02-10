@@ -38,6 +38,11 @@ pub trait GetEvents {
             Err(e) => Err(e),
         }
     }
+
+    /// Whether event_stored() is definitive — i.e., returning false means the event
+    /// genuinely doesn't exist, not just that it's missing from local cache.
+    /// Default is false (safe for ephemeral nodes).
+    fn storage_is_definitive(&self) -> bool { false }
 }
 
 /// Retrieve entity state snapshots.
@@ -70,6 +75,10 @@ impl<R: GetEvents + Send + Sync + ?Sized> GetEvents for &R {
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
         (*self).event_stored(event_id).await
     }
+
+    fn storage_is_definitive(&self) -> bool {
+        (*self).storage_is_definitive()
+    }
 }
 
 #[async_trait]
@@ -90,13 +99,15 @@ impl<R: GetState + Send + Sync + ?Sized> GetState for &R {
 #[derive(Clone)]
 pub struct LocalEventGetter {
     collection: StorageCollectionWrapper,
+    durable: bool,
     staging: Arc<RwLock<HashMap<EventId, Event>>>,
 }
 
 impl LocalEventGetter {
-    pub fn new(collection: StorageCollectionWrapper) -> Self {
+    pub fn new(collection: StorageCollectionWrapper, durable: bool) -> Self {
         Self {
             collection,
+            durable,
             staging: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -121,6 +132,10 @@ impl GetEvents for LocalEventGetter {
         // Check permanent storage only (not staging)
         let events = self.collection.get_events(vec![event_id.clone()]).await?;
         Ok(events.into_iter().next().is_some())
+    }
+
+    fn storage_is_definitive(&self) -> bool {
+        self.durable
     }
 }
 

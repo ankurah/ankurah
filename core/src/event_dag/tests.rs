@@ -1971,6 +1971,12 @@ mod phase4_duplicate_creation {
                 .cloned()
                 .ok_or_else(|| crate::error::RetrievalError::EventNotFound(event_id.clone()))
         }
+
+        /// SimpleRetriever has no concept of permanent storage vs staging,
+        /// so event_stored always returns false.
+        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, crate::error::RetrievalError> {
+            Ok(false)
+        }
     }
 
     fn make_creation_event(seed: u8) -> Event {

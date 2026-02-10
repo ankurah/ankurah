@@ -129,7 +129,7 @@ where
         let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
 
         // Stage the event, apply, then commit
-        let event_getter = LocalEventGetter::new(storage.clone());
+        let event_getter = LocalEventGetter::new(storage.clone(), true);
         event_getter.stage_event(event.clone());
 
         // Apply the creation event so LWW values are tagged with event_id before serialization.
@@ -255,7 +255,7 @@ where
         let mut root_state = None;
 
         let state_getter = LocalStateGetter::new(storage.clone());
-        let event_getter = LocalEventGetter::new(storage.clone());
+        let event_getter = LocalEventGetter::new(storage.clone(), self.0.durable);
 
         for state in
             storage.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?

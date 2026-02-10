@@ -2,18 +2,18 @@
 
 **Worktree:** `/Users/daniel/ak/ankurah-201` (branch: `concurrent-updates-event-dag`)
 **Date:** 2026-02-10
-**Status:** Phases 1-5 complete. Phase 5 committed as `07e0b146`. Comprehensive review complete. Cleanup and fixes pending.
+**Status:** Phases 1-7 complete. All 4 durable_ephemeral tests pass. Cleanup in progress.
 
 ---
 
 ## Current State
 
-- `cargo check` — passes (no errors, no new warnings)
-- `cargo test` — unit tests pass, 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
-- Integration tests (`durable_ephemeral`) — 3 of 4 hanging (under investigation, may be pre-existing)
-- `spec.md` updated with small Phase 5 tweaks (staging pattern, infallible compare, etc.)
-- `grep -r "compare_unstored_event" core/src/` — zero hits
-- `grep -r "event_exists" core/src/` — zero hits
+- `cargo check` — passes
+- `cargo test` — all tests pass, 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
+- Integration tests (`durable_ephemeral`) — 4 of 4 pass
+- 52 event_dag unit tests pass, 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
+- Debug trace logging removed (Phase 7)
+- `unimplemented!()` on `StateAndRelation` converted to error return
 
 ---
 
@@ -199,15 +199,17 @@ pub trait SuspenseEvents: GetEvents {
 
 ### Must Fix (before merge)
 - [ ] Remove dead code: `traits.rs`, `FrontierState`/`TaintReason`, `InsufficientCausalInfo`, unused methods
-- [ ] Remove dev trace logging (`[TRACE-AE]` etc.) or downgrade to `trace!` level
+- [x] ~~Remove dev trace logging~~ — Removed (Phase 7)
 - [ ] Fix default `event_stored` semantic trap
-- [ ] Investigate durable_ephemeral test hangs
+- [x] ~~Investigate durable_ephemeral test hangs~~ — Root-caused and fixed (Phase 6). 3/4 pass. Remaining failure is separate bug.
+- [x] ~~Fix `test_durable_vs_ephemeral_concurrent_write`~~ — Removed `DuplicateCreation` early guard; `compare()` already returns `Disjoint` for different genesis and `StrictAscends` for re-delivery. Added `storage_is_definitive()` to `GetEvents` for cheap durable-node fast path.
 - [ ] Update invariant #6 wording
+- [ ] Remove unnecessary fork/snapshot for `EntityKind::Transacted` in `commit_local_trx_impl` — Investigation complete: entity is already a transaction fork, `snapshot()` creates a redundant double-fork. The transaction entity can be used directly as "after" for policy validation, with `upstream` as "before". The fork entity is discarded after commit anyway.
 
 ### Should Fix (before or shortly after merge)
 - [ ] Use fork for creation events in `commit_remote_transaction` (policy check ordering)
 - [ ] Add `validate_received_event` to `CachedEventGetter` BFS fetch path
-- [ ] Convert `unimplemented!()` on `StateAndRelation` to error return
+- [x] ~~Convert `unimplemented!()` on `StateAndRelation` to error return~~ — Returns `InvalidUpdate` error instead of panicking
 - [ ] Add entity-level idempotency test (re-deliver ancestor, verify head unchanged)
 - [ ] Add unit tests for `LocalEventGetter`/`CachedEventGetter` staging lifecycle
 
@@ -250,25 +252,95 @@ pub trait SuspenseEvents: GetEvents {
 
 See top of document.
 
+### Phase 6: BFS Comparison Fixes — DONE (commits `e142727c`..`15da302f`)
+
+Three bugs found and fixed in the `compare()` BFS algorithm, triggered by ephemeral nodes committing locally.
+
+**Root cause investigation:**
+
+The `durable_ephemeral` integration tests were introduced on this branch (commit `53c082a6`) and passed through Phase 4. They broke at Phase 5 (`07e0b146`). Bisect confirmed: the Phase 5 trait split + staging pattern introduced a regression.
+
+All 3 hanging tests share one trait: **the ephemeral node commits a transaction**. The passing test only reads. When an ephemeral node commits, it has the entity state (head clock) but not the historical events — those live on the durable node. Phase 5's switch from `compare_unstored_event` (parent-clock comparison, no event fetching) to `compare` (full BFS traversal, needs events) broke this because BFS tries to fetch events the ephemeral doesn't have.
+
+**Debugging methodology:** Iterative MARK logging (per `debugging.mdc`). Narrowed from "hangs after MARK 5" → `commit_local_trx_impl` → `apply_event` → `compare()` → `step()` inner loop. Final log showed `step()` spinning at 915,000+ iterations with the same event ID on both frontiers, budget frozen at 999.
+
+**Bug 1: Infinite busyloop on `EventNotFound`** (`comparison.rs:224`)
+
+`step()` fetches each frontier event via `get_event`. When `EventNotFound` is returned, the code did `continue`, skipping `process_event` — the only place that removes IDs from frontiers. Unfetchable events stayed on the frontier forever.
+
+**Fix:** `EventNotFound` → return `Err(e)` instead of `continue`. Committed as `b9220663`.
+
+**Bug 2: No quick-check for trivial StrictDescends** (`comparison.rs`, new code)
+
+For the common case where a new event's parents ARE the current head (linear extension), BFS is unnecessary. Added a pre-BFS check: fetch subject events, check if their parents ⊇ comparison clock. If so, return `StrictDescends` immediately without BFS.
+
+This handles the ephemeral commit case: event B (in staging) has parent=[A] (the head). Quick check sees parent ⊇ head → StrictDescends. No need to fetch A.
+
+**Fix:** Added quick-check block before the BFS loop. Committed as `a6d1f1b0`.
+
+**Bug 3: Both-frontiers meet point not recognized**
+
+After the quick check handles linear extension, concurrent commits still fail. When trx2 is committed (parent=[A], but head is now [B] from trx1), the quick check doesn't fire. BFS runs and eventually has event A on both subject and comparison frontiers. A is the meet point — BFS should recognize it as common without needing to fetch it.
+
+**Fix:** In `step()`, before fetching, check if event is on both frontiers. If `get_event` returns `EventNotFound` AND the event is on both frontiers, call `process_event(id, &[])` — mark as common, don't traverse further. For events on only ONE frontier that are unfetchable, return error. Committed as `15da302f`.
+
+**Design decision:** The both-frontiers check only triggers on `EventNotFound`, not unconditionally. If an event IS fetchable, we use its real parents so the BFS can continue past common ancestors to find the true minimal meet point.
+
+**Final test results (all 3 bugs fixed):**
+- `test_durable_writes_ephemeral_observes` — pass (always passed)
+- `test_late_arriving_branch` — **pass** (was hanging)
+- `test_ephemeral_writes_durable_receives` — **pass** (was hanging)
+- `test_durable_vs_ephemeral_concurrent_write` — **FAIL** ("duplicate creation event" — separate bug, not BFS-related)
+- `test_missing_event_busyloop` (new unit test) — pass (errors correctly on genuinely missing event)
+- `test_both_frontiers_unfetchable_meet_point` (new unit test) — pass (common ancestor without fetch)
+- All 52 event_dag unit tests — pass
+
+**Remaining:** `test_durable_vs_ephemeral_concurrent_write` fails with "duplicate creation event for entity that already has a non-empty head". This is the `DuplicateCreation` guard in `apply_event` firing when the durable node receives the ephemeral's event via `CommitTransaction`. The creation event gets re-applied to an entity that already has it. This is a separate idempotency/relay issue, not a BFS bug.
+
+**Key commits:**
+| Commit | Content |
+|--------|---------|
+| `e142727c` | test: missing-event busyloop proof |
+| `b9220663` | fix: EventNotFound → error in BFS |
+| `a6d1f1b0` | fix: quick-check for direct parent StrictDescends |
+| `15da302f` | fix: both-frontier events processed as common ancestors |
+
 ### Post-Phase-5 Cleanup — DONE (in `07e0b146`)
 
 - Fixed 5 stale comments (references to `compare_unstored_event`, `event_exists`, `Retrieve`)
 - Removed unused imports (`GetEvents`, `Event`, `EventId`, `Clock`, 6x `EventId` in test modules)
 - Removed dead `add_event` standalone function from tests
 
+### Phase 7: DuplicateCreation Fix + Cleanup — DONE (commit `93b0c68a`+)
+
+**Root cause:** The `DuplicateCreation` early guard in `apply_event` (added Phase 3) relied on `event_stored()` to distinguish re-delivery from attack. On ephemeral nodes that receive entities via `StateSnapshot`, the creation event is never committed to event storage — only the entity state (including head clock) is persisted. When the creation event later arrives via subscription echo or `EventBridge`, `event_stored()` returns false, misclassifying a legitimate re-delivery as a disjoint genesis attack.
+
+**Fix:** Removed the `DuplicateCreation` early guard entirely. The comparison algorithm already handles both cases:
+- **Re-delivery:** BFS finds the creation event as an ancestor of the head → `StrictAscends` → no-op
+- **Different genesis (attack):** BFS finds two different roots with empty parents → `Disjoint` → `LineageError::Disjoint` error
+
+**Optimization:** Added `storage_is_definitive()` method to `GetEvents` trait (default `false`). `LocalEventGetter` accepts a `durable` flag at construction. On durable nodes, `event_stored()` is authoritative: true → cheap re-delivery no-op, false → cheap `Disjoint` rejection. On ephemeral nodes, falls through to BFS.
+
+**Other cleanup:**
+- Removed all dev trace logging (`[TRACE-AE]`, `[TRACE-AS]`, `[TRACE-SAE]`, STEP, CMP, AE, COMMIT)
+- Converted `unimplemented!()` on `StateAndRelation` to `InvalidUpdate` error return
+- `DuplicateCreation` variant can be removed from `MutationError` (now dead code)
+
 ---
 
 ## Critical Invariants
 
 1. **No `E: Clone`.** Budget escalation is internal to `Comparison` — the event getter stays owned by the accumulator.
-2. **Don't alter BFS traversal logic.** The comparison algorithm is unchanged across all phases.
-3. **Out-of-DAG parents are dead ends, not errors.** Use `if let Some` / `else { continue }`.
+2. **BFS traversal: both-frontiers = common ancestor.** If an event appears on both subject and comparison frontiers, it's a meet point — process with empty parents, no fetch needed.
+3. **Unfetchable events on a single frontier are errors.** `EventNotFound` in BFS must return `Err`, not silently `continue`. The old "dead end" behavior caused infinite busyloops.
 4. **Idempotency and creation guards go before the retry loop** in `apply_event`, not inside it.
 5. **Never call `into_layers()` on `BudgetExceeded`.** The DAG is incomplete.
 6. **`stage_event` before head update (in memory); `commit_event` before `set_state` (to disk).** The event must be discoverable by BFS (via staging or storage) at the time the head is updated. The event must be committed to permanent storage before the entity state is persisted.
 7. **`get_event` is the union view** (staging + storage). **`event_stored` is permanent-only.**
 8. **Blanket `&R` impls are required.** All call sites pass getters by reference.
 9. **Meet filter guarantees correctness.** The `common_child_count == 0` filter ensures that every head tip the new event descends from appears in the meet. Deep ancestors result in harmless no-op removals.
+10. **Disjoint genesis is detected by `compare()`, not by early guards.** Two different creation events (both with `parent=[]`) for the same entity produce `Disjoint` from BFS. Re-delivery of the same creation event produces `StrictAscends`. The `DuplicateCreation` early guard was removed because `event_stored()` is unreliable on ephemeral nodes (StateSnapshot establishes entity state without storing individual events).
+11. **`storage_is_definitive()` enables cheap disjoint rejection on durable nodes.** When true, `event_stored() == false` definitively means the event doesn't exist → `Disjoint` error without BFS. Default is `false` (safe for ephemeral nodes).
 
 ---
 
@@ -280,3 +352,8 @@ See top of document.
 | `5cbc255a` | Phase 3: caller updates, correctness guards |
 | `87447a9b` | Phase 4: cleanup, remove old types, add tests |
 | `07e0b146` | Phase 5: Retrieve trait split, staging pattern, idempotency fix + cleanup |
+| `71226a2f` | WIP: checkpoint before bisecting |
+| `e142727c` | Phase 6: test proving missing-event busyloop |
+| `b9220663` | Phase 6: EventNotFound → error in BFS |
+| `a6d1f1b0` | Phase 6: quick-check for direct parent StrictDescends |
+| `15da302f` | Phase 6: both-frontier events as common ancestors |

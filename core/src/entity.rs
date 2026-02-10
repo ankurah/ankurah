@@ -228,7 +228,6 @@ impl Entity {
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<E>(&self, getter: &E, event: &Event) -> Result<bool, MutationError>
     where E: GetEvents + Send + Sync {
-        tracing::info!("[TRACE-AE] apply_event called for entity={}, event_id={}, event_parent={}", self.id(), event.id(), event.parent);
         debug!("apply_event head: {event} to {self}");
 
         // Budget for DAG traversal - should be large enough for typical histories
@@ -244,11 +243,24 @@ impl Entity {
         // (node_applier, system.rs) store events to storage BEFORE calling
         // apply_event (so BFS can find them), which would cause false positives.
 
-        // Creation event re-delivery: if entity already has a non-empty head,
-        // this creation event is a reflection (e.g. server echo, EventBridge).
-        // The normal comparison path handles this correctly (StrictAscends → no-op),
-        // so just fall through.
-        // The TOCTOU-guarded creation check below handles the first-time case.
+        // Creation event on entity with non-empty head: either re-delivery or attack.
+        // On durable nodes (definitive storage), we can cheaply distinguish:
+        //   event_stored() == true  → re-delivery → no-op
+        //   event_stored() == false → different genesis event → reject
+        // On ephemeral nodes, event_stored() may return false for legitimate
+        // re-deliveries (entity arrived via StateSnapshot without event storage),
+        // so we fall through to BFS which correctly identifies:
+        //   StrictAscends → re-delivery → no-op
+        //   Disjoint → different genesis → reject
+        if event.is_entity_create() && !self.head().is_empty() {
+            if getter.event_stored(&event.id()).await? {
+                return Ok(false);
+            }
+            if getter.storage_is_definitive() {
+                return Err(LineageError::Disjoint.into());
+            }
+            // Ephemeral: fall through to comparison
+        }
 
         // Check for entity creation under the mutex to avoid TOCTOU race
         if event.is_entity_create() {
@@ -280,11 +292,9 @@ impl Entity {
         const MAX_RETRIES: usize = 5;
 
         for attempt in 0..MAX_RETRIES {
-            tracing::info!("AE 1 - attempt {}, head={}", attempt, head);
             // Stage the event so BFS can discover it, then compare event's clock vs head
             let subject_clock: Clock = event.id().into();
             let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;
-            tracing::info!("AE 2 - compare result: {:?}", comparison_result.relation);
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("Equal - skip");
@@ -409,12 +419,6 @@ impl Entity {
 
         for attempt in 0..MAX_RETRIES {
             let comparison_result = crate::event_dag::compare(getter, &new_head, &head, DEFAULT_BUDGET).await?;
-            tracing::info!(
-                "[TRACE-AS] apply_state comparing new_head={} vs current_head={}, result={:?}",
-                new_head,
-                head,
-                comparison_result.relation
-            );
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
                     debug!("{self} apply_state - heads are equal, skipping");

@@ -103,13 +103,6 @@ impl NodeApplier {
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
-                tracing::info!(
-                    "[TRACE-SAE] StateAndEvent received for entity {} from peer {}, incoming_head={}, event_count={}",
-                    entity_id,
-                    from_peer_id,
-                    state_fragment.state.head,
-                    event_fragments.len()
-                );
                 let mut attested_events = Vec::new();
                 for fragment in event_fragments {
                     let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
@@ -124,17 +117,10 @@ impl NodeApplier {
 
                 // with_state only updates the in-memory entity, it does NOT persist to storage
                 let (changed, entity) = node.entities.with_state(state_getter, event_getter, entity_id, collection_id.clone(), state.payload.state).await?;
-                tracing::info!(
-                    "[TRACE-SAE] with_state returned changed={:?} for entity {}, entity_head={:?}",
-                    changed,
-                    entity_id,
-                    entity.head()
-                );
                 entities.push(entity.clone());
 
                 if matches!(changed, Some(true) | None) {
                     // State applied successfully (new entity or strictly descends)
-                    tracing::info!("[TRACE-SAE] Saving state for entity {}", entity_id);
                     // Commit all staged events
                     for event in &attested_events {
                         event_getter.commit_event(event).await?;
@@ -144,11 +130,6 @@ impl NodeApplier {
                 } else {
                     // State not applied (divergence or older) - fall back to event-by-event application
                     // This handles DivergedSince where we need to merge concurrent branches
-                    tracing::info!(
-                        "[TRACE-SAE] State not applied for entity {} (changed={:?}), falling back to event-by-event application",
-                        entity_id,
-                        changed
-                    );
                     let mut applied_events = Vec::new();
                     for event in attested_events {
                         if entity.apply_event(event_getter, &event.payload).await? {
@@ -157,7 +138,6 @@ impl NodeApplier {
                         }
                     }
                     if !applied_events.is_empty() {
-                        tracing::info!("[TRACE-SAE] Applied {} events via fallback for entity {}", applied_events.len(), entity_id);
                         Self::save_state(node, &entity, &collection).await?;
                         changes.push(EntityChange::new(entity, applied_events)?);
                     }
@@ -311,9 +291,8 @@ impl NodeApplier {
                 Ok(Some(EntityChange::new(entity, Vec::new())?))
             }
 
-            proto::DeltaContent::StateAndRelation { state: _, relation: _ } => {
-                // Phase 2: Will validate causal assertion and apply state
-                unimplemented!("StateAndRelation not yet implemented in Phase 1")
+            proto::DeltaContent::StateAndRelation { .. } => {
+                Err(MutationError::InvalidUpdate("StateAndRelation not yet implemented"))
             }
         }
     }
