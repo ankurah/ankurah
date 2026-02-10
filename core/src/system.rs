@@ -260,8 +260,11 @@ where
         for state in
             storage.fetch_states(&ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }).await?
         {
-            let (_entity_changed, entity) =
-                self.0.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state.clone()).await?;
+            let (_entity_changed, entity) = self
+                .0
+                .entities
+                .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state.clone())
+                .await?;
             let lww_backend = entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
             if let Some(value) = lww_backend.get(&"item".to_string()) {
                 let item = proto::sys::Item::from_value(Some(value)).expect("Invalid sys item");

@@ -192,12 +192,10 @@ impl PropertyBackend for LWWBackend {
                 // We still seed it so it participates if no layer event touches
                 // this property, but mark it as auto-losable.
                 let known_in_dag = layer.dag_contains(&event_id);
-                winners.insert(prop.clone(), Candidate {
-                    value: entry.value(),
-                    event_id,
-                    from_to_apply: false,
-                    older_than_meet: !known_in_dag,
-                });
+                winners.insert(
+                    prop.clone(),
+                    Candidate { value: entry.value(), event_id, from_to_apply: false, older_than_meet: !known_in_dag },
+                );
             }
         }
 
