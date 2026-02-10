@@ -36,6 +36,10 @@ impl GetEvents for MockRetriever {
             .cloned()
             .ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
     }
+
+    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        Ok(self.events.contains_key(event_id))
+    }
 }
 
 /// Create a test event with deterministic content-hashed IDs.

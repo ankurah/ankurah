@@ -167,10 +167,6 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
-    #[error("duplicate creation event for entity that already has a non-empty head")]
-    DuplicateCreation,
-    #[error("insufficient causal info: cannot determine relationship between {event_a:?} and {event_b:?}")]
-    InsufficientCausalInfo { event_a: EventId, event_b: EventId },
 }
 
 impl From<tokio::task::JoinError> for MutationError {

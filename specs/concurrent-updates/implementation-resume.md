@@ -2,7 +2,7 @@
 
 **Worktree:** `/Users/daniel/ak/ankurah-201` (branch: `concurrent-updates-event-dag`)
 **Date:** 2026-02-10
-**Status:** Phases 1-7 complete. All 4 durable_ephemeral tests pass. Cleanup in progress.
+**Status:** Phases 1-8 complete. All tests pass. Ready for merge review.
 
 ---
 
@@ -11,9 +11,14 @@
 - `cargo check` — passes
 - `cargo test` — all tests pass, 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
 - Integration tests (`durable_ephemeral`) — 4 of 4 pass
-- 52 event_dag unit tests pass, 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
+- 176 core unit tests pass (up from 52), 1 `#[ignore]`d (`test_toctou_retry_exhaustion`)
 - Debug trace logging removed (Phase 7)
 - `unimplemented!()` on `StateAndRelation` converted to error return
+- Dead code removed (Phase 8)
+- `event_stored` default impl removed — now a required method
+- `TContext` commit indirection collapsed (3 functions → 1)
+- Internals documentation added (`docs/internals/event-dag.md`, `docs/internals/retrieval.md`)
+- Entity-level idempotency test + staging lifecycle unit tests added
 
 ---
 
@@ -80,8 +85,7 @@ Minimum diff review identified ~226 lines of removable diff. Golf review (scoped
 - `InsufficientCausalInfo` error variant — never constructed
 - `EventLayer::has_work()`, `event_getter_mut()`, `ComparisonResult::into_layers()` — never called
 
-**Dev artifacts to remove:**
-- 7x `info!("[TRACE-AE]"...)` debug traces at info level (~25 lines)
+**Dev artifacts:** ~~7x `info!("[TRACE-AE]"...)` debug traces~~ — Removed (Phase 7)
 
 **Unrelated cleanups (consider splitting to separate commit):**
 - `property_backend_name() -> &'static str`, `&Vec<Op>` → `&[Op]`, `deltas` → `initial` rename
@@ -104,7 +108,7 @@ Full report: `/private/tmp/claude-501/-Users-daniel-ak/tasks/a3076b6.output`
 ### Security Review
 
 Top findings:
-- `unimplemented!()` on `StateAndRelation` (`node_applier.rs:316`) — peer can crash the node
+- ~~`unimplemented!()` on `StateAndRelation`~~ — Fixed (Phase 7), returns `InvalidUpdate` error
 - No size/count limits on peer events — trivial DoS
 - `collect_event_bridge` has no traversal limit (`node.rs:680-702`)
 - `std::sync::RwLock` poisoning cascade on any panic
@@ -156,7 +160,7 @@ pub trait SuspenseEvents: GetEvents {
 
 **Design decisions made during implementation:**
 
-- `apply_event` takes `E: GetEvents` only (not `SuspenseEvents`). The caller manages staging and committing. This avoids needing a "dry-run" wrapper for the fork in `context.rs:commit_local_trx_impl` where `commit_event` must NOT fire.
+- `apply_event` takes `E: GetEvents` only (not `SuspenseEvents`). The caller manages staging and committing. This avoids needing a "dry-run" wrapper for the fork in `context.rs:commit_local_trx` where `commit_event` must NOT fire.
 - `commit_event` takes `&Attested<Event>` (not `&EventId`), because `collection.add_event()` requires the attested version.
 - `stage_event` uses interior mutability (`&self` not `&mut self`) via `Arc<RwLock<HashMap>>`.
 - Blanket `&R` impls for `GetEvents` and `GetState` are needed — nearly every call site passes `&event_getter` or `&state_getter` by reference.
@@ -181,7 +185,7 @@ pub trait SuspenseEvents: GetEvents {
 | `core/src/node_applier.rs` | Staging pattern replaces eager `collection.add_event()`; two-arg getters |
 | `core/src/node.rs` | `commit_remote_transaction` + `fetch_entities_from_local` use new types |
 | `core/src/system.rs` | `create` + `load_system_catalog` use staging/new types |
-| `core/src/context.rs` | `commit_local_trx_impl` uses staging; other methods use new types |
+| `core/src/context.rs` | `commit_local_trx` uses staging; other methods use new types |
 | `core/src/peer_subscription/client_relay.rs` | `remote_subscribe` uses new types |
 | `core/src/event_dag/tests.rs` | `MockRetriever` implements `GetEvents`; tests use staging + `compare` |
 
@@ -198,20 +202,20 @@ pub trait SuspenseEvents: GetEvents {
 ## Action Items from Review
 
 ### Must Fix (before merge)
-- [ ] Remove dead code: `traits.rs`, `FrontierState`/`TaintReason`, `InsufficientCausalInfo`, unused methods
+- [x] ~~Remove dead code~~ — Removed `traits.rs`, `FrontierState`/`TaintReason`, `InsufficientCausalInfo`, `DuplicateCreation`, `has_work()`, `event_getter_mut()` (Phase 8)
 - [x] ~~Remove dev trace logging~~ — Removed (Phase 7)
-- [ ] Fix default `event_stored` semantic trap
+- [x] ~~Fix default `event_stored` semantic trap~~ — Removed default impl; now a required method. Added explicit impl to `MockRetriever` (Phase 8)
 - [x] ~~Investigate durable_ephemeral test hangs~~ — Root-caused and fixed (Phase 6). 3/4 pass. Remaining failure is separate bug.
 - [x] ~~Fix `test_durable_vs_ephemeral_concurrent_write`~~ — Removed `DuplicateCreation` early guard; `compare()` already returns `Disjoint` for different genesis and `StrictAscends` for re-delivery. Added `storage_is_definitive()` to `GetEvents` for cheap durable-node fast path.
-- [ ] Update invariant #6 wording
-- [ ] Remove unnecessary fork/snapshot for `EntityKind::Transacted` in `commit_local_trx_impl` — Investigation complete: entity is already a transaction fork, `snapshot()` creates a redundant double-fork. The transaction entity can be used directly as "after" for policy validation, with `upstream` as "before". The fork entity is discarded after commit anyway.
+- [x] ~~Update invariant #6 wording~~ — Invariant documented in `docs/internals/event-dag.md` with correct weaker property (Phase 8)
+- [ ] ~~Remove unnecessary fork/snapshot for `EntityKind::Transacted` in `commit_local_trx`~~ — Deferred to GitHub #242. Pre-existing behavior, not introduced by this branch. Broader design question about policy validation and `apply_event` as preview mechanism.
 
 ### Should Fix (before or shortly after merge)
-- [ ] Use fork for creation events in `commit_remote_transaction` (policy check ordering)
-- [ ] Add `validate_received_event` to `CachedEventGetter` BFS fetch path
+- [ ] ~~Use fork for creation events in `commit_remote_transaction`~~ — Pre-existing on main. Filed as GitHub #243
+- [ ] ~~Add `validate_received_event` to `CachedEventGetter` BFS fetch path~~ — Pre-existing on main. Filed as GitHub #244
 - [x] ~~Convert `unimplemented!()` on `StateAndRelation` to error return~~ — Returns `InvalidUpdate` error instead of panicking
-- [ ] Add entity-level idempotency test (re-deliver ancestor, verify head unchanged)
-- [ ] Add unit tests for `LocalEventGetter`/`CachedEventGetter` staging lifecycle
+- [x] ~~Add entity-level idempotency test~~ — `test_redelivery_of_ancestor_event_is_noop` in `edge_cases.rs` (Phase 8)
+- [x] ~~Add unit tests for `LocalEventGetter`/`CachedEventGetter` staging lifecycle~~ — 4 tests in `retrieval.rs` (Phase 8)
 
 ### Nice to Have
 - [ ] Deduplicate test helpers across inner test modules (~120 lines)
@@ -238,7 +242,7 @@ pub trait SuspenseEvents: GetEvents {
 
 ### Phase 3: Update Callers + Correctness Fixes — DONE (commit `5cbc255a`)
 
-- Creation uniqueness guard (`DuplicateCreation`), `into_layers()` replaces `compute_layers()`
+- Creation uniqueness guard (`DuplicateCreation`, later removed in Phase 7), `into_layers()` replaces `compute_layers()`
 - LWW `older_than_meet` rule via `dag_contains()`, infallible layer `compare()`
 - Backend replay for late-created backends, `apply_state` returns `StateApplyResult`
 
@@ -262,7 +266,7 @@ The `durable_ephemeral` integration tests were introduced on this branch (commit
 
 All 3 hanging tests share one trait: **the ephemeral node commits a transaction**. The passing test only reads. When an ephemeral node commits, it has the entity state (head clock) but not the historical events — those live on the durable node. Phase 5's switch from `compare_unstored_event` (parent-clock comparison, no event fetching) to `compare` (full BFS traversal, needs events) broke this because BFS tries to fetch events the ephemeral doesn't have.
 
-**Debugging methodology:** Iterative MARK logging (per `debugging.mdc`). Narrowed from "hangs after MARK 5" → `commit_local_trx_impl` → `apply_event` → `compare()` → `step()` inner loop. Final log showed `step()` spinning at 915,000+ iterations with the same event ID on both frontiers, budget frozen at 999.
+**Debugging methodology:** Iterative MARK logging (per `debugging.mdc`). Narrowed from "hangs after MARK 5" → `commit_local_trx` → `apply_event` → `compare()` → `step()` inner loop. Final log showed `step()` spinning at 915,000+ iterations with the same event ID on both frontiers, budget frozen at 999.
 
 **Bug 1: Infinite busyloop on `EventNotFound`** (`comparison.rs:224`)
 
@@ -295,7 +299,7 @@ After the quick check handles linear extension, concurrent commits still fail. W
 - `test_both_frontiers_unfetchable_meet_point` (new unit test) — pass (common ancestor without fetch)
 - All 52 event_dag unit tests — pass
 
-**Remaining:** `test_durable_vs_ephemeral_concurrent_write` fails with "duplicate creation event for entity that already has a non-empty head". This is the `DuplicateCreation` guard in `apply_event` firing when the durable node receives the ephemeral's event via `CommitTransaction`. The creation event gets re-applied to an entity that already has it. This is a separate idempotency/relay issue, not a BFS bug.
+**Remaining at Phase 6:** `test_durable_vs_ephemeral_concurrent_write` failed with "duplicate creation event". Fixed in Phase 7 — see below.
 
 **Key commits:**
 | Commit | Content |
@@ -310,6 +314,37 @@ After the quick check handles linear extension, concurrent commits still fail. W
 - Fixed 5 stale comments (references to `compare_unstored_event`, `event_exists`, `Retrieve`)
 - Removed unused imports (`GetEvents`, `Event`, `EventId`, `Clock`, 6x `EventId` in test modules)
 - Removed dead `add_event` standalone function from tests
+
+### Phase 8: Cleanup, Tests, and Documentation — DONE
+
+**Dead code removal (6 items):**
+- Deleted `core/src/event_dag/traits.rs` (~53 lines) and `mod traits` declaration
+- Removed `FrontierState`, `TaintReason`, `is_tainted()`, `taint()`, `state` field from `frontier.rs`
+- Removed `InsufficientCausalInfo` and `DuplicateCreation` variants from `MutationError`
+- Removed `EventLayer::has_work()` and `EventAccumulator::event_getter_mut()`
+- Note: `ComparisonResult::into_layers()` was kept — actively used in tests
+
+**`event_stored` semantic trap fix:**
+- Removed default implementation from `GetEvents` trait — now a required method
+- Added explicit `event_stored` impl to `MockRetriever` (checks HashMap directly)
+
+**`TContext` commit simplification:**
+- Collapsed 3-layer indirection (`commit_local_trx` → `commit_local_trx_with_events` → `commit_local_trx_impl`) into single `commit_local_trx` method returning `Vec<Event>`
+- Removed `commit_local_trx_with_events` from trait and impl
+- Inlined `commit_local_trx_inner` body directly into trait impl
+- `Transaction::commit()` discards events; `commit_and_return_events()` gated behind `test-helpers` feature
+
+**Test coverage:**
+- `test_redelivery_of_ancestor_event_is_noop` — entity-level idempotency (the exact Phase 5 bug scenario)
+- 4 staging lifecycle unit tests in `retrieval.rs` (stage→get, stage≠stored, commit→stored, definitive flag)
+
+**Documentation:**
+- Created `docs/internals/event-dag.md` — algorithm, staging pattern, invariants, design decisions
+- Created `docs/internals/retrieval.md` — trait semantics, concrete types, crash safety
+
+**GitHub issues filed for pre-existing bugs:**
+- #243: Creation events bypass fork-based policy validation in `commit_remote_transaction`
+- #244: Remote event fetching during BFS bypasses `validate_received_event`
 
 ### Phase 7: DuplicateCreation Fix + Cleanup — DONE (commit `93b0c68a`+)
 
@@ -357,3 +392,5 @@ After the quick check handles linear extension, concurrent commits still fail. W
 | `b9220663` | Phase 6: EventNotFound → error in BFS |
 | `a6d1f1b0` | Phase 6: quick-check for direct parent StrictDescends |
 | `15da302f` | Phase 6: both-frontier events as common ancestors |
+| `93b0c68a` | Phase 7: remove DuplicateCreation guard, rely on compare() Disjoint |
+| `1021fa70` | Phase 7: durable flag, trace removal, StateAndRelation fix |

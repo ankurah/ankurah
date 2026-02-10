@@ -732,3 +732,94 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
 
     Ok(())
 }
+
+/// Test: Re-delivering an already-applied ancestor event is a no-op (idempotency).
+///
+/// This is the exact bug scenario that motivated the Phase 5 staging rewrite:
+/// `compare_unstored_event` would corrupt head to [C, B] when B was re-delivered.
+///
+/// DAG: A → B → C  (linear chain, head=[C])
+/// Re-deliver event B → head must still be [C] (StrictAscends → no-op)
+///
+/// The test uses `commit_remote_transaction` to re-deliver the event, which is
+/// the same code path used when events arrive from a peer node.
+#[tokio::test]
+async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+    let mut dag = TestDag::new();
+
+    // Step 1: Create entity (genesis A), head=[A]
+    let album_id = {
+        let trx = ctx.begin();
+        let album = trx.create(&Album { name: "Initial".to_owned(), year: "0".to_owned() }).await?;
+        let id = album.id();
+        dag.enumerate(trx.commit_and_return_events().await?); // A
+        id
+    };
+
+    let collection = ctx.collection(&Album::collection()).await?;
+    let state = collection.get_state(album_id).await?;
+    clock_eq!(dag, state.payload.state.head, [A]);
+
+    // Step 2: Commit event B with parent A, head=[B]
+    let events_b;
+    {
+        let album = ctx.get::<AlbumView>(album_id).await?;
+        let trx = ctx.begin();
+        album.edit(&trx)?.name().replace("Name-B")?;
+        events_b = trx.commit_and_return_events().await?;
+        dag.enumerate(events_b.clone());
+    }
+
+    let state = collection.get_state(album_id).await?;
+    clock_eq!(dag, state.payload.state.head, [B]);
+
+    // Step 3: Commit event C with parent B, head=[C]
+    {
+        let album = ctx.get::<AlbumView>(album_id).await?;
+        let trx = ctx.begin();
+        album.edit(&trx)?.name().replace("Name-C")?;
+        dag.enumerate(trx.commit_and_return_events().await?); // C
+    }
+
+    let state = collection.get_state(album_id).await?;
+    clock_eq!(dag, state.payload.state.head, [C]);
+
+    // Snapshot the album state before re-delivery
+    let album_before = ctx.get::<AlbumView>(album_id).await?;
+    let name_before = album_before.name().unwrap();
+    assert_eq!(name_before, "Name-C", "State should be at C before re-delivery");
+
+    // Step 4: Re-deliver event B via commit_remote_transaction
+    // Wrap the raw event in Attested (no attestations needed for PermissiveAgent)
+    let attested_events: Vec<ankurah::proto::Attested<ankurah::proto::Event>> = events_b
+        .into_iter()
+        .map(|e| ankurah::proto::Attested {
+            payload: e,
+            attestations: Default::default(),
+        })
+        .collect();
+
+    let trx_id = ankurah::proto::TransactionId::new();
+    node.commit_remote_transaction(&DEFAULT_CONTEXT, trx_id, attested_events).await?;
+
+    // Step 5: Assert head is still [C] — B is an ancestor of C, so re-delivery is a no-op
+    let state = collection.get_state(album_id).await?;
+    clock_eq!(dag, state.payload.state.head, [C]);
+
+    // Also verify the entity state was not corrupted
+    let album_after = ctx.get::<AlbumView>(album_id).await?;
+    assert_eq!(album_after.name().unwrap(), "Name-C", "State should still be at C after re-delivery of B");
+
+    // Verify DAG structure is intact
+    let events = collection.dump_entity_events(album_id).await?;
+    assert_eq!(events.len(), 3, "Should still have exactly 3 events (A, B, C)");
+    assert_dag!(dag, events, {
+        A => [],
+        B => [A],
+        C => [B],
+    });
+
+    Ok(())
+}
