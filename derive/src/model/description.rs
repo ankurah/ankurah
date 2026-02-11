@@ -271,21 +271,21 @@ impl ModelDescription {
                 let projected_type = &field.ty;
                 let type_str = quote!(#projected_type).to_string();
 
-                // Check if it's a Ref<T> type
-                if type_str.contains("Ref <") || type_str.starts_with("Ref<") {
-                    // Ref<T> -> return base64 String
-                    quote! {
-                        #[uniffi::method(name = #field_name_str)]
-                        pub fn #uniffi_method_name(&self) -> Result<String, ::ankurah::property::PropertyError> {
-                            self.#field_name().map(|r| r.id().to_base64())
-                        }
-                    }
-                } else if type_str.contains("Option < Ref") || type_str.contains("Option<Ref") {
+                // Check Option<Ref<T>> before Ref<T> since "Ref <" matches both
+                if type_str.contains("Option < Ref") || type_str.contains("Option<Ref") {
                     // Option<Ref<T>> -> return Option<String>
                     quote! {
                         #[uniffi::method(name = #field_name_str)]
                         pub fn #uniffi_method_name(&self) -> Result<Option<String>, ::ankurah::property::PropertyError> {
                             self.#field_name().map(|opt| opt.map(|r| r.id().to_base64()))
+                        }
+                    }
+                } else if type_str.contains("Ref <") || type_str.starts_with("Ref<") {
+                    // Ref<T> -> return base64 String
+                    quote! {
+                        #[uniffi::method(name = #field_name_str)]
+                        pub fn #uniffi_method_name(&self) -> Result<String, ::ankurah::property::PropertyError> {
+                            self.#field_name().map(|r| r.id().to_base64())
                         }
                     }
                 } else {
