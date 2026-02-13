@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-storage-postgres"
-version       = "0.7.21"
+version       = "0.7.22"
 edition       = "2021"
 description   = "Ankurah storage engine using Postgres"
 license       = "MIT OR Apache-2.0"
@@ -19,16 +19,16 @@ anyhow         = "1.0"
 thiserror      = "2.0"
 tokio          = { version = "1.36", features = ["full"] }
 
-ankql         = { path = "../../ankql", version = "=0.7.21" }
-ankurah-core  = { path = "../../core", version = "=0.7.21" }
-ankurah-proto = { path = "../../proto", version = "=0.7.21", features = ["postgres"] }
+ankql         = { path = "../../ankql", version = "=0.7.22" }
+ankurah-core  = { path = "../../core", version = "=0.7.22" }
+ankurah-proto = { path = "../../proto", version = "=0.7.22", features = ["postgres"] }
 tracing       = "0.1"
 async-trait   = "0.1"
 futures-util  = "0.3"
 bytes         = "1.5"
 
 [dev-dependencies]
-ankurah                = { path = "../../ankurah", version = "=0.7.21", features = ["derive"] }
+ankurah                = { path = "../../ankurah", version = "=0.7.22", features = ["derive"] }
 tokio                  = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber     = "0.3"
 ctor                   = "0.2"
