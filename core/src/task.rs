@@ -8,9 +8,7 @@ static RUNTIME_HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::
 /// The handle is used as a fallback when `spawn` is called from threads
 /// without a Tokio runtime context (e.g. GC/finalizer threads in FFI).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn set_runtime_handle(handle: tokio::runtime::Handle) {
-    RUNTIME_HANDLE.set(handle).ok();
-}
+pub fn set_runtime_handle(handle: tokio::runtime::Handle) { RUNTIME_HANDLE.set(handle).ok(); }
 
 /// Spawn a task.
 ///
