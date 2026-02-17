@@ -1,3 +1,4 @@
+0.7.23  Fix task::spawn panic on threads without Tokio runtime context; add set_runtime_handle() for FFI consumers
 0.7.22  UniFFI wrapper type deduplication and Option<Ref<T>> support for React Native bindings
 0.7.21  Calculated signal type for derived computations; fix WASM by_id to not consume EntityId; fix recursive mutex in ResultSet loaded flag; JsValueCalculated error logging with stack traces
 0.7.20  Fix local node phantom entity bugs and add validation tests for adversarial local and remote cases
