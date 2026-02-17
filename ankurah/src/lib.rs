@@ -159,6 +159,9 @@ pub use ankurah_core::{
     value::{Value, ValueType},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use ankurah_core::task::set_runtime_handle;
+
 // Re-export the derive macro
 #[cfg(feature = "derive")]
 pub use ankurah_derive::*;
