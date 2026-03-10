@@ -90,10 +90,15 @@ where
         self.0.collectionset.get(id).await
     }
 
-    /// Returns true if we've successfully initialized or joined a system
+    /// Returns true once a local system root is available for use.
+    ///
+    /// Durable nodes become ready after creating or loading a system root.
+    /// Ephemeral nodes also become ready when they load a cached root from
+    /// local storage so they can operate offline. This does not imply the node
+    /// is currently connected to, or reconciled with, a durable peer.
     pub fn is_system_ready(&self) -> bool { *self.0.system_ready.read().unwrap() }
 
-    /// Waits until we've successfully initialized or joined a system
+    /// Waits until a local system root is available for use.
     pub async fn wait_system_ready(&self) {
         if !self.is_system_ready() {
             self.0.system_ready_notify.notified().await;
@@ -283,9 +288,9 @@ where
             *root = root_state;
         }
 
-        // Only mark ready if we're a durable node and found a root
-        // Ephemeral nodes must explicitly join via join_system()
-        if has_root && self.0.durable {
+        // Mark ready if we found a cached root (enables offline-first for ephemeral nodes)
+        // Ephemeral nodes will verify/update the root when they connect via join_system()
+        if has_root {
             *self.0.system_ready.write().unwrap() = true;
             self.0.system_ready_notify.notify_waiters();
         }

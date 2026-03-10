@@ -93,7 +93,7 @@
 //!
 //!     // Connect nodes using local process connection
 //!     let _conn = LocalProcessConnection::new(&server, &client).await?;
-//!     client.system.wait_system_ready().await; // Wait for the client to join the server "system"
+//!     client.system.wait_system_ready().await; // Wait until the client has a usable local system root
 //!
 //!     // Get contexts for the server and client
 //!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT)?;

@@ -17,7 +17,7 @@ async fn initialize_client_impl(server_url: &str) -> Result<()> {
     let storage = IndexedDBStorageEngine::open("myapp").await?;
     let node = Node::new(Arc::new(storage), PermissiveAgent::new());
     let _client = WebsocketClient::new(node.clone(), server_url)?;
-    node.system.wait_system_ready().await;
+    node.system.wait_system_ready().await; // Wait until a local system root is available
 
     let context = node.context(DEFAULT_CONTEXT)?;
     let _albums = context.query::<ankurah_doc_example_model::AlbumView>("year > 1985")?;

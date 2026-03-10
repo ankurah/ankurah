@@ -57,7 +57,7 @@ async fn rust_client_example() -> anyhow::Result<()> {
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new(Arc::new(storage), PermissiveAgent::new());
     let _client = WebsocketClient::new(node.clone(), "ws://localhost:9797").await?;
-    node.system.wait_system_ready().await;
+    node.system.wait_system_ready().await; // Wait until a local system root is available
 
     // Create album
     let ctx = node.context(ankurah::policy::DEFAULT_CONTEXT)?;

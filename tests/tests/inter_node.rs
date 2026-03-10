@@ -161,6 +161,68 @@ async fn server_edits_subscription() -> Result<()> {
 }
 
 #[tokio::test]
+async fn cached_livequery_survives_disconnect_and_catches_up_on_reconnect() -> Result<()> {
+    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server_node.system.create().await?;
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    let conn = LocalProcessConnection::new(&server_node, &client_node).await?;
+    client_node.system.wait_system_ready().await;
+
+    let client = client_node.context(c)?;
+    let query = client.query_wait::<AlbumView>("year >= '2020'").await?;
+    assert_eq!(query.ids(), Vec::<EntityId>::new());
+
+    let initial_watcher = TestWatcher::changeset();
+    let initial_handle = query.subscribe(&initial_watcher);
+
+    let initial_album = {
+        let server = server_node.context(c)?;
+        let trx = server.begin();
+        let album = trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?.read();
+        trx.commit().await?;
+        album
+    };
+
+    assert_eq!(initial_watcher.take_one().await, vec![(initial_album.id(), ChangeKind::Add)]);
+    assert_eq!(query.ids(), vec![initial_album.id()]);
+    assert_eq!(names(query.peek()), vec!["Ask That God".to_string()]);
+    drop(initial_handle);
+
+    drop(conn);
+
+    let new_album = {
+        let server = server_node.context(c)?;
+        let trx = server.begin();
+        let album = trx.create(&Album { name: "Future Dust".into(), year: "2027".into() }).await?.read();
+        trx.commit().await?;
+        album
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert_eq!(query.ids(), vec![initial_album.id()], "Disconnected livequery should retain cached resultset");
+    assert_eq!(names(query.peek()), vec!["Ask That God".to_string()]);
+
+    let offline_watcher = TestWatcher::changeset();
+    let _offline_handle = query.subscribe(&offline_watcher);
+    assert_eq!(offline_watcher.quiesce().await, 0, "Resubscribing offline should not fabricate new changes");
+    assert_eq!(query.ids(), vec![initial_album.id()], "Offline resubscribe should still expose cached results");
+
+    let _reconn = LocalProcessConnection::new(&server_node, &client_node).await?;
+
+    assert_eq!(offline_watcher.take_one().await, vec![(new_album.id(), ChangeKind::Add)]);
+
+    let mut ids = query.ids();
+    ids.sort();
+    let mut expected = vec![initial_album.id(), new_album.id()];
+    expected.sort();
+    assert_eq!(ids, expected, "Existing livequery should catch up after reconnect");
+    assert_eq!(names(query.peek()), vec!["Ask That God".to_string(), "Future Dust".to_string()]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_client_server_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

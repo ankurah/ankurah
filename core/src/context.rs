@@ -149,7 +149,11 @@ impl Context {
         Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
 
-    /// Subscribe to changes in entities matching a selection and wait for initialization
+    /// Subscribe to changes in entities matching a selection and wait for local initialization.
+    ///
+    /// When caching is enabled for an ephemeral node, this returns once the local
+    /// cached result set is ready. Remote catch-up from a durable peer may still
+    /// continue asynchronously after this resolves.
     pub async fn query_wait<R>(
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
