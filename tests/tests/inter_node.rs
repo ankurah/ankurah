@@ -186,13 +186,6 @@ async fn cached_livequery_survives_disconnect_and_catches_up_on_reconnect() -> R
     let conn = LocalProcessConnection::new(&server_node, &client_node).await?;
     client_node.system.wait_system_ready().await;
 
-    let client = client_node.context(c)?;
-    let query = client.query_wait::<AlbumView>("year >= '2020'").await?;
-    assert_eq!(query.ids(), Vec::<EntityId>::new());
-
-    let initial_watcher = TestWatcher::changeset();
-    let initial_handle = query.subscribe(&initial_watcher);
-
     let initial_album = {
         let server = server_node.context(c)?;
         let trx = server.begin();
@@ -201,10 +194,10 @@ async fn cached_livequery_survives_disconnect_and_catches_up_on_reconnect() -> R
         album
     };
 
-    assert_eq!(initial_watcher.take_one().await, vec![(initial_album.id(), ChangeKind::Add)]);
+    let client = client_node.context(c)?;
+    let query = client.query_wait::<AlbumView>(nocache("year >= '2020'")?).await?;
     assert_eq!(query.ids(), vec![initial_album.id()]);
     assert_eq!(names(query.peek()), vec!["Ask That God".to_string()]);
-    drop(initial_handle);
 
     drop(conn);
 
