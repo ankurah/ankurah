@@ -184,6 +184,12 @@ where
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
 
+        if let Some(local) = self.node.entities.get(&id) {
+            self.node.ensure_entity_subscription(collection_id.clone(), id, self.cdata.clone());
+            debug!("Node({}).get_entity found resident entity - returning without awaiting remote", self.node.id);
+            return Ok(local);
+        }
+
         if !self.node.durable {
             // Fetch from peers and commit first response
             match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
@@ -207,6 +213,7 @@ where
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_changed, entity) =
                     self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;
+                self.node.ensure_entity_subscription(collection_id.clone(), id, self.cdata.clone());
                 Ok(entity)
             }
             Err(e) => Err(e),

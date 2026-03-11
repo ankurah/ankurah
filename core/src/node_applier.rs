@@ -34,9 +34,12 @@ impl NodeApplier {
         let Some(relay) = &node.subscription_relay else {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay"));
         };
-        let cdata = relay.get_contexts_for_peer(from_peer_id);
+        let mut cdata = relay.get_contexts_for_peer(from_peer_id);
         if cdata.is_empty() {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
+            cdata = node.entity_subscription_contexts();
+        }
+        if cdata.is_empty() {
+            return Err(MutationError::InvalidUpdate("Should not be receiving updates without subscription context"));
         }
 
         // Apply all updates and notify reactor

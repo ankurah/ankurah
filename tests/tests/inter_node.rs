@@ -423,20 +423,68 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
         trx.commit().await?;
     }
     assert_eq!(lq_watcher.quiesce().await, 0, "subscription to LiveQuery signal should still be dead");
-    assert_eq!(view_watcher.quiesce().await, 0, "The current expected behavior (though undesirable) is that the Entity itself should not receive updates after dropping client_livequery");
+    assert_eq!(
+        view_watcher.take_one().await,
+        client_pet.clone(),
+        "Resident entity should continue receiving updates after dropping client_livequery"
+    );
 
-    // TODO: After implementing implicit entity subscriptions, the entity should continue receiving updates after dropping client_livequery
-    // at which point the above assertion should change, and then
-    // drop(view_subguard);
-    // {
-    //     let trx = server.begin();
-    //     let server_pet = server.get::<PetView>(pet_id).await?;
-    //     server_pet.edit(&trx)?.age().replace("6")?;
-    //     trx.commit().await?;
-    // }
-    // tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for propagation to client
-    // assert_eq!(pet.age(), "6"); // Updates to the underlying entity should continue even after everything (other than the Entity itself) is dropped
-    // assert_eq!(check_view_changes(), vec![],"But the subscription to the View signal should be dead with the dropping of the view_subguard"
+    drop(_view_subguard);
+    {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("6")?;
+        trx.commit().await?;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert_eq!(client_pet.age().unwrap(), "6");
+    assert_eq!(view_watcher.quiesce().await, 0, "View signal should stop notifying after dropping view_subguard");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resident_entity_from_get_resubscribes_after_reconnect() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let server_ctx = server.context(c)?;
+    let client_ctx = client.context(c)?;
+
+    let pet_id = {
+        let trx = server_ctx.begin();
+        let pet = trx.create(&Pet { name: "Echo".to_string(), age: "1".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    let client_pet = client_ctx.get::<PetView>(pet_id).await?;
+    let watcher = TestWatcher::new();
+    let _guard = client_pet.subscribe(&watcher);
+    assert_eq!(client_pet.age().unwrap(), "1");
+    assert_eq!(watcher.quiesce().await, 0);
+
+    drop(conn);
+
+    {
+        let trx = server_ctx.begin();
+        let server_pet = server_ctx.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("2")?;
+        trx.commit().await?;
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert_eq!(client_pet.age().unwrap(), "1", "Disconnected resident entity should keep cached state");
+    assert_eq!(watcher.quiesce().await, 0, "Disconnected resident entity should not receive updates");
+
+    let _reconn = LocalProcessConnection::new(&client, &server).await?;
+
+    assert_eq!(watcher.take_one().await, client_pet.clone());
+    assert_eq!(client_pet.age().unwrap(), "2", "Resident entity fetched via get should catch up after reconnect");
 
     Ok(())
 }
