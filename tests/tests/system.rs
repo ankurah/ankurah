@@ -365,3 +365,44 @@ async fn test_ephemeral_cached_root_supports_offline_queries_after_restart() -> 
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_ephemeral_cached_fetch_supports_offline_after_restart() -> Result<()> {
+    let durable_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+    let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+
+    {
+        let durable_node = Node::new_durable(durable_engine, PermissiveAgent::new());
+        durable_node.system.create().await?;
+
+        let ephemeral_node = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        let _conn = LocalProcessConnection::new(&durable_node, &ephemeral_node).await?;
+        ephemeral_node.system.wait_system_ready().await;
+
+        let ephemeral = ephemeral_node.context_async(DEFAULT_CONTEXT).await;
+        let trx = ephemeral.begin();
+        trx.create(&Pet { name: "Fido".into(), age: "3".to_string() }).await?;
+        trx.commit().await?;
+
+        let pets = ephemeral.fetch::<PetView>("name = 'Fido'").await?;
+        assert_eq!(pets.len(), 1, "Connected ephemeral node should serve cached fetch results");
+    }
+
+    {
+        let ephemeral_node = Node::new(ephemeral_engine, PermissiveAgent::new());
+        ephemeral_node.system.wait_loaded().await;
+        assert!(ephemeral_node.system.is_system_ready(), "Cached root should make the system usable offline after restart");
+
+        let offline = ephemeral_node.context(DEFAULT_CONTEXT)?;
+        let pets = offline.fetch::<PetView>("name = 'Fido'").await?;
+        assert_eq!(pets.len(), 1, "Offline fetch should fall back to local cached results");
+
+        let err = offline
+            .fetch::<PetView>(ankurah::core::node::nocache("name = 'Fido'")?)
+            .await
+            .expect_err("nocache fetch should still require a durable peer");
+        assert!(matches!(err, ankurah::core::error::RetrievalError::NoDurablePeers));
+    }
+
+    Ok(())
+}

@@ -222,10 +222,14 @@ where
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
 
-        // TODO implement cached: true
         if !self.node.durable {
-            // Fetch from peers and commit first response
-            Ok(self.fetch_from_peer(collection_id, args.selection).await?)
+            match self.fetch_from_peer(collection_id, args.selection.clone()).await {
+                Ok(entities) => Ok(entities),
+                Err(RetrievalError::NoDurablePeers) if args.cached => {
+                    self.node.fetch_entities_from_local(collection_id, &args.selection).await
+                }
+                Err(e) => Err(e),
+            }
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
             let states = storage_collection.fetch_states(&args.selection).await?;
