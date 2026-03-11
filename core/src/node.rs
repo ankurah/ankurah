@@ -756,7 +756,7 @@ where
         match self
             .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
             .await
-            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+            .map_err(RetrievalError::RequestError)?
         {
             proto::NodeResponseBody::Get(states) => {
                 let collection = self.collections.get(collection_id).await?;
@@ -771,11 +771,11 @@ where
             }
             proto::NodeResponseBody::Error(e) => {
                 debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
+                Err(RetrievalError::RequestError(RequestError::ServerError(e)))
             }
-            _ => {
+            other => {
                 debug!("Unexpected response type from peer get");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
+                Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other)))
             }
         }
     }

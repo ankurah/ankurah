@@ -1,6 +1,10 @@
 mod common;
 
 use ankurah::core::node::nocache;
+use ankurah::core::{
+    connector::{PeerSender, SendError},
+    error::{RequestError, RetrievalError},
+};
 use ankurah::signals::Subscribe;
 use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
@@ -12,6 +16,21 @@ use tracing::info;
 use common::{Album, AlbumView, Pet, PetView};
 
 use crate::common::*;
+
+#[derive(Clone)]
+struct FailingPeerSender {
+    recipient: EntityId,
+}
+
+impl PeerSender for FailingPeerSender {
+    fn send_message(&self, _message: ankurah::proto::NodeMessage) -> std::result::Result<(), SendError> {
+        Err(SendError::ConnectionClosed)
+    }
+
+    fn recipient_node_id(&self) -> EntityId { self.recipient }
+
+    fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+}
 
 pub fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap_or_default()).collect::<Vec<String>>() }
 
@@ -485,6 +504,60 @@ async fn resident_entity_from_get_resubscribes_after_reconnect() -> Result<()> {
 
     assert_eq!(watcher.take_one().await, client_pet.clone());
     assert_eq!(client_pet.age().unwrap(), "2", "Resident entity fetched via get should catch up after reconnect");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cached_reads_fall_back_to_local_on_transient_peer_failures() -> Result<()> {
+    let durable_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+    let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+
+    let server = Node::new_durable(durable_engine, PermissiveAgent::new());
+    server.system.create().await?;
+
+    let pet_id = {
+        let server_ctx = server.context(c)?;
+        let trx = server_ctx.begin();
+        let pet = trx.create(&Pet { name: "LieFi".to_string(), age: "1".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    {
+        let client = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        let _conn = LocalProcessConnection::new(&client, &server).await?;
+        client.system.wait_system_ready().await;
+
+        let client_ctx = client.context(c)?;
+        assert_eq!(client_ctx.get::<PetView>(pet_id).await?.age().unwrap(), "1");
+        assert_eq!(client_ctx.fetch::<PetView>("name = 'LieFi'").await?.len(), 1);
+    }
+
+    let client = Node::new(ephemeral_engine, PermissiveAgent::new());
+    client.system.wait_loaded().await;
+    assert!(client.system.is_system_ready(), "Cached root should keep restarted ephemeral node usable");
+
+    client.register_peer(
+        ankurah::proto::Presence { node_id: server.id, durable: true, system_root: server.system.root() },
+        Box::new(FailingPeerSender { recipient: server.id }),
+    );
+
+    let client_ctx = client.context(c)?;
+
+    match client_ctx.get::<PetView>(pet_id).await {
+        Err(RetrievalError::RequestError(RequestError::SendError(_))) => {}
+        other => panic!("Expected uncached get to fail with a send error, got {other:?}"),
+    }
+
+    assert_eq!(client_ctx.get_cached::<PetView>(pet_id).await?.age().unwrap(), "1");
+    assert_eq!(client_ctx.fetch::<PetView>("name = 'LieFi'").await?.len(), 1);
+
+    match client_ctx.fetch::<PetView>(nocache("name = 'LieFi'")?).await {
+        Err(RetrievalError::RequestError(RequestError::SendError(_))) => {}
+        other => panic!("Expected nocache fetch to fail with a send error, got {other:?}"),
+    }
 
     Ok(())
 }

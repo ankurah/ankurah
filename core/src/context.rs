@@ -175,6 +175,26 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    fn should_fallback_to_local(cached: bool, error: &RetrievalError) -> bool {
+        if !cached {
+            return false;
+        }
+
+        match error {
+            RetrievalError::NoDurablePeers => true,
+            RetrievalError::RequestError(req_err) => match req_err {
+                crate::error::RequestError::PeerNotConnected => true,
+                crate::error::RequestError::ConnectionLost => true,
+                crate::error::RequestError::SendError(_) => true,
+                crate::error::RequestError::InternalChannelClosed => true,
+                crate::error::RequestError::ServerError(_) => false,
+                crate::error::RequestError::UnexpectedResponse(_) => false,
+                crate::error::RequestError::AccessDenied(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
     pub(crate) async fn get_entity(
         &self,
@@ -194,7 +214,7 @@ where
             // Fetch from peers and commit first response
             match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
                 Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if cached => (),
+                Err(e) if Self::should_fallback_to_local(cached, &e) => (),
                 Err(e) => {
                     return Err(e);
                 }
@@ -232,7 +252,7 @@ where
         if !self.node.durable {
             match self.fetch_from_peer(collection_id, args.selection.clone()).await {
                 Ok(entities) => Ok(entities),
-                Err(RetrievalError::NoDurablePeers) if args.cached => {
+                Err(e) if Self::should_fallback_to_local(args.cached, &e) => {
                     self.node.fetch_entities_from_local(collection_id, &args.selection).await
                 }
                 Err(e) => Err(e),
@@ -378,7 +398,8 @@ where
         match self
             .node
             .request(peer_id, &self.cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
-            .await?
+            .await
+            .map_err(RetrievalError::RequestError)?
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 // TASK: Clarify retriever semantics for durable vs ephemeral nodes https://github.com/ankurah/ankurah/issues/144
@@ -393,11 +414,11 @@ where
             }
             proto::NodeResponseBody::Error(e) => {
                 tracing::debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
+                Err(RetrievalError::RequestError(crate::error::RequestError::ServerError(e)))
             }
-            _ => {
+            other => {
                 tracing::debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
+                Err(RetrievalError::RequestError(crate::error::RequestError::UnexpectedResponse(other)))
             }
         }
     }
