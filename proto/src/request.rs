@@ -179,12 +179,7 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
             NodeRequestBody::SubscribeEntity { collection, ids, known_entities } => {
-                write!(
-                    f,
-                    "SubscribeEntity {collection} ids:{} known:{}",
-                    ids.len(),
-                    known_entities.len()
-                )
+                write!(f, "SubscribeEntity {collection} ids:{} known:{}", ids.len(), known_entities.len())
             }
             NodeRequestBody::GetEvents { collection, event_ids } => {
                 write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)

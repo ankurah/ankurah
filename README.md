@@ -138,7 +138,7 @@ server.run(&quot;0.0.0.0:9797&quot;).await?;</code></pre>
 <pre><code transclude="docs/example/server/src/main.rs#rust-client-example">let storage = SledStorageEngine::new_test()?;
 let node = Node::new(Arc::new(storage), PermissiveAgent::new());
 let _client = WebsocketClient::new(node.clone(), &quot;ws://localhost:9797&quot;).await?;
-node.system.wait_system_ready().await;
+node.system.wait_system_ready().await; // Wait until a local system root is available
 
 // Create album
 let ctx = node.context(ankurah::policy::DEFAULT_CONTEXT)?;
@@ -150,7 +150,7 @@ trx.commit().await?;</code></pre>
 <pre><code transclude="docs/example/wasm-bindings/src/lib.rs#client-example">let storage = IndexedDBStorageEngine::open(&quot;myapp&quot;).await?;
 let node = Node::new(Arc::new(storage), PermissiveAgent::new());
 let _client = WebsocketClient::new(node.clone(), server_url)?;
-node.system.wait_system_ready().await;
+node.system.wait_system_ready().await; // Wait until a local system root is available
 
 let context = node.context(DEFAULT_CONTEXT)?;
 let _albums = context.query::&lt;ankurah_doc_example_model::AlbumView&gt;(&quot;year &gt; 1985&quot;)?;</code></pre>

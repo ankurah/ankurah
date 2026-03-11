@@ -65,9 +65,7 @@ impl SubscriptionHandler {
     }
 
     /// Remove entity subscriptions from this peer's subscription using inclusive ranges.
-    pub fn remove_entity_ranges(&self, ranges: &[proto::EntityIdRange]) {
-        self.subscription.remove_entity_subscription_ranges(ranges);
-    }
+    pub fn remove_entity_ranges(&self, ranges: &[proto::EntityIdRange]) { self.subscription.remove_entity_subscription_ranges(ranges); }
 
     /// Handle an entity subscription request for this peer.
     pub async fn subscribe_entities<SE, PA>(

@@ -23,9 +23,7 @@ struct FailingPeerSender {
 }
 
 impl PeerSender for FailingPeerSender {
-    fn send_message(&self, _message: ankurah::proto::NodeMessage) -> std::result::Result<(), SendError> {
-        Err(SendError::ConnectionClosed)
-    }
+    fn send_message(&self, _message: ankurah::proto::NodeMessage) -> std::result::Result<(), SendError> { Err(SendError::ConnectionClosed) }
 
     fn recipient_node_id(&self) -> EntityId { self.recipient }
 

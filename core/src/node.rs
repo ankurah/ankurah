@@ -510,8 +510,7 @@ where
             proto::NodeRequestBody::SubscribeEntity { collection, ids, known_entities } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 use itertools::Itertools;
-                let cdata =
-                    cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribeEntity"))?;
+                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribeEntity"))?;
                 peer_state.subscription_handler.subscribe_entities(self, collection, ids, cdata, known_entities).await
             }
             proto::NodeRequestBody::GetEvents { collection, event_ids } => {
@@ -791,12 +790,7 @@ where
     /// Get all durable peer node IDs
     pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.durable_peers.to_vec() }
 
-    pub(crate) fn ensure_entity_subscription(
-        &self,
-        collection_id: CollectionId,
-        entity_id: proto::EntityId,
-        cdata: PA::ContextData,
-    ) {
+    pub(crate) fn ensure_entity_subscription(&self, collection_id: CollectionId, entity_id: proto::EntityId, cdata: PA::ContextData) {
         if self.durable {
             return;
         }
@@ -835,11 +829,7 @@ where
             .collect();
 
         let deltas = match self
-            .request(
-                peer_id,
-                &cdata,
-                proto::NodeRequestBody::SubscribeEntity { collection: collection_id.clone(), ids, known_entities },
-            )
+            .request(peer_id, &cdata, proto::NodeRequestBody::SubscribeEntity { collection: collection_id.clone(), ids, known_entities })
             .await
             .map_err(RetrievalError::RequestError)?
         {
