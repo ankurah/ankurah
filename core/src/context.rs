@@ -113,17 +113,35 @@ impl Context {
     //     Ok(result)
     // }
 
+    /// Get a single entity, requiring a successful remote read on ephemeral nodes.
+    ///
+    /// If the entity is already resident in memory, the local resident instance is
+    /// returned immediately. Otherwise, ephemeral nodes treat this as a
+    /// remote-authoritative read and return transport failures rather than falling
+    /// back to cached storage.
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
 
-    /// Get an entity, but its ok to return early if the entity is already in the local node storage
+    /// Get a single entity with offline-tolerant fallback semantics.
+    ///
+    /// If the entity is already resident in memory, the local resident instance is
+    /// returned immediately. Otherwise, ephemeral nodes try a remote read first and
+    /// fall back to local cached storage when no durable peer is available or the
+    /// remote read fails with a transient transport error.
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
 
+    /// Fetch entities matching a selection.
+    ///
+    /// By default, string/selection arguments enable cached mode. On ephemeral nodes
+    /// that means `fetch()` tries a remote read first, but falls back to locally
+    /// cached results when no durable peer is available or the remote read fails
+    /// with a transient transport error. Use `nocache(...)` when the fetch must be
+    /// remote-authoritative.
     pub async fn fetch<R: View>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
