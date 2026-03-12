@@ -195,12 +195,16 @@ async fn cached_livequery_survives_disconnect_and_catches_up_on_reconnect() -> R
     };
 
     let client = client_node.context(c)?;
+    // Start from a known remote truth so the rest of the test is about offline
+    // persistence and reconnect catch-up, not initialization timing.
     let query = client.query_wait::<AlbumView>(nocache("year >= '2020'")?).await?;
     assert_eq!(query.ids(), vec![initial_album.id()]);
     assert_eq!(names(query.peek()), vec!["Ask That God".to_string()]);
 
     drop(conn);
 
+    // While disconnected, the durable node moves forward. The client should keep
+    // serving its last coherent cached resultset rather than inventing changes.
     let new_album = {
         let server = server_node.context(c)?;
         let trx = server.begin();
@@ -218,6 +222,8 @@ async fn cached_livequery_survives_disconnect_and_catches_up_on_reconnect() -> R
     assert_eq!(offline_watcher.quiesce().await, 0, "Resubscribing offline should not fabricate new changes");
     assert_eq!(query.ids(), vec![initial_album.id()], "Offline resubscribe should still expose cached results");
 
+    // Reconnect should revive the same livequery rather than requiring callers to
+    // build a new one. The missing durable-side row should arrive as a normal Add.
     let _reconn = LocalProcessConnection::new(&server_node, &client_node).await?;
 
     assert_eq!(offline_watcher.take_one().await, vec![(new_album.id(), ChangeKind::Add)]);
