@@ -4,6 +4,7 @@ use anyhow::anyhow;
 
 use rand::prelude::*;
 use std::{
+    collections::BTreeMap,
     fmt,
     hash::Hash,
     ops::Deref,
@@ -86,6 +87,14 @@ impl MatchArgs {
     }
 }
 
+struct EntitySubscriptionState<CD: ContextData> {
+    tracked: BTreeMap<CollectionId, BTreeMap<proto::EntityId, CD>>,
+}
+
+impl<CD: ContextData> Default for EntitySubscriptionState<CD> {
+    fn default() -> Self { Self { tracked: BTreeMap::new() } }
+}
+
 /// A participant in the Ankurah network, and primary place where queries are initiated
 
 pub struct Node<SE, PA>(pub(crate) Arc<NodeInner<SE, PA>>)
@@ -140,6 +149,7 @@ where PA: PolicyAgent
     pub system: SystemManager<SE, PA>,
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
+    entity_subscription_state: std::sync::Mutex<EntitySubscriptionState<PA::ContextData>>,
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
     pub(crate) type_resolver: crate::TypeResolver,
@@ -174,6 +184,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
+            entity_subscription_state: std::sync::Mutex::new(EntitySubscriptionState::default()),
             type_resolver: crate::TypeResolver::new(),
         }));
 
@@ -183,6 +194,21 @@ where
             if relay.set_node(Arc::new(weak_node)).is_err() {
                 warn!("Failed to set message sender for subscription relay");
             }
+        }
+
+        {
+            let weak_node = node.weak();
+            crate::task::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    let Some(node) = weak_node.upgrade() else {
+                        break;
+                    };
+                    if let Err(e) = node.flush_dead_entity_subscriptions().await {
+                        warn!("Failed to flush dead entity subscriptions: {}", e);
+                    }
+                }
+            });
         }
 
         node
@@ -208,6 +234,7 @@ where
             system: system_manager,
             predicate_context: SafeMap::new(),
             subscription_relay: None,
+            entity_subscription_state: std::sync::Mutex::new(EntitySubscriptionState::default()),
             type_resolver: crate::TypeResolver::new(),
         }))
     }
@@ -240,11 +267,15 @@ where
                 if let Some(system_root) = presence.system_root {
                     action_info!(self, "received system root", "{}", &system_root.payload);
                     let me = self.clone();
+                    let peer_id = presence.node_id;
                     crate::task::spawn(async move {
                         if let Err(e) = me.system.join_system(system_root).await {
                             action_error!(me, "failed to join system", "{}", &e);
                         } else {
                             action_info!(me, "successfully joined system");
+                            if let Err(e) = me.resubscribe_tracked_entities_to_peer(peer_id).await {
+                                warn!("Failed to resubscribe tracked entities to peer {}: {}", peer_id, e);
+                            }
                         }
                     });
                 } else {
@@ -407,6 +438,11 @@ where
                     peer_state.subscription_handler.remove_predicate(query_id)?;
                 }
             }
+            proto::NodeMessage::UnsubscribeEntities { from, collection: _, ranges } => {
+                if let Some(peer_state) = self.peer_connections.get(&from) {
+                    peer_state.subscription_handler.remove_entity_ranges(&ranges);
+                }
+            }
         }
         Ok(())
     }
@@ -470,6 +506,12 @@ where
                 }
 
                 Ok(proto::NodeResponseBody::Get(states))
+            }
+            proto::NodeRequestBody::SubscribeEntity { collection, ids, known_entities } => {
+                let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
+                use itertools::Itertools;
+                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for SubscribeEntity"))?;
+                peer_state.subscription_handler.subscribe_entities(self, collection, ids, cdata, known_entities).await
             }
             proto::NodeRequestBody::GetEvents { collection, event_ids } => {
                 self.policy_agent.can_access_collection(cdata, &collection)?;
@@ -713,7 +755,7 @@ where
         match self
             .request(peer_id, cdata, proto::NodeRequestBody::Get { collection: collection_id.clone(), ids })
             .await
-            .map_err(|e| RetrievalError::Other(format!("{:?}", e)))?
+            .map_err(RetrievalError::RequestError)?
         {
             proto::NodeResponseBody::Get(states) => {
                 let collection = self.collections.get(collection_id).await?;
@@ -728,11 +770,11 @@ where
             }
             proto::NodeResponseBody::Error(e) => {
                 debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
+                Err(RetrievalError::RequestError(RequestError::ServerError(e)))
             }
-            _ => {
+            other => {
                 debug!("Unexpected response type from peer get");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
+                Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other)))
             }
         }
     }
@@ -747,6 +789,153 @@ where
 
     /// Get all durable peer node IDs
     pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.durable_peers.to_vec() }
+
+    pub(crate) fn ensure_entity_subscription(&self, collection_id: CollectionId, entity_id: proto::EntityId, cdata: PA::ContextData) {
+        if self.durable {
+            return;
+        }
+
+        let should_subscribe = {
+            let mut state = self.entity_subscription_state.lock().unwrap();
+            let collection = state.tracked.entry(collection_id.clone()).or_default();
+            collection.insert(entity_id, cdata.clone()).is_none()
+        };
+
+        if should_subscribe {
+            let me = self.clone();
+            crate::task::spawn(async move {
+                if let Some(peer_id) = me.get_durable_peer_random() {
+                    if let Err(e) = me.subscribe_entities_with_peer(peer_id, collection_id, vec![entity_id], cdata).await {
+                        warn!("Failed to subscribe entity {} with peer {}: {}", entity_id, peer_id, e);
+                    }
+                }
+            });
+        }
+    }
+
+    async fn subscribe_entities_with_peer(
+        &self,
+        peer_id: proto::EntityId,
+        collection_id: CollectionId,
+        ids: Vec<proto::EntityId>,
+        cdata: PA::ContextData,
+    ) -> Result<(), RetrievalError> {
+        let storage_collection = self.collections.get(&collection_id).await?;
+        let known_entities = storage_collection
+            .get_states(ids.clone())
+            .await?
+            .into_iter()
+            .map(|state| proto::KnownEntity { entity_id: state.payload.entity_id, head: state.payload.state.head.clone() })
+            .collect();
+
+        let deltas = match self
+            .request(peer_id, &cdata, proto::NodeRequestBody::SubscribeEntity { collection: collection_id.clone(), ids, known_entities })
+            .await
+            .map_err(RetrievalError::RequestError)?
+        {
+            proto::NodeResponseBody::EntitiesSubscribed { deltas } => deltas,
+            proto::NodeResponseBody::Error(e) => return Err(RetrievalError::RequestError(RequestError::ServerError(e))),
+            other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
+        };
+
+        let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id, self, &cdata);
+        crate::node_applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &retriever).await?;
+        retriever.store_used_events().await?;
+        Ok(())
+    }
+
+    async fn resubscribe_tracked_entities_to_peer(&self, peer_id: proto::EntityId) -> Result<(), RetrievalError> {
+        if self.durable {
+            return Ok(());
+        }
+
+        let tracked = {
+            let state = self.entity_subscription_state.lock().unwrap();
+            state.tracked.clone()
+        };
+
+        for (collection_id, entities) in tracked {
+            for (entity_id, cdata) in entities {
+                if self.entities.get(&entity_id).is_some() {
+                    self.subscribe_entities_with_peer(peer_id, collection_id.clone(), vec![entity_id], cdata).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn flush_dead_entity_subscriptions(&self) -> Result<(), RequestError> {
+        if self.durable {
+            return Ok(());
+        }
+
+        let ranges_by_collection = {
+            let mut state = self.entity_subscription_state.lock().unwrap();
+            let mut ranges_by_collection = Vec::new();
+
+            for (collection_id, entities) in state.tracked.iter_mut() {
+                let ids: Vec<_> = entities.keys().copied().collect();
+                let mut dead_ids = Vec::new();
+                let mut ranges = Vec::new();
+                let mut current_start = None;
+                let mut current_end = None;
+
+                for entity_id in ids {
+                    let is_live = self.entities.get(&entity_id).is_some();
+                    if is_live {
+                        if let (Some(start), Some(end)) = (current_start.take(), current_end.take()) {
+                            ranges.push(proto::EntityIdRange { start, end });
+                        }
+                    } else {
+                        dead_ids.push(entity_id);
+                        if current_start.is_none() {
+                            current_start = Some(entity_id);
+                        }
+                        current_end = Some(entity_id);
+                    }
+                }
+
+                if let (Some(start), Some(end)) = (current_start.take(), current_end.take()) {
+                    ranges.push(proto::EntityIdRange { start, end });
+                }
+
+                for entity_id in dead_ids {
+                    entities.remove(&entity_id);
+                }
+
+                if !ranges.is_empty() {
+                    ranges_by_collection.push((collection_id.clone(), ranges));
+                }
+            }
+
+            state.tracked.retain(|_, entities| !entities.is_empty());
+            ranges_by_collection
+        };
+
+        if ranges_by_collection.is_empty() {
+            return Ok(());
+        }
+
+        for peer_id in self.get_durable_peers() {
+            if let Some(connection) = self.peer_connections.get(&peer_id) {
+                for (collection, ranges) in &ranges_by_collection {
+                    connection.send_message(proto::NodeMessage::UnsubscribeEntities {
+                        from: self.id,
+                        collection: collection.clone(),
+                        ranges: ranges.clone(),
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn entity_subscription_contexts(&self) -> std::collections::HashSet<PA::ContextData> {
+        let state = self.entity_subscription_state.lock().unwrap();
+        state.tracked.values().flat_map(|entities| entities.values().cloned()).collect()
+    }
 
     /// TEST ONLY: Create a phantom entity with a specific ID.
     ///

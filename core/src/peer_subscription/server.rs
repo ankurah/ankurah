@@ -59,6 +59,57 @@ impl SubscriptionHandler {
         Ok(())
     }
 
+    /// Remove entity subscriptions from this peer's subscription.
+    pub fn remove_entities(&self, entity_ids: impl IntoIterator<Item = proto::EntityId>) {
+        self.subscription.remove_entity_subscriptions(entity_ids);
+    }
+
+    /// Remove entity subscriptions from this peer's subscription using inclusive ranges.
+    pub fn remove_entity_ranges(&self, ranges: &[proto::EntityIdRange]) { self.subscription.remove_entity_subscription_ranges(ranges); }
+
+    /// Handle an entity subscription request for this peer.
+    pub async fn subscribe_entities<SE, PA>(
+        &self,
+        node: &Node<SE, PA>,
+        collection_id: proto::CollectionId,
+        ids: Vec<proto::EntityId>,
+        cdata: &PA::ContextData,
+        known_entities: Vec<proto::KnownEntity>,
+    ) -> anyhow::Result<proto::NodeResponseBody>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        node.policy_agent.can_access_collection(cdata, &collection_id)?;
+        let storage_collection = node.collections.get(&collection_id).await?;
+
+        let mut initial_states = Vec::new();
+        let mut subscribed_ids = Vec::new();
+        for state in storage_collection.get_states(ids).await? {
+            match node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state) {
+                Ok(_) => {
+                    subscribed_ids.push(state.payload.entity_id);
+                    initial_states.push(state);
+                }
+                Err(crate::policy::AccessDenied::ByPolicy(_)) => {}
+                Err(e) => return Err(anyhow::anyhow!("Error from peer entity subscription: {}", e)),
+            }
+        }
+
+        self.subscription.add_entity_subscriptions(subscribed_ids);
+
+        let known_map: std::collections::HashMap<_, _> = known_entities.into_iter().map(|k| (k.entity_id, k.head)).collect();
+
+        let mut deltas = Vec::with_capacity(initial_states.len());
+        for state in initial_states {
+            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection).await? {
+                deltas.push(delta);
+            }
+        }
+
+        Ok(proto::NodeResponseBody::EntitiesSubscribed { deltas })
+    }
+
     /// Handle a subscription request for this peer.
     pub async fn subscribe_query<SE, PA>(
         &self,

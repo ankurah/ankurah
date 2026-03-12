@@ -10,7 +10,7 @@ use ankurah_proto::{self as proto};
 use futures::future;
 use indexmap::IndexMap;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
 };
 use tracing::debug;
@@ -93,7 +93,7 @@ pub(super) struct Inner<E: AbstractEntity + Filterable, Ev> {
 struct State<E: AbstractEntity + Filterable, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
     /// The set of entities that are subscribed to by this subscription
-    pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
+    pub(crate) entity_subscriptions: BTreeSet<proto::EntityId>,
     // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
@@ -108,7 +108,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             id: ReactorSubscriptionId::new(),
             state: std::sync::Mutex::new(State {
                 queries: HashMap::new(),
-                entity_subscriptions: HashSet::new(),
+                entity_subscriptions: BTreeSet::new(),
                 entities: HashMap::new(),
                 broadcast,
             }),
@@ -126,6 +126,22 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     pub fn remove_entity_subscription(&self, entity_id: proto::EntityId) {
         let mut state = self.state.lock().unwrap();
         state.entity_subscriptions.remove(&entity_id);
+    }
+
+    /// Remove entity subscriptions that fall within any provided inclusive ranges.
+    pub fn remove_entity_subscription_ranges(&self, ranges: &[proto::EntityIdRange]) -> Vec<proto::EntityId> {
+        let mut state = self.state.lock().unwrap();
+        let mut removed = Vec::new();
+
+        for range in ranges {
+            let to_remove: Vec<_> = state.entity_subscriptions.range(range.start..=range.end).copied().collect();
+            for entity_id in to_remove {
+                state.entity_subscriptions.remove(&entity_id);
+                removed.push(entity_id);
+            }
+        }
+
+        removed
     }
 
     /// Check if any queries match this entity (for determining if entity watcher should be removed)

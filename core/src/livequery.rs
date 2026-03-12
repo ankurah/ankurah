@@ -147,7 +147,11 @@ impl EntityLiveQuery {
     }
     pub fn map<R: View>(self) -> LiveQuery<R> { LiveQuery(self, PhantomData) }
 
-    /// Wait for the LiveQuery to be fully initialized with initial states
+    /// Wait for the LiveQuery to be locally initialized for the current selection.
+    ///
+    /// For cached queries on ephemeral nodes, this only waits for the local cached
+    /// result set to be usable. Remote backfill and catch-up from a durable peer
+    /// may still complete asynchronously afterward.
     pub async fn wait_initialized(&self) {
         // If already initialized, return immediately
         if self.0.initialized_version.load(std::sync::atomic::Ordering::Relaxed)
@@ -309,7 +313,7 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
 }
 
 impl<R: View> LiveQuery<R> {
-    /// Wait for the LiveQuery to be fully initialized with initial states
+    /// Wait for the LiveQuery to be locally initialized for the current selection.
     pub async fn wait_initialized(&self) { self.0.wait_initialized().await; }
 
     pub fn resultset(&self) -> ResultSet<R> { self.0 .0.resultset.wrap::<R>() }

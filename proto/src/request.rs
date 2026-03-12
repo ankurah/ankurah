@@ -37,6 +37,13 @@ pub struct KnownEntity {
     pub head: Clock,
 }
 
+/// Inclusive entity-id span used for compact unsubscribe batches.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EntityIdRange {
+    pub start: EntityId,
+    pub end: EntityId,
+}
+
 /// Causal relation between two clocks: `subject` (local) vs `other`.
 /// - A `Clock` is a normalized antichain frontier (a lattice point).
 /// - `meet` is the GCA frontier: Max(Past(subject) ∩ Past(other)).
@@ -122,6 +129,7 @@ pub enum NodeRequestBody {
     CommitTransaction { id: TransactionId, events: Vec<Attested<Event>> },
     // Request to fetch entities matching a predicate
     Get { collection: CollectionId, ids: Vec<EntityId> },
+    SubscribeEntity { collection: CollectionId, ids: Vec<EntityId>, known_entities: Vec<KnownEntity> },
     GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
     Fetch { collection: CollectionId, selection: ast::Selection, known_matches: Vec<KnownEntity> },
     SubscribeQuery { query_id: QueryId, collection: CollectionId, selection: ast::Selection, version: u32, known_matches: Vec<KnownEntity> },
@@ -142,6 +150,7 @@ pub enum NodeResponseBody {
     CommitComplete { id: TransactionId },
     Fetch(Vec<EntityDelta>),
     Get(Vec<Attested<EntityState>>),
+    EntitiesSubscribed { deltas: Vec<EntityDelta> },
     GetEvents(Vec<Attested<Event>>),
     QuerySubscribed { query_id: QueryId, deltas: Vec<EntityDelta> },
     Success,
@@ -169,6 +178,9 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::Get { collection, ids } => {
                 write!(f, "Get {collection} {}", ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
+            NodeRequestBody::SubscribeEntity { collection, ids, known_entities } => {
+                write!(f, "SubscribeEntity {collection} ids:{} known:{}", ids.len(), known_entities.len())
+            }
             NodeRequestBody::GetEvents { collection, event_ids } => {
                 write!(f, "GetEvents {collection} {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
@@ -190,6 +202,9 @@ impl std::fmt::Display for NodeResponseBody {
             }
             NodeResponseBody::Get(states) => {
                 write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
+            }
+            NodeResponseBody::EntitiesSubscribed { deltas } => {
+                write!(f, "EntitiesSubscribed [{}]", deltas.len())
             }
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))

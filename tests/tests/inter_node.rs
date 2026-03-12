@@ -1,6 +1,10 @@
 mod common;
 
 use ankurah::core::node::nocache;
+use ankurah::core::{
+    connector::{PeerSender, SendError},
+    error::{RequestError, RetrievalError},
+};
 use ankurah::signals::Subscribe;
 use ankurah::{changes::ChangeKind, policy::DEFAULT_CONTEXT as c, EntityId, Mutable, Node, PermissiveAgent};
 use ankurah_connector_local_process::LocalProcessConnection;
@@ -12,6 +16,19 @@ use tracing::info;
 use common::{Album, AlbumView, Pet, PetView};
 
 use crate::common::*;
+
+#[derive(Clone)]
+struct FailingPeerSender {
+    recipient: EntityId,
+}
+
+impl PeerSender for FailingPeerSender {
+    fn send_message(&self, _message: ankurah::proto::NodeMessage) -> std::result::Result<(), SendError> { Err(SendError::ConnectionClosed) }
+
+    fn recipient_node_id(&self) -> EntityId { self.recipient }
+
+    fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+}
 
 pub fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap_or_default()).collect::<Vec<String>>() }
 
@@ -157,6 +174,67 @@ async fn server_edits_subscription() -> Result<()> {
 
     // Ensure no additional unexpected changes
     assert_eq!(client_watcher.quiesce().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cached_livequery_survives_disconnect_and_catches_up_on_reconnect() -> Result<()> {
+    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server_node.system.create().await?;
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    let conn = LocalProcessConnection::new(&server_node, &client_node).await?;
+    client_node.system.wait_system_ready().await;
+
+    let initial_album = {
+        let server = server_node.context(c)?;
+        let trx = server.begin();
+        let album = trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?.read();
+        trx.commit().await?;
+        album
+    };
+
+    let client = client_node.context(c)?;
+    // Start from a known remote truth so the rest of the test is about offline
+    // persistence and reconnect catch-up, not initialization timing.
+    let query = client.query_wait::<AlbumView>(nocache("year >= '2020'")?).await?;
+    assert_eq!(query.ids(), vec![initial_album.id()]);
+    assert_eq!(names(query.peek()), vec!["Ask That God".to_string()]);
+
+    drop(conn);
+
+    // While disconnected, the durable node moves forward. The client should keep
+    // serving its last coherent cached resultset rather than inventing changes.
+    let new_album = {
+        let server = server_node.context(c)?;
+        let trx = server.begin();
+        let album = trx.create(&Album { name: "Future Dust".into(), year: "2027".into() }).await?.read();
+        trx.commit().await?;
+        album
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert_eq!(query.ids(), vec![initial_album.id()], "Disconnected livequery should retain cached resultset");
+    assert_eq!(names(query.peek()), vec!["Ask That God".to_string()]);
+
+    let offline_watcher = TestWatcher::changeset();
+    let _offline_handle = query.subscribe(&offline_watcher);
+    assert_eq!(offline_watcher.quiesce().await, 0, "Resubscribing offline should not fabricate new changes");
+    assert_eq!(query.ids(), vec![initial_album.id()], "Offline resubscribe should still expose cached results");
+
+    // Reconnect should revive the same livequery rather than requiring callers to
+    // build a new one. The missing durable-side row should arrive as a normal Add.
+    let _reconn = LocalProcessConnection::new(&server_node, &client_node).await?;
+
+    assert_eq!(offline_watcher.take_one().await, vec![(new_album.id(), ChangeKind::Add)]);
+
+    let mut ids = query.ids();
+    ids.sort();
+    let mut expected = vec![initial_album.id(), new_album.id()];
+    expected.sort();
+    assert_eq!(ids, expected, "Existing livequery should catch up after reconnect");
+    assert_eq!(names(query.peek()), vec!["Ask That God".to_string(), "Future Dust".to_string()]);
+
     Ok(())
 }
 
@@ -361,20 +439,122 @@ async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
         trx.commit().await?;
     }
     assert_eq!(lq_watcher.quiesce().await, 0, "subscription to LiveQuery signal should still be dead");
-    assert_eq!(view_watcher.quiesce().await, 0, "The current expected behavior (though undesirable) is that the Entity itself should not receive updates after dropping client_livequery");
+    assert_eq!(
+        view_watcher.take_one().await,
+        client_pet.clone(),
+        "Resident entity should continue receiving updates after dropping client_livequery"
+    );
 
-    // TODO: After implementing implicit entity subscriptions, the entity should continue receiving updates after dropping client_livequery
-    // at which point the above assertion should change, and then
-    // drop(view_subguard);
-    // {
-    //     let trx = server.begin();
-    //     let server_pet = server.get::<PetView>(pet_id).await?;
-    //     server_pet.edit(&trx)?.age().replace("6")?;
-    //     trx.commit().await?;
-    // }
-    // tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // wait for propagation to client
-    // assert_eq!(pet.age(), "6"); // Updates to the underlying entity should continue even after everything (other than the Entity itself) is dropped
-    // assert_eq!(check_view_changes(), vec![],"But the subscription to the View signal should be dead with the dropping of the view_subguard"
+    drop(_view_subguard);
+    {
+        let trx = server.begin();
+        let server_pet = server.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("6")?;
+        trx.commit().await?;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert_eq!(client_pet.age().unwrap(), "6");
+    assert_eq!(view_watcher.quiesce().await, 0, "View signal should stop notifying after dropping view_subguard");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resident_entity_from_get_resubscribes_after_reconnect() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let server_ctx = server.context(c)?;
+    let client_ctx = client.context(c)?;
+
+    let pet_id = {
+        let trx = server_ctx.begin();
+        let pet = trx.create(&Pet { name: "Echo".to_string(), age: "1".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    let client_pet = client_ctx.get::<PetView>(pet_id).await?;
+    let watcher = TestWatcher::new();
+    let _guard = client_pet.subscribe(&watcher);
+    assert_eq!(client_pet.age().unwrap(), "1");
+    assert_eq!(watcher.quiesce().await, 0);
+
+    drop(conn);
+
+    {
+        let trx = server_ctx.begin();
+        let server_pet = server_ctx.get::<PetView>(pet_id).await?;
+        server_pet.edit(&trx)?.age().replace("2")?;
+        trx.commit().await?;
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert_eq!(client_pet.age().unwrap(), "1", "Disconnected resident entity should keep cached state");
+    assert_eq!(watcher.quiesce().await, 0, "Disconnected resident entity should not receive updates");
+
+    let _reconn = LocalProcessConnection::new(&client, &server).await?;
+
+    assert_eq!(watcher.take_one().await, client_pet.clone());
+    assert_eq!(client_pet.age().unwrap(), "2", "Resident entity fetched via get should catch up after reconnect");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cached_reads_fall_back_to_local_on_transient_peer_failures() -> Result<()> {
+    let durable_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+    let ephemeral_engine = Arc::new(SledStorageEngine::new_test().unwrap());
+
+    let server = Node::new_durable(durable_engine, PermissiveAgent::new());
+    server.system.create().await?;
+
+    let pet_id = {
+        let server_ctx = server.context(c)?;
+        let trx = server_ctx.begin();
+        let pet = trx.create(&Pet { name: "LieFi".to_string(), age: "1".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    {
+        let client = Node::new(ephemeral_engine.clone(), PermissiveAgent::new());
+        let _conn = LocalProcessConnection::new(&client, &server).await?;
+        client.system.wait_system_ready().await;
+
+        let client_ctx = client.context(c)?;
+        assert_eq!(client_ctx.get::<PetView>(pet_id).await?.age().unwrap(), "1");
+        assert_eq!(client_ctx.fetch::<PetView>("name = 'LieFi'").await?.len(), 1);
+    }
+
+    let client = Node::new(ephemeral_engine, PermissiveAgent::new());
+    client.system.wait_loaded().await;
+    assert!(client.system.is_system_ready(), "Cached root should keep restarted ephemeral node usable");
+
+    client.register_peer(
+        ankurah::proto::Presence { node_id: server.id, durable: true, system_root: server.system.root() },
+        Box::new(FailingPeerSender { recipient: server.id }),
+    );
+
+    let client_ctx = client.context(c)?;
+
+    match client_ctx.get::<PetView>(pet_id).await {
+        Err(RetrievalError::RequestError(RequestError::SendError(_))) => {}
+        other => panic!("Expected uncached get to fail with a send error, got {other:?}"),
+    }
+
+    assert_eq!(client_ctx.get_cached::<PetView>(pet_id).await?.age().unwrap(), "1");
+    assert_eq!(client_ctx.fetch::<PetView>("name = 'LieFi'").await?.len(), 1);
+
+    match client_ctx.fetch::<PetView>(nocache("name = 'LieFi'")?).await {
+        Err(RetrievalError::RequestError(RequestError::SendError(_))) => {}
+        other => panic!("Expected nocache fetch to fail with a send error, got {other:?}"),
+    }
 
     Ok(())
 }

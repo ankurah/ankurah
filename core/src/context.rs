@@ -113,17 +113,35 @@ impl Context {
     //     Ok(result)
     // }
 
+    /// Get a single entity, requiring a successful remote read on ephemeral nodes.
+    ///
+    /// If the entity is already resident in memory, the local resident instance is
+    /// returned immediately. Otherwise, ephemeral nodes treat this as a
+    /// remote-authoritative read and return transport failures rather than falling
+    /// back to cached storage.
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
 
-    /// Get an entity, but its ok to return early if the entity is already in the local node storage
+    /// Get a single entity with offline-tolerant fallback semantics.
+    ///
+    /// If the entity is already resident in memory, the local resident instance is
+    /// returned immediately. Otherwise, ephemeral nodes try a remote read first and
+    /// fall back to local cached storage when no durable peer is available or the
+    /// remote read fails with a transient transport error.
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
 
+    /// Fetch entities matching a selection.
+    ///
+    /// By default, string/selection arguments enable cached mode. On ephemeral nodes
+    /// that means `fetch()` tries a remote read first, but falls back to locally
+    /// cached results when no durable peer is available or the remote read fails
+    /// with a transient transport error. Use `nocache(...)` when the fetch must be
+    /// remote-authoritative.
     pub async fn fetch<R: View>(&self, args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
@@ -149,7 +167,11 @@ impl Context {
         Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
 
-    /// Subscribe to changes in entities matching a selection and wait for initialization
+    /// Subscribe to changes in entities matching a selection and wait for local initialization.
+    ///
+    /// When caching is enabled for an ephemeral node, this returns once the local
+    /// cached result set is ready. Remote catch-up from a durable peer may still
+    /// continue asynchronously after this resolves.
     pub async fn query_wait<R>(
         &self,
         args: impl TryInto<MatchArgs, Error = impl Into<RetrievalError>>,
@@ -171,6 +193,26 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    fn should_fallback_to_local(cached: bool, error: &RetrievalError) -> bool {
+        if !cached {
+            return false;
+        }
+
+        match error {
+            RetrievalError::NoDurablePeers => true,
+            RetrievalError::RequestError(req_err) => match req_err {
+                crate::error::RequestError::PeerNotConnected => true,
+                crate::error::RequestError::ConnectionLost => true,
+                crate::error::RequestError::SendError(_) => true,
+                crate::error::RequestError::InternalChannelClosed => true,
+                crate::error::RequestError::ServerError(_) => false,
+                crate::error::RequestError::UnexpectedResponse(_) => false,
+                crate::error::RequestError::AccessDenied(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Retrieve a single entity, either by cloning the resident Entity from the Node's WeakEntitySet or fetching from storage
     pub(crate) async fn get_entity(
         &self,
@@ -180,11 +222,17 @@ where
     ) -> Result<Entity, RetrievalError> {
         debug!("Node({}).get_entity {:?}-{:?}", self.node.id, id, collection_id);
 
+        if let Some(local) = self.node.entities.get(&id) {
+            self.node.ensure_entity_subscription(collection_id.clone(), id, self.cdata.clone());
+            debug!("Node({}).get_entity found resident entity - returning without awaiting remote", self.node.id);
+            return Ok(local);
+        }
+
         if !self.node.durable {
             // Fetch from peers and commit first response
             match self.node.get_from_peer(collection_id, vec![id], &self.cdata).await {
                 Ok(_) => (),
-                Err(RetrievalError::NoDurablePeers) if cached => (),
+                Err(e) if Self::should_fallback_to_local(cached, &e) => (),
                 Err(e) => {
                     return Err(e);
                 }
@@ -203,6 +251,7 @@ where
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_changed, entity) =
                     self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;
+                self.node.ensure_entity_subscription(collection_id.clone(), id, self.cdata.clone());
                 Ok(entity)
             }
             Err(e) => Err(e),
@@ -218,10 +267,14 @@ where
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
 
-        // TODO implement cached: true
         if !self.node.durable {
-            // Fetch from peers and commit first response
-            Ok(self.fetch_from_peer(collection_id, args.selection).await?)
+            match self.fetch_from_peer(collection_id, args.selection.clone()).await {
+                Ok(entities) => Ok(entities),
+                Err(e) if Self::should_fallback_to_local(args.cached, &e) => {
+                    self.node.fetch_entities_from_local(collection_id, &args.selection).await
+                }
+                Err(e) => Err(e),
+            }
         } else {
             let storage_collection = self.node.collections.get(collection_id).await?;
             let states = storage_collection.fetch_states(&args.selection).await?;
@@ -363,7 +416,8 @@ where
         match self
             .node
             .request(peer_id, &self.cdata, proto::NodeRequestBody::Fetch { collection: collection_id.clone(), selection, known_matches })
-            .await?
+            .await
+            .map_err(RetrievalError::RequestError)?
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 // TASK: Clarify retriever semantics for durable vs ephemeral nodes https://github.com/ankurah/ankurah/issues/144
@@ -378,11 +432,11 @@ where
             }
             proto::NodeResponseBody::Error(e) => {
                 tracing::debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
+                Err(RetrievalError::RequestError(crate::error::RequestError::ServerError(e)))
             }
-            _ => {
+            other => {
                 tracing::debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
+                Err(RetrievalError::RequestError(crate::error::RequestError::UnexpectedResponse(other)))
             }
         }
     }

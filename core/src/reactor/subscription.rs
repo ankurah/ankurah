@@ -78,6 +78,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let entity_ids: Vec<_> = entity_ids.into_iter().collect();
         self.0.reactor.remove_entity_subscriptions(self.0.subscription_id, entity_ids);
     }
+
+    /// Remove entity subscriptions using inclusive entity-id ranges.
+    pub fn remove_entity_subscription_ranges(&self, ranges: &[proto::EntityIdRange]) {
+        let removed = {
+            let subscriptions = self.0.reactor.0.subscriptions.lock().unwrap();
+            subscriptions.get(&self.0.subscription_id).map(|subscription| subscription.remove_entity_subscription_ranges(ranges))
+        };
+
+        if let Some(removed) = removed {
+            self.0.reactor.remove_entity_subscriptions(self.0.subscription_id, removed);
+        }
+    }
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for ReactorSubscription<E, Ev> {
