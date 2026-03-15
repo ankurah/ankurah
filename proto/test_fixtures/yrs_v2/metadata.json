@@ -1,0 +1,8 @@
+{
+  "empty_doc": { "client_id": 1, "fields": {} },
+  "simple_text": { "client_id": 1, "fields": { "content": "Hello, World!" } },
+  "multifield": { "client_id": 2, "fields": { "title": "Cat video #2918", "description": "Very cute cats playing" } },
+  "text_with_edits": { "client_id": 3, "fields": { "content": "Hello, World!" } },
+  "incremental_base": { "client_id": 4, "fields": { "content": "Hello" } },
+  "incremental_diff": { "client_id": 4, "fields": { "content": "Hello, World!" }, "note": "Apply after incremental_base to get full state" }
+}
