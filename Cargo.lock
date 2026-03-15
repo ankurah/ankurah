@@ -217,6 +217,7 @@ dependencies = [
  "ulid",
  "uniffi",
  "wasm-bindgen",
+ "yrs",
 ]
 
 [[package]]

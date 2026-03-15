@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use ankurah_proto::auth::{Attestation, AttestationSet, Attested, AuthData};
+use ankurah_proto::auth::{Attestation, AttestationSet, Attested, AuthData, Principal};
 use ankurah_proto::clock::Clock;
 use ankurah_proto::collection::CollectionId;
 use ankurah_proto::data::{
@@ -19,8 +19,8 @@ use ankurah_proto::data::{
 use ankurah_proto::message::{Message, NodeMessage};
 use ankurah_proto::peering::Presence;
 use ankurah_proto::request::{
-    CausalAssertionFragment, CausalRelation, DeltaContent, EntityDelta, KnownEntity, NodeRequest,
-    NodeRequestBody, NodeResponse, NodeResponseBody, RequestId,
+    CausalAssertion, CausalAssertionFragment, CausalRelation, DeltaContent, EntityDelta,
+    KnownEntity, NodeRequest, NodeRequestBody, NodeResponse, NodeResponseBody, RequestId,
 };
 use ankurah_proto::sys;
 use ankurah_proto::transaction::TransactionId;
@@ -716,4 +716,56 @@ fn test_system_fixture() {
     data.extend(bincode::serialize(&collection_item).unwrap());
 
     check_or_write_fixture("system.bin", &data);
+}
+
+#[test]
+fn test_causal_assertion_fixture() {
+    let causal_assertion = CausalAssertion {
+        entity_id: make_entity_id(0x10),
+        subject: make_clock_single(),
+        other: make_clock_multi(),
+        relation: CausalRelation::StrictDescends,
+    };
+
+    let causal_assertion_equal = CausalAssertion {
+        entity_id: make_entity_id(0x20),
+        subject: make_clock_empty(),
+        other: make_clock_empty(),
+        relation: CausalRelation::Equal,
+    };
+
+    let mut data = Vec::new();
+    data.extend(bincode::serialize(&causal_assertion).unwrap());
+    data.extend(bincode::serialize(&causal_assertion_equal).unwrap());
+
+    check_or_write_fixture("causal_assertion.bin", &data);
+}
+
+#[test]
+fn test_principal_fixture() {
+    let principal = Principal {};
+
+    let mut data = Vec::new();
+    data.extend(bincode::serialize(&principal).unwrap());
+
+    check_or_write_fixture("principal.bin", &data);
+}
+
+#[test]
+fn test_attested_event_fixture() {
+    let attested_event = Attested {
+        payload: make_event(),
+        attestations: make_attestation_set_two(),
+    };
+
+    let attested_event_empty_attestations = Attested {
+        payload: make_event(),
+        attestations: make_attestation_set_empty(),
+    };
+
+    let mut data = Vec::new();
+    data.extend(bincode::serialize(&attested_event).unwrap());
+    data.extend(bincode::serialize(&attested_event_empty_attestations).unwrap());
+
+    check_or_write_fixture("attested_event.bin", &data);
 }

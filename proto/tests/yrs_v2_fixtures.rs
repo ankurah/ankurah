@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use yrs::{GetString, ReadTxn, Text, Transact};
+use yrs::{GetString, ReadTxn, Text, Transact, updates::decoder::Decode, Update};
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -191,4 +191,60 @@ fn test_incremental_diff() {
     };
 
     check_or_write_fixture("incremental_diff.bin", &diff);
+}
+
+#[test]
+fn test_concurrent_merge() {
+    // Two docs with different client_ids make concurrent edits, then merge
+    let doc_a = make_doc(10);
+    let doc_b = make_doc(20);
+
+    let text_a = doc_a.get_or_insert_text("content");
+    let text_b = doc_b.get_or_insert_text("content");
+
+    // Doc A inserts "Hello"
+    {
+        let mut txn = doc_a.transact_mut();
+        text_a.insert(&mut txn, 0, "Hello");
+        txn.commit();
+    }
+
+    // Doc B inserts "World" (concurrently, without seeing A's edit)
+    {
+        let mut txn = doc_b.transact_mut();
+        text_b.insert(&mut txn, 0, "World");
+        txn.commit();
+    }
+
+    // Merge: apply A's state into B, and B's state into A
+    let state_a = encode_full_state(&doc_a);
+    let state_b = encode_full_state(&doc_b);
+
+    {
+        let mut txn = doc_a.transact_mut();
+        let update = Update::decode_v2(&state_b).unwrap();
+        txn.apply_update(update).unwrap();
+        txn.commit();
+    }
+    {
+        let mut txn = doc_b.transact_mut();
+        let update = Update::decode_v2(&state_a).unwrap();
+        txn.apply_update(update).unwrap();
+        txn.commit();
+    }
+
+    // Both docs should now have the same merged content
+    let merged_a = {
+        let txn = doc_a.transact();
+        text_a.get_string(&txn)
+    };
+    let merged_b = {
+        let txn = doc_b.transact();
+        text_b.get_string(&txn)
+    };
+    assert_eq!(merged_a, merged_b, "Merged docs should be identical");
+
+    // Save the merged state from doc_a (both should be equivalent)
+    let merged_state = encode_full_state(&doc_a);
+    check_or_write_fixture("concurrent_merge.bin", &merged_state);
 }
