@@ -223,9 +223,38 @@ Start with one listener per database for simplicity. Multi-database listeners ca
 
 If the durable subscriptions feature is implemented for MySQL (with `commit_seq` on the event table), synthetic events from mode 1 use `add_event()` which assigns the next `commit_seq`. From the perspective of durable subscriptions, synthetic events are indistinguishable from native events. They appear in the commit sequence and are delivered to subscribers normally.
 
+## Column Name Clarification
+
+Phase 1 creates ankurah-owned tables with columns `id`, `state_buffer`, `head`, `attestations`. The discriminator column for CDC on these tables is `head`.
+
+When existing tables are migrated in a future phase (adding ankurah metadata columns to pre-existing tables), those columns will use the `_ankurah_` prefix (e.g., `_ankurah_head`, `_ankurah_entity_id`) to avoid colliding with existing column names. The discriminator column name is therefore table-dependent — `head` on ankurah-owned tables, `_ankurah_head` on migrated tables. The listener must be configured with the correct column name per table.
+
+For Phase 2, which operates on ankurah-owned tables, the discriminator column is `head`.
+
+## Column-to-PropertyName Mapping
+
+For ankurah-owned tables, materialized column names ARE property names (they're created by the storage engine from `backend.property_values()`). Internal columns (`id`, `state_buffer`, `head`, `attestations`) are a known fixed set and must be excluded when constructing synthetic operations from column diffs.
+
+## Attestations on Synthetic Events
+
+Synthetic events carry an empty `AttestationSet`. They are system-generated, not attested by any policy agent. Downstream consumers can distinguish synthetic events from native events by checking for the absence of attestations.
+
+## Reactor Notification Path
+
+The binlog listener should use the Node's existing event application infrastructure to process detected changes, rather than constructing Entity instances directly. The listener holds a `WeakNode` reference and calls through the Node's event application path, which handles entity construction, backend initialization, and reactor notification internally.
+
+## Startup Validation
+
+On startup, the listener should query `SHOW VARIABLES LIKE 'binlog_row_image'` and fail with a clear error if the value is not `FULL`. With `MINIMAL` row images, the before-image may only contain the primary key, causing the head-field discriminator to silently malfunction.
+
+## Position Persistence at Transaction Boundaries
+
+The MySQL binlog groups multiple row events within a single transaction (between GTID/BEGIN events and XID/COMMIT events). The listener should only persist its binlog position at transaction boundaries. Persisting mid-transaction could cause partial replay on crash, where the listener starts mid-transaction and processes only the latter half of a transaction's row events.
+
 ## Future Work
 
 - **DELETE handling**: Create tombstone events when external DELETEs are detected. Depends on ankurah adding a delete/tombstone operation.
 - **Leader election** for mode 1 singleton: Automatic failover if the designated lifter node goes down.
 - **Batched synthetic events**: For high-volume external writes, batch multiple column changes into fewer synthetic events.
+- **GTID-based positioning**: Modern MySQL 8.0+ deployments typically use GTIDs. Support GTID-based positioning as an alternative to file+position for environments where binlog files may rotate or be purged.
 - **Postgres CDC**: Logical replication for Postgres serves the same role. The mode 1 / mode 2 distinction applies equally. This spec should not paint Postgres CDC into a corner.

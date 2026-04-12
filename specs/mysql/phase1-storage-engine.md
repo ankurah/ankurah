@@ -469,7 +469,7 @@ Analogous to `PGValue`. Maps `ankurah_core::value::Value` variants to MySQL type
 
 ```rust
 pub enum MySQLValue {
-    String(String),        // VARCHAR
+    String(String),        // TEXT
     TinyInt(i8),           // TINYINT
     SmallInt(i16),         // SMALLINT
     Int(i32),              // INT
@@ -483,7 +483,7 @@ pub enum MySQLValue {
 impl MySQLValue {
     pub fn mysql_type(&self) -> &'static str {
         match self {
-            MySQLValue::String(_) => "VARCHAR(255)",
+            MySQLValue::String(_) => "TEXT",
             MySQLValue::TinyInt(_) => "TINYINT",
             MySQLValue::SmallInt(_) => "SMALLINT",
             MySQLValue::Int(_) => "INT",
@@ -536,6 +536,46 @@ pub fn error_kind(err: &mysql_async::Error) -> ErrorKind {
     // Extract MySQL error code and message, classify
 }
 ```
+
+## Materialized Column Type Preservation
+
+When auto-materializing columns, the storage engine only chooses a MySQL type for columns it **creates**. If a column already exists (discovered via `information_schema.columns`), its existing type is preserved. The `rebuild_columns_cache` captures the existing `data_type` from information_schema. The `add_missing_columns` path only fires for columns that don't exist yet.
+
+This is important for forward compatibility: when existing tables with pre-defined column types are eventually managed by ankurah, the storage engine must not alter their types.
+
+## Attestation Serialization
+
+Both the state table and event table use single-blob serialization for attestations (`bincode::serialize(&attestations)` → `MEDIUMBLOB`). This differs from Postgres which uses `BYTEA[]` for the state table. The single-blob approach is simpler and consistent across both tables.
+
+## MySQL-Specific Implementation Notes
+
+### ON DUPLICATE KEY UPDATE affected_rows
+
+For `add_event`, the `ON DUPLICATE KEY UPDATE id = id` idiom reports `affected_rows = 0` for duplicates (no-op update) and `affected_rows = 1` for new inserts. So `affected > 0` correctly returns `true` for new events and `false` for duplicates without needing the `CLIENT_FOUND_ROWS` connection flag.
+
+### Transaction rollback on error
+
+`mysql_async` automatically rolls back uncommitted transactions when a `Conn` is dropped or returned to the pool. The `set_state` transaction does not need explicit `ROLLBACK` on error paths.
+
+### Pool shutdown
+
+`mysql_async::Pool` requires `disconnect().await` for clean shutdown (unlike bb8 which drops synchronously). The `MySQL` struct should provide a `shutdown()` method:
+
+```rust
+impl MySQL {
+    pub async fn shutdown(self) {
+        self.pool.disconnect().await;
+    }
+}
+```
+
+### delete_all_collections scope
+
+Phase 1 assumes ankurah has a dedicated MySQL database. `delete_all_collections` drops all tables in the current database (filtering by `information_schema.tables WHERE table_schema = DATABASE()`). If sharing a database with non-ankurah tables, a metadata table or naming convention would be needed — this is deferred to a future phase.
+
+### JSON comparison semantics
+
+MySQL 8's JSON type supports type-aware comparison (numbers compare numerically, strings lexicographically). This is similar to Postgres JSONB. Edge-case differences exist but are not expected to affect typical queries. Document known differences if encountered during testing.
 
 ## Testing
 

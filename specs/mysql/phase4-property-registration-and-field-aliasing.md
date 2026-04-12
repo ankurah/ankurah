@@ -195,3 +195,21 @@ Without field aliasing, the CDC listener would need a separate mapping from colu
 5. The property's name in the registry can also be updated from `total_amount` to `amount` if desired — this is a metadata change, not a data migration.
 
 The `name` approach covers the common case (Rust field name differs from DB column name). The `id` approach is more robust — it survives both field renames and property name changes, because the EntityId is the immutable identity.
+
+**Note**: `#[model(id = "...")]` is blocked on the state buffer serialization format change (transitioning from string-keyed to EntityId-keyed). `#[model(name = "...")]` works immediately since it's a string substitution. The `id` attribute is a stretch goal contingent on issue #85 property registration being fully implemented.
+
+## ankql Query Resolution
+
+When a field has `#[model(name = "customer_id")]`, ankql queries use the **storage name** (`customer_id`), not the Rust field name (`customer`). The Rust API uses `.customer()`. These are intentionally different namespaces — ankql operates on storage/property names, Rust code operates on field names. This matches the existing behavior where ankql queries already use property names (which today happen to equal the lowercased field name).
+
+## Attribute Coexistence Rules
+
+- `name` and `id` are mutually exclusive on the same field. Validated at compile time.
+- `ephemeral` is mutually exclusive with both `name` and `id` — ephemeral fields aren't stored, so naming them is meaningless. Validated at compile time.
+- The attribute parser must handle comma-separated items in `#[model(...)]` to support combinations like `#[model(ephemeral)]` alongside the new key-value pairs, even if only to reject invalid combinations with a clear error.
+
+## Compile-Time Validation
+
+- `#[model(id = "...")]`: The derive macro validates that the string parses as a valid base64 EntityId at compile time.
+- `#[model(name = "...")]`: The derive macro validates the string is non-empty and contains only valid property name characters.
+- `#[model(table = "...")]` on the struct: validated similarly to name.

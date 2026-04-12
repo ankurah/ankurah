@@ -4,8 +4,20 @@
 
 Multi-tenant deployments need to route storage operations to different MySQL databases based on context (e.g., which tenant the current request is for). Ankurah provides the plumbing for this via two changes:
 
-1. **StorageEngine trait change**: `collection()` receives `PA::ContextData` so the storage engine can make routing decisions based on the current context. The type binding is enforced at compile time.
+1. **StorageEngine trait change**: `collection()` receives `PA::ContextData` so the storage engine can make routing decisions based on the current context. The type binding is enforced at compile time. Context is always required (no `Option`) — system operations use a default context.
 2. **Injectable connection resolver**: The MySQL storage engine accepts an application-provided resolver that maps context data to a MySQL connection pool. The resolver implementation is application-specific — ankurah defines the trait, the application provides the logic.
+
+## ContextData Gets a Default Bound
+
+The `ContextData` trait gains a `Default` bound:
+
+```rust
+pub trait ContextData: Send + Sync + Clone + Hash + Eq + Default + 'static {}
+```
+
+This provides a root/system context for operations that aren't user-initiated (system catalog loading, peer sync, subscription handlers). `SystemManager` and other internal code uses `C::default()` as context.
+
+For single-tenant deployments with `()` as context, `Default` is already implemented. Multi-tenant applications implement `Default` to return a system/root context that resolves to the default pool.
 
 ## StorageEngine Trait Change
 
@@ -28,13 +40,15 @@ Make `StorageEngine` generic over the context type, defaulting to `()`:
 #[async_trait]
 pub trait StorageEngine<C: Send + Sync + 'static = ()>: Send + Sync {
     type Value;
-    async fn collection(&self, id: &CollectionId, context: Option<&C>)
+    async fn collection(&self, id: &CollectionId, context: &C)
         -> Result<Arc<dyn StorageCollection>, RetrievalError>;
     async fn delete_all_collections(&self) -> Result<bool, MutationError>;
 }
 ```
 
-`Option<&C>` because some operations have no context (system-level operations, peer sync). The storage engine must have a sensible default or return an error if context is required but absent.
+Context is always required — no `Option`. Every code path provides context:
+- `NodeAndContext` passes `&self.cdata` (user context).
+- `SystemManager`, peer sync, subscription handlers pass `&C::default()` (root context).
 
 ### Type Binding Through the System
 
@@ -53,11 +67,11 @@ where
 pub async fn get(
     &self,
     id: &CollectionId,
-    context: Option<&C>,
+    context: &C,
 ) -> Result<StorageCollectionWrapper, RetrievalError>
 ```
 
-`NodeAndContext` (which holds both `node` and `cdata`) passes `Some(&self.cdata)` when calling through to the collection set. Code paths without context (peer sync, system operations) pass `None`.
+Call sites that currently call `collections.get(id)` without context (e.g., `SystemManager::load_system_catalog`, `SystemManager::create`, peer sync in `node_applier.rs`, subscription handlers in `peer_subscription/server.rs`) are updated to pass `&C::default()`.
 
 ### Existing Storage Engines
 
@@ -71,7 +85,7 @@ impl<C: Send + Sync + 'static> StorageEngine<C> for Postgres {
     async fn collection(
         &self,
         id: &CollectionId,
-        _context: Option<&C>,
+        _context: &C,
     ) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // existing implementation unchanged — context ignored
     }
@@ -112,34 +126,28 @@ pub trait ConnectionResolver: Send + Sync + 'static {
 ```rust
 pub struct MultiTenantMySQL<R: ConnectionResolver> {
     resolver: R,
-    /// Fallback pool for operations without context (system tables, etc.)
-    default_pool: Option<mysql_async::Pool>,
 }
 
 #[async_trait]
-impl<R: ConnectionResolver> StorageEngine<R::Context> for MultiTenantMySQL<R> {
+impl<R: ConnectionResolver> StorageEngine<R::Context> for MultiTenantMySQL<R>
+where R::Context: Default
+{
     type Value = MySQLValue;
 
     async fn collection(
         &self,
         id: &CollectionId,
-        context: Option<&R::Context>,
+        context: &R::Context,
     ) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
-        let pool = match context {
-            Some(ctx) => self.resolver.resolve(ctx, id).await?,
-            None => {
-                self.default_pool.clone()
-                    .ok_or_else(|| RetrievalError::StorageError(
-                        "No context provided and no default pool configured".into()
-                    ))?
-            }
-        };
+        let pool = self.resolver.resolve(context, id).await?;
 
         // Proceed with pool — same as single-tenant MySQL::collection()
         // (validate name, get schema, create bucket, DDL lock, create tables, etc.)
     }
 }
 ```
+
+The resolver receives context on every call, including system operations (which pass `R::Context::default()`). The resolver is responsible for mapping the default context to the appropriate system/default pool.
 
 ### Compile-Time Type Binding
 
@@ -148,7 +156,7 @@ When constructing a Node, the compiler enforces that the resolver's context type
 ```rust
 // Application code:
 let resolver = MyAppResolver::new(/* ... */);
-let engine = MultiTenantMySQL::new(resolver, None);
+let engine = MultiTenantMySQL::new(resolver);
 let node = Node::new(Arc::new(engine), my_policy_agent);
 // Node<MultiTenantMySQL<MyAppResolver>, MyPolicyAgent>
 //
@@ -163,14 +171,9 @@ If the resolver's context type doesn't match the policy agent's context data, th
 
 `CollectionSet` currently caches collections by `CollectionId`. With multi-tenancy, the same `CollectionId` (e.g., "order") may resolve to different databases depending on context.
 
-The multi-tenant storage engine handles this internally — it returns different `MysqlBucket` instances backed by different pools for different contexts. `CollectionSet`'s cache (keyed by `CollectionId` alone) would incorrectly return a cached collection for the wrong tenant.
+The multi-tenant storage engine handles this internally — it returns different `MysqlBucket` instances backed by different pools for different contexts. Since `ContextData` already requires `Hash + Eq`, `CollectionSet` can include context in its cache key: `(CollectionId, C)`. For single-tenant engines where `C = ()`, this adds no overhead (all lookups use the same `()` key).
 
-Options:
-- **Option A**: `CollectionSet` includes context in its cache key. Requires `C: Hash + Eq`.
-- **Option B**: The multi-tenant storage engine manages its own per-tenant cache, and `CollectionSet` is bypassed or made context-aware.
-- **Option C**: `CollectionSet` does not cache when context is `Some` (always delegates to the storage engine, which caches internally).
-
-Option C is the simplest and avoids leaking tenancy concerns into the core. The storage engine's resolver is already expected to cache pools.
+For multi-tenant engines, this means different tenant contexts get separate cached collections, which is correct — they're backed by different database pools.
 
 ## Pool Management
 
@@ -182,6 +185,12 @@ Recommended defaults for resolver implementations:
 - Max connections per tenant pool: 5
 - Idle timeout: 5 minutes
 - Pool-per-tenant with database in connection string (not `USE DATABASE`, which changes connection state and interacts poorly with pooling)
+
+## Single-Tenant vs Multi-Tenant MySQL
+
+Both engines coexist:
+- `MySQL` — the simple Phase 1 engine. Implements `StorageEngine<C>` for all `C` (ignores context). For single-tenant or single-database deployments.
+- `MultiTenantMySQL<R>` — wraps a `ConnectionResolver` for tenant-aware routing. Implements `StorageEngine<R::Context>`. Shares `MysqlBucket` and the SQL builder with `MySQL`.
 
 ## What Is NOT Specified Here
 
