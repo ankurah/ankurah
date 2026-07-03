@@ -52,7 +52,14 @@ pub(crate) async fn compare<E: GetEvents>(
     comparison: &Clock,
     budget: usize,
 ) -> Result<ComparisonResult<E>, RetrievalError> {
-    // Early exit for obvious cases - empty clocks are disjoint
+    // Identical clocks (including two empty ones) are equal.
+    if subject.as_slice() == comparison.as_slice() {
+        let accumulator = EventAccumulator::new(event_getter);
+        return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
+    }
+
+    // A clock with no history shares nothing with a non-empty one: diverged
+    // with an empty meet.
     if subject.as_slice().is_empty() || comparison.as_slice().is_empty() {
         let accumulator = EventAccumulator::new(event_getter);
         return Ok(ComparisonResult::new(
@@ -67,37 +74,45 @@ pub(crate) async fn compare<E: GetEvents>(
         ));
     }
 
-    if subject.as_slice() == comparison.as_slice() {
-        let accumulator = EventAccumulator::new(event_getter);
-        return Ok(ComparisonResult::new(AbstractCausalRelation::Equal, accumulator));
-    }
-
     let mut accumulator = EventAccumulator::new(event_getter);
 
-    // Quick check: if every comparison head appears as a parent of some subject
-    // event, then subject strictly descends from comparison (one step away).
-    // This avoids BFS entirely for the common case of a new event whose parents
-    // ARE the current head -- and crucially avoids fetching the comparison events
+    // Quick check: if every subject event sits exactly one step above the
+    // comparison heads (nonempty parent set, all parents within the comparison
+    // set) and every comparison head is covered by some subject event's
+    // parents, then subject strictly descends comparison. This avoids BFS
+    // entirely for the common case of a new event whose parents ARE the
+    // current head -- and crucially avoids fetching the comparison events
     // themselves, which may not be in local storage (ephemeral node scenario).
+    //
+    // Both directions are required for soundness (V3): without the per-event
+    // parents-within-comparison guard, a subject event contributing nothing
+    // relevant to the parent union (a disjoint genesis root, or an event on a
+    // foreign lineage) is silently vouched for by its siblings, and the BFS
+    // that would detect the disjoint lineage never runs.
     {
         let comparison_set: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
         let mut all_parents: BTreeSet<EventId> = BTreeSet::new();
-        let mut all_fetched = true;
+        let mut applicable = true;
 
         for id in subject.as_slice() {
             match accumulator.get_event(id).await {
                 Ok(event) => {
                     accumulator.accumulate(&event);
-                    all_parents.extend(event.parent.as_slice().iter().cloned());
+                    let parents = event.parent.as_slice();
+                    if parents.is_empty() || !parents.iter().all(|p| comparison_set.contains(p)) {
+                        applicable = false;
+                        break;
+                    }
+                    all_parents.extend(parents.iter().cloned());
                 }
                 Err(_) => {
-                    all_fetched = false;
+                    applicable = false;
                     break;
                 }
             }
         }
 
-        if all_fetched && comparison_set.is_subset(&all_parents) {
+        if applicable && comparison_set.is_subset(&all_parents) {
             // Subject's parents cover all comparison heads -> StrictDescends
             let chain: Vec<EventId> = subject.as_slice().to_vec();
             return Ok(ComparisonResult::new(AbstractCausalRelation::StrictDescends { chain }, accumulator));
@@ -439,11 +454,39 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         // seen_comparison_heads only ever holds members of original_comparison,
         // so length equality means set equality.
         if self.seen_comparison_heads.len() == self.original_comparison.len() {
-            // Build forward chain from comparison head to subject head
-            // The subject_visited contains events from subject head backward
-            // We need the forward chain (older to newer), excluding the comparison heads themselves
-            let chain: Vec<_> = self.subject_visited.iter().rev().filter(|id| !self.original_comparison.contains(id)).cloned().collect();
-            return Some(AbstractCausalRelation::StrictDescends { chain });
+            // Seeing every comparison head proves cover containment, but the
+            // adoption semantics of StrictDescends require more: every subject
+            // head must share lineage with the comparison. A subject clock
+            // that juxtaposes a foreign lineage (e.g. an extra disjoint root)
+            // covers the comparison heads via its other components while
+            // smuggling in unrelated history (V3). Such a shape must not fire
+            // here; left to run, the traversal exhausts and yields the
+            // diverged verdict, so the foreign line merges through layers
+            // instead of being adopted wholesale.
+            //
+            // Sharing lineage means the head's ancestry intersects the
+            // comparison heads' ancestry, not that it reaches a comparison
+            // head: a legitimate subject head may be a sibling of a comparison
+            // head (concurrent tips joined by the subject clock), grounded
+            // through a common ancestor. Ancestry here includes parent ids
+            // referenced by explored events even when not yet fetched; those
+            // edges are real DAG structure, so intersecting on them is sound
+            // and preserves early termination.
+            let dag = self.accumulator.dag();
+            let comparison_heads: Vec<EventId> = self.original_comparison.iter().cloned().collect();
+            let comparison_ancestry = compute_ancestry_from_dag(dag, &comparison_heads);
+            let grounded = self
+                .original_subject
+                .iter()
+                .all(|head| compute_ancestry_from_dag(dag, std::slice::from_ref(head)).iter().any(|id| comparison_ancestry.contains(id)));
+            if grounded {
+                // Build forward chain from comparison head to subject head
+                // The subject_visited contains events from subject head backward
+                // We need the forward chain (older to newer), excluding the comparison heads themselves
+                let chain: Vec<_> =
+                    self.subject_visited.iter().rev().filter(|id| !self.original_comparison.contains(id)).cloned().collect();
+                return Some(AbstractCausalRelation::StrictDescends { chain });
+            }
         }
 
         // StrictAscends: comparison's traversal has seen all subject heads

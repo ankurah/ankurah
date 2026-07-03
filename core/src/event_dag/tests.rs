@@ -303,11 +303,13 @@ async fn test_empty_clocks() {
     let empty = Clock::default();
     let non_empty = clock!(id1);
 
+    // Two empty clocks are the same clock: Equal, not diverged.
+    let result = compare(retriever.clone(), &empty, &empty, 100).await.unwrap();
+    assert_eq!(result.relation, AbstractCausalRelation::Equal);
+
+    // One-sided empty clocks share no history: diverged with an empty meet.
     let expected =
         AbstractCausalRelation::DivergedSince { meet: vec![], subject: vec![], other: vec![], subject_chain: vec![], other_chain: vec![] };
-
-    let result = compare(retriever.clone(), &empty, &empty, 100).await.unwrap();
-    assert_eq!(result.relation, expected);
     let result = compare(retriever.clone(), &non_empty, &empty, 100).await.unwrap();
     assert_eq!(result.relation, expected);
     let result = compare(retriever.clone(), &empty, &non_empty, 100).await.unwrap();
@@ -2547,7 +2549,6 @@ mod quick_check_disjoint_verify {
     /// entity.rs does not wholesale-replace head with {B, X} and silently adopt
     /// X's disjoint lineage.
     #[tokio::test]
-    #[ignore = "V3: red until remediation A3 (quick-check guard), see specs/concurrent-updates/remediation-2026-07.md"]
     async fn test_quick_check_disjoint_extra_root() {
         let mut retriever = MockRetriever::new();
 
@@ -2577,6 +2578,47 @@ mod quick_check_disjoint_verify {
             "subject {{B, X}} contains disjoint root X; must not be StrictDescends over {{A}}, got {:?}",
             result.relation
         );
+    }
+
+    /// When the guard trips (a subject event's parents are not within the
+    /// comparison set), the comparison must fall through to the full BFS and
+    /// return its verdict, not error or misclassify.
+    ///
+    /// DAG: A (root);  B -> A;  D -> B;  C -> A.
+    /// Subject = {D}, comparison = {C}: D's parent B is outside {C}, so the
+    /// shortcut does not apply; BFS finds the true relation
+    /// DivergedSince { meet: [A] }.
+    #[tokio::test]
+    async fn test_quick_check_guard_falls_through_to_bfs() {
+        let mut retriever = MockRetriever::new();
+
+        let ev_a = make_test_event(1, &[]);
+        let id_a = ev_a.id();
+        retriever.add_event(ev_a);
+
+        let ev_b = make_test_event(2, &[id_a.clone()]);
+        let id_b = ev_b.id();
+        retriever.add_event(ev_b);
+
+        let ev_d = make_test_event(3, &[id_b.clone()]);
+        let id_d = ev_d.id();
+        retriever.add_event(ev_d);
+
+        let ev_c = make_test_event(4, &[id_a.clone()]);
+        let id_c = ev_c.id();
+        retriever.add_event(ev_c);
+
+        let subject = clock!(id_d);
+        let comparison = clock!(id_c);
+
+        let result = compare(retriever, &subject, &comparison, 100).await.unwrap();
+
+        match &result.relation {
+            AbstractCausalRelation::DivergedSince { meet, .. } => {
+                assert_eq!(meet, &vec![id_a.clone()], "meet should be [A]");
+            }
+            other => panic!("expected DivergedSince {{ meet: [A] }} via BFS fallthrough, got {:?}", other),
+        }
     }
 }
 
