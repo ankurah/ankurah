@@ -1,7 +1,7 @@
 [package]
 name        = "ankurah-jwt-auth"
 description = "JWT-based PolicyAgent for Ankurah"
-version     = "0.7.23"
+version     = "0.8.0"
 edition     = "2021"
 license     = "MIT OR Apache-2.0"
 homepage    = "https://github.com/ankurah/ankurah"
@@ -15,10 +15,10 @@ uniffi  = ["dep:uniffi"]
 
 [dependencies]
 # Internal dependencies
-ankurah       = { path = "../../ankurah", features = ["derive"], version = "=0.7.23" }
-ankurah-core  = { path = "../../core", version = "=0.7.23" }
-ankurah-proto = { path = "../../proto", version = "=0.7.23" }
-ankql         = { path = "../../ankql", version = "=0.7.23" }
+ankurah       = { path = "../../ankurah", features = ["derive"], version = "=0.8.0" }
+ankurah-core  = { path = "../../core", version = "=0.8.0" }
+ankurah-proto = { path = "../../proto", version = "=0.8.0" }
+ankql         = { path = "../../ankql", version = "=0.8.0" }
 
 # JWT
 jwt-simple = { version = "0.12", default-features = false, features = ["pure-rust"] }
@@ -46,6 +46,6 @@ tokio        = { version = "1", default-features = false, features = ["rt"] }
 wasm-bindgen = "0.2"
 
 [dev-dependencies]
-ankurah-storage-sled            = { path = "../../storage/sled", version = "=0.7.23" }
-ankurah-connector-local-process = { path = "../../connectors/local-process", version = "=0.7.23" }
+ankurah-storage-sled            = { path = "../../storage/sled", version = "=0.8.0" }
+ankurah-connector-local-process = { path = "../../connectors/local-process", version = "=0.8.0" }
 tokio                           = { version = "1", features = ["full"] }
