@@ -22,7 +22,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> Result<(), MutationError>
+    ) -> Result<(), ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -32,24 +32,39 @@ impl NodeApplier {
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
         // but this feels brittle, because failure to apply this event would affect the other contexts on this node.
         let Some(relay) = &node.subscription_relay else {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay"));
+            return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay").into());
         };
         let cdata = relay.get_contexts_for_peer(from_peer_id);
         if cdata.is_empty() {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context"));
+            return Err(MutationError::InvalidUpdate("Should not be receiving updates without at least predicate context").into());
         }
 
-        // Apply all updates and notify reactor
+        // Apply all updates. One bad item must not poison the batch: failures
+        // are collected per item, the remaining items still apply, and the
+        // reactor is notified for the successfully applied subset.
         let mut changes = Vec::new();
+        let mut errors: Vec<ApplyErrorItem> = Vec::new();
         for update in items {
-            let collection = node.collections.get(&update.collection).await?;
-            let event_getter = CachedEventGetter::new(update.collection.clone(), collection.clone(), node, &cdata);
-            let state_getter = LocalStateGetter::new(collection);
-            Self::apply_update(node, from_peer_id, update, &event_getter, &state_getter, &mut changes, &mut ()).await?;
+            let entity_id = update.entity_id;
+            let item_collection = update.collection.clone();
+            let result = async {
+                let collection = node.collections.get(&update.collection).await?;
+                let event_getter = CachedEventGetter::new(update.collection.clone(), collection.clone(), node, &cdata);
+                let state_getter = LocalStateGetter::new(collection);
+                Self::apply_update(node, from_peer_id, update, &event_getter, &state_getter, &mut changes, &mut ()).await
+            }
+            .await;
+            if let Err(cause) = result {
+                tracing::warn!("failed to apply update for {}/{}: {}", item_collection, entity_id, cause);
+                errors.push(ApplyErrorItem { entity_id, collection: item_collection, cause });
+            }
         }
 
         node.reactor.notify_change(changes).await;
 
+        if !errors.is_empty() {
+            return Err(ApplyError::Items(errors));
+        }
         Ok(())
     }
 
@@ -88,16 +103,39 @@ impl NodeApplier {
                 entities.push(entity.clone());
 
                 let mut applied_events = Vec::new();
+                let mut failure: Option<MutationError> = None;
                 for event in attested_events {
                     // Events should always be appliable sequentially
-                    if entity.apply_event(event_getter, &event.payload).await? {
-                        event_getter.commit_event(&event).await?;
+                    let applied = match entity.apply_event(event_getter, &event.payload).await {
+                        Ok(applied) => applied,
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    };
+                    if applied {
+                        if let Err(e) = event_getter.commit_event(&event).await {
+                            failure = Some(e);
+                            break;
+                        }
                         applied_events.push(event);
                     }
                 }
 
+                // Anything applied before a failure is real progress; notify it.
                 if !applied_events.is_empty() {
-                    changes.push(EntityChange::new(entity, applied_events)?);
+                    changes.push(EntityChange::new(entity.clone(), applied_events)?);
+                }
+
+                if let Some(e) = failure {
+                    // get_retrieve_or_create may have materialized an empty-head
+                    // resident for an entity we know nothing about (e.g. a
+                    // non-creation event for an entity that was never received).
+                    // Evict it, or the entity appears to exist with no state.
+                    // Recovering by requesting state from the peer is tracked as
+                    // a follow-up.
+                    node.entities.remove_if_phantom(&entity_id);
+                    return Err(e);
                 }
             }
 

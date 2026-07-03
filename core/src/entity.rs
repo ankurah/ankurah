@@ -688,6 +688,25 @@ impl WeakEntitySet {
         entity
     }
 
+    /// Evict an entity from the set only if it is absent from storage-backed
+    /// life: resident with an empty head (or already dead). An empty-head
+    /// resident is a phantom, materialized speculatively for an incoming
+    /// update that then failed to apply; leaving it resident makes the entity
+    /// appear to exist with no state. Returns true if an entry was removed.
+    pub fn remove_if_phantom(&self, id: &EntityId) -> bool {
+        let mut entities = self.0.write().unwrap();
+        if let Some(weak) = entities.get(id) {
+            if let Some(entity) = weak.upgrade() {
+                if !entity.head().is_empty() {
+                    return false;
+                }
+            }
+            entities.remove(id);
+            return true;
+        }
+        false
+    }
+
     /// TEST ONLY: Create a phantom entity with a specific ID.
     ///
     /// This creates an entity that was never properly created via Transaction::create(),

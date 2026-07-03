@@ -47,10 +47,11 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
       All `check_event` before any `commit_event`.
       Test: two-entity trx, second denied, assert zero durable events.
       Test lives in ankurah-tests (`commit_atomicity.rs`) with a local selective-deny agent (permissive except the second album check_event), avoiding a core dev-dependency cycle per the fix plan.
-- [ ] **C3 (V6, MEDIUM-HIGH): per-item error containment in apply_updates.**
+- [x] **C3 (V6, MEDIUM-HIGH): per-item error containment in apply_updates.**
       Collect per-item failures, continue batch, notify applied subset; remove phantom empty-head entity on failure. Needs-state recovery: implement if under an hour, else file follow-up issue.
       Test: three-item batch with middle EventOnly-for-unknown-entity; items 1 and 3 apply and notify; no phantom resident.
       Audit: callers of apply_updates for any-failure-fails-batch assumptions.
+      Landed: apply_updates returns ApplyError::Items aggregating per-item failures; within the EventOnly arm, events applied before a failure keep their EntityChange, and a new WeakEntitySet::remove_if_phantom evicts the speculative empty-head resident. Needs-state recovery deferred to a follow-up issue (file with B3 at merge). Audit result: the single caller is handle_update, which converts any error into NodeUpdateAck::Error back to the sender (acks are informational, no retry machinery), so no caller assumed all-or-nothing. Test: `update_batch_containment.rs` forges the three-item batch and injects it through the public handle_message seam (EventOnly is a dead send path in current senders, so wire choreography cannot produce it); asserts items 1 and 3 applied and durable, nothing durable for the unknown entity, and the phantom evicted.
 
 ## Docs and validation gate
 
