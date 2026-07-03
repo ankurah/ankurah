@@ -1271,6 +1271,109 @@ mod lww_layer_tests {
             assert_eq!(backend.get(&"x".into()), Some(Value::String((*winner_value).into())));
         }
     }
+
+    /// Like make_lww_event but with an explicit parent clock, for multi-layer DAG scenarios.
+    fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
+        let mut event = make_lww_event(seed, properties);
+        event.parent = Clock::from(parent_ids.to_vec());
+        event
+    }
+
+    /// H1 verification: cross-layer handling of winners drawn from already_applied events.
+    ///
+    /// DAG (M = meet, layers as EventLayers yields them for head=[A], incoming=B):
+    ///   M -- A            (local branch, sets x, in head ancestry => already_applied, layer 1)
+    ///   M -- X -- B       (remote branch, B sets x => to_apply; X layer 1, B layer 2)
+    /// A and B are concurrent; the test arranges A.id > B.id, so correct LWW
+    /// resolution says A's value must win on every replica.
+    ///
+    /// apply_layer only persists winners with from_to_apply=true (lww.rs), so a
+    /// winner drawn from already_applied is never written back to self.values.
+    /// This test pins down both halves of the question:
+    ///
+    /// 1. REACHABLE state (invariant): by the time A is in head ancestry, entity.rs
+    ///    has already applied A's operations (apply_operations_from_event on create/
+    ///    StrictDescends/commit, or as a to_apply winner in an earlier merge), so the
+    ///    stored entry for x is A (or something that beat A). Re-seeding each layer
+    ///    from stored state therefore resolves correctly without persisting
+    ///    already_applied winners. Verified for both the local replica and a remote
+    ///    replica that receives A fresh -- they converge on A's value.
+    ///
+    /// 2. UNREACHABLE-state mechanics (the H1 hazard): if the stored entry for x were
+    ///    stamped with a below-meet event Z while A sat only in already_applied, then
+    ///    layer 1 resolves A as the winner for x but does NOT persist it, layer 2
+    ///    re-seeds from stale Z (older_than_meet), and B auto-wins: wrong final value
+    ///    AND wrong stored event_id. The assertions document that mechanical hazard;
+    ///    entity.rs cannot produce this precondition because head only advances after
+    ///    the event's operations are applied to backend state.
+    #[test]
+    fn test_cross_layer_already_applied_winner_persistence() {
+        // Below-meet event Z: last writer of x before the meet. Deliberately NOT
+        // included in the layers' DAG context (BFS never accumulates below the meet).
+        let event_z = make_lww_event(9, vec![("x", "value_from_Z")]);
+
+        let meet = make_test_event(50, &[]);
+        let remote_mid = make_test_event(51, &[meet.id()]); // X: remote event, no lww ops
+        let event_b = make_lww_event_with_parent(2, vec![("x", "value_from_B")], &[remote_mid.id()]);
+        // Local-branch event A, concurrent with B, with A.id > B.id (search over seeds).
+        let event_a = (0u8..=255)
+            .map(|seed| make_lww_event_with_parent(seed, vec![("x", "value_from_A")], &[meet.id()]))
+            .find(|a| a.id() > event_b.id())
+            .expect("some seed yields A.id > B.id");
+
+        let lww_key = "lww".to_string();
+        let a_ops = event_a.operations.get(&lww_key).unwrap();
+        let z_ops = event_z.operations.get(&lww_key).unwrap();
+
+        // All layers share the same accumulated DAG {M, A, X, B}; Z is absent from it.
+        let layer1 = || layer_from_refs_with_context(&[&event_a], &[&remote_mid], &[&meet, &event_b]);
+        let layer1_a_fresh = || layer_from_refs_with_context(&[], &[&event_a, &remote_mid], &[&meet, &event_b]);
+        let layer2 = || layer_from_refs_with_context(&[], &[&event_b], &[&meet, &event_a, &remote_mid]);
+
+        // (1a) REACHABLE local replica: stored x already reflects A, because A's
+        // operations were applied when A entered head ancestry.
+        let backend_local = LWWBackend::new();
+        backend_local.apply_operations_with_event(a_ops, event_a.id()).unwrap();
+        backend_local.apply_layer(&layer1()).unwrap();
+        backend_local.apply_layer(&layer2()).unwrap();
+        assert_eq!(
+            backend_local.get(&"x".into()),
+            Some(Value::String("value_from_A".into())),
+            "reachable state: stored entry reflects already_applied A, so A must survive B"
+        );
+
+        // (1b) Convergence control: a replica that receives A fresh (to_apply) agrees.
+        let backend_remote = LWWBackend::new();
+        backend_remote.apply_operations_with_event(z_ops, event_z.id()).unwrap();
+        backend_remote.apply_layer(&layer1_a_fresh()).unwrap();
+        backend_remote.apply_layer(&layer2()).unwrap();
+        assert_eq!(
+            backend_remote.get(&"x".into()),
+            Some(Value::String("value_from_A".into())),
+            "replica receiving A via to_apply must converge to A's value"
+        );
+
+        // (2) UNREACHABLE-state mechanics: stored x stamped with below-meet Z while A
+        // is only in already_applied. Layer 1's winner (A) is not persisted...
+        let backend_stale = LWWBackend::new();
+        backend_stale.apply_operations_with_event(z_ops, event_z.id()).unwrap();
+        backend_stale.apply_layer(&layer1()).unwrap();
+        assert_eq!(
+            backend_stale.get_event_id(&"x".into()),
+            Some(event_z.id()),
+            "already_applied winner A is not written back; stored entry still stamped with Z"
+        );
+        // ...so layer 2 re-seeds from stale Z (older_than_meet) and B auto-wins,
+        // even though A.id > B.id says A should win. This is the H1 hazard, shown
+        // here to be purely mechanical: the precondition is unreachable via entity.rs.
+        backend_stale.apply_layer(&layer2()).unwrap();
+        assert_eq!(
+            backend_stale.get(&"x".into()),
+            Some(Value::String("value_from_B".into())),
+            "stale-seed mechanics: with an (entity-unreachable) below-meet stored entry, B beats A"
+        );
+        assert_eq!(backend_stale.get_event_id(&"x".into()), Some(event_b.id()));
+    }
 }
 
 // ============================================================================
@@ -2101,5 +2204,277 @@ mod phase4_eager_storage_bfs {
             assert!(!layer.to_apply.is_empty() || !layer.already_applied.is_empty(), "Layer should not be empty");
         }
         assert!(layer_count > 0, "Should produce at least one layer from eagerly stored events");
+    }
+}
+
+// ============================================================================
+// BFS REVISIT BUG VERIFICATION (no per-side visited set in comparison.rs)
+// ============================================================================
+
+#[cfg(test)]
+mod bfs_revisit_bugs {
+    use super::*;
+
+    /// CLAIM A: A second, longer path re-adds an already-processed node to the
+    /// subject frontier. The re-visit re-runs the `original_comparison.contains`
+    /// check and decrements `unseen_comparison_heads` a second time for the SAME
+    /// head, so it can hit 0 while another comparison head (D) was never reached.
+    ///
+    /// DAG (parents point right):
+    ///   S -> {A, B};  A -> N;  B -> C;  C -> N;  N -> R;  D -> R
+    /// Head (comparison) = {N, D}. Subject = {S}.
+    /// S descends from N via two paths of different length but does NOT descend
+    /// from D, so the correct relation is DivergedSince { meet: [N], .. }.
+    /// The bug double-decrements for N and falsely reports StrictDescends,
+    /// which entity.rs turns into head = {S}, silently discarding tip D.
+    #[tokio::test]
+    #[ignore = "V1: red until remediation A1 (per-side visited sets), see specs/concurrent-updates/remediation-2026-07.md"]
+    async fn double_decrement_falsely_reports_strict_descends() {
+        let mut retriever = MockRetriever::new();
+
+        let ev_r = make_test_event(1, &[]);
+        let id_r = ev_r.id();
+        retriever.add_event(ev_r);
+
+        let ev_n = make_test_event(2, &[id_r.clone()]);
+        let id_n = ev_n.id();
+        retriever.add_event(ev_n);
+
+        let ev_d = make_test_event(3, &[id_r.clone()]);
+        let id_d = ev_d.id();
+        retriever.add_event(ev_d);
+
+        let ev_a = make_test_event(4, &[id_n.clone()]);
+        let id_a = ev_a.id();
+        retriever.add_event(ev_a);
+
+        // Pick a seed for C such that id(N) < id(C). The frontier is a BTreeSet
+        // iterated in id order, so this makes the subject BFS process N (short
+        // path, via A) BEFORE C re-adds N to the frontier (long path, via B),
+        // forcing the re-visit. Content hashing makes this deterministic once a
+        // seed is found.
+        let ev_c = (10u8..=255)
+            .map(|seed| make_test_event(seed, &[id_n.clone()]))
+            .find(|ev| ev.id() > id_n)
+            .expect("some seed must yield id(C) > id(N)");
+        let id_c = ev_c.id();
+        retriever.add_event(ev_c);
+
+        let ev_b = make_test_event(5, &[id_c.clone()]);
+        let id_b = ev_b.id();
+        retriever.add_event(ev_b);
+
+        let ev_s = make_test_event(6, &[id_a.clone(), id_b.clone()]);
+        let id_s = ev_s.id();
+        retriever.add_event(ev_s);
+
+        let subject = clock!(id_s);
+        let comparison = clock!(id_n, id_d); // two concurrent tips
+
+        let result = compare(retriever, &subject, &comparison, 100).await.unwrap();
+
+        match &result.relation {
+            AbstractCausalRelation::DivergedSince { meet, .. } => {
+                assert_eq!(meet, &vec![id_n.clone()], "meet should be exactly [N]");
+            }
+            other => panic!(
+                "S does NOT descend from concurrent tip D; expected DivergedSince {{ meet: [N] }} but got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// CLAIM B: heads are removed from `outstanding_heads` only at the moment a
+    /// node FIRST becomes common, using the origins known at that moment. Here
+    /// C2's origin reaches M one step later (via X), so C2 stays outstanding
+    /// forever and check_result forces DivergedSince { meet: [] } even though
+    /// the meet is plainly {M}.
+    ///
+    /// DAG: C1 -> M;  C2 -> X -> M;  S -> M;  M is root.
+    /// Subject = {S}, comparison = {C1, C2}. Correct: DivergedSince meet [M].
+    #[tokio::test]
+    #[ignore = "V2: red until remediation A2 (origin retirement), see specs/concurrent-updates/remediation-2026-07.md"]
+    async fn late_origin_propagation_yields_empty_meet() {
+        let mut retriever = MockRetriever::new();
+
+        let ev_m = make_test_event(1, &[]);
+        let id_m = ev_m.id();
+        retriever.add_event(ev_m);
+
+        let ev_c1 = make_test_event(2, &[id_m.clone()]);
+        let id_c1 = ev_c1.id();
+        retriever.add_event(ev_c1);
+
+        let ev_x = make_test_event(3, &[id_m.clone()]);
+        let id_x = ev_x.id();
+        retriever.add_event(ev_x);
+
+        let ev_c2 = make_test_event(4, &[id_x.clone()]);
+        let id_c2 = ev_c2.id();
+        retriever.add_event(ev_c2);
+
+        let ev_s = make_test_event(5, &[id_m.clone()]);
+        let id_s = ev_s.id();
+        retriever.add_event(ev_s);
+
+        let subject = clock!(id_s);
+        let comparison = clock!(id_c1, id_c2);
+
+        let result = compare(retriever, &subject, &comparison, 100).await.unwrap();
+
+        match &result.relation {
+            AbstractCausalRelation::DivergedSince { meet, .. } => {
+                assert_eq!(
+                    meet,
+                    &vec![id_m.clone()],
+                    "meet should be [M]; an empty meet makes entity.rs re-layer from genesis and skips head tip removal"
+                );
+            }
+            other => panic!("expected DivergedSince {{ meet: [M] }}, got {:?}", other),
+        }
+    }
+}
+
+// ============================================================================
+// QUICK-CHECK SUBSET ACCEPTS DISJOINT EXTRA ROOT (adversarial verification)
+// ============================================================================
+
+#[cfg(test)]
+mod quick_check_disjoint_verify {
+    use super::*;
+
+    /// CLAIM 1: the quick-check in comparison.rs (~L100) returns StrictDescends
+    /// whenever `comparison_set.is_subset(&all_parents)`, where `all_parents` is
+    /// the union of the parents of every subject head event. A subject head that
+    /// carries an EXTRA, DISJOINT genesis root X contributes nothing to
+    /// all_parents (X has no parents), so the subset test still passes on the
+    /// strength of the *other* subject event and StrictDescends is returned even
+    /// though X's ancestry is entirely disjoint from the comparison clock.
+    ///
+    /// DAG (parents point right):  A (root);  B -> A;  X (independent root)
+    /// Subject (new head) = {B, X};  comparison (current head) = {A}.
+    /// B alone descends from A, but X shares no ancestry with A, so the correct
+    /// relation is NOT StrictDescends — it must be Diverged/Disjoint so that
+    /// entity.rs does not wholesale-replace head with {B, X} and silently adopt
+    /// X's disjoint lineage.
+    #[tokio::test]
+    #[ignore = "V3: red until remediation A3 (quick-check guard), see specs/concurrent-updates/remediation-2026-07.md"]
+    async fn test_quick_check_disjoint_extra_root() {
+        let mut retriever = MockRetriever::new();
+
+        // A: genesis root of the comparison lineage
+        let ev_a = make_test_event(1, &[]);
+        let id_a = ev_a.id();
+        retriever.add_event(ev_a);
+
+        // B: child of A (this is the part that genuinely descends)
+        let ev_b = make_test_event(2, &[id_a.clone()]);
+        let id_b = ev_b.id();
+        retriever.add_event(ev_b);
+
+        // X: an INDEPENDENT genesis root, no parents, unrelated to A
+        let ev_x = make_test_event(3, &[]);
+        let id_x = ev_x.id();
+        retriever.add_event(ev_x);
+
+        let subject = clock!(id_b, id_x); // new head carries a disjoint extra root
+        let comparison = clock!(id_a); // current head
+
+        let result = compare(retriever, &subject, &comparison, 100).await.unwrap();
+
+        // The bug: quick-check returns StrictDescends. Assert it does NOT.
+        assert!(
+            !matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }),
+            "subject {{B, X}} contains disjoint root X; must not be StrictDescends over {{A}}, got {:?}",
+            result.relation
+        );
+    }
+}
+
+/// Adversarial verification: does the StrictDescends "gap-jump" in entity.rs
+/// (`apply_event`, ~L300) apply ONLY the incoming event's operations and jump
+/// the head, silently skipping intermediate ancestor events that were never
+/// individually applied?
+#[cfg(test)]
+mod strict_descends_gap_jump {
+    use super::*;
+    use crate::entity::Entity;
+    use crate::property::backend::lww::LWWBackend;
+    use crate::property::backend::PropertyBackend;
+
+    /// Like make_lww_event but with an explicit parent clock.
+    fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
+        let mut event = make_lww_event(seed, properties);
+        event.parent = Clock::from(parent_ids.to_vec());
+        event
+    }
+
+    /// Read a committed LWW property value out of the entity's serialized state.
+    fn read_lww(entity: &Entity, prop: &str) -> Option<Value> {
+        let state = entity.to_state().unwrap();
+        let buf = state.state_buffers.0.get("lww")?;
+        let backend = LWWBackend::from_state_buffer(buf).unwrap();
+        backend.get(&prop.into())
+    }
+
+    #[tokio::test]
+    #[ignore = "V4: red until remediation B (topological bridge apply), see specs/concurrent-updates/remediation-2026-07.md"]
+    async fn test_strict_descends_gap_jump_skips_ancestor_ops() {
+        let mut entity_id_bytes = [0u8; 16];
+        entity_id_bytes[0] = 42;
+        let entity_id = EntityId::from_bytes(entity_id_bytes);
+        let entity = Entity::create(entity_id, "test".into());
+
+        let mut retriever = MockRetriever::new();
+
+        // A: genesis create event (empty parent). Establishes head {A}.
+        let ev_a = make_lww_event_with_parent(1, vec![("p0", "genesis")], &[]);
+        let id_a = ev_a.id();
+        retriever.add_event(ev_a.clone());
+        assert!(ev_a.is_entity_create(), "A must be a creation event");
+
+        // X: child of A, writes p1. This is the intermediate ancestor.
+        let ev_x = make_lww_event_with_parent(2, vec![("p1", "written_by_X")], &[id_a.clone()]);
+        let id_x = ev_x.id();
+        retriever.add_event(ev_x.clone());
+
+        // B: child of X, writes p2. B descends A through X.
+        let ev_b = make_lww_event_with_parent(3, vec![("p2", "written_by_B")], &[id_x.clone()]);
+        let id_b = ev_b.id();
+        retriever.add_event(ev_b.clone());
+
+        // Establish local head = {A}.
+        assert!(entity.apply_event(&retriever, &ev_a).await.unwrap(), "A should apply");
+        assert_eq!(entity.head(), Clock::from(vec![id_a.clone()]));
+        assert_eq!(read_lww(&entity, "p0"), Some(Value::String("genesis".into())));
+
+        // Bridge delivers [X, B] but node_applier stages ALL upfront (add_event here
+        // simulates staging) then applies in received order. The separately-confirmed
+        // non-topological-sort bug means B can be applied before X. Apply B FIRST.
+        let applied_b = entity.apply_event(&retriever, &ev_b).await.unwrap();
+        assert!(applied_b, "B should apply (StrictDescends over head {{A}})");
+        // Gap-jump: head jumped straight to {B}, skipping X.
+        assert_eq!(entity.head(), Clock::from(vec![id_b.clone()]), "head gap-jumped to B");
+
+        // Apply X next. head {B} already descends X -> StrictAscends -> Ok(false) no-op.
+        let applied_x = entity.apply_event(&retriever, &ev_x).await.unwrap();
+        assert!(!applied_x, "X is now history relative to head {{B}} -> no-op (StrictAscends)");
+
+        // Final state check. head {B} implies X is in history, so p1 (X's only write)
+        // MUST be present in entity state for consistency.
+        let p2 = read_lww(&entity, "p2");
+        let p1 = read_lww(&entity, "p1");
+
+        assert_eq!(p2, Some(Value::String("written_by_B".into())), "B's op (p2) applied");
+
+        // THE BUG: p1 is missing. X's operations were never applied to the backend,
+        // yet head {B} claims X is part of history. On a durable node this wrong
+        // state is persisted via set_state and served to peers as canonical.
+        assert_eq!(
+            p1,
+            Some(Value::String("written_by_X".into())),
+            "CONSISTENCY VIOLATION: head descends X but X's write (p1) is missing. \
+             StrictDescends gap-jump applied only B's ops and skipped intermediate ancestor X. p1={p1:?}"
+        );
     }
 }
