@@ -60,8 +60,10 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
       The chain caveat lives under the comparison outcomes table (contents duplicate-free, order not topological, consumers must not use it as application order). The corrected bridge-ordering statement lives in retrieval.md's EventBridge paragraph (receiver-side topological sort; wire order untrusted), since event-dag.md had no bridge-ordering claim to correct.
 - [x] Update `implementation-resume.md` / `implementation-status.md` headers to reference the July verification and this tracker.
       Both marked SUPERSEDED as status documents with pointers to the July verification, fix plan, and this tracker; the resume's Critical Invariants section remains flagged authoritative. Pre-existing February em dashes in those two documents were left as-is (historical content, not new prose).
-- [ ] Validation: all five verification tests green (zero ignores from this effort); `cargo test` default members; jwt-auth suite; `cargo check -p ankurah-core --features wasm` (isolated); fmt + taplo.
-- [ ] Merge prep: PR #201 description refresh (no em dashes); version rides the 0.9.0 chain.
+- [x] Validation: all five verification tests green (zero ignores from this effort); `cargo test` default members; jwt-auth suite; `cargo check -p ankurah-core --features wasm` (isolated); fmt + taplo.
+      2026-07-03: default members 658 passed / 0 failed; jwt-auth 88 passed; core lib 186 passed with only the pre-existing toctou ignore; wasm isolated check clean (pre-existing unused-import warnings only); fmt and taplo checks clean; CI green on all pushed commits including wasm browser tests.
+- [x] Merge prep: PR #201 description refresh (no em dashes); version rides the 0.9.0 chain.
+      Posted 2026-07-03: reflects the 0.8.1 rebase, the July verification and remediation (V1-V7 summaries), current test counts, and the 0.9.0 chain note. Scanned for em dashes before posting. Merge-commit shaping (squash or two-commit) is the maintainer's call at merge time.
 
 ## After merge (tracked elsewhere)
 
