@@ -280,8 +280,12 @@ impl NodeApplier {
                 // Get or create entity
                 let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &delta.collection, &delta.entity_id).await?;
 
-                // Apply events in forward (causal) order - oldest first
-                // Events in EventBridge are already in causal order from the server
+                // Apply events parents-first. Wire order is untrusted: applying
+                // a child before its staged parent gap-jumps the head past the
+                // parent, whose operations are then dropped as StrictAscends
+                // (V4). The producer also sorts, but receivers must not rely
+                // on sender ordering.
+                let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
                 for event in attested_events.into_iter() {
                     entity.apply_event(event_getter, &event.payload).await?;
                     event_getter.commit_event(&event).await?;

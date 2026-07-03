@@ -27,11 +27,13 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
 
 ## Cluster B: application ordering
 
-- [ ] **B1 (V4, CRITICAL): receiver-side topological sort of EventBridge application.**
+- [x] **B1 (V4, CRITICAL): receiver-side topological sort of EventBridge application.**
       Kahn's over the staged bridge set in node_applier; cycle detection bails to the existing error path. Fix the false "already in causal order" comment.
       Test to un-ignore: `strict_descends_gap_jump::test_strict_descends_gap_jump_skips_ancestor_ops`.
       Additional test: uneven-diamond bridge `[X,P,H2,H1]` end-to-end via EventBridge delivery.
-- [ ] **B2 (hygiene): producer-side sort in `collect_event_bridge`.**
+      NOTE on the test seam: the committed red test simulated the bridge bug by applying child-before-parent directly on the entity, which pins B3 (the entity-level gap-replay defense, explicitly a follow-up), not B1. Core cannot construct a Node (dev-dependency cycle), so per the fix plan's fallback the test was reworked to drive the receiver-side sequence (stage all, topo-sort via the new `event_dag::ordering::topo_sort_events`, apply in order) and verified to fail at three layers with the sort disabled. End-to-end coverage: `inter_node::test_event_bridge_uneven_diamond` builds the X -> P -> {H1, H2} shape across three real nodes and asserts P's write survives bridge application plus all four bridge events durably present on the receiver (proving the bridge path served the fetch, not a snapshot fallback). Note the even diamond's wire order is coincidentally valid either way; the unit test carries the old-code discrimination.
+- [x] **B2 (hygiene): producer-side sort in `collect_event_bridge`.**
+      Same `topo_sort_events` on the produced batch, replacing the discovery-order reverse. Receivers still sort independently.
 - [ ] **B3 (follow-up issue, do not implement now): StrictDescends gap-replay defense in entity.rs.**
       Blocked on chain trustworthiness (delivered by A1). File issue on merge.
 

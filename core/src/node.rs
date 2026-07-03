@@ -707,8 +707,11 @@ where
                     }
                 }
 
-                // Reverse to get oldest-first order
-                events.reverse();
+                // Backward BFS discovery order is not a causal order (uneven
+                // branch lengths interleave); sort parents-first so the wire
+                // carries a sane order. Receivers sort again and must not
+                // trust this.
+                let events = crate::event_dag::ordering::topo_sort_events(events)?;
                 Ok(events)
             }
             _ => {

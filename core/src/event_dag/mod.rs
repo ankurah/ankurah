@@ -8,6 +8,7 @@ pub(crate) mod accumulator;
 pub(crate) mod comparison;
 pub(crate) mod frontier;
 pub(crate) mod layers;
+pub(crate) mod ordering;
 pub(crate) mod relation;
 #[cfg(test)]
 mod tests;

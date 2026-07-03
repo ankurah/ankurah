@@ -2621,16 +2621,22 @@ mod quick_check_disjoint_verify {
     }
 }
 
-/// Adversarial verification: does the StrictDescends "gap-jump" in entity.rs
-/// (`apply_event`, ~L300) apply ONLY the incoming event's operations and jump
-/// the head, silently skipping intermediate ancestor events that were never
-/// individually applied?
+/// V4: the StrictDescends "gap-jump" in entity.rs applies ONLY the incoming
+/// event's operations and jumps the head, so a bridge batch applied out of
+/// causal order silently loses the skipped ancestors' operations. The
+/// remediation defense is ordering: batches are topologically sorted
+/// (parents first) before application on both the producer and receiver
+/// sides. The entity-level defense (replaying staged-but-unapplied ancestors
+/// inside the StrictDescends arm) is deliberately NOT part of this
+/// remediation; it is the B3 follow-up issue.
 #[cfg(test)]
 mod strict_descends_gap_jump {
     use super::*;
     use crate::entity::Entity;
+    use crate::event_dag::ordering::topo_sort_events;
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
+    use ankurah_proto::Attested;
 
     /// Like make_lww_event but with an explicit parent clock.
     fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
@@ -2647,8 +2653,15 @@ mod strict_descends_gap_jump {
         backend.get(&prop.into())
     }
 
+    /// A bridge delivering [B, X] child-first must not lose X's operations.
+    /// This drives the receiver-side sequence at the unit level: stage the
+    /// whole batch (add_event simulates staging), topologically sort, apply
+    /// in sorted order. Without the sort, applying B first compares
+    /// StrictDescends over head {A} (its ancestry resolves via staging), the
+    /// head gap-jumps to {B}, and X's ops are then dropped as StrictAscends:
+    /// p1 goes missing while head {B} claims X is history. On a durable node
+    /// that wrong state is persisted via set_state and served as canonical.
     #[tokio::test]
-    #[ignore = "V4: red until remediation B (topological bridge apply), see specs/concurrent-updates/remediation-2026-07.md"]
     async fn test_strict_descends_gap_jump_skips_ancestor_ops() {
         let mut entity_id_bytes = [0u8; 16];
         entity_id_bytes[0] = 42;
@@ -2678,33 +2691,26 @@ mod strict_descends_gap_jump {
         assert_eq!(entity.head(), Clock::from(vec![id_a.clone()]));
         assert_eq!(read_lww(&entity, "p0"), Some(Value::String("genesis".into())));
 
-        // Bridge delivers [X, B] but node_applier stages ALL upfront (add_event here
-        // simulates staging) then applies in received order. The separately-confirmed
-        // non-topological-sort bug means B can be applied before X. Apply B FIRST.
-        let applied_b = entity.apply_event(&retriever, &ev_b).await.unwrap();
-        assert!(applied_b, "B should apply (StrictDescends over head {{A}})");
-        // Gap-jump: head jumped straight to {B}, skipping X.
-        assert_eq!(entity.head(), Clock::from(vec![id_b.clone()]), "head gap-jumped to B");
+        // The wire delivers child B before its parent X.
+        let batch = vec![Attested::opt(ev_b.clone(), None), Attested::opt(ev_x.clone(), None)];
+        let sorted = topo_sort_events(batch).unwrap();
+        let sorted_ids: Vec<EventId> = sorted.iter().map(|e| e.payload.id()).collect();
+        assert_eq!(sorted_ids, vec![id_x.clone(), id_b.clone()], "sort must place parent X before child B");
 
-        // Apply X next. head {B} already descends X -> StrictAscends -> Ok(false) no-op.
-        let applied_x = entity.apply_event(&retriever, &ev_x).await.unwrap();
-        assert!(!applied_x, "X is now history relative to head {{B}} -> no-op (StrictAscends)");
+        for event in &sorted {
+            assert!(entity.apply_event(&retriever, &event.payload).await.unwrap(), "each event applies in causal order");
+        }
 
-        // Final state check. head {B} implies X is in history, so p1 (X's only write)
-        // MUST be present in entity state for consistency.
-        let p2 = read_lww(&entity, "p2");
+        assert_eq!(entity.head(), Clock::from(vec![id_b.clone()]), "head advanced to B");
+        assert_eq!(read_lww(&entity, "p2"), Some(Value::String("written_by_B".into())), "B's op (p2) applied");
+
+        // The V4 loss: without ordered application, p1 is missing while head
+        // {B} claims X is part of history.
         let p1 = read_lww(&entity, "p1");
-
-        assert_eq!(p2, Some(Value::String("written_by_B".into())), "B's op (p2) applied");
-
-        // THE BUG: p1 is missing. X's operations were never applied to the backend,
-        // yet head {B} claims X is part of history. On a durable node this wrong
-        // state is persisted via set_state and served to peers as canonical.
         assert_eq!(
             p1,
             Some(Value::String("written_by_X".into())),
-            "CONSISTENCY VIOLATION: head descends X but X's write (p1) is missing. \
-             StrictDescends gap-jump applied only B's ops and skipped intermediate ancestor X. p1={p1:?}"
+            "CONSISTENCY VIOLATION: head descends X but X's write (p1) is missing. p1={p1:?}"
         );
     }
 }
