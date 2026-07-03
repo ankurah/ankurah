@@ -65,7 +65,7 @@ for how property backends consume these layers.
 
 The comparison algorithm (`core/src/event_dag/comparison.rs`) determines the
 causal relationship between a subject clock and a comparison clock. There are
-five possible outcomes:
+six possible outcomes:
 
 | Outcome | Meaning | Action |
 |---------|---------|--------|
@@ -74,9 +74,13 @@ five possible outcomes:
 | StrictAscends | Subject is strictly older | No-op (already integrated) |
 | DivergedSince | Concurrent branches since a meet | Merge via layers |
 | Disjoint | Unrelated histories (different genesis) | Reject |
+| BudgetExceeded | Traversal budget exhausted before a conclusion | Error (see [Budget escalation](#budget-escalation)) |
 
-If the traversal budget is exhausted before reaching a conclusion, the result is
-`BudgetExceeded` (see [Budget escalation](#budget-escalation) below).
+`StrictDescends` carries a `chain` of the events the subject traversal
+visited. Its contents are duplicate-free, but its order is traversal order,
+not guaranteed topological -- consumers must not use it as an application
+order. Batch application paths sort independently (see
+[EventBridge ordering](retrieval.md#staging-vs-permanent-storage)).
 
 ### Quick-check: the linear-extension fast path
 
@@ -118,10 +122,11 @@ correctly terminating traversal at that point. An unfetchable event on only
 ### Budget escalation
 
 The initial budget (default 1000 events) caps each BFS attempt. If exhausted,
-the algorithm internally retries with 4x budget (up to `initial * 4`), reusing
-the accumulated DAG structure and LRU cache as a warm start. This avoids
-re-fetching events on retry and keeps the public API simple -- callers do not
-need to manage retry logic.
+the algorithm internally retries with 4x budget (up to `initial * 4`). The
+traversal itself restarts from the original clocks -- only the accumulator
+(recorded DAG structure and LRU event cache) survives the retry, so re-walked
+steps avoid storage round-trips but still spend budget. The internal retry
+keeps the public API simple -- callers do not need to manage retry logic.
 
 
 ## The Staging Pattern
@@ -229,9 +234,10 @@ The fix: stage the event first, then pass the event's own ID as the subject
 clock. BFS discovers the staged event, traverses its parents naturally, and
 produces the correct `StrictAscends` for re-delivery with no special-case logic.
 
-### Why the `DuplicateCreation` guard was removed
+### Why the `DuplicateCreation` guard was refined
 
-An early guard used `event_stored()` to detect duplicate creation events. On
+An early guard used `event_stored()` unconditionally to detect duplicate
+creation events. On
 [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) this works, but
 on [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes) that
 receive entities via `StateSnapshot`, the creation event is never individually
@@ -239,10 +245,12 @@ committed -- only the entity state referencing it is stored. When the creation
 event later arrives via subscription, `event_stored()` returns `false`,
 misclassifying a legitimate re-delivery as a different genesis.
 
-The guard was removed. `compare()` already handles both cases correctly:
-re-delivery yields `StrictAscends`; different genesis yields `Disjoint`. On
-durable nodes, [`storage_is_definitive()`](retrieval.md#why-three-traits-instead-of-one) restores the
-cheap fast path.
+The unconditional guard was replaced with conditional logic. Where storage is
+definitive ([`storage_is_definitive()`](retrieval.md#why-three-traits-instead-of-one)),
+`event_stored() == true` short-circuits a re-delivery as a no-op and a missing
+event is rejected as a different genesis. Ephemeral nodes fall through to
+`compare()`, which handles both cases correctly: re-delivery yields
+`StrictAscends`; different genesis yields `Disjoint`.
 
 ### Why the retrieval traits were split
 

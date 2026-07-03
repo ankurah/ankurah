@@ -1,8 +1,12 @@
 # EventAccumulator Refactor — Implementation Resume
 
 **Worktree:** `/Users/daniel/ak/ankurah-201` (branch: `concurrent-updates-event-dag`)
-**Date:** 2026-02-10
-**Status:** All code complete. All tests pass. Doc validation done. Code review matrix COMPLETE (8/8 reviewers).
+**Date:** 2026-02-10 (status header updated 2026-07-03)
+**Status:** SUPERSEDED as a status document. The February merge-readiness claim was overturned by
+`verification-review-2026-07.md` (four confirmed bugs, two regressions), and the fixes landed via
+`remediation-2026-07.md` (tracker) / `fix-plan-2026-07.md` (designs). The Critical Invariants section
+below remains authoritative; the review matrix summary reflects February coverage only, which
+under-covered the BFS comparison state machine and cross-event application ordering.
 
 ---
 
@@ -107,17 +111,17 @@ then validated against source code by 7 independent agents. Summary:
 
 ### Doc Fixes Still TODO
 
-- [ ] `retrieval.md`: Add conditional logic to pseudocode (commit only when apply_event returns true; save_state only when events applied)
-- [ ] `retrieval.md`: Change "Used by durable nodes" to "Used for local commits on all node types"
-- [ ] `property-backends.md`: Fix "batch of events in causal order" → "sequence of layers in topological order; each layer contains concurrent events"
-- [ ] `entity-lifecycle.md`: Add event_stored() == true no-op path to Guard 1 description
-- [ ] `entity-lifecycle.md`: Clarify head update is "remove meet ancestors + insert event ID"
-- [ ] `entity-lifecycle.md`: Note StateAndEvent fallback triggers on Older too, not only divergence
-- [ ] `node-architecture.md`: Mention EventOnly variant (valid wire format, handled by receiver)
-- [ ] `node-architecture.md`: Fix "LWW merge resolution" → "event-by-event apply_event with BFS comparison"
-- [ ] `event-dag.md`: Fix "warm start" → only LRU cache survives, BFS restarts from original clocks
-- [ ] `event-dag.md`: Fix "five possible outcomes" → six (including BudgetExceeded)
-- [ ] `event-dag.md`: Change "DuplicateCreation guard removed" → "guard refined/replaced with conditional logic"
+- [x] `retrieval.md`: Add conditional logic to pseudocode (commit only when apply_event returns true; save_state only when events applied)
+- [x] `retrieval.md`: Change "Used by durable nodes" to "Used for local commits on all node types"
+- [x] `property-backends.md`: Fix "batch of events in causal order" → "sequence of layers in topological order; each layer contains concurrent events"
+- [x] `entity-lifecycle.md`: Add event_stored() == true no-op path to Guard 1 description
+- [x] `entity-lifecycle.md`: Clarify head update is "remove meet ancestors + insert event ID"
+- [x] `entity-lifecycle.md`: Note StateAndEvent fallback triggers on Older too, not only divergence
+- [x] `node-architecture.md`: Mention EventOnly variant (valid wire format, handled by receiver)
+- [x] `node-architecture.md`: Fix "LWW merge resolution" → "event-by-event apply_event with BFS comparison"
+- [x] `event-dag.md`: Fix "warm start" → only LRU cache survives, BFS restarts from original clocks
+- [x] `event-dag.md`: Fix "five possible outcomes" → six (including BudgetExceeded)
+- [x] `event-dag.md`: Change "DuplicateCreation guard removed" → "guard refined/replaced with conditional logic"
 
 ---
 

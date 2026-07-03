@@ -45,13 +45,16 @@ but they serve different moments in the lifecycle.
 ### Streaming updates (`UpdateContent`)
 
 Once an ephemeral node has an active subscription with a durable peer, the
-durable node pushes changes as they happen. Each update carries the new entity
-state plus the events that produced it. On the receiving side the node
-validates the state, integrates the events via
+durable node pushes changes as they happen. An update item carries either the
+events alone (`EventOnly`, when the sender expects the receiver to already
+have the state) or the new entity state plus the events that produced it
+(`StateAndEvent`). `EventOnly` is a valid wire format handled by the
+receiver, though current senders always include state. On the receiving side
+the node validates the state, integrates the events via
 [`apply_event`](entity-lifecycle.md#apply_event-in-detail), and persists the
-result. If the incoming state diverges from what the receiver already has, the
-receiver falls back to per-event application with
-[LWW merge resolution](lww-merge.md).
+result. If the incoming state diverges from what the receiver already has,
+the receiver falls back to event-by-event `apply_event` with
+[BFS comparison](event-dag.md#comparing-two-clocks).
 
 ### Request/response deltas (`DeltaContent`)
 

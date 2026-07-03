@@ -117,9 +117,10 @@ events and empty heads:
 
 1. **Creation event on a non-empty head.** On
    [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) where
-   storage is definitive, a not-yet-stored event proves different genesis --
-   reject as `Disjoint`. On ephemeral nodes, fall through to BFS which
-   distinguishes re-delivery from different genesis.
+   storage is definitive, `event_stored() == true` identifies a re-delivery --
+   no-op, while a not-yet-stored event proves different genesis -- reject as
+   `Disjoint`. On ephemeral nodes, fall through to BFS which distinguishes
+   re-delivery from different genesis.
 
 2. **Creation event on an empty head.** Acquire the write lock, re-check that
    the head is still empty (TOCTOU protection), apply operations, set the head.
@@ -140,7 +141,7 @@ and acts on the [`causal relation`](event-dag.md#core-concepts):
 | `Equal` | Already integrated -- no-op |
 | `StrictDescends` | Direct descendant -- apply operations, advance head |
 | `StrictAscends` | Event is older than current state -- no-op |
-| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#core-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), update head to reflect both tips |
+| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#core-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), update head (remove meet ancestors, insert the event id) so it reflects both tips |
 | `Disjoint` | Different lineage -- error |
 | `BudgetExceeded` | DAG traversal too deep -- error |
 
@@ -238,6 +239,7 @@ This gives clean crash recovery semantics:
    staged (discoverable by BFS) before `apply_event` is called. Events must be
    committed to storage before entity state referencing them is persisted.
 
-6. **StateAndEvent divergence fallback.** When `apply_state` returns
-   `DivergedRequiresEvents`, the applier falls back to event-by-event
-   application. Events are never silently dropped on divergence.
+6. **StateAndEvent divergence fallback.** When `apply_state` does not apply
+   the incoming state (divergence, or the state is older than what the
+   receiver has), the applier falls back to event-by-event application.
+   Events are never silently dropped on divergence.

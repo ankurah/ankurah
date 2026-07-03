@@ -61,9 +61,9 @@ persisting incomplete state.
 ### Conflict resolution
 
 When [concurrent branches merge](entity-lifecycle.md#apply_event-in-detail),
-the entity feeds each backend an `EventLayer` -- a batch of events in causal
-order. For each layer the LWW backend must choose a single winning value per
-property. The full algorithm is described in
+the entity feeds each backend a sequence of `EventLayer`s in topological
+order; each layer contains concurrent events. For each layer the LWW backend
+must choose a single winning value per property. The full algorithm is described in
 [LWW Resolution Rules](lww-merge.md#lww-resolution-rules); the conceptual
 steps are:
 

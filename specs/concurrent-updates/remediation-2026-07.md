@@ -55,9 +55,11 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
 
 ## Docs and validation gate
 
-- [ ] The 11 doc fixes itemized in `implementation-resume.md` (Doc Fixes Still TODO).
-- [ ] event-dag.md: chain reliability caveat; corrected bridge-ordering statement.
-- [ ] Update `implementation-resume.md` / `implementation-status.md` headers to reference the July verification and this tracker.
+- [x] The 11 doc fixes itemized in `implementation-resume.md` (Doc Fixes Still TODO).
+- [x] event-dag.md: chain reliability caveat; corrected bridge-ordering statement.
+      The chain caveat lives under the comparison outcomes table (contents duplicate-free, order not topological, consumers must not use it as application order). The corrected bridge-ordering statement lives in retrieval.md's EventBridge paragraph (receiver-side topological sort; wire order untrusted), since event-dag.md had no bridge-ordering claim to correct.
+- [x] Update `implementation-resume.md` / `implementation-status.md` headers to reference the July verification and this tracker.
+      Both marked SUPERSEDED as status documents with pointers to the July verification, fix plan, and this tracker; the resume's Critical Invariants section remains flagged authoritative. Pre-existing February em dashes in those two documents were left as-is (historical content, not new prose).
 - [ ] Validation: all five verification tests green (zero ignores from this effort); `cargo test` default members; jwt-auth suite; `cargo check -p ankurah-core --features wasm` (isolated); fmt + taplo.
 - [ ] Merge prep: PR #201 description refresh (no em dashes); version rides the 0.9.0 chain.
 

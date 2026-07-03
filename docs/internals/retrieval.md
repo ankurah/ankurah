@@ -65,7 +65,7 @@ without their individual events being stored.
 The two concrete implementations of the retrieval traits differ in how far
 they search for a missing event:
 
-**`LocalEventGetter`** -- Used by [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes).
+**`LocalEventGetter`** -- Used for local commits on all node types.
 Checks the staging map, then local storage. If the event is not found
 locally, that is a hard error. Sets `storage_is_definitive` based on the
 `durable` flag passed at construction.
@@ -94,10 +94,11 @@ for each event:
 entity = get_or_create(...)
 
 for each attested_event:
-    entity.apply_event(event_getter, &event)   // (2) compare + apply in memory
-    event_getter.commit_event(&attested_event)  // (3) commit to disk
+    if entity.apply_event(event_getter, &event) // (2) compare + apply in memory
+        event_getter.commit_event(&attested_event) // (3) commit to disk
 
-save_state(entity)                             // (4) persist entity state
+if any event applied:
+    save_state(entity)                         // (4) persist entity state
 ```
 
 For `StateAndEvent` content, the flow first tries
@@ -108,8 +109,11 @@ state diverges, it falls back to per-event
 `commit_event`, then saves state.
 
 For `EventBridge` (in `apply_delta`), all events are staged upfront, then
-applied and committed in causal order (oldest first), and finally the entity
-state is saved.
+topologically sorted (parents first) by the receiver before being applied and
+committed, and finally the entity state is saved. The producer also sorts what
+it sends, but wire order is untrusted: applying a child before its staged
+parent would jump the head past the parent and silently drop the parent's
+operations.
 
 
 ## Crash Safety

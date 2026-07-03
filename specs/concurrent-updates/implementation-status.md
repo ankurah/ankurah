@@ -1,7 +1,13 @@
 # Concurrent Updates: Implementation Status
 
 **Branch:** `concurrent-updates-event-dag`
-**Date:** 2026-01-05
+**Date:** 2026-01-05 (status header updated 2026-07-03)
+
+> **SUPERSEDED as a status document.** Kept as a design/history record. For current state see
+> `verification-review-2026-07.md` (verified findings), `fix-plan-2026-07.md` (fix designs), and
+> `remediation-2026-07.md` (execution tracker). The January "critical bug" below was fixed on this
+> branch; the July verification found and fixed four further bugs in the comparison state machine
+> and application ordering.
 
 ---
 
