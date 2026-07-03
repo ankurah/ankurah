@@ -92,3 +92,37 @@ overlapping the verification review's hardening list are marked (H-n).
     re-checking frontier membership per id works but obscures the
     both-frontiers case; draining per frontier deterministically would
     remove the mid-loop skip and clarify processing order.
+
+## Additions from the 2026-07-03 diff-weight audit
+
+Parallel audits over the full branch diff (three primary agents plus
+slices) confirmed proto/, the manifests, and the bulk of core/ carry no
+churn. Safe trims were applied directly on the PR branch (dead
+re-exports, an uncalled accumulator method, duplicated test helper,
+subsumed and duplicate tests, debug leftovers; see commit "Trim diff
+weight found by the readability audit"). Items needing judgment or
+deferred to this pass:
+
+19. **EventLayer visibility leak.** `PropertyBackend::apply_layer` is a
+    pub trait method taking `&EventLayer`, but `EventLayer` is
+    pub(crate); the compiler warns private_interfaces at the trait and
+    both impls. Decide: make EventLayer (and enough of its surface)
+    genuinely public so external crates can implement PropertyBackend,
+    or narrow the trait's reachability.
+20. **ValueEntry::Pending is behaviorally inert.** Constructed in two
+    places but value()/event_id() fold it into the same arms as
+    Uncommitted/Committed, so it acts as a rename. Confirm whether it
+    is scaffolding for offline writes (#252) or collapse the enum.
+21. **Notification-loop duplication.** The lock-broadcasts/iterate/send
+    loop appears four times across lww.rs and yrs.rs; extract a helper
+    taking an iterator of PropertyName.
+22. **node_applier validate+stage loop duplicated** verbatim in the
+    EventOnly and StateAndEvent arms (the branch deleted the shared
+    save_events helper); re-extract, which also unifies partial-progress
+    semantics.
+23. **transaction.rs commit wrappers** (js/native/uniffi) triplicate a
+    two-line body discarding commit_local_trx's Vec<Event>; consider one
+    inner fn.
+24. **False positive to remember:** the `use std::collections::HashMap`
+    inside the assert_dag! macro body is load-bearing (macro_export
+    expands at call sites in other files); do not "clean" it.
