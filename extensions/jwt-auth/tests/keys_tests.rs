@@ -9,6 +9,9 @@ use jwt_simple::prelude::Duration;
 
 #[test]
 fn test_sign_and_verify() {
+    // The one real keygen in the suite: every other test uses the committed
+    // fixture keys (common::test_keys) to keep CI fast, so this test keeps
+    // SigningKeys::generate() itself covered end to end.
     let keys = SigningKeys::generate().unwrap();
     let claims = JwtClaims {
         sub: "user-123".into(),
@@ -27,7 +30,7 @@ fn test_sign_and_verify() {
 
 #[test]
 fn test_sign_and_verify_no_name() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let claims = JwtClaims {
         sub: "user-456".into(),
         roles: vec!["Reader".into()],
@@ -44,8 +47,8 @@ fn test_sign_and_verify_no_name() {
 
 #[test]
 fn test_verify_wrong_key_fails() {
-    let keys1 = SigningKeys::generate().unwrap();
-    let keys2 = SigningKeys::generate().unwrap();
+    let keys1 = common::test_keys();
+    let keys2 = common::test_keys_alt();
     let claims = JwtClaims {
         sub: "user-123".into(),
         roles: vec!["Admin".into()],
@@ -59,14 +62,14 @@ fn test_verify_wrong_key_fails() {
 
 #[test]
 fn test_verify_garbage_token_fails() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     assert!(keys.verify("not.a.jwt").is_err());
     assert!(keys.verify("").is_err());
 }
 
 #[test]
 fn test_public_key_pem_export() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let pem = keys.public_key_pem().unwrap();
     assert!(pem.contains("BEGIN PUBLIC KEY"));
     assert!(pem.contains("END PUBLIC KEY"));
@@ -78,7 +81,7 @@ fn test_public_key_pem_export() {
 
 #[test]
 fn test_jwt_keys_verify_only() {
-    let signing_keys = SigningKeys::generate().unwrap();
+    let signing_keys = common::test_keys();
     let public_pem = signing_keys.public_key_pem().unwrap();
     let verify_keys = JwtKeys::from_public_pem(&public_pem).unwrap();
 
@@ -99,7 +102,7 @@ fn test_jwt_keys_verify_only() {
 
 #[test]
 fn test_jwt_keys_signing_variant_verify() {
-    let signing_keys = SigningKeys::generate().unwrap();
+    let signing_keys = common::test_keys();
     let jwt_keys = JwtKeys::Signing(signing_keys.clone());
 
     let claims = JwtClaims {
@@ -116,7 +119,7 @@ fn test_jwt_keys_signing_variant_verify() {
 
 #[test]
 fn test_jwt_keys_public_key_pem() {
-    let signing_keys = SigningKeys::generate().unwrap();
+    let signing_keys = common::test_keys();
     let jwt_keys = JwtKeys::Signing(signing_keys.clone());
     let pem = jwt_keys.public_key_pem().unwrap();
     assert!(pem.contains("BEGIN PUBLIC KEY"));
@@ -141,7 +144,7 @@ fn test_ephemeral_agent_starts_with_no_keys() {
 #[test]
 fn test_ephemeral_agent_set_keys() {
     let agent = JwtAgent::new_ephemeral();
-    let signing_keys = SigningKeys::generate().unwrap();
+    let signing_keys = common::test_keys();
     agent.set_keys(JwtKeys::Signing(signing_keys.clone()));
     assert!(agent.signing_keys().is_some());
 }
@@ -152,7 +155,7 @@ fn test_ephemeral_agent_set_keys() {
 
 #[test]
 fn test_parse_claims_unverified() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let claims = JwtClaims {
         sub: "user-77".into(),
         roles: vec!["Admin".into(), "Editor".into()],
@@ -171,7 +174,7 @@ fn test_parse_claims_unverified() {
 
 #[test]
 fn test_parse_claims_unverified_no_name() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let claims = JwtClaims {
         sub: "user-88".into(),
         roles: vec!["Reader".into()],

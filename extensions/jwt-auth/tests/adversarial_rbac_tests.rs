@@ -2,7 +2,7 @@ mod common;
 
 use ankurah::Model;
 use ankurah::Node;
-use ankurah_jwt_auth::{JwtAgent, JwtContext, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtContext};
 use ankurah_proto::CollectionId;
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, load_blog_config, make_claims, sign_token};
@@ -23,7 +23,7 @@ pub struct Post {
 async fn test_reader_cannot_write_post_via_ephemeral() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
@@ -51,7 +51,7 @@ async fn test_reader_cannot_write_post_via_ephemeral() -> anyhow::Result<()> {
 async fn test_reader_cannot_write_to_user_collection() -> anyhow::Result<()> {
     use ankurah_core::policy::PolicyAgent;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let reader_claims = make_claims("reader-user-attack", &["Reader"], "reader@attack.com");
@@ -78,7 +78,7 @@ async fn test_reader_cannot_write_to_user_collection() -> anyhow::Result<()> {
 /// A NoUser context (unauthenticated) attempts to write to any collection.
 #[tokio::test]
 async fn test_nouser_cannot_write_anything() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
@@ -103,7 +103,7 @@ async fn test_nouser_cannot_write_anything() -> anyhow::Result<()> {
 async fn test_root_context_cannot_be_sent_over_wire() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
@@ -136,7 +136,7 @@ async fn test_root_context_cannot_be_sent_over_wire() -> anyhow::Result<()> {
 async fn test_non_privileged_cannot_write_jwtpolicy() -> anyhow::Result<()> {
     use ankurah_jwt_auth::JwtPolicy;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
@@ -172,7 +172,7 @@ async fn test_non_privileged_cannot_write_jwtpolicy() -> anyhow::Result<()> {
 async fn test_nouser_can_read_jwtpolicy_but_not_other_collections() -> anyhow::Result<()> {
     use ankurah_core::policy::PolicyAgent;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys, blog_config_path())?;
 
     let nouser = JwtContext::NoUser;

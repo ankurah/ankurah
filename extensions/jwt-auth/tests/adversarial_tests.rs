@@ -2,7 +2,7 @@ mod common;
 
 use ankurah::Model;
 use ankurah::Node;
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext};
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, make_claims};
 use jwt_simple::prelude::Duration;
@@ -23,8 +23,8 @@ pub struct Post {
 async fn test_server_rejects_wrongly_signed_token() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
 
-    let server_keys = SigningKeys::generate()?;
-    let attacker_keys = SigningKeys::generate()?;
+    let server_keys = common::test_keys();
+    let attacker_keys = common::test_keys_alt();
     let agent = JwtAgent::new_durable(server_keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
@@ -59,7 +59,7 @@ async fn test_server_rejects_wrongly_signed_token() -> anyhow::Result<()> {
 /// Verify that expired tokens are correctly rejected with strict time tolerance.
 #[tokio::test]
 async fn test_server_rejects_expired_token() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
 
     let claims = make_claims("expired-user", &["Editor"], "expired@blog.com");
     let short_lived_token = keys.sign(&claims, Duration::from_millis(1))?;
@@ -83,7 +83,7 @@ async fn test_server_rejects_expired_token() -> anyhow::Result<()> {
 async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
     use ankurah_core::policy::PolicyAgent;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
