@@ -1,6 +1,6 @@
 [package]
 name          = "ankurah-storage-sqlite"
-version       = "0.7.23"
+version       = "0.8.0"
 edition       = "2021"
 description   = "Ankurah storage engine using SQLite"
 license       = "MIT OR Apache-2.0"
@@ -29,13 +29,13 @@ serde       = { version = "1.0", features = ["derive"] }
 serde_json  = "1"
 
 # Ankurah workspace dependencies
-ankql                  = { path = "../../ankql", version = "=0.7.23" }
-ankurah-core           = { path = "../../core", version = "=0.7.23" }
-ankurah-proto          = { path = "../../proto", version = "=0.7.23" }
-ankurah-storage-common = { path = "../common", version = "=0.7.23" }
+ankql                  = { path = "../../ankql", version = "=0.8.0" }
+ankurah-core           = { path = "../../core", version = "=0.8.0" }
+ankurah-proto          = { path = "../../proto", version = "=0.8.0" }
+ankurah-storage-common = { path = "../common", version = "=0.8.0" }
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
-ankurah            = { path = "../../ankurah", version = "=0.7.23", features = ["derive"] }
+ankurah            = { path = "../../ankurah", version = "=0.8.0", features = ["derive"] }
 tracing-subscriber = "0.3"
 ctor               = "0.2"

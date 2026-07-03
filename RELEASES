@@ -1,3 +1,4 @@
+0.8.0   JWT auth extension (ankurah-jwt-auth): configurable RBAC and row-level security; PolicyAgent on_node_ready lifecycle hook; read-policy enforcement on direct gets and subscription initial deltas; EntityLiveQuery::new_weak_node for non-node-retaining subscribers; typed EntityId literals from JS substitution args and jwt scope filters
 0.7.23  Fix task::spawn panic on threads without Tokio runtime context; add set_runtime_handle() for FFI consumers
 0.7.22  UniFFI wrapper type deduplication and Option<Ref<T>> support for React Native bindings
 0.7.21  Calculated signal type for derived computations; fix WASM by_id to not consume EntityId; fix recursive mutex in ResultSet loaded flag; JsValueCalculated error logging with stack traces
