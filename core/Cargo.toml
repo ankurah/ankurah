@@ -15,6 +15,7 @@ wasm = [
     "serde-wasm-bindgen",
     "js-sys",
     "send_wrapper",
+    "ankql/wasm",
     "ankurah-proto/wasm",
     "ankurah-derive",
     "futures-timer/wasm-bindgen",
