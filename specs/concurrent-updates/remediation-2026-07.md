@@ -6,7 +6,7 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
 
 ## Cluster A: comparison.rs bookkeeping
 
-- [ ] **A1 (V1, CRITICAL): per-side visitation and head accounting.**
+- [x] **A1 (V1, CRITICAL): per-side visitation and head accounting.**
       Replace `unseen_comparison_heads`/`unseen_subject_heads` counters with idempotent seen-sets; add per-side processed sets consulted before frontier extension and processing.
       Test to un-ignore: `bfs_revisit_bugs::double_decrement_falsely_reports_strict_descends`.
       Additional tests: mirror false-StrictAscends case; diamond-chain budget test (completes within O(events)).

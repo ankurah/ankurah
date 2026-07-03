@@ -146,12 +146,20 @@ struct Comparison<'a, E: GetEvents> {
     meet_candidates: BTreeSet<EventId>,
     outstanding_heads: BTreeSet<EventId>,
 
+    /// Nodes already expanded from each side. A node reachable by more than one
+    /// path can be re-added to a frontier after it was first processed; these
+    /// sets make expansion idempotent per side so heads are not double-counted
+    /// and budget is spent per-event rather than per-path.
+    subject_processed: BTreeSet<EventId>,
+    comparison_processed: BTreeSet<EventId>,
+
     // Progress tracking
     remaining_budget: usize,
-    /// Count of comparison heads not yet seen by subject's traversal (for StrictDescends)
-    unseen_comparison_heads: usize,
-    /// Count of subject heads not yet seen by comparison's traversal (for StrictAscends)
-    unseen_subject_heads: usize,
+    /// Comparison heads reached by subject's traversal (all seen => StrictDescends).
+    /// A set, not a counter, so revisits cannot decrement the same head twice.
+    seen_comparison_heads: BTreeSet<EventId>,
+    /// Subject heads reached by comparison's traversal (all seen => StrictAscends).
+    seen_subject_heads: BTreeSet<EventId>,
     any_common: bool,
 
     // Chain tracking (for forward chain accumulation)
@@ -224,9 +232,11 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             states: HashMap::new(),
             meet_candidates: BTreeSet::new(),
             outstanding_heads: comparison_ids.clone(),
+            subject_processed: BTreeSet::new(),
+            comparison_processed: BTreeSet::new(),
             remaining_budget: budget,
-            unseen_comparison_heads: comparison_ids.len(),
-            unseen_subject_heads: subject_ids.len(),
+            seen_comparison_heads: BTreeSet::new(),
+            seen_subject_heads: BTreeSet::new(),
             any_common: false,
             subject_visited: Vec::new(),
             other_visited: Vec::new(),
@@ -343,22 +353,29 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             }
         }
 
-        // Extend frontiers with parents
-        if from_subject {
-            self.subject_frontier.extend(parents.iter().cloned());
+        // Extend frontiers with parents, but only expand each node once per side.
+        // Without this guard a node reached by two paths is expanded twice, which
+        // re-runs head accounting and re-spends budget (V1). Head tracking uses
+        // sets so it is idempotent regardless, but skipping re-expansion also
+        // keeps budget per-event and avoids redundant fetches. Parents already
+        // processed on this side are filtered out too: a longer path arriving
+        // later would otherwise re-queue a finished node, re-spending budget and
+        // duplicating visited/chain entries.
+        if from_subject && self.subject_processed.insert(id.clone()) {
+            self.subject_frontier.extend(parents.iter().filter(|p| !self.subject_processed.contains(*p)).cloned());
 
             // Check if subject's traversal reached a comparison head
             if self.original_comparison.contains(&id) {
-                self.unseen_comparison_heads = self.unseen_comparison_heads.saturating_sub(1);
+                self.seen_comparison_heads.insert(id.clone());
             }
         }
 
-        if from_comparison {
-            self.comparison_frontier.extend(parents.iter().cloned());
+        if from_comparison && self.comparison_processed.insert(id.clone()) {
+            self.comparison_frontier.extend(parents.iter().filter(|p| !self.comparison_processed.contains(*p)).cloned());
 
             // Check if comparison's traversal reached a subject head
             if self.original_subject.contains(&id) {
-                self.unseen_subject_heads = self.unseen_subject_heads.saturating_sub(1);
+                self.seen_subject_heads.insert(id.clone());
             }
         }
     }
@@ -408,9 +425,10 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
     }
 
     fn check_result(&mut self) -> Option<AbstractCausalRelation<EventId>> {
-        // Check for complete descent (only if not tainted)
-        // StrictDescends: subject's traversal has seen all comparison heads
-        if self.unseen_comparison_heads == 0 {
+        // StrictDescends: subject's traversal has seen all comparison heads.
+        // seen_comparison_heads only ever holds members of original_comparison,
+        // so length equality means set equality.
+        if self.seen_comparison_heads.len() == self.original_comparison.len() {
             // Build forward chain from comparison head to subject head
             // The subject_visited contains events from subject head backward
             // We need the forward chain (older to newer), excluding the comparison heads themselves
@@ -420,7 +438,7 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
 
         // StrictAscends: comparison's traversal has seen all subject heads
         // This means subject is older (strictly before comparison)
-        if self.unseen_subject_heads == 0 {
+        if self.seen_subject_heads.len() == self.original_subject.len() {
             return Some(AbstractCausalRelation::StrictAscends);
         }
 

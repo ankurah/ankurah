@@ -2228,7 +2228,6 @@ mod bfs_revisit_bugs {
     /// The bug double-decrements for N and falsely reports StrictDescends,
     /// which entity.rs turns into head = {S}, silently discarding tip D.
     #[tokio::test]
-    #[ignore = "V1: red until remediation A1 (per-side visited sets), see specs/concurrent-updates/remediation-2026-07.md"]
     async fn double_decrement_falsely_reports_strict_descends() {
         let mut retriever = MockRetriever::new();
 
@@ -2277,10 +2276,145 @@ mod bfs_revisit_bugs {
             AbstractCausalRelation::DivergedSince { meet, .. } => {
                 assert_eq!(meet, &vec![id_n.clone()], "meet should be exactly [N]");
             }
+            other => panic!("S does NOT descend from concurrent tip D; expected DivergedSince {{ meet: [N] }} but got {:?}", other),
+        }
+    }
+
+    /// Mirror of the double-decrement case: the same DAG and forced re-visit,
+    /// but with subject and comparison roles swapped, so the double-count lands
+    /// on the subject-head accounting and the false verdict is StrictAscends,
+    /// which entity.rs turns into silently dropping the incoming event.
+    ///
+    /// Subject = {N, D}, comparison = {S}. Correct: DivergedSince { meet: [N] }.
+    #[tokio::test]
+    async fn double_decrement_falsely_reports_strict_ascends() {
+        let mut retriever = MockRetriever::new();
+
+        let ev_r = make_test_event(1, &[]);
+        let id_r = ev_r.id();
+        retriever.add_event(ev_r);
+
+        let ev_n = make_test_event(2, &[id_r.clone()]);
+        let id_n = ev_n.id();
+        retriever.add_event(ev_n);
+
+        let ev_d = make_test_event(3, &[id_r.clone()]);
+        let id_d = ev_d.id();
+        retriever.add_event(ev_d);
+
+        let ev_a = make_test_event(4, &[id_n.clone()]);
+        let id_a = ev_a.id();
+        retriever.add_event(ev_a);
+
+        // Same seed condition as the StrictDescends case: id(N) < id(C) makes
+        // the comparison-side BFS process N (short path, via A) before C
+        // re-encounters it (long path, via B).
+        let ev_c = (10u8..=255)
+            .map(|seed| make_test_event(seed, &[id_n.clone()]))
+            .find(|ev| ev.id() > id_n)
+            .expect("some seed must yield id(C) > id(N)");
+        let id_c = ev_c.id();
+        retriever.add_event(ev_c);
+
+        let ev_b = make_test_event(5, &[id_c.clone()]);
+        let id_b = ev_b.id();
+        retriever.add_event(ev_b);
+
+        let ev_s = make_test_event(6, &[id_a.clone(), id_b.clone()]);
+        let id_s = ev_s.id();
+        retriever.add_event(ev_s);
+
+        let subject = clock!(id_n, id_d); // two concurrent tips
+        let comparison = clock!(id_s);
+
+        let result = compare(retriever, &subject, &comparison, 100).await.unwrap();
+
+        match &result.relation {
+            AbstractCausalRelation::DivergedSince { meet, .. } => {
+                assert_eq!(meet, &vec![id_n.clone()], "meet should be exactly [N]");
+            }
             other => panic!(
-                "S does NOT descend from concurrent tip D; expected DivergedSince {{ meet: [N] }} but got {:?}",
+                "comparison {{S}} does NOT reach concurrent tip D, so it cannot strictly ascend; expected DivergedSince {{ meet: [N] }} but got {:?}",
                 other
             ),
+        }
+    }
+
+    /// Budget must be spent per event, not per path. A chain of uneven diamonds
+    /// has O(levels) events but 2^levels distinct paths; per-path bookkeeping
+    /// re-processes the join node of every level and cascades exponentially,
+    /// exhausting even the 4x-escalated budget. Per-event bookkeeping completes
+    /// within a small multiple of the event count and yields a duplicate-free
+    /// chain.
+    ///
+    /// Each level: J -> {A, B}; A -> prev (short); B -> C -> prev (long).
+    /// C's seed is searched so id(C) > id(prev), forcing prev to be re-added to
+    /// the frontier after it was already processed (the V1 re-visit shape).
+    /// Like make_test_event but with a two-byte seed: the per-level id-ordering
+    /// search below can need far more than 256 candidates when a join id lands
+    /// high in the hash space.
+    fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
+        let mut entity_id_bytes = [0u8; 16];
+        entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
+        let entity_id = EntityId::from_bytes(entity_id_bytes);
+        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    }
+
+    #[tokio::test]
+    async fn diamond_chain_completes_within_linear_budget() {
+        use std::collections::BTreeSet;
+
+        let mut retriever = MockRetriever::new();
+
+        const LEVELS: usize = 12;
+        let mut seed = 1u16;
+        let mut next_seed = move || {
+            let s = seed;
+            seed = seed.checked_add(1).expect("seed space exhausted");
+            s
+        };
+
+        let ev_r = make_test_event_u16(next_seed(), &[]);
+        let id_r = ev_r.id();
+        retriever.add_event(ev_r);
+
+        let mut prev = id_r.clone();
+        for _ in 0..LEVELS {
+            let ev_a = make_test_event_u16(next_seed(), &[prev.clone()]);
+            let id_a = ev_a.id();
+            retriever.add_event(ev_a);
+
+            let ev_c = loop {
+                let candidate = make_test_event_u16(next_seed(), &[prev.clone()]);
+                if candidate.id() > prev {
+                    break candidate;
+                }
+            };
+            let id_c = ev_c.id();
+            retriever.add_event(ev_c);
+
+            let ev_b = make_test_event_u16(next_seed(), &[id_c.clone()]);
+            let id_b = ev_b.id();
+            retriever.add_event(ev_b);
+
+            let ev_j = make_test_event_u16(next_seed(), &[id_a.clone(), id_b.clone()]);
+            prev = ev_j.id();
+            retriever.add_event(ev_j);
+        }
+
+        let total_events = 1 + 4 * LEVELS;
+        let subject = clock!(prev); // top join
+        let comparison = clock!(id_r); // genesis
+
+        let result = compare(retriever, &subject, &comparison, 2 * total_events).await.unwrap();
+
+        match &result.relation {
+            AbstractCausalRelation::StrictDescends { chain } => {
+                let unique: BTreeSet<_> = chain.iter().collect();
+                assert_eq!(unique.len(), chain.len(), "chain must not contain duplicate events");
+                assert_eq!(chain.len(), total_events - 1, "chain covers every event except the comparison head R");
+            }
+            other => panic!("expected StrictDescends within a 2x-event-count budget (per-event, not per-path); got {:?}", other),
         }
     }
 
