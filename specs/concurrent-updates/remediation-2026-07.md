@@ -43,9 +43,10 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
       `normalized()` (sort+dedup) in new/From/TryInto and serde deserialization.
       Tests: unsorted bincode round-trip; codex's `[C,B,E]` head-maintenance scenario.
       Deserialization normalizes via `#[serde(from = "Vec<EventId>")]` (newtype serialization is transparent, so the wire shape is unchanged). The wasm and postgres decode paths already normalized inline and were left as-is for the post-merge factorization pass.
-- [ ] **C2 (V7, LOW): two-phase commit_local_trx.**
+- [x] **C2 (V7, LOW): two-phase commit_local_trx.**
       All `check_event` before any `commit_event`.
       Test: two-entity trx, second denied, assert zero durable events.
+      Test lives in ankurah-tests (`commit_atomicity.rs`) with a local selective-deny agent (permissive except the second album check_event), avoiding a core dev-dependency cycle per the fix plan.
 - [ ] **C3 (V6, MEDIUM-HIGH): per-item error containment in apply_updates.**
       Collect per-item failures, continue batch, notify applied subset; remove phantom empty-head entity on failure. Needs-state recovery: implement if under an hour, else file follow-up issue.
       Test: three-item batch with middle EventOnly-for-unknown-entity; items 1 and 3 apply and notify; no phantom resident.

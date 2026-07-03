@@ -104,7 +104,9 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let mut attested_events = Vec::new();
         let mut entity_attested_events = Vec::new();
 
-        // Check policy and collect attestations
+        // Phase 1: check policy and collect attestations for EVERY event
+        // before persisting ANY of them, so a later denial leaves nothing
+        // durable (failure atomicity, V7).
         for (entity, event) in entity_events {
             // Create a temporary fork to apply the event for validation
             use std::sync::atomic::AtomicBool;
@@ -127,11 +129,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
             let attested = Attested::opt(event.clone(), attestation);
 
-            // Now commit the event to storage
-            event_getter.commit_event(&attested).await?;
-
             attested_events.push(attested.clone());
             entity_attested_events.push((entity, attested));
+        }
+
+        // Phase 2: all events attested; persist them.
+        for (_, attested) in &entity_attested_events {
+            let collection = self.node.collections.get(&attested.payload.collection).await?;
+            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
+            event_getter.commit_event(attested).await?;
         }
 
         // Update heads BEFORE relaying (makes entities visible to server echo)
