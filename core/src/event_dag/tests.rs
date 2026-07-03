@@ -53,6 +53,15 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
 }
 
+/// Like make_test_event but with a two-byte seed, for tests that need a wide
+/// or exhaustive seed space (id-ordering searches, randomized DAG generation).
+fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
+    let mut entity_id_bytes = [0u8; 16];
+    entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
+    let entity_id = EntityId::from_bytes(entity_id_bytes);
+    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+}
+
 /// Create a Clock from EventIds without consuming them.
 macro_rules! clock {
     ($($id:expr),* $(,)?) => {
@@ -2352,16 +2361,6 @@ mod bfs_revisit_bugs {
     /// Each level: J -> {A, B}; A -> prev (short); B -> C -> prev (long).
     /// C's seed is searched so id(C) > id(prev), forcing prev to be re-added to
     /// the frontier after it was already processed (the V1 re-visit shape).
-    /// Like make_test_event but with a two-byte seed: the per-level id-ordering
-    /// search below can need far more than 256 candidates when a join id lands
-    /// high in the hash space.
-    fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
-        let mut entity_id_bytes = [0u8; 16];
-        entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
-        let entity_id = EntityId::from_bytes(entity_id_bytes);
-        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
-    }
-
     #[tokio::test]
     async fn diamond_chain_completes_within_linear_budget() {
         use std::collections::BTreeSet;
@@ -2707,5 +2706,193 @@ mod strict_descends_gap_jump {
             "CONSISTENCY VIOLATION: head descends X but X's write (p1) is missing. \
              StrictDescends gap-jump applied only B's ops and skipped intermediate ancestor X. p1={p1:?}"
         );
+    }
+}
+
+// ============================================================================
+// PROPERTY TEST: state machine verdict vs brute-force reachability oracle
+// ============================================================================
+
+#[cfg(test)]
+mod comparison_property {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Deterministic xorshift32: no external dependency, and every failure is
+    /// reproducible from the printed dag_seed.
+    struct Rng(u32);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize { (self.next() as usize) % n }
+    }
+
+    /// Inclusive ancestry over the true parent map (the oracle's reachability).
+    fn ancestry(parents: &BTreeMap<EventId, Vec<EventId>>, heads: &[EventId]) -> BTreeSet<EventId> {
+        let mut out = BTreeSet::new();
+        let mut stack: Vec<EventId> = heads.to_vec();
+        while let Some(id) = stack.pop() {
+            if !out.insert(id.clone()) {
+                continue;
+            }
+            if let Some(ps) = parents.get(&id) {
+                stack.extend(ps.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// Reduce a set of events to its maximal antichain: drop members that are
+    /// proper ancestors of other members.
+    fn to_antichain(parents: &BTreeMap<EventId, Vec<EventId>>, ids: &BTreeSet<EventId>) -> Vec<EventId> {
+        ids.iter()
+            .filter(|id| !ids.iter().any(|other| other != *id && ancestry(parents, std::slice::from_ref(other)).contains(*id)))
+            .cloned()
+            .collect()
+    }
+
+    #[derive(Debug)]
+    enum Expected {
+        Equal,
+        StrictDescends,
+        StrictAscends,
+        DivergedMeet(Vec<EventId>),
+        /// A comparison head set mixing shared-lineage and foreign heads hits a
+        /// traversal-order-dependent branch in check_result: Disjoint when a
+        /// foreign genesis is recorded as other_root first, otherwise
+        /// DivergedSince with an empty meet. Pre-existing looseness (tracked as
+        /// a hardening note); the oracle accepts either.
+        EmptyMeetOrDisjoint,
+        Disjoint,
+    }
+
+    /// Brute-force specification of the comparison verdict. Precedence mirrors
+    /// the machine: Equal, then the strict completions (which fire during
+    /// traversal), then the exhaustion verdicts.
+    fn oracle(parents: &BTreeMap<EventId, Vec<EventId>>, subject: &[EventId], comparison: &[EventId]) -> Expected {
+        let s_set: BTreeSet<EventId> = subject.iter().cloned().collect();
+        let c_set: BTreeSet<EventId> = comparison.iter().cloned().collect();
+        if s_set == c_set {
+            return Expected::Equal;
+        }
+
+        let s_cover = ancestry(parents, subject);
+        let c_cover = ancestry(parents, comparison);
+
+        // StrictDescends: cover containment plus every subject head grounded
+        // (its ancestry intersects the comparison's cover).
+        if c_cover.is_subset(&s_cover)
+            && subject.iter().all(|h| ancestry(parents, std::slice::from_ref(h)).intersection(&c_cover).next().is_some())
+        {
+            return Expected::StrictDescends;
+        }
+
+        // StrictAscends is deliberately cover-containment only (it drives
+        // skip-incoming decisions, where covering suffices).
+        if s_cover.is_subset(&c_cover) {
+            return Expected::StrictAscends;
+        }
+
+        let common: BTreeSet<EventId> = s_cover.intersection(&c_cover).cloned().collect();
+        if common.is_empty() {
+            return Expected::Disjoint;
+        }
+
+        // A comparison head sharing nothing with the subject's cover can never
+        // be retired: the exhaustion gate reports an empty meet (or Disjoint,
+        // depending on which genesis was recorded first).
+        if comparison.iter().any(|h| ancestry(parents, std::slice::from_ref(h)).intersection(&s_cover).next().is_none()) {
+            return Expected::EmptyMeetOrDisjoint;
+        }
+
+        Expected::DivergedMeet(to_antichain(parents, &common))
+    }
+
+    fn verdict_matches(expected: &Expected, actual: &AbstractCausalRelation<EventId>) -> bool {
+        match (expected, actual) {
+            (Expected::Equal, AbstractCausalRelation::Equal) => true,
+            (Expected::StrictDescends, AbstractCausalRelation::StrictDescends { .. }) => true,
+            (Expected::StrictAscends, AbstractCausalRelation::StrictAscends) => true,
+            (Expected::DivergedMeet(want), AbstractCausalRelation::DivergedSince { meet, .. }) => {
+                let mut got = meet.clone();
+                got.sort();
+                let mut want = want.clone();
+                want.sort();
+                got == want
+            }
+            (Expected::EmptyMeetOrDisjoint, AbstractCausalRelation::DivergedSince { meet, .. }) => meet.is_empty(),
+            (Expected::EmptyMeetOrDisjoint, AbstractCausalRelation::Disjoint { .. }) => true,
+            (Expected::Disjoint, AbstractCausalRelation::Disjoint { .. }) => true,
+            _ => false,
+        }
+    }
+
+    /// Randomized small DAGs (including extra genesis roots), random antichain
+    /// clocks, machine verdict checked against the oracle. Clocks are built
+    /// sorted since Clock does not yet normalize input order (C1).
+    #[tokio::test]
+    async fn randomized_dags_match_reachability_oracle() {
+        for dag_seed in 1u32..=300 {
+            let mut rng = Rng(dag_seed.wrapping_mul(0x9E37_79B9) | 1);
+            let n_events = 5 + rng.below(6); // 5..=10
+
+            let mut retriever = MockRetriever::new();
+            let mut ids: Vec<EventId> = Vec::new();
+            let mut parents_map: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
+
+            for i in 0..n_events {
+                // The first event is always a root; later events occasionally
+                // start a fresh root to exercise disjoint and foreign-lineage
+                // shapes.
+                let parent_ids: Vec<EventId> = if i == 0 || rng.below(6) == 0 {
+                    vec![]
+                } else {
+                    let mut chosen = BTreeSet::new();
+                    for _ in 0..(1 + rng.below(2)) {
+                        chosen.insert(ids[rng.below(ids.len())].clone());
+                    }
+                    // Parent clocks are antichains in honest input.
+                    to_antichain(&parents_map, &chosen)
+                };
+
+                let ev = make_test_event_u16(i as u16 + 1, &parent_ids);
+                let id = ev.id();
+                parents_map.insert(id.clone(), parent_ids);
+                ids.push(id);
+                retriever.add_event(ev);
+            }
+
+            for _pair in 0..4 {
+                let mut pick_clock = |rng: &mut Rng| -> Vec<EventId> {
+                    let mut set = BTreeSet::new();
+                    for _ in 0..(1 + rng.below(3)) {
+                        set.insert(ids[rng.below(ids.len())].clone());
+                    }
+                    to_antichain(&parents_map, &set)
+                };
+                let subject_ids = pick_clock(&mut rng);
+                let comparison_ids = pick_clock(&mut rng);
+
+                let subject = Clock::from(subject_ids.clone());
+                let comparison = Clock::from(comparison_ids.clone());
+
+                let result = compare(retriever.clone(), &subject, &comparison, 4 * n_events).await.unwrap();
+                let expected = oracle(&parents_map, &subject_ids, &comparison_ids);
+
+                assert!(
+                    verdict_matches(&expected, &result.relation),
+                    "verdict mismatch\n  dag_seed={dag_seed}\n  subject={subject_ids:?}\n  comparison={comparison_ids:?}\n  expected={expected:?}\n  actual={:?}\n  dag={parents_map:#?}",
+                    result.relation
+                );
+            }
+        }
     }
 }
