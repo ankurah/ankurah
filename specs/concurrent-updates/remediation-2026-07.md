@@ -10,9 +10,10 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
       Replace `unseen_comparison_heads`/`unseen_subject_heads` counters with idempotent seen-sets; add per-side processed sets consulted before frontier extension and processing.
       Test to un-ignore: `bfs_revisit_bugs::double_decrement_falsely_reports_strict_descends`.
       Additional tests: mirror false-StrictAscends case; diamond-chain budget test (completes within O(events)).
-- [ ] **A2 (V2, HIGH): origin retirement on propagation to already-common nodes.**
+- [x] **A2 (V2, HIGH): origin retirement on propagation to already-common nodes.**
       Retire arriving origins from `outstanding_heads` when propagation reaches a node already in `meet_candidates`; debug-assert against the exhaustion-time recompute.
       Test to un-ignore: `bfs_revisit_bugs::late_origin_propagation_yields_empty_meet`.
+      DEVIATION from fix-plan A2: the planned design is insufficient. Origins can stall at a node that is already expanded but NOT common (A1's per-side dedup no longer re-expands it), so neither incremental retirement nor the origin-union recompute ever sees that head satisfied; both agree on the wrong answer and the planned debug-assert would not fire. Implemented the incremental retirement as planned PLUS an exhaustion-time reachability reconciliation over the accumulated DAG (a head is outstanding only if no meet candidate is backward-reachable from it), which replaces the recompute/debug-assert as product code. New pinning test: `bfs_revisit_bugs::origin_stalled_at_processed_node_still_retires_head` (verified to fail with reconciliation disabled and the planned fix in place). Note for the post-merge factorization pass: with reconciliation as ground truth, the incremental origins bookkeeping is a prunable fast path only.
 - [ ] **A3 (V3, HIGH): quick-check soundness guard.**
       Subset shortcut only when every subject event has a nonempty parent set contained in the comparison set; otherwise fall through to BFS.
       Test to un-ignore: `quick_check_disjoint_verify::test_quick_check_disjoint_extra_root`.

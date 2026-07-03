@@ -2427,7 +2427,6 @@ mod bfs_revisit_bugs {
     /// DAG: C1 -> M;  C2 -> X -> M;  S -> M;  M is root.
     /// Subject = {S}, comparison = {C1, C2}. Correct: DivergedSince meet [M].
     #[tokio::test]
-    #[ignore = "V2: red until remediation A2 (origin retirement), see specs/concurrent-updates/remediation-2026-07.md"]
     async fn late_origin_propagation_yields_empty_meet() {
         let mut retriever = MockRetriever::new();
 
@@ -2463,6 +2462,62 @@ mod bfs_revisit_bugs {
                     &vec![id_m.clone()],
                     "meet should be [M]; an empty meet makes entity.rs re-layer from genesis and skips head tip removal"
                 );
+            }
+            other => panic!("expected DivergedSince {{ meet: [M] }}, got {:?}", other),
+        }
+    }
+
+    /// Found during remediation A2: origins can stall at a node that is already
+    /// EXPANDED but not common. Incremental retirement (including the
+    /// arrival-at-common case of A2) never sees such a head reach the meet, and
+    /// the per-side dedup from A1 means the traversal will not carry it further.
+    /// The exhaustion-time reachability reconciliation must retire it.
+    ///
+    /// DAG: C1 -> K -> M;  H -> L -> K;  S -> M;  M is root.
+    /// Subject = {S}, comparison = {C1, H}. The seed search forces
+    /// id(K) < id(L), so K is expanded (propagating only C1's origin onward)
+    /// before L delivers H's origin to K, where it stalls.
+    /// Correct: DivergedSince { meet: [M] }.
+    #[tokio::test]
+    async fn origin_stalled_at_processed_node_still_retires_head() {
+        let mut retriever = MockRetriever::new();
+
+        let ev_m = make_test_event(1, &[]);
+        let id_m = ev_m.id();
+        retriever.add_event(ev_m);
+
+        let ev_k = make_test_event(2, &[id_m.clone()]);
+        let id_k = ev_k.id();
+        retriever.add_event(ev_k);
+
+        let ev_c1 = make_test_event(3, &[id_k.clone()]);
+        let id_c1 = ev_c1.id();
+        retriever.add_event(ev_c1);
+
+        // L: child of K on the longer path; must be expanded after K.
+        let ev_l = (10u16..=u16::MAX)
+            .map(|seed| make_test_event_u16(seed, &[id_k.clone()]))
+            .find(|ev| ev.id() > id_k)
+            .expect("some seed must yield id(L) > id(K)");
+        let id_l = ev_l.id();
+        retriever.add_event(ev_l);
+
+        let ev_h = make_test_event(4, &[id_l.clone()]);
+        let id_h = ev_h.id();
+        retriever.add_event(ev_h);
+
+        let ev_s = make_test_event(5, &[id_m.clone()]);
+        let id_s = ev_s.id();
+        retriever.add_event(ev_s);
+
+        let subject = clock!(id_s);
+        let comparison = clock!(id_c1, id_h);
+
+        let result = compare(retriever, &subject, &comparison, 100).await.unwrap();
+
+        match &result.relation {
+            AbstractCausalRelation::DivergedSince { meet, .. } => {
+                assert_eq!(meet, &vec![id_m.clone()], "meet should be [M] even though H's origin stalled at K");
             }
             other => panic!("expected DivergedSince {{ meet: [M] }}, got {:?}", other),
         }

@@ -27,7 +27,7 @@
 //! 5. **Repeat** until: relationship determined, frontiers empty, or budget exhausted
 
 use super::{
-    accumulator::{ComparisonResult, EventAccumulator},
+    accumulator::{compute_ancestry_from_dag, ComparisonResult, EventAccumulator},
     frontier::Frontier,
     relation::AbstractCausalRelation,
 };
@@ -334,6 +334,16 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             // Propagate origins
             for parent in parents {
                 self.states.entry(parent.clone()).or_insert_with(NodeState::new).origins.extend(origins.clone());
+                // A head whose origins arrive at an already-common node is
+                // satisfied. Heads are otherwise retired only at the moment a
+                // node first becomes common, so an origin arriving one step
+                // later via a longer path would stay outstanding forever and
+                // force an empty meet (V2).
+                if self.meet_candidates.contains(parent) {
+                    for origin in &origins {
+                        self.outstanding_heads.remove(origin);
+                    }
+                }
             }
         }
 
@@ -444,6 +454,22 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
 
         // Check if frontiers are exhausted
         if self.subject_frontier.is_empty() && self.comparison_frontier.is_empty() {
+            // Reconcile outstanding heads by reachability before the empty-meet
+            // gate. Incremental origin retirement is best-effort: origins that
+            // arrive at a node after it was already expanded stall there (the
+            // traversal will not expand it again), so a head can stay
+            // outstanding even though a common node is reachable from it. The
+            // ground truth is reachability over the accumulated DAG, which is
+            // complete for both traversals at exhaustion.
+            if !self.outstanding_heads.is_empty() && self.any_common {
+                let dag = self.accumulator.dag();
+                let meet_candidates = &self.meet_candidates;
+                self.outstanding_heads.retain(|head| {
+                    let ancestry = compute_ancestry_from_dag(dag, std::slice::from_ref(head));
+                    !ancestry.iter().any(|id| meet_candidates.contains(id))
+                });
+            }
+
             // Compute minimal common ancestors
             let meet: Vec<_> =
                 self.meet_candidates.iter().filter(|id| self.states.get(*id).map_or(0, |s| s.common_child_count) == 0).cloned().collect();
