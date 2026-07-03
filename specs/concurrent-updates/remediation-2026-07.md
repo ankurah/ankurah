@@ -39,9 +39,10 @@ Execution state for the fixes in `fix-plan-2026-07.md`, addressing the confirmed
 
 ## Cluster C: contained fixes
 
-- [ ] **C1 (V5, MEDIUM): Clock normalization.**
+- [x] **C1 (V5, MEDIUM): Clock normalization.**
       `normalized()` (sort+dedup) in new/From/TryInto and serde deserialization.
       Tests: unsorted bincode round-trip; codex's `[C,B,E]` head-maintenance scenario.
+      Deserialization normalizes via `#[serde(from = "Vec<EventId>")]` (newtype serialization is transparent, so the wire shape is unchanged). The wasm and postgres decode paths already normalized inline and were left as-is for the post-merge factorization pass.
 - [ ] **C2 (V7, LOW): two-phase commit_local_trx.**
       All `check_event` before any `commit_event`.
       Test: two-entity trx, second denied, assert zero durable events.
