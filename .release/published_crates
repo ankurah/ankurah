@@ -22,3 +22,6 @@ ankurah-websocket-client
 ankurah-storage-postgres
 ankurah-storage-indexeddb-wasm
 ankurah-websocket-client-wasm
+
+# Tier 6: Extensions (depends on ankurah)
+ankurah-jwt-auth
