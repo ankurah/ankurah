@@ -1,0 +1,120 @@
+{
+  "version": 1,
+
+  "roles": {
+    "Admin": {
+      "privileges": ["*"],
+      "description": "Full system access — all operations on all entities"
+    },
+    "Dispatcher": {
+      "privileges": [
+        "view_jobs", "manage_jobs",
+        "view_users",
+        "view_schedule", "manage_schedule",
+        "view_fleet",
+        "view_customers", "manage_customers",
+        "view_field_offices"
+      ],
+      "description": "Manages jobs, schedules, customers, and coordinates technicians"
+    },
+    "Technician": {
+      "privileges": [
+        "view_jobs", "update_own_jobs",
+        "view_schedule",
+        "view_customers",
+        "view_fleet"
+      ],
+      "description": "Views assigned jobs and updates their own work"
+    }
+  },
+
+  "privileges": {
+    "view_users":           { "description": "View user/staff list and profiles" },
+    "manage_users":         { "description": "Create, edit, deactivate user accounts" },
+    "view_jobs":            { "description": "View all jobs and visits" },
+    "manage_jobs":          { "description": "Create, edit, delete jobs and visits" },
+    "update_own_jobs":      { "description": "Update jobs/visits assigned to self" },
+    "view_schedule":        { "description": "View schedules and recurring plans" },
+    "manage_schedule":      { "description": "Create and modify schedules" },
+    "view_customers":       { "description": "View customer and property records" },
+    "manage_customers":     { "description": "Create, edit, delete customers and properties" },
+    "view_fleet":           { "description": "View vehicle records" },
+    "manage_fleet":         { "description": "Create, edit, delete vehicles" },
+    "view_field_offices":   { "description": "View field office configuration" },
+    "manage_field_offices": { "description": "Create, edit field offices" },
+    "view_services":        { "description": "View service type configuration" },
+    "manage_services":      { "description": "Create, edit service types and plans" },
+    "configure_system":     { "description": "System-level configuration (highest privilege)" }
+  },
+
+  "entity_rules": {
+    "user": {
+      "read": "view_users",
+      "write": "manage_users",
+      "self_access": {
+        "read": true,
+        "write": ["name", "phone", "avatar_url", "emergency_contact_name", "emergency_contact_phone", "emergency_contact_relationship"],
+        "owner_field": "id"
+      }
+    },
+    "customer": {
+      "read": "view_customers",
+      "write": "manage_customers"
+    },
+    "property": {
+      "read": "view_customers",
+      "write": "manage_customers"
+    },
+    "bodyofwater": {
+      "read": "view_customers",
+      "write": "manage_customers"
+    },
+    "job": {
+      "read": "view_jobs",
+      "write": "manage_jobs",
+      "self_access": {
+        "read": true,
+        "write_when": "update_own_jobs",
+        "owner_field": "assigned_to"
+      }
+    },
+    "visit": {
+      "read": "view_jobs",
+      "write": "manage_jobs",
+      "self_access": {
+        "read": true,
+        "write_when": "update_own_jobs",
+        "owner_field": "technician"
+      }
+    },
+    "schedule": {
+      "read": "view_schedule",
+      "write": "manage_schedule"
+    },
+    "recurringserviceplan": {
+      "read": "view_schedule",
+      "write": "manage_schedule"
+    },
+    "vehicle": {
+      "read": "view_fleet",
+      "write": "manage_fleet"
+    },
+    "fieldoffice": {
+      "read": "view_field_offices",
+      "write": "manage_field_offices"
+    },
+    "servicetype": {
+      "read": "view_services",
+      "write": "manage_services"
+    },
+    "serviceplan": {
+      "read": "view_services",
+      "write": "manage_services"
+    }
+  },
+
+  "defaults": {
+    "unknown_entity_read": "configure_system",
+    "unknown_entity_write": "configure_system"
+  }
+}

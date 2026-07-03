@@ -113,6 +113,16 @@ impl SubscriptionHandler {
         // Generate deltas based on known_matches - use expanded states
         let mut deltas = Vec::with_capacity(expanded_states.len());
         for state in expanded_states {
+            // Row-level read policy: the query predicate was already narrowed by
+            // filter_predicate above, but expand_states can resurface entities from
+            // known_matches that the subscriber can no longer read, and scope rules
+            // are evaluated against entity state, not just the predicate. Skip
+            // unreadable entities silently (mirroring the Fetch/Get handlers) so one
+            // out-of-scope entity doesn't fail the whole subscription.
+            if node.policy_agent.check_read(cdata, &state.payload.entity_id, &collection_id, &state.payload.state).is_err() {
+                continue;
+            }
+
             // Only include delta if heads differ (None means heads are equal)
             if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection).await? {
                 deltas.push(delta);

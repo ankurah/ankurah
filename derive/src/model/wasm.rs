@@ -300,9 +300,8 @@ pub fn wasm_livequery_wrapper(livequery_name: &Ident, view_name: &Ident, results
                 let mut selection = ::ankurah::ankql::parser::parse_selection(new_selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
-                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
-                selection.predicate = selection.predicate.populate(args_array)?;
+                selection.predicate =
+                    ::ankurah::core::model::js_populate_predicate(selection.predicate, substitution_values)?;
 
                 self.0.update_selection_wait(selection)
                     .await
@@ -436,9 +435,8 @@ pub fn wasm_model_namespace(
                 let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
-                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
-                selection.predicate = selection.predicate.populate(args_array)?;
+                selection.predicate =
+                    ::ankurah::core::model::js_populate_predicate(selection.predicate, substitution_values)?;
 
                 let items = context
                     .fetch::<#view_name>(selection)
@@ -452,9 +450,8 @@ pub fn wasm_model_namespace(
                 let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
-                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
-                selection.predicate = selection.predicate.populate(args_array)?;
+                selection.predicate =
+                    ::ankurah::core::model::js_populate_predicate(selection.predicate, substitution_values)?;
 
                 let livequery = context.query::<#view_name>(selection)
                     .map_err(|e| ::wasm_bindgen::JsValue::from(e.to_string()))?;
@@ -470,9 +467,8 @@ pub fn wasm_model_namespace(
                 let mut selection = ::ankurah::ankql::parser::parse_selection(selection.as_str())?;
 
                 // Convert the variadic JsValue (which is an array) and pass directly to populate
-                let args_array: ::ankurah::derive_deps::js_sys::Array = substitution_values.clone().try_into()
-                    .map_err(|_| ::wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
-                selection.predicate = selection.predicate.populate(args_array)?;
+                selection.predicate =
+                    ::ankurah::core::model::js_populate_predicate(selection.predicate, substitution_values)?;
 
                 let args = ::ankurah::MatchArgs { selection, cached: false };
                 let livequery = context.query::<#view_name>(args)
