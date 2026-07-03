@@ -193,6 +193,9 @@ where
 
         if let Some(local) = self.node.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
+            let state = local.to_state()?;
+            let entity_id = local.id();
+            self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state)?;
             return Ok(local);
         }
         debug!("{}.get_entity fetching from storage", self.node);
@@ -200,6 +203,12 @@ where
         let collection = self.node.collections.get(collection_id).await?;
         match collection.get_state(id).await {
             Ok(entity_state) => {
+                self.node.policy_agent.check_read(
+                    &self.cdata,
+                    &entity_state.payload.entity_id,
+                    collection_id,
+                    &entity_state.payload.state,
+                )?;
                 let retriever = crate::retrieval::EphemeralNodeRetriever::new(collection_id.clone(), &self.node, &self.cdata);
                 let (_changed, entity) =
                     self.node.entities.with_state(&retriever, id, collection_id.clone(), entity_state.payload.state).await?;

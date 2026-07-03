@@ -177,6 +177,46 @@ pub fn js_preprocess_ref_field(obj: &wasm_bindgen::JsValue, field_name: &str) ->
     Ok(())
 }
 
+// Populate AnkQL placeholders from variadic JS substitution values, mapping
+// EntityId instances to typed EntityId literals so Ref-field comparisons
+// collate consistently across fetch and live-update paths
+// (https://github.com/ankurah/ankurah/issues/259). Other values use the
+// standard JsValue conversion (string/bool/number).
+#[doc(hidden)]
+#[cfg(feature = "wasm")]
+pub fn js_populate_predicate(
+    predicate: ankql::ast::Predicate,
+    substitution_values: &wasm_bindgen::JsValue,
+) -> Result<ankql::ast::Predicate, wasm_bindgen::JsValue> {
+    let args_array: js_sys::Array =
+        substitution_values.clone().try_into().map_err(|_| wasm_bindgen::JsValue::from_str("Invalid arguments array"))?;
+
+    let exprs = args_array
+        .iter()
+        .map(|value| match js_entity_id(&value) {
+            Some(id) => Ok(ankql::ast::Expr::from(&id)),
+            None => ankql::ast::Expr::try_from(value),
+        })
+        .collect::<Result<Vec<_>, ankql::error::ParseError>>()
+        .map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))?;
+
+    predicate.populate(exprs).map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))
+}
+
+// Duck-typed detection of a WASM EntityId instance: a non-string object with a
+// callable `to_base64` returning a parseable id (mirrors js_preprocess_ref_field).
+#[cfg(feature = "wasm")]
+fn js_entity_id(value: &wasm_bindgen::JsValue) -> Option<ankurah_proto::EntityId> {
+    use wasm_bindgen::JsCast;
+    if value.as_string().is_some() || !value.is_object() {
+        return None;
+    }
+    let to_base64 = js_sys::Reflect::get(value, &wasm_bindgen::JsValue::from_str("to_base64")).ok()?;
+    let func = to_base64.dyn_ref::<js_sys::Function>()?;
+    let result = func.call0(value).ok()?;
+    ankurah_proto::EntityId::from_base64(result.as_string()?).ok()
+}
+
 // Helper function for map implementations in generated WASM ResultSet wrappers
 // don't document this
 #[doc(hidden)]

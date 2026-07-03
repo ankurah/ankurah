@@ -1,0 +1,19 @@
+{
+  "roles": {
+    "Owner": ["admin:read", "admin:write", "account:write"],
+    "Administrator": ["admin:read", "admin:write"]
+  },
+  "collections": {
+    "assignment": {
+      "read": "admin:read",
+      "write": "admin:write",
+      "scope": [
+        {
+          "filter": "role_key = 'administrator'",
+          "unless_privilege": "account:write",
+          "applies_to": "write"
+        }
+      ]
+    }
+  }
+}

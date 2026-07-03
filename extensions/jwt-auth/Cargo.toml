@@ -1,0 +1,51 @@
+[package]
+name        = "ankurah-jwt-auth"
+description = "JWT-based PolicyAgent for Ankurah"
+version     = "0.7.23"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+homepage    = "https://github.com/ankurah/ankurah"
+repository  = "https://github.com/ankurah/ankurah"
+
+[features]
+default = []
+wasm    = []
+watcher = ["dep:notify"]
+uniffi  = ["dep:uniffi"]
+
+[dependencies]
+# Internal dependencies
+ankurah       = { path = "../../ankurah", features = ["derive"], version = "=0.7.23" }
+ankurah-core  = { path = "../../core", version = "=0.7.23" }
+ankurah-proto = { path = "../../proto", version = "=0.7.23" }
+ankql         = { path = "../../ankql", version = "=0.7.23" }
+
+# JWT
+jwt-simple = { version = "0.12", default-features = false, features = ["pure-rust"] }
+
+# File watching (optional)
+notify = { version = "7", optional = true }
+
+# UniFFI (optional, needed when Model derive generates uniffi code in workspace context)
+uniffi = { version = "0.29", optional = true }
+
+# Core
+base64      = "0.22"
+anyhow      = "1.0"
+async-trait = "0.1"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+thiserror   = "2"
+tracing     = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["fs", "time", "rt"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio        = { version = "1", default-features = false, features = ["rt"] }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+ankurah-storage-sled            = { path = "../../storage/sled", version = "=0.7.23" }
+ankurah-connector-local-process = { path = "../../connectors/local-process", version = "=0.7.23" }
+tokio                           = { version = "1", features = ["full"] }

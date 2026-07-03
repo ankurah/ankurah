@@ -1,0 +1,32 @@
+{
+  "roles": {
+    "Admin": ["*"],
+    "Editor": ["view_posts", "manage_posts", "view_comments", "manage_comments", "view_users"],
+    "Author": ["view_posts", "create_posts", "view_comments", "create_comments", "view_users"],
+    "Reader": ["view_published_posts", "view_comments", "create_comments"]
+  },
+  "collections": {
+    "post": {
+      "read": "view_posts",
+      "write": "manage_posts",
+      "scope": [
+        {
+          "filter": "author = $jwt.sub",
+          "unless_privilege": "manage_posts"
+        }
+      ]
+    },
+    "comment": {
+      "read": "view_comments",
+      "write": "manage_comments"
+    },
+    "user": {
+      "read": "view_users",
+      "write": "manage_users"
+    },
+    "tag": {
+      "read": "view_posts",
+      "write": "manage_posts"
+    }
+  }
+}

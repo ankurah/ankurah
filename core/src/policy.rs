@@ -2,7 +2,7 @@ use crate::util::Iterable;
 use crate::{
     entity::Entity,
     error::ValidationError,
-    node::{ContextData, Node, NodeInner},
+    node::{ContextData, Node, NodeInner, WeakNode},
     property::PropertyError,
     proto::{self},
     storage::StorageEngine,
@@ -51,6 +51,10 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The context type that will be used for all resource requests.
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
+
+    /// Called after the Node is fully constructed, giving the PolicyAgent a weak reference to its owning node.
+    /// Use this to start background tasks (file watchers, policy subscriptions) that need the node.
+    fn on_node_ready<SE: StorageEngine + Send + Sync + 'static>(&self, _node: WeakNode<SE, Self>) {}
 
     /// Create relevant auth data for a given request
     /// This could be a JWT or a cryptographic signature, or some other arbitrary method of authentication as defined by the PolicyAgent

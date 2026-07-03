@@ -185,6 +185,8 @@ where
             }
         }
 
+        node.policy_agent.on_node_ready(node.weak());
+
         node
     }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
@@ -196,7 +198,7 @@ where
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), true);
 
-        Node(Arc::new(NodeInner {
+        let node = Node(Arc::new(NodeInner {
             id,
             collections,
             entities: entityset,
@@ -209,7 +211,11 @@ where
             predicate_context: SafeMap::new(),
             subscription_relay: None,
             type_resolver: crate::TypeResolver::new(),
-        }))
+        }));
+
+        node.policy_agent.on_node_ready(node.weak());
+
+        node
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode(Arc::downgrade(&self.0)) }
 
