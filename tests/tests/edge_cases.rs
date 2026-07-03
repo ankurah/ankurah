@@ -24,29 +24,11 @@ async fn test_single_event_entity() -> Result<()> {
     let state = collection.get_state(album_id).await?;
     clock_eq!(dag, state.payload.state.head, [A]);
 
+    // The degenerate base case: a single-event entity reads back its genesis
+    // write. Forking from genesis is covered by
+    // dag_auditing::test_simple_diamond_structure.
     let album = ctx.get::<AlbumView>(album_id).await?;
-
-    // Two concurrent events from genesis
-    let trx1 = ctx.begin();
-    let trx2 = ctx.begin();
-
-    album.edit(&trx1)?.name().replace("Name-B")?;
-    album.edit(&trx2)?.year().replace("2025")?;
-
-    dag.enumerate(trx1.commit_and_return_events().await?); // B
-    dag.enumerate(trx2.commit_and_return_events().await?); // C
-
-    // After B: would have head=[B], but we committed both so now head=[B,C]
-    let state = collection.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
-
-    // Verify DAG structure
-    let events = collection.dump_entity_events(album_id).await?;
-    assert_dag!(dag, events, {
-        A => [],
-        B => [A],
-        C => [A],
-    });
+    assert_eq!(album.name().unwrap(), "Genesis");
 
     Ok(())
 }
@@ -103,8 +85,6 @@ async fn test_rapid_concurrent_transactions() -> Result<()> {
             Err(_) => panics += 1,
         }
     }
-
-    println!("Results: {} successes, {} failures, {} panics", successes, failures, panics);
 
     // No panics allowed
     assert_eq!(panics, 0, "No panics should occur");
@@ -594,7 +574,6 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
     let b_id = dag.id('B').unwrap();
     let c_id = dag.id('C').unwrap();
     let bc_winner = if b_id > c_id { "Title-B" } else { "Title-C" };
-    let _bc_winner_id = if b_id > c_id { b_id.clone() } else { c_id.clone() };
 
     // Verify the winner's value is in the state
     let record = ctx.get::<RecordView>(record_id).await?;
@@ -620,9 +599,6 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
     let state = collection.get_state(record_id).await?;
     // D's parent is [B, C], so D strictly descends from both - head becomes [D]
     clock_eq!(dag, state.payload.state.head, [D]);
-
-    // Now let's test the actual bug scenario: create a situation where an event
-    // extends only one tip of a multi-head by using two nodes
 
     Ok(())
 }

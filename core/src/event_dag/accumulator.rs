@@ -61,10 +61,6 @@ impl<E: GetEvents> EventAccumulator<E> {
         Ok(event)
     }
 
-    /// Check whether an event_id is present in the accumulated DAG structure.
-    /// Used by LWW resolution to distinguish "known older" from "unknown".
-    pub(crate) fn contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
-
     /// Get a reference to the DAG structure.
     pub(crate) fn dag(&self) -> &BTreeMap<EventId, Vec<EventId>> { &self.dag }
 

@@ -80,7 +80,7 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
     ///
     /// # For CRDT backends (Yrs)
     /// Apply all operations from `to_apply` events. Order within layer doesn't
-    /// matter (CRDTs are commutative). Can ignore `already_applied` and `current_head`.
+    /// matter (CRDTs are commutative). Can ignore `already_applied`.
     fn apply_layer(&self, layer: &EventLayer) -> Result<(), MutationError>;
 
     /// Listen to changes for a specific field managed by this backend.

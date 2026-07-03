@@ -13,18 +13,8 @@ pub(crate) mod relation;
 #[cfg(test)]
 mod tests;
 
-// Core types
-pub(crate) use frontier::Frontier;
-pub(crate) use relation::AbstractCausalRelation;
-
-// Comparison functions
 pub(crate) use comparison::compare;
-
-// Layer computation
-pub(crate) use layers::CausalRelation;
-
-// Accumulator types
-pub(crate) use accumulator::{ComparisonResult, EventAccumulator, EventLayers};
+pub(crate) use relation::AbstractCausalRelation;
 
 /// Default budget for DAG traversal — large enough for typical histories
 /// but bounded to prevent runaway traversal on malicious/corrupted data.

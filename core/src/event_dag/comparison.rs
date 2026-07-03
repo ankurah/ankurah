@@ -17,6 +17,12 @@
 //!
 //! ## Process
 //!
+//! Before any traversal, `compare` runs a quick check for the common case of
+//! a new event sitting exactly one step above the current head (every subject
+//! event's parents nonempty and within the comparison clock, every comparison
+//! head covered). That shape returns `StrictDescends` without fetching the
+//! comparison events at all; the BFS below is the general path.
+//!
 //! 1. **Initialize**: Start with two frontiers = {subject_head} and {other_head}
 //! 2. **Expand**: Fetch events at current frontier positions via `EventAccumulator`
 //! 3. **Process**: For each returned event:

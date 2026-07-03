@@ -84,7 +84,6 @@ impl<R: GetState + Send + Sync + ?Sized> GetState for &R {
 /// `get_event` checks staging first, then permanent storage.
 /// `event_stored` checks permanent storage only.
 /// `commit_event` persists to storage and removes from staging.
-#[derive(Clone)]
 pub struct LocalEventGetter {
     collection: StorageCollectionWrapper,
     durable: bool,

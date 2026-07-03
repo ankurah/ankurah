@@ -1,3 +1,4 @@
+use crate::event_dag::DEFAULT_BUDGET;
 use crate::retrieval::{GetEvents, GetState};
 use crate::selection::filter::Filterable;
 use crate::{
@@ -230,8 +231,6 @@ impl Entity {
     where E: GetEvents + Send + Sync {
         debug!("apply_event head: {event} to {self}");
 
-        use crate::event_dag::DEFAULT_BUDGET;
-
         // Idempotency is handled by the comparison algorithm:
         // - Event already in head -> Equal -> no-op (Ok(false))
         // - Event is ancestor of head -> StrictAscends -> no-op (Ok(false))
@@ -380,7 +379,7 @@ impl Entity {
                     self.broadcast.send(());
                     return Ok(true);
                 }
-                AbstractCausalRelation::Disjoint { gca: _, subject_root: _, other_root: _ } => {
+                AbstractCausalRelation::Disjoint { .. } => {
                     return Err(LineageError::Disjoint.into());
                 }
                 AbstractCausalRelation::BudgetExceeded { subject, other } => {
@@ -412,7 +411,6 @@ impl Entity {
 
         debug!("{self} apply_state - new head: {new_head}");
         const MAX_RETRIES: usize = 5;
-        use crate::event_dag::DEFAULT_BUDGET;
 
         for attempt in 0..MAX_RETRIES {
             let comparison_result = crate::event_dag::compare(getter, &new_head, &head, DEFAULT_BUDGET).await?;
@@ -454,7 +452,7 @@ impl Entity {
                     );
                     return Ok(StateApplyResult::DivergedRequiresEvents);
                 }
-                AbstractCausalRelation::Disjoint { gca: _, subject_root: _, other_root: _ } => {
+                AbstractCausalRelation::Disjoint { .. } => {
                     error!("{self} apply_state - heads are disjoint (different genesis)");
                     return Err(LineageError::Disjoint.into());
                 }

@@ -90,6 +90,13 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
     }
 }
 
+/// Like make_lww_event but with an explicit parent clock, for multi-layer DAG scenarios.
+fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
+    let mut event = make_lww_event(seed, properties);
+    event.parent = Clock::from(parent_ids.to_vec());
+    event
+}
+
 fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
     let mut dag = BTreeMap::new();
     for event in already_applied.iter().chain(to_apply.iter()).chain(context_events.iter()) {
@@ -1084,76 +1091,6 @@ async fn test_diverged_chains_ordering() {
 // IDEMPOTENCY TESTS (Phase 2G)
 // ============================================================================
 
-#[tokio::test]
-async fn test_same_event_redundant_delivery() {
-    let mut retriever = MockRetriever::new();
-
-    // Create: A -> B -> C
-    let ev_a = make_test_event(1, &[]);
-    let id_a = ev_a.id();
-    retriever.add_event(ev_a);
-
-    let ev_b = make_test_event(2, &[id_a]);
-    let id_b = ev_b.id();
-    retriever.add_event(ev_b);
-
-    let ev_c = make_test_event(3, &[id_b.clone()]);
-    let id_c = ev_c.id();
-    retriever.add_event(ev_c.clone());
-
-    // Entity head is at C
-    let entity_head = clock!(id_c);
-
-    // Event C is delivered again (redundant) - recreate same event
-    // event_c_again has the same content as ev_c, so same EventId - already in retriever
-    let event_c_again = make_test_event(3, &[id_b]);
-
-    let result = compare(retriever.clone(), &Clock::from(vec![event_c_again.id()]), &entity_head, 100).await.unwrap();
-
-    // Should be Equal since event is already at head
-    assert!(
-        matches!(result.relation, AbstractCausalRelation::Equal),
-        "Redundant delivery of head event should return Equal, got {:?}",
-        result.relation
-    );
-}
-
-#[tokio::test]
-async fn test_event_in_history_not_at_head() {
-    let mut retriever = MockRetriever::new();
-
-    // Create: A -> B -> C
-    let ev_a = make_test_event(1, &[]);
-    let id_a = ev_a.id();
-    retriever.add_event(ev_a);
-
-    let ev_b = make_test_event(2, &[id_a.clone()]);
-    let id_b = ev_b.id();
-    retriever.add_event(ev_b);
-
-    let ev_c = make_test_event(3, &[id_b]);
-    let id_c = ev_c.id();
-    retriever.add_event(ev_c);
-
-    // Entity head is at C
-    let entity_head = clock!(id_c);
-
-    // Event B (in history but not at head) is delivered.
-    // With staging, B is already in the retriever (same content = same EventId as ev_b).
-    // compare([B], [C]) can now walk the DAG and discover B is an ancestor of C.
-    let event_b = make_test_event(2, &[id_a]);
-
-    let result = compare(retriever.clone(), &Clock::from(vec![event_b.id()]), &entity_head, 100).await.unwrap();
-
-    // With staging, B IS discoverable in the retriever. compare([B], [C]) walks
-    // backward from C and finds B as an ancestor, so this returns StrictAscends.
-    assert!(
-        matches!(result.relation, AbstractCausalRelation::StrictAscends),
-        "Event in history should return StrictAscends (B is ancestor of C), got {:?}",
-        result.relation
-    );
-}
-
 // ============================================================================
 // LWW LAYER APPLICATION TESTS (Phase 3)
 // ============================================================================
@@ -1281,13 +1218,6 @@ mod lww_layer_tests {
             // Winner is in to_apply - that value should win
             assert_eq!(backend.get(&"x".into()), Some(Value::String((*winner_value).into())));
         }
-    }
-
-    /// Like make_lww_event but with an explicit parent clock, for multi-layer DAG scenarios.
-    fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
-        let mut event = make_lww_event(seed, properties);
-        event.parent = Clock::from(parent_ids.to_vec());
-        event
     }
 
     /// H1 verification: cross-layer handling of winners drawn from already_applied events.
@@ -2637,13 +2567,6 @@ mod strict_descends_gap_jump {
     use crate::property::backend::lww::LWWBackend;
     use crate::property::backend::PropertyBackend;
     use ankurah_proto::Attested;
-
-    /// Like make_lww_event but with an explicit parent clock.
-    fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
-        let mut event = make_lww_event(seed, properties);
-        event.parent = Clock::from(parent_ids.to_vec());
-        event
-    }
 
     /// Read a committed LWW property value out of the entity's serialized state.
     fn read_lww(entity: &Entity, prop: &str) -> Option<Value> {

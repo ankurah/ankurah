@@ -148,6 +148,41 @@ async fn test_concurrent_deletes() -> Result<()> {
     Ok(())
 }
 
+/// Concurrent deletes with a gap: neither delete touches the middle character,
+/// so it must survive the merge. Distinct from test_concurrent_deletes, whose
+/// ranges are boundary-adjacent and cover the whole string.
+#[tokio::test]
+async fn test_concurrent_deletes_disjoint_ranges_leave_gap() -> Result<()> {
+    let ctx = setup().await?;
+    let mut dag = TestDag::new();
+
+    let doc_id = {
+        let trx = ctx.begin();
+        let doc = trx.create(&Document { content: "hello world".to_owned() }).await?;
+        let id = doc.id();
+        dag.enumerate(trx.commit_and_return_events().await?);
+        id
+    };
+
+    let doc = ctx.get::<DocumentView>(doc_id).await?;
+
+    let trx1 = ctx.begin();
+    let trx2 = ctx.begin();
+
+    doc.edit(&trx1)?.content().delete(0, 5)?; // Delete "hello", leave the space
+    doc.edit(&trx2)?.content().delete(6, 5)?; // Delete "world", leave the space
+
+    dag.enumerate(trx1.commit_and_return_events().await?);
+    dag.enumerate(trx2.commit_and_return_events().await?);
+
+    let final_doc = ctx.get::<DocumentView>(doc_id).await?;
+    let final_content = final_doc.content().unwrap();
+
+    assert_eq!(final_content, " ", "the untouched middle space must survive both deletes, got: '{final_content}'");
+
+    Ok(())
+}
+
 /// Test 2.4: Concurrent Insert and Delete at Same Position
 #[tokio::test]
 async fn test_concurrent_insert_and_delete() -> Result<()> {
