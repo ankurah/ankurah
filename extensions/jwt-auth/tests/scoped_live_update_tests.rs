@@ -7,8 +7,10 @@
 //! but never received commit-time updates. Substitution now populates typed
 //! EntityId literals for values that parse as EntityIds, closing the gap.
 
+mod common;
+
 use ankurah::{Model, Node, Ref};
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_storage_sled::SledStorageEngine;
 use jwt_simple::prelude::Duration;
 use std::sync::Arc;
@@ -57,7 +59,7 @@ async fn eventually_count(lq: &ankurah::LiveQuery<ScopeItemView>, expected: usiz
 /// receive entities committed after the subscription was established.
 #[tokio::test]
 async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
 
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);

@@ -8,7 +8,7 @@ mod common;
 
 use ankurah::{Model, Node};
 use ankurah_connector_local_process::LocalProcessConnection;
-use ankurah_jwt_auth::{JwtAgent, JwtContext, ScopeRuleOp, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtContext, ScopeRuleOp};
 use ankurah_storage_sled::SledStorageEngine;
 use common::{make_claims, sign_token};
 use std::sync::Arc;
@@ -48,7 +48,7 @@ fn applies_to_defaults_to_read_write_and_parses() {
 /// pre-existing rows outside the filter.
 #[tokio::test]
 async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), scope_ops_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());

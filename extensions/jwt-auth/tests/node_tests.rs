@@ -3,7 +3,7 @@ mod common;
 use ankurah::{Model, Node, Ref};
 use ankurah_core::model::Mutable;
 use ankurah_core::policy::PolicyAgent;
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_proto::{Clock, Event, OperationSet};
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, make_claims, sign_token};
@@ -32,7 +32,7 @@ pub struct ScopedRecord {
 
 #[tokio::test]
 async fn test_jwt_agent_single_durable_node() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
@@ -56,7 +56,7 @@ async fn test_jwt_agent_single_durable_node() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_jwt_agent_reader_cannot_write_post() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
@@ -92,7 +92,7 @@ async fn test_write_scope_allows_matching_ref_and_denies_other_ref() -> anyhow::
         }
     }"#;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(config_json)?);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
@@ -146,7 +146,7 @@ async fn test_read_scope_denies_direct_get_for_out_of_scope_resident_entity() ->
         }
     }"#;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(config_json)?);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
@@ -200,7 +200,7 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
         }
     }"#;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(serde_json::from_str::<PolicyConfig>(config_json)?);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
@@ -245,7 +245,7 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
 async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
@@ -286,7 +286,7 @@ async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
 async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
@@ -320,7 +320,7 @@ async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_jwtpolicy_collection_always_accessible() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let collection = ankurah_proto::CollectionId::from("jwtpolicy");
@@ -338,7 +338,7 @@ async fn test_jwtpolicy_collection_always_accessible() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_jwt_agent_collection_access_denied() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let collection = ankurah_proto::CollectionId::from("post");
@@ -356,7 +356,7 @@ async fn test_jwt_agent_collection_access_denied() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_root_context_bypasses_all_policy_checks() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let storage = SledStorageEngine::new_test()?;
@@ -378,7 +378,7 @@ async fn test_root_context_bypasses_all_policy_checks() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_root_bypasses_collection_access() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     use ankurah_core::policy::PolicyAgent;

@@ -1,7 +1,7 @@
 mod common;
 
 use ankurah_core::policy::PolicyAgent;
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_proto::CollectionId;
 use common::make_predicate;
 use jwt_simple::prelude::Duration;
@@ -29,7 +29,7 @@ fn test_filter_predicate_custom_claim_variable() {
     }"#;
     let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
 
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
@@ -70,7 +70,7 @@ fn test_filter_predicate_missing_claim_denied() {
     }"#;
     let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
 
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
@@ -117,7 +117,7 @@ fn test_filter_predicate_multiple_rules_anded() {
     }"#;
     let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
 
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));

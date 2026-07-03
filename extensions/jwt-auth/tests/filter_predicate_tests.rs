@@ -2,7 +2,7 @@ mod common;
 
 use ankql::ast::Predicate;
 use ankurah_core::policy::PolicyAgent;
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, PolicyConfig};
 use ankurah_proto::CollectionId;
 use common::{blog_config_path, make_predicate};
 use jwt_simple::prelude::Duration;
@@ -10,7 +10,7 @@ use jwt_simple::prelude::Duration;
 /// Root context returns predicate unchanged (bypasses all filtering)
 #[test]
 fn test_filter_predicate_privileged_bypasses() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys, blog_config_path()).unwrap();
 
     let ctx = JwtContext::Root;
@@ -24,7 +24,7 @@ fn test_filter_predicate_privileged_bypasses() {
 /// Collection without scope rules returns predicate unchanged
 #[test]
 fn test_filter_predicate_no_scope_rules() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
 
     let claims = JwtClaims {
@@ -46,7 +46,7 @@ fn test_filter_predicate_no_scope_rules() {
 /// Author role (lacks manage_posts) gets scope filter AND-ed in
 #[test]
 fn test_filter_predicate_applies_scope_rule() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
 
     let claims = JwtClaims {
@@ -77,7 +77,7 @@ fn test_filter_predicate_applies_scope_rule() {
 /// Editor role (has manage_posts) sees no scope filter (unless_privilege bypasses)
 #[test]
 fn test_filter_predicate_unless_privilege_bypasses() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
 
     let claims = JwtClaims {
@@ -136,7 +136,7 @@ fn test_filter_predicate_unconditional_scope_rule() {
     }"#;
     let config: PolicyConfig = serde_json::from_str(config_json).unwrap();
 
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_ephemeral();
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
@@ -161,7 +161,7 @@ fn test_filter_predicate_unconditional_scope_rule() {
 /// Injection attempt with quotes fails-closed
 #[test]
 fn test_filter_predicate_injection_payload_is_inert() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path()).unwrap();
 
     let payload = "'; DROP TABLE posts; --";

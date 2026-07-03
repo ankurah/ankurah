@@ -2,7 +2,7 @@ mod common;
 
 use ankurah::Model;
 use ankurah::Node;
-use ankurah_jwt_auth::{JwtAgent, JwtContext, JwtPolicy, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtContext, JwtPolicy};
 use ankurah_storage_sled::SledStorageEngine;
 use common::{blog_config_path, make_claims, sign_token};
 use jwt_simple::prelude::Duration;
@@ -22,7 +22,7 @@ pub struct Post {
 async fn test_ephemeral_receives_policy_via_livequery() -> anyhow::Result<()> {
     use ankurah_connector_local_process::LocalProcessConnection;
 
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let public_pem = keys.public_key_pem()?;
     let config_json = include_str!("fixtures/simple_blog.json").to_string();
 

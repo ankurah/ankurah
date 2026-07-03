@@ -8,7 +8,7 @@ mod common;
 
 use ankurah::{Model, Node, Ref};
 use ankurah_connector_local_process::LocalProcessConnection;
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, JwtPolicy, PolicyConfig, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, JwtKeys, JwtPolicy, PolicyConfig};
 use ankurah_storage_sled::SledStorageEngine;
 use jwt_simple::prelude::Duration;
 use std::sync::Arc;
@@ -59,7 +59,7 @@ async fn eventually_count(lq: &ankurah::LiveQuery<ScopeCredView>, expected: usiz
 
 #[tokio::test]
 async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
-    let keys = SigningKeys::generate()?;
+    let keys = common::test_keys();
     let public_pem = keys.public_key_pem()?;
 
     let server_agent = JwtAgent::new_ephemeral();

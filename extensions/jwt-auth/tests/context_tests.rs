@@ -1,6 +1,6 @@
 mod common;
 
-use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext, SigningKeys};
+use ankurah_jwt_auth::{JwtAgent, JwtClaims, JwtContext};
 use ankurah_proto::CollectionId;
 use common::blog_config_path;
 
@@ -156,7 +156,7 @@ fn test_nouser_context_equality() {
 
 #[test]
 fn test_nouser_can_access_jwtpolicy_collection() {
-    let keys = SigningKeys::generate().unwrap();
+    let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys, blog_config_path()).unwrap();
 
     use ankurah_core::policy::PolicyAgent;
