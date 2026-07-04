@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 /// Duplicate events (by id) are collapsed to their first occurrence. Ids are
 /// content-addressed, so cycles are impossible in honest input; a cycle means
 /// a malformed or malicious batch and returns an error.
-pub(crate) fn topo_sort_events(events: Vec<Attested<Event>>) -> Result<Vec<Attested<Event>>, MutationError> {
+pub fn topo_sort_events(events: Vec<Attested<Event>>) -> Result<Vec<Attested<Event>>, MutationError> {
     let mut by_id: BTreeMap<EventId, Attested<Event>> = BTreeMap::new();
     for event in events {
         by_id.entry(event.payload.id()).or_insert(event);
