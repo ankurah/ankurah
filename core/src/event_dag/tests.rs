@@ -2694,12 +2694,6 @@ mod comparison_property {
         StrictDescends,
         StrictAscends,
         DivergedMeet(Vec<EventId>),
-        /// A comparison head set mixing shared-lineage and foreign heads hits a
-        /// traversal-order-dependent branch in check_result: Disjoint when a
-        /// foreign genesis is recorded as other_root first, otherwise
-        /// DivergedSince with an empty meet. Pre-existing looseness (tracked as
-        /// a hardening note); the oracle accepts either.
-        EmptyMeetOrDisjoint,
         Disjoint,
     }
 
@@ -2735,11 +2729,12 @@ mod comparison_property {
             return Expected::Disjoint;
         }
 
-        // A comparison head sharing nothing with the subject's cover can never
-        // be retired: the exhaustion gate reports an empty meet (or Disjoint,
-        // depending on which genesis was recorded first).
+        // A comparison head sharing nothing with the subject's cover cannot be
+        // accounted to any common node: the exhaustion gate reports the
+        // conservative empty meet. (Disjoint is reserved for no shared
+        // history at all.)
         if comparison.iter().any(|h| ancestry(parents, std::slice::from_ref(h)).intersection(&s_cover).next().is_none()) {
-            return Expected::EmptyMeetOrDisjoint;
+            return Expected::DivergedMeet(vec![]);
         }
 
         Expected::DivergedMeet(to_antichain(parents, &common))
@@ -2757,8 +2752,6 @@ mod comparison_property {
                 want.sort();
                 got == want
             }
-            (Expected::EmptyMeetOrDisjoint, AbstractCausalRelation::DivergedSince { meet, .. }) => meet.is_empty(),
-            (Expected::EmptyMeetOrDisjoint, AbstractCausalRelation::Disjoint { .. }) => true,
             (Expected::Disjoint, AbstractCausalRelation::Disjoint { .. }) => true,
             _ => false,
         }

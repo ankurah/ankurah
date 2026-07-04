@@ -254,12 +254,7 @@ impl PropertyBackend for LWWBackend {
         }
 
         // Notify subscribers for changed fields
-        let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        for field_name in changed_fields {
-            if let Some(broadcast) = field_broadcasts.get(&field_name) {
-                broadcast.send(());
-            }
-        }
+        super::notify_changed_fields(&self.field_broadcasts, changed_fields.iter());
 
         Ok(())
     }
@@ -312,12 +307,7 @@ impl LWWBackend {
         }
 
         // Notify field subscribers for changed fields only
-        let field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
-        for field_name in changed_fields {
-            if let Some(broadcast) = field_broadcasts.get(&field_name) {
-                broadcast.send(());
-            }
-        }
+        super::notify_changed_fields(&self.field_broadcasts, changed_fields.iter());
 
         Ok(())
     }

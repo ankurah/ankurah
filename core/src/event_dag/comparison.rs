@@ -154,46 +154,80 @@ pub(crate) async fn compare<E: GetEvents>(
 struct Comparison<'a, E: GetEvents> {
     accumulator: &'a mut EventAccumulator<E>,
 
-    // Frontiers being explored
-    subject_frontier: Frontier<EventId>,
-    comparison_frontier: Frontier<EventId>,
+    /// The subject clock's backward traversal.
+    subject: Side,
+    /// The comparison clock's backward traversal.
+    comparison: Side,
 
-    // Original heads (for tracking strict descent/ascent)
-    original_subject: BTreeSet<EventId>,
-    original_comparison: BTreeSet<EventId>,
-
-    // Tracking state
+    // Shared discovery state
     states: HashMap<EventId, NodeState>,
+    /// Nodes reached by both traversals, in first-discovery order.
     meet_candidates: BTreeSet<EventId>,
-    outstanding_heads: BTreeSet<EventId>,
-
-    /// Nodes already expanded from each side. A node reachable by more than one
-    /// path can be re-added to a frontier after it was first processed; these
-    /// sets make expansion idempotent per side so heads are not double-counted
-    /// and budget is spent per-event rather than per-path.
-    subject_processed: BTreeSet<EventId>,
-    comparison_processed: BTreeSet<EventId>,
-
-    // Progress tracking
-    remaining_budget: usize,
-    /// Comparison heads reached by subject's traversal (all seen => StrictDescends).
-    /// A set, not a counter, so revisits cannot decrement the same head twice.
-    seen_comparison_heads: BTreeSet<EventId>,
-    /// Subject heads reached by comparison's traversal (all seen => StrictAscends).
-    seen_subject_heads: BTreeSet<EventId>,
     any_common: bool,
 
-    // Chain tracking (for forward chain accumulation)
-    /// Events visited from subject's traversal (child→parent order during traversal)
-    subject_visited: Vec<EventId>,
-    /// Events visited from comparison's traversal (child→parent order during traversal)
-    other_visited: Vec<EventId>,
+    remaining_budget: usize,
+}
 
-    // Root tracking (for Disjoint detection)
-    /// Genesis event found in subject's traversal (event with empty parents)
-    subject_root: Option<EventId>,
-    /// Genesis event found in comparison's traversal (event with empty parents)
-    other_root: Option<EventId>,
+/// One clock's backward traversal. Both sides are instances of this type so
+/// their bookkeeping cannot drift apart: the historical false-verdict bugs in
+/// this module came from hand-duplicated per-side accounting.
+struct Side {
+    /// This side's original head set.
+    original: BTreeSet<EventId>,
+    /// Ids queued for processing.
+    frontier: Frontier<EventId>,
+    /// Nodes already expanded from this side. A node reachable by more than
+    /// one path can be re-encountered; this set makes expansion idempotent so
+    /// budget is spent per event rather than per path and `visited` stays
+    /// duplicate-free.
+    processed: BTreeSet<EventId>,
+    /// Heads of the OPPOSITE clock reached by this traversal. A set, not a
+    /// counter, so revisits cannot double-count the same head. Seeing every
+    /// opposite head means this side's cover contains the opposite clock.
+    opposite_heads_seen: BTreeSet<EventId>,
+    /// Events this traversal processed, in child-to-parent encounter order
+    /// (reversed for forward chains).
+    visited: Vec<EventId>,
+    /// First genesis event this traversal reached (for Disjoint detection).
+    root: Option<EventId>,
+}
+
+impl Side {
+    fn new(heads: BTreeSet<EventId>) -> Self {
+        Self {
+            frontier: Frontier::new(heads.clone()),
+            original: heads,
+            processed: BTreeSet::new(),
+            opposite_heads_seen: BTreeSet::new(),
+            visited: Vec::new(),
+            root: None,
+        }
+    }
+
+    /// This side's share of processing `id`: record the visit and genesis,
+    /// expand the frontier once per node, and track opposite-head sightings.
+    ///
+    /// Expansion filters out parents already processed on this side: a longer
+    /// path arriving later must not re-queue a finished node, which would
+    /// re-spend budget and duplicate visited/chain entries.
+    fn absorb(&mut self, id: &EventId, parents: &[EventId], opposite_original: &BTreeSet<EventId>) {
+        self.visited.push(id.clone());
+        if parents.is_empty() && self.root.is_none() {
+            self.root = Some(id.clone());
+        }
+        if self.processed.insert(id.clone()) {
+            self.frontier.extend(parents.iter().filter(|p| !self.processed.contains(*p)).cloned());
+            if opposite_original.contains(id) {
+                self.opposite_heads_seen.insert(id.clone());
+            }
+        }
+    }
+
+    /// Whether this side's traversal has seen every head of the opposite
+    /// clock, i.e. this side's cover contains the opposite clock. The seen
+    /// set only ever holds members of the opposite head set, so length
+    /// equality means set equality.
+    fn covers(&self, opposite: &Side) -> bool { self.opposite_heads_seen.len() == opposite.original.len() }
 }
 
 #[derive(Clone)]
@@ -201,7 +235,6 @@ struct NodeState {
     seen_from_subject: bool,
     seen_from_comparison: bool,
     common_child_count: usize,
-    origins: Vec<EventId>,          // Tracks which comparison heads reach this node
     subject_children: Vec<EventId>, // Children from subject's traversal
     other_children: Vec<EventId>,   // Children from comparison's traversal
 }
@@ -212,7 +245,6 @@ impl NodeState {
             seen_from_subject: false,
             seen_from_comparison: false,
             common_child_count: 0,
-            origins: Vec::new(),
             subject_children: Vec::new(),
             other_children: Vec::new(),
         }
@@ -241,43 +273,28 @@ impl NodeState {
 
 impl<'a, E: GetEvents> Comparison<'a, E> {
     fn new(accumulator: &'a mut EventAccumulator<E>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
-        let subject_ids: BTreeSet<EventId> = subject.as_slice().iter().cloned().collect();
-        let comparison_ids: BTreeSet<EventId> = comparison.as_slice().iter().cloned().collect();
-
         Self {
             accumulator,
-            subject_frontier: Frontier::new(subject_ids.clone()),
-            comparison_frontier: Frontier::new(comparison_ids.clone()),
-            original_subject: subject_ids.clone(),
-            original_comparison: comparison_ids.clone(),
+            subject: Side::new(subject.as_slice().iter().cloned().collect()),
+            comparison: Side::new(comparison.as_slice().iter().cloned().collect()),
             states: HashMap::new(),
             meet_candidates: BTreeSet::new(),
-            outstanding_heads: comparison_ids.clone(),
-            subject_processed: BTreeSet::new(),
-            comparison_processed: BTreeSet::new(),
-            remaining_budget: budget,
-            seen_comparison_heads: BTreeSet::new(),
-            seen_subject_heads: BTreeSet::new(),
             any_common: false,
-            subject_visited: Vec::new(),
-            other_visited: Vec::new(),
-            subject_root: None,
-            other_root: None,
+            remaining_budget: budget,
         }
     }
 
     async fn step(&mut self) -> Result<Option<AbstractCausalRelation<EventId>>, RetrievalError> {
         // Collect frontier IDs from both frontiers
         let mut all_frontier_ids = Vec::new();
-        all_frontier_ids.extend(self.subject_frontier.ids.iter().cloned());
-        all_frontier_ids.extend(self.comparison_frontier.ids.iter().cloned());
+        all_frontier_ids.extend(self.subject.frontier.ids.iter().cloned());
+        all_frontier_ids.extend(self.comparison.frontier.ids.iter().cloned());
 
-        // Fetch events individually via accumulator (replaces batch expand_frontier)
         for id in &all_frontier_ids {
             // Skip events already processed (e.g. an ID that appeared in both
             // frontiers gets collected twice but was already handled on its
             // first encounter).
-            if !self.subject_frontier.ids.contains(id) && !self.comparison_frontier.ids.contains(id) {
+            if !self.subject.frontier.ids.contains(id) && !self.comparison.frontier.ids.contains(id) {
                 continue;
             }
 
@@ -285,14 +302,14 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
                 Ok(event) => event,
                 Err(RetrievalError::EventNotFound(_)) => {
                     // Event is unfetchable. If it's currently on both frontiers,
-                    // it's a common ancestor — process with empty parents to
+                    // it's a common ancestor -- process with empty parents to
                     // terminate the traversal at this point. This handles the
                     // ephemeral node scenario where the meet point event is
                     // unreachable from local storage.
                     // Note: we check at processing time, not collection time,
                     // because process_event for earlier events in this loop may
                     // have added IDs to frontiers.
-                    if self.subject_frontier.ids.contains(id) && self.comparison_frontier.ids.contains(id) {
+                    if self.subject.frontier.ids.contains(id) && self.comparison.frontier.ids.contains(id) {
                         self.process_event(id.clone(), &[]);
                         continue;
                     }
@@ -310,111 +327,43 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
     }
 
     fn process_event(&mut self, id: EventId, parents: &[EventId]) {
-        let from_subject = self.subject_frontier.remove(&id);
-        let from_comparison = self.comparison_frontier.remove(&id);
+        let from_subject = self.subject.frontier.remove(&id);
+        let from_comparison = self.comparison.frontier.remove(&id);
 
-        // Track visited events for chain building (in child→parent order during traversal)
-        if from_subject {
-            self.subject_visited.push(id.clone());
-        }
-        if from_comparison {
-            self.other_visited.push(id.clone());
-        }
-
-        // Update node state
-        let (is_common, origins) = {
+        // Update shared node state
+        let is_common = {
             let state = self.states.entry(id.clone()).or_insert_with(NodeState::new);
             state.mark_seen_from(from_subject, from_comparison);
-
-            // Track origins for comparison heads
-            if from_comparison && self.original_comparison.contains(&id) {
-                state.origins.push(id.clone());
-            }
-
-            (state.is_common(), state.origins.clone())
+            state.is_common()
         };
 
-        // Handle common nodes
+        // First discovery of a common node: a meet candidate. Its parents
+        // gain a common child, which disqualifies them from the final meet
+        // (an ancestor of shared history is not its edge).
         if is_common && self.meet_candidates.insert(id.clone()) {
             self.any_common = true;
-
-            // Remove satisfied heads from checklist
-            for origin in &origins {
-                self.outstanding_heads.remove(origin);
-            }
-
-            // Update parent states
             for parent in parents {
-                let parent_state = self.states.entry(parent.clone()).or_insert_with(NodeState::new);
-                if from_comparison {
-                    parent_state.origins.extend(origins.clone());
-                }
-                parent_state.common_child_count += 1;
-            }
-        } else if from_comparison {
-            // Propagate origins
-            for parent in parents {
-                self.states.entry(parent.clone()).or_insert_with(NodeState::new).origins.extend(origins.clone());
-                // A head whose origins arrive at an already-common node is
-                // satisfied. Heads are otherwise retired only at the moment a
-                // node first becomes common, so an origin arriving one step
-                // later via a longer path would stay outstanding forever and
-                // force an empty meet (V2).
-                if self.meet_candidates.contains(parent) {
-                    for origin in &origins {
-                        self.outstanding_heads.remove(origin);
-                    }
-                }
+                self.states.entry(parent.clone()).or_insert_with(NodeState::new).common_child_count += 1;
             }
         }
 
         // Register this event as a child of each of its parents (for immediate children tracking)
         for parent in parents {
-            let parent_state = self.states.entry(parent.clone()).or_insert_with(NodeState::new);
-            parent_state.add_child(id.clone(), from_subject, from_comparison);
+            self.states.entry(parent.clone()).or_insert_with(NodeState::new).add_child(id.clone(), from_subject, from_comparison);
         }
 
-        // Detect genesis events (empty parents) for Disjoint detection
-        if parents.is_empty() {
-            if from_subject && self.subject_root.is_none() {
-                self.subject_root = Some(id.clone());
-            }
-            if from_comparison && self.other_root.is_none() {
-                self.other_root = Some(id.clone());
-            }
+        if from_subject {
+            self.subject.absorb(&id, parents, &self.comparison.original);
         }
-
-        // Extend frontiers with parents, but only expand each node once per side.
-        // Without this guard a node reached by two paths is expanded twice, which
-        // re-runs head accounting and re-spends budget (V1). Head tracking uses
-        // sets so it is idempotent regardless, but skipping re-expansion also
-        // keeps budget per-event and avoids redundant fetches. Parents already
-        // processed on this side are filtered out too: a longer path arriving
-        // later would otherwise re-queue a finished node, re-spending budget and
-        // duplicating visited/chain entries.
-        if from_subject && self.subject_processed.insert(id.clone()) {
-            self.subject_frontier.extend(parents.iter().filter(|p| !self.subject_processed.contains(*p)).cloned());
-
-            // Check if subject's traversal reached a comparison head
-            if self.original_comparison.contains(&id) {
-                self.seen_comparison_heads.insert(id.clone());
-            }
-        }
-
-        if from_comparison && self.comparison_processed.insert(id.clone()) {
-            self.comparison_frontier.extend(parents.iter().filter(|p| !self.comparison_processed.contains(*p)).cloned());
-
-            // Check if comparison's traversal reached a subject head
-            if self.original_subject.contains(&id) {
-                self.seen_subject_heads.insert(id.clone());
-            }
+        if from_comparison {
+            self.comparison.absorb(&id, parents, &self.subject.original);
         }
     }
 
     /// Build forward chain from visited events, trimmed to start after meet.
-    /// Visited is in child→parent order, so we reverse and filter.
-    fn build_forward_chain(&self, visited: &[EventId], meet: &BTreeSet<EventId>) -> Vec<EventId> {
-        // Reverse to get parent→child (causal) order
+    /// Visited is in child-to-parent order, so we reverse and filter.
+    fn build_forward_chain(visited: &[EventId], meet: &BTreeSet<EventId>) -> Vec<EventId> {
+        // Reverse to get parent-to-child (causal) order
         let mut chain: Vec<_> = visited.iter().rev().cloned().collect();
 
         // Find first event after meet (drop meet and everything before it)
@@ -456,79 +405,58 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
     }
 
     fn check_result(&mut self) -> Option<AbstractCausalRelation<EventId>> {
-        // StrictDescends: subject's traversal has seen all comparison heads.
-        // seen_comparison_heads only ever holds members of original_comparison,
-        // so length equality means set equality.
-        if self.seen_comparison_heads.len() == self.original_comparison.len() {
-            // Seeing every comparison head proves cover containment, but the
-            // adoption semantics of StrictDescends require more: every subject
-            // head must share lineage with the comparison. A subject clock
-            // that juxtaposes a foreign lineage (e.g. an extra disjoint root)
-            // covers the comparison heads via its other components while
-            // smuggling in unrelated history (V3). Such a shape must not fire
-            // here; left to run, the traversal exhausts and yields the
-            // diverged verdict, so the foreign line merges through layers
-            // instead of being adopted wholesale.
-            //
-            // Sharing lineage means the head's ancestry intersects the
-            // comparison heads' ancestry, not that it reaches a comparison
-            // head: a legitimate subject head may be a sibling of a comparison
-            // head (concurrent tips joined by the subject clock), grounded
-            // through a common ancestor. Ancestry here includes parent ids
-            // referenced by explored events even when not yet fetched; those
-            // edges are real DAG structure, so intersecting on them is sound
-            // and preserves early termination.
+        // StrictDescends: the subject's traversal has seen every comparison
+        // head, proving cover containment. The adoption semantics of
+        // StrictDescends require more: every subject head must share lineage
+        // with the comparison. A subject clock that juxtaposes a foreign
+        // lineage (e.g. an extra disjoint root) covers the comparison heads
+        // via its other components while smuggling in unrelated history (V3).
+        // Such a shape must not fire here; left to run, the traversal
+        // exhausts and yields the diverged verdict, so the foreign line
+        // merges through layers instead of being adopted wholesale.
+        //
+        // Sharing lineage means the head's ancestry intersects the comparison
+        // heads' ancestry, not that it reaches a comparison head: a
+        // legitimate subject head may be a sibling of a comparison head
+        // (concurrent tips joined by the subject clock), grounded through a
+        // common ancestor. Ancestry here includes parent ids referenced by
+        // explored events even when not yet fetched; those edges are real DAG
+        // structure, so intersecting on them is sound and preserves early
+        // termination.
+        if self.subject.covers(&self.comparison) {
             let dag = self.accumulator.dag();
-            let comparison_heads: Vec<EventId> = self.original_comparison.iter().cloned().collect();
+            let comparison_heads: Vec<EventId> = self.comparison.original.iter().cloned().collect();
             let comparison_ancestry = compute_ancestry_from_dag(dag, &comparison_heads);
-            let grounded = self
-                .original_subject
-                .iter()
-                .all(|head| compute_ancestry_from_dag(dag, std::slice::from_ref(head)).iter().any(|id| comparison_ancestry.contains(id)));
+            let grounded =
+                self.subject.original.iter().all(|head| {
+                    compute_ancestry_from_dag(dag, std::slice::from_ref(head)).iter().any(|id| comparison_ancestry.contains(id))
+                });
             if grounded {
-                // Build forward chain from comparison head to subject head
-                // The subject_visited contains events from subject head backward
-                // We need the forward chain (older to newer), excluding the comparison heads themselves
+                // Forward chain (older to newer), excluding the comparison
+                // heads themselves.
                 let chain: Vec<_> =
-                    self.subject_visited.iter().rev().filter(|id| !self.original_comparison.contains(id)).cloned().collect();
+                    self.subject.visited.iter().rev().filter(|id| !self.comparison.original.contains(id)).cloned().collect();
                 return Some(AbstractCausalRelation::StrictDescends { chain });
             }
         }
 
-        // StrictAscends: comparison's traversal has seen all subject heads
-        // This means subject is older (strictly before comparison)
-        if self.seen_subject_heads.len() == self.original_subject.len() {
+        // StrictAscends: the comparison's traversal has seen every subject
+        // head, so the subject is already covered by the comparison.
+        // Deliberately cover-only, no grounding: this verdict drives
+        // skip-the-incoming decisions, for which covering is sufficient.
+        if self.comparison.covers(&self.subject) {
             return Some(AbstractCausalRelation::StrictAscends);
         }
 
         // Check if frontiers are exhausted
-        if self.subject_frontier.is_empty() && self.comparison_frontier.is_empty() {
-            // Reconcile outstanding heads by reachability before the empty-meet
-            // gate. Incremental origin retirement is best-effort: origins that
-            // arrive at a node after it was already expanded stall there (the
-            // traversal will not expand it again), so a head can stay
-            // outstanding even though a common node is reachable from it. The
-            // ground truth is reachability over the accumulated DAG, which is
-            // complete for both traversals at exhaustion.
-            if !self.outstanding_heads.is_empty() && self.any_common {
-                let dag = self.accumulator.dag();
-                let meet_candidates = &self.meet_candidates;
-                self.outstanding_heads.retain(|head| {
-                    let ancestry = compute_ancestry_from_dag(dag, std::slice::from_ref(head));
-                    !ancestry.iter().any(|id| meet_candidates.contains(id))
-                });
-            }
-
-            // Compute minimal common ancestors
-            let meet: Vec<_> =
-                self.meet_candidates.iter().filter(|id| self.states.get(*id).map_or(0, |s| s.common_child_count) == 0).cloned().collect();
-
-            // Determine final relation based on frontier states and findings
-            if !self.any_common || !self.outstanding_heads.is_empty() {
-                // No common ancestors found - check if we have different roots (Disjoint)
-                if let (Some(subject_root), Some(other_root)) = (&self.subject_root, &self.other_root) {
+        if self.subject.frontier.is_empty() && self.comparison.frontier.is_empty() {
+            // No shared history discovered: the clocks are disjoint when the
+            // two traversals bottomed out at different genesis events. (Both
+            // roots are always found by exhaustion; the fallthrough is
+            // defensive.)
+            if !self.any_common {
+                if let (Some(subject_root), Some(other_root)) = (&self.subject.root, &self.comparison.root) {
                     if subject_root != other_root {
-                        // Proven different genesis events
                         return Some(AbstractCausalRelation::Disjoint {
                             gca: None,
                             subject_root: subject_root.clone(),
@@ -536,7 +464,6 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
                         });
                     }
                 }
-                // Couldn't prove disjoint - return DivergedSince with empty meet
                 return Some(AbstractCausalRelation::DivergedSince {
                     meet: vec![],
                     subject: vec![],
@@ -546,10 +473,38 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
                 });
             }
 
+            // Shared history exists. Every comparison head must be accounted
+            // for: some common node reachable backward from it over the
+            // accumulated DAG, which is complete for both traversals at
+            // exhaustion. A head sharing nothing with the subject forces the
+            // conservative empty meet, so the merge machinery re-layers
+            // rather than pretending a partial meet covers the whole clock.
+            let dag = self.accumulator.dag();
+            let meet_candidates = &self.meet_candidates;
+            let all_heads_accounted = self
+                .comparison
+                .original
+                .iter()
+                .all(|head| compute_ancestry_from_dag(dag, std::slice::from_ref(head)).iter().any(|id| meet_candidates.contains(id)));
+            if !all_heads_accounted {
+                return Some(AbstractCausalRelation::DivergedSince {
+                    meet: vec![],
+                    subject: vec![],
+                    other: vec![],
+                    subject_chain: vec![],
+                    other_chain: vec![],
+                });
+            }
+
+            // The meet: common nodes with no common children, i.e. the
+            // maximal antichain of the shared region.
+            let meet: Vec<_> =
+                self.meet_candidates.iter().filter(|id| self.states.get(*id).map_or(0, |s| s.common_child_count) == 0).cloned().collect();
+
             // Build forward chains from meet to tips
             let meet_set: BTreeSet<_> = meet.iter().cloned().collect();
-            let subject_chain = self.build_forward_chain(&self.subject_visited, &meet_set);
-            let other_chain = self.build_forward_chain(&self.other_visited, &meet_set);
+            let subject_chain = Self::build_forward_chain(&self.subject.visited, &meet_set);
+            let other_chain = Self::build_forward_chain(&self.comparison.visited, &meet_set);
 
             // Collect immediate children of meet toward each side
             let (subject_immediate, other_immediate) = self.collect_immediate_children(&meet);
@@ -565,8 +520,8 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         } else if self.remaining_budget == 0 {
             // Budget exhausted
             Some(AbstractCausalRelation::BudgetExceeded {
-                subject: self.subject_frontier.ids.clone(),
-                other: self.comparison_frontier.ids.clone(),
+                subject: self.subject.frontier.ids.clone(),
+                other: self.comparison.frontier.ids.clone(),
             })
         } else {
             // Continue exploration

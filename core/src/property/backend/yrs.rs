@@ -173,12 +173,7 @@ impl PropertyBackend for YrsBackend {
             self.apply_update(&operation.diff, &changed_fields)?;
         }
         //Only notify field subscribers for fields that actually changed
-        let field_broadcasts = self.field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
-        for field_name in changed_fields.lock().unwrap().iter() {
-            if let Some(broadcast) = field_broadcasts.get(field_name) {
-                broadcast.send(());
-            }
-        }
+        super::notify_changed_fields(&self.field_broadcasts, changed_fields.lock().unwrap().iter());
 
         Ok(())
     }
@@ -198,12 +193,7 @@ impl PropertyBackend for YrsBackend {
         }
 
         // Notify field subscribers for fields that actually changed
-        let field_broadcasts = self.field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
-        for field_name in changed_fields.lock().unwrap().iter() {
-            if let Some(broadcast) = field_broadcasts.get(field_name) {
-                broadcast.send(());
-            }
-        }
+        super::notify_changed_fields(&self.field_broadcasts, changed_fields.lock().unwrap().iter());
 
         Ok(())
     }

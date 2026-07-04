@@ -98,6 +98,19 @@ pub trait PropertyBackend: Any + Send + Sync + Debug + 'static {
 // or if they can take a generic, they should also take a `Vec<u8>`.
 
 // TODO: Implement a property backend type registry rather than this hardcoded nonsense.
+/// Fire the change broadcast for each named field that has subscribers.
+pub(crate) fn notify_changed_fields<'a>(
+    field_broadcasts: &std::sync::Mutex<std::collections::BTreeMap<crate::property::PropertyName, ankurah_signals::broadcast::Broadcast>>,
+    changed: impl IntoIterator<Item = &'a crate::property::PropertyName>,
+) {
+    let broadcasts = field_broadcasts.lock().expect("field_broadcasts lock is poisoned");
+    for field_name in changed {
+        if let Some(broadcast) = broadcasts.get(field_name) {
+            broadcast.send(());
+        }
+    }
+}
+
 pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<dyn PropertyBackend>, RetrievalError> {
     if name == "yrs" {
         let backend = match buffer {

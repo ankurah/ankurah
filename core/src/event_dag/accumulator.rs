@@ -221,8 +221,13 @@ impl<E: GetEvents> EventLayers<E> {
 /// This is the new EventLayer that carries DAG structure (parent pointers only)
 /// rather than full event clones. The `compare()` method is infallible since
 /// it only traverses parent pointers, treating missing entries as dead ends.
+///
+/// `pub` only so `PropertyBackend::apply_layer` (a public trait method) has a
+/// reachable parameter type; its constructor and accessors remain
+/// crate-internal while the external backend API surface is designed
+/// (ankurah#267).
 #[derive(Debug, Clone)]
-pub(crate) struct EventLayer {
+pub struct EventLayer {
     pub(crate) already_applied: Vec<Event>,
     pub(crate) to_apply: Vec<Event>,
     /// Shared DAG structure for causal comparison: event_id -> parent_ids.

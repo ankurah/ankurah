@@ -68,6 +68,31 @@ impl NodeApplier {
         Ok(())
     }
 
+    /// Validate each event fragment against policy and stage it for BFS
+    /// discovery. Shared by every update arm that carries events.
+    fn validate_and_stage<SE, PA, E>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        entity_id: proto::EntityId,
+        collection_id: &proto::CollectionId,
+        event_fragments: Vec<proto::EventFragment>,
+        event_getter: &E,
+    ) -> Result<Vec<Attested<proto::Event>>, MutationError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        E: SuspenseEvents + Send + Sync,
+    {
+        let mut attested_events = Vec::new();
+        for fragment in event_fragments {
+            let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
+            node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
+            event_getter.stage_event(attested_event.payload.clone());
+            attested_events.push(attested_event);
+        }
+        Ok(attested_events)
+    }
+
     async fn apply_update<SE, PA, E, S>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
@@ -90,13 +115,8 @@ impl NodeApplier {
         match content {
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
-                let mut attested_events = Vec::new();
-                for fragment in event_fragments {
-                    let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
-                    node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
-                    event_getter.stage_event(attested_event.payload.clone());
-                    attested_events.push(attested_event);
-                }
+                let attested_events =
+                    Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, event_getter)?;
 
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
                 let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
@@ -141,13 +161,8 @@ impl NodeApplier {
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
-                let mut attested_events = Vec::new();
-                for fragment in event_fragments {
-                    let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
-                    node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
-                    event_getter.stage_event(attested_event.payload.clone());
-                    attested_events.push(attested_event);
-                }
+                let attested_events =
+                    Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, event_getter)?;
 
                 let state = (entity_id, collection_id.clone(), state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
