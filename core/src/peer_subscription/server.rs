@@ -124,7 +124,7 @@ impl SubscriptionHandler {
             }
 
             // Only include delta if heads differ (None means heads are equal)
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection).await? {
+            if let Some(delta) = node.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
                 deltas.push(delta);
             }
         }

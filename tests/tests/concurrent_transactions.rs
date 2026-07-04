@@ -11,13 +11,14 @@ use common::*;
 #[tokio::test]
 async fn test_concurrent_transactions_same_entity() -> Result<()> {
     let context = durable_sled_setup().await?.context_async(DEFAULT_CONTEXT).await;
+    let mut dag = TestDag::new();
 
     // Create initial entity
     let album_id = {
         let trx = context.begin();
         let album = trx.create(&Album { name: "Initial Name".to_owned(), year: "2024".to_owned() }).await?;
         let id = album.id();
-        trx.commit().await?;
+        dag.enumerate(trx.commit_and_return_events().await?); // A = genesis
         id
     };
 
@@ -37,13 +38,13 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
     album_mut2.year().replace("2025")?;
 
     // Commit first transaction - this should succeed
-    trx1.commit().await?;
+    dag.enumerate(trx1.commit_and_return_events().await?); // B = first concurrent update
 
     // Commit second transaction - this should handle the concurrent update
     // The second transaction's event has parent that equals the head before trx1 committed,
     // but now the head has been updated by trx1. This should be detected as NotDescends
     // and handled appropriately.
-    trx2.commit().await?;
+    dag.enumerate(trx2.commit_and_return_events().await?); // C = second concurrent update
 
     // Verify both changes were applied via the live entity view
     let final_album = context.get::<AlbumView>(album_id).await?;
@@ -70,6 +71,18 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
             head_id.to_base64_short()
         );
     }
+
+    // Verify DAG structure using assert_dag! macro
+    // Expected structure:
+    //       A (genesis - create)
+    //      / \
+    //     B   C (concurrent updates)
+    assert_dag!(dag, persisted_events, {
+        A => [],      // genesis (no parents)
+        B => [A],
+        C => [A],
+    });
+    clock_eq!(dag, persisted_head, [B, C]);
 
     Ok(())
 }

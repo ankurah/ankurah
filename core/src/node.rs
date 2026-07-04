@@ -23,7 +23,7 @@ use crate::{
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
     reactor::{AbstractEntity, Reactor},
-    retrieval::LocalRetriever,
+    retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
     system::SystemManager,
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
@@ -454,7 +454,7 @@ where
 
                     // Generate delta based on known_matches (returns None if heads are equal)
                     // No need to reconstruct Entity - work directly with EntityState
-                    if let Some(delta) = self.generate_entity_delta(&known_map, state, &storage_collection).await? {
+                    if let Some(delta) = self.generate_entity_delta(&known_map, state, &storage_collection, cdata).await? {
                         deltas.push(delta);
                     }
                 }
@@ -558,20 +558,27 @@ where
             let collection = self.collections.get(&event.payload.collection).await?;
 
             // When applying an event, we should only look at the local storage for the lineage
-            let retriever = LocalRetriever::new(collection.clone());
-            let entity = self.entities.get_retrieve_or_create(&retriever, &event.payload.collection, &event.payload.entity_id).await?;
+            let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
+            let state_getter = LocalStateGetter::new(collection.clone());
+            let entity = self
+                .entities
+                .get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id)
+                .await?;
+
+            // Stage the event so BFS can discover it
+            event_getter.stage_event(event.payload.clone());
 
             // Handle creates vs updates differently for policy validation
             let (entity_before, entity_after, already_applied) = if event.payload.is_entity_create() && entity.head().is_empty() {
                 // Create: apply to entity directly, use as both before/after
-                entity.apply_event(&retriever, &event.payload).await?;
+                entity.apply_event(&event_getter, &event.payload).await?;
                 (entity.clone(), entity.clone(), true)
             } else {
                 // Update: snapshot, apply to fork for validation
                 use std::sync::atomic::AtomicBool;
                 let trx_alive = Arc::new(AtomicBool::new(true));
                 let forked = entity.snapshot(trx_alive);
-                forked.apply_event(&retriever, &event.payload).await?;
+                forked.apply_event(&event_getter, &event.payload).await?;
                 (entity.clone(), forked, false)
             };
 
@@ -580,15 +587,18 @@ where
                 event.attestations.push(attestation);
             }
 
+            // Commit the staged event to permanent storage
+            event_getter.commit_event(event).await?;
+
             // For updates only: apply event to real entity (creates already applied above)
-            let applied = if already_applied { true } else { entity.apply_event(&retriever, &event.payload).await? };
+            // Event is now in storage, so BFS will find it
+            let applied = if already_applied { true } else { entity.apply_event(&event_getter, &event.payload).await? };
 
             if applied {
                 let state = entity.to_state()?;
                 let entity_state = EntityState { entity_id: entity.id(), collection: entity.collection().clone(), state };
                 let attestation = self.policy_agent.attest_state(self, &entity_state);
                 let attested = Attested::opt(entity_state, attestation);
-                collection.add_event(event).await?;
                 collection.set_state(attested).await?;
                 changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
             }
@@ -601,15 +611,17 @@ where
 
     /// Generate EntityDelta for an entity state, using known_matches to decide between StateSnapshot and EventBridge
     /// Returns None if the entity is in known_matches with equal heads (client already has current state)
-    pub(crate) async fn generate_entity_delta(
+    pub(crate) async fn generate_entity_delta<C>(
         &self,
         known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
         entity_state: proto::Attested<proto::EntityState>,
         storage_collection: &crate::storage::StorageCollectionWrapper,
+        cdata: &C,
     ) -> anyhow::Result<Option<proto::EntityDelta>>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
+        C: crate::util::Iterable<PA::ContextData>,
     {
         // Destructure to take ownership and avoid clones
         let proto::Attested { payload: proto::EntityState { entity_id, collection, state }, attestations } = entity_state;
@@ -623,7 +635,7 @@ where
             }
 
             // Case 2: Heads differ → try to build EventBridge (cheaper than full state) ✓
-            match self.collect_event_bridge(storage_collection, known_head, current_head).await {
+            match self.collect_event_bridge(storage_collection, known_head, current_head, cdata).await {
                 Ok(attested_events) if !attested_events.is_empty() => {
                     // Convert Attested<Event> to EventFragments (strips entity_id and collection)
                     let event_fragments: Vec<proto::EventFragment> = attested_events.into_iter().map(|e| e.into()).collect();
@@ -645,53 +657,85 @@ where
         Ok(Some(proto::EntityDelta { entity_id, collection, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
 
-    /// Collect events between known_head and current_head using lineage comparison
-    pub(crate) async fn collect_event_bridge(
+    /// Collect events between known_head and current_head using event_dag comparison.
+    /// Returns events needed to advance from known_head to current_head.
+    pub(crate) async fn collect_event_bridge<C>(
         &self,
         storage_collection: &crate::storage::StorageCollectionWrapper,
         known_head: &proto::Clock,
         current_head: &proto::Clock,
+        cdata: &C,
     ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
+        C: crate::util::Iterable<PA::ContextData>,
     {
-        use crate::lineage::{EventAccumulator, Ordering};
-        use crate::retrieval::LocalRetriever;
+        use crate::event_dag::{compare, AbstractCausalRelation};
+        use crate::retrieval::LocalEventGetter;
+        use std::collections::HashSet;
 
-        let retriever = LocalRetriever::new(storage_collection.clone());
-        let accumulator = EventAccumulator::new(None); // No limit for Phase 1
-        let mut comparison = crate::lineage::Comparison::new_with_accumulator(
-            &retriever,
-            current_head,
-            known_head,
-            100000, // TODO: make budget configurable
-            Some(accumulator),
-        );
+        let event_getter = LocalEventGetter::new(storage_collection.clone(), self.durable);
 
-        // Run comparison
-        loop {
-            match comparison.step().await? {
-                Some(Ordering::Descends) => {
-                    // Current descends from known - perfect for event bridge
-                    break;
+        // First check the causal relationship
+        let comparison_result = compare(&event_getter, current_head, known_head, 100000).await?;
+
+        match comparison_result.relation {
+            AbstractCausalRelation::Equal => {
+                // Heads are equal - no events needed
+                Ok(vec![])
+            }
+            AbstractCausalRelation::StrictDescends { chain: _ } => {
+                // Current descends from known - collect events by walking backward
+                // TODO: Optimize with forward chain from relation (GitHub #200)
+                let known_set: HashSet<_> = known_head.as_slice().iter().collect();
+                let mut events = Vec::new();
+                let mut frontier: Vec<proto::EventId> = current_head.as_slice().to_vec();
+                let mut visited: HashSet<proto::EventId> = HashSet::new();
+
+                while !frontier.is_empty() {
+                    let batch = std::mem::take(&mut frontier);
+                    let fetched = storage_collection.get_events(batch).await?;
+
+                    for event in fetched {
+                        let id = event.payload.id();
+                        if visited.insert(id.clone()) && !known_set.contains(&id) {
+                            // Add parents to frontier (walking backward)
+                            for parent in event.payload.parent.as_slice() {
+                                if !visited.contains(parent) && !known_set.contains(parent) {
+                                    frontier.push(parent.clone());
+                                }
+                            }
+                            events.push(event);
+                        }
+                    }
                 }
-                Some(Ordering::Equal) => {
-                    // Heads are equal - no events needed
-                    break;
+
+                // Receivers must not learn events the read policy hides.
+                // One unreadable event makes the whole bridge unusable (a
+                // chain with a hole loses operations downstream), so give up
+                // entirely and let the caller fall back to a state snapshot,
+                // which passes its own read check.
+                for event in &events {
+                    match self.policy_agent.check_read_event(cdata, event) {
+                        Ok(()) => {}
+                        Err(AccessDenied::ByPolicy(_)) => return Ok(vec![]),
+                        Err(e) => return Err(anyhow!("check_read_event failed while building event bridge: {}", e)),
+                    }
                 }
-                Some(_) => {
-                    // Other relationships (NotDescends, Incomparable, etc.) - can't build bridge
-                    return Ok(vec![]);
-                }
-                None => {
-                    // Continue stepping
-                }
+
+                // Backward BFS discovery order is not a causal order (uneven
+                // branch lengths interleave); sort parents-first so the wire
+                // carries a sane order. Receivers sort again and must not
+                // trust this.
+                let events = crate::event_dag::ordering::topo_sort_events(events)?;
+                Ok(events)
+            }
+            _ => {
+                // Other relationships (NotDescends, Incomparable, etc.) - can't build simple bridge
+                Ok(vec![])
             }
         }
-
-        // Extract accumulated events
-        Ok(comparison.take_accumulated_events().unwrap_or_default())
     }
 
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }
@@ -824,11 +868,14 @@ where
     ) -> Result<Vec<Entity>, RetrievalError> {
         let storage_collection = self.collections.get(collection_id).await?;
         let initial_states = storage_collection.fetch_states(selection).await?;
-        let retriever = crate::retrieval::LocalRetriever::new(storage_collection);
+        let state_getter = LocalStateGetter::new(storage_collection.clone());
+        let event_getter = LocalEventGetter::new(storage_collection, self.durable);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
-            let (_, entity) =
-                self.entities.with_state(&retriever, state.payload.entity_id, collection_id.clone(), state.payload.state).await?;
+            let (_, entity) = self
+                .entities
+                .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
+                .await?;
             entities.push(entity);
         }
         Ok(entities)

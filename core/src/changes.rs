@@ -20,14 +20,21 @@ impl ChangeNotification for EntityChange {
 // TODO consider a flattened version of EntityChange that includes the entity and Vec<(operations, parent, attestations)> rather than a Vec<Attested<Event>>
 impl EntityChange {
     pub fn new(entity: Entity, events: Vec<Attested<Event>>) -> Result<Self, MutationError> {
-        // validate that all events have the same entity id as the entity
-        // and that the event ids are present in the entity's head clock
-        for event in &events {
-            let head = entity.head();
+        // Every event must belong to this entity and be part of its current
+        // history: either a head tip, or the parent of a later event in the
+        // same batch (an ancestor superseded within an ordered multi-event
+        // batch, e.g. a bridge or a multi-event subscription item). Requiring
+        // head membership alone rejects legitimate parent-then-child batches
+        // after both events applied.
+        let head = entity.head();
+        for (i, event) in events.iter().enumerate() {
             if event.payload.entity_id != entity.id {
                 return Err(MutationError::InvalidEvent);
             }
-            if !head.contains(&event.payload.id()) {
+            let id = event.payload.id();
+            let in_head = head.contains(&id);
+            let superseded_in_batch = events[i + 1..].iter().any(|later| later.payload.parent.contains(&id));
+            if !in_head && !superseded_in_batch {
                 return Err(MutationError::InvalidEvent);
             }
         }
