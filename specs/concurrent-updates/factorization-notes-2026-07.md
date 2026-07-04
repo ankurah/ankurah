@@ -126,3 +126,14 @@ deferred to this pass:
 24. **False positive to remember:** the `use std::collections::HashMap`
     inside the assert_dag! macro body is load-bearing (macro_export
     expands at call sites in other files); do not "clean" it.
+
+## Status stamp, 2026-07-04
+
+RFC issues #265 (comparison core), #266 (indexed causality), #267
+(backend contract), #268 (ingest pipeline) now carry the strategic
+items. Landed directly in PR #201 before merge: items 1 and 2 (Side
+type; origins machinery removed, reachability-only accounting), item 9
+(Disjoint requires no shared history; oracle pins one verdict), item
+19 provisionally (EventLayer pub with crate-internal surface), item 21
+(notify_changed_fields helper), item 22 (validate_and_stage helper).
+Still open here or in the RFCs: items 4-8, 10-18, 20, 23.
