@@ -10,7 +10,7 @@
 //! relation and accumulator, layer draining, and batch topological sort.
 
 use crate::error::{MutationError, RetrievalError};
-use crate::event_dag::accumulator::{ComparisonResult, EventLayer, EventLayers};
+use crate::event_dag::accumulator::{ComparisonResult, EventLayers};
 use crate::event_dag::compare as compare_internal;
 use crate::event_dag::ordering::topo_sort_events as topo_sort_internal;
 use crate::retrieval::GetEvents;
@@ -19,8 +19,17 @@ use ankurah_proto::{Attested, Clock, Event, EventId};
 pub use crate::event_dag::relation::AbstractCausalRelation;
 pub use crate::event_dag::DEFAULT_BUDGET;
 
-/// Re-exported so bench code can name the layer-drain iterator's output.
-pub use crate::event_dag::accumulator::EventLayer as BenchEventLayer;
+/// Sizes of a drained layer. The internal `EventLayer` keeps its event vecs
+/// `pub(crate)`; the benches only need the counts (to drive draining and to
+/// keep the work from being optimized away), so we surface those rather than
+/// widen `EventLayer`'s public API.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchLayer {
+    /// Events this layer would apply (not yet in the current head ancestry).
+    pub to_apply: usize,
+    /// Events already present in the current head ancestry.
+    pub already_applied: usize,
+}
 
 /// Compare two clocks over the given event source, returning the causal
 /// relation and the accumulated DAG. Mirror of the internal `compare`.
@@ -54,8 +63,10 @@ impl<E: GetEvents> BenchComparisonResult<E> {
 pub struct BenchEventLayers<E: GetEvents>(EventLayers<E>);
 
 impl<E: GetEvents> BenchEventLayers<E> {
-    /// Yield the next topological layer, or `None` when drained.
-    pub async fn next(&mut self) -> Result<Option<EventLayer>, RetrievalError> { self.0.next().await }
+    /// Yield the next topological layer's sizes, or `None` when drained.
+    pub async fn next(&mut self) -> Result<Option<BenchLayer>, RetrievalError> {
+        Ok(self.0.next().await?.map(|layer| BenchLayer { to_apply: layer.to_apply.len(), already_applied: layer.already_applied.len() }))
+    }
 }
 
 /// Topologically sort a batch of events parents-first. Mirror of the internal
