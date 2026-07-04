@@ -50,4 +50,4 @@ Standards: real sources with working links (verified), primary sources preferred
 - [x] 05-testing.md
 - [x] 06-staleness-horizons.md
 - [x] 07-database-internals.md
-- [ ] design-deltas.md (adversarial synthesis)
+- [x] design-deltas.md (adversarial synthesis)
