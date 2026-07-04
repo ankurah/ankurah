@@ -1,0 +1,271 @@
+# Old-engine (pre-#201) benchmark, for reproducing the origin/main baseline.
+# Apply from a clean checkout of origin/main 81082afd:
+#   git checkout 81082afd
+#   git apply core/benches/baseline-main-benches.patch   # path relative to repo root
+#   cargo bench -p ankurah-core --bench lineage_baseline
+# This bench uses only the old engine's public lineage::compare API; no core
+# source changes are needed. NEVER commit it to the baseline tree.
+#
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+index 20f3d352..a5de85f0 100644
+--- a/core/Cargo.toml
++++ b/core/Cargo.toml
+@@ -64,3 +64,8 @@ uniffi               = { version = "0.29", optional = true }
+ [dev-dependencies]
+ maplit         = "1.0"
+ ankurah-derive = { path = "../derive", version = "=0.8.1" }
++criterion      = { version = "0.5", features = ["async_tokio"] }
++
++[[bench]]
++name    = "lineage_baseline"
++harness = false
+diff --git a/core/benches/lineage_baseline.rs b/core/benches/lineage_baseline.rs
+new file mode 100644
+index 00000000..e9343e28
+--- /dev/null
++++ b/core/benches/lineage_baseline.rs
+@@ -0,0 +1,244 @@
++//! Old-engine (pre-#201) baseline benchmarks for workstream E1.
++//!
++//! This file is DELIBERATELY UNCOMMITTED in the baseline-main checkout (detached
++//! HEAD at origin/main 81082afd). It is preserved as a patch on the E1 branch
++//! (`benches/baseline-main-benches.patch`) so the old-engine numbers are
++//! reproducible without committing to the pinned baseline tree.
++//!
++//! It ports the same DAG shapes as the new-engine `event_dag` bench to the old
++//! `lineage::compare` API, which operates over the generic `TClock`/`TEvent`/
++//! `GetEvents` traits with integer ids (no content addressing). Verdict names
++//! differ from the new engine:
++//!   Descends        <- linear_deep, wide_antichain  (== new StrictDescends)
++//!   NotDescends     <- diamond_chain                (== new DivergedSince)
++//!   Incomparable    <- disjoint                     (== new Disjoint)
++//!
++//! Build and run (from the baseline-main worktree):
++//!   cargo bench -p ankurah-core --bench lineage_baseline
++
++use std::collections::HashMap;
++
++use ankurah_core::lineage::{compare, GetEvents, Ordering};
++use ankurah_core::error::RetrievalError;
++use ankurah_core::retrieval::{TClock, TEvent};
++use ankurah_proto::{AttestationSet, Attested};
++use async_trait::async_trait;
++use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
++
++type TestId = u32;
++
++#[derive(Clone)]
++struct TestClock {
++    members: Vec<TestId>,
++}
++
++#[derive(Clone)]
++struct TestEvent {
++    id: TestId,
++    parent_clock: TestClock,
++}
++
++impl TClock for TestClock {
++    type Id = TestId;
++    fn members(&self) -> &[Self::Id] { &self.members }
++}
++
++impl TEvent for TestEvent {
++    type Id = TestId;
++    type Parent = TestClock;
++    fn id(&self) -> TestId { self.id }
++    fn parent(&self) -> &TestClock { &self.parent_clock }
++}
++
++impl std::fmt::Display for TestEvent {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Event({})", self.id) }
++}
++
++/// In-memory event store mirroring the old lineage tests' MockEventStore, plus
++/// convenience constructors for the benchmark DAG shapes.
++struct MockEventStore {
++    events: HashMap<TestId, Attested<TestEvent>>,
++}
++
++impl MockEventStore {
++    fn new() -> Self { Self { events: HashMap::new() } }
++
++    fn add(&mut self, id: TestId, parent_ids: &[TestId]) {
++        let event = TestEvent { id, parent_clock: TestClock { members: parent_ids.to_vec() } };
++        self.events.insert(id, Attested { payload: event, attestations: AttestationSet::default() });
++    }
++}
++
++#[async_trait]
++impl GetEvents for MockEventStore {
++    type Id = TestId;
++    type Event = TestEvent;
++
++    async fn retrieve_event(&self, event_ids: Vec<Self::Id>) -> Result<(usize, Vec<Attested<Self::Event>>), RetrievalError> {
++        let mut result = Vec::new();
++        for id in event_ids {
++            if let Some(event) = self.events.get(&id) {
++                result.push(event.clone());
++            }
++        }
++        Ok((1, result))
++    }
++
++    fn stage_events(&self, _events: impl IntoIterator<Item = Attested<Self::Event>>) {}
++    fn mark_event_used(&self, _event_id: &Self::Id) {}
++}
++
++struct Scenario {
++    store: MockEventStore,
++    subject: TestClock,
++    comparison: TestClock,
++    events: u64,
++}
++
++/// Linear chain 0 -> ... -> depth-1; head vs root => Descends.
++fn linear_deep(depth: usize) -> Scenario {
++    let mut s = MockEventStore::new();
++    for i in 0..depth {
++        if i == 0 {
++            s.add(0, &[]);
++        } else {
++            s.add(i as u32, &[(i - 1) as u32]);
++        }
++    }
++    Scenario { store: s, subject: TestClock { members: vec![(depth - 1) as u32] }, comparison: TestClock { members: vec![0] }, events: depth as u64 }
++}
++
++/// A chain of `n` diamonds; the two pre-join tips of the final diamond are
++/// concurrent => NotDescends. Ids: root 0, then per diamond (a, b, join).
++fn diamond_chain(n: usize) -> Scenario {
++    let mut s = MockEventStore::new();
++    let mut id = 0u32;
++    let mut next = || {
++        let v = id;
++        id += 1;
++        v
++    };
++    let mut base = next();
++    s.add(base, &[]);
++    let mut last_a = base;
++    let mut last_b = base;
++    for _ in 0..n {
++        let a = next();
++        s.add(a, &[base]);
++        let b = next();
++        s.add(b, &[base]);
++        last_a = a;
++        last_b = b;
++        let join = next();
++        s.add(join, &[a, b]);
++        base = join;
++    }
++    Scenario { store: s, subject: TestClock { members: vec![last_a] }, comparison: TestClock { members: vec![last_b] }, events: (1 + n * 3) as u64 }
++}
++
++/// Root with `width` concurrent children joined by one event; join vs root =>
++/// Descends over a width-wide parent antichain.
++fn wide_antichain(width: usize) -> Scenario {
++    let mut s = MockEventStore::new();
++    s.add(0, &[]);
++    let children: Vec<TestId> = (1..=width as u32).collect();
++    for &c in &children {
++        s.add(c, &[0]);
++    }
++    let join = width as u32 + 1;
++    s.add(join, &children);
++    Scenario { store: s, subject: TestClock { members: vec![join] }, comparison: TestClock { members: vec![0] }, events: (width + 2) as u64 }
++}
++
++/// Two independent chains sharing no root; heads compare Incomparable.
++fn disjoint(depth: usize) -> Scenario {
++    let mut s = MockEventStore::new();
++    // Chain A: 0..depth
++    for i in 0..depth {
++        if i == 0 {
++            s.add(0, &[]);
++        } else {
++            s.add(i as u32, &[(i - 1) as u32]);
++        }
++    }
++    // Chain B: base 1_000_000
++    let b0 = 1_000_000u32;
++    for i in 0..depth {
++        if i == 0 {
++            s.add(b0, &[]);
++        } else {
++            s.add(b0 + i as u32, &[b0 + (i - 1) as u32]);
++        }
++    }
++    Scenario {
++        store: s,
++        subject: TestClock { members: vec![(depth - 1) as u32] },
++        comparison: TestClock { members: vec![b0 + (depth - 1) as u32] },
++        events: (2 * depth) as u64,
++    }
++}
++
++// The old engine charges budget per BFS step (the mock returns cost 1 per
++// retrieve_event batch) and, unlike the new engine, does NOT self-escalate the
++// budget. A high fixed budget lets every shape reach its terminal verdict so
++// the comparison measures the same work as the new engine (which escalates
++// internally from DEFAULT_BUDGET = 1000 up to 4x). See the methodology doc.
++const BUDGET: usize = 1_000_000;
++
++fn bench_compare(c: &mut Criterion) {
++    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
++    let mut group = c.benchmark_group("compare");
++
++    for depth in [10usize, 100, 1000] {
++        let s = linear_deep(depth);
++        group.throughput(Throughput::Elements(s.events));
++        group.bench_with_input(BenchmarkId::new("linear_deep", depth), &s, |b, s| {
++            b.to_async(&rt).iter(|| async {
++                let o = compare(&s.store, &s.subject, &s.comparison, BUDGET).await.unwrap();
++                assert!(matches!(o, Ordering::Descends));
++                std::hint::black_box(o);
++            });
++        });
++    }
++
++    for n in [4usize, 16, 64] {
++        let s = diamond_chain(n);
++        group.throughput(Throughput::Elements(s.events));
++        group.bench_with_input(BenchmarkId::new("diamond_chain", n), &s, |b, s| {
++            b.to_async(&rt).iter(|| async {
++                let o = compare(&s.store, &s.subject, &s.comparison, BUDGET).await.unwrap();
++                assert!(matches!(o, Ordering::NotDescends { .. }));
++                std::hint::black_box(o);
++            });
++        });
++    }
++
++    for width in [4usize, 16, 64] {
++        let s = wide_antichain(width);
++        group.throughput(Throughput::Elements(s.events));
++        group.bench_with_input(BenchmarkId::new("wide_antichain", width), &s, |b, s| {
++            b.to_async(&rt).iter(|| async {
++                let o = compare(&s.store, &s.subject, &s.comparison, BUDGET).await.unwrap();
++                assert!(matches!(o, Ordering::Descends));
++                std::hint::black_box(o);
++            });
++        });
++    }
++
++    for depth in [10usize, 100] {
++        let s = disjoint(depth);
++        group.throughput(Throughput::Elements(s.events));
++        group.bench_with_input(BenchmarkId::new("disjoint", depth), &s, |b, s| {
++            b.to_async(&rt).iter(|| async {
++                let o = compare(&s.store, &s.subject, &s.comparison, BUDGET).await.unwrap();
++                assert!(matches!(o, Ordering::Incomparable));
++                std::hint::black_box(o);
++            });
++        });
++    }
++
++    group.finish();
++}
++
++criterion_group!(benches, bench_compare);
++criterion_main!(benches);
