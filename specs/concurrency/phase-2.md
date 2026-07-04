@@ -260,7 +260,7 @@ workstream ends by updating this document's checklist.
 
 ## Checklist
 
-- [ ] A: issue triage table appended, issue comments posted
+- [x] A: issue triage table appended, issue comments posted
 - [x] B: bibliography plus design-deltas memo committed
 - [x] C1: simulation harness with reorder/drop/dup/partition and convergence invariants
 - [x] C2: nightly comparison-vs-oracle property sweep and simulation swarm
