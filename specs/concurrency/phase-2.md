@@ -273,5 +273,5 @@ workstream ends by updating this document's checklist.
 - [ ] D6: validated ingress
 - [ ] D7: observability counters and alerts
 - [ ] D8: #265 and #267 remainders
-- [ ] E1: benchmark harness and baseline (lands at phase 2 start)
+- [x] E1: benchmark harness and baseline (lands at phase 2 start)
 - [ ] E2: optimization PR with before/after numbers

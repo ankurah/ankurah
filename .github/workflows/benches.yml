@@ -1,0 +1,61 @@
+name: Benchmarks
+
+# Runs the event DAG micro-benchmarks in a short "smoke" mode so the harness
+# stays green and its output is archived on every change, without gating the
+# job on runner timing noise. Regression tracking is ADVISORY: the critcmp step
+# below never fails the job. Full-fidelity numbers for the methodology doc are
+# captured locally (see core/benches/README.md), not on shared CI runners.
+
+on:
+  pull_request:
+    branches: [main, concurrent-updates-event-dag]
+    paths:
+      - "core/**"
+      - "proto/**"
+      - ".github/workflows/benches.yml"
+  workflow_dispatch:
+
+jobs:
+  benches:
+    name: Event DAG micro-benchmarks (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Smoke mode: tiny warm-up and measurement windows keep the job fast and
+      # tolerant of shared-runner jitter. This validates that every bench builds
+      # and runs and that criterion produces output; it does not produce
+      # publication-grade medians.
+      - name: Run benches (smoke)
+        run: |
+          cargo bench -p ankurah-core --features bench-internals --bench event_dag -- \
+            --warm-up-time 0.5 --measurement-time 1 --sample-size 10 \
+            --save-baseline ci-smoke
+
+      # Advisory only: compare against a saved baseline if one is present in the
+      # tree. `|| true` guarantees the step (and job) never fails on timing.
+      # critcmp is best-effort; absence of a baseline is not an error.
+      - name: Compare against archived baseline (advisory, never fails)
+        run: |
+          cargo install critcmp --locked || true
+          if [ -f benches/baselines/ci-smoke.json ]; then
+            critcmp benches/baselines/ci-smoke.json ci-smoke || true
+          else
+            echo "No archived baseline (benches/baselines/ci-smoke.json); skipping comparison."
+          fi
+        continue-on-error: true
+
+      - name: Upload criterion output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-event-dag
+          path: target/criterion
+          if-no-files-found: warn
+          retention-days: 30
