@@ -43,11 +43,11 @@ Standards: real sources with working links (verified), primary sources preferred
 
 ## Deliverables checklist
 
-- [ ] 01-compaction-lifecycle.md
-- [ ] 02-indexed-causality.md
-- [ ] 03-merkle-causal.md
-- [ ] 04-merge-semantics.md
-- [ ] 05-testing.md
-- [ ] 06-staleness-horizons.md
-- [ ] 07-database-internals.md
+- [x] 01-compaction-lifecycle.md
+- [x] 02-indexed-causality.md
+- [x] 03-merkle-causal.md
+- [x] 04-merge-semantics.md
+- [x] 05-testing.md
+- [x] 06-staleness-horizons.md
+- [x] 07-database-internals.md
 - [ ] design-deltas.md (adversarial synthesis)
