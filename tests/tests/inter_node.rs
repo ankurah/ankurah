@@ -426,6 +426,94 @@ async fn test_lineage_event_bridge() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_event_bridge_uneven_diamond() -> Result<()> {
+    // The receiver knows head {A}; the server advances through X -> P and then
+    // two concurrent tips H1 (server) and H2 (a second writer). The receiver's
+    // re-fetch is served by an EventBridge covering {A} -> {H1, H2}, whose
+    // backward-BFS discovery order interleaves the uneven branches, so correct
+    // application depends on the topological sorts on both sides (V4). The
+    // discriminator is P's write: unordered application gap-jumps past it and
+    // the write is silently lost while the head claims P is history.
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let writer = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let receiver = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    let _conn_w = LocalProcessConnection::new(&writer, &server).await?;
+    let _conn_r = LocalProcessConnection::new(&receiver, &server).await?;
+    writer.system.wait_system_ready().await;
+    receiver.system.wait_system_ready().await;
+
+    let ctx_s = server.context(c)?;
+    let ctx_w = writer.context(c)?;
+    let ctx_r = receiver.context(c)?;
+
+    // A: creation on the server.
+    let pet_id = {
+        let trx = ctx_s.begin();
+        let pet = trx.create(&Pet { name: "diamond".to_string(), age: "0".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+
+    // Receiver learns the entity at head {A} and stays behind afterward (no
+    // subscription).
+    let query = format!("id = '{}'", pet_id);
+    let initial = ctx_r.fetch::<PetView>(query.as_str()).await?;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].age().unwrap(), "0");
+
+    // X then P: the linear trunk on the server.
+    let id_x = {
+        let trx = ctx_s.begin();
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("age-X")?;
+        trx.commit_and_return_events().await?[0].id()
+    };
+    let id_p = {
+        let trx = ctx_s.begin();
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age().replace("age-P")?;
+        trx.commit_and_return_events().await?[0].id()
+    };
+
+    // Writer catches up to {P}, then both fork concurrently: H1 on the
+    // server, H2 on the writer.
+    let _ = ctx_w.fetch::<PetView>(query.as_str()).await?;
+    let pet_s = ctx_s.get::<PetView>(pet_id).await?;
+    let pet_w = ctx_w.get::<PetView>(pet_id).await?;
+    let trx_s = ctx_s.begin();
+    let trx_w = ctx_w.begin();
+    pet_s.edit(&trx_s)?.name().replace("name-H1")?;
+    pet_w.edit(&trx_w)?.name().replace("name-H2")?;
+    let id_h1 = trx_s.commit_and_return_events().await?[0].id();
+    let id_h2 = trx_w.commit_and_return_events().await?[0].id();
+
+    // Let H2 propagate so the server's head becomes {H1, H2}.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Re-fetch on the receiver: served by an EventBridge from known {A}.
+    let results = ctx_r.fetch::<PetView>(query.as_str()).await?;
+    assert_eq!(results.len(), 1);
+    let final_r = &results[0];
+
+    assert_eq!(final_r.age().unwrap(), "age-P", "P's write must survive bridge application");
+    // Pet.name is Yrs text: concurrent replaces merge, keeping both inserts.
+    let name = final_r.name().unwrap();
+    assert!(name.contains("name-H1") && name.contains("name-H2"), "both concurrent tips' writes must be present, got {name}");
+
+    // Prove the bridge (not a state snapshot fallback) served this fetch: the
+    // receiver committed the bridge events to its local storage.
+    let collection_r = ctx_r.collection(&Pet::collection()).await?;
+    let events_r = collection_r.dump_entity_events(pet_id).await?;
+    let ids: std::collections::HashSet<_> = events_r.iter().map(|e| e.payload.id()).collect();
+    for (label, id) in [("X", &id_x), ("P", &id_p), ("H1", &id_h1), ("H2", &id_h2)] {
+        assert!(ids.contains(id), "receiver must hold bridge event {label}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
     // Create server (durable) and client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
