@@ -4,7 +4,18 @@ pub mod connector;
 pub mod context;
 pub mod entity;
 pub mod error;
+#[cfg(not(feature = "bench-internals"))]
 pub(crate) mod event_dag;
+// The benchmark harness (workstream E) compiles in a separate unit and needs
+// to reach the DAG engine. Under `bench-internals` the module is raised to
+// `pub` so `bench_support` can wrap it; the default build keeps it crate-local.
+#[cfg(feature = "bench-internals")]
+pub mod event_dag;
+
+/// Narrow, feature-gated entry points into the event DAG engine for the
+/// benchmark harness. Never part of the default public surface.
+#[cfg(feature = "bench-internals")]
+pub mod bench_support;
 pub mod indexing;
 pub mod livequery;
 pub mod model;

@@ -25,6 +25,11 @@ default = []
 instrument = []
 # Enables test helper methods for adversarial testing (e.g., creating phantom entities)
 test-helpers = []
+# Exposes narrow wrappers over the crate-internal event DAG engine
+# (`bench_support`) for the criterion benches in `benches/`. Never enabled by
+# the default build; keeps the DAG comparison/layering/ordering primitives
+# crate-local for normal consumers.
+bench-internals = []
 
 [dependencies]
 # Internal dependencies
@@ -65,3 +70,11 @@ uniffi               = { version = "0.29", optional = true }
 [dev-dependencies]
 maplit         = "1.0"
 ankurah-derive = { path = "../derive", version = "=0.9.0" }
+criterion      = { version = "0.5", features = ["async_tokio"] }
+
+# Event DAG engine benchmarks (workstream E). harness = false because criterion
+# provides its own harness; requires the `bench-internals` feature to reach the
+# crate-internal engine via `bench_support`.
+[[bench]]
+name    = "event_dag"
+harness = false

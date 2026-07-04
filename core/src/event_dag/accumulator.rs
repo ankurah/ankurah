@@ -71,7 +71,7 @@ impl<E: GetEvents> EventAccumulator<E> {
 }
 
 /// Result of a causal comparison, carrying the accumulated DAG.
-pub(crate) struct ComparisonResult<E: GetEvents> {
+pub struct ComparisonResult<E: GetEvents> {
     /// The causal relation between the compared clocks.
     pub(crate) relation: AbstractCausalRelation<EventId>,
     /// The event accumulator with DAG structure (private -- access via into_layers).
