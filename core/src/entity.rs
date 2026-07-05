@@ -182,7 +182,13 @@ impl Entity {
             }
         }
 
-        if operations.is_empty() {
+        // No operations on an EXISTING entity means nothing changed: no event.
+        // On a brand-new entity (empty head) it means every field is its
+        // default, which is still an entity: emit a zero-operation creation
+        // event so the entity exists, replicates, and persists (the #175
+        // degenerate case; RFC 5.4). EventId hashes fine over empty
+        // operations.
+        if operations.is_empty() && !state.head.is_empty() {
             Ok(None)
         } else {
             let operations = OperationSet(operations);

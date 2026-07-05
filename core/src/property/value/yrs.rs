@@ -77,6 +77,12 @@ impl<Projected> FromEntity for YrsString<Projected> {
 
 impl<Projected, S: FromActiveType<YrsString<Projected>>> FromActiveType<YrsString<Projected>> for Option<S> {
     fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
+        // Compiled-OPTIONAL: an absent root is None, never a fabricated
+        // default (RFC 5.4 rule 2). Checked here because the required
+        // projections below default instead of erroring.
+        if active.value().is_none() {
+            return Ok(None);
+        }
         match S::from_active(active) {
             Ok(value) => Ok(Some(value)),
             Err(PropertyError::Missing) => Ok(None),
@@ -87,20 +93,16 @@ impl<Projected, S: FromActiveType<YrsString<Projected>>> FromActiveType<YrsStrin
 
 impl<Projected> FromActiveType<YrsString<Projected>> for String {
     fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
-        match active.value() {
-            Some(value) => Ok(value),
-            None => Err(PropertyError::Missing),
-        }
+        // Compiled-REQUIRED: an operation-based CRDT cannot distinguish an
+        // empty text from an untouched one, so "no operations" is a
+        // legitimate encoding OF the default: absent reads as "" instead of
+        // erroring Missing (RFC 5.4 rule 3; the #175 fix).
+        Ok(active.value().unwrap_or_default())
     }
 }
 
 impl<'a, Projected> FromActiveType<YrsString<Projected>> for std::borrow::Cow<'a, str> {
-    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
-        match active.value() {
-            Some(value) => Ok(Self::from(value)),
-            None => Err(PropertyError::Missing),
-        }
-    }
+    fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> { Ok(Self::from(active.value().unwrap_or_default())) }
 }
 
 impl<Projected> InitializeWith<String> for YrsString<Projected> {
