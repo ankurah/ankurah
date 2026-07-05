@@ -4,6 +4,8 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::{collections::BTreeMap, sync::Arc};
 
+#[cfg(test)]
+mod conformance;
 pub mod lww;
 //pub mod pn_counter;
 pub mod yrs;
