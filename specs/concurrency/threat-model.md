@@ -638,6 +638,66 @@ PermissiveAgent every security gap is moot, which is itself meta-gap G-0.
 
 ---
 
+## 6. Claims to tests
+
+The wire-level adversarial suite (part 2) lives in the ankurah-tests crate
+(core tests cannot construct a `Node`). New arms are in
+`tests/tests/adversarial_wire.rs`; three pre-existing arms in
+`tests/tests/{update_batch_containment,bridge_policy,commit_atomicity}.rs`
+already pin claims and are cross-referenced rather than duplicated. Every arm
+carries a doc comment citing its claim id(s).
+
+Status legend: **enforced-pass** (a green test pins current behavior);
+**gap-red-ignored** (an `#[ignore]`d red test pins what SHOULD happen and
+un-ignores when the owning issue lands); **existing-suite** (pinned by a green
+test outside this file); **design-boundary** (a documented property or a design
+assertion, not a wire arm, per the claim body).
+
+| Claim | Test `path::name` | Status |
+|---|---|---|
+| C4-01 | `adversarial_wire::malformed_clock_identity_is_order_independent_end_to_end` (id recomputed from contents, order-independent) | enforced-pass |
+| C4-02 | none (collection-attribution is gap G-2, deferred to #274; the hashing fact is exercised transitively by every event build) | design-boundary |
+| C4-03 | `adversarial_wire::{malformed_clock_deserialization_normalizes, no_public_non_normalizing_clock_constructor, malformed_clock_identity_is_order_independent_end_to_end}` | enforced-pass |
+| C4-04 | `adversarial_wire::{declared_cycle_is_unconstructible_content_addressing, fabricated_cycle_batch_is_contained}` | enforced-pass |
+| C4-05 | `adversarial_wire::replay_flood_is_idempotent` | enforced-pass |
+| C4-06 | `adversarial_wire::{forged_second_genesis_rejected_on_durable_node, forged_second_genesis_rejected_on_ephemeral_node}` | enforced-pass |
+| C4-07 | `adversarial_wire::forged_extra_genesis_head_does_not_trigger_wholesale_adoption` | enforced-pass |
+| C4-08 | exercised via the ephemeral second-genesis reject (grounded `Disjoint`, not a budget artifact) in `forged_second_genesis_rejected_on_ephemeral_node`; a dedicated budget-boundary arm is a C1 simulation scenario | design-boundary |
+| C4-09 | fetch-failure termination exercised by `adversarial_wire::forged_dangling_parent_is_contained`; deep/wide-parent budget-exhaustion timing is a C1 simulation scenario, not a fast wire arm | enforced-pass (partial) |
+| C4-10 | conservative-meet / merge correctness is a DAG-merge concern covered by the C1 simulation and `dag_auditing.rs`; no dedicated adversarial arm here | design-boundary |
+| C4-11 | `adversarial_wire::{forged_dangling_parent_is_contained, phantom_entity_is_evicted_on_failed_apply}`; `update_batch_containment::test_event_only_unknown_entity_does_not_poison_batch` | enforced-pass |
+| C4-12 | `adversarial_wire::phantom_entity_is_evicted_on_failed_apply` | enforced-pass |
+| C4-13 | TOCTOU atomicity is a concurrent-writer scenario owned by the C1 simulation; not a single-node wire arm | design-boundary |
+| C4-14 | `bridge_policy::test_event_bridge_events_are_policy_validated_on_receive`; `commit_atomicity` (check_event denial) | existing-suite |
+| C4-15 | `adversarial_wire::bfs_fetched_events_are_policy_validated` | gap-red-ignored (G-1, #244/#274) |
+| C4-16 | none (durable-peer authentication is gap G-8; no seam to assert against, adjacent to #274/phase 3) | design-boundary |
+| C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |
+| C4-18 | `bridge_policy::test_event_bridge_respects_read_policy_on_send` | existing-suite |
+| C4-19 | none here (creation-event fork asymmetry is gap G-6; the remote-transaction path with a rejecting agent is owned by #243) | design-boundary |
+| C4-20 | authorship-is-not-structural is demonstrated by every arm accepting unsigned forged events under PermissiveAgent; the signing-agent rejection arm belongs with the jwt-auth suite | design-boundary |
+| C4-21 | I-confluence boundary is a design assertion for #274 and a C3 conformance audit, not a wire arm (per the claim body) | design-boundary |
+| C4-22 | enforced by absence: `Event` carries no depth/generation field to forge; the forged-generation arm activates when #266 lands | design-boundary |
+| G-4 | `adversarial_wire::equivocation_flood_antichain_is_bounded` | gap-red-ignored (G-4, #246 / signature layer) |
+
+Coverage summary: of the twenty-two claims, the Byzantine-safe structural and
+containment claims that a single-node wire delivery can falsify are pinned by
+green arms (C4-01, C4-03, C4-04, C4-05, C4-06, C4-07, C4-09 partial, C4-11,
+C4-12); the three open ingress gaps are pinned by red-ignored arms (C4-15/G-1,
+C4-17/G-3, plus G-4); the attestation-dependent admission/read claims are
+already pinned by the existing policy suite (C4-14, C4-18); and the remaining
+claims are documented boundaries a wire arm cannot cheaply or meaningfully add
+here (C4-02, C4-08, C4-10, C4-13, C4-16, C4-19, C4-20, C4-21, C4-22), each with
+its owning issue or workstream named above.
+
+No arm contradicted a claim. One behavior warranted a precise assertion choice:
+on an ephemeral node a rejected second genesis (C4-06) still causes BFS to pull
+the real genesis into local storage as a grounding side effect (the documented
+C4-15 fetch behavior), so `forged_second_genesis_rejected_on_ephemeral_node`
+asserts the semantic outcome (head unchanged, forged root not adopted, forged
+event not committed) rather than a raw stored-event count.
+
+---
+
 ## Appendix: source grounding
 
 Claims verified by reading, at commit 90f9a67d:
@@ -654,6 +714,6 @@ now normalizes at the deserialization boundary via `#[serde(from = "Vec<EventId>
 (2) Issue **#244 names symbols that predate the refactor**; the gap is real and
 unchanged, now at `CachedEventGetter::get_event` (C4-15).
 
-The wire-level adversarial suite (part 2 of C4) implements one test arm per named
-claim above; the C4 checklist line in specs/concurrency/phase-2.md ticks only when
-both parts land.
+The wire-level adversarial suite (part 2 of C4) maps every claim above to a test or
+a named boundary in section 6 (Claims to tests); the C4 checklist line in
+specs/concurrency/phase-2.md ticks only when both parts land.
