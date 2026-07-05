@@ -15,3 +15,9 @@
 mod harness;
 mod models;
 mod scenarios;
+
+// Postgres crash arm: same kill-and-reopen model over a real postgres container
+// (the node dies, the server survives). Off by default because it needs Docker;
+// enable with `--features postgres-crash`.
+#[cfg(feature = "postgres-crash")]
+mod postgres;
