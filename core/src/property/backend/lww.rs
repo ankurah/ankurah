@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::{EventId, Operation};
+use ankurah_proto::{EntityId, EventId, Operation};
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,9 @@ use crate::{
 };
 
 const LWW_DIFF_VERSION: u8 = 1;
+/// Diff version for the id-keyed (v2) encoding (RFC 5.5, plan.md A8). Payload
+/// is a [`V2Diff`]: an id-keyed map plus a name-keyed residue.
+const LWW_DIFF_VERSION_2: u8 = 2;
 
 /// Version header for serialized LWW state buffers: the first byte of every
 /// buffer identifies its encoding, and deserialization refuses buffers whose
@@ -29,6 +32,9 @@ const LWW_DIFF_VERSION: u8 = 1;
 /// loudly during deserialization, never silently misparse.)
 const LWW_STATE_VERSION_BASE: u8 = 0xA0;
 const LWW_STATE_VERSION_1: u8 = LWW_STATE_VERSION_BASE + 1;
+/// State buffer header byte for the id-keyed (v2) encoding (RFC 5.5, plan.md
+/// A8). Payload is a [`V2State`]: an id-keyed map plus a name-keyed residue.
+const LWW_STATE_VERSION_2: u8 = LWW_STATE_VERSION_BASE + 2;
 
 /// Provenance stamp for values loaded from unversioned (pre-0.9) state
 /// buffers, which recorded no per-property event id. All-zeros is not a
@@ -40,6 +46,71 @@ const LWW_STATE_VERSION_1: u8 = LWW_STATE_VERSION_BASE + 1;
 /// the local head it yields the same election result on every replica,
 /// including replicas that rebuilt provenance by replaying events.
 const LEGACY_EVENT_ID: [u8; 32] = [0; 32];
+
+/// How a property is keyed inside the backend's `values` map.
+///
+/// Under the id-keyed contract (RFC 5.5) a property known to the schema is
+/// keyed by its defining property entity id; a name that the binding cannot
+/// resolve (legacy residue not yet migrated, or a catalog/system collection
+/// that is permanently name-keyed) is keyed by its display name. Variant
+/// order is Id-then-Name; it is only used for deterministic `BTreeMap`
+/// ordering and carries no semantics.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PropertyKey {
+    Id(EntityId),
+    Name(String),
+}
+
+/// A name<->id translation table for one collection's properties, supplied by
+/// the schema layer (local compiled schema and/or the replicated catalog).
+///
+/// Invariant: `to_id` and `to_name` are mutual inverses -- for every
+/// `(name, id)` in `to_id` there is `(id, name)` in `to_name`, and vice
+/// versa. Callers that build a binding are responsible for upholding this;
+/// the backend relies on it when reverse-translating id keys back to names
+/// for projection and for v1/0xA1 emission.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaBinding {
+    pub to_id: BTreeMap<String, EntityId>,
+    pub to_name: BTreeMap<EntityId, String>,
+}
+
+/// Per-backend-instance wire encoding selector.
+///
+/// Defaults to [`WireMode::NameKeyedV1`]. Catalog and system collections stay
+/// `NameKeyedV1` permanently (the RFC 4 bootstrap exemption); user
+/// collections are flipped to [`WireMode::IdKeyedV2`] by later integration
+/// once a schema binding is attached. The mode only governs what this
+/// instance EMITS (`to_state_buffer` / `to_operations`); decode always
+/// accepts every version it knows regardless of mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireMode {
+    NameKeyedV1,
+    IdKeyedV2,
+}
+
+impl Default for WireMode {
+    fn default() -> Self { WireMode::NameKeyedV1 }
+}
+
+/// Wire payload for a version-2 (id-keyed) LWW diff. `by_id` carries the
+/// normative id-keyed changes; `residue` carries name-keyed changes for
+/// properties a writer could not resolve to an id (so legacy names survive a
+/// rewrite without data loss). A writer with a full binding produces an empty
+/// `residue`.
+#[derive(Serialize, Deserialize)]
+struct V2Diff {
+    by_id: BTreeMap<EntityId, Option<Value>>,
+    residue: BTreeMap<String, Option<Value>>,
+}
+
+/// Wire payload for a version-2 (0xA2) LWW state buffer. Same split as
+/// [`V2Diff`] but over committed entries (value + provenance event id).
+#[derive(Serialize, Deserialize)]
+struct V2State {
+    by_id: BTreeMap<EntityId, CommittedEntry>,
+    residue: BTreeMap<String, CommittedEntry>,
+}
 
 #[derive(Clone, Debug)]
 enum ValueEntry {
@@ -68,8 +139,18 @@ impl ValueEntry {
 #[derive(Debug)]
 pub struct LWWBackend {
     // TODO - can this be safely combined with the values map?
-    values: RwLock<BTreeMap<PropertyName, ValueEntry>>,
+    values: RwLock<BTreeMap<PropertyKey, ValueEntry>>,
+    // Field-change broadcasts stay keyed by display NAME (String): per-field
+    // signal consumers address by name, and the id-keyed contract is a wire
+    // concern, not a signals concern (plan.md decision 7).
     field_broadcasts: Mutex<BTreeMap<PropertyName, ankurah_signals::broadcast::Broadcast>>,
+    /// Name<->id translation for this collection's properties. Set once, when
+    /// integration attaches a schema; absent for catalog/system collections
+    /// and for any backend before binding.
+    binding: RwLock<Option<Arc<SchemaBinding>>>,
+    /// What this instance emits. Set-once alongside `binding` for user
+    /// collections; permanently `NameKeyedV1` for catalog/system collections.
+    wire_mode: RwLock<WireMode>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,7 +159,7 @@ pub struct LWWDiff {
     data: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct CommittedEntry {
     value: Option<Value>,
     event_id: EventId,
@@ -89,16 +170,89 @@ impl Default for LWWBackend {
 }
 
 impl LWWBackend {
-    pub fn new() -> LWWBackend { Self { values: RwLock::new(BTreeMap::default()), field_broadcasts: Mutex::new(BTreeMap::new()) } }
+    pub fn new() -> LWWBackend {
+        Self {
+            values: RwLock::new(BTreeMap::default()),
+            field_broadcasts: Mutex::new(BTreeMap::new()),
+            binding: RwLock::new(None),
+            wire_mode: RwLock::new(WireMode::default()),
+        }
+    }
+
+    /// Attach a name<->id translation table. Migrates existing name-keyed
+    /// entries whose names the binding resolves onto id keys (see the body for
+    /// the id-wins-on-collision rule). Idempotent-ish: re-binding re-runs the
+    /// migration against the current entries.
+    pub fn bind_schema(&self, binding: Arc<SchemaBinding>) {
+        {
+            let mut values = self.values.write().unwrap();
+            let existing = std::mem::take(&mut *values);
+            for (key, entry) in existing {
+                match key {
+                    PropertyKey::Name(name) => {
+                        if let Some(id) = binding.to_id.get(&name) {
+                            // Migrate the name entry onto its id key. If an id
+                            // entry is already present, keep it and drop this
+                            // name duplicate: an id-keyed entry can only have
+                            // come from newer id-keyed data, so it is
+                            // authoritative over a legacy name residue for the
+                            // same property. Deterministic and lossless in the
+                            // direction that matters.
+                            values.entry(PropertyKey::Id(*id)).or_insert(entry);
+                        } else {
+                            values.insert(PropertyKey::Name(name), entry);
+                        }
+                    }
+                    PropertyKey::Id(id) => {
+                        values.insert(PropertyKey::Id(id), entry);
+                    }
+                }
+            }
+        }
+        *self.binding.write().unwrap() = Some(binding);
+    }
+
+    /// Choose the wire encoding this instance emits.
+    pub fn set_wire_mode(&self, mode: WireMode) { *self.wire_mode.write().unwrap() = mode; }
+
+    /// Resolve a display name to the key it should be stored/looked-up under:
+    /// `Id` when the binding knows the name, else `Name`.
+    fn key_for_name(&self, name: &str) -> PropertyKey {
+        match self.binding.read().unwrap().as_ref().and_then(|b| b.to_id.get(name).copied()) {
+            Some(id) => PropertyKey::Id(id),
+            None => PropertyKey::Name(name.to_string()),
+        }
+    }
 
     pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
+        let key = self.key_for_name(&property_name);
         let mut values = self.values.write().unwrap();
-        values.insert(property_name, ValueEntry::Uncommitted { value });
+        values.insert(key, ValueEntry::Uncommitted { value });
     }
 
     pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
+        let key = self.key_for_name(property_name);
         let values = self.values.read().unwrap();
-        values.get(property_name).and_then(|entry| entry.value())
+        // Resolve under the id key first; fall back to the name key for
+        // legacy residue not yet migrated to an id (RFC 5.5 read fallback).
+        if let PropertyKey::Id(_) = key {
+            if let Some(entry) = values.get(&key) {
+                return entry.value();
+            }
+            return values.get(&PropertyKey::Name(property_name.clone())).and_then(|entry| entry.value());
+        }
+        values.get(&key).and_then(|entry| entry.value())
+    }
+
+    /// Reverse-translate a stored key to a display name via the binding.
+    /// Name keys pass through; Id keys resolve through `to_name`; an Id key
+    /// with no known name is unprojectable and yields `None` (RFC 5.6 catalog
+    /// -lag opacity).
+    fn key_to_name(binding: Option<&Arc<SchemaBinding>>, key: &PropertyKey) -> Option<String> {
+        match key {
+            PropertyKey::Name(name) => Some(name.clone()),
+            PropertyKey::Id(id) => binding.and_then(|b| b.to_name.get(id).cloned()),
+        }
     }
 }
 
@@ -112,23 +266,38 @@ impl PropertyBackend for LWWBackend {
         let cloned = (*values).clone();
         drop(values);
 
+        // Carry the schema binding and wire mode across the fork: a
+        // transaction fork of a user-collection backend must keep keying and
+        // emitting id-keyed, or writes made inside the transaction would be
+        // name-keyed and mismatch on commit.
+        let binding = self.binding.read().unwrap().clone();
+        let wire_mode = *self.wire_mode.read().unwrap();
+
         Arc::new(Self {
             values: RwLock::new(cloned),
             // Create fresh broadcasts (don't clone the existing ones for transaction isolation)
             field_broadcasts: Mutex::new(BTreeMap::new()),
+            binding: RwLock::new(binding),
+            wire_mode: RwLock::new(wire_mode),
         })
     }
 
     fn properties(&self) -> Vec<PropertyName> {
         let values = self.values.read().unwrap();
-        values.keys().cloned().collect::<Vec<PropertyName>>()
+        let binding = self.binding.read().unwrap();
+        // Project to display names; id keys with no known name are omitted
+        // (unprojectable by design, RFC 5.6).
+        values.keys().filter_map(|k| Self::key_to_name(binding.as_ref(), k)).collect::<Vec<PropertyName>>()
     }
 
     fn property_value(&self, property_name: &PropertyName) -> Option<Value> { self.get(property_name) }
 
     fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
         let values = self.values.read().unwrap();
-        values.iter().map(|(k, v)| (k.clone(), v.value())).collect()
+        let binding = self.binding.read().unwrap();
+        // Name keys pass through as-is; id keys are reverse-translated through
+        // the binding; id keys with no known name are OMITTED (RFC 5.6).
+        values.iter().filter_map(|(k, v)| Self::key_to_name(binding.as_ref(), k).map(|name| (name, v.value()))).collect()
     }
 
     fn property_backend_name() -> &'static str { "lww" }
@@ -136,23 +305,68 @@ impl PropertyBackend for LWWBackend {
     fn to_state_buffer(&self) -> Result<Vec<u8>, StateError> {
         // Serialize with required event_id for per-property conflict resolution after loading.
         let values = self.values.read().unwrap();
-        let mut serializable: BTreeMap<PropertyName, CommittedEntry> = BTreeMap::new();
-        for (name, entry) in values.iter() {
-            let Some(event_id) = entry.event_id() else {
-                return Err(StateError::SerializationError(Box::new(std::io::Error::new(
+        let binding = self.binding.read().unwrap();
+        let wire_mode = *self.wire_mode.read().unwrap();
+
+        // Committed provenance is required for every property in either mode.
+        let require_event_id = |key: &PropertyKey, entry: &ValueEntry| -> Result<EventId, StateError> {
+            entry.event_id().ok_or_else(|| {
+                StateError::SerializationError(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("LWW state requires event_id for property {}", name),
-                ))));
-            };
-            serializable.insert(name.clone(), CommittedEntry { value: entry.value(), event_id });
+                    format!("LWW state requires event_id for property {:?}", key),
+                )))
+            })
+        };
+
+        match wire_mode {
+            WireMode::NameKeyedV1 => {
+                let mut serializable: BTreeMap<PropertyName, CommittedEntry> = BTreeMap::new();
+                for (key, entry) in values.iter() {
+                    let event_id = require_event_id(key, entry)?;
+                    // Reverse-translate id keys to names. An id key with no
+                    // known name is an encoding error in v1 mode; it should be
+                    // unreachable because catalog/system entities never see id
+                    // keys.
+                    let Some(name) = Self::key_to_name(binding.as_ref(), key) else {
+                        return Err(StateError::SerializationError(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("LWW v1 (0xA1) state cannot encode unresolvable id key {:?}", key),
+                        ))));
+                    };
+                    serializable.insert(name, CommittedEntry { value: entry.value(), event_id });
+                }
+                let mut state_buffer = vec![LWW_STATE_VERSION_1];
+                bincode::serialize_into(&mut state_buffer, &serializable)?;
+                Ok(state_buffer)
+            }
+            WireMode::IdKeyedV2 => {
+                let mut state = V2State { by_id: BTreeMap::new(), residue: BTreeMap::new() };
+                for (key, entry) in values.iter() {
+                    let event_id = require_event_id(key, entry)?;
+                    let committed = CommittedEntry { value: entry.value(), event_id };
+                    match key {
+                        PropertyKey::Id(id) => {
+                            state.by_id.insert(*id, committed);
+                        }
+                        PropertyKey::Name(name) => {
+                            state.residue.insert(name.clone(), committed);
+                        }
+                    }
+                }
+                let mut state_buffer = vec![LWW_STATE_VERSION_2];
+                bincode::serialize_into(&mut state_buffer, &state)?;
+                Ok(state_buffer)
+            }
         }
-        let mut state_buffer = vec![LWW_STATE_VERSION_1];
-        bincode::serialize_into(&mut state_buffer, &serializable)?;
-        Ok(state_buffer)
     }
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
+        // Decode is schema-BLIND: it never consults a binding. Legacy/0xA1
+        // produce Name keys; 0xA2 produces Id keys (by_id) and Name keys
+        // (residue). Any name<->id migration happens later, only via
+        // bind_schema. The freshly-decoded backend defaults to no binding and
+        // NameKeyedV1 mode; integration flips those afterwards.
         let (version, payload) = match state_buffer.split_first() {
             Some((version, payload)) => (*version, payload),
             None => return Err(crate::error::RetrievalError::Other("empty LWW state buffer".to_string())),
@@ -169,41 +383,93 @@ impl PropertyBackend for LWWBackend {
                 .map_err(|e| crate::error::RetrievalError::Other(format!("failed to parse pre-0.9 legacy LWW state buffer: {e}")))?;
             let map = legacy_map
                 .into_iter()
-                .map(|(k, value)| (k, ValueEntry::Committed { value, event_id: EventId::from_bytes(LEGACY_EVENT_ID) }))
+                .map(|(k, value)| (PropertyKey::Name(k), ValueEntry::Committed { value, event_id: EventId::from_bytes(LEGACY_EVENT_ID) }))
                 .collect();
-            return Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) });
+            return Ok(Self::from_decoded(map));
         }
-        if version != LWW_STATE_VERSION_1 {
-            return Err(crate::error::RetrievalError::Other(format!(
-                "unknown LWW state buffer version {version:#04x} (this binary supports {LWW_STATE_VERSION_1:#04x})"
-            )));
+        match version {
+            LWW_STATE_VERSION_1 => {
+                let raw_map = bincode::deserialize::<BTreeMap<PropertyName, CommittedEntry>>(payload)?;
+                let map = raw_map
+                    .into_iter()
+                    .map(|(k, entry)| (PropertyKey::Name(k), ValueEntry::Committed { value: entry.value, event_id: entry.event_id }))
+                    .collect();
+                Ok(Self::from_decoded(map))
+            }
+            LWW_STATE_VERSION_2 => {
+                let state = bincode::deserialize::<V2State>(payload)?;
+                let mut map: BTreeMap<PropertyKey, ValueEntry> = BTreeMap::new();
+                for (id, entry) in state.by_id {
+                    map.insert(PropertyKey::Id(id), ValueEntry::Committed { value: entry.value, event_id: entry.event_id });
+                }
+                for (name, entry) in state.residue {
+                    map.insert(PropertyKey::Name(name), ValueEntry::Committed { value: entry.value, event_id: entry.event_id });
+                }
+                Ok(Self::from_decoded(map))
+            }
+            // Unknown versions are refused loudly rather than misread. A 0.9
+            // binary refuses 0xA2 (and anything above 0xA1) via this identical
+            // arm it shipped with; #294's version negotiation turns that
+            // refusal into a negotiated capability rather than an error.
+            _ => Err(crate::error::RetrievalError::Other(format!(
+                "unknown LWW state buffer version {version:#04x} (this binary supports {LWW_STATE_VERSION_1:#04x} and {LWW_STATE_VERSION_2:#04x})"
+            ))),
         }
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, CommittedEntry>>(payload)?;
-        let map =
-            raw_map.into_iter().map(|(k, entry)| (k, ValueEntry::Committed { value: entry.value, event_id: entry.event_id })).collect();
-        Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
     }
 
     fn to_operations(&self) -> Result<Option<Vec<Operation>>, MutationError> {
         let mut values = self.values.write().unwrap();
-        let mut changed_values = BTreeMap::new();
+        let binding = self.binding.read().unwrap();
+        let wire_mode = *self.wire_mode.read().unwrap();
 
-        for (name, entry) in values.iter_mut() {
+        // Collect the keys+values that transitioned Uncommitted -> Pending.
+        let mut changed: Vec<(PropertyKey, Option<Value>)> = Vec::new();
+        for (key, entry) in values.iter_mut() {
             let ValueEntry::Uncommitted { value } = entry else {
                 continue;
             };
             let value = value.clone();
-            changed_values.insert(name.clone(), value.clone());
+            changed.push((key.clone(), value.clone()));
             *entry = ValueEntry::Pending { value };
         }
 
-        if changed_values.is_empty() {
+        if changed.is_empty() {
             return Ok(None);
         }
 
-        Ok(Some(vec![Operation {
-            diff: bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&changed_values)? })?,
-        }]))
+        let diff = match wire_mode {
+            WireMode::NameKeyedV1 => {
+                let mut changed_values: BTreeMap<PropertyName, Option<Value>> = BTreeMap::new();
+                for (key, value) in changed {
+                    // Reverse-translate id keys to names; an unresolvable id
+                    // key in v1 mode is an encoding error (unreachable for
+                    // catalog/system entities, which never hold id keys).
+                    let Some(name) = Self::key_to_name(binding.as_ref(), &key) else {
+                        return Err(MutationError::UpdateFailed(
+                            anyhow::anyhow!("LWW v1 diff cannot encode unresolvable id key {:?}", key).into(),
+                        ));
+                    };
+                    changed_values.insert(name, value);
+                }
+                bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION, data: bincode::serialize(&changed_values)? })?
+            }
+            WireMode::IdKeyedV2 => {
+                let mut v2 = V2Diff { by_id: BTreeMap::new(), residue: BTreeMap::new() };
+                for (key, value) in changed {
+                    match key {
+                        PropertyKey::Id(id) => {
+                            v2.by_id.insert(id, value);
+                        }
+                        PropertyKey::Name(name) => {
+                            v2.residue.insert(name, value);
+                        }
+                    }
+                }
+                bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION_2, data: bincode::serialize(&v2)? })?
+            }
+        };
+
+        Ok(Some(vec![Operation { diff }]))
     }
 
     fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError> {
@@ -225,7 +491,10 @@ impl PropertyBackend for LWWBackend {
             older_than_meet: bool,
         }
 
-        let mut winners: BTreeMap<PropertyName, Candidate> = BTreeMap::new();
+        // Keyed by PropertyKey so id-keyed (v2) and name-keyed (v1/legacy
+        // residue) candidates elect independently; the per-key LWW logic is
+        // identical for both kinds.
+        let mut winners: BTreeMap<PropertyKey, Candidate> = BTreeMap::new();
 
         // Seed with stored last-write candidates (required event_id).
         {
@@ -233,7 +502,7 @@ impl PropertyBackend for LWWBackend {
             for (prop, entry) in values.iter() {
                 let Some(event_id) = entry.event_id() else {
                     return Err(MutationError::UpdateFailed(
-                        anyhow::anyhow!("LWW candidate missing event_id for property {}", prop).into(),
+                        anyhow::anyhow!("LWW candidate missing event_id for property {:?}", prop).into(),
                     ));
                 };
 
@@ -254,37 +523,48 @@ impl PropertyBackend for LWWBackend {
             if let Some(operations) = event.operations.get(&Self::property_backend_name().to_string()) {
                 for operation in operations {
                     let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
-                    match version {
-                        1 => {
-                            let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
-                            for (prop, value) in changes {
-                                let candidate = Candidate { value, event_id: event.id(), from_to_apply, older_than_meet: false };
-                                if let Some(current) = winners.get_mut(&prop) {
-                                    if current.older_than_meet {
-                                        // Stored value is below meet -- any layer candidate wins
-                                        *current = candidate;
-                                    } else {
-                                        // Both in accumulated set -- use causal comparison (infallible)
-                                        let relation = layer.compare(&candidate.event_id, &current.event_id);
-                                        match relation {
-                                            CausalRelation::Descends => {
-                                                *current = candidate;
-                                            }
-                                            CausalRelation::Ascends => {}
-                                            CausalRelation::Concurrent => {
-                                                if candidate.event_id > current.event_id {
-                                                    *current = candidate;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    winners.insert(prop, candidate);
-                                }
-                            }
+                    // Normalize both wire versions into (PropertyKey, value)
+                    // candidates; election below is version-agnostic.
+                    let changes: Vec<(PropertyKey, Option<Value>)> = match version {
+                        1 => bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(&data)?
+                            .into_iter()
+                            .map(|(name, value)| (PropertyKey::Name(name), value))
+                            .collect(),
+                        2 => {
+                            let v2: V2Diff = bincode::deserialize(&data)?;
+                            v2.by_id
+                                .into_iter()
+                                .map(|(id, value)| (PropertyKey::Id(id), value))
+                                .chain(v2.residue.into_iter().map(|(name, value)| (PropertyKey::Name(name), value)))
+                                .collect()
                         }
                         version => {
                             return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into()))
+                        }
+                    };
+                    for (prop, value) in changes {
+                        let candidate = Candidate { value, event_id: event.id(), from_to_apply, older_than_meet: false };
+                        if let Some(current) = winners.get_mut(&prop) {
+                            if current.older_than_meet {
+                                // Stored value is below meet -- any layer candidate wins
+                                *current = candidate;
+                            } else {
+                                // Both in accumulated set -- use causal comparison (infallible)
+                                let relation = layer.compare(&candidate.event_id, &current.event_id);
+                                match relation {
+                                    CausalRelation::Descends => {
+                                        *current = candidate;
+                                    }
+                                    CausalRelation::Ascends => {}
+                                    CausalRelation::Concurrent => {
+                                        if candidate.event_id > current.event_id {
+                                            *current = candidate;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            winners.insert(prop, candidate);
                         }
                     }
                 }
@@ -295,10 +575,16 @@ impl PropertyBackend for LWWBackend {
         let mut changed_fields = Vec::new();
         {
             let mut values = self.values.write().unwrap();
+            let binding = self.binding.read().unwrap();
             for (prop, candidate) in winners {
                 if candidate.from_to_apply {
-                    values.insert(prop.clone(), ValueEntry::Committed { value: candidate.value, event_id: candidate.event_id });
-                    changed_fields.push(prop);
+                    // Reverse-translate to a display name for the broadcast;
+                    // an id-keyed change with an unknown name fires no
+                    // broadcast (RFC 5.6 opacity).
+                    if let Some(name) = Self::key_to_name(binding.as_ref(), &prop) {
+                        changed_fields.push(name);
+                    }
+                    values.insert(prop, ValueEntry::Committed { value: candidate.value, event_id: candidate.event_id });
                 }
             }
         }
@@ -320,6 +606,18 @@ impl PropertyBackend for LWWBackend {
 }
 
 impl LWWBackend {
+    /// Build a decoded backend from a key map. Decode is schema-blind, so the
+    /// result carries no binding and defaults to NameKeyedV1; integration
+    /// flips those afterwards via bind_schema / set_wire_mode.
+    fn from_decoded(map: BTreeMap<PropertyKey, ValueEntry>) -> Self {
+        Self {
+            values: RwLock::new(map),
+            field_broadcasts: Mutex::new(BTreeMap::new()),
+            binding: RwLock::new(None),
+            wire_mode: RwLock::new(WireMode::default()),
+        }
+    }
+
     /// Get the broadcast ID for a specific field, creating the broadcast if necessary
     pub fn field_broadcast_id(&self, field_name: &PropertyName) -> ankurah_signals::broadcast::BroadcastId {
         let mut field_broadcasts = self.field_broadcasts.lock().expect("other thread panicked, panic here too");
@@ -328,9 +626,18 @@ impl LWWBackend {
     }
 
     /// Get the event_id that last wrote a property value (if tracked).
+    /// Resolves the name to its key the same way `get` does, with the same
+    /// name-key fallback for legacy residue.
     pub fn get_event_id(&self, property_name: &PropertyName) -> Option<EventId> {
+        let key = self.key_for_name(property_name);
         let values = self.values.read().unwrap();
-        values.get(property_name).and_then(|entry| entry.event_id())
+        if let PropertyKey::Id(_) = key {
+            if let Some(entry) = values.get(&key) {
+                return entry.event_id();
+            }
+            return values.get(&PropertyKey::Name(property_name.clone())).and_then(|entry| entry.event_id());
+        }
+        values.get(&key).and_then(|entry| entry.event_id())
     }
     /// Internal implementation that handles both tracked and untracked operations.
     fn apply_operations_internal(&self, operations: &[Operation], event_id: Option<EventId>) -> Result<(), MutationError> {
@@ -338,21 +645,39 @@ impl LWWBackend {
 
         for operation in operations {
             let LWWDiff { version, data } = bincode::deserialize(&operation.diff)?;
-            match version {
-                1 => {
-                    let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data)?;
-
-                    let mut values = self.values.write().unwrap();
-                    for (property_name, new_value) in changes {
-                        let entry = match event_id.clone() {
-                            Some(event_id) => ValueEntry::Committed { value: new_value, event_id },
-                            None => ValueEntry::Pending { value: new_value },
-                        };
-                        values.insert(property_name.clone(), entry);
-                        changed_fields.push(property_name);
-                    }
+            // Normalize both wire versions into (PropertyKey, value) changes;
+            // storage and stamping below are version-agnostic. Decode stays
+            // schema-blind: v1 names stay Name keys (migration is bind_schema's
+            // job), v2 by_id becomes Id keys and residue stays Name keys.
+            let changes: Vec<(PropertyKey, Option<Value>)> = match version {
+                1 => bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(&data)?
+                    .into_iter()
+                    .map(|(name, value)| (PropertyKey::Name(name), value))
+                    .collect(),
+                2 => {
+                    let v2: V2Diff = bincode::deserialize(&data)?;
+                    v2.by_id
+                        .into_iter()
+                        .map(|(id, value)| (PropertyKey::Id(id), value))
+                        .chain(v2.residue.into_iter().map(|(name, value)| (PropertyKey::Name(name), value)))
+                        .collect()
                 }
                 version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
+            };
+
+            let mut values = self.values.write().unwrap();
+            let binding = self.binding.read().unwrap();
+            for (key, new_value) in changes {
+                let entry = match event_id.clone() {
+                    Some(event_id) => ValueEntry::Committed { value: new_value, event_id },
+                    None => ValueEntry::Pending { value: new_value },
+                };
+                // Reverse-translate for the broadcast; an id-keyed change with
+                // an unknown name fires no broadcast (RFC 5.6 opacity).
+                if let Some(name) = Self::key_to_name(binding.as_ref(), &key) {
+                    changed_fields.push(name);
+                }
+                values.insert(key, entry);
             }
         }
 
@@ -445,5 +770,252 @@ mod tests {
     fn empty_buffer_is_refused() {
         let err = LWWBackend::from_state_buffer(&Vec::new()).unwrap_err();
         assert!(err.to_string().contains("empty LWW state buffer"), "unexpected error: {err}");
+    }
+
+    // ---- id-keyed (v2) tests ----------------------------------------------
+
+    fn id(byte: u8) -> EntityId {
+        let mut bytes = [0u8; 16];
+        bytes[0] = byte;
+        EntityId::from_bytes(bytes)
+    }
+
+    /// A binding mapping "title" -> id(0x11) and "author" -> id(0x22).
+    fn title_author_binding() -> Arc<SchemaBinding> {
+        let mut to_id = BTreeMap::new();
+        let mut to_name = BTreeMap::new();
+        for (name, b) in [("title", 0x11u8), ("author", 0x22u8)] {
+            to_id.insert(name.to_string(), id(b));
+            to_name.insert(id(b), name.to_string());
+        }
+        Arc::new(SchemaBinding { to_id, to_name })
+    }
+
+    /// Build a committed, id-keyed backend: bind, flip to v2, set + commit.
+    fn committed_v2_backend(event_id: EventId) -> LWWBackend {
+        let backend = LWWBackend::new();
+        backend.bind_schema(title_author_binding());
+        backend.set_wire_mode(WireMode::IdKeyedV2);
+        backend.set("title".into(), Some(Value::String("alpha".into())));
+        let ops = backend.to_operations().unwrap().expect("pending write should yield operations");
+        backend.apply_operations_with_event(&ops, event_id).unwrap();
+        backend
+    }
+
+    // (a) v2 diff round-trip and 0xA2 state round-trip (Id and residue).
+    #[test]
+    fn v2_diff_round_trips_id_and_residue() {
+        let source = LWWBackend::new();
+        source.bind_schema(title_author_binding());
+        source.set_wire_mode(WireMode::IdKeyedV2);
+        source.set("title".into(), Some(Value::String("alpha".into()))); // -> by_id (id 0x11)
+                                                                         // A name the binding does not know becomes residue.
+        source.set("legacy".into(), Some(Value::I64(7)));
+
+        let ops = source.to_operations().unwrap().expect("writes yield operations");
+        // The diff must be version 2.
+        let LWWDiff { version, data } = bincode::deserialize(&ops[0].diff).unwrap();
+        assert_eq!(version, LWW_DIFF_VERSION_2);
+        let decoded: V2Diff = bincode::deserialize(&data).unwrap();
+        assert_eq!(decoded.by_id.get(&id(0x11)), Some(&Some(Value::String("alpha".into()))));
+        assert_eq!(decoded.residue.get("legacy"), Some(&Some(Value::I64(7))));
+
+        // Apply into a fresh v2 backend with the same binding: values project.
+        let sink = LWWBackend::new();
+        sink.bind_schema(title_author_binding());
+        sink.set_wire_mode(WireMode::IdKeyedV2);
+        sink.apply_operations_with_event(&ops, EventId::from_bytes([9; 32])).unwrap();
+        assert_eq!(sink.get(&"title".to_string()), Some(Value::String("alpha".into())));
+        assert_eq!(sink.get(&"legacy".to_string()), Some(Value::I64(7)));
+    }
+
+    #[test]
+    fn v2_state_buffer_round_trips_id_and_residue() {
+        let event_id = EventId::from_bytes([7; 32]);
+        let backend = LWWBackend::new();
+        backend.bind_schema(title_author_binding());
+        backend.set_wire_mode(WireMode::IdKeyedV2);
+        backend.set("title".into(), Some(Value::String("alpha".into())));
+        backend.set("legacy".into(), Some(Value::I64(7)));
+        let ops = backend.to_operations().unwrap().unwrap();
+        backend.apply_operations_with_event(&ops, event_id.clone()).unwrap();
+
+        let buffer = backend.to_state_buffer().unwrap();
+        assert_eq!(buffer[0], LWW_STATE_VERSION_2, "first byte is the 0xA2 header");
+        let state: V2State = bincode::deserialize(&buffer[1..]).unwrap();
+        assert!(state.by_id.contains_key(&id(0x11)));
+        assert!(state.residue.contains_key("legacy"));
+
+        // Decode is schema-blind: without re-binding, the id key is
+        // unprojectable, but the residue name projects.
+        let restored = LWWBackend::from_state_buffer(&buffer).unwrap();
+        assert_eq!(restored.get(&"legacy".to_string()), Some(Value::I64(7)));
+        assert!(!restored.property_values().contains_key("title"), "id key unprojectable before re-binding");
+        // Re-bind and the id key projects back to its name.
+        restored.bind_schema(title_author_binding());
+        assert_eq!(restored.get(&"title".to_string()), Some(Value::String("alpha".into())));
+        assert_eq!(restored.get_event_id(&"title".to_string()), Some(event_id));
+    }
+
+    // (b) v1 buffer decode -> bind_schema -> to_state_buffer in IdKeyedV2 mode
+    // emits 0xA2 with translated ids and residue preserved for unbound names.
+    #[test]
+    fn v1_buffer_migrates_to_v2_on_save_with_residue_preserved() {
+        // Produce a legitimate 0xA1 buffer with two names, one of which the
+        // binding will know ("title") and one it will not ("legacy").
+        let event_id = EventId::from_bytes([5; 32]);
+        let v1 = LWWBackend::new(); // default NameKeyedV1
+        v1.set("title".into(), Some(Value::String("alpha".into())));
+        v1.set("legacy".into(), Some(Value::I64(7)));
+        let ops = v1.to_operations().unwrap().unwrap();
+        v1.apply_operations_with_event(&ops, event_id.clone()).unwrap();
+        let v1_buffer = v1.to_state_buffer().unwrap();
+        assert_eq!(v1_buffer[0], LWW_STATE_VERSION_1);
+
+        // Decode (schema-blind -> Name keys), then bind + flip to v2.
+        let migrated = LWWBackend::from_state_buffer(&v1_buffer).unwrap();
+        migrated.bind_schema(title_author_binding());
+        migrated.set_wire_mode(WireMode::IdKeyedV2);
+
+        let v2_buffer = migrated.to_state_buffer().unwrap();
+        assert_eq!(v2_buffer[0], LWW_STATE_VERSION_2, "lazy rewrite-on-save emits 0xA2");
+        let state: V2State = bincode::deserialize(&v2_buffer[1..]).unwrap();
+        // "title" translated onto its id; provenance preserved.
+        let title_entry = state.by_id.get(&id(0x11)).expect("title migrated to id key");
+        assert_eq!(title_entry.value, Some(Value::String("alpha".into())));
+        assert_eq!(title_entry.event_id, event_id);
+        // "legacy" (unbound) preserved verbatim in residue.
+        assert_eq!(state.residue.get("legacy").map(|e| e.value.clone()), Some(Some(Value::I64(7))));
+    }
+
+    // (c) Pre-0.9 legacy buffer decodes with LEGACY_EVENT_ID provenance and
+    // migrates the same way.
+    #[test]
+    fn pre_09_legacy_buffer_migrates_to_v2() {
+        let legacy: BTreeMap<PropertyName, Option<Value>> =
+            [("title".to_string(), Some(Value::String("alpha".into()))), ("legacy".to_string(), Some(Value::I64(7)))].into_iter().collect();
+        let legacy_buffer = bincode::serialize(&legacy).unwrap();
+        assert!(legacy_buffer[0] < LWW_STATE_VERSION_BASE);
+
+        let restored = LWWBackend::from_state_buffer(&legacy_buffer).unwrap();
+        // Legacy provenance stamp preserved.
+        assert_eq!(restored.get_event_id(&"title".to_string()), Some(EventId::from_bytes(LEGACY_EVENT_ID)));
+
+        restored.bind_schema(title_author_binding());
+        restored.set_wire_mode(WireMode::IdKeyedV2);
+        let v2_buffer = restored.to_state_buffer().unwrap();
+        assert_eq!(v2_buffer[0], LWW_STATE_VERSION_2);
+        let state: V2State = bincode::deserialize(&v2_buffer[1..]).unwrap();
+        assert_eq!(state.by_id.get(&id(0x11)).unwrap().event_id, EventId::from_bytes(LEGACY_EVENT_ID));
+        assert!(state.residue.contains_key("legacy"));
+    }
+
+    // (d) Refusal: 0xA3 state buffer and diff version 3 refused with the
+    // existing error shape; also pin that a 0.9 decoder refuses 0xA2 via the
+    // identical unknown-version arm it shipped with.
+    #[test]
+    fn future_state_version_and_diff_version_are_refused() {
+        // 0xA3 (one past the versions this binary knows) refused.
+        let backend = committed_v2_backend(EventId::from_bytes([7; 32]));
+        let mut buffer = backend.to_state_buffer().unwrap();
+        buffer[0] = LWW_STATE_VERSION_BASE + 3; // 0xA3
+        let err = LWWBackend::from_state_buffer(&buffer).unwrap_err();
+        assert!(err.to_string().contains("unknown LWW state buffer version"), "unexpected error: {err}");
+        // The supported-version text now lists both 0xA1 and 0xA2.
+        assert!(err.to_string().contains("0xa1") && err.to_string().contains("0xa2"), "supported list should name both: {err}");
+
+        // A diff carrying version 3 is refused with the existing operation
+        // error shape via apply.
+        let bad_diff =
+            bincode::serialize(&LWWDiff { version: 3, data: bincode::serialize(&BTreeMap::<PropertyName, Option<Value>>::new()).unwrap() })
+                .unwrap();
+        let err = backend.apply_operations(&[Operation { diff: bad_diff }]).unwrap_err();
+        assert!(err.to_string().contains("Unknown LWW operation version"), "unexpected error: {err}");
+
+        // 0.9-decoder refusal of 0xA2: a 0.9 binary shipped an
+        // unknown-version arm that refuses everything above 0xA1, so it
+        // refuses 0xA2 by the SAME arm this binary uses to refuse >0xA2. We
+        // assert our decoder refuses an unknown version above 0xA2; 0.9's
+        // decoder refuses 0xA2 identically (it just had a lower ceiling).
+        let mut a4 = backend.to_state_buffer().unwrap();
+        a4[0] = LWW_STATE_VERSION_BASE + 4;
+        assert!(LWWBackend::from_state_buffer(&a4).is_err());
+    }
+
+    // (e) Default-mode invariance: no binding, default mode -> state buffer
+    // first byte 0xA1, diff version 1, decodable as the legacy name-keyed
+    // shape (byte-compatible with today).
+    #[test]
+    fn default_mode_is_byte_compatible_with_v1() {
+        let event_id = EventId::from_bytes([7; 32]);
+        let backend = committed_backend(event_id.clone());
+
+        // State: first byte 0xA1, payload a BTreeMap<PropertyName, CommittedEntry>.
+        let buffer = backend.to_state_buffer().unwrap();
+        assert_eq!(buffer[0], LWW_STATE_VERSION_1);
+        let decoded: BTreeMap<PropertyName, CommittedEntry> = bincode::deserialize(&buffer[1..]).unwrap();
+        assert_eq!(decoded.get("title").map(|e| e.value.clone()), Some(Some(Value::String("alpha".into()))));
+        assert_eq!(decoded.get("title").map(|e| e.event_id.clone()), Some(event_id));
+
+        // Diff: version byte 1, payload a BTreeMap<PropertyName, Option<Value>>.
+        let fresh = LWWBackend::new();
+        fresh.set("title".into(), Some(Value::String("alpha".into())));
+        let ops = fresh.to_operations().unwrap().unwrap();
+        let LWWDiff { version, data } = bincode::deserialize(&ops[0].diff).unwrap();
+        assert_eq!(version, LWW_DIFF_VERSION);
+        let changes: BTreeMap<PropertyName, Option<Value>> = bincode::deserialize(&data).unwrap();
+        assert_eq!(changes.get("title"), Some(&Some(Value::String("alpha".into()))));
+    }
+
+    // (f) Opacity: apply a v2 diff carrying an unknown property id (no
+    // binding); it persists through to_state_buffer (0xA2) and does NOT appear
+    // in property_values().
+    #[test]
+    fn unknown_id_persists_but_is_unprojectable() {
+        let backend = LWWBackend::new();
+        backend.set_wire_mode(WireMode::IdKeyedV2); // v2 emit, but NO binding
+
+        // Craft a v2 diff carrying a property id the backend cannot project.
+        let unknown = id(0xEE);
+        let v2 = V2Diff { by_id: [(unknown, Some(Value::String("opaque".into())))].into_iter().collect(), residue: BTreeMap::new() };
+        let diff = bincode::serialize(&LWWDiff { version: LWW_DIFF_VERSION_2, data: bincode::serialize(&v2).unwrap() }).unwrap();
+        backend.apply_operations_with_event(&[Operation { diff }], EventId::from_bytes([3; 32])).unwrap();
+
+        // Not projectable (no binding to reverse-translate the id).
+        assert!(!backend.property_values().contains_key("opaque"));
+        assert!(backend.properties().is_empty(), "unprojectable id omitted from properties()");
+
+        // But it persists: 0xA2 buffer carries it under by_id.
+        let buffer = backend.to_state_buffer().unwrap();
+        assert_eq!(buffer[0], LWW_STATE_VERSION_2);
+        let state: V2State = bincode::deserialize(&buffer[1..]).unwrap();
+        assert_eq!(state.by_id.get(&unknown).map(|e| e.value.clone()), Some(Some(Value::String("opaque".into()))));
+    }
+
+    // (g) Broadcasts: a named-field change still fires its field broadcast
+    // after the rekey.
+    #[test]
+    fn named_field_change_fires_broadcast_after_rekey() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let backend = LWWBackend::new();
+        backend.bind_schema(title_author_binding());
+        backend.set_wire_mode(WireMode::IdKeyedV2);
+
+        let fired = Arc::new(AtomicUsize::new(0));
+        let fired_clone = fired.clone();
+        // Listen by NAME even though the value keys by id.
+        let _guard = backend.listen_field(
+            &"title".to_string(),
+            Arc::new(move |_| {
+                fired_clone.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        backend.set("title".into(), Some(Value::String("alpha".into())));
+        let ops = backend.to_operations().unwrap().unwrap();
+        backend.apply_operations_with_event(&ops, EventId::from_bytes([1; 32])).unwrap();
+
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "id-keyed change must still fire the name-keyed broadcast");
     }
 }
