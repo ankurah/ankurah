@@ -160,6 +160,103 @@ async fn server_edits_subscription() -> Result<()> {
     Ok(())
 }
 
+// Deterministic red repro for the subscription-notification race behind the
+// intermittent `server_edits_subscription` failure (flaky-test tracker #202).
+//
+// Mechanism: when a query initializes, its QuerySubscribed deltas are applied by
+// NodeApplier::apply_delta_inner. For a StateSnapshot delta it calls
+// entity.with_state(...), which returns Some(false) when the state does NOT
+// advance the entity (already resident at that head). apply_delta_inner discards
+// that flag and unconditionally emits an EntityChange with EMPTY events. Because
+// reactor.notify_change is global across every subscription on the node, that
+// no-op change is delivered to ANOTHER, already-established query that holds the
+// same entity as an ItemChange::Update with an empty events list. On slow
+// runners this spurious empty-events Update wins the race against the real
+// edit-driven Update, producing exactly:
+//     left:  [(id, Update, [])]        right: [(id, Update, [EventId(..)])]
+//
+// The race in production is timing (message ordering across two concurrently
+// initializing subscriptions). Here we make the window explicit and
+// deterministic with a MessageGate that holds query B's QuerySubscribed
+// response until query A is fully established and watching the same entity at
+// the same head. Releasing B's (now no-op) delta must NOT notify query A.
+#[tokio::test]
+async fn subscription_empty_events_from_noop_delta() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+
+    // Query B's id is not known until we build it, but the gate closure needs to
+    // recognize B's QuerySubscribed response. Share it via an Arc set below.
+    let gate_query_id: Arc<std::sync::Mutex<Option<proto::QueryId>>> = Arc::new(std::sync::Mutex::new(None));
+
+    // Hold QuerySubscribed responses whose query_id matches B, so B's initial
+    // delta is not applied on the client until we explicitly release it.
+    let (_conn, gate) = {
+        let gate_query_id = gate_query_id.clone();
+        GatedConnection::new(&server, &client, move |msg: &proto::NodeMessage| match msg {
+            proto::NodeMessage::Response(resp) => match &resp.body {
+                proto::NodeResponseBody::QuerySubscribed { query_id, .. } => Some(*query_id) == *gate_query_id.lock().unwrap(),
+                _ => false,
+            },
+            _ => false,
+        })
+    };
+    client.system.wait_system_ready().await;
+
+    let server_ctx = server.context(c)?;
+    let client_ctx = client.context(c)?;
+
+    // Create Rex on the server.
+    let rex = {
+        let trx = server_ctx.begin();
+        let rex = trx.create(&Pet { name: "Rex".to_string(), age: "1".to_string() }).await?;
+        let read = rex.read();
+        trx.commit().await?;
+        read
+    };
+
+    let pred = "name = 'Rex'";
+
+    // Query B: start (do NOT wait). Its known_matches are empty (Rex not local
+    // yet) so the server returns a StateSnapshot for Rex - which the gate parks.
+    let query_b = client_ctx.query::<PetView>(nocache(pred)?)?;
+    *gate_query_id.lock().unwrap() = Some(query_b.query_id());
+
+    // Query A: fully establish. Rex is still not local (B's delta is held), so A
+    // gets and applies its own StateSnapshot, making Rex resident at head0 and
+    // registering A's watchers.
+    let query_a = client_ctx.query_wait::<PetView>(nocache(pred)?).await?;
+    assert_eq!(query_a.ids(), vec![rex.id()]);
+
+    let watcher_a = TestWatcher::changeset_with_event_ids();
+    let _handle_a = query_a.subscribe(&watcher_a);
+    assert_eq!(watcher_a.count(), 0); // no notification on subscribe
+
+    // Release B's held delta: a StateSnapshot for Rex at the SAME head A already
+    // holds - a no-op apply (with_state -> Some(false)). This must NOT surface a
+    // spurious empty-events Update on query A's watcher.
+    gate.release_held(&client).await;
+    assert_eq!(
+        watcher_a.quiesce().await,
+        0,
+        "a no-op initial-subscription delta for an already-resident entity must not notify another subscription"
+    );
+
+    // Sanity: the real signal path still works. A genuine edit yields exactly one
+    // Update carrying the writing event id.
+    {
+        let trx = server_ctx.begin();
+        rex.edit(&trx)?.age().overwrite(0, 1, "7")?;
+        trx.commit().await?;
+    }
+    assert_eq!(watcher_a.take_one().await, vec![(rex.id(), ChangeKind::Update, rex.entity().head().to_vec())]);
+    assert_eq!(watcher_a.quiesce().await, 0);
+
+    let _ = query_b; // keep B alive through the assertions
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_client_server_propagation() -> Result<()> {
     // Create server (durable) and two client nodes

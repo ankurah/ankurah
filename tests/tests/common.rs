@@ -48,6 +48,131 @@ pub struct Record {
     pub artist: String,
 }
 
+// ---------------------------------------------------------------------------
+// GatedConnection: a LocalProcessConnection variant that lets a test hold
+// selected inbound messages to one node and release them on demand. Used to
+// make subscription-ordering races deterministic (see
+// inter_node::subscription_empty_events_from_noop_delta). Lives in the test
+// crate so the shipped connector keeps its minimal API.
+// ---------------------------------------------------------------------------
+
+use ankurah::core::connector::{PeerSender, SendError};
+use tokio::sync::mpsc;
+
+#[derive(Clone)]
+struct GatedSender {
+    sender: mpsc::Sender<proto::NodeMessage>,
+    node_id: proto::EntityId,
+}
+
+#[async_trait::async_trait]
+impl PeerSender for GatedSender {
+    fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+        self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
+        Ok(())
+    }
+    fn recipient_node_id(&self) -> proto::EntityId { self.node_id }
+    fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+}
+
+/// Handle for holding/releasing messages the gated side would otherwise deliver.
+#[derive(Clone)]
+pub struct MessageGate {
+    filter: Arc<dyn Fn(&proto::NodeMessage) -> bool + Send + Sync>,
+    held: Arc<Mutex<Vec<proto::NodeMessage>>>,
+}
+
+impl MessageGate {
+    /// Release all currently-held messages back into the gated node, in arrival order.
+    pub async fn release_held<SE, PA>(&self, node: &Node<SE, PA>)
+    where
+        SE: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let drained: Vec<_> = { self.held.lock().unwrap().drain(..).collect() };
+        for message in drained {
+            let _ = node.handle_message(message).await;
+        }
+    }
+}
+
+/// One-directional gated connection: messages destined for `gated` that match
+/// the filter are parked in the gate instead of being handled, until released.
+/// All other messages (both directions) are handled immediately.
+pub struct GatedConnection {
+    task_a: tokio::task::JoinHandle<()>,
+    task_b: tokio::task::JoinHandle<()>,
+}
+
+impl GatedConnection {
+    /// `other` <-> `gated`. Only messages arriving at `gated` are subject to the gate.
+    pub fn new<SE1, PA1, SE2, PA2>(
+        other: &Node<SE1, PA1>,
+        gated: &Node<SE2, PA2>,
+        filter: impl Fn(&proto::NodeMessage) -> bool + Send + Sync + 'static,
+    ) -> (Self, MessageGate)
+    where
+        SE1: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA1: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+        SE2: ankurah::core::storage::StorageEngine + Send + Sync + 'static,
+        PA2: ankurah::policy::PolicyAgent + Send + Sync + 'static,
+    {
+        let (other_tx, mut other_rx) = mpsc::channel(1024);
+        let (gated_tx, mut gated_rx) = mpsc::channel(1024);
+
+        other.register_peer(
+            proto::Presence { node_id: gated.id, durable: gated.durable, system_root: gated.system.root() },
+            Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
+        );
+        gated.register_peer(
+            proto::Presence { node_id: other.id, durable: other.durable, system_root: other.system.root() },
+            Box::new(GatedSender { sender: other_tx, node_id: other.id }),
+        );
+
+        let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())) };
+
+        // Messages flowing INTO `other` are always handled immediately.
+        let task_a = {
+            let node = other.clone();
+            tokio::spawn(async move {
+                while let Some(message) = other_rx.recv().await {
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        let _ = node.handle_message(message).await;
+                    });
+                }
+            })
+        };
+
+        // Messages flowing INTO `gated` are parked if they match the filter.
+        let task_b = {
+            let node = gated.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                while let Some(message) = gated_rx.recv().await {
+                    if (gate.filter)(&message) {
+                        gate.held.lock().unwrap().push(message);
+                        continue;
+                    }
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        let _ = node.handle_message(message).await;
+                    });
+                }
+            })
+        };
+
+        (Self { task_a, task_b }, gate)
+    }
+}
+
+impl Drop for GatedConnection {
+    fn drop(&mut self) {
+        self.task_a.abort();
+        self.task_b.abort();
+    }
+}
+
 // Initialize tracing for tests
 #[ctor::ctor]
 fn init_tracing() {
