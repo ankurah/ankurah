@@ -25,6 +25,7 @@ use crate::{
     policy::{AccessDenied, PolicyAgent},
     reactor::{AbstractEntity, Reactor},
     retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
+    schema::catalog::CatalogManager,
     storage::StorageEngine,
     system::SystemManager,
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
@@ -146,6 +147,10 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
+    /// The metadata catalog map (RFC section 5.2). Warmed from storage on
+    /// durable nodes and via the subscription relay on ephemeral nodes.
+    pub catalog: CatalogManager<SE, PA>,
+
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
@@ -180,6 +185,7 @@ where
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
+        let catalog_manager = CatalogManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
 
         // Only ephemeral nodes relay subscriptions upstream to a durable peer.
         let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
@@ -195,6 +201,7 @@ where
             durable,
             policy_agent,
             system: system_manager,
+            catalog: catalog_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
             type_resolver: crate::TypeResolver::new(),
@@ -208,6 +215,7 @@ where
             }
         }
 
+        node.catalog.start(node.weak());
         node.policy_agent.on_node_ready(node.weak());
 
         node
@@ -783,12 +791,27 @@ where
         if !self.system.is_system_ready() {
             return Err(anyhow!("System is not ready"));
         }
+        // NOTE: unlike `context_async`, the synchronous `context` does NOT
+        // kick off the ephemeral catalog subscription (RFC 5.2). Doing so
+        // requires a spawned, fire-and-forget task (this method cannot
+        // await), and that concurrent subscription setup perturbs the
+        // precise entity-watcher teardown timing that some existing
+        // subscription-lifecycle tests assert. Ephemeral consumers that need
+        // the catalog resolve it by creating their context via
+        // `context_async`, or by calling `node.catalog.ensure_subscribed`
+        // directly; `wait_catalog_ready` gates readiness either way. Durable
+        // nodes are unaffected (they warm from storage at startup).
         Ok(Context::new(Node::clone(self), data))
     }
 
     pub async fn context_async(&self, data: PA::ContextData) -> Context {
         self.system.wait_system_ready().await;
-        Context::new(Node::clone(self), data)
+        let node = Node::clone(self);
+        // Ephemeral nodes warm the catalog map by subscribing to the catalog
+        // collections through the relay (RFC 5.2); first call wins, the rest
+        // are no-ops. Durable nodes short-circuit (they warm from storage).
+        node.catalog.ensure_subscribed(data.clone(), &node).await;
+        Context::new(node, data)
     }
 
     pub(crate) async fn get_from_peer(

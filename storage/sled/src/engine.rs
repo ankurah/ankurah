@@ -85,6 +85,12 @@ impl SledStorageEngine {
 #[async_trait]
 impl StorageEngine for SledStorageEngine {
     type Value = Vec<u8>;
+
+    /// Trait-level listing (see `StorageEngine::list_collections`); delegates
+    /// to the inherent method, which reads existing sled tree names without
+    /// opening (creating) any.
+    async fn list_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { SledStorageEngine::list_collections(self) }
+
     async fn collection(&self, id: &CollectionId) -> Result<Arc<dyn StorageCollection>, RetrievalError> {
         // could this block for any meaningful period of time? We might consider spawn_blocking
 

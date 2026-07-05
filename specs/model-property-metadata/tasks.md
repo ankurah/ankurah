@@ -86,29 +86,45 @@ DONE: PR #306; decision record posted on #294.
 
 ## 4. Catalog subscription and map
 
-- [ ] CatalogMap: (minting model, anchor, backend, value_type) -> id;
-      id -> definition; model -> membership set; collection -> model;
-      per-collection display-name index.
-- [ ] Warm via three predicate-True subscriptions at system-ready;
-      updates applied from changesets.
-- [ ] `wait_catalog_ready` gate; `hard_reset` flushes catalog map and
-      derived-id caches; tests for both.
+- [x] CatalogMap: id -> definition maps for all three kinds; collection
+      -> model; model -> membership set; per-collection display-name
+      index + global name index (sibling gate feed); resolve/lookup API.
+- [x] Warm + incremental updates: durable nodes subscribe FIRST
+      (fetch-free reactor queries) then merge the storage scan, so a
+      mid-warm registration is never missed; ephemeral nodes stand up
+      three relay-backed LiveQueries on first context_async (deviation:
+      sync context() cannot spawn the subscription without perturbing
+      reactor timing; ensure_subscribed is public for explicit use).
+- [x] `wait_catalog_ready` gate; `hard_reset` flushes the catalog map
+      via a reset hook installed on SystemManager; tests for both
+      (tests/tests/catalog_map.rs, 6 tests incl. rename re-indexing and
+      ephemeral live updates).
+- [ ] StorageEngine::list_collections overrides for postgres, sqlite,
+      and IndexedDB (default is empty, so a RESTARTING durable node on
+      those engines currently warms cold and relies on live updates
+      only; sled is covered). Small, engine-local; fits Phase C or
+      earlier.
 
 ## 5. LWW v2 / state 0xA2
 
-- [ ] Wire shapes: LWW_DIFF_VERSION_2, LWW_STATE_VERSION_2 (0xA2);
+- [x] Wire shapes: LWW_DIFF_VERSION_2, LWW_STATE_VERSION_2 (0xA2);
       by_id + residue two-map payloads; round-trip tests.
-- [ ] In-memory PropertyKey::{Id, Name} over the ValueEntry lifecycle;
-      name-keyed mode pinned for catalog/system collections; entity
-      access resolves name -> id through the schema binding.
-- [ ] Read fallback: 0xA1 and pre-0.9 buffers translate name -> id via
-      (local schema, catalog), residue on miss, lazy rewrite-on-save to
-      0xA2; v1 diffs apply the same way.
-- [ ] Unknown-id v2 payloads apply and persist opaquely (catalog lag);
-      projection yields UnknownProperty until the entry arrives.
-- [ ] Compatibility tests: simulated 0.9 binary refuses 0xA2/v2 cleanly
-      (pin lww.rs:176-180 behavior); catalog collections still write
-      v1/0xA1; residue preserved through rewrite when unresolvable.
+- [x] In-memory PropertyKey::{Id, Name} over the ValueEntry lifecycle;
+      SchemaBinding (bind_schema migration) and WireMode per instance;
+      default NameKeyedV1 byte-identical to today, so catalog/system
+      collections are pinned by default. DORMANT until integration.
+- [x] Read fallback mechanics: 0xA1 and pre-0.9 buffers decode to Name
+      keys, bind_schema migrates known names to ids, rewrite-on-save
+      emits 0xA2 with residue preserved; v1 diffs apply the same way.
+- [ ] Integration flip: entity assembly attaches SchemaBinding sourced
+      from (local compiled schema, catalog map) and sets IdKeyedV2 for
+      user collections; catalog/system stay NameKeyedV1 (with groups
+      6-8).
+- [x] Unknown-id v2 payloads apply and persist opaquely (catalog lag);
+      unprojectable until a binding knows the id.
+- [x] Compatibility tests: 0xA3/v3 refused with the shipped refusal arm
+      (the same arm a 0.9 binary refuses 0xA2 with); default-mode
+      byte-compatibility pinned; residue preserved through rewrite.
 - [ ] PROTOCOL_VERSION -> 2 lands with this epoch (one bump covering
       LWW v2, Identifier AST, RegisterSchema).
 

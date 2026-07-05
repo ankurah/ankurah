@@ -374,6 +374,13 @@ impl EntityLiveQuery {
     pub fn selection(&self) -> Read<(ankql::ast::Selection, u32)> { self.0.selection.read() }
     pub fn resultset(&self) -> EntityResultSet { self.0.resultset.clone() }
 
+    /// The underlying reactor subscription, for internal subscribers that
+    /// need the raw `ReactorUpdate` stream (entity-level, not `View`-mapped)
+    /// -- e.g. the catalog map, which maintains itself over unmapped
+    /// `Entity`s. External consumers use the `Subscribe<ChangeSet<R>>` impl
+    /// on `LiveQuery<R>` instead.
+    pub(crate) fn reactor_subscription(&self) -> &crate::reactor::ReactorSubscription { &self.0.subscription }
+
     /// Create a weak reference to this LiveQuery
     pub fn weak(&self) -> WeakEntityLiveQuery { WeakEntityLiveQuery(Arc::downgrade(&self.0)) }
 }

@@ -473,3 +473,19 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
    bindings, which carry the literal id).
 9. **Phase 0 as a separate PR off main**; Phase A follows on this
    branch.
+10. **Catalog subscriptions are policy-free on durable nodes** (the
+    SystemManager precedent: the map is node infrastructure reading its
+    own storage; mutation stays gated by check_event, remote access by
+    the server-side subscription checks). Ephemeral nodes warm on the
+    first context_async with that context's credentials: a node's
+    catalog visibility follows the credentials it runs under.
+11. **StorageEngine::list_collections** added (additive, default empty)
+    so the catalog warm never materializes empty `_ankurah_*` trees;
+    sled overrides it, the other engines' overrides are follow-up work
+    (tracked in tasks.md group 4).
+12. **Reactor event-batching fix folded in**: ReactorUpdateItem now
+    appends events across same-entity changes within one notify batch
+    instead of keeping only the first change's events. A multi-event
+    commit (a registration's genesis + follow-up) previously relayed
+    live with entity state ahead of its listed events, which receivers
+    reject; latent for any multi-event commit, surfaced by the catalog.

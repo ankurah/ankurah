@@ -51,6 +51,12 @@ struct Inner<SE, PA> {
     system_ready: RwLock<bool>,
     system_ready_notify: Notify,
     reactor: Reactor,
+    /// Installed by `CatalogManager::start`. `hard_reset` invokes it to flush
+    /// the in-memory catalog map, which the SystemManager cannot reach
+    /// directly (the Node owns the CatalogManager). RFC 5.2 requires the
+    /// catalog map to be flushed alongside the state hard_reset clears,
+    /// because derived catalog ids are root-scoped.
+    catalog_reset_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     _phantom: PhantomData<PA>,
 }
 
@@ -72,6 +78,7 @@ where
             system_ready: RwLock::new(false),
             system_ready_notify: Notify::new(),
             reactor,
+            catalog_reset_hook: RwLock::new(None),
             _phantom: PhantomData,
         }));
         {
@@ -107,6 +114,14 @@ where
         if !self.is_system_ready() {
             self.0.system_ready_notify.notified().await;
         }
+    }
+
+    /// Install the catalog-map flush hook (called by `CatalogManager::start`).
+    /// `hard_reset` invokes it so the in-memory catalog map is cleared
+    /// together with the state this manager resets; the SystemManager cannot
+    /// see the CatalogManager (the Node holds it), so it holds this handle.
+    pub(crate) fn set_catalog_reset_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.0.catalog_reset_hook.write().unwrap() = Some(hook);
     }
 
     /// Creates a new system root. This should only be called once per system by durable nodes
@@ -231,6 +246,19 @@ where
             let mut collection_map = self.0.collection_map.write().unwrap();
             collection_map.clear();
         }
+
+        // Flush the in-memory catalog map (RFC 5.2): derived catalog ids are
+        // root-scoped, so a node re-joining a different system must re-derive
+        // everything; a stale map would leak the old system's ids. Runs after
+        // collection_map.clear() and before reactor.system_reset(), which the
+        // catalog's own reactor subscriptions also observe. The hook clears
+        // maps and drops subscriptions but never deletes storage collections
+        // (that is delete_all_collections above).
+        let catalog_reset_hook = self.0.catalog_reset_hook.read().unwrap().clone();
+        if let Some(hook) = catalog_reset_hook {
+            hook();
+        }
+
         {
             let mut system_ready = self.0.system_ready.write().unwrap();
             *system_ready = false;

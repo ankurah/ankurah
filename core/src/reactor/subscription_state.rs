@@ -423,9 +423,19 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 if matches || did_match || entity_subscribed {
                     let item = items.entry(entity_id).or_insert_with(|| ReactorUpdateItem {
                         entity: entity.clone(),
-                        events: change.events().to_vec(),
+                        events: Vec::new(),
                         predicate_relevance: Vec::new(),
                     });
+
+                    // Same entity, multiple changes in one batch (e.g. a catalog
+                    // registration's genesis + follow-up): keep the latest entity
+                    // snapshot and APPEND events, so the item's events cover the
+                    // whole head the entity now reflects. Previously the first
+                    // change's events won and the rest were dropped, leaving the
+                    // item's state ahead of its listed events -- which a receiver
+                    // rejects in EntityChange::new.
+                    item.entity = entity.clone();
+                    item.events.extend(change.events().iter().cloned());
 
                     if let Some(mc) = membership_change {
                         item.predicate_relevance.push((query_id, mc));

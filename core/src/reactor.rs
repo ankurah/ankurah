@@ -278,6 +278,37 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         Ok(())
     }
 
+    /// Register a query and its watchers WITHOUT reading storage.
+    ///
+    /// Unlike [`add_query_and_notify`], this performs no local fetch, so it
+    /// never materializes the collection. It is for subscribers that supply
+    /// their own initial state out of band and only need the reactor to route
+    /// future `notify_change` updates -- notably the metadata catalog manager,
+    /// which must be able to watch catalog collections that do not yet exist
+    /// in storage without conjuring empty `_ankurah_*` trees. The query's
+    /// watchers (including the `Predicate::True` wildcard) are registered so
+    /// subsequent changes are delivered; no initial notification is sent.
+    pub fn add_query_no_fetch(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        collection_id: proto::CollectionId,
+        selection: ankql::ast::Selection,
+        resultset: EntityResultSet<E>,
+        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+    ) -> anyhow::Result<()> {
+        let subscription = {
+            let subscriptions = self.0.subscriptions.lock().unwrap();
+            subscriptions.get(&subscription_id).cloned().ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", subscription_id))?
+        };
+
+        subscription.register_query(query_id, collection_id.clone(), resultset, gap_fetcher)?;
+        // Empty included_entities: register the watchers (predicate/wildcard)
+        // without any storage read. `&mut ()` discards update items.
+        subscription.update_query(query_id, collection_id, selection, Vec::new(), 1, &mut ())?;
+        Ok(())
+    }
+
     /// Update an existing predicate (v>0) and send notifications
     /// Does diffing against the current resultset
     /// Used by local LiveQuery updates

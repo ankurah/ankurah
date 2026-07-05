@@ -61,6 +61,12 @@ impl<SE: StorageEngine> CollectionSet<SE> {
         Ok(memory_collections.keys().cloned().collect())
     }
 
+    /// Collections that already have durable storage, per the engine, WITHOUT
+    /// creating any (unlike `get`). The catalog manager uses this to warm
+    /// only the catalog collections that exist, so a schema-less node never
+    /// materializes empty `_ankurah_*` trees.
+    pub async fn engine_collections(&self) -> Result<Vec<CollectionId>, RetrievalError> { self.0.storage_engine.list_collections().await }
+
     pub async fn delete_all_collections(&self) -> Result<bool, MutationError> {
         // Clear in-memory collections first
         {

@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod genesis;
 pub mod registration;
 
