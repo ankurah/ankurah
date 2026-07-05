@@ -165,9 +165,8 @@ impl PropertyBackend for LWWBackend {
             // a corrupt buffer, not format ambiguity. Loaded values carry
             // LEGACY_EVENT_ID, and the next to_state_buffer rewrites the
             // entity in the current versioned format.
-            let legacy_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer).map_err(|e| {
-                crate::error::RetrievalError::Other(format!("failed to parse pre-0.9 legacy LWW state buffer: {e}"))
-            })?;
+            let legacy_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer)
+                .map_err(|e| crate::error::RetrievalError::Other(format!("failed to parse pre-0.9 legacy LWW state buffer: {e}")))?;
             let map = legacy_map
                 .into_iter()
                 .map(|(k, value)| (k, ValueEntry::Committed { value, event_id: EventId::from_bytes(LEGACY_EVENT_ID) }))
