@@ -187,15 +187,6 @@ impl<'a> Workload<'a> {
         })
     }
 
-    /// Deliver a raw, harness-constructed subscription-update batch from
-    /// `origin` to `dst` through the scheduler. This is the seam scenarios use
-    /// to reproduce the V4 (adversarial bridge order) and V6 (unknown-entity
-    /// item in a batch) wire shapes precisely, since those live in the
-    /// SubscriptionUpdate applier rather than the CommitTransaction path.
-    pub fn deliver_raw_update(&mut self, origin: usize, dst: usize, message: proto::NodeMessage) {
-        self.scheduler.enqueue(origin, dst, message);
-    }
-
     /// Reserve a deterministic entity id that is never created and must never be
     /// materialized on any node. Registered as forbidden so the phantom check
     /// (resident-first, so it catches a resident-only empty-head phantom) fails
