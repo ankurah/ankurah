@@ -451,3 +451,64 @@ macro_rules! clock_eq {
             "Clock mismatch: expected {:?}, got {:?}", expected_sorted, actual);
     }};
 }
+
+/// Start a test websocket server and return the server node, URL, and task handle
+#[allow(unused)]
+pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, PermissiveAgent>, String, tokio::task::JoinHandle<()>)> {
+    use ankurah_websocket_server::WebsocketServer;
+    use rand::Rng;
+    use tracing::info;
+
+    // Create and initialize server node
+    let server_storage = Arc::new(SledStorageEngine::new_test()?);
+    let server_node = Node::new_durable(server_storage, PermissiveAgent::new());
+    server_node.system.create().await?;
+
+    let mut rng = rand::thread_rng();
+
+    // Retry logic for port conflicts
+    const MAX_PORT_RETRIES: usize = 10;
+    let mut last_error = None;
+
+    for attempt in 0..MAX_PORT_RETRIES {
+        let port: u16 = rng.gen_range(20000..=65000);
+        let bind_addr = format!("127.0.0.1:{}", port);
+        let server_url = format!("ws://127.0.0.1:{}", port);
+
+        info!("Attempt {} - Starting websocket server on {}", attempt + 1, server_url);
+
+        // Start server in background task
+        let server_node_clone = server_node.clone();
+        let bind_addr_clone = bind_addr.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut server = WebsocketServer::new(server_node_clone);
+            if let Err(e) = server.run(&bind_addr_clone).await {
+                tracing::warn!("Test server error on {}: {}", bind_addr_clone, e);
+            }
+        });
+
+        // Wait briefly for the TcpListener::bind() call to complete
+        // If port is in use, the server task will complete immediately with an error
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Check if the server task is still running (successful bind) or completed (failed bind)
+        if server_task.is_finished() {
+            // Server task completed immediately, which means binding failed
+            tracing::warn!("Failed to bind server on port {} (attempt {})", port, attempt + 1);
+            last_error = Some(anyhow::anyhow!("Port {} binding failed", port));
+
+            if attempt < MAX_PORT_RETRIES - 1 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            continue;
+        }
+
+        // Server task is still running, which means TcpListener::bind() succeeded
+        // The server is now listening and ready for connections
+        info!("Successfully started websocket server on {} (attempt {})", server_url, attempt + 1);
+        return Ok((server_node, server_url, server_task));
+    }
+
+    Err(anyhow::anyhow!("Failed to start test server after {} attempts. Last error: {:?}", MAX_PORT_RETRIES, last_error))
+}

@@ -129,6 +129,17 @@ impl Connection {
         if let Ok(message) = bincode::deserialize::<proto::Message>(&data) {
             match message {
                 proto::Message::Presence(server_presence) => {
+                    // Pre-check the version so the server learns why we are
+                    // leaving; register_peer re-enforces this for every transport.
+                    if !proto::protocol_compatible(server_presence.protocol_version) {
+                        let rejection =
+                            proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: server_presence.protocol_version };
+                        error!("Refusing server {}: {}", self.url, rejection);
+                        let _ = self.send_message(proto::Message::PresenceRejected(rejection.clone()));
+                        self.disconnect();
+                        self.set_state(ConnectionState::Error { message: rejection.to_string() });
+                        return;
+                    }
                     let state = { self.state.read().unwrap().clone() };
                     match state {
                         ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
@@ -136,17 +147,23 @@ impl Connection {
                             if self
                                 .set_state(ConnectionState::Connected { url: self.url.clone(), server_presence: server_presence.clone() })
                             {
-                                self.node.register_peer(
+                                if let Err(rejection) = self.node.register_peer(
                                     server_presence.clone(),
                                     Box::new(WebSocketPeerSender {
                                         recipient_node_id: server_presence.node_id,
                                         ws: SendWrapper::new(self.ws.clone()),
                                     }),
-                                );
+                                ) {
+                                    error!("Refusing server {}: {}", self.url, rejection);
+                                    self.disconnect();
+                                    self.set_state(ConnectionState::Error { message: rejection.to_string() });
+                                    return;
+                                }
                                 let presence = proto::Presence {
                                     node_id: self.node.id(),
                                     durable: self.node.durable(),
                                     system_root: self.node.system_root(),
+                                    protocol_version: proto::PROTOCOL_VERSION,
                                 };
                                 // Send our presence message
                                 if let Err(e) = self.send_message(proto::Message::Presence(presence)) {
@@ -161,6 +178,11 @@ impl Connection {
                         }
                     }
                 }
+                proto::Message::PresenceRejected(rejection) => {
+                    error!("Server {} refused connection: {}", self.url, rejection);
+                    self.disconnect();
+                    self.set_state(ConnectionState::Error { message: rejection.to_string() });
+                }
                 proto::Message::PeerMessage(msg) => {
                     let node = self.node.cloned();
                     // TODO: determine the performance implications of spawning a new task for each message
@@ -173,7 +195,21 @@ impl Connection {
                 }
             }
         } else {
-            warn!("Failed to deserialize message from server");
+            let connecting = matches!(&*self.state.read().unwrap(), ConnectionState::Connecting { .. });
+            if connecting {
+                // A handshake we cannot read will never establish; close instead
+                // of idling on a dead connection.
+                let message = if proto::is_version0_presence(&data) {
+                    format!("Server {} speaks a pre-versioning (0.9.x or older) protocol; refusing", self.url)
+                } else {
+                    format!("Failed to deserialize handshake message from {}; closing", self.url)
+                };
+                error!("{}", message);
+                self.disconnect();
+                self.set_state(ConnectionState::Error { message });
+            } else {
+                warn!("Failed to deserialize message from server");
+            }
         }
     }
 

@@ -118,7 +118,12 @@ where
 
     // Immediately send server presence after connection
     if let Err(e) = conn
-        .send(proto::Message::Presence(proto::Presence { node_id: node.id, durable: node.durable, system_root: node.system.root() }))
+        .send(proto::Message::Presence(proto::Presence {
+            node_id: node.id,
+            durable: node.durable,
+            system_root: node.system.root(),
+            protocol_version: proto::PROTOCOL_VERSION,
+        }))
         .await
     {
         debug!("Error sending presence to {client_ip}: {:?}", e);
@@ -163,6 +168,16 @@ where
             if let Ok(message) = deserialize::<proto::Message>(&d) {
                 match message {
                     proto::Message::Presence(presence) => {
+                        // Pre-check the version while we can still reply through the
+                        // connection and await the flush; register_peer re-enforces
+                        // this for every transport.
+                        if !proto::protocol_compatible(presence.protocol_version) {
+                            let rejection =
+                                proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
+                            warn!("Refusing peer at {client_ip}: {rejection}");
+                            let _ = state.send(proto::Message::PresenceRejected(rejection)).await;
+                            return ControlFlow::Break(());
+                        }
                         match state {
                             Connection::Initial(sender) => {
                                 if let Some(sender) = sender.take() {
@@ -172,8 +187,14 @@ where
                                     // Register peer sender for this client
                                     let sender = WebSocketClientSender::new(presence.node_id, sender);
 
-                                    node.register_peer(presence, Box::new(sender.clone()));
-                                    *state = Connection::Established(sender);
+                                    match node.register_peer(presence, Box::new(sender.clone())) {
+                                        Ok(()) => *state = Connection::Established(sender),
+                                        Err(rejection) => {
+                                            warn!("Refusing peer at {client_ip}: {rejection}");
+                                            let _ = sender.send_message(proto::Message::PresenceRejected(rejection));
+                                            return ControlFlow::Break(());
+                                        }
+                                    }
                                 }
                             }
                             _ => warn!("Received presence from {} but already have a peer sender - ignoring", client_ip),
@@ -190,7 +211,20 @@ where
                             warn!("Received peer message from {} but not connected as a peer", client_ip);
                         }
                     }
+                    proto::Message::PresenceRejected(rejection) => {
+                        warn!("Peer at {} refused our presence: {}", client_ip, rejection);
+                        return ControlFlow::Break(());
+                    }
                 }
+            } else if let Connection::Initial(_) = state {
+                // A peer whose handshake we cannot read will never establish;
+                // close instead of leaving the connection dangling.
+                if proto::is_version0_presence(&d) {
+                    warn!("Refusing peer at {client_ip}: pre-versioning (0.9.x or older) protocol handshake");
+                } else {
+                    error!("Failed to deserialize handshake message from {client_ip}; closing");
+                }
+                return ControlFlow::Break(());
             } else {
                 error!("Failed to deserialize message from {}", client_ip);
             }
