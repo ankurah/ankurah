@@ -48,7 +48,7 @@ use crate::{
     livequery::EntityLiveQuery,
     node::{Node, WeakNode},
     policy::PolicyAgent,
-    property::backend::{LWWBackend, PropertyBackend},
+    property::backend::{lww::SchemaBinding, LWWBackend, PropertyBackend},
     reactor::{AbstractEntity, GapFetcher, MembershipChange, Reactor, ReactorSubscription, ReactorUpdate},
     resultset::EntityResultSet,
     storage::StorageEngine,
@@ -285,6 +285,31 @@ impl CatalogMapInner {
 
     fn siblings_by_name(&self, name: &str) -> Vec<EntityId> {
         self.names_global.get(name).into_iter().flat_map(|s| s.iter().copied()).collect()
+    }
+
+    /// Build a name<->id translation table for every property reachable via
+    /// `collection`'s model and its memberships (RFC 5.5 v2 binding). Returns
+    /// `None` when the collection has no model in the map yet (nothing to
+    /// bind). The two directions are mutual inverses by construction, as
+    /// [`SchemaBinding`] requires; on a display-name collision (two ids share
+    /// a name in one contract, e.g. mid-retype) the last membership wins the
+    /// forward entry while both id->name entries are kept, which is
+    /// acceptable for projection (the reverse map is what materialization
+    /// reads) and never fabricates an id the contract does not contain.
+    fn binding_for(&self, collection: &str) -> Option<SchemaBinding> {
+        let model_id = self.by_collection.get(collection)?;
+        let membership_ids = self.model_memberships.get(model_id)?;
+        let mut to_id: BTreeMap<String, EntityId> = BTreeMap::new();
+        let mut to_name: BTreeMap<EntityId, String> = BTreeMap::new();
+        for mid in membership_ids {
+            if let Some(membership) = self.memberships.get(mid) {
+                if let Some(prop) = self.properties.get(&membership.property) {
+                    to_id.insert(prop.name.clone(), prop.id);
+                    to_name.insert(prop.id, prop.name.clone());
+                }
+            }
+        }
+        Some(SchemaBinding { to_id, to_name })
     }
 }
 
@@ -748,6 +773,16 @@ where
 
     /// The property named `name` in `collection` (RFC 5.2 name lookup).
     pub fn resolve(&self, collection: &str, name: &str) -> Option<EntityId> { self.0.map.read().unwrap().resolve(collection, name) }
+
+    /// A `SchemaBinding` (name<->id for every property reachable via the
+    /// collection's model and memberships) for attaching to a user-collection
+    /// LWW backend so it emits the id-keyed (v2) encoding (RFC 5.5). Returns
+    /// `None` when the collection has no model in the catalog yet. Built fresh
+    /// from the current map on each call (RFC 5.5 Phase A: construct at attach
+    /// time; a cached Arc updated on catalog change is a later optimization).
+    pub fn binding_for(&self, collection: &CollectionId) -> Option<Arc<SchemaBinding>> {
+        self.0.map.read().unwrap().binding_for(collection.as_str()).map(Arc::new)
+    }
 
     pub fn property_by_id(&self, id: &EntityId) -> Option<PropertyDef> { self.0.map.read().unwrap().properties.get(id).cloned() }
 

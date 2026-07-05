@@ -14,7 +14,9 @@ use crate::{id::EntityId, Attested, EntityState};
 /// - absent: 0.9.x and earlier carried no version in Presence. Such peers
 ///   are classified as version 0 (see [`is_version0_presence`]) and refused.
 /// - 1: the 0.9 wire shapes plus the versioned Presence handshake (#294).
-pub const PROTOCOL_VERSION: u32 = 1;
+/// - 2: the Phase A id-keyed epoch: LWW diff v2 / state 0xA2, resolved
+///   Identifier selections, RegisterSchema.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Whether a peer advertising `remote` can interoperate with this binary.
 ///

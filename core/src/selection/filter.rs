@@ -2,7 +2,7 @@
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
 use crate::value::Value;
-use ankql::ast::{ComparisonOperator, Expr, Predicate};
+use ankql::ast::{ComparisonOperator, Expr, Identifier, Predicate};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -57,11 +57,15 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone().into())),
         Expr::Path(path) => evaluate_path_steps(item, &path.steps),
-        // Phase A: evaluate a resolved Identifier EXACTLY like a Path whose steps are
-        // [name, ..subpath] (name-based entity value lookup + sub-path extraction). The
-        // switch to id-based lookup arrives later with the v2 integration -- do not
-        // attempt it now.
-        Expr::Identifier(identifier) => evaluate_path_steps(item, &identifier.path_steps()),
+        // A RESOLVED Identifier addresses exactly one property by its
+        // resolved-at name plus an optional JSON sub-path. It does NOT share
+        // the Path qualifier logic: the resolution pass already stripped any
+        // collection qualifier and fixed the property, so a leading step that
+        // happens to equal the collection name is the PROPERTY, never a
+        // qualifier. Evaluate value(name) + subpath extraction only. (Phase A:
+        // name-based lookup through the binding; id-based lookup is a
+        // follow-up, Filterable::value_by_property_id.)
+        Expr::Identifier(identifier) => evaluate_identifier(item, identifier),
         Expr::ExprList(exprs) => {
             let mut result = Vec::new();
             for expr in exprs {
@@ -73,9 +77,25 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
     }
 }
 
-/// Evaluate a sequence of path steps (as produced by `PathExpr::steps` or
-/// `Identifier::path_steps`) against an item. Shared by the `Expr::Path` and
-/// `Expr::Identifier` arms so both evaluate identically (Phase A: name-based).
+/// Evaluate a RESOLVED [`Identifier`]: look up the property by its
+/// resolved-at name, then extract any JSON sub-path. Unlike
+/// [`evaluate_path_steps`] this does NO collection-qualifier handling -- the
+/// resolution pass already bound the property, so `name` is authoritative
+/// even when it equals the collection name (Phase A: name-based lookup).
+fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Result<ExprOutput<Value>, Error> {
+    let name = identifier.property_name();
+    if identifier.is_simple() {
+        // Bare column reference: value(name) only.
+        return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
+    }
+    // A JSON sub-path: fetch the property then traverse into it.
+    evaluate_sub_path(item, name, &identifier.subpath)
+}
+
+/// Evaluate a sequence of path steps (as produced by `PathExpr::steps`)
+/// against an item. Used by the `Expr::Path` arm (unresolved paths still
+/// carry the legacy collection-qualifier ambiguity); the resolved
+/// `Expr::Identifier` arm uses [`evaluate_identifier`] instead.
 fn evaluate_path_steps<I: Filterable>(item: &I, steps: &[String]) -> Result<ExprOutput<Value>, Error> {
     // For simple paths, use the first step as the property name
     if steps.len() == 1 {

@@ -76,6 +76,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
         let primary_entity = self.node.entities.create(collection);
+        // Flip a user-collection entity to the id-keyed (v2) wire encoding
+        // (RFC 5.5 Phase A) on the PRIMARY, BEFORE snapshotting: the snapshot
+        // forks the bound backend (fork carries binding + wire mode), and the
+        // commit save path persists the primary (upstream), so both the diff
+        // and the rewritten state buffer are v2. No-op for system/catalog.
+        self.node.bind_entity(&primary_entity);
         primary_entity.snapshot(trx_alive)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
@@ -381,6 +387,10 @@ where
 
         if let Some(local) = self.node.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
+            // Defensive re-bind of the resident (idempotent): guarantees the
+            // returned user entity is id-keyed (v2) even if it was first
+            // assembled on a path that predates binding (RFC 5.5).
+            self.node.bind_entity(&local);
             let state = local.to_state()?;
             let entity_id = local.id();
             self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state)?;
@@ -404,6 +414,9 @@ where
                     .entities
                     .with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state)
                     .await?;
+                // Flip to id-keyed (v2) so a subsequent edit rewrites 0xA2 and
+                // id-keyed values project through the binding (RFC 5.5).
+                self.node.bind_entity(&entity);
                 Ok(entity)
             }
             Err(e) => Err(e),
@@ -415,6 +428,12 @@ where
         // Fetch raw states from storage
 
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
+
+        // Resolve property references against the catalog (RFC 5.5 Phase A):
+        // PathExpr -> Identifier, failing closed on unknown properties, with
+        // the catalog-lag deferral. Idempotent, so a selection resolved by an
+        // outer caller passes through unchanged here.
+        args.selection = self.node.catalog.resolve_selection_deferred(collection_id, &args.selection).await?;
 
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);
@@ -437,6 +456,8 @@ where
                     .entities
                     .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
                     .await?;
+                // Flip to id-keyed (v2) for user collections (RFC 5.5).
+                self.node.bind_entity(&entity);
                 entities.push(entity);
             }
             Ok(entities)

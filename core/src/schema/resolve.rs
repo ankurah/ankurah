@@ -35,6 +35,32 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    /// Resolve a selection with the Phase A CATALOG-LAG DEFERRAL rule (RFC
+    /// 5.5): attempt [`resolve_selection`]; if it fails `UnknownProperty`
+    /// only because the catalog is not ready yet, await readiness and retry
+    /// ONCE, then propagate. A compiled model resolves immediately via the
+    /// `cache_compiled` overlay, so this awaits only when a reference is
+    /// genuinely unknown on a not-yet-warm catalog. Any non-`UnknownProperty`
+    /// error, or an `UnknownProperty` when the catalog IS ready (a real
+    /// unknown reference), propagates without waiting (fail closed).
+    pub async fn resolve_selection_deferred(&self, collection: &CollectionId, selection: &Selection) -> Result<Selection, PropertyError> {
+        match self.resolve_selection(collection, selection) {
+            Ok(resolved) => Ok(resolved),
+            Err(PropertyError::UnknownProperty { collection: c, name }) => {
+                if self.is_catalog_ready() {
+                    // Catalog is warm and still cannot resolve it: a real
+                    // unknown reference. Fail closed.
+                    return Err(PropertyError::UnknownProperty { collection: c, name });
+                }
+                // Data may have outrun metadata: wait for the catalog to warm,
+                // then retry exactly once.
+                self.wait_catalog_ready().await;
+                self.resolve_selection(collection, selection)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Resolve every property reference in `selection` against the catalog
     /// for `collection`. Errors with `UnknownProperty` on the first
     /// reference nothing defines (fail closed, AC5). Already-resolved

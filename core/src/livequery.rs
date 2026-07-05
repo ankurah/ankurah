@@ -213,6 +213,17 @@ where
     node.policy_agent.can_access_collection(&cdata, &collection_id)?;
     args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
 
+    // NOTE: property RESOLUTION (PathExpr -> Identifier, RFC 5.5) cannot run
+    // here: create_inner is SYNC (called from the LiveQuery constructors) and
+    // the catalog-lag deferral must be able to await catalog readiness. It is
+    // therefore deferred into the async paths that follow this function:
+    //   - DURABLE node: resolved (with deferral) inside the spawned activation
+    //     task below, which writes the resolved selection back into `inner`
+    //     before the reactor sees it.
+    //   - EPHEMERAL node: resolved on the forward path in
+    //     `Node::subscribe_remote_query` (see new_with_node_ref).
+    // Resolution is idempotent and precedes type_resolver at each site.
+
     // Resolve types in the AST (converts literals for JSON path comparisons)
     args.selection = node.type_resolver.resolve_selection_types(args.selection);
 
@@ -242,10 +253,30 @@ where
     if args.cached || !has_relay {
         // Durable node: spawn initialization task directly (no remote subscription needed)
         let inner2 = inner.clone();
+        // Capture the catalog + collection so the async task can run property
+        // RESOLUTION (with the catalog-lag deferral) that create_inner cannot,
+        // being sync. The resolved selection is written back into `inner`
+        // before activate reads it (see below).
+        let catalog = node.catalog.clone();
+        let resolve_collection = collection_id.clone();
 
         debug!("LiveQuery::new() spawning initialization task for durable node predicate {}", query_id);
         crate::task::spawn(async move {
             debug!("LiveQuery initialization task starting for predicate {}", query_id);
+            // RFC 5.5 resolution: PathExpr -> Identifier, failing closed, with
+            // deferral. Runs before activate so the reactor query is resolved.
+            let (current, current_version) = inner2.selection.value();
+            match catalog.resolve_selection_deferred(&resolve_collection, &current).await {
+                Ok(resolved) => inner2.selection.set((resolved, current_version)),
+                Err(e) => {
+                    debug!("LiveQuery resolution failed for predicate {}: {}", query_id, e);
+                    inner2.error.set(Some(e.into()));
+                    // Still mark initialized so waiters do not hang on a query
+                    // that fails closed; the error is surfaced via `error`.
+                    inner2.mark_initialized(1);
+                    return;
+                }
+            }
             if let Err(e) = inner2.activate(1).await {
                 debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
                 inner2.error.set(Some(e));
@@ -370,6 +401,14 @@ impl EntityLiveQuery {
     }
 
     pub fn error(&self) -> Read<Option<RetrievalError>> { self.0.error.read() }
+
+    /// Record a terminal error for this query (e.g. a fail-closed resolution
+    /// failure raised on the async forward path). Also releases
+    /// `wait_initialized` waiters so they observe the error rather than hang.
+    pub(crate) fn set_error(&self, error: RetrievalError) {
+        self.0.error.set(Some(error));
+        self.0.mark_initialized(self.0.current_version.load(std::sync::atomic::Ordering::Relaxed).max(1));
+    }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
     pub fn selection(&self) -> Read<(ankql::ast::Selection, u32)> { self.0.selection.read() }
     pub fn resultset(&self) -> EntityResultSet { self.0.resultset.clone() }

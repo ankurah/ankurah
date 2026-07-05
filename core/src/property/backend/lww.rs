@@ -105,11 +105,31 @@ struct V2Diff {
 }
 
 /// Wire payload for a version-2 (0xA2) LWW state buffer. Same split as
-/// [`V2Diff`] but over committed entries (value + provenance event id).
+/// [`V2Diff`] but over committed entries (value + provenance event id +
+/// optional display-name hint). Entries are [`V2CommittedEntry`], NOT the
+/// v1 [`CommittedEntry`]: the 0xA1 payload is frozen and must never gain a
+/// field, so the hint lives only in the v2 entry type.
 #[derive(Serialize, Deserialize)]
 struct V2State {
-    by_id: BTreeMap<EntityId, CommittedEntry>,
-    residue: BTreeMap<String, CommittedEntry>,
+    by_id: BTreeMap<EntityId, V2CommittedEntry>,
+    residue: BTreeMap<String, V2CommittedEntry>,
+}
+
+/// A committed entry in a 0xA2 state buffer: value + provenance, plus an
+/// optional display-name HINT (RFC 5.5 engine-materialization decision,
+/// #289). A bound writer fills `name` from its binding's reverse map (or the
+/// hints side-map) at write time; an unknown-id entry carries `None`
+/// (unprojectable, correct). The hint lets a backend parsed WITHOUT a
+/// binding -- the storage engines' `from_state_buffer` materialization path
+/// -- still project id-keyed entries to names, so SQL/sled indexes keep
+/// working across the Phase A->C window. Hints never enter DIFF bytes, so
+/// identity and convergence are untouched; state buffers are not
+/// identity-hashed. Renames leave stale hints until rewrite-on-save.
+#[derive(Serialize, Deserialize, Clone)]
+struct V2CommittedEntry {
+    value: Option<Value>,
+    event_id: EventId,
+    name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +171,14 @@ pub struct LWWBackend {
     /// What this instance emits. Set-once alongside `binding` for user
     /// collections; permanently `NameKeyedV1` for catalog/system collections.
     wire_mode: RwLock<WireMode>,
+    /// Display-name hints for id-keyed entries, carried by 0xA2 state buffers
+    /// (RFC 5.5 engine-materialization decision). Populated on 0xA2 decode
+    /// from each entry's `name` hint, and consulted by `property_values`,
+    /// `properties`, and broadcast reverse-translation when the binding lacks
+    /// the id -- so a backend parsed WITHOUT a binding (the storage engines'
+    /// `from_state_buffer` path) still projects id-keyed entries to names for
+    /// materialization. The binding, when present, always wins over a hint.
+    hints: RwLock<BTreeMap<EntityId, String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -176,6 +204,7 @@ impl LWWBackend {
             field_broadcasts: Mutex::new(BTreeMap::new()),
             binding: RwLock::new(None),
             wire_mode: RwLock::new(WireMode::default()),
+            hints: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -216,12 +245,20 @@ impl LWWBackend {
     pub fn set_wire_mode(&self, mode: WireMode) { *self.wire_mode.write().unwrap() = mode; }
 
     /// Resolve a display name to the key it should be stored/looked-up under:
-    /// `Id` when the binding knows the name, else `Name`.
+    /// `Id` when the binding knows the name; else the id whose decode-time
+    /// HINT matches the name (so an UNBOUND backend loaded from a 0xA2 buffer
+    /// still addresses its id-keyed entries by name -- View accessors, `set`
+    /// rewrites, and `get_event_id` all route here); else `Name`.
     fn key_for_name(&self, name: &str) -> PropertyKey {
-        match self.binding.read().unwrap().as_ref().and_then(|b| b.to_id.get(name).copied()) {
-            Some(id) => PropertyKey::Id(id),
-            None => PropertyKey::Name(name.to_string()),
+        if let Some(id) = self.binding.read().unwrap().as_ref().and_then(|b| b.to_id.get(name).copied()) {
+            return PropertyKey::Id(id);
         }
+        // Reverse-scan the hints (id -> name) for a matching display name. The
+        // binding always wins above; hints only cover ids a binding cannot.
+        if let Some(id) = self.hints.read().unwrap().iter().find_map(|(id, n)| (n == name).then_some(*id)) {
+            return PropertyKey::Id(id);
+        }
+        PropertyKey::Name(name.to_string())
     }
 
     pub fn set(&self, property_name: PropertyName, value: Option<Value>) {
@@ -230,28 +267,72 @@ impl LWWBackend {
         values.insert(key, ValueEntry::Uncommitted { value });
     }
 
-    pub fn get(&self, property_name: &PropertyName) -> Option<Value> {
-        let key = self.key_for_name(property_name);
+    pub fn get(&self, property_name: &PropertyName) -> Option<Value> { self.lookup_entry(property_name).and_then(|e| e.value()) }
+
+    /// Find the stored entry for a display name, trying every key it could
+    /// live under (RFC 5.5 read fallback), in priority order:
+    ///   1. the id the binding/hint maps the name to ([`key_for_name`]);
+    ///   2. the bare Name key (legacy residue not yet migrated);
+    ///   3. any id whose decode-time HINT is this name -- so a value stored
+    ///      under a FOREIGN id (e.g. a state produced under a different system
+    ///      root, or before a rename) is still readable by its display name.
+    /// Shared by `get` and `get_event_id` so both resolve identically.
+    fn lookup_entry(&self, property_name: &PropertyName) -> Option<ValueEntry> {
         let values = self.values.read().unwrap();
-        // Resolve under the id key first; fall back to the name key for
-        // legacy residue not yet migrated to an id (RFC 5.5 read fallback).
-        if let PropertyKey::Id(_) = key {
-            if let Some(entry) = values.get(&key) {
-                return entry.value();
-            }
-            return values.get(&PropertyKey::Name(property_name.clone())).and_then(|entry| entry.value());
+        let key = self.key_for_name(property_name);
+        if let Some(entry) = values.get(&key) {
+            return Some(entry.clone());
         }
-        values.get(&key).and_then(|entry| entry.value())
+        // key_for_name may have returned an id (binding/hint) that has no entry;
+        // try the bare name next.
+        if !matches!(key, PropertyKey::Name(_)) {
+            if let Some(entry) = values.get(&PropertyKey::Name(property_name.clone())) {
+                return Some(entry.clone());
+            }
+        }
+        // Last resort: a value under a foreign id carrying this display-name
+        // hint (cross-root / pre-rename state). The binding wins above, so this
+        // only fires when no bound/named key held the value.
+        let hints = self.hints.read().unwrap();
+        for (id, name) in hints.iter() {
+            if name == property_name {
+                if let Some(entry) = values.get(&PropertyKey::Id(*id)) {
+                    return Some(entry.clone());
+                }
+            }
+        }
+        None
     }
 
-    /// Reverse-translate a stored key to a display name via the binding.
+    /// Reverse-translate a stored key to a display name via the binding ONLY.
     /// Name keys pass through; Id keys resolve through `to_name`; an Id key
     /// with no known name is unprojectable and yields `None` (RFC 5.6 catalog
-    /// -lag opacity).
+    /// -lag opacity). Used by the v1 EMISSION paths, where an unresolvable id
+    /// key is a hard encoding error and must NOT be masked by a decode-time
+    /// hint (a bound v1/system backend never legitimately holds id keys).
     fn key_to_name(binding: Option<&Arc<SchemaBinding>>, key: &PropertyKey) -> Option<String> {
         match key {
             PropertyKey::Name(name) => Some(name.clone()),
             PropertyKey::Id(id) => binding.and_then(|b| b.to_name.get(id).cloned()),
+        }
+    }
+
+    /// Reverse-translate a stored key to a display name for PROJECTION,
+    /// consulting the binding FIRST and the decode-time hints side-map second
+    /// (RFC 5.5 engine-materialization decision). Name keys pass through; an
+    /// Id key resolves through the binding, else through the hint captured on
+    /// 0xA2 decode, else is unprojectable (`None`). This is the path
+    /// `property_values`/`properties`/broadcasts use, so an UNBOUND backend
+    /// (the engines' `from_state_buffer` materialization) still projects
+    /// id-keyed entries to names via their hints.
+    fn key_to_name_projected(
+        binding: Option<&Arc<SchemaBinding>>,
+        hints: &BTreeMap<EntityId, String>,
+        key: &PropertyKey,
+    ) -> Option<String> {
+        match key {
+            PropertyKey::Name(name) => Some(name.clone()),
+            PropertyKey::Id(id) => binding.and_then(|b| b.to_name.get(id).cloned()).or_else(|| hints.get(id).cloned()),
         }
     }
 }
@@ -269,9 +350,12 @@ impl PropertyBackend for LWWBackend {
         // Carry the schema binding and wire mode across the fork: a
         // transaction fork of a user-collection backend must keep keying and
         // emitting id-keyed, or writes made inside the transaction would be
-        // name-keyed and mismatch on commit.
+        // name-keyed and mismatch on commit. Carry the hints side-map too, so
+        // a fork of an UNBOUND backend loaded from a 0xA2 buffer keeps
+        // projecting id-keyed entries (and re-emits their hints on save).
         let binding = self.binding.read().unwrap().clone();
         let wire_mode = *self.wire_mode.read().unwrap();
+        let hints = self.hints.read().unwrap().clone();
 
         Arc::new(Self {
             values: RwLock::new(cloned),
@@ -279,15 +363,17 @@ impl PropertyBackend for LWWBackend {
             field_broadcasts: Mutex::new(BTreeMap::new()),
             binding: RwLock::new(binding),
             wire_mode: RwLock::new(wire_mode),
+            hints: RwLock::new(hints),
         })
     }
 
     fn properties(&self) -> Vec<PropertyName> {
         let values = self.values.read().unwrap();
         let binding = self.binding.read().unwrap();
-        // Project to display names; id keys with no known name are omitted
-        // (unprojectable by design, RFC 5.6).
-        values.keys().filter_map(|k| Self::key_to_name(binding.as_ref(), k)).collect::<Vec<PropertyName>>()
+        let hints = self.hints.read().unwrap();
+        // Project to display names via binding-then-hint; id keys with no
+        // known name are omitted (unprojectable by design, RFC 5.6).
+        values.keys().filter_map(|k| Self::key_to_name_projected(binding.as_ref(), &hints, k)).collect::<Vec<PropertyName>>()
     }
 
     fn property_value(&self, property_name: &PropertyName) -> Option<Value> { self.get(property_name) }
@@ -295,9 +381,11 @@ impl PropertyBackend for LWWBackend {
     fn property_values(&self) -> BTreeMap<PropertyName, Option<Value>> {
         let values = self.values.read().unwrap();
         let binding = self.binding.read().unwrap();
+        let hints = self.hints.read().unwrap();
         // Name keys pass through as-is; id keys are reverse-translated through
-        // the binding; id keys with no known name are OMITTED (RFC 5.6).
-        values.iter().filter_map(|(k, v)| Self::key_to_name(binding.as_ref(), k).map(|name| (name, v.value()))).collect()
+        // the binding, then the decode-time hints (so an UNBOUND backend still
+        // projects); id keys with no known name are OMITTED (RFC 5.6).
+        values.iter().filter_map(|(k, v)| Self::key_to_name_projected(binding.as_ref(), &hints, k).map(|name| (name, v.value()))).collect()
     }
 
     fn property_backend_name() -> &'static str { "lww" }
@@ -340,16 +428,24 @@ impl PropertyBackend for LWWBackend {
                 Ok(state_buffer)
             }
             WireMode::IdKeyedV2 => {
+                let hints = self.hints.read().unwrap();
                 let mut state = V2State { by_id: BTreeMap::new(), residue: BTreeMap::new() };
                 for (key, entry) in values.iter() {
                     let event_id = require_event_id(key, entry)?;
-                    let committed = CommittedEntry { value: entry.value(), event_id };
                     match key {
                         PropertyKey::Id(id) => {
-                            state.by_id.insert(*id, committed);
+                            // Fill the display-name hint: binding reverse map
+                            // first, else the decode-time side-map, else None
+                            // (unknown id stays unprojectable, correct).
+                            let name = binding.as_ref().and_then(|b| b.to_name.get(id).cloned()).or_else(|| hints.get(id).cloned());
+                            state.by_id.insert(*id, V2CommittedEntry { value: entry.value(), event_id, name });
                         }
                         PropertyKey::Name(name) => {
-                            state.residue.insert(name.clone(), committed);
+                            // Residue is already name-keyed; the hint just
+                            // echoes the key so an unbound reload keeps it.
+                            state
+                                .residue
+                                .insert(name.clone(), V2CommittedEntry { value: entry.value(), event_id, name: Some(name.clone()) });
                         }
                     }
                 }
@@ -399,13 +495,21 @@ impl PropertyBackend for LWWBackend {
             LWW_STATE_VERSION_2 => {
                 let state = bincode::deserialize::<V2State>(payload)?;
                 let mut map: BTreeMap<PropertyKey, ValueEntry> = BTreeMap::new();
+                // Retain each id entry's display-name hint so an UNBOUND
+                // reload (the storage engines' materialization path) can still
+                // project it. Residue names carry no hint: they are already
+                // their own key.
+                let mut hints: BTreeMap<EntityId, String> = BTreeMap::new();
                 for (id, entry) in state.by_id {
+                    if let Some(name) = entry.name {
+                        hints.insert(id, name);
+                    }
                     map.insert(PropertyKey::Id(id), ValueEntry::Committed { value: entry.value, event_id: entry.event_id });
                 }
                 for (name, entry) in state.residue {
                     map.insert(PropertyKey::Name(name), ValueEntry::Committed { value: entry.value, event_id: entry.event_id });
                 }
-                Ok(Self::from_decoded(map))
+                Ok(Self::from_decoded_with_hints(map, hints))
             }
             // Unknown versions are refused loudly rather than misread. A 0.9
             // binary refuses 0xA2 (and anything above 0xA1) via this identical
@@ -543,6 +647,11 @@ impl PropertyBackend for LWWBackend {
                         }
                     };
                     for (prop, value) in changes {
+                        // Normalize an incoming name key onto its id key (if
+                        // bound/hinted) so a v1/residue write competes with the
+                        // id-keyed value for the same property in election,
+                        // matching how stored values were seeded (RFC 5.5).
+                        let prop = self.normalize_key(prop);
                         let candidate = Candidate { value, event_id: event.id(), from_to_apply, older_than_meet: false };
                         if let Some(current) = winners.get_mut(&prop) {
                             if current.older_than_meet {
@@ -576,12 +685,13 @@ impl PropertyBackend for LWWBackend {
         {
             let mut values = self.values.write().unwrap();
             let binding = self.binding.read().unwrap();
+            let hints = self.hints.read().unwrap();
             for (prop, candidate) in winners {
                 if candidate.from_to_apply {
-                    // Reverse-translate to a display name for the broadcast;
-                    // an id-keyed change with an unknown name fires no
-                    // broadcast (RFC 5.6 opacity).
-                    if let Some(name) = Self::key_to_name(binding.as_ref(), &prop) {
+                    // Reverse-translate to a display name for the broadcast
+                    // (binding then hint); an id-keyed change with no known
+                    // name fires no broadcast (RFC 5.6 opacity).
+                    if let Some(name) = Self::key_to_name_projected(binding.as_ref(), &hints, &prop) {
                         changed_fields.push(name);
                     }
                     values.insert(prop, ValueEntry::Committed { value: candidate.value, event_id: candidate.event_id });
@@ -609,12 +719,18 @@ impl LWWBackend {
     /// Build a decoded backend from a key map. Decode is schema-blind, so the
     /// result carries no binding and defaults to NameKeyedV1; integration
     /// flips those afterwards via bind_schema / set_wire_mode.
-    fn from_decoded(map: BTreeMap<PropertyKey, ValueEntry>) -> Self {
+    fn from_decoded(map: BTreeMap<PropertyKey, ValueEntry>) -> Self { Self::from_decoded_with_hints(map, BTreeMap::new()) }
+
+    /// As [`from_decoded`], but also seed the display-name hints side-map
+    /// (0xA2 decode only). The hints let an UNBOUND backend project id-keyed
+    /// entries for engine materialization; a later bind_schema still wins.
+    fn from_decoded_with_hints(map: BTreeMap<PropertyKey, ValueEntry>, hints: BTreeMap<EntityId, String>) -> Self {
         Self {
             values: RwLock::new(map),
             field_broadcasts: Mutex::new(BTreeMap::new()),
             binding: RwLock::new(None),
             wire_mode: RwLock::new(WireMode::default()),
+            hints: RwLock::new(hints),
         }
     }
 
@@ -625,19 +741,25 @@ impl LWWBackend {
         broadcast.id()
     }
 
-    /// Get the event_id that last wrote a property value (if tracked).
-    /// Resolves the name to its key the same way `get` does, with the same
-    /// name-key fallback for legacy residue.
-    pub fn get_event_id(&self, property_name: &PropertyName) -> Option<EventId> {
-        let key = self.key_for_name(property_name);
-        let values = self.values.read().unwrap();
-        if let PropertyKey::Id(_) = key {
-            if let Some(entry) = values.get(&key) {
-                return entry.event_id();
-            }
-            return values.get(&PropertyKey::Name(property_name.clone())).and_then(|entry| entry.event_id());
+    /// Normalize a just-decoded key against the current binding/hints so that
+    /// an incoming NAME-keyed change (a v1 diff, or v2 residue) for a property
+    /// this backend knows by id lands on the SAME id key as its existing
+    /// id-keyed value, and therefore COMPETES in LWW election instead of
+    /// splitting into a shadow name entry (RFC 5.5 mixed-version convergence).
+    /// Id keys pass through unchanged. Uses [`key_for_name`], so the binding
+    /// wins and the decode-time hints cover ids no binding resolves.
+    fn normalize_key(&self, key: PropertyKey) -> PropertyKey {
+        match key {
+            PropertyKey::Id(_) => key,
+            PropertyKey::Name(name) => self.key_for_name(&name),
         }
-        values.get(&key).and_then(|entry| entry.event_id())
+    }
+
+    /// Get the event_id that last wrote a property value (if tracked).
+    /// Resolves the name to its key the same way `get` does (binding/hint id,
+    /// then name, then foreign-id-by-hint).
+    pub fn get_event_id(&self, property_name: &PropertyName) -> Option<EventId> {
+        self.lookup_entry(property_name).and_then(|e| e.event_id())
     }
     /// Internal implementation that handles both tracked and untracked operations.
     fn apply_operations_internal(&self, operations: &[Operation], event_id: Option<EventId>) -> Result<(), MutationError> {
@@ -665,16 +787,23 @@ impl LWWBackend {
                 version => return Err(MutationError::UpdateFailed(anyhow::anyhow!("Unknown LWW operation version: {:?}", version).into())),
             };
 
+            // Normalize incoming name keys onto their id keys (if bound/hinted)
+            // BEFORE taking the values lock, so a v1/residue write competes with
+            // the id-keyed value for the same property rather than shadowing it.
+            let changes: Vec<(PropertyKey, Option<Value>)> = changes.into_iter().map(|(k, v)| (self.normalize_key(k), v)).collect();
+
             let mut values = self.values.write().unwrap();
             let binding = self.binding.read().unwrap();
+            let hints = self.hints.read().unwrap();
             for (key, new_value) in changes {
                 let entry = match event_id.clone() {
                     Some(event_id) => ValueEntry::Committed { value: new_value, event_id },
                     None => ValueEntry::Pending { value: new_value },
                 };
-                // Reverse-translate for the broadcast; an id-keyed change with
-                // an unknown name fires no broadcast (RFC 5.6 opacity).
-                if let Some(name) = Self::key_to_name(binding.as_ref(), &key) {
+                // Reverse-translate for the broadcast (binding then hint); an
+                // id-keyed change with no known name fires no broadcast (RFC
+                // 5.6 opacity).
+                if let Some(name) = Self::key_to_name_projected(binding.as_ref(), &hints, &key) {
                     changed_fields.push(name);
                 }
                 values.insert(key, entry);
@@ -845,16 +974,62 @@ mod tests {
         let state: V2State = bincode::deserialize(&buffer[1..]).unwrap();
         assert!(state.by_id.contains_key(&id(0x11)));
         assert!(state.residue.contains_key("legacy"));
+        // The bound writer stamped the display-name HINT onto the id entry
+        // (RFC 5.5 engine-materialization decision).
+        assert_eq!(state.by_id.get(&id(0x11)).and_then(|e| e.name.clone()), Some("title".to_string()));
 
-        // Decode is schema-blind: without re-binding, the id key is
-        // unprojectable, but the residue name projects.
+        // Decode is schema-blind, but the hint travels with the buffer: an
+        // UNBOUND reload STILL projects the id key by name (this is exactly
+        // the storage engines' from_state_buffer materialization path).
         let restored = LWWBackend::from_state_buffer(&buffer).unwrap();
         assert_eq!(restored.get(&"legacy".to_string()), Some(Value::I64(7)));
-        assert!(!restored.property_values().contains_key("title"), "id key unprojectable before re-binding");
-        // Re-bind and the id key projects back to its name.
+        assert_eq!(
+            restored.property_values().get("title"),
+            Some(&Some(Value::String("alpha".into()))),
+            "hint projects the id key even without a binding"
+        );
+        // A binding still resolves the id key the same way.
         restored.bind_schema(title_author_binding());
         assert_eq!(restored.get(&"title".to_string()), Some(Value::String("alpha".into())));
         assert_eq!(restored.get_event_id(&"title".to_string()), Some(event_id));
+    }
+
+    // (a2) The engine-materialization case, end to end: a bound writer emits a
+    // 0xA2 buffer; a completely UNBOUND backend decodes it (as the storage
+    // engines do inside set_state) and projects EVERY id-keyed property to its
+    // name via the decode-time hints -- so SQL/sled materialization and
+    // TemporaryEntity filtering keep working across the Phase A->C window.
+    #[test]
+    fn unbound_decode_of_bound_v2_buffer_projects_all_names_via_hints() {
+        let event_id = EventId::from_bytes([4; 32]);
+        let writer = LWWBackend::new();
+        writer.bind_schema(title_author_binding());
+        writer.set_wire_mode(WireMode::IdKeyedV2);
+        writer.set("title".into(), Some(Value::String("alpha".into())));
+        writer.set("author".into(), Some(Value::String("bob".into())));
+        let ops = writer.to_operations().unwrap().unwrap();
+        writer.apply_operations_with_event(&ops, event_id).unwrap();
+        let buffer = writer.to_state_buffer().unwrap();
+        assert_eq!(buffer[0], LWW_STATE_VERSION_2);
+
+        // Decode with NO binding, exactly like a storage engine's
+        // from_state_buffer materialization path.
+        let unbound = LWWBackend::from_state_buffer(&buffer).unwrap();
+        let projected = unbound.property_values();
+        assert_eq!(projected.get("title"), Some(&Some(Value::String("alpha".into()))));
+        assert_eq!(projected.get("author"), Some(&Some(Value::String("bob".into()))));
+        // properties() is likewise fully projected via hints.
+        let mut names = unbound.properties();
+        names.sort();
+        assert_eq!(names, vec!["author".to_string(), "title".to_string()]);
+
+        // And the hints survive a load->save cycle on the UNBOUND backend: it
+        // re-emits 0xA2 with the same names, so a later reload still projects.
+        unbound.set_wire_mode(WireMode::IdKeyedV2);
+        let re = unbound.to_state_buffer().unwrap();
+        let restate: V2State = bincode::deserialize(&re[1..]).unwrap();
+        assert_eq!(restate.by_id.get(&id(0x11)).and_then(|e| e.name.clone()), Some("title".to_string()));
+        assert_eq!(restate.by_id.get(&id(0x22)).and_then(|e| e.name.clone()), Some("author".to_string()));
     }
 
     // (b) v1 buffer decode -> bind_schema -> to_state_buffer in IdKeyedV2 mode

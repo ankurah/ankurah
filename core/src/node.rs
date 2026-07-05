@@ -162,6 +162,45 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    /// Flip a USER-collection entity's LWW backend to the id-keyed (v2) wire
+    /// encoding (RFC 5.5 Phase A). Called at every user-entity assembly path
+    /// (create/load/apply). No-op for the system collection and the metadata
+    /// catalog collections, which stay permanently name-keyed (RFC 4
+    /// bootstrap exemption): those must never carry id keys or emit 0xA2.
+    ///
+    /// Attaches the collection's schema binding when the catalog can produce
+    /// one (name<->id for every membership property), then sets
+    /// [`WireMode::IdKeyedV2`]. If the catalog has no model for this
+    /// collection yet, the wire mode still flips but no binding is attached:
+    /// the backend keys new writes by name (residue) and projects id-keyed
+    /// entries loaded from a 0xA2 buffer via their hints, so it degrades
+    /// exactly like the legacy read-fallback until the binding warms and a
+    /// rewrite-on-save migrates the residue.
+    ///
+    /// The yrs backend is deliberately untouched: yrs roots stay name-keyed
+    /// by decision (RFC 5.5 Phase C).
+    pub fn bind_entity(&self, entity: &Entity) {
+        let collection = entity.collection();
+        // System + catalog collections are the bootstrap exemption: never bind.
+        if collection.as_str() == crate::system::SYSTEM_COLLECTION_ID || crate::schema::is_catalog_collection(collection) {
+            return;
+        }
+        let backend = match entity.get_backend::<crate::property::backend::LWWBackend>() {
+            Ok(backend) => backend,
+            // A missing LWW backend on a user entity is not fatal here: the
+            // entity may use only yrs. Nothing to flip.
+            Err(e) => {
+                debug!("bind_entity: no LWW backend for {}: {e}", entity.id());
+                return;
+            }
+        };
+        if let Some(binding) = self.catalog.binding_for(collection) {
+            backend.bind_schema(binding);
+        }
+        backend.set_wire_mode(crate::property::backend::lww::WireMode::IdKeyedV2);
+    }
+
+
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, SmallRng::from_entropy()) }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, true, SmallRng::from_entropy()) }
 
@@ -603,6 +642,10 @@ where
                 .entities
                 .get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id)
                 .await?;
+            // Flip to id-keyed (v2) BEFORE applying the event, so the rewritten
+            // state (to_state below) is a 0xA2 buffer and id-keyed values
+            // project (RFC 5.5). No-op for system/catalog collections.
+            self.bind_entity(&entity);
 
             // Stage the event so BFS can discover it
             event_getter.stage_event(event.payload.clone());
@@ -939,12 +982,35 @@ where
         version: u32,
         livequery: crate::livequery::WeakEntityLiveQuery,
     ) {
-        if let Some(ref relay) = self.subscription_relay {
-            // Resolve types in the AST (converts literals for JSON path comparisons)
-            let selection = self.type_resolver.resolve_selection_types(selection);
-            self.predicate_context.insert(query_id, cdata.clone());
-            relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
+        if self.subscription_relay.is_none() {
+            return;
         }
+        // The selection this ephemeral node forwards to its durable peer must
+        // be RESOLVED (PathExpr -> Identifier, RFC 5.5 Phase A), and resolution
+        // carries the catalog-lag deferral, which must be able to await. This
+        // path is sync (called from the LiveQuery constructor), so resolve +
+        // forward inside a spawned task. The relay registration is already
+        // asynchronous with respect to activation, so deferring it one hop is
+        // safe; a resolution failure is surfaced on the livequery's `error`.
+        let node = self.clone();
+        crate::task::spawn(async move {
+            let selection = match node.catalog.resolve_selection_deferred(&collection_id, &selection).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    debug!("subscribe_remote_query resolution failed for {query_id}: {e}");
+                    if let Some(lq) = livequery.upgrade() {
+                        lq.set_error(e.into());
+                    }
+                    return;
+                }
+            };
+            // Resolve types in the AST (converts literals for JSON path comparisons).
+            let selection = node.type_resolver.resolve_selection_types(selection);
+            node.predicate_context.insert(query_id, cdata.clone());
+            if let Some(ref relay) = node.subscription_relay {
+                relay.subscribe_query(query_id, collection_id, selection, cdata, version, livequery);
+            }
+        });
     }
 
     pub async fn fetch_entities_from_local(
@@ -962,6 +1028,8 @@ where
                 .entities
                 .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
                 .await?;
+            // Flip to id-keyed (v2) for user collections (RFC 5.5).
+            self.bind_entity(&entity);
             entities.push(entity);
         }
         Ok(entities)
@@ -997,11 +1065,32 @@ where
     }
 
     fn update_remote_query(&self, query_id: proto::QueryId, selection: ankql::ast::Selection, version: u32) -> Result<(), anyhow::Error> {
-        if let Some(ref relay) = self.subscription_relay {
-            // Resolve types in the AST (converts literals for JSON path comparisons)
-            let selection = self.type_resolver.resolve_selection_types(selection);
-            relay.update_query(query_id, selection, version)?;
-        }
+        let Some(collection_id) = self.subscription_relay.as_ref().and_then(|relay| relay.collection_for_query(query_id)) else {
+            // No relay, or the query is not (yet) registered: nothing to update.
+            return Ok(());
+        };
+        // As with subscribe_remote_query, the forwarded selection must be
+        // RESOLVED (RFC 5.5) with the catalog-lag deferral, which must await;
+        // this trait method is sync, so resolve + forward in a spawned task.
+        // A resolution or forward failure is logged (the sync caller has
+        // already returned); the selection version guards against regressions.
+        let node = self.clone();
+        crate::task::spawn(async move {
+            let selection = match node.catalog.resolve_selection_deferred(&collection_id, &selection).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    debug!("update_remote_query resolution failed for {query_id}: {e}");
+                    return;
+                }
+            };
+            // Resolve types in the AST (converts literals for JSON path comparisons).
+            let selection = node.type_resolver.resolve_selection_types(selection);
+            if let Some(ref relay) = node.subscription_relay {
+                if let Err(e) = relay.update_query(query_id, selection, version) {
+                    debug!("update_remote_query forward failed for {query_id}: {e}");
+                }
+            }
+        });
         Ok(())
     }
 

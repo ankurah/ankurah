@@ -117,17 +117,21 @@ DONE: PR #306; decision record posted on #294.
 - [x] Read fallback mechanics: 0xA1 and pre-0.9 buffers decode to Name
       keys, bind_schema migrates known names to ids, rewrite-on-save
       emits 0xA2 with residue preserved; v1 diffs apply the same way.
-- [ ] Integration flip: entity assembly attaches SchemaBinding sourced
-      from (local compiled schema, catalog map) and sets IdKeyedV2 for
-      user collections; catalog/system stay NameKeyedV1 (with groups
-      6-8).
+- [x] Integration flip: Node::bind_entity attaches the catalog-built
+      SchemaBinding and IdKeyedV2 mode at every user-entity assembly
+      path (create, get, fetch, remote commit, subscription/delta
+      apply); catalog/system stay NameKeyedV1; 0xA2 state entries carry
+      display-name hints so unbound engine parsers keep materializing
+      through the A-to-C window (plan decision 13); incoming v1
+      name-keyed writes migrate onto id keys at apply so mixed-version
+      writes compete in one LWW election (tests/tests/epoch_flip.rs).
 - [x] Unknown-id v2 payloads apply and persist opaquely (catalog lag);
       unprojectable until a binding knows the id.
 - [x] Compatibility tests: 0xA3/v3 refused with the shipped refusal arm
       (the same arm a 0.9 binary refuses 0xA2 with); default-mode
       byte-compatibility pinned; residue preserved through rewrite.
-- [ ] PROTOCOL_VERSION -> 2 lands with this epoch (one bump covering
-      LWW v2, Identifier AST, RegisterSchema).
+- [x] PROTOCOL_VERSION -> 2 landed (one bump covering LWW v2/0xA2,
+      resolved Identifier selections, RegisterSchema).
 
 ## 6. ankql Identifier and resolution
 
@@ -149,15 +153,18 @@ DONE: PR #306; decision record posted on #294.
       flips on with the client registration lifecycle + protocol v2
       epoch (no interim state, rev 3). wait_catalog_ready deferral and
       TypeResolver absorption land with that flip.
-- [ ] Fetch/SubscribeQuery carry resolved Selections; receiver-side
+- [x] Fetch/SubscribeQuery carry resolved Selections (resolution runs
+      at the four origin sites with wait_catalog_ready deferral; sync
+      sites resolve in their async continuation); receiver-side
       pass-through for unknown ids (until #274).
-- [ ] Engines consume Identifier.name for columns; assume_null /
+- [x] Engines consume Identifier.name for columns; assume_null /
       referenced_columns keyed consistently via Identifier.
 - [ ] Unify missing-property semantics (filter error / reactor
       unwrap_or(false) / SQL assume_null) under the one rule.
-- [ ] Tests: resolve via schema, via catalog only, UnknownProperty on
-      neither; subpath preservation; cross-node rename scenario
-      resolves both display names to one property id.
+- [x] Tests: resolve via schema, via catalog only, UnknownProperty on
+      neither; subpath preservation; rename resolves to one property id
+      (resolution.rs); end-to-end fail-closed fetch + overlay
+      resolution (epoch_flip.rs).
 
 ## 7. Read-path rules (#175 fix)
 

@@ -313,6 +313,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         subscriptions.get(&query_id).map(|info| info.status.clone())
     }
 
+    /// The collection a registered query belongs to. Used by the ephemeral
+    /// update path to RESOLVE a new selection (RFC 5.5) before forwarding, as
+    /// the trait method carries no collection parameter.
+    pub fn collection_for_query(&self, query_id: proto::QueryId) -> Option<CollectionId> {
+        let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        subscriptions.get(&query_id).map(|state| state.content.collection_id.clone())
+    }
+
     /// Get all unique contexts for predicates established or requested with a specific peer
     /// TODO: update the data structure to do this via a direct lookup rather than having to scan the entire map
     pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {

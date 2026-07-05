@@ -489,3 +489,21 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     commit (a registration's genesis + follow-up) previously relayed
     live with entity state ahead of its listed events, which receivers
     reject; latent for any multi-event commit, surfaced by the catalog.
+13. **0xA2 state entries carry an optional display-name hint** for the
+    A-to-C window: postgres/sqlite/sled parse state buffers UNBOUND
+    (postgres lib.rs:366, sqlite engine.rs:279, sled collection.rs:118)
+    to materialize columns/rows, so a pure id-keyed state buffer would
+    black out engine querying until Phase C. Hints live only inside the
+    opaque LWW state buffer; v2 DIFFS stay pure id-keyed, so identity
+    and convergence are untouched; renames leave stale hints until
+    rewrite-on-save; Phase C's catalog-bound engines remove the
+    dependence. Rejected: an engine trait-seam change (Phase C
+    territory) and 0xA1-emit from id-keyed memory (cannot encode
+    unknown-id entries: data loss).
+14. **Commit-time registration closes the edit-only gap**: the sync
+    edit path cannot await a durable registration, so commit_local_trx
+    ensure-registers any touched collection whose compiled schema is
+    recorded but not yet ensured. Auto-assert triggers are best-effort
+    (a denied registration warns and never fails a data write: policy
+    gates schema definition, not data writes); ctx.register::<M>() is
+    the strict form.

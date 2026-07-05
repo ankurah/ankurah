@@ -143,6 +143,9 @@ impl NodeApplier {
 
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
                 let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
+                // Flip to id-keyed (v2) for user collections BEFORE applying,
+                // so the saved state is 0xA2 and values project (RFC 5.5).
+                node.bind_entity(&entity);
                 entities.push(entity.clone());
 
                 let mut applied_events = Vec::new();
@@ -196,6 +199,8 @@ impl NodeApplier {
                 // with_state only updates the in-memory entity, it does NOT persist to storage
                 let (changed, entity) =
                     node.entities.with_state(state_getter, event_getter, entity_id, collection_id.clone(), state.payload.state).await?;
+                // Flip to id-keyed (v2) for user collections (RFC 5.5).
+                node.bind_entity(&entity);
                 entities.push(entity.clone());
 
                 if matches!(changed, Some(true) | None) {
@@ -339,6 +344,8 @@ impl NodeApplier {
                     .entities
                     .with_state(state_getter, event_getter, delta.entity_id, delta.collection, attested_state.payload.state)
                     .await?;
+                // Flip to id-keyed (v2) for user collections (RFC 5.5).
+                node.bind_entity(&entity);
 
                 // Save state to storage
                 Self::save_state(node, &entity, &collection).await?;
@@ -369,6 +376,9 @@ impl NodeApplier {
 
                 // Get or create entity
                 let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &delta.collection, &delta.entity_id).await?;
+                // Flip to id-keyed (v2) BEFORE applying events so the saved
+                // state is 0xA2 and values project (RFC 5.5).
+                node.bind_entity(&entity);
 
                 // Apply events parents-first. Wire order is untrusted: applying
                 // a child before its staged parent gap-jumps the head past the
