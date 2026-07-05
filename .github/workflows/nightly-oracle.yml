@@ -1,0 +1,105 @@
+name: Nightly Oracle Scale-Out
+
+# C2 (concurrency phase 2, workstream C item 2): the comparison property
+# oracle (core/src/event_dag/tests.rs, randomized_dags_match_reachability_oracle)
+# runs a few hundred seeds on every normal `cargo test`. This workflow runs it
+# at 100k+ seeds so schedules nobody hand-wrote get a chance to surface a
+# divergence between the state machine and the brute-force reachability
+# oracle. On failure the run's output (containing the self-contained
+# ORACLEFAIL line: dag_seed, verdicts, and the exact single-seed command to
+# reproduce) is uploaded as an artifact.
+#
+# IMPORTANT: GitHub only fires `schedule` triggers from the default branch of
+# a repository. This PR targets `concurrent-updates-event-dag` (not `main`),
+# so the cron below is dormant until this workflow file lands on `main`.
+# `workflow_dispatch` works on any branch in the meantime, so the run can be
+# exercised manually before that merge.
+
+on:
+  schedule:
+    # 03:17 UTC daily. Off-the-hour to avoid the top-of-hour thundering herd
+    # on shared runners. Dormant until this file is on the default branch;
+    # see the note above.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      oracle_seeds:
+        description: "Number of dag_seed values to run (ORACLE_SEEDS)"
+        required: false
+        default: "100000"
+      oracle_seed_base:
+        description: "First dag_seed value to run (ORACLE_SEED_BASE)"
+        required: false
+        default: "1"
+
+jobs:
+  oracle-scale-out:
+    name: Comparison oracle (high-seed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the comparison property oracle at high seed count
+        id: oracle
+        run: |
+          set -o pipefail
+          ORACLE_SEEDS="${{ github.event.inputs.oracle_seeds || '100000' }}" \
+          ORACLE_SEED_BASE="${{ github.event.inputs.oracle_seed_base || '1' }}" \
+            cargo test -p ankurah-core --lib \
+              event_dag::tests::comparison_property::randomized_dags_match_reachability_oracle \
+              -- --nocapture 2>&1 | tee oracle-output.log
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Upload failure output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oracle-failure-output
+          path: oracle-output.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Placeholder for the C1 simulation swarm nightly (SIM_SEEDS-driven large
+  # tier: tests/tests/sim_swarm.rs, `--ignored` swarm_* tests). Disabled until
+  # PR #278 (C1: deterministic multi-node simulation harness) lands, since
+  # that harness does not exist on this branch yet and this PR must not
+  # depend on C1's branch content. Once #278 lands, uncomment this job (it is
+  # deliberately left as a `run:` block below rather than removed, so the
+  # follow-up is "uncomment and verify" rather than "reconstruct from
+  # memory").
+  #
+  # sim-swarm-nightly:
+  #   name: Simulation swarm (high-seed)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Set up Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #
+  #     - name: Cache dependencies
+  #       uses: Swatinem/rust-cache@v2
+  #
+  #     - name: Run the simulation swarm at high seed count
+  #       run: |
+  #         set -o pipefail
+  #         SIM_SEEDS="${{ github.event.inputs.oracle_seeds || '100000' }}" \
+  #           cargo test -p ankurah-tests --test sim_swarm -- --ignored --nocapture 2>&1 | tee sim-swarm-output.log
+  #       env:
+  #         RUST_BACKTRACE: 1
+  #
+  #     - name: Upload failure output
+  #       if: failure()
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: sim-swarm-failure-output
+  #         path: sim-swarm-output.log
+  #         if-no-files-found: warn
+  #         retention-days: 30
