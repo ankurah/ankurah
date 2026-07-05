@@ -42,6 +42,9 @@ base64  = "0.22"
 tokio-tungstenite = "0.27"
 futures-util      = "0.3"
 
+# derive-macro compile-fail fixtures (derive_compile_fail.rs)
+trybuild = "1.0"
+
 # C6 postgres crash arm (feature-gated). The node process dies mid-write while
 # the postgres server survives; the parent reopens the same database and checks
 # the recovery invariants. Requires Docker, so it is off by default and out of

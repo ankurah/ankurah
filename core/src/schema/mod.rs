@@ -1,6 +1,9 @@
 pub mod catalog;
 pub mod genesis;
+pub mod local;
 pub mod registration;
+
+pub use local::{registration_request, FieldSchema, ModelSchema};
 
 use crate::property::PropertyError;
 use crate::value::ValueType;

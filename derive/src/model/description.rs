@@ -7,6 +7,11 @@ pub struct ModelDescription {
     // Basic identifiers
     name: Ident,
 
+    // Struct-level attributes (for #[model(id = "...")] explicit binding,
+    // RFC 5.9; the flag form #[model(ephemeral)]-style is parsed separately
+    // via get_model_flag).
+    struct_attrs: Vec<syn::Attribute>,
+
     // Field collections - only store what we actually parsed
     active_fields: Vec<syn::Field>,
     ephemeral_fields: Vec<syn::Field>,
@@ -42,11 +47,13 @@ impl ModelDescription {
         // Load backend configurations at compile time
         let backend_registry = crate::model::backend_registry::BackendRegistry::new()?;
 
-        Ok(Self { name, active_fields, ephemeral_fields, backend_registry })
+        Ok(Self { name, struct_attrs: input.attrs.clone(), active_fields, ephemeral_fields, backend_registry })
     }
 
     // Basic identifier accessors
     pub fn name(&self) -> &Ident { &self.name }
+    /// Struct-level attributes, for `#[model(id = "...")]` parsing (RFC 5.9).
+    pub fn struct_attrs(&self) -> &[syn::Attribute] { &self.struct_attrs }
     pub fn collection_str(&self) -> String { self.name.to_string().to_lowercase() }
     pub fn view_name(&self) -> Ident { format_ident!("{}View", self.name) }
     pub fn mutable_name(&self) -> Ident { format_ident!("{}Mut", self.name) }

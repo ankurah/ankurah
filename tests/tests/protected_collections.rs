@@ -4,7 +4,6 @@
 
 mod common;
 use common::*;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const PROTECTED: [&str; 4] = ["_ankurah_system", "_ankurah_model", "_ankurah_property", "_ankurah_model_property"];
@@ -40,26 +39,18 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
     Ok(())
 }
 
-/// Local transactions are refused the same way (the only catalog mutation
-/// path is the registration operation, which does not go through
-/// client transactions).
-#[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Model, Serialize, Deserialize)]
-pub struct _ankurah_model {
-    pub name: String,
-}
-
-#[tokio::test]
-async fn local_commits_into_protected_collections_refused() -> anyhow::Result<()> {
-    let node = durable_sled_setup().await?;
-    let ctx = node.context(DEFAULT_CONTEXT)?;
-
-    let trx = ctx.begin();
-    trx.create(&_ankurah_model { name: "smuggled".into() }).await?;
-    let err = trx.commit().await.expect_err("protected collection must refuse local commits");
-    assert!(err.to_string().contains("protected"), "unexpected error: {err}");
-    Ok(())
-}
+// NOTE: the local-transaction path into a protected collection (the
+// `commit_local_trx` guard, core/src/context.rs) is no longer reachable
+// through the public API: a user model whose collection carries the
+// reserved `_ankurah_` prefix is now REFUSED at derive time (RFC section 4,
+// "rejected for user-model collection ids at derive time"), so a struct
+// like `_ankurah_model` cannot be defined at all. That compile-time
+// rejection is exercised by the trybuild fixture
+// `tests/tests/compile_fail/reserved_collection_prefix.rs`
+// (see `derive_compile_fail.rs`). The runtime `commit_local_trx` guard
+// remains in place as structural defense-in-depth; the receiver-side guard
+// for all four protected collections is exercised by
+// `server_refuses_commits_into_protected_collections` above.
 
 /// Unknown collections under the reserved prefix never get storage: a
 /// fetch for one is refused rather than creating it on demand.

@@ -164,21 +164,25 @@ DONE: PR #306; decision record posted on #294.
 
 ## 8. Derive macro, attributes, lifecycle glue
 
-- [ ] ModelDescriptor/FieldSchema emission per the normative mapping
-      table; ephemeral fields excluded; descriptor snapshot test
-      covering every table row.
-- [ ] `#[property(anchor = "...")]`; anchor chains keep the original
-      anchor; anchor-reuse refusal test (retired name re-minted ->
-      refusal demanding an anchor).
-- [ ] `#[model(id = "...")]` / `#[property(id = "...")]`: compile-time
-      id parse; registration-time verification (backend/value_type
-      match, cold-start hard fail); shared-property membership minting;
-      test: shared property read from two contracts with differing
-      optional.
-- [ ] `_ankurah_` collection prefix -> derive-time compile error
-      (trybuild or equivalent).
+- [x] ModelSchema/FieldSchema emission per the normative mapping table
+      (errata recorded in rfc.md section 4: Option<String> is
+      LWW-backed in shipped code, and custom derive(Property) types map
+      to (lww, string)); ephemeral fields excluded; descriptor test
+      covers every table row; Model trait gains schema().
+- [x] `#[property(anchor = "...")]` parsed and emitted into FieldSchema
+      (executor-side anchor-reuse refusal already tested in group 3).
+- [x] `#[model(id = "...")]` / `#[property(id = "...")]`: compile-time
+      base64/16-byte validation; carried on the schema and into
+      descriptors (registration-time verification already tested in
+      group 3).
+- [x] `_ankurah_` collection prefix -> derive-time compile error
+      (trybuild fixtures; the runtime commit_local_trx guard stays as
+      defense-in-depth).
+- [x] registration_request(): ModelSchema -> RegisterSchema descriptor
+      vectors; end-to-end test registers a derived model's schema and
+      resolves it through the catalog map.
 - [ ] Registration triggers in context paths (mutating auto-assert,
-      read-path cache-only, explicit register).
+      read-path cache-only, explicit register::<M>(), offline queue).
 
 ## 9. Cross-cutting and pre-PR
 

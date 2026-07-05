@@ -14,6 +14,12 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
         Err(e) => return e.into_compile_error(),
     };
 
+    // The compiled schema: static ModelSchema + fn schema() (RFC 4, 5.8, 5.9).
+    let schema_method = match crate::model::schema::schema_impl(model) {
+        Ok(tokens) => tokens,
+        Err(e) => return e.into_compile_error(),
+    };
+
     // RefWrapper associated type for WASM builds
     let ref_wrapper_type = if cfg!(feature = "wasm") {
         let ref_name = format_ident!("{}Ref", name);
@@ -32,6 +38,7 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
             fn collection() -> ankurah::proto::CollectionId {
                 #collection_str.into()
             }
+            #schema_method
             fn initialize_new_entity(&self, entity: &::ankurah::entity::Entity) {
                 use ::ankurah::property::InitializeWith;
                 #(
