@@ -46,6 +46,23 @@
 //!   collections are `Vec`/`BTreeSet`/`BTreeMap`. HashMaps in the harness are
 //!   membership-only and never feed the trace. The scaled determinism audit is
 //!   what guards this invariant against regression.
+//! - Node-side emission order (latent, not reached by the audited scenarios).
+//!   When a single `handle_message` emits more than one outbound message, their
+//!   relative order in the capture queue is the order the production code
+//!   emitted them, and two production paths order emission by hash iteration:
+//!   the reactor buffers per-subscription candidates in a `HashMap`
+//!   (`reactor.rs`, `candidates_by_sub`) so a node with two peer subscriptions
+//!   emits its two `Update`s in randomized order, and `get_durable_peers`
+//!   iterates a `HashSet`-backed `SafeSet` so a multi-durable relay emits its
+//!   per-peer requests in randomized order. The relay also sends on
+//!   `task::spawn` tasks whose polling interleaving the seeded RNG does not
+//!   control. None of this is reachable by the current scenarios: they use one
+//!   durable node and no live subscriptions, so every `handle_message` emits at
+//!   most one captured message, and the audit is clean across 1500+ seeds. But
+//!   the first scenario that establishes multiple subscriptions or a
+//!   multi-durable topology and runs under the determinism audit can see a
+//!   non-identical trace for one seed until those production emission orders are
+//!   made deterministic. Flagged for the workstream-D scenarios.
 
 pub mod faults;
 pub mod invariants;
