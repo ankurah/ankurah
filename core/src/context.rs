@@ -50,6 +50,25 @@ pub trait TContext {
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
+    /// RFC 5.2 model first-use registration, object-safe so the mutating
+    /// transaction paths (`create`/`edit`) can trigger it without the
+    /// concrete `<SE, PA>`. BEST-EFFORT: a denied registration only warns and
+    /// must NOT fail the write. Policy gates schema DEFINITION, not data
+    /// writes; a create for a model the caller may not register still
+    /// succeeds (RFC 5.2, binding rationale).
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema);
+    /// RFC 5.2 read-path caching: overlay a compiled model's derived catalog
+    /// entries so resolution answers for it, WITHOUT any durable write.
+    /// Object-safe so read paths (`get`/`fetch`/`query`) can call it without
+    /// the concrete `<SE, PA>`. Cheap and synchronous; no-op if the system
+    /// root is not yet known.
+    fn cache_compiled(&self, schema: &'static crate::schema::ModelSchema);
+    /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
+    /// form): propagate the error instead of swallowing it. Object-safe.
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<(), crate::schema::registration::RegistrationError>;
 }
 
 #[async_trait]
@@ -74,6 +93,20 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // compare_exchange returns Err if the value was already false (already committed/rolled back).
         if trx.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(MutationError::General("Transaction already committed or rolled back".into()));
+        }
+
+        // Close the edit-only registration gap (RFC 5.2 "durable write on
+        // first mutating use"): Transaction::edit is sync and cannot await a
+        // durable registration, so ensure-register here for any touched
+        // collection whose compiled schema is known but not yet ensured.
+        // Best-effort, like the create-path trigger: policy gates schema
+        // definition, not data writes.
+        for entity in trx.entities.iter() {
+            if let Some(schema) = self.node.catalog.unensured_schema_for(entity.collection().as_str()) {
+                if let Err(e) = self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await {
+                    tracing::warn!("commit-time registration for '{}' failed: {e}", schema.collection);
+                }
+            }
         }
 
         // Generate events from the transaction entities
@@ -193,6 +226,22 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) {
+        // BEST-EFFORT (RFC 5.2): a registration refusal must not fail the
+        // caller's data write, so a strict Err only warns. The catalog latch,
+        // the compiled-overlay cache, and the offline queue all live inside
+        // ensure_registered.
+        if let Err(e) = self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await {
+            tracing::warn!("ensure_registered for collection '{}' failed (data write proceeds): {}", schema.collection, e);
+        }
+    }
+    fn cache_compiled(&self, schema: &'static crate::schema::ModelSchema) { self.node.catalog.cache_compiled(schema); }
+    async fn register_strict(
+        &self,
+        schema: &'static crate::schema::ModelSchema,
+    ) -> Result<(), crate::schema::registration::RegistrationError> {
+        self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await
+    }
 }
 
 // This whole impl is conditionalized by the wasm feature flag
@@ -233,13 +282,26 @@ impl Context {
     //     Ok(result)
     // }
 
+    /// RFC 5.2 eager explicit registration (STRICT form): register `M`'s
+    /// model, properties, and memberships now, propagating any error (unlike
+    /// the auto-assert path on create/edit, which is best-effort). Useful
+    /// before first render so predicate resolution has the ids ready. A
+    /// second call is a no-op (the collection is latched as ensured).
+    pub async fn register<M: crate::model::Model>(&self) -> Result<(), crate::schema::registration::RegistrationError> {
+        self.0.register_strict(M::schema()).await
+    }
+
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        // Read-path caching (RFC 5.2): overlay the compiled schema so
+        // resolution answers for R's model without a durable write.
+        self.0.cache_compiled(<R::Model as crate::model::Model>::schema());
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
     }
 
     /// Get an entity, but its ok to return early if the entity is already in the local node storage
     pub async fn get_cached<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
+        self.0.cache_compiled(<R::Model as crate::model::Model>::schema());
         let entity = self.0.get_entity(id, &R::collection(), true).await?;
         Ok(R::from_entity(entity))
     }
@@ -248,6 +310,10 @@ impl Context {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
         let collection_id = R::Model::collection();
+
+        // Read-path caching (RFC 5.2): derive-and-cache, never durably
+        // register. Predicate resolution needs the ids before any create.
+        self.0.cache_compiled(R::Model::schema());
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
 
@@ -266,6 +332,8 @@ impl Context {
     where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
+        // Read-path caching (RFC 5.2): overlay before building the query.
+        self.0.cache_compiled(R::Model::schema());
         Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
 

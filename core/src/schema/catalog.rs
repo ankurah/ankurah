@@ -34,13 +34,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::{self as proto, CollectionId, EntityId, QueryId};
+use ankurah_proto::{self as proto, schema_id, CollectionId, EntityId, QueryId};
 use ankurah_signals::{porcelain::subscribe::SubscriptionGuard, Subscribe};
 use tokio::sync::Notify;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     collectionset::CollectionSet,
@@ -52,10 +52,11 @@ use crate::{
     reactor::{AbstractEntity, GapFetcher, MembershipChange, Reactor, ReactorSubscription, ReactorUpdate},
     resultset::EntityResultSet,
     storage::StorageEngine,
+    system::SystemManager,
     value::Value,
 };
 
-use super::{model_collection, model_property_collection, property_collection};
+use super::{model_collection, model_property_collection, property_collection, registration::RegistrationError, ModelSchema};
 
 /// A parsed model definition entity (`_ankurah_model`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +446,13 @@ where PA: PolicyAgent
     entities: WeakEntitySet,
     reactor: Reactor,
     durable: bool,
+    /// The system root accessor. `cache_compiled` and `ensure_registered`
+    /// need the root to derive catalog ids (RFC 5.1); it is unknown until
+    /// the system is ready, in which case those paths no-op or defer. Stored
+    /// (separately from `Node`, which is not held here) after `start`
+    /// upgrades the weak node; `SystemManager` is `Clone` and outlives the
+    /// node, so this keeps derivation possible without holding the node.
+    system: RwLock<Option<SystemManager<SE, PA>>>,
     map: RwLock<CatalogMapInner>,
     ready: RwLock<bool>,
     ready_notify: Notify,
@@ -457,6 +465,27 @@ where PA: PolicyAgent
     /// Ephemeral first-call-wins latch for `ensure_subscribed`. Reset by
     /// `reset` so a hard-reset node can re-subscribe.
     subscribed: RwLock<bool>,
+    /// Collections whose registration has been ENSURED for this process
+    /// (RFC 5.2 model first-use latch). Latched on a successful durable
+    /// write, a successful forwarded RegisterSchema, or on queueing an
+    /// offline registration. A strict error (executor/policy refusal) does
+    /// NOT latch. Cleared by `reset` (root-scoped derivations must not
+    /// survive hard_reset).
+    ensured: RwLock<BTreeSet<String>>,
+    /// collection -> compiled schema pointer, recorded by every
+    /// cache_compiled call (root or not). Lets the COMMIT path close the
+    /// edit-only registration gap: `Transaction::edit` is sync and cannot
+    /// await a durable registration, so commit_local_trx ensure-registers
+    /// any touched collection whose schema is known but not yet ensured
+    /// (RFC 5.2 "durable write on first mutating use"). Pointers are
+    /// 'static and root-free, so this survives reset().
+    compiled_schemas: RwLock<BTreeMap<String, &'static ModelSchema>>,
+    /// Offline queue (RFC 5.2 OFFLINE ephemeral flow): registrations an
+    /// ephemeral node could not deliver because no durable peer was
+    /// connected. Drained by `drain_pending` when a durable peer connects.
+    /// Holds the compiled schema (a `&'static`) and the cdata to forward
+    /// with.
+    pending_registrations: Mutex<Vec<(&'static ModelSchema, PA::ContextData)>>,
     _phantom: std::marker::PhantomData<PA>,
 }
 
@@ -471,12 +500,16 @@ where
             entities,
             reactor,
             durable,
+            system: RwLock::new(None),
             map: RwLock::new(CatalogMapInner::default()),
             ready: RwLock::new(false),
             ready_notify: Notify::new(),
             durable_sub: RwLock::new(None),
             ephemeral_queries: RwLock::new(Vec::new()),
             subscribed: RwLock::new(false),
+            ensured: RwLock::new(BTreeSet::new()),
+            compiled_schemas: RwLock::new(BTreeMap::new()),
+            pending_registrations: Mutex::new(Vec::new()),
             _phantom: std::marker::PhantomData,
         }))
     }
@@ -487,6 +520,12 @@ where
     /// hard-reset hook and otherwise waits for `ensure_subscribed`.
     pub(crate) fn start(&self, node: WeakNode<SE, PA>) {
         let Some(strong) = node.upgrade() else { return };
+
+        // Store the SystemManager so cache_compiled/ensure_registered can
+        // reach the system root for id derivation (RFC 5.1) on BOTH node
+        // kinds, without holding the Node itself. SystemManager is a separate
+        // Arc that outlives the node.
+        *self.0.system.write().unwrap() = Some(strong.system.clone());
 
         // Install the hard-reset flush hook on the system manager so
         // SystemManager::hard_reset can clear the catalog in-place (it does
@@ -696,6 +735,12 @@ where
         *self.0.durable_sub.write().unwrap() = None;
         self.0.ephemeral_queries.write().unwrap().clear();
         *self.0.subscribed.write().unwrap() = false;
+        // Root-scoped derivations must not survive hard_reset (RFC 5.2): a
+        // node re-joining a different system must re-derive and re-ensure
+        // everything against the new root, so drop the ensured latch and any
+        // queued (old-root) registrations.
+        self.0.ensured.write().unwrap().clear();
+        self.0.pending_registrations.lock().unwrap().clear();
         debug!("CatalogManager reset (map cleared, not ready)");
     }
 
@@ -721,6 +766,208 @@ where
     /// Property ids sharing display name `name` across ALL contracts (the
     /// cross-contract sibling gate, RFC 5.4 rule 4).
     pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> { self.0.map.read().unwrap().siblings_by_name(name) }
+
+    // -- registration lifecycle (RFC 5.2, work package A11b) ----------------
+
+    /// The system root entity id, if the system is ready. Derivation of
+    /// catalog ids (RFC 5.1) is impossible without it, so callers no-op or
+    /// defer when this is `None`.
+    fn root(&self) -> Option<EntityId> {
+        let system = self.0.system.read().unwrap();
+        system.as_ref().and_then(|s| s.root()).map(|r| r.payload.entity_id)
+    }
+
+    /// RFC 5.2 read-path caching ("read paths derive and cache"): overlay a
+    /// compiled model's derived catalog entries into the map so `resolve`
+    /// answers for it BEFORE any durable registration. No-op if the system
+    /// root is unknown (ids are not derivable yet). NEVER writes durably.
+    ///
+    /// The entries are minted with the SAME shapes the durable executor
+    /// produces (RFC 5.1 genesis + follow-up), so a real catalog entry
+    /// arriving later from storage or a peer overwrites them identically:
+    /// model records `collection`/`name`; each property records
+    /// `minted_for = model id`, `name`/`anchor`, `backend`, `value_type`;
+    /// each membership records `model`, `property`, `optional`. Explicit-id
+    /// bindings (RFC 5.9) are honored: the property id is the bound id, not a
+    /// derived one. Idempotent (keyed by entity id).
+    pub fn cache_compiled(&self, schema: &'static ModelSchema) {
+        self.0.compiled_schemas.write().unwrap().insert(schema.collection.to_string(), schema);
+        let Some(root) = self.root() else {
+            return; // system root unknown: ids are not derivable, nothing to overlay
+        };
+
+        // Model id: an explicit binding (RFC 5.9) or the by-collection
+        // derivation (RFC 5.1). The explicit id is validated at derive time,
+        // so a parse failure is a derive-macro bug.
+        let model_id = match schema.explicit_id {
+            Some(id) => match EntityId::from_base64(id) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("cache_compiled: invalid model explicit id {id:?}: {e}");
+                    return;
+                }
+            },
+            None => schema_id::model_entity_id(&root, schema.collection),
+        };
+
+        let mut map = self.0.map.write().unwrap();
+        map.upsert_model(ModelDef { id: model_id, collection: schema.collection.to_string(), name: schema.name.to_string() });
+
+        for field in schema.properties {
+            let property_id = match field.explicit_id {
+                Some(id) => match EntityId::from_base64(id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        error!("cache_compiled: invalid property explicit id {id:?} on field {}: {e}", field.field);
+                        continue;
+                    }
+                },
+                None => schema_id::property_entity_id(&root, &model_id, field.anchor, field.backend, field.value_type),
+            };
+            map.upsert_property(PropertyDef {
+                id: property_id,
+                minted_for: Some(model_id),
+                name: field.name.to_string(),
+                backend: field.backend.to_string(),
+                value_type: field.value_type.to_string(),
+                target_model: None,
+            });
+            let membership_id = schema_id::membership_entity_id(&root, &model_id, &property_id);
+            map.upsert_membership(MembershipDef {
+                id: membership_id,
+                model: model_id,
+                property: property_id,
+                optional: Some(field.optional),
+            });
+        }
+    }
+
+    /// RFC 5.2 model first-use registration ("ensure registration"). Called
+    /// on the mutating path (create/edit) before the write. Fast-returns if
+    /// the collection is already ensured this process. Always
+    /// [`cache_compiled`] first (so local resolution works even before the
+    /// durable round trip completes), then durably registers:
+    ///
+    /// - DURABLE node: execute the registration locally
+    ///   ([`Node::execute_schema_registration`]); latch on Ok.
+    /// - EPHEMERAL node with a durable peer: forward RegisterSchema to it and
+    ///   expect Success; latch on Ok.
+    /// - EPHEMERAL node with NO durable peer: queue the registration for
+    ///   reconnect (RFC 5.2 OFFLINE flow) and latch (queued); return Ok. The
+    ///   offline data write proceeds immediately; the durable side
+    ///   materializes fully once the queued registration lands.
+    ///
+    /// A STRICT error (executor refusal, or an Error response from the peer)
+    /// returns Err WITHOUT latching, so a later attempt retries. This is the
+    /// strict surface; the auto-assert trigger on `create`/`edit` swallows
+    /// the Err to a warning (policy gates schema definition, not data writes;
+    /// RFC 5.2 data-freedom rationale).
+    pub async fn ensure_registered(
+        &self,
+        node: &Node<SE, PA>,
+        cdata: &PA::ContextData,
+        schema: &'static ModelSchema,
+    ) -> Result<(), RegistrationError> {
+        let collection = schema.collection.to_string();
+        if self.0.ensured.read().unwrap().contains(&collection) {
+            return Ok(());
+        }
+
+        // Overlay the compiled entries locally FIRST (fail-open, cheap): even
+        // if the durable registration is refused or deferred, local
+        // resolution answers for this model.
+        self.cache_compiled(schema);
+
+        let (models, properties, memberships) = super::registration_request(schema);
+
+        if node.durable {
+            // A durable node executes registration itself (no forwarding).
+            node.execute_schema_registration(cdata, models, properties, memberships).await?;
+            self.0.ensured.write().unwrap().insert(collection);
+            return Ok(());
+        }
+
+        // Ephemeral: forward to a connected durable peer if one exists,
+        // otherwise queue for reconnect.
+        match node.get_durable_peers().first().copied() {
+            Some(peer) => {
+                let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
+                match node.request(peer, cdata, body).await {
+                    Ok(proto::NodeResponseBody::Success) => {
+                        self.0.ensured.write().unwrap().insert(collection);
+                        Ok(())
+                    }
+                    // A policy/executor refusal is a STRICT error: do not latch.
+                    Ok(proto::NodeResponseBody::Error(e)) => Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(e))),
+                    Ok(other) => Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!(
+                        "unexpected response to RegisterSchema: {other}"
+                    )))),
+                    Err(e) => Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!("{e:?}")))),
+                }
+            }
+            None => {
+                // No durable peer: queue and latch (queued). The offline data
+                // write proceeds; drain_pending forwards this on reconnect.
+                self.0.pending_registrations.lock().unwrap().push((schema, cdata.clone()));
+                self.0.ensured.write().unwrap().insert(collection);
+                debug!("catalog: queued offline registration for '{}' (no durable peer)", schema.collection);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether this collection's registration is latched (durably executed,
+    /// forwarded successfully, or queued for reconnect) this process.
+    pub fn is_ensured(&self, collection: &str) -> bool { self.0.ensured.read().unwrap().contains(collection) }
+
+    /// The compiled schema recorded for `collection`, if any and if NOT yet
+    /// ensured. The commit path uses this to close the edit-only gap.
+    pub(crate) fn unensured_schema_for(&self, collection: &str) -> Option<&'static ModelSchema> {
+        if self.is_ensured(collection) {
+            return None;
+        }
+        self.0.compiled_schemas.read().unwrap().get(collection).copied()
+    }
+
+    /// RFC 5.2 OFFLINE flow drain: forward every queued registration to a
+    /// connected durable peer. Spawns a task (callers are sync, e.g.
+    /// `register_peer`). A transport failure RE-QUEUES the entry (the peer
+    /// may have dropped mid-drain); a policy refusal is logged and dropped
+    /// (re-queuing a refusal would loop). Called from `Node::register_peer`
+    /// when a durable peer connects.
+    pub(crate) fn drain_pending(&self, node: &Node<SE, PA>) {
+        let drained: Vec<(&'static ModelSchema, PA::ContextData)> = { std::mem::take(&mut *self.0.pending_registrations.lock().unwrap()) };
+        if drained.is_empty() {
+            return;
+        }
+        let me = self.clone();
+        let node = node.clone();
+        crate::task::spawn(async move {
+            for (schema, cdata) in drained {
+                let Some(peer) = node.get_durable_peers().first().copied() else {
+                    // Lost the peer before we got to this entry: re-queue.
+                    me.0.pending_registrations.lock().unwrap().push((schema, cdata));
+                    continue;
+                };
+                let (models, properties, memberships) = super::registration_request(schema);
+                let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
+                match node.request(peer, &cdata, body).await {
+                    Ok(proto::NodeResponseBody::Success) => {}
+                    Ok(proto::NodeResponseBody::Error(e)) => {
+                        warn!("catalog: durable peer refused queued registration for '{}': {}", schema.collection, e);
+                    }
+                    Ok(other) => {
+                        warn!("catalog: unexpected response to queued registration for '{}': {}", schema.collection, other);
+                    }
+                    Err(e) => {
+                        // Transport failure: re-queue for the next reconnect.
+                        warn!("catalog: transport error draining registration for '{}', re-queuing: {:?}", schema.collection, e);
+                        me.0.pending_registrations.lock().unwrap().push((schema, cdata));
+                    }
+                }
+            }
+        });
+    }
 
     /// TEST/INTROSPECTION: number of parsed entities of each kind
     /// (models, properties, memberships).

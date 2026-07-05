@@ -257,6 +257,12 @@ where
                 relay.notify_peer_connected(presence.node_id);
             }
 
+            // Drain any registrations queued while offline (RFC 5.2 OFFLINE
+            // flow): a durable peer is now reachable, so forward them. Spawns
+            // its own task; re-queues transport failures, drops policy
+            // refusals with a warning.
+            self.catalog.drain_pending(self);
+
             if !self.durable {
                 if let Some(system_root) = presence.system_root {
                     action_info!(self, "received system root", "{}", &system_root.payload);

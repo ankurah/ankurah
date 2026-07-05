@@ -83,9 +83,7 @@ DONE: PR #306; decision record posted on #294.
       transport is the registration operation re-issued or the
       subscription relay; decide and implement with group 4.
 - [ ] Policy-denial test (needs a denying PolicyAgent fixture).
-- [ ] Client lifecycle: ensure-registration on first mutating use;
-      derive+cache on read paths; `ctx.register::<M>()`; offline queue
-      drained on durable-peer connect (needs group 8 descriptors).
+- [x] Client lifecycle: DONE with group 8 (see group 8 trigger entry).
 
 ## 4. Catalog subscription and map
 
@@ -193,8 +191,14 @@ DONE: PR #306; decision record posted on #294.
 - [x] registration_request(): ModelSchema -> RegisterSchema descriptor
       vectors; end-to-end test registers a derived model's schema and
       resolves it through the catalog map.
-- [ ] Registration triggers in context paths (mutating auto-assert,
-      read-path cache-only, explicit register::<M>(), offline queue).
+- [x] Registration triggers in context paths: trx.create/get::<M>
+      auto-assert (best-effort; policy gates schema definition, not
+      data writes); sync edit caches, and COMMIT closes the edit-only
+      gap by ensure-registering touched unensured collections; read
+      paths overlay the compiled schema without durable writes;
+      strict ctx.register::<M>(); offline queue drains on durable-peer
+      connect; hard_reset clears the latch and queue
+      (tests/tests/registration_lifecycle.rs, 6 tests).
 
 ## 9. Cross-cutting and pre-PR
 

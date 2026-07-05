@@ -60,6 +60,10 @@ impl Transaction {
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
+        // RFC 5.2 model first-use: ensure M is registered BEFORE creating the
+        // entity. Best-effort (a denied registration only warns; policy gates
+        // schema definition, not data writes).
+        self.dyncontext.ensure_registered(M::schema()).await;
         let entity = self.dyncontext.create_entity(M::collection(), self.alive.clone());
         model.initialize_new_entity(&entity);
         self.dyncontext.check_write(&entity)?;
@@ -72,6 +76,10 @@ impl Transaction {
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
     pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
+        // RFC 5.2 model first-use on the mutating fetch-to-edit path: ensure
+        // M is registered. Best-effort (warns on refusal, never fails the
+        // edit; the async durable path mirrors `create`).
+        self.dyncontext.ensure_registered(M::schema()).await;
         match self.get_trx_entity(id) {
             Some(entity) => Ok(MutableBorrow::new(entity)),
             None => {
@@ -90,6 +98,17 @@ impl Transaction {
         }
     }
     pub fn edit<'rec, 'trx: 'rec, M: Model>(&'trx self, entity: &Entity) -> Result<MutableBorrow<'rec, M::Mutable>, AccessDenied> {
+        // RFC 5.2 model first-use on the edit path. This entry is
+        // SYNCHRONOUS (it is what the derive-generated `View::edit` calls, so
+        // it cannot become async without touching derive and every
+        // `.edit()?` call site), so it overlays the compiled schema via the
+        // cheap sync cache rather than issuing the durable async
+        // registration. The durable write still happens on the async mutating
+        // entries (`create`, `get`); the entity being edited was itself
+        // created or fetched through one of those, so the model reaches the
+        // durable catalog. This overlay guarantees local resolution here and
+        // now.
+        self.dyncontext.cache_compiled(M::schema());
         if let Some(entity) = self.get_trx_entity(&entity.id) {
             return Ok(MutableBorrow::new(entity));
         }
