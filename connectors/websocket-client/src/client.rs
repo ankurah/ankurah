@@ -277,6 +277,7 @@ where
             node_id: inner.node.id,
             durable: inner.node.durable,
             system_root: inner.node.system.root(),
+            protocol_version: proto::PROTOCOL_VERSION,
         });
 
         sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
@@ -351,14 +352,39 @@ where
         match msg {
             Some(Ok(Message::Binary(data))) => match bincode::deserialize(&data) {
                 Ok(proto::Message::Presence(server_presence)) => {
-                    Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx).await;
-                    Ok(MessageResult::Continue)
+                    // Pre-check the version while the sink is at hand so the server
+                    // learns why we are leaving; register_peer re-enforces this for
+                    // every transport.
+                    if !proto::protocol_compatible(server_presence.protocol_version) {
+                        let rejection =
+                            proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: server_presence.protocol_version };
+                        error!("Refusing server {}: {}", inner.server_url, rejection);
+                        if let Ok(bytes) = bincode::serialize(&proto::Message::PresenceRejected(rejection)) {
+                            let _ = sink.send(Message::Binary(bytes.into())).await;
+                        }
+                        return Ok(MessageResult::Break);
+                    }
+                    Ok(Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx).await)
+                }
+                Ok(proto::Message::PresenceRejected(rejection)) => {
+                    error!("Server {} refused connection: {}", inner.server_url, rejection);
+                    Ok(MessageResult::Break)
                 }
                 Ok(proto::Message::PeerMessage(node_msg)) => {
                     Self::handle_peer_message(inner, node_msg).await;
                     Ok(MessageResult::Continue)
                 }
                 Err(e) => {
+                    if peer_sender.is_none() {
+                        // A handshake we cannot read will never establish; close
+                        // instead of idling on a dead connection.
+                        if proto::is_version0_presence(&data) {
+                            error!("Server {} speaks a pre-versioning (0.9.x or older) protocol; refusing", inner.server_url);
+                        } else {
+                            error!("Failed to deserialize handshake message from {}: {}; closing", inner.server_url, e);
+                        }
+                        return Ok(MessageResult::Break);
+                    }
                     warn!("Failed to deserialize message: {}", e);
                     Ok(MessageResult::Continue)
                 }
@@ -403,11 +429,14 @@ where
         server_presence: proto::Presence,
         peer_sender: &mut Option<WebsocketPeerSender>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
-    ) {
+    ) -> MessageResult {
         info!("Received server presence: {}", server_presence.node_id);
 
         let (sender, rx) = WebsocketPeerSender::new(server_presence.node_id);
-        inner.node.register_peer(server_presence.clone(), Box::new(sender.clone()));
+        if let Err(rejection) = inner.node.register_peer(server_presence.clone(), Box::new(sender.clone())) {
+            error!("Refusing server {}: {}", inner.server_url, rejection);
+            return MessageResult::Break;
+        }
 
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
@@ -415,6 +444,7 @@ where
         inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });
         inner.connected.store(true, Ordering::Release);
         info!("Successfully connected to server {}", inner.server_url);
+        MessageResult::Continue
     }
 
     async fn handle_peer_message(inner: &Arc<Inner<SE, PA>>, node_msg: proto::NodeMessage) {
