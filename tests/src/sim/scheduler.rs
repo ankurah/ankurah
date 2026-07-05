@@ -52,6 +52,13 @@ struct InFlight {
     accept: Option<(proto::EntityId, proto::EventId)>,
 }
 
+/// How many times to yield to the executor when the queue looks empty, letting
+/// pending spawned tasks emit before declaring quiescence. Small: on a
+/// current-thread runtime a spawned task that is going to emit does so within a
+/// yield or two of becoming ready; a larger budget only delays detection of
+/// genuine idleness.
+const YIELD_BUDGET: usize = 8;
+
 /// Unordered node-pair key for the partition matrix.
 fn pair(a: usize, b: usize) -> (usize, usize) {
     if a <= b {
@@ -177,8 +184,23 @@ impl Scheduler {
             self.absorb_captured();
 
             if self.inflight.is_empty() {
-                self.absorb_captured();
-                if self.inflight.is_empty() {
+                // Nothing queued right now, but a node may have spawned a
+                // background task (subscription setup, reactor gap-fill) that
+                // has not yet run and will emit a message. Yield to the
+                // current-thread executor a bounded number of times so those
+                // tasks make progress, re-absorbing after each; only declare
+                // quiescence once a full yield budget produces no new traffic.
+                // yield_now is deterministic on a single-threaded runtime.
+                let mut settled = true;
+                for _ in 0..YIELD_BUDGET {
+                    tokio::task::yield_now().await;
+                    self.absorb_captured();
+                    if !self.inflight.is_empty() {
+                        settled = false;
+                        break;
+                    }
+                }
+                if settled {
                     break;
                 }
             }
