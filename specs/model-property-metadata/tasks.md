@@ -73,8 +73,11 @@ DONE: PR #306; decision record posted on #294.
       server; idempotent re-issue (heads unchanged); anchor rename then
       reuse-refusal; explicit-id sharing with per-contract optionality;
       not-found and retype-mismatch hard-fails; ephemeral refusal.
-- [ ] Relay-side self-certification: validate_catalog_genesis on
-      catalog events arriving via subscription (with group 4).
+- [x] Relay-side self-certification: validate_catalog_genesis runs in
+      NodeApplier::validate_and_stage (the shared funnel for subscription
+      updates AND fetch/subscribe delta bridges) for every genesis
+      targeting a catalog collection; forged and payload-swapped geneses
+      are refused before staging (tests/tests/catalog_genesis_relay.rs).
 - [ ] Multi-durable propagation: CommitTransaction is refused for
       catalog collections by design, so durable-durable catalog
       transport is the registration operation re-issued or the

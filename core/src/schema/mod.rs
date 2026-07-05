@@ -28,3 +28,11 @@ pub const RESERVED_COLLECTION_PREFIX: &str = "_ankurah_";
 pub fn model_collection() -> CollectionId { CollectionId::fixed_name(MODEL_COLLECTION_ID) }
 pub fn property_collection() -> CollectionId { CollectionId::fixed_name(PROPERTY_COLLECTION_ID) }
 pub fn model_property_collection() -> CollectionId { CollectionId::fixed_name(MODEL_PROPERTY_COLLECTION_ID) }
+
+/// Whether `id` is one of the three metadata catalog collections (NOT the
+/// system collection, which replicates via the Presence handshake and has
+/// its own trust story).
+pub fn is_catalog_collection(id: &CollectionId) -> bool {
+    let s = id.as_str();
+    s == MODEL_COLLECTION_ID || s == PROPERTY_COLLECTION_ID || s == MODEL_PROPERTY_COLLECTION_ID
+}
