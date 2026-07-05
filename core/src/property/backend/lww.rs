@@ -17,6 +17,19 @@ use crate::{
 
 const LWW_DIFF_VERSION: u8 = 1;
 
+/// Version header for serialized LWW state buffers: the first byte of every
+/// buffer identifies its encoding, and deserialization refuses buffers whose
+/// version it does not know rather than guessing.
+///
+/// Versions are offset high because unversioned pre-0.9 buffers were raw
+/// bincode maps whose first byte is the low byte of the property count -- a
+/// small number. Keeping versions at 0xA1+ makes the two ranges disjoint, so
+/// one byte classifies any buffer without parse-probing. (A legacy entity
+/// would need 160+ properties to be misclassified, and would then fail
+/// loudly during deserialization, never silently misparse.)
+const LWW_STATE_VERSION_BASE: u8 = 0xA0;
+const LWW_STATE_VERSION_1: u8 = LWW_STATE_VERSION_BASE + 1;
+
 #[derive(Clone, Debug)]
 enum ValueEntry {
     Uncommitted { value: Option<Value> },
@@ -122,13 +135,30 @@ impl PropertyBackend for LWWBackend {
             };
             serializable.insert(name.clone(), CommittedEntry { value: entry.value(), event_id });
         }
-        let state_buffer = bincode::serialize(&serializable)?;
+        let mut state_buffer = vec![LWW_STATE_VERSION_1];
+        bincode::serialize_into(&mut state_buffer, &serializable)?;
         Ok(state_buffer)
     }
 
     fn from_state_buffer(state_buffer: &Vec<u8>) -> std::result::Result<Self, crate::error::RetrievalError>
     where Self: Sized {
-        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, CommittedEntry>>(state_buffer)?;
+        let (version, payload) = match state_buffer.split_first() {
+            Some((version, payload)) => (*version, payload),
+            None => return Err(crate::error::RetrievalError::Other("empty LWW state buffer".to_string())),
+        };
+        if version < LWW_STATE_VERSION_BASE {
+            return Err(crate::error::RetrievalError::Other(
+                "unversioned (pre-0.9) LWW state buffer; migration is required before this store can be read \
+                 (see specs/storage-migration-0.8.md)"
+                    .to_string(),
+            ));
+        }
+        if version != LWW_STATE_VERSION_1 {
+            return Err(crate::error::RetrievalError::Other(format!(
+                "unknown LWW state buffer version {version:#04x} (this binary supports {LWW_STATE_VERSION_1:#04x})"
+            )));
+        }
+        let raw_map = bincode::deserialize::<BTreeMap<PropertyName, CommittedEntry>>(payload)?;
         let map =
             raw_map.into_iter().map(|(k, entry)| (k, ValueEntry::Committed { value: entry.value, event_id: entry.event_id })).collect();
         Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) })
@@ -314,3 +344,58 @@ impl LWWBackend {
 }
 
 // Need ID based happens-before determination to resolve conflicts
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn committed_backend(event_id: EventId) -> LWWBackend {
+        let backend = LWWBackend::new();
+        backend.set("title".into(), Some(Value::String("alpha".into())));
+        let ops = backend.to_operations().unwrap().expect("pending write should yield operations");
+        backend.apply_operations_with_event(&ops, event_id).unwrap();
+        backend
+    }
+
+    #[test]
+    fn state_buffer_round_trips_with_version_header() {
+        let event_id = EventId::from_bytes([7; 32]);
+        let backend = committed_backend(event_id.clone());
+
+        let buffer = backend.to_state_buffer().unwrap();
+        assert_eq!(buffer[0], LWW_STATE_VERSION_1, "first byte is the state version header");
+
+        let restored = LWWBackend::from_state_buffer(&buffer).unwrap();
+        assert_eq!(restored.get(&"title".to_string()), Some(Value::String("alpha".into())));
+        assert_eq!(restored.get_event_id(&"title".to_string()), Some(event_id));
+    }
+
+    #[test]
+    fn unversioned_pre_09_buffer_is_refused() {
+        // Simulate a pre-0.9 buffer: raw bincode of property -> Option<Value>,
+        // no header. Its first byte is the map length's low byte (here 0x01).
+        let legacy: BTreeMap<PropertyName, Option<Value>> =
+            [("title".to_string(), Some(Value::String("alpha".into())))].into_iter().collect();
+        let legacy_buffer = bincode::serialize(&legacy).unwrap();
+        assert!(legacy_buffer[0] < LWW_STATE_VERSION_BASE);
+
+        let err = LWWBackend::from_state_buffer(&legacy_buffer).unwrap_err();
+        assert!(err.to_string().contains("pre-0.9"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unknown_future_version_is_refused() {
+        let backend = committed_backend(EventId::from_bytes([7; 32]));
+        let mut buffer = backend.to_state_buffer().unwrap();
+        buffer[0] = LWW_STATE_VERSION_BASE + 9;
+
+        let err = LWWBackend::from_state_buffer(&buffer).unwrap_err();
+        assert!(err.to_string().contains("unknown LWW state buffer version"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn empty_buffer_is_refused() {
+        let err = LWWBackend::from_state_buffer(&Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("empty LWW state buffer"), "unexpected error: {err}");
+    }
+}
