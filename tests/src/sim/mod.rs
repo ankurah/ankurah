@@ -33,4 +33,4 @@ pub mod transport;
 
 pub use faults::FaultConfig;
 pub use model::{Field, SimRecord, SimRecordView};
-pub use scenario::{body, run_once, run_with_determinism_audit, ScenarioFut, SimOutcome, Workload};
+pub use scenario::{body, run_once, run_with_determinism_audit, sweep, ScenarioFut, SimOutcome, Workload};

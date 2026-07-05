@@ -64,7 +64,12 @@ fn pair(a: usize, b: usize) -> (usize, usize) {
 pub struct Scheduler {
     inflight: Vec<InFlight>,
     /// Cut links (heals restore delivery).
-    partitions: std::collections::HashSet<(usize, usize)>,
+    /// Cut links. A `BTreeSet` (not `HashSet`): its iteration and `drain` order
+    /// is sorted and deterministic, so the order in which partitions are healed,
+    /// and therefore the trace, does not depend on hash-map iteration order. A
+    /// `HashSet` here leaks per-process randomized iteration into the trace and
+    /// breaks the determinism audit (found by that audit at scale).
+    partitions: std::collections::BTreeSet<(usize, usize)>,
     captured: Captured,
     faults: FaultConfig,
     /// Node id per logical index, used to resolve the recipient index of
@@ -78,7 +83,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(captured: Captured, faults: FaultConfig, node_ids: Vec<proto::EntityId>) -> Self {
-        Self { inflight: Vec::new(), partitions: std::collections::HashSet::new(), captured, faults, node_ids, max_rounds: 100_000 }
+        Self { inflight: Vec::new(), partitions: std::collections::BTreeSet::new(), captured, faults, node_ids, max_rounds: 100_000 }
     }
 
     fn node_count(&self) -> usize { self.node_ids.len() }
@@ -186,7 +191,9 @@ impl Scheduler {
             // the convergence invariant requires.
             let deliverable_now = self.inflight.iter().any(|m| self.link_up(m.src, m.dst));
             if !deliverable_now && !self.partitions.is_empty() {
-                let healed: Vec<_> = self.partitions.drain().collect();
+                // Sorted iteration (BTreeSet via mem::take) keeps the heal order,
+                // and thus the trace, deterministic.
+                let healed = std::mem::take(&mut self.partitions);
                 for key in healed {
                     trace.record(TraceEvent::Partition { a: key.0, b: key.1, up: true });
                 }
