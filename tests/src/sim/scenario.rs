@@ -422,3 +422,26 @@ where
     );
     first
 }
+
+/// Run a scenario across `seeds`, each under its own swarm fault config derived
+/// from the seed, collecting the outcomes that violated an invariant. This is
+/// the driver the larger local/nightly tier and C2's scale-out share: any hit
+/// carries its self-contained `artifact_line`, sufficient to reproduce from the
+/// log alone. Returns (total_run, failures).
+pub fn sweep<F, B>(scenario_name: &'static str, seeds: impl Iterator<Item = u64>, node_count: usize, body: F) -> (usize, Vec<SimOutcome>)
+where
+    F: Fn() -> B,
+    B: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b>,
+{
+    let mut total = 0;
+    let mut failures = Vec::new();
+    for seed in seeds {
+        total += 1;
+        let faults = FaultConfig::swarm_from_seed(seed);
+        let outcome = run_once(scenario_name, seed, faults, node_count, body());
+        if !outcome.ok() {
+            failures.push(outcome);
+        }
+    }
+    (total, failures)
+}
