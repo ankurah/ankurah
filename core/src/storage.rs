@@ -6,10 +6,6 @@ use tracing::warn;
 use crate::error::{MutationError, RetrievalError};
 use ankurah_proto::{Attested, CollectionId, EntityId, EntityState, Event, EventId};
 
-pub fn state_name(name: &str) -> String { format!("{}_state", name) }
-
-pub fn event_name(name: &str) -> String { format!("{}_event", name) }
-
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
     type Value;
