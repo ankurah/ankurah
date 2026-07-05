@@ -41,6 +41,9 @@ pub fn entity_id(counter: u64) -> proto::EntityId {
     proto::EntityId::from_bytes(bytes)
 }
 
+/// The `SimRecord` collection id.
+pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
+
 /// Which LWW field a write targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {

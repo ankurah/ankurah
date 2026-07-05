@@ -31,6 +31,9 @@ impl std::fmt::Display for Violation {
 pub struct ExpectedUniverse {
     /// Entity ids that were committed at some origin during the run.
     pub created: Vec<proto::EntityId>,
+    /// Entity ids that were never created and must never be materialized on any
+    /// node (reserved unknowns in phantom-eviction scenarios).
+    pub forbidden: Vec<proto::EntityId>,
 }
 
 /// Byte-canonical form of a materialized state for cross-node equality. The
@@ -115,11 +118,23 @@ pub async fn check_no_phantom(nodes: &[SimNode], universe: &ExpectedUniverse) ->
     let mut violations = Vec::new();
     let expected: std::collections::HashSet<_> = universe.created.iter().copied().collect();
     for node in nodes {
+        // Storage-materialized entities: none may be uncreated.
         for entity in node.known_entities().await {
             if !expected.contains(&entity) {
                 violations.push(Violation {
                     invariant: "no_phantom",
                     detail: format!("n{} materialized uncreated entity {}", node.index, entity.to_base64_short()),
+                });
+            }
+        }
+        // Explicitly forbidden entities must not be materialized even as a
+        // resident-only empty-head phantom (the V6 eviction case): the resident-
+        // first read catches a phantom that never reached storage.
+        for &entity in &universe.forbidden {
+            if node.entity_state(entity).await.is_some() {
+                violations.push(Violation {
+                    invariant: "no_phantom",
+                    detail: format!("n{} holds forbidden (never-created) entity {} as a phantom", node.index, entity.to_base64_short()),
                 });
             }
         }

@@ -33,6 +33,14 @@ pub struct Workload<'a> {
     /// reading a node (reads would be nondeterministic mid-flight; the harness
     /// tracks the origin head it just produced).
     heads: std::collections::HashMap<proto::EntityId, proto::Clock>,
+    /// Live subscriptions held open for the run's duration. Dropping a
+    /// `LiveQuery` tears down its relay context, so scenarios that inject
+    /// SubscriptionUpdates keep them alive here.
+    subscriptions: Vec<ankurah::LiveQuery<super::model::SimRecordView>>,
+    /// Entity ids that must NEVER be materialized on any node (reserved unknown
+    /// entities in phantom-eviction scenarios). Checked at quiescence via the
+    /// resident-first read, so even a resident-only phantom is caught.
+    forbidden: Vec<proto::EntityId>,
 }
 
 impl<'a> Workload<'a> {
@@ -93,6 +101,92 @@ impl<'a> Workload<'a> {
     /// mid-workload settle are healed at its barrier, exactly as at the end.
     pub async fn settle(&mut self) { self.scheduler.run_to_quiescence(self.nodes, self.rng, self.trace).await; }
 
+    /// Establish a live subscription on an (ephemeral) node against `predicate`,
+    /// then settle so the SubscribeQuery request and its response flow. This is
+    /// the precondition for injecting SubscriptionUpdates at that node: the
+    /// applier requires a relay context for the sending peer. The subscription
+    /// is held open for the rest of the run.
+    pub async fn subscribe(&mut self, node: usize, predicate: &str) {
+        let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
+        self.subscriptions.push(lq);
+        self.settle().await;
+    }
+
+    /// Build and deliver a `StateAndEvent` SubscriptionUpdate carrying `origin`'s
+    /// current full state and event lineage for `entity` to `dst`, through the
+    /// scheduler. The groundable state snapshot always applies; used to prove
+    /// the SubscriptionUpdate path works and as the valid items around an
+    /// adversarial one.
+    pub async fn deliver_state_update(&mut self, origin: usize, dst: usize, entity: proto::EntityId) {
+        let item = self.state_and_event_item(origin, entity).await;
+        let message = self.subscription_update_message(origin, dst, vec![item]);
+        self.scheduler.enqueue(origin, dst, message);
+    }
+
+    /// Deliver an arbitrary set of pre-built subscription-update items as one
+    /// batch from `origin` to `dst`. This is the seam scenarios use to construct
+    /// the exact V4/V6 wire shapes (adversarially ordered EventOnly fragments, a
+    /// mix of valid and unknown-entity items). Delivered once, not
+    /// acceptance-retried, since the point is to exercise the applier's handling
+    /// of that specific batch.
+    pub fn deliver_items(&mut self, origin: usize, dst: usize, items: Vec<proto::SubscriptionUpdateItem>) {
+        let message = self.subscription_update_message(origin, dst, items);
+        self.scheduler.enqueue(origin, dst, message);
+    }
+
+    /// Apply forged events at a single node through the real remote-commit path,
+    /// without enqueueing any propagation. Scenarios use this to make a node the
+    /// source of truth for events they will then hand-deliver as a specific wire
+    /// batch (so the delivered order, not the harness's, is what the receiver
+    /// sees). Events are applied in the order given, which must be causal for the
+    /// commit path; the tracked head advances to the last event.
+    pub async fn apply_events_at(&mut self, node: usize, entity: proto::EntityId, events: Vec<Attested<proto::Event>>) {
+        let last = events.last().map(|e| e.payload.id());
+        self.nodes[node].origin_commit(events).await.expect("forged events apply at source node");
+        if let Some(id) = last {
+            self.heads.insert(entity, proto::Clock::from(vec![id]));
+        }
+    }
+
+    /// Build an `EventOnly` subscription-update item carrying the given forged
+    /// events (as fragments) for `entity`, in the exact order passed. Scenarios
+    /// pass a deliberately adversarial (e.g. child-first) order to probe the V4
+    /// bridge-ordering shape; the applier must still apply parent-first.
+    pub fn event_only_item(&self, entity: proto::EntityId, events: Vec<Attested<proto::Event>>) -> proto::SubscriptionUpdateItem {
+        let fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
+        proto::SubscriptionUpdateItem {
+            entity_id: entity,
+            collection: super::model::sim_collection(),
+            content: proto::UpdateContent::EventOnly(fragments),
+            predicate_relevance: vec![],
+        }
+    }
+
+    /// A `StateAndEvent` item for an entity from `origin`'s current stored
+    /// state and lineage.
+    pub async fn state_and_event_item(&self, origin: usize, entity: proto::EntityId) -> proto::SubscriptionUpdateItem {
+        let state = self.nodes[origin].entity_state(entity).await.expect("origin holds entity state");
+        let events = model::causal_sort(self.nodes[origin].stored_events(entity).await);
+        let state_fragment = proto::StateFragment { state, attestations: proto::AttestationSet::default() };
+        let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
+        proto::SubscriptionUpdateItem {
+            entity_id: entity,
+            collection: super::model::sim_collection(),
+            content: proto::UpdateContent::StateAndEvent(state_fragment, event_fragments),
+            predicate_relevance: vec![],
+        }
+    }
+
+    /// Wrap items into a `NodeMessage::Update` addressed from `origin` to `dst`.
+    fn subscription_update_message(&self, origin: usize, dst: usize, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+        proto::NodeMessage::Update(proto::NodeUpdate {
+            id: proto::UpdateId::new(),
+            from: self.nodes[origin].id(),
+            to: self.nodes[dst].id(),
+            body: proto::NodeUpdateBody::SubscriptionUpdate { items },
+        })
+    }
+
     /// Deliver a raw, harness-constructed subscription-update batch from
     /// `origin` to `dst` through the scheduler. This is the seam scenarios use
     /// to reproduce the V4 (adversarial bridge order) and V6 (unknown-entity
@@ -102,14 +196,16 @@ impl<'a> Workload<'a> {
         self.scheduler.enqueue(origin, dst, message);
     }
 
-    /// Register an entity id as expected in the invariant universe without a
-    /// commit (for scenarios that assert an entity must NOT appear, the phantom
-    /// case). Returns a deterministic fresh id not used by `create_at`.
+    /// Reserve a deterministic entity id that is never created and must never be
+    /// materialized on any node. Registered as forbidden so the phantom check
+    /// (resident-first, so it catches a resident-only empty-head phantom) fails
+    /// if any node ends up holding it.
     pub fn reserve_unknown_entity(&mut self) -> proto::EntityId {
         // Use a high, disjoint id range so it can never collide with a
         // counter-derived created id.
         let id = model::entity_id(u64::MAX - self.next_entity);
         self.next_entity += 1;
+        self.forbidden.push(id);
         id
     }
 
@@ -245,12 +341,23 @@ where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
 
         // Let the system settle (ephemeral nodes join node 0). This runs under
         // the *actual* fault config; even join traffic is subject to the
-        // schedule, matching a real cold start.
-        scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
+        // schedule, matching a real cold start. Ephemeral nodes join from the
+        // durable node's system root carried in their Presence, which is a local
+        // operation on a spawned task; awaiting readiness drives that task to
+        // completion deterministically, interleaved with draining any traffic it
+        // produces.
+        for node in &nodes {
+            if !node.durable {
+                node.node.system.wait_system_ready().await;
+            }
+            scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
+        }
 
         // Run the workload in an inner scope so its mutable borrows of the
         // scheduler/rng/trace end before the quiescence barrier reuses them.
-        let created = {
+        // Subscriptions are lifted out so their relay contexts stay alive
+        // through the final barrier and the invariant checks.
+        let (created, forbidden, _subscriptions) = {
             let mut workload = Workload {
                 nodes: &nodes,
                 scheduler: &mut scheduler,
@@ -259,16 +366,21 @@ where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
                 next_entity: 0,
                 created: Vec::new(),
                 heads: std::collections::HashMap::new(),
+                subscriptions: Vec::new(),
+                forbidden: Vec::new(),
             };
             body(&mut workload).await;
-            std::mem::take(&mut workload.created)
+            let created = std::mem::take(&mut workload.created);
+            let forbidden = std::mem::take(&mut workload.forbidden);
+            let subs = std::mem::take(&mut workload.subscriptions);
+            (created, forbidden, subs)
         };
 
         // Quiescence barrier: drain all in-flight messages, healing partitions,
         // so the convergence check is well posed.
         scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
 
-        let universe = ExpectedUniverse { created };
+        let universe = ExpectedUniverse { created, forbidden };
         let violations = invariants::check_all(&nodes, &universe).await;
         let max_head_len = invariants::max_head_len(&nodes, &universe).await;
 
