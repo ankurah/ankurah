@@ -1,7 +1,9 @@
 # Internals
 
 - [Event DAG Subsystem](event-dag.md)
-- [Retrieval and Storage Layer](retrieval.md)
+- [The Compare-Apply Cycle](compare-apply-cycle.md)
+- [Event Retrieval and Staging](retrieval.md)
+- [Storage Engine Layer](storage-engines.md)
 - [Entity Lifecycle](entity-lifecycle.md)
 - [Node Architecture and Replication](node-architecture.md)
 - [Property Backends](property-backends.md)

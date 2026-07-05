@@ -26,14 +26,14 @@ merge proceeds in three conceptual stages:
 
 ### 1. Layer computation
 
-All events between the [meet point](event-dag.md#core-concepts) (the last
+All events between the [meet point](event-dag.md#key-concepts) (the last
 common ancestor of the two branches) and the branch tips are partitioned into
 **concurrency layers** -- groups of events at the same causal depth. Within a
 layer, events are either **already applied** (the replica has already
 incorporated them) or **to-apply** (new to this replica). Layers are produced
 in topological order so that earlier causal history is resolved before later
-history. See [EventLayers](event-dag.md#core-concepts) for details on the
-iterator.
+history. See [Event Layers](event-dag.md#event-layers) for the precise
+definition of a layer and the guarantees it provides.
 
 ### 2. Per-layer resolution
 
@@ -57,13 +57,13 @@ When a challenger event competes against the current incumbent for a property,
 three rules are applied in priority order:
 
 1. **Older-than-meet rule.** If the incumbent value was written by an event
-   that predates the [meet point](event-dag.md#core-concepts), the challenger
+   that predates the [meet point](event-dag.md#key-concepts), the challenger
    wins unconditionally. Rationale: every event in the layer descends from the
    meet, which itself descends from (or equals) the old event. The challenger
    is strictly newer.
 
 2. **Causal dominance.** If one event is an ancestor of the other in the
-   [accumulated DAG](event-dag.md#core-concepts), the descendant wins. This
+   [accumulated DAG](event-dag.md#key-concepts), the descendant wins. This
    respects user intent: a write made *after* seeing a prior value should
    supersede it.
 
@@ -148,30 +148,33 @@ order does not matter.
    for mutated properties, so subsequent layers seed from the correct
    incumbent.
 
-### Prerequisite: causal delivery
+### Prerequisite: causal application order
 
-Determinism relies on **causal delivery**: a child event must not arrive before
-its parents. If event D has parent \[C\], a [replica](node-architecture.md)
-must have already integrated C before D arrives.
+Determinism relies on events being **applied** parents-first: if event D has
+parent \[C\], a [replica](node-architecture.md) must integrate C before D.
+This is an application-order invariant, not a transport guarantee -- the
+receiver enforces it itself by staging each multi-event batch and
+topologically sorting it by in-batch parent edges (`event_dag/ordering.rs`)
+before applying. Sender order is never trusted.
 
 
 ## Integration With Entity::apply_event
 
 The `DivergedSince` handler in
-[`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail) ties the
+[`Entity::apply_event`](entity-lifecycle.md#how-events-are-applied) ties the
 pipeline together:
 
-1. Decompose the [comparison result](event-dag.md#core-concepts) into the
+1. Decompose the [comparison result](event-dag.md#key-concepts) into the
    causal relation and the accumulated DAG.
 2. Build the [layer iterator](#the-three-stage-pipeline) from the meet point
    and current head.
 3. Collect all layers (async; may hit [storage](retrieval.md)).
 4. Acquire the entity write lock; re-check the head for
-   [TOCTOU safety](entity-lifecycle.md#the-try_mutate-toctou-protection).
+   [TOCTOU safety](entity-lifecycle.md#toctou-protection).
 5. For each layer in topological order, call the resolution algorithm on every
    [property backend](property-backends.md#the-propertybackend-trait). If a
    to-apply event introduces a
-   [new backend type](property-backends.md#backend-registration-and-late-creation),
+   [new backend type](property-backends.md#backend-registration),
    create it and replay earlier layers first.
 6. Update the head, release the lock, and broadcast change notifications.
 

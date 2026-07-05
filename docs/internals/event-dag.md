@@ -27,7 +27,7 @@ The event DAG subsystem answers two questions:
    [property backends](property-backends.md) use to merge concurrent operations.
 
 The implementation lives in `core/src/event_dag/` and is consumed primarily by
-[`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail).
+[`Entity::apply_event`](entity-lifecycle.md#how-events-are-applied).
 
 
 ## Key Concepts
@@ -55,10 +55,11 @@ between the meet and the branch tips needs to be merged.
        E
 ```
 
-**Event layers** -- After finding the meet, events above it are partitioned into
-topological layers for merge. Each layer contains events whose dependencies are
-satisfied by earlier layers. See [LWW merge](lww-merge.md#layer-computation)
-for how property backends consume these layers.
+**Event layers** -- After finding the meet, the history is replayed in
+topological generations for merge. See [Event Layers](#event-layers) for the
+precise definition and its guarantees, and
+[LWW merge](lww-merge.md#the-three-stage-pipeline) for how property backends
+consume the layers.
 
 
 ## Comparing Two Clocks
@@ -80,7 +81,7 @@ six possible outcomes:
 visited. Its contents are duplicate-free, but its order is traversal order,
 not guaranteed topological -- consumers must not use it as an application
 order. Batch application paths sort independently (see
-[EventBridge ordering](retrieval.md#staging-vs-permanent-storage)).
+[batch ordering](retrieval.md#the-event-lifecycle-stage-apply-commit-persist)).
 
 ### Quick-check: the linear-extension fast path
 
@@ -106,10 +107,31 @@ DAG from both clocks simultaneously:
 3. When an event is reached from both directions, it becomes a **meet
    candidate**.
 4. After each step, check whether a conclusion can be drawn:
-   - All comparison heads seen by the subject traversal: `StrictDescends`.
+   - The subject traversal has seen every comparison head **and** its boundary
+     is clean (see below): `StrictDescends`.
    - All subject heads seen by the comparison traversal: `StrictAscends`.
    - Both frontiers empty: compute the minimal meet (candidates with no common
      descendants in the traversal), return `DivergedSince` or `Disjoint`.
+
+### Why coverage alone is not enough
+
+Seeing every comparison head proves the subject's cover *contains* the
+comparison clock -- but not that the subject introduces nothing else. A
+subject clock can smuggle in a foreign lineage two ways: as an extra head
+(`[B, X]` versus `[A]`, where `B` descends `A` but `X` has an independent
+genesis), or through a single graft event whose parent clock joins a
+legitimate ancestor with an unrelated root. Fast-forwarding either shape
+would adopt the foreign line wholesale.
+
+The guard is the **clean-boundary check**: before declaring `StrictDescends`,
+every genesis root the subject traversal has discovered, and every id still
+on its unexplored frontier, must lie within the comparison's ancestry
+(computed over the accumulated DAG, including parent ids referenced by
+explored events but not yet fetched). Honest shapes pass exactly as before --
+a deep linear extension's unexplored remainder sits below the comparison
+surface, and a sibling tip bottoms out at a shared ancestor. Smuggled shapes
+fail the check, the traversal runs to exhaustion, and the foreign line goes
+through the diverged merge or reject paths instead of being adopted.
 
 ### Unfetchable events on both frontiers
 
@@ -127,6 +149,72 @@ traversal itself restarts from the original clocks -- only the accumulator
 (recorded DAG structure and LRU event cache) survives the retry, so re-walked
 steps avoid storage round-trips but still spend budget. The internal retry
 keeps the public API simple -- callers do not need to manage retry logic.
+
+
+## Event Layers
+
+When comparison returns `DivergedSince`, the merge machinery walks the
+accumulated DAG *forward* and hands [property backends](property-backends.md)
+the history as a sequence of **event layers**. A layer is one generation of a
+topological sort:
+
+> A layer is the set of events whose parents have all been emitted by earlier
+> layers -- where the meet itself, and any parent outside the accumulated DAG,
+> counts as already emitted.
+
+Equivalently, an event's layer number is its longest-path distance from the
+meet: an event whose parents sit at depths 1 and 3 lands at depth 4, waiting
+for its deepest parent.
+
+```text
+        M              meet (never emitted)
+       / \
+     X1   Y1           layer 1: {X1, Y1}
+      |
+     X2                layer 2: {X2}
+      |
+     X3                layer 3: {X3}
+```
+
+Layers group by causal depth, **not by branch**. With head `[X3]` and
+incoming `Y1`, X1 and Y1 share layer 1 even though they sit on opposite sides
+of the divergence, and the local tip X3 flows through in layer 3. Two
+guarantees make per-layer merging sound:
+
+1. **Parents precede children.** Every causal predecessor of an event above
+   the meet appears in a strictly earlier layer, so applying layers in order
+   respects causality.
+
+2. **Divergent-region layers are antichains.** Above the meet, no event in a
+   layer is an ancestor of another event in the same layer, even transitively.
+   This holds because `DivergedSince` is only produced by an exhaustive
+   traversal (see [Invariants](#invariants)): every event between the meet and
+   the tips is in the accumulated DAG, so a causal path cannot hide behind an
+   unfetched event. Within a layer, concurrency is genuine.
+
+Orthogonal to layering, each layer partitions its events by whether the local
+replica has already incorporated them: events in the current head's ancestry
+are **already-applied**, the rest are **to-apply**. In the diagram, X1..X3
+are already-applied and Y1 is to-apply. Already-applied events participate in
+[merge resolution](lww-merge.md#the-three-stage-pipeline) as context -- they
+can defeat an incoming write -- but only to-apply winners mutate state.
+
+Order *within* a layer is deliberately meaningless: backends receive the
+layer as a set. [Yrs](property-backends.md#yrs-backend) ignores layer
+boundaries entirely (CRDT operations commute), while
+[LWW](property-backends.md#lww-backend) treats each layer as an election
+round whose incumbent is re-seeded from stored state.
+
+Two scope notes. First, the layer sweep covers the *entire* accumulated DAG,
+and an exhaustive traversal accumulates the common history **below** the meet
+as well -- so when the meet sits above genesis, early layers also carry
+below-meet events (genesis itself surfaces in layer 1). These are always
+already-applied (they are ancestors of the current head by definition), so
+they never mutate state; they are inert electoral context. Second, the
+antichain guarantee is scoped to the divergent region: a below-meet straggler
+can share a layer with an event that descends it through the meet. This is
+harmless for the same reason -- causal comparisons consult the full
+accumulated DAG, never layer membership.
 
 
 ## The Staging Pattern
@@ -261,4 +349,4 @@ manages that), the split into [`GetEvents`](retrieval.md#why-three-traits-instea
 [`GetState`](retrieval.md#why-three-traits-instead-of-one), and
 [`SuspenseEvents`](retrieval.md#why-three-traits-instead-of-one) turns the staging protocol into
 a compile-time constraint. See the
-[Retrieval and Storage Layer](retrieval.md) documentation for details.
+[Event Retrieval and Staging](retrieval.md) documentation for details.

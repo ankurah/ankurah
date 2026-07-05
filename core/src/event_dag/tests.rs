@@ -1250,7 +1250,11 @@ mod lww_layer_tests {
     #[test]
     fn test_cross_layer_already_applied_winner_persistence() {
         // Below-meet event Z: last writer of x before the meet. Deliberately NOT
-        // included in the layers' DAG context (BFS never accumulates below the meet).
+        // included in the layers' DAG context, modeling the ephemeral cut where
+        // traversal terminates at an unfetchable common ancestor. (The exhaustive
+        // durable path DOES accumulate below the meet; there Z would be in the DAG
+        // and layer 2's stale re-seed would lose to B via Descends rather than
+        // older_than_meet -- same outcome, same unreachable precondition.)
         let event_z = make_lww_event(9, vec![("x", "value_from_Z")]);
 
         let meet = make_test_event(50, &[]);

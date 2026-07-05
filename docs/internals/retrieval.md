@@ -1,10 +1,13 @@
-# Retrieval and Storage Layer
+# Event Retrieval and Staging
 
 The retrieval layer is the bridge between the [event DAG](event-dag.md) and
 persistent storage. Its job is to answer two questions during event
 processing: "give me this event's data" and "has this event already been
 durably stored?" These sound similar but have deliberately different
-semantics, and the layer's design follows from keeping them separate.
+semantics, and the layer's design follows from keeping them separate. The
+durable backends it sits on top of -- the traits, the engine matrix, and the
+predicate fetch path -- are documented separately in the
+[Storage Engine Layer](storage-engines.md).
 
 
 ## Why Three Traits Instead of One
@@ -108,12 +111,13 @@ state diverges, it falls back to per-event
 [`apply_event`](entity-lifecycle.md#how-events-are-applied) followed by
 `commit_event`, then saves state.
 
-For `EventBridge` (in `apply_delta`), all events are staged upfront, then
-topologically sorted (parents first) by the receiver before being applied and
-committed, and finally the entity state is saved. The producer also sorts what
-it sends, but wire order is untrusted: applying a child before its staged
-parent would jump the head past the parent and silently drop the parent's
-operations.
+The same parent-first rule applies to every multi-event wire shape --
+`EventOnly`, `StateAndEvent`, and `EventBridge` (in `apply_delta`) alike: the
+receiver stages the whole batch upfront, topologically sorts it by in-batch
+parent edges (`event_dag/ordering.rs`), and only then applies, commits, and
+finally saves entity state. The producer also sorts what it sends, but wire
+order is untrusted: applying a child before its staged parent would jump the
+head past the parent and silently drop the parent's operations.
 
 
 ## Crash Safety
