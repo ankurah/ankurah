@@ -37,14 +37,14 @@
 //! is addressed rather than ignored:
 //!
 //! - Where intent is mechanically testable against a golden oracle, the kit adds
-//!   a law for it. For LWW this is the causal-dominance law
-//!   ([`law_causal_dominance`]): a causally-later write must always beat a
-//!   causally-earlier one regardless of content-hash tiebreak order (verdict
-//!   267-C). For Yrs this is the interleaving probe ([`law_sequence_intent`]),
-//!   which runs the backend directly against adversarial concurrent-insert
-//!   configurations and pins the *actual* interleaving behavior (verdict 267-B);
-//!   it is a characterization test, not a guarantee that the DAG discipline
-//!   preserves intent.
+//!   a law for it. For LWW this is the causal-dominance law (the
+//!   `causal_dominance_beats_hash_tiebreak` test): a causally-later write must
+//!   always beat a causally-earlier one regardless of content-hash tiebreak order
+//!   (verdict 267-C). For Yrs this is the interleaving probe (the
+//!   `sequence_intent_interleaving_characterization` test), which runs the backend
+//!   directly against the adversarial concurrent-insert configuration and pins the
+//!   *actual* merge outcome (verdict 267-B); it is a characterization test, not a
+//!   guarantee that the DAG discipline preserves intent.
 //! - Everything else about merge semantics (whether LWW's silent loss is
 //!   acceptable for a given field, whether structured text belongs in a CRDT
 //!   rather than an LWW register) is out of scope for the kit and is the
@@ -533,5 +533,148 @@ mod lww_conformance {
             Some(Value::String("later-write".to_string())),
             "the causally-later write must win even though the earlier event id sorts larger"
         );
+    }
+}
+
+// ============================================================================
+// Reference implementation: Yrs
+// ============================================================================
+
+mod yrs_conformance {
+    use super::*;
+    use crate::property::backend::yrs::YrsBackend;
+
+    /// Yrs adopter. A `Write` is a text insertion `(field, index, text)`.
+    struct YrsAdopter;
+
+    impl ConformanceBackend for YrsAdopter {
+        type Write = (&'static str, u32, &'static str);
+
+        fn backend_name() -> &'static str { YrsBackend::property_backend_name() }
+
+        fn new_backend() -> Arc<dyn PropertyBackend> { Arc::new(YrsBackend::new()) }
+
+        fn from_state_buffer(buffer: &[u8]) -> Arc<dyn PropertyBackend> {
+            Arc::new(YrsBackend::from_state_buffer(&buffer.to_vec()).expect("Yrs from_state_buffer"))
+        }
+
+        fn stage_write(_backend: &Arc<dyn PropertyBackend>, write: &Self::Write) -> Vec<Operation> {
+            // A fresh doc's diff against its empty starting state is a self-contained
+            // update inserting the text; this is the wire form of one edit.
+            let scratch = YrsBackend::new();
+            scratch.insert(write.0, write.1, write.2).expect("yrs insert");
+            scratch.to_operations().expect("to_operations").expect("yrs write must produce operations")
+        }
+
+        fn concurrent_writes() -> Vec<Self::Write> {
+            // Concurrent inserts at the same position on the same field: the classic
+            // interleaving-prone configuration.
+            vec![("body", 0, "aaa"), ("body", 0, "bbb"), ("body", 0, "ccc")]
+        }
+
+        fn linear_writes() -> Vec<Self::Write> {
+            // Applied to distinct fields so the linear round-trip is unambiguous.
+            vec![("title", 0, "Hello"), ("body", 0, "World"), ("tag", 0, "x")]
+        }
+
+        // check_provenance: default no-op. Yrs is a CRDT and ignores the writing
+        // event id (RFC #267 permits this); it has no per-property provenance to
+        // assert.
+    }
+
+    #[test]
+    fn state_buffer_round_trip() { law_state_buffer_round_trip::<YrsAdopter>(); }
+
+    #[test]
+    fn operation_round_trip_across_nodes() { law_operation_round_trip_across_nodes::<YrsAdopter>(); }
+
+    #[test]
+    fn provenance() { law_provenance::<YrsAdopter>(); }
+
+    #[test]
+    fn cross_order_determinism() { law_cross_order_determinism::<YrsAdopter>(); }
+
+    #[test]
+    fn within_layer_permutation_invariance() { law_within_layer_permutation_invariance::<YrsAdopter>(); }
+
+    /// Sequence-intent characterization for Yrs (verdict 267-B).
+    ///
+    /// The lit review flagged the Yjs family as interleaving-prone: the generic
+    /// laws certify that replicas converge, not that they converge on a merge a
+    /// user would call correct. This probe runs Yrs directly against the canonical
+    /// configuration the review named (two replicas each inserting a run at the
+    /// SAME position, concurrently) and pins the ACTUAL merged string, so the
+    /// intent question is answered with evidence rather than left silent.
+    ///
+    /// This is a characterization test, not a guarantee. It asserts three things,
+    /// all empirically observed against the current yrs:
+    ///
+    /// 1. Convergence (the law): both op-application orders of the concurrent
+    ///    inserts yield the byte-identical merged string. This holds.
+    /// 2. No loss: both concurrent runs survive in full (merged length is the sum).
+    /// 3. The observed order: for two disjoint concurrent runs at the same
+    ///    position, yrs keeps each run CONTIGUOUS (it does not splice them
+    ///    character-by-character) and orders the two blocks deterministically by
+    ///    CRDT site precedence. The concrete result is pinned below. If a future
+    ///    yrs upgrade changes the merge (e.g. adopts Fugue-style non-interleaving,
+    ///    or begins interleaving these runs), the pinned string changes and forces
+    ///    a deliberate re-read rather than a silent semantic shift.
+    ///
+    /// FINDING (surfaced in the PR body): which run leads is NOT reproducible
+    /// across process runs. `yrs::Doc::new()` assigns a RANDOM client id, and the
+    /// CRDT breaks the tie between two concurrent same-position inserts by site
+    /// precedence, so the merged string is "xxxyyy" or "yyyxxx" depending on the
+    /// draw. Convergence is unaffected (every replica applies the same event bytes
+    /// and agrees), but the concrete merge is a coin flip. This is the executable
+    /// proof of verdict 267-B: the laws pin convergence; they cannot pin intent,
+    /// and here they cannot even pin the byte outcome because the backend seeds it
+    /// from randomness. The test therefore asserts the reproducible invariants
+    /// (convergence, no loss, each run contiguous, result is one of the two block
+    /// orders) rather than a single hard-coded string.
+    ///
+    /// The point is to make the merge semantics executable and load-bearing:
+    /// structured text must live in a CRDT backend chosen with these semantics
+    /// understood, and the generic laws certify convergence but never intent
+    /// (module docs; verdicts 267-A, 267-B, 267-D).
+    #[test]
+    fn sequence_intent_interleaving_characterization() {
+        // Two concurrent replicas, each inserting a 3-char run at position 0 of an
+        // empty field. No shared root, so the only content is the two concurrent
+        // runs; the merged order is entirely the CRDT's merge decision.
+        let left = ("body", 0u32, "xxx");
+        let right = ("body", 0u32, "yyy");
+
+        let scratch = YrsAdopter::new_backend();
+        let event_l = make_event(4000, YrsAdopter::backend_name(), YrsAdopter::stage_write(&scratch, &left), &[]);
+        let event_r = make_event(4001, YrsAdopter::backend_name(), YrsAdopter::stage_write(&scratch, &right), &[]);
+
+        // Apply in both orders; both are a single layer of two concurrent events.
+        let merged = |order: [&Event; 2]| -> String {
+            let backend = YrsAdopter::new_backend();
+            let refs: Vec<&Event> = order.to_vec();
+            let layer = layer_from_events(&[], &refs, &[]);
+            backend.apply_layer(&layer).unwrap();
+            match backend.property_value(&"body".to_string()) {
+                Some(crate::value::Value::String(s)) => s,
+                other => panic!("expected a string body, got {other:?}"),
+            }
+        };
+
+        let lr = merged([&event_l, &event_r]);
+        let rl = merged([&event_r, &event_l]);
+
+        // (1) Convergence: op-application order does not change the merged string.
+        // This is deterministic within a run (same event bytes both ways).
+        assert_eq!(lr, rl, "Yrs must converge on the same merged string regardless of op-application order");
+
+        // (2) No loss: both concurrent runs survive in full.
+        assert_eq!(lr.len(), left.2.len() + right.2.len(), "both concurrent runs must survive the merge");
+
+        // (3) Contiguity: each run appears as an unbroken block (yrs does not splice
+        // these disjoint concurrent runs character-by-character), and the overall
+        // order is one of the two block orderings. WHICH ordering is the random
+        // client-id tie-break (see the FINDING above), so we accept either.
+        assert!(lr == "xxxyyy" || lr == "yyyxxx", "expected two contiguous blocks in one of the two site-precedence orders, got {lr:?}");
+        assert!(lr.contains("xxx") && lr.contains("yyy"), "each run must appear contiguously");
     }
 }
