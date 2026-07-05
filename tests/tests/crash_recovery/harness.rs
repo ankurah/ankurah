@@ -115,6 +115,13 @@ impl CrashFlushable for SledStorageEngine {
     }
 }
 
+// Postgres autocommits each statement to a durable server that survives the
+// node crash, so there is nothing to flush from the dying node's side.
+#[cfg(feature = "postgres-crash")]
+impl CrashFlushable for ankurah_storage_postgres::Postgres {
+    fn crash_flush(&self) {}
+}
+
 // ============================================================================
 // CRASH-INJECTING STORAGE WRAPPER
 // ============================================================================
@@ -351,23 +358,34 @@ impl ChildOutcome {
 /// `test_name` must be the fully qualified test path as `cargo test` / libtest
 /// filters it, e.g. `scenarios::child_commit_event_before_set_state`.
 pub fn spawn_crash_child(test_name: &str, sled_dir: &Path, crash: CrashPoint) -> Result<ChildOutcome> {
+    let sled_dir_str = sled_dir.to_string_lossy().into_owned();
+    spawn_crash_child_with(test_name, crash, &[(ENV_SLED_DIR, &sled_dir_str)])
+}
+
+/// General child spawn: run exactly `test_name` with the crash point, a private
+/// handoff file, and any extra environment variables (e.g. a sled directory or a
+/// postgres URI). Waits for the child to die and returns its outcome.
+pub fn spawn_crash_child_with(test_name: &str, crash: CrashPoint, extra_env: &[(&str, &str)]) -> Result<ChildOutcome> {
     let exe = std::env::current_exe()?;
-    // A per-spawn handoff file next to the sled dir. Removed first so stale data
-    // from a previous run of the same dir cannot leak in.
-    let handoff_file = sled_dir.with_extension("handoff");
+    // A unique per-spawn handoff file in the temp dir.
+    static NONCE: AtomicUsize = AtomicUsize::new(0);
+    let n = NONCE.fetch_add(1, Ordering::SeqCst);
+    let handoff_file = std::env::temp_dir().join(format!("ankurah-c6-handoff-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_file(&handoff_file);
 
-    let output = std::process::Command::new(exe)
-        .arg("--exact")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--exact")
         .arg(test_name)
         .arg("--nocapture")
         // libtest runs one thread so counters stay deterministic; also ensures
         // the abort is not racing sibling tests in the child binary.
         .arg("--test-threads=1")
         .env(ENV_CRASH_POINT, crash.to_env())
-        .env(ENV_SLED_DIR, sled_dir)
-        .env(ENV_HANDOFF_FILE, &handoff_file)
-        .output()?;
+        .env(ENV_HANDOFF_FILE, &handoff_file);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output()?;
 
     let handoff = handoff_read(&handoff_file);
     let _ = std::fs::remove_file(&handoff_file);
