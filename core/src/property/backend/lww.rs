@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{MutationError, StateError},
-    event_dag::accumulator::{CausalRelation, EventLayer},
+    event_dag::{CausalRelation, EventLayer},
     property::{backend::PropertyBackend, PropertyName, Value},
 };
 

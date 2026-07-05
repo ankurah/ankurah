@@ -327,7 +327,7 @@ impl Entity {
                     let (_relation, accumulator) = comparison_result.into_parts();
                     let mut layers = accumulator.into_layers(meet.clone(), head.as_slice().to_vec());
 
-                    let mut applied_layers: Vec<crate::event_dag::accumulator::EventLayer> = Vec::new();
+                    let mut applied_layers: Vec<crate::event_dag::EventLayer> = Vec::new();
 
                     // Collect all layers first, then apply under lock
                     let mut all_layers = Vec::new();
