@@ -257,7 +257,7 @@ workstream ends by updating this document's checklist.
 
 - [ ] A: issue triage table appended, issue comments posted
 - [ ] B: bibliography plus design-deltas memo committed
-- [ ] C1: simulation harness with reorder/drop/dup/partition and convergence invariants
+- [x] C1: simulation harness with reorder/drop/dup/partition and convergence invariants
 - [ ] C2: nightly oracle scale-out
 - [ ] C3: backend conformance kit; pn_counter decision
 - [ ] C4: threat model document plus wire-level adversarial suite
