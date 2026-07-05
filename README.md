@@ -32,13 +32,15 @@ Building applications where multiple users interact with shared state is hard. Y
 
 Ankurah is **event-sourced**: every change is an operation that can be replayed, merged, and synchronized. Entities can reference each other (graph-style navigation), and you can subscribe to live queries that automatically update as data changes anywhere in the system.
 
-Your model is defined once in Rust with a derive macro. The same code compiles to native binaries for servers and WASM for browsers. TypeScript interfaces and React hooks are generated automatically.
+Your model is defined once in Rust with a derive macro. The same code compiles to native binaries for servers and WASM for browsers. TypeScript interfaces and React-ready bindings are generated automatically.
 
 ### Why Ankurah?
 
 **Local-first by default.** Your queries execute against the local cache instantly, then sync with durable servers in the background. Users get sub-millisecond reads and offline support without you writing sync logic.
 
 **Live queries that just work.** Subscribe to a query and your UI stays in sync automatically—changes flow in from anywhere.
+
+**Deterministic conflict resolution.** Concurrent edits merge per field: causally newer writes win, and true conflicts resolve identically on every replica. See [the guarantees](https://ankurah.org/concurrency/guarantees.html).
 
 **Graph-ready data model.** Entities can reference each other, and you can navigate those relationships directly in queries. Full graph traversal is on the roadmap.
 
@@ -106,8 +108,6 @@ const AlbumList = signalObserver(({ albums }: Props) =&gt; {
 **IndexedDB**
 <pre><code transclude="docs/example/wasm-bindings/src/lib.rs#storage-indexeddb">let storage = IndexedDBStorageEngine::open(&quot;myapp&quot;).await?;</code></pre>
 
-<sub>TiKV planned</sub>
-
 ### ⚡ Generated Interfaces
 
 ```typescript
@@ -119,7 +119,7 @@ export class Album {
 
 ### 🔋 Batteries Included
 
-WebSocket server & client • HTTP/REST endpoints • Authentication hooks • Query routing & pushdown
+WebSocket server & client • Embeddable axum routes • Authentication hooks • Query routing & pushdown
 
 ---
 
