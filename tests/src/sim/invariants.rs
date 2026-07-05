@@ -213,13 +213,18 @@ fn strict_ancestors(
     seen
 }
 
-/// Run every invariant and collect all violations.
+/// Run every invariant and collect all violations. The result is sorted so the
+/// SIMFAIL artifact line is itself reproducible: without this, a violation set
+/// gathered partly from a storage scan could render in a different textual order
+/// across runs of one seed, making the log line C2 consumes non-deterministic
+/// even when the trace hash matched.
 pub async fn check_all(nodes: &[SimNode], universe: &ExpectedUniverse) -> Vec<Violation> {
     let mut violations = Vec::new();
     violations.extend(check_convergence(nodes, universe).await);
     violations.extend(check_no_lost_write(nodes, universe).await);
     violations.extend(check_no_phantom(nodes, universe).await);
     violations.extend(check_head_antichain(nodes, universe).await);
+    violations.sort_by(|a, b| (a.invariant, &a.detail).cmp(&(b.invariant, &b.detail)));
     violations
 }
 

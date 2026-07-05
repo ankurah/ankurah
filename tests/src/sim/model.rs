@@ -101,6 +101,14 @@ pub fn attest(event: proto::Event) -> Attested<proto::Event> { Attested::opt(eve
 pub fn causal_sort(mut events: Vec<Attested<proto::Event>>) -> Vec<Attested<proto::Event>> {
     use std::collections::{HashMap, HashSet};
 
+    // Deduplicate by event id up front: the algorithm places each id once, so a
+    // repeated event would otherwise leave a copy unplaceable and force the
+    // defensive fallback. Keep the first occurrence.
+    {
+        let mut seen = HashSet::new();
+        events.retain(|e| seen.insert(e.payload.id()));
+    }
+
     // Index events by id and record which ids are present in this set.
     let present: HashSet<proto::EventId> = events.iter().map(|e| e.payload.id()).collect();
 
