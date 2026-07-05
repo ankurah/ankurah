@@ -58,6 +58,12 @@ Only **Committed** entries carry an `EventId`. The backend refuses to serialize
 its state if any entry is still Uncommitted or Pending -- this prevents
 persisting incomplete state.
 
+Serialized LWW state buffers begin with a one-byte version header, and
+deserialization refuses buffers whose version it does not know rather than
+guessing. Versions are offset high (`0xA1` = version 1) because unversioned
+pre-0.9 buffers were raw bincode maps whose first byte is a small property
+count -- one byte therefore classifies any buffer with no parse-probing.
+
 ### Conflict resolution
 
 When [concurrent branches merge](entity-lifecycle.md#how-events-are-applied),
