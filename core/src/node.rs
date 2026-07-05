@@ -3,11 +3,12 @@ use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
 use anyhow::anyhow;
 
 use rand::prelude::*;
+use rand::rngs::SmallRng;
 use std::{
     fmt,
     hash::Hash,
     ops::Deref,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::oneshot;
 
@@ -132,6 +133,12 @@ where PA: PolicyAgent
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState>>,
     durable_peers: SafeSet<proto::EntityId>,
 
+    /// Per-node source of randomness for peer selection. Seeded from entropy in production;
+    /// an explicit seed can be injected at construction so the simulation harness and tests
+    /// can reproduce an identical selection sequence. Held behind a Mutex because draws mutate
+    /// RNG state and Node is shared across tasks; the lock is only ever held for a single draw.
+    rng: Mutex<SmallRng>,
+
     pub(crate) predicate_context: SafeMap<proto::QueryId, PA::ContextData>,
 
     /// The reactor for handling subscriptions
@@ -150,17 +157,32 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
-        let collections = CollectionSet::new(engine.clone());
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, SmallRng::from_entropy()) }
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, true, SmallRng::from_entropy()) }
+
+    /// Construct an ephemeral node whose peer-selection RNG is seeded explicitly.
+    /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new`].
+    pub fn new_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
+        Self::build(engine, policy_agent, false, SmallRng::seed_from_u64(rng_seed))
+    }
+
+    /// Construct a durable node whose peer-selection RNG is seeded explicitly.
+    /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new_durable`].
+    pub fn new_durable_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
+        Self::build(engine, policy_agent, true, SmallRng::seed_from_u64(rng_seed))
+    }
+
+    fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
+        let collections = CollectionSet::new(engine);
         let entityset: WeakEntitySet = Default::default();
         let id = proto::EntityId::new();
         let reactor = Reactor::new();
-        notice_info!("Node {id:#} created as ephemeral");
+        notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), false);
+        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), durable);
 
-        // Create subscription relay for ephemeral nodes
-        let subscription_relay = Some(SubscriptionRelay::new());
+        // Only ephemeral nodes relay subscriptions upstream to a durable peer.
+        let subscription_relay = if durable { None } else { Some(SubscriptionRelay::new()) };
 
         let node = Node(Arc::new(NodeInner {
             id,
@@ -168,8 +190,9 @@ where
             entities: entityset,
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
+            rng: Mutex::new(rng),
             reactor,
-            durable: false,
+            durable,
             policy_agent,
             system: system_manager,
             predicate_context: SafeMap::new(),
@@ -184,34 +207,6 @@ where
                 warn!("Failed to set message sender for subscription relay");
             }
         }
-
-        node.policy_agent.on_node_ready(node.weak());
-
-        node
-    }
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
-        let collections = CollectionSet::new(engine);
-        let entityset: WeakEntitySet = Default::default();
-        let id = proto::EntityId::new();
-        let reactor = Reactor::new();
-        notice_info!("Node {id:#} created as durable");
-
-        let system_manager = SystemManager::new(collections.clone(), entityset.clone(), reactor.clone(), true);
-
-        let node = Node(Arc::new(NodeInner {
-            id,
-            collections,
-            entities: entityset,
-            peer_connections: SafeMap::new(),
-            durable_peers: SafeSet::new(),
-            reactor,
-            durable: true,
-            policy_agent,
-            system: system_manager,
-            predicate_context: SafeMap::new(),
-            subscription_relay: None,
-            type_resolver: crate::TypeResolver::new(),
-        }));
 
         node.policy_agent.on_node_ready(node.weak());
 
@@ -801,16 +796,25 @@ where
         }
     }
 
-    /// Get a random durable peer node ID
+    /// Get a random durable peer node ID.
+    ///
+    /// Draws from the node's seeded RNG (not `thread_rng`) so the simulation harness can reproduce
+    /// selections. The candidate slice is sorted first: `choose` indexes by position, so a stable
+    /// candidate order is required for a given seed to yield a given peer.
     pub fn get_durable_peer_random(&self) -> Option<proto::EntityId> {
-        let mut rng = rand::thread_rng();
-        // Convert to Vec since DashSet iterator doesn't support random selection
-        let peers: Vec<_> = self.durable_peers.to_vec();
-        peers.choose(&mut rng).copied()
+        let peers = self.get_durable_peers();
+        let mut rng = self.rng.lock().expect("node rng mutex poisoned");
+        peers.choose(&mut *rng).copied()
     }
 
-    /// Get all durable peer node IDs
-    pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.durable_peers.to_vec() }
+    /// Get all durable peer node IDs, sorted by id for a stable fan-out order.
+    /// The underlying set is unordered; callers that emit per peer (relay, random selection)
+    /// depend on this stable order for the C1 determinism audit.
+    pub fn get_durable_peers(&self) -> Vec<proto::EntityId> {
+        let mut peers = self.durable_peers.to_vec();
+        peers.sort();
+        peers
+    }
 
     /// TEST ONLY: Create a phantom entity with a specific ID.
     ///
@@ -825,6 +829,15 @@ where
     pub fn conjure_evil_phantom(&self, id: proto::EntityId, collection: proto::CollectionId) -> crate::entity::Entity {
         self.entities.conjure_evil_phantom(id, collection)
     }
+
+    /// TEST ONLY: Register a durable peer id directly, bypassing the connection handshake.
+    ///
+    /// Lets tests populate the durable-peer set to exercise fan-out ordering and seeded random
+    /// selection without standing up real peer connections.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.durable_peers.insert(peer_id); }
 }
 
 impl<SE, PA> NodeInner<SE, PA>

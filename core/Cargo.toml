@@ -33,7 +33,7 @@ ankql           = { path = "../ankql", version = "=0.9.0" }
 ankurah-proto   = { path = "../proto", version = "=0.9.0" }
 ankurah-signals = { path = "../signals", version = "=0.9.0" }
 
-rand                 = "0.8"
+rand                 = { version = "0.8", features = ["small_rng"] }
 anyhow               = "1.0"
 thiserror            = "2"
 chrono               = { version = "0.4", default-features = false }
