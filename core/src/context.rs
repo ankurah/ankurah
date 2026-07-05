@@ -81,6 +81,14 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
             if let Some(event) = entity.generate_commit_event()? {
+                // Protected collections (system + metadata catalog) are not
+                // mutable through ordinary transactions; the catalog's only
+                // mutation path is the registration operation (RFC 4).
+                if crate::system::PROTECTED_COLLECTIONS.contains(&event.collection.as_str()) {
+                    return Err(MutationError::General(
+                        format!("collection '{}' is protected and not writable by transactions", event.collection).into(),
+                    ));
+                }
                 // Validate creation events: if parent is empty, this is a creation event
                 // and the entity must have been created in this transaction via create()
                 if event.is_entity_create() {

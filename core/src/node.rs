@@ -430,6 +430,16 @@ where
     where C: Iterable<PA::ContextData> {
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => {
+                // Protected collections (the system collection and the metadata
+                // catalog) are not mutable through ordinary transactions,
+                // regardless of the sender's software version; the catalog's
+                // only mutation path is the registration operation (RFC 4).
+                if let Some(event) = events.iter().find(|e| crate::system::PROTECTED_COLLECTIONS.contains(&e.payload.collection.as_str())) {
+                    return Ok(proto::NodeResponseBody::Error(format!(
+                        "collection '{}' is protected and not writable by transactions",
+                        event.payload.collection
+                    )));
+                }
                 // TODO - relay to peers in a gossipy/resource-available manner, so as to improve propagation
                 // With moderate potential for duplication, while not creating message loops
                 // Doing so would be a secondary/tertiary/etc hop for this message

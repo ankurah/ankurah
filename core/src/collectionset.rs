@@ -26,6 +26,16 @@ impl<SE: StorageEngine> CollectionSet<SE> {
     pub fn new(storage_engine: Arc<SE>) -> Self { Self(Arc::new(Inner { storage_engine, collections: RwLock::new(BTreeMap::new()) })) }
 
     pub async fn get(&self, id: &CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
+        // The `_ankurah_` prefix is reserved for the system and catalog
+        // collections; anything else under it never gets storage.
+        if id.as_str().starts_with(crate::schema::RESERVED_COLLECTION_PREFIX)
+            && !crate::system::PROTECTED_COLLECTIONS.contains(&id.as_str())
+        {
+            return Err(RetrievalError::Other(format!(
+                "collection id '{id}' uses the reserved prefix '{}'",
+                crate::schema::RESERVED_COLLECTION_PREFIX
+            )));
+        }
         let collections = self.0.collections.read().await;
         if let Some(store) = collections.get(id) {
             return Ok(store.clone());
