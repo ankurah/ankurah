@@ -54,11 +54,33 @@ impl SimNode {
         self.node.commit_remote_transaction(&ankurah::policy::DEFAULT_CONTEXT, txid, events).await
     }
 
-    /// Read the canonical materialized state of an entity from this node's
-    /// storage, or `None` if the node has never materialized it. The returned
-    /// `proto::State` (state buffers + head clock) is the byte-comparable unit
-    /// the convergence invariant equates across nodes.
+    /// Register a live query for `SimRecord` on this (ephemeral) node against a
+    /// predicate. This drives the real subscription relay to register a context
+    /// for the durable peer, which the `SubscriptionUpdate` applier
+    /// (`apply_updates`) requires before it will process a batch from that peer.
+    /// The returned `LiveQuery` must be held for the subscription's lifetime.
+    /// The scheduler must be settled after this so the SubscribeQuery request
+    /// and its response flow.
+    pub fn subscribe(&self, predicate: &str) -> Result<ankurah::LiveQuery<super::model::SimRecordView>, anyhow::Error> {
+        let ctx = self.node.context(ankurah::policy::DEFAULT_CONTEXT)?;
+        Ok(ctx.query::<super::model::SimRecordView>(predicate)?)
+    }
+
+    /// Read the canonical materialized state of an entity as this node would
+    /// serve it to a client: the resident (in-memory) entity if one is held,
+    /// else the persisted state buffer. The resident view is authoritative
+    /// because the EventOnly apply path advances the in-memory entity and
+    /// commits events but does not rewrite the storage state buffer, so reading
+    /// storage alone under-reports convergence. Returns `None` if the node has
+    /// neither a resident entity nor a persisted state for `entity`. The
+    /// returned `proto::State` (state buffers + head clock) is the byte-
+    /// comparable unit the convergence invariant equates across nodes.
     pub async fn entity_state(&self, entity: proto::EntityId) -> Option<proto::State> {
+        if let Some(resident) = self.node.get_resident_entity(entity) {
+            if let Ok(state) = resident.to_state() {
+                return Some(state);
+            }
+        }
         let collection = self.node.collections.get(&SimRecord::collection()).await.ok()?;
         match collection.get_state(entity).await {
             Ok(state) => Some(state.payload.state),

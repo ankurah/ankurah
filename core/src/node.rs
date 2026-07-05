@@ -740,6 +740,20 @@ where
 
     pub fn next_entity_id(&self) -> proto::EntityId { proto::EntityId::new() }
 
+    /// The currently-resident (in-memory) entity for `id`, if one is held.
+    ///
+    /// The resident entity carries the authoritative materialized state, which
+    /// can be ahead of the persisted state buffer: the EventOnly apply path
+    /// commits events and advances the in-memory entity but does not rewrite the
+    /// state buffer in storage (state is a rebuildable cache of the event log).
+    /// A test or tool that must observe a node's true materialized state
+    /// (e.g. the phase 2 simulation harness checking cross-node convergence)
+    /// needs this resident view; reading the storage state buffer alone
+    /// under-reports EventOnly progress. Returns `None` if no strong reference
+    /// keeps the entity resident, in which case the caller falls back to the
+    /// persisted state.
+    pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
+
     pub fn context(&self, data: PA::ContextData) -> Result<Context, anyhow::Error> {
         if !self.system.is_system_ready() {
             return Err(anyhow!("System is not ready"));
