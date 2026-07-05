@@ -5,7 +5,6 @@ members = [
     "proto",
     "examples/wasm-bindings",
     "examples/model",
-    # "examples/leptos-app",
     "examples/server",
     "docs/example/model",
     "docs/example/server",
