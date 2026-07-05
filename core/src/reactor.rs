@@ -29,7 +29,7 @@ use crate::{
 use ankurah_proto::{self as proto};
 use futures::future::join_all;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -336,8 +336,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         tracing::debug!("Reactor.notify_change({} changes)", changes.len());
 
-        // Build per-subscription candidate accumulators (first lock of watcher_set)
-        let mut candidates_by_sub: HashMap<ReactorSubscriptionId, CandidateChanges<C>> = HashMap::new();
+        // Build per-subscription candidate accumulators (first lock of watcher_set).
+        // BTreeMap (not HashMap) so that emission across subscriptions follows a stable,
+        // ReactorSubscriptionId-sorted order. Any order is semantically legal, but the C1
+        // simulation audit requires the same seed to reproduce an identical emission trace.
+        let mut candidates_by_sub: BTreeMap<ReactorSubscriptionId, CandidateChanges<C>> = BTreeMap::new();
         {
             let watcher_set = self.0.watcher_set.lock().unwrap();
             for (offset, change) in changes.iter().enumerate() {
@@ -626,4 +629,81 @@ mod tests {
     // 6. Test index_watchers for field-specific comparisons
     // 7. Test proper cleanup when unsubscribing (all watchers removed)
     // 8. Test multiple subscriptions watching the same entity
+
+    /// A ChangeNotification over the test entity/event types, so notify_change can be driven directly.
+    #[derive(Debug, Clone)]
+    struct TestChange {
+        entity: TestEntity,
+        events: Vec<TestEvent>,
+    }
+    impl std::fmt::Display for TestChange {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "TestChange({})", self.entity.id) }
+    }
+    impl ChangeNotification for TestChange {
+        type Entity = TestEntity;
+        type Event = TestEvent;
+        fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { (self.entity, self.events) }
+        fn entity(&self) -> &Self::Entity { &self.entity }
+        fn events(&self) -> &[Self::Event] { &self.events }
+    }
+
+    /// notify_change must emit across subscriptions in a stable, id-sorted order.
+    ///
+    /// Any emission order is semantically legal, but the C1 simulation audit requires the same
+    /// inputs to reproduce an identical trace. candidates_by_sub is a BTreeMap keyed on
+    /// ReactorSubscriptionId, so the order is a strict refinement (sorted by subscription id) and
+    /// is identical across runs. Every subscription entity-subscribes to the same entity id, so a
+    /// single change fans out to all of them and their relative emission order is observable.
+    #[tokio::test]
+    async fn test_notify_change_emits_in_stable_subscription_order() {
+        // Shared observer: every subscription pushes its id here as its update is emitted.
+        // Because Broadcast::send runs listeners synchronously and evaluate_changes emits before
+        // returning (no gap fill for entity subscriptions), the push order equals the
+        // candidates_by_sub iteration order.
+        async fn run_once(shared_entity: &TestEntity) -> Vec<ReactorSubscriptionId> {
+            let reactor = Reactor::<TestEntity, TestEvent>::new();
+            let emission_order = Arc::new(Mutex::new(Vec::<ReactorSubscriptionId>::new()));
+
+            // Several subscriptions, all watching the same entity by id. Both the ReactorSubscription
+            // handles and the listen guards must stay alive for the whole run: dropping a
+            // ReactorSubscription unsubscribes it, and dropping a guard detaches its listener.
+            let mut subs = Vec::new();
+            let mut guards = Vec::new();
+            for _ in 0..5 {
+                let rsub = reactor.subscribe();
+                let sub_id = rsub.id();
+                let order = emission_order.clone();
+                let guard = rsub.subscribe(Box::new(move |_update: ReactorUpdate<TestEntity, TestEvent>| {
+                    order.lock().unwrap().push(sub_id);
+                }) as Box<dyn Fn(ReactorUpdate<TestEntity, TestEvent>) + Send + Sync>);
+                reactor.add_entity_subscriptions(sub_id, [shared_entity.id]);
+                guards.push(guard);
+                subs.push(rsub);
+            }
+
+            // A single change on the shared entity fans out to every subscription.
+            let change = TestChange { entity: shared_entity.clone(), events: vec![] };
+            reactor.notify_change(vec![change]).await;
+
+            let observed = emission_order.lock().unwrap().clone();
+            drop(guards);
+            drop(subs);
+            observed
+        }
+
+        let shared_entity = TestEntity::new("Album", "pending");
+        let order1 = run_once(&shared_entity).await;
+        let order2 = run_once(&shared_entity).await;
+
+        assert_eq!(order1.len(), 5, "all subscriptions should be notified");
+
+        // Within a run, the order is the ascending subscription-id sort (BTreeMap refinement),
+        // not a HashMap-arbitrary order.
+        let mut sorted1 = order1.clone();
+        sorted1.sort();
+        assert_eq!(order1, sorted1, "emission order must be sorted by subscription id");
+        let mut sorted2 = order2.clone();
+        sorted2.sort();
+        assert_eq!(order2, sorted2, "emission order must be sorted by subscription id on the second run too");
+    }
 }

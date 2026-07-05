@@ -3,7 +3,7 @@ use crate::reactor::comparison_index::ComparisonIndex;
 use crate::reactor::property_path::PropertyPath;
 use crate::reactor::{AbstractEntity, ReactorSubscriptionId};
 use ankurah_proto as proto;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct WatcherSet {
@@ -25,7 +25,7 @@ impl WatcherSet {
         entity: &E,
         offset: usize,
         changes_arc: &Arc<Vec<C>>,
-        candidates_by_sub: &mut HashMap<ReactorSubscriptionId, CandidateChanges<C>>,
+        candidates_by_sub: &mut BTreeMap<ReactorSubscriptionId, CandidateChanges<C>>,
     ) {
         let entity_id = AbstractEntity::id(entity);
 
