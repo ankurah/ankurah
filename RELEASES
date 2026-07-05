@@ -1,3 +1,4 @@
+0.9.0   Concurrent updates: event-DAG causal comparison and layered per-property merge; LWW state buffers gain a one-byte version header (unversioned pre-0.9 buffers are refused pending migration tooling); contributor internals documentation
 0.8.1   Fix ankurah-core wasm feature to enable ankql/wasm (0.8.0 publish verification failed for wasm storage/connector crates); add ankurah-jwt-auth to the publish list
 0.8.0   JWT auth extension (ankurah-jwt-auth): configurable RBAC and row-level security; PolicyAgent on_node_ready lifecycle hook; read-policy enforcement on direct gets and subscription initial deltas; EntityLiveQuery::new_weak_node for non-node-retaining subscribers; typed EntityId literals from JS substitution args and jwt scope filters
 0.7.23  Fix task::spawn panic on threads without Tokio runtime context; add set_runtime_handle() for FFI consumers
