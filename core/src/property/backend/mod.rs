@@ -4,15 +4,21 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::{collections::BTreeMap, sync::Arc};
 
+// The dormant pn_counter backend (issues #37/#38, a commutative i64
+// counter) was deleted rather than revived: it predated the July trait
+// factorization by 19 compile errors, and a counter cannot satisfy the
+// conformance kit's cross-order determinism law without being rebuilt as a
+// provenance-tracking, idempotent op-counter (apply_layer summing deltas is
+// non-idempotent and the counter kept no per-event id to de-duplicate on).
+// See the RFC #267 conformance kit and the C3 PR body for the full rationale
+// and what a future counter backend must provide.
 #[cfg(test)]
 mod conformance;
 pub mod lww;
-//pub mod pn_counter;
 pub mod yrs;
 use crate::error::{MutationError, RetrievalError, StateError};
 use crate::event_dag::EventLayer;
 pub use lww::LWWBackend;
-//pub use pn_counter::PNBackend;
 pub use yrs::YrsBackend;
 
 use super::{PropertyName, Value};
@@ -126,15 +132,7 @@ pub fn backend_from_string(name: &str, buffer: Option<&Vec<u8>>) -> Result<Arc<d
             None => LWWBackend::new(),
         };
         Ok(Arc::new(backend))
-    }
-    /*else if name == "pn" {
-        let backend = match buffer {
-            Some(buffer) => PNBackend::from_state_buffer(buffer)?,
-            None => PNBackend::new(),
-        };
-        Ok(Arc::new(backend))
-    } */
-    else {
+    } else {
         Err(RetrievalError::Other(format!("unknown backend: {}", name)))
     }
 }

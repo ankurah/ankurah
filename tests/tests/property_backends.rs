@@ -27,8 +27,6 @@ pub struct Video {
     pub description: Option<String>,
     #[active_type(LWW)]
     pub visibility: Visibility,
-    /*#[active_type(PNCounter)]
-    pub views: i32,*/
     #[active_type(LWW)]
     pub attribution: Option<String>,
 }
@@ -45,19 +43,16 @@ async fn property_backends() -> Result<()> {
             title: "Cat video #2918".into(),
             description: Some("Test".into()),
             visibility: Visibility::Public,
-            //views: 0,
             attribution: None,
         })
         .await?;
 
     let id = cat_video.id();
-    //cat_video.views.add(2); // FIXME: applying twice for some reason
     cat_video.visibility().set(&Visibility::Unlisted)?;
     cat_video.title().insert(15, " (Very cute)")?;
     trx.commit().await?;
 
     let video = ctx.get::<VideoView>(id).await?;
-    //assert_eq!(video.views().unwrap(), 1);
     assert_eq!(video.visibility().unwrap(), Visibility::Unlisted);
     assert_eq!(video.title().unwrap(), "Cat video #2918 (Very cute)");
 
