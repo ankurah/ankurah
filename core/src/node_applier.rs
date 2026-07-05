@@ -316,7 +316,7 @@ impl NodeApplier {
                 let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
-                let (_, entity) = node
+                let (changed, entity) = node
                     .entities
                     .with_state(state_getter, event_getter, delta.entity_id, delta.collection, attested_state.payload.state)
                     .await?;
@@ -324,7 +324,21 @@ impl NodeApplier {
                 // Save state to storage
                 Self::save_state(node, &entity, &collection).await?;
 
-                // Phase 1: Return EntityChange with empty events
+                // Only notify if the snapshot actually advanced the entity. with_state
+                // returns Some(false) when the state did not apply (the entity is
+                // already resident at this head, or the snapshot is older). Emitting a
+                // change here would be spurious: notify_change is global across every
+                // subscription on the node, so a no-op snapshot for one subscribing
+                // query surfaces on ANOTHER already-established query - which holds the
+                // same entity - as an empty-events ItemChange::Update. That is the
+                // subscription-notification race behind the intermittent
+                // server_edits_subscription failure. None (freshly created) and
+                // Some(true) (advanced) are real changes and still notify.
+                if matches!(changed, Some(false)) {
+                    return Ok(None);
+                }
+
+                // Snapshots carry no events, so the change reports an empty events list.
                 Ok(Some(EntityChange::new(entity, Vec::new())?))
             }
 
@@ -343,15 +357,29 @@ impl NodeApplier {
                 // (V4). The producer also sorts, but receivers must not rely
                 // on sender ordering.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
+                let mut applied_any = false;
                 for event in attested_events.into_iter() {
-                    entity.apply_event(event_getter, &event.payload).await?;
+                    if entity.apply_event(event_getter, &event.payload).await? {
+                        applied_any = true;
+                    }
                     event_getter.commit_event(&event).await?;
                 }
 
                 // Save updated state
                 Self::save_state(node, &entity, &collection).await?;
 
-                // Phase 1: Return EntityChange with empty events
+                // Only notify if the bridge actually advanced the entity. If every
+                // event was already applied (apply_event returned false for all), the
+                // entity did not change and emitting an EntityChange would surface a
+                // spurious empty-events Update on other subscriptions holding this
+                // entity (see the StateSnapshot arm above). This mirrors the streaming
+                // StateAndEvent fallback, which also only notifies when events applied.
+                if !applied_any {
+                    return Ok(None);
+                }
+
+                // Bridges carry no events on the change itself; the events were applied
+                // above, so the change reports an empty events list.
                 Ok(Some(EntityChange::new(entity, Vec::new())?))
             }
 
