@@ -21,6 +21,18 @@ per-engine meta-marker design in section 3 is therefore superseded; the rest
 of this document (compatibility inventory, synthesis rule, per-engine sweep
 mechanics, wire-compat caveat) remains the plan of record for the follow-up.
 
+**Amendment (same day):** rather than refusing unversioned buffers,
+`from_state_buffer` now falls back to parsing them as the legacy map and
+stamps loaded values with an all-zeros sentinel event id. The sentinel
+supersedes section 5's head-stamp recommendation: because pre-0.9 histories
+are linear, older-than-meet auto-lose reproduces true-provenance election
+outcomes exactly, and does so identically on every replica -- head stamping
+does not (a replica that rebuilds provenance by replaying events derives the
+true per-property stamps and can elect a different winner than a replica
+stamped with its local head). Stores upgrade lazily on the next state save;
+the follow-up migrator (ankurah#284) reduces to an optional bulk sweep for
+stores that want eager rewriting.
+
 ---
 
 ## 0. TL;DR
