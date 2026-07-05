@@ -512,6 +512,13 @@ where
 
                 Ok(proto::NodeResponseBody::GetEvents(events))
             }
+            proto::NodeRequestBody::RegisterSchema { models, properties, memberships } => {
+                let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
+                match self.execute_schema_registration(cdata, models, properties, memberships).await {
+                    Ok(()) => Ok(proto::NodeResponseBody::Success),
+                    Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
+                }
+            }
             proto::NodeRequestBody::SubscribeQuery { query_id, collection, selection, version, known_matches } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // only one cdata is permitted for SubscribePredicate

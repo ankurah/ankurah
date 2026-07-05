@@ -6,74 +6,83 @@ train, red-to-green where a test can pin the change.
 
 ## 1. Phase 0: #294 protocol version (separate PR off main)
 
-- [ ] `PROTOCOL_VERSION: u32 = 1` in proto; `protocol_version: u32`
+DONE: PR #306; decision record posted on #294.
+
+- [x] `PROTOCOL_VERSION: u32 = 1` in proto; `protocol_version: u32`
       appended as the last field of `Presence`; compatibility check
       isolated in one function (equality for now).
-- [ ] `Message::PresenceRejected { expected: u32, received: u32 }`
+- [x] `Message::PresenceRejected { expected: u32, received: u32 }`
       variant.
-- [ ] Fallible `register_peer`: version mismatch (including implied
+- [x] Fallible `register_peer`: version mismatch (including implied
       version 0) refuses with `PresenceRejected` sent best-effort, then
       teardown via the existing deregister path; all four connectors
       (websocket-server, websocket-client, websocket-client-wasm,
       local-process) propagate the refusal and close instead of
       dropping the frame.
-- [ ] Presence decode failure before establishment closes the
+- [x] Presence decode failure before establishment closes the
       connection with an actionable log (version-0 peer guidance)
       instead of leaving it open.
-- [ ] Tests: same-version connect; mismatch refused in both directions
+- [x] Tests: same-version connect; mismatch refused in both directions
       (rejection observed); hand-crafted version-0 Presence bytes
       (old-shape mirror enum) refused without panic; existing
       integration suite green.
-- [ ] Close out #294: record refuse-semantics decision and the deferred
+- [x] Close out #294: record refuse-semantics decision and the deferred
       policy-hook question on the issue.
 
 ## 2. Phase A foundation: derivation, frozen encoder, create-with-id
 
-- [ ] `proto/src/schema_id.rs`: model/property/membership id derivation
+- [x] `proto/src/schema_id.rs`: model/property/membership id derivation
       (domain tags v1, u64-LE length prefixes, SHA-256 first 16 bytes);
       zero-model-id standalone scope constant; golden-vector tests.
-- [ ] Ulid audit: verify nothing interprets EntityId timestamp bits
+- [x] Ulid audit: verify nothing interprets EntityId timestamp bits
       (fact-checked once already: no readers); record in PR
       description; regression test that from_bytes round-trips
       hash-derived ids.
-- [ ] `core/src/schema/genesis.rs`: frozen genesis encoder for the
+- [x] `core/src/schema/genesis.rs`: frozen genesis encoder for the
       three catalog kinds (pinned LWWDiff v1 name-keyed shape, scalar
       Values, empty parent clock); golden byte vectors independent of
       lww.rs.
-- [ ] `validate_catalog_genesis`: recompute entity id from payload and
+- [x] `validate_catalog_genesis`: recompute entity id from payload and
       event id from re-encoding; tamper tests (field value, field set,
       operation count).
-- [ ] Create-with-derived-id: pub(crate) WeakEntitySet path registering
-      with the phantom guard (Transaction::create /
-      commit_local_trx:84-98 parity); test that a derived-id create
-      commits and a phantom still refuses.
+- [x] Create-with-derived-id: RESOLVED without new plumbing. The
+      executor rides `get_retrieve_or_create` +
+      `commit_remote_transaction` (the receive path), which already
+      materializes entities under given ids; the phantom guard only
+      constrains client transactions, which registration does not use.
 
 ## 3. Catalog collections, protection, registration operation
 
-- [ ] Collection constants `_ankurah_model`, `_ankurah_property`,
+- [x] Collection constants `_ankurah_model`, `_ankurah_property`,
       `_ankurah_model_property`; PROTECTED_COLLECTIONS extended to all
       four system collections.
-- [ ] `_ankurah_` prefix reservation in CollectionSet::get (user paths
+- [x] `_ankurah_` prefix reservation in CollectionSet::get (user paths
       refused, system callers allowed); test.
 - [ ] Catalog entity accessors in the SysRoot raw-entity style (system
       models; never derive(Model)).
-- [ ] proto descriptors (ModelDescriptor, PropertyDescriptor,
+- [x] proto descriptors (ModelDescriptor, PropertyDescriptor,
       MembershipDescriptor) + `NodeRequestBody::RegisterSchema`.
-- [ ] Durable-side executor: derive ids, catalog lookups, anchor-reuse
+- [x] Durable-side executor: derive ids, catalog lookups, anchor-reuse
       refusal, explicit-id verification, frozen genesis + LWW follow-up
       events, PolicyAgent::check_event on every event, persist + relay;
       Success/Error response.
-- [ ] Receiver-side protection: CommitTransaction events targeting
-      protected collections refused outright; relayed catalog genesis
-      validated by self-certification.
+- [x] Receiver-side protection: CommitTransaction events targeting
+      protected collections refused outright (local and remote paths);
+      tests.
+- [x] Tests: registration from descriptors alone on a schema-less
+      server; idempotent re-issue (heads unchanged); anchor rename then
+      reuse-refusal; explicit-id sharing with per-contract optionality;
+      not-found and retype-mismatch hard-fails; ephemeral refusal.
+- [ ] Relay-side self-certification: validate_catalog_genesis on
+      catalog events arriving via subscription (with group 4).
+- [ ] Multi-durable propagation: CommitTransaction is refused for
+      catalog collections by design, so durable-durable catalog
+      transport is the registration operation re-issued or the
+      subscription relay; decide and implement with group 4.
+- [ ] Policy-denial test (needs a denying PolicyAgent fixture).
 - [ ] Client lifecycle: ensure-registration on first mutating use;
       derive+cache on read paths; `ctx.register::<M>()`; offline queue
-      drained on durable-peer connect.
-- [ ] Tests: two-node concurrent registration converges to identical
-      genesis EventIds; RegisterSchema idempotent across re-issue and
-      across two durable executors; policy denial; commit into
-      `_ankurah_model` refused; tampered genesis refused; offline queue
-      drains on reconnect.
+      drained on durable-peer connect (needs group 8 descriptors).
 
 ## 4. Catalog subscription and map
 

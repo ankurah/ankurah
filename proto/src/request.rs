@@ -115,16 +115,99 @@ pub struct EntityDelta {
     pub content: DeltaContent,
 }
 
+/// A model definition to register: a named data contract bound to a
+/// collection (specs/model-property-metadata/rfc.md section 4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDescriptor {
+    /// The collection this model's entities live in (the identity anchor).
+    pub collection: String,
+    /// Display name (initially the struct name); mutable metadata.
+    pub name: String,
+}
+
+/// A property definition to register. Language-agnostic: `backend` and
+/// `value_type` follow the normative mapping table (RFC section 4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropertyDescriptor {
+    /// Collection of the minting model: the derivation SCOPE (provenance,
+    /// not ownership).
+    pub minting_collection: String,
+    /// Permanent derivation name: equals `name` unless an anchor pinned an
+    /// earlier name (rename lineage, RFC 5.8).
+    pub anchor: String,
+    /// Current display name.
+    pub name: String,
+    /// Backend registry name, e.g. "lww", "yrs".
+    pub backend: String,
+    /// Language-agnostic value type, e.g. "string", "i64".
+    pub value_type: String,
+    /// For reference-typed properties: the target model entity. Mutable
+    /// metadata, not identity.
+    pub target_model: Option<EntityId>,
+    /// Explicit binding (RFC 5.9): reference an EXISTING property entity
+    /// instead of deriving one. Never mints; hard-fails if absent.
+    pub explicit_id: Option<EntityId>,
+}
+
+/// How a membership names its property within a RegisterSchema request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PropertyRef {
+    /// A property declared in this request for the same model, by anchor.
+    Anchor(String),
+    /// An existing (possibly shared) property entity, by explicit id.
+    Id(EntityId),
+}
+
+/// A (model, property) contract-membership to register.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipDescriptor {
+    /// The model's collection.
+    pub collection: String,
+    pub property: PropertyRef,
+    /// PER CONTRACT: the same property may be required in one model and
+    /// optional in another.
+    pub optional: bool,
+}
+
 /// The body of a request from one node to another
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeRequestBody {
     // Request that the Events to be committed on the remote node
-    CommitTransaction { id: TransactionId, events: Vec<Attested<Event>> },
+    CommitTransaction {
+        id: TransactionId,
+        events: Vec<Attested<Event>>,
+    },
     // Request to fetch entities matching a predicate
-    Get { collection: CollectionId, ids: Vec<EntityId> },
-    GetEvents { collection: CollectionId, event_ids: Vec<EventId> },
-    Fetch { collection: CollectionId, selection: ast::Selection, known_matches: Vec<KnownEntity> },
-    SubscribeQuery { query_id: QueryId, collection: CollectionId, selection: ast::Selection, version: u32, known_matches: Vec<KnownEntity> },
+    Get {
+        collection: CollectionId,
+        ids: Vec<EntityId>,
+    },
+    GetEvents {
+        collection: CollectionId,
+        event_ids: Vec<EventId>,
+    },
+    Fetch {
+        collection: CollectionId,
+        selection: ast::Selection,
+        known_matches: Vec<KnownEntity>,
+    },
+    SubscribeQuery {
+        query_id: QueryId,
+        collection: CollectionId,
+        selection: ast::Selection,
+        version: u32,
+        known_matches: Vec<KnownEntity>,
+    },
+    /// Register schema definitions (RFC 5.2). Carries everything a durable
+    /// node needs to execute registration itself: the receiver derives the
+    /// ids, mints frozen genesis events, policy-checks, persists, and
+    /// relays. Idempotent by construction. The catalog collections are not
+    /// writable any other way.
+    RegisterSchema {
+        models: Vec<ModelDescriptor>,
+        properties: Vec<PropertyDescriptor>,
+        memberships: Vec<MembershipDescriptor>,
+    },
 }
 
 /// A response from one node to another
@@ -177,6 +260,9 @@ impl std::fmt::Display for NodeRequestBody {
             }
             NodeRequestBody::SubscribeQuery { query_id, collection, selection: query, version, known_matches } => {
                 write!(f, "Subscribe {query_id} {collection} {query} v{version} known:{}", known_matches.len())
+            }
+            NodeRequestBody::RegisterSchema { models, properties, memberships } => {
+                write!(f, "RegisterSchema models:{} properties:{} memberships:{}", models.len(), properties.len(), memberships.len())
             }
         }
     }

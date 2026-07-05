@@ -1,4 +1,5 @@
 pub mod genesis;
+pub mod registration;
 
 use crate::property::PropertyError;
 use crate::value::ValueType;
