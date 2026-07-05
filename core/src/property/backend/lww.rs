@@ -30,6 +30,17 @@ const LWW_DIFF_VERSION: u8 = 1;
 const LWW_STATE_VERSION_BASE: u8 = 0xA0;
 const LWW_STATE_VERSION_1: u8 = LWW_STATE_VERSION_BASE + 1;
 
+/// Provenance stamp for values loaded from unversioned (pre-0.9) state
+/// buffers, which recorded no per-property event id. All-zeros is not a
+/// reachable content hash, so it is never found in an accumulated DAG and
+/// merge resolution treats such values as older-than-meet: any event that
+/// writes the property wins. For pre-0.9 stores this reproduces the true
+/// outcome exactly -- their histories are linear, so a real per-property
+/// stamp would also lose to every later write -- and unlike stamping with
+/// the local head it yields the same election result on every replica,
+/// including replicas that rebuilt provenance by replaying events.
+const LEGACY_EVENT_ID: [u8; 32] = [0; 32];
+
 #[derive(Clone, Debug)]
 enum ValueEntry {
     Uncommitted { value: Option<Value> },
@@ -147,11 +158,21 @@ impl PropertyBackend for LWWBackend {
             None => return Err(crate::error::RetrievalError::Other("empty LWW state buffer".to_string())),
         };
         if version < LWW_STATE_VERSION_BASE {
-            return Err(crate::error::RetrievalError::Other(
-                "unversioned (pre-0.9) LWW state buffer; migration is required before this store can be read \
-                 (see specs/storage-migration-0.8.md)"
-                    .to_string(),
-            ));
+            // Unversioned pre-0.9 buffer: raw bincode of property -> value,
+            // no header byte and no per-property provenance. The version
+            // ranges are disjoint by construction, so this is a dispatch on
+            // the same single byte, not a parse probe: a failure below means
+            // a corrupt buffer, not format ambiguity. Loaded values carry
+            // LEGACY_EVENT_ID, and the next to_state_buffer rewrites the
+            // entity in the current versioned format.
+            let legacy_map = bincode::deserialize::<BTreeMap<PropertyName, Option<Value>>>(state_buffer).map_err(|e| {
+                crate::error::RetrievalError::Other(format!("failed to parse pre-0.9 legacy LWW state buffer: {e}"))
+            })?;
+            let map = legacy_map
+                .into_iter()
+                .map(|(k, value)| (k, ValueEntry::Committed { value, event_id: EventId::from_bytes(LEGACY_EVENT_ID) }))
+                .collect();
+            return Ok(Self { values: RwLock::new(map), field_broadcasts: Mutex::new(BTreeMap::new()) });
         }
         if version != LWW_STATE_VERSION_1 {
             return Err(crate::error::RetrievalError::Other(format!(
@@ -371,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn unversioned_pre_09_buffer_is_refused() {
+    fn unversioned_pre_09_buffer_loads_via_fallback_and_upgrades_on_save() {
         // Simulate a pre-0.9 buffer: raw bincode of property -> Option<Value>,
         // no header. Its first byte is the map length's low byte (here 0x01).
         let legacy: BTreeMap<PropertyName, Option<Value>> =
@@ -379,8 +400,36 @@ mod tests {
         let legacy_buffer = bincode::serialize(&legacy).unwrap();
         assert!(legacy_buffer[0] < LWW_STATE_VERSION_BASE);
 
-        let err = LWWBackend::from_state_buffer(&legacy_buffer).unwrap_err();
-        assert!(err.to_string().contains("pre-0.9"), "unexpected error: {err}");
+        let restored = LWWBackend::from_state_buffer(&legacy_buffer).unwrap();
+        assert_eq!(restored.get(&"title".to_string()), Some(Value::String("alpha".into())));
+        assert_eq!(restored.get_event_id(&"title".to_string()), Some(EventId::from_bytes(LEGACY_EVENT_ID)));
+
+        // Re-serialization writes the current versioned format: lazy upgrade.
+        let upgraded = restored.to_state_buffer().unwrap();
+        assert_eq!(upgraded[0], LWW_STATE_VERSION_1);
+        let round_tripped = LWWBackend::from_state_buffer(&upgraded).unwrap();
+        assert_eq!(round_tripped.get(&"title".to_string()), Some(Value::String("alpha".into())));
+        assert_eq!(round_tripped.get_event_id(&"title".to_string()), Some(EventId::from_bytes(LEGACY_EVENT_ID)));
+    }
+
+    #[test]
+    fn empty_legacy_buffer_loads_as_empty() {
+        // A pre-0.9 zero-property buffer is eight zero bytes; first byte 0x00.
+        let legacy: BTreeMap<PropertyName, Option<Value>> = BTreeMap::new();
+        let legacy_buffer = bincode::serialize(&legacy).unwrap();
+        assert_eq!(legacy_buffer[0], 0x00);
+
+        let restored = LWWBackend::from_state_buffer(&legacy_buffer).unwrap();
+        assert!(restored.properties().is_empty());
+    }
+
+    #[test]
+    fn corrupt_legacy_buffer_errors_clearly() {
+        // Low first byte dispatches to the legacy parser; garbage after that
+        // is corruption, and the error should say which parser rejected it.
+        let garbage = vec![0x03, 0xde, 0xad, 0xbe, 0xef];
+        let err = LWWBackend::from_state_buffer(&garbage).unwrap_err();
+        assert!(err.to_string().contains("legacy LWW state buffer"), "unexpected error: {err}");
     }
 
     #[test]
