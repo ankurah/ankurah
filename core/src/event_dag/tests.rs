@@ -2814,12 +2814,50 @@ mod comparison_property {
         }
     }
 
+    /// Base of the `dag_seed` range, overridable so a nightly or manual run can
+    /// shift the window without overlapping a prior run's coverage. Default
+    /// matches the historical hardcoded start (`1`) so ordinary test runs are
+    /// unchanged.
+    fn oracle_seed_base() -> u32 { std::env::var("ORACLE_SEED_BASE").ok().and_then(|s| s.parse().ok()).unwrap_or(1) }
+
+    /// Count of `dag_seed` values to run, overridable for the nightly high-seed
+    /// scale-out (100k+). Default matches the historical hardcoded count
+    /// (`300`) so ordinary test runs are unchanged.
+    fn oracle_seed_count() -> u32 { std::env::var("ORACLE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(300) }
+
+    /// The self-contained, one-line seeded-failure artifact. Everything needed
+    /// to reproduce the exact failing case from the log line alone: the
+    /// dag_seed (which deterministically regenerates the DAG and all four
+    /// subject/comparison pairs via the xorshift `Rng`), the mismatching
+    /// verdict, and the precise command to re-run just that seed. Format
+    /// mirrors C1's `SIMFAIL` line (space-separated `key=value` tokens, one
+    /// line, no wrapping).
+    fn artifact_line(
+        dag_seed: u32,
+        subject_ids: &[EventId],
+        comparison_ids: &[EventId],
+        expected: &Expected,
+        actual: &AbstractCausalRelation<EventId>,
+    ) -> String {
+        format!(
+            "ORACLEFAIL dag_seed={dag_seed} subject={subject_ids:?} comparison={comparison_ids:?} expected={expected:?} actual={actual:?} reproduce=\"ORACLE_SEED_BASE={dag_seed} ORACLE_SEEDS=1 cargo test -p ankurah-core --lib event_dag::tests::comparison_property::randomized_dags_match_reachability_oracle -- --exact --nocapture\""
+        )
+    }
+
     /// Randomized small DAGs (including extra genesis roots), random antichain
     /// clocks, machine verdict checked against the oracle. Clocks are built
     /// sorted since Clock does not yet normalize input order (C1).
+    ///
+    /// The `dag_seed` range is `ORACLE_SEED_BASE..(ORACLE_SEED_BASE +
+    /// ORACLE_SEEDS)`, defaulting to `1..=300` (unchanged from before these
+    /// env vars existed). The nightly scale-out (C2) sets `ORACLE_SEEDS` to
+    /// 100k+; a hit prints an `ORACLEFAIL` line (see `artifact_line`) before
+    /// panicking, so any divergence is reproducible from the log alone.
     #[tokio::test]
     async fn randomized_dags_match_reachability_oracle() {
-        for dag_seed in 1u32..=300 {
+        let seed_base = oracle_seed_base();
+        let seed_count = oracle_seed_count();
+        for dag_seed in seed_base..seed_base.saturating_add(seed_count) {
             let mut rng = Rng(dag_seed.wrapping_mul(0x9E37_79B9) | 1);
             let n_events = 5 + rng.below(6); // 5..=10
 
@@ -2866,13 +2904,32 @@ mod comparison_property {
                 let result = compare(retriever.clone(), &subject, &comparison, 4 * n_events).await.unwrap();
                 let expected = oracle(&parents_map, &subject_ids, &comparison_ids);
 
-                assert!(
-                    verdict_matches(&expected, &result.relation),
-                    "verdict mismatch\n  dag_seed={dag_seed}\n  subject={subject_ids:?}\n  comparison={comparison_ids:?}\n  expected={expected:?}\n  actual={:?}\n  dag={parents_map:#?}",
-                    result.relation
-                );
+                if !verdict_matches(&expected, &result.relation) {
+                    panic!("{}", artifact_line(dag_seed, &subject_ids, &comparison_ids, &expected, &result.relation));
+                }
             }
         }
+    }
+
+    #[test]
+    fn artifact_line_format_is_self_contained() {
+        let subject_ids = vec![];
+        let comparison_ids = vec![];
+        let expected = Expected::Disjoint;
+        let actual = AbstractCausalRelation::Equal;
+        let line = artifact_line(42, &subject_ids, &comparison_ids, &expected, &actual);
+
+        assert!(line.starts_with("ORACLEFAIL "), "artifact line must start with the ORACLEFAIL marker: {line}");
+        assert!(line.contains("dag_seed=42"), "artifact line must carry the exact dag_seed: {line}");
+        assert!(line.contains("expected=Disjoint"), "artifact line must carry the expected verdict: {line}");
+        assert!(line.contains("actual=Equal"), "artifact line must carry the actual verdict: {line}");
+        assert!(
+            line.contains(
+                "reproduce=\"ORACLE_SEED_BASE=42 ORACLE_SEEDS=1 cargo test -p ankurah-core --lib event_dag::tests::comparison_property::randomized_dags_match_reachability_oracle -- --exact --nocapture\""
+            ),
+            "artifact line must carry a copy-pasteable single-seed repro command: {line}"
+        );
+        assert!(!line.contains('\n'), "artifact line must be a single line: {line}");
     }
 }
 
