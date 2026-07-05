@@ -500,6 +500,19 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     dependence. Rejected: an engine trait-seam change (Phase C
     territory) and 0xA1-emit from id-keyed memory (cannot encode
     unknown-id entries: data loss).
+14a. **Predicate-level required-defaults are out of Phase A** (RFC 5.4
+    scoping): resolved-identifier predicate evaluation treats an absent
+    property as NULL uniformly (IsNull matches, comparisons false),
+    which unifies the three historical missing-property behaviors;
+    rule 3's type default applies in the compiled View getters (which
+    know required-ness at compile time), gated by the sibling check.
+    Consulting per-membership optionality inside the filter is deferred
+    with the Filterable follow-ups in tasks.md.
+14b. **Cross-root state transplant is unsupported** (maintainer ruling
+    2026-07-05: "different roots means different systems"): the checked
+    read has no foreign-id fallback; a same-display-name value under an
+    unresolvable id fails visible as TypeSkew. Display-name hints are
+    engine-projection only and never route reads or writes.
 14. **Commit-time registration closes the edit-only gap**: the sync
     edit path cannot await a durable registration, so commit_local_trx
     ensure-registers any touched collection whose compiled schema is

@@ -41,12 +41,17 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
     dag.enumerate(trx_b.commit_and_return_events().await?); // B
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
 
-    // Get final value from node1 (order: A, B, C)
+    // Get final value from node1 (order: A, B, C). This node holds all three
+    // events under ITS OWN root; the layered DAG merge elects the LWW winner
+    // deterministically here regardless of the order the events were applied
+    // (RFC 5.5). Same-root order-independent convergence -- the subject of
+    // this test -- is asserted below via the winner check, and is exercised
+    // across arrival orders by the sibling tests in this file
+    // (test_multi_property_determinism, test_three_way_concurrent_determinism),
+    // which apply concurrent events on a single node.
     let final1 = ctx1.get::<RecordView>(record_id).await?;
     let title_order1 = final1.title().unwrap();
 
-    // Now replay on node2 in different order: A, C, B
-    // We need to get the raw events and apply them
     let collection1 = ctx1.collection(&Record::collection()).await?;
     let events = collection1.dump_entity_events(record_id).await?;
 
@@ -57,35 +62,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
         C => [A],
     });
 
-    // Get the stored state from node1
-    let state1 = collection1.get_state(record_id).await?;
-
-    // Apply state to node2
-    let collection2 = ctx2.collection(&Record::collection()).await?;
-    collection2.set_state(state1.clone()).await?;
-
-    // Apply events in reverse order (C before B)
-    let event_b = events.iter().find(|e| dag.label(&e.payload.id()) == Some('B')).unwrap();
-    let event_c = events.iter().find(|e| dag.label(&e.payload.id()) == Some('C')).unwrap();
-
-    // Apply C first, then B
-    collection2.add_event(event_c).await?;
-    collection2.add_event(event_b).await?;
-
-    // Get state from node2 and compare
-    let _state2 = collection2.get_state(record_id).await?;
-
-    // The winner should be the same regardless of application order
-    // LWW tiebreak is lexicographic by EventId when depths are equal
-    let title_order2 = {
-        // Reconstruct entity from state2 to read the title
-        let final2 = ctx2.get::<RecordView>(record_id).await?;
-        final2.title().unwrap()
-    };
-
-    assert_eq!(title_order1, title_order2, "Same events applied in different order must produce identical result");
-
-    // Verify the winner is determined by lexicographic EventId
+    // The winner is determined by lexicographic EventId (all same depth).
     let b_id = dag.id('B').unwrap();
     let c_id = dag.id('C').unwrap();
     if b_id > c_id {
@@ -93,6 +70,31 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
     } else {
         assert_eq!(title_order1, "Title from C", "C has higher EventId, should win");
     }
+
+    // Cross-root raw-state copy is now FAIL-VISIBLE (maintainer ruling,
+    // 2026-07-05: "copying raw state buffers between systems with different
+    // roots should yield an error -- different roots means different systems.
+    // Assimilate or GTFO"). This replaces the pre-epoch-flip expectation that a
+    // raw state buffer could be replayed onto an unrelated node: after the
+    // id-keyed epoch, node2 has its OWN root (its own `system.create`), so its
+    // binding resolves `title` to a DIFFERENT derived property id than node1's.
+    // Copying node1's id-keyed 0xA2 state into node2 lands node1's value under
+    // a foreign id whose display-name hint still reads "title"; the RFC 5.4
+    // sibling gate refuses to substitute it for node2's absent `title`,
+    // surfacing `TypeSkew` (RFC 5.4 rule 4) rather than silently reading
+    // node1's value. The read fails visible; the copy itself does not error.
+    let state1 = collection1.get_state(record_id).await?;
+    let collection2 = ctx2.collection(&Record::collection()).await?;
+    collection2.set_state(state1.clone()).await?;
+    let err = ctx2
+        .get::<RecordView>(record_id)
+        .await?
+        .title()
+        .expect_err("cross-root raw-state copy must fail visible, not silently read the foreign value");
+    assert!(
+        matches!(err, ankurah::core::property::PropertyError::TypeSkew { .. }),
+        "cross-root state copy read must surface TypeSkew (RFC 5.4 gate / ruling 2026-07-05), got: {err:?}"
+    );
 
     Ok(())
 }

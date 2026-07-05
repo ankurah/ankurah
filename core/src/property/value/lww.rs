@@ -38,12 +38,37 @@ impl<T: Property> LWW<T> {
         Ok(())
     }
 
+    /// Project the property under the RFC 5.4 read rules (the #175 fix):
+    ///   - present -> the value;
+    ///   - absent + REQUIRED (a defaulting value type, e.g. `String`/`i64`) ->
+    ///     the type default via [`Property::absent_default`];
+    ///   - absent + OPTIONAL (`Option<T>`) -> `None`, because the projected
+    ///     type is `Option<T>` and its `absent_default` is `None`, so the inner
+    ///     default never fires;
+    ///   - absent + no fabricable default (`EntityId`/`Ref<T>`, derived enums)
+    ///     -> `PropertyError::Missing` (or `None` under an `Option`).
+    /// The read is gated: a same-display-name retype sibling holding data
+    /// surfaces `PropertyError::TypeSkew` instead of any of the above
+    /// (`LWWBackend::get_checked`).
     pub fn get(&self) -> Result<T, PropertyError> {
-        let value = self.get_value();
-        T::from_value(value)
+        match self.get_checked_value()? {
+            Some(value) => T::from_value(Some(value)),
+            // Absent (and no skew): feed the type's required-absent default to
+            // `from_value`. `None` -> `from_value(None)` keeps today's meaning
+            // (Missing for a required scalar, None for an Option).
+            None => T::from_value(T::absent_default()),
+        }
     }
 
+    /// The raw stored value via the LENIENT backend read (no sibling gate, no
+    /// default). Retained for callers that want the backend's stored value as
+    /// is; the compiled projection uses [`get`] / [`get_checked_value`].
     pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property_name) }
+
+    /// The stored value under the RFC 5.4 sibling gate: `Ok(Some)` present,
+    /// `Ok(None)` absent, `Err(TypeSkew)` when a retype lineage holds data
+    /// here (delegates to [`LWWBackend::get_checked`]).
+    pub fn get_checked_value(&self) -> Result<Option<Value>, PropertyError> { self.backend.get_checked(&self.property_name) }
 }
 
 impl<T: Property> FromEntity for LWW<T> {
@@ -53,6 +78,14 @@ impl<T: Property> FromEntity for LWW<T> {
     }
 }
 
+// One generic projection covers every LWW-backed field, because LWW's
+// projected type is OPEN (any `Property`: scalars, `Option<_>`, `Json`,
+// `Ref<T>`, derived enums), so it cannot enumerate concrete impls the way
+// `YrsString`'s closed set does. The RFC 5.4 read rules are threaded through
+// `LWW::get` -> `get_checked` -> `Property::absent_default` instead: the
+// required-vs-optional-vs-default decision is keyed on the projected type, and
+// the sibling gate rides along uniformly (so `TypeSkew` propagates for every
+// projection, per the A10 spec).
 impl<T: Property> FromActiveType<LWW<T>> for T {
     fn from_active(active: LWW<T>) -> Result<Self, PropertyError>
     where Self: Sized {

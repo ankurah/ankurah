@@ -567,6 +567,38 @@ impl Filterable for Entity {
             state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
         }
     }
+
+    /// Checked read for RESOLVED-identifier predicate evaluation (RFC 5.4).
+    /// Consults the LWW backend's `get_checked` FIRST -- so a same-display-name
+    /// retype lineage sitting on this entity fails visible (`TypeSkew`) instead
+    /// of evaluating as a silent NULL -- then falls back to the other backends
+    /// (yrs etc.) via the lenient `property_value`. The sibling gate is
+    /// LWW-vs-LWW only; yrs-vs-LWW same-name conflicts are pre-existing
+    /// pathology out of scope for the Phase A gate (A10 spec scope note).
+    fn value_checked(&self, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
+        if name == "id" {
+            return Ok(Some(Value::EntityId(self.id)));
+        }
+        let state = self.state.read().expect("other thread panicked, panic here too");
+        let lww_name = crate::property::backend::LWWBackend::property_backend_name();
+        // LWW backend first, through the gate. A `TypeSkew` here is a real
+        // cross-lineage collision and must propagate, not be masked by a later
+        // backend's lenient read. Absent (and not skewed): fall through to the
+        // other backends before concluding NULL.
+        if let Some(backend) = state.backends.get(lww_name) {
+            if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
+                if let Some(value) = lww.get_checked(&name.to_owned())? {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        // Non-LWW backends (yrs, pn_counter): lenient read, no gate.
+        Ok(state
+            .backends
+            .iter()
+            .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
+            .find_map(|(_, backend)| backend.property_value(&name.to_owned())))
+    }
 }
 
 impl TemporaryEntity {
@@ -605,6 +637,35 @@ impl Filterable for TemporaryEntity {
             let state = self.0.state.read().expect("other thread panicked, panic here too");
             state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
         }
+    }
+
+    /// Checked read for RESOLVED-identifier predicate evaluation (RFC 5.4),
+    /// mirroring [`Entity::value_checked`]: the LWW backend's `get_checked`
+    /// first (so a same-display-name retype lineage fails visible `TypeSkew`
+    /// rather than evaluating as a silent NULL), then the other backends via
+    /// the lenient `property_value`. Materialized `TemporaryEntity`s parse
+    /// their backends UNBOUND, so the gate there scans the bare Name key and
+    /// the decode-time hints, exactly as the storage-engine read path needs.
+    fn value_checked(&self, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
+        if name == "id" {
+            return Ok(Some(Value::EntityId(self.0.id)));
+        }
+        let state = self.0.state.read().expect("other thread panicked, panic here too");
+        let lww_name = crate::property::backend::LWWBackend::property_backend_name();
+        // LWW backend first, through the gate; a `TypeSkew` here propagates.
+        if let Some(backend) = state.backends.get(lww_name) {
+            if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
+                if let Some(value) = lww.get_checked(&name.to_owned())? {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        // Non-LWW backends (yrs, pn_counter): lenient read, no gate.
+        Ok(state
+            .backends
+            .iter()
+            .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
+            .find_map(|(_, backend)| backend.property_value(&name.to_owned())))
     }
 }
 

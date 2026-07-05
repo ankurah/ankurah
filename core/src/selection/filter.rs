@@ -1,6 +1,7 @@
 //! Filter items based on a predicate. This is necessary for cases where we are scanning over a set of data
 //! which has not been pre-filtered by an index search - or to supplement/validate an index search with additional filtering.
 
+use crate::property::PropertyError;
 use crate::value::Value;
 use ankql::ast::{ComparisonOperator, Expr, Identifier, Predicate};
 use thiserror::Error;
@@ -15,6 +16,18 @@ pub enum Error {
     UnsupportedExpression(&'static str),
     #[error("Unsupported operator: {0}")]
     UnsupportedOperator(&'static str),
+    /// A checked property read hit the RFC 5.4 sibling gate: a same-display-
+    /// name retype lineage holds data on this item, so the read is fail-visible
+    /// (a `TypeSkew` from `Filterable::value_checked`) rather than a silent
+    /// NULL. Predicate evaluation surfaces it as an error, so the offending
+    /// item is reported (`FilterResult::Error`) instead of silently
+    /// matching/not-matching.
+    #[error("property read error: {0}")]
+    PropertyRead(String),
+}
+
+impl From<PropertyError> for Error {
+    fn from(e: PropertyError) -> Self { Error::PropertyRead(e.to_string()) }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +63,17 @@ impl ExprOutput<Value> {
 pub trait Filterable {
     fn collection(&self) -> &str;
     fn value(&self, name: &str) -> Option<Value>;
+
+    /// Read a property under the RFC 5.4 sibling gate for RESOLVED-identifier
+    /// evaluation. `Ok(Some)` = present, `Ok(None)` = absent (evaluated as NULL
+    /// by the caller), `Err` = a checked-read failure such as `TypeSkew` (a
+    /// same-display-name retype lineage holds data), surfaced as an evaluation
+    /// error rather than a silent NULL.
+    ///
+    /// The default delegates to the lenient [`value`], so mock/test items and
+    /// non-entity `Filterable`s are unaffected. `Entity` overrides it to route
+    /// the checked lookup through the LWW backend's `get_checked`.
+    fn value_checked(&self, name: &str) -> Result<Option<Value>, PropertyError> { Ok(self.value(name)) }
 }
 
 fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Value>, Error> {
@@ -85,11 +109,30 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
 fn evaluate_identifier<I: Filterable>(item: &I, identifier: &Identifier) -> Result<ExprOutput<Value>, Error> {
     let name = identifier.property_name();
     if identifier.is_simple() {
-        // Bare column reference: value(name) only.
-        return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
+        // Bare column reference. RFC 5.4: a RESOLVED identifier that the item
+        // does not hold evaluates as NULL (IsNull matches, comparisons are
+        // false) instead of erroring PropertyNotFound -- this unifies the three
+        // historical missing-property behaviors (filter hard-error, reactor
+        // unwrap_or(false), SQL assume_null). The read is CHECKED, so a
+        // same-display-name retype sibling holding data surfaces as an
+        // evaluation error (`TypeSkew`) rather than a silent NULL.
+        return Ok(match item.value_checked(name)? {
+            Some(value) => ExprOutput::Value(value),
+            None => ExprOutput::None,
+        });
     }
-    // A JSON sub-path: fetch the property then traverse into it.
-    evaluate_sub_path(item, name, &identifier.subpath)
+    // A JSON sub-path on a resolved identifier: fetch the base property
+    // (checked, so TypeSkew propagates), then traverse into it. An absent base
+    // is NULL (consistent with the bare case), never PropertyNotFound.
+    let Some(base) = item.value_checked(name)? else {
+        return Ok(ExprOutput::None);
+    };
+    match base.extract_at_path(&identifier.subpath) {
+        Some(value) => Ok(ExprOutput::Value(value)),
+        // Present base, but the sub-path is absent within it: NULL, matching
+        // the absent-as-NULL rule for resolved references.
+        None => Ok(ExprOutput::None),
+    }
 }
 
 /// Evaluate a sequence of path steps (as produced by `PathExpr::steps`)

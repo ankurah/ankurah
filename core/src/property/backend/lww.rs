@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{MutationError, StateError},
     event_dag::{CausalRelation, EventLayer},
-    property::{backend::PropertyBackend, PropertyName, Value},
+    property::{backend::PropertyBackend, traits::PropertyError, PropertyName, Value},
 };
 
 const LWW_DIFF_VERSION: u8 = 1;
@@ -245,17 +245,17 @@ impl LWWBackend {
     pub fn set_wire_mode(&self, mode: WireMode) { *self.wire_mode.write().unwrap() = mode; }
 
     /// Resolve a display name to the key it should be stored/looked-up under:
-    /// `Id` when the binding knows the name; else the id whose decode-time
-    /// HINT matches the name (so an UNBOUND backend loaded from a 0xA2 buffer
-    /// still addresses its id-keyed entries by name -- View accessors, `set`
-    /// rewrites, and `get_event_id` all route here); else `Name`.
+    /// the binding's `Id` when it knows the name, else the bare `Name` key.
+    ///
+    /// Hints do NOT route here (RFC 5.4 ruling, 2026-07-05): reads/writes of a
+    /// name land on the binding id or the bare Name key, nothing else. A hint
+    /// is a PROJECTION aid only (it lets `property_values`/`properties`/
+    /// broadcasts on an UNBOUND backend name id-keyed entries loaded from a
+    /// 0xA2 buffer); it never addresses a name onto a foreign id, because
+    /// keying a write off a decode-time hint would let one system's raw state
+    /// masquerade as another's ("different roots means different systems").
     fn key_for_name(&self, name: &str) -> PropertyKey {
         if let Some(id) = self.binding.read().unwrap().as_ref().and_then(|b| b.to_id.get(name).copied()) {
-            return PropertyKey::Id(id);
-        }
-        // Reverse-scan the hints (id -> name) for a matching display name. The
-        // binding always wins above; hints only cover ids a binding cannot.
-        if let Some(id) = self.hints.read().unwrap().iter().find_map(|(id, n)| (n == name).then_some(*id)) {
             return PropertyKey::Id(id);
         }
         PropertyKey::Name(name.to_string())
@@ -269,36 +269,93 @@ impl LWWBackend {
 
     pub fn get(&self, property_name: &PropertyName) -> Option<Value> { self.lookup_entry(property_name).and_then(|e| e.value()) }
 
-    /// Find the stored entry for a display name, trying every key it could
-    /// live under (RFC 5.5 read fallback), in priority order:
-    ///   1. the id the binding/hint maps the name to ([`key_for_name`]);
-    ///   2. the bare Name key (legacy residue not yet migrated);
-    ///   3. any id whose decode-time HINT is this name -- so a value stored
-    ///      under a FOREIGN id (e.g. a state produced under a different system
-    ///      root, or before a rename) is still readable by its display name.
+    /// Read a property under the RFC 5.4 sibling gate (rule 4). Unlike the
+    /// lenient [`get`], this fails VISIBLE when a same-display-name retype
+    /// lineage holds data that the binding-resolved id does not, so the
+    /// checked read never silently substitutes a sibling's value (or, upstream
+    /// in the View getter / predicate evaluation, fabricates a default over
+    /// it). Used by the compiled View getters and by filter evaluation.
+    ///
+    /// The gate is answerable inside the backend because id-keyed writes from
+    /// ANY contract stamp a display-name hint, so a foreign lineage's value is
+    /// visible here (RFC 5.4 rule 4; the A10 spec's gate section).
+    ///
+    /// Two regimes, after the cross-root-transplant ruling (2026-07-05):
+    /// - The binding RESOLVES `name` to id A.
+    ///   - A holds a value -> `Ok(Some)`.
+    ///   - A is absent: scan for ANY OTHER `Id` key that holds data and whose
+    ///     display name (binding reverse map, else decode-time hint) equals
+    ///     `name`. A match is a retype lineage sitting on this entity (or a
+    ///     foreign-root state copied in) -> `Err(TypeSkew)` naming both ids.
+    ///     This is where a cross-root state copy fails visible: the foreign id
+    ///     does not equal A, but its hint names the same display name, so the
+    ///     read refuses rather than substituting the foreign value.
+    ///   - No skewing sibling: check the bare `Name` key (legacy residue not
+    ///     yet migrated onto A) -> `Ok(Some/None)`.
+    /// - The binding does NOT resolve `name` (no contract knowledge of it):
+    ///   there is no id A to skew against and no contract that owns the name,
+    ///   so read ONLY the bare `Name` key -> `Ok(Some/None)`. There is
+    ///   deliberately no cross-id scan without a contract: an unbound backend
+    ///   never routes a name onto a foreign id (RFC 5.4 ruling).
+    pub fn get_checked(&self, property_name: &PropertyName) -> Result<Option<Value>, PropertyError> {
+        let values = self.values.read().unwrap();
+        let binding = self.binding.read().unwrap();
+
+        let Some(resolved_id) = binding.as_ref().and_then(|b| b.to_id.get(property_name).copied()) else {
+            // No binding knowledge of this name: read only the bare Name key.
+            return Ok(values.get(&PropertyKey::Name(property_name.clone())).and_then(|e| e.value()));
+        };
+
+        // The binding-resolved id holds a value -> return it directly.
+        if let Some(value) = values.get(&PropertyKey::Id(resolved_id)).and_then(|e| e.value()) {
+            return Ok(Some(value));
+        }
+
+        // Absent under the resolved id: scan for a same-display-name sibling
+        // (a DIFFERENT id key that holds data). Its display name comes from the
+        // binding reverse map first, else the decode-time hint.
+        let hints = self.hints.read().unwrap();
+        for (key, entry) in values.iter() {
+            let PropertyKey::Id(id) = key else { continue };
+            if *id == resolved_id {
+                continue;
+            }
+            if entry.value().is_none() {
+                continue;
+            }
+            let sibling_name = binding.as_ref().and_then(|b| b.to_name.get(id).cloned()).or_else(|| hints.get(id).cloned());
+            if sibling_name.as_deref() == Some(property_name.as_str()) {
+                return Err(PropertyError::TypeSkew { name: property_name.clone(), a: resolved_id.to_base64(), b: id.to_base64() });
+            }
+        }
+
+        // No skewing sibling: the value may still live under the bare Name key
+        // (legacy residue the binding has not migrated onto the id yet).
+        Ok(values.get(&PropertyKey::Name(property_name.clone())).and_then(|e| e.value()))
+    }
+
+    /// Find the stored entry for a display name, in priority order:
+    ///   1. the id the BINDING maps the name to ([`key_for_name`]);
+    ///   2. the bare Name key (legacy residue not yet migrated).
     /// Shared by `get` and `get_event_id` so both resolve identically.
+    ///
+    /// There is deliberately NO foreign-id-by-hint fallback (RFC 5.4 ruling,
+    /// 2026-07-05): a value stored under an id the binding does not resolve is
+    /// NOT readable by this name. Copying raw state buffers between systems
+    /// with different roots yields foreign ids that never match a local
+    /// binding, and the ruling makes that fail-visible (via `get_checked`'s
+    /// sibling gate) rather than silently substituting the foreign value here.
     fn lookup_entry(&self, property_name: &PropertyName) -> Option<ValueEntry> {
         let values = self.values.read().unwrap();
         let key = self.key_for_name(property_name);
         if let Some(entry) = values.get(&key) {
             return Some(entry.clone());
         }
-        // key_for_name may have returned an id (binding/hint) that has no entry;
-        // try the bare name next.
+        // key_for_name may have returned a binding id that has no entry; try
+        // the bare name next (legacy residue).
         if !matches!(key, PropertyKey::Name(_)) {
             if let Some(entry) = values.get(&PropertyKey::Name(property_name.clone())) {
                 return Some(entry.clone());
-            }
-        }
-        // Last resort: a value under a foreign id carrying this display-name
-        // hint (cross-root / pre-rename state). The binding wins above, so this
-        // only fires when no bound/named key held the value.
-        let hints = self.hints.read().unwrap();
-        for (id, name) in hints.iter() {
-            if name == property_name {
-                if let Some(entry) = values.get(&PropertyKey::Id(*id)) {
-                    return Some(entry.clone());
-                }
             }
         }
         None
@@ -756,8 +813,8 @@ impl LWWBackend {
     }
 
     /// Get the event_id that last wrote a property value (if tracked).
-    /// Resolves the name to its key the same way `get` does (binding/hint id,
-    /// then name, then foreign-id-by-hint).
+    /// Resolves the name to its key the same way `get` does (binding id, then
+    /// bare name).
     pub fn get_event_id(&self, property_name: &PropertyName) -> Option<EventId> {
         self.lookup_entry(property_name).and_then(|e| e.event_id())
     }

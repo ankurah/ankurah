@@ -168,16 +168,27 @@ DONE: PR #306; decision record posted on #294.
 
 ## 7. Read-path rules (#175 fix)
 
-- [ ] Rule ladder with membership-sourced optionality
-      (optional-on-ambiguity; contract in play); View getters keep
-      compiled optionality.
-- [ ] Cross-contract sibling gate -> PropertyError::TypeSkew naming
-      both ids; test with retype lineages from two contracts.
-- [ ] Type defaults for required-absent scalars; entityid exception
-      stays Missing.
-- [ ] Zero-op creation events; un-ignore
-      tests/tests/yrs_backend.rs:303-332; integration: create with
-      empty string, reload, read back "".
+- [x] Rule ladder: View getters keep compiled optionality
+      (Property::absent_default keyed on the projected type, so
+      Option<T> short-circuits ahead of the required default);
+      predicate evaluation of resolved identifiers treats absent as
+      NULL (IsNull matches, comparisons false), unifying the three
+      historical behaviors. Predicate-level membership-sourced
+      required-defaults are deliberately OUT of Phase A (plan decision
+      15).
+- [x] Cross-contract sibling gate (LWWBackend::get_checked) ->
+      PropertyError::TypeSkew naming both ids, from the View getter AND
+      filter evaluation; the lenient foreign-id-by-hint fallback is
+      REMOVED per the cross-root ruling (2026-07-05: different roots
+      are different systems; transplants fail visible); hints are
+      engine-projection only (tests/tests/read_rules.rs).
+- [x] Type defaults for required-absent scalars ("", 0, 0.0, false,
+      empty binary, Json null); entityid/Ref and custom Property types
+      keep Missing (no fabricable default).
+- [x] Zero-op creation events; un-ignored
+      tests/tests/yrs_backend.rs (test_sequential_text_operations);
+      integration: create with empty string, reload, read back ""
+      (landed earlier with the #175 commit; boxes consolidated here).
 
 ## 8. Derive macro, attributes, lifecycle glue
 
@@ -225,3 +236,12 @@ DONE: PR #306; decision record posted on #294.
 - sled property_config rekey; postgres/sqlite catalog-bound columns,
   rename DDL, collision suffixes; IndexedDB re-materialization; seam
   cleanliness per RFC 4a.
+- Stored-form transform layer (maintainer direction, 2026-07-05):
+  design a storage-boundary translation that lets state buffers be
+  STORED with cheap engine-local property ids (offsets/u32s) and
+  transformed to full property EntityIds at the wire/memory boundary,
+  mirroring the injected encryptor/decryptor seam the future E2EE phase
+  needs for values. This subsumes and removes Phase A's 0xA2
+  display-name hints AND shrinks the stored 16-byte ids. Events are
+  exempt by nature (hashed identity: full ids forever). Design it once
+  with the E2EE transform seam in view.
