@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::error::RetrievalError;
-use crate::event_dag::accumulator::EventLayer;
+use crate::event_dag::EventLayer;
 use crate::property::backend::lww::LWWBackend;
 use crate::property::backend::PropertyBackend;
 use crate::retrieval::GetEvents;

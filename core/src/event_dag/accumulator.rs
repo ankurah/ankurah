@@ -1,21 +1,20 @@
-//! Event accumulator for DAG traversal and layer computation.
+//! Event accumulator for the comparison-phase BFS.
 //!
-//! Provides `EventAccumulator` which collects DAG structure during comparison BFS,
-//! and `EventLayers` which computes concurrency layers from the accumulated DAG.
+//! Provides `EventAccumulator`, which collects DAG structure during the
+//! backward comparison traversal and offers read-through event caching, plus
+//! the pure DAG-walk helpers shared with the layer machinery. The forward,
+//! apply-phase view (`EventLayers` / `EventLayer`) lives in `layers`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use lru::LruCache;
 
 use crate::error::RetrievalError;
+use crate::event_dag::layers::EventLayers;
 use crate::event_dag::relation::AbstractCausalRelation;
 use crate::retrieval::GetEvents;
 use ankurah_proto::{Event, EventId};
-
-// Re-export CausalRelation from layers (same enum, avoid duplication)
-pub(crate) use super::layers::CausalRelation;
 
 /// Accumulates event DAG structure during comparison and provides
 /// read-through caching for event retrieval during layer iteration.
@@ -101,167 +100,6 @@ impl<E: GetEvents> ComparisonResult<E> {
     pub(crate) fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<E>) { (self.relation, self.accumulator) }
 }
 
-// ---- EventLayers: async layer iterator ----
-
-/// Async iterator over EventLayer for merge application.
-/// Computes layers lazily using forward expansion from the meet point.
-/// Pre-builds a parent->children index at construction for O(1) lookups.
-pub(crate) struct EventLayers<E: GetEvents> {
-    accumulator: EventAccumulator<E>,
-    current_head_ancestry: BTreeSet<EventId>,
-
-    /// Parent->children index, built once at construction: O(N)
-    children_index: BTreeMap<EventId, Vec<EventId>>,
-
-    /// Shared DAG structure reference, passed to each yielded EventLayer
-    dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
-
-    // Iteration state
-    processed: BTreeSet<EventId>,
-    frontier: BTreeSet<EventId>,
-}
-
-impl<E: GetEvents> EventLayers<E> {
-    fn new(accumulator: EventAccumulator<E>, meet: Vec<EventId>, current_head: Vec<EventId>) -> Self {
-        // Build parent->children index from accumulated DAG: O(N)
-        let mut children_index: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
-        for (id, parents) in &accumulator.dag {
-            for parent in parents {
-                children_index.entry(parent.clone()).or_default().push(id.clone());
-            }
-        }
-
-        // Compute current head ancestry for partitioning.
-        let current_head_ancestry = compute_ancestry_from_dag(&accumulator.dag, &current_head);
-
-        // Snapshot the DAG structure into an Arc for sharing with EventLayers
-        let dag = Arc::new(accumulator.dag.clone());
-
-        // Initialize frontier: all events in the DAG whose in-DAG parents are
-        // all processed. This is a generalized topological-sort seed.
-        let processed: BTreeSet<EventId> = meet.iter().cloned().collect();
-        let frontier: BTreeSet<EventId> = accumulator
-            .dag
-            .keys()
-            .filter(|id| !processed.contains(*id))
-            .filter(|id| {
-                accumulator
-                    .dag
-                    .get(*id)
-                    .map(|ps| ps.iter().all(|p| processed.contains(p) || !accumulator.dag.contains_key(p)))
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-
-        Self { accumulator, current_head_ancestry, children_index, dag, processed, frontier }
-    }
-
-    /// Get next layer (async -- may fetch events from storage via accumulator).
-    /// Returns layers in topological order (earliest first).
-    pub(crate) async fn next(&mut self) -> Result<Option<EventLayer>, RetrievalError> {
-        if self.frontier.is_empty() {
-            return Ok(None);
-        }
-
-        let mut to_apply = Vec::new();
-        let mut already_applied = Vec::new();
-        let layer_frontier: Vec<EventId> = std::mem::take(&mut self.frontier).into_iter().collect();
-
-        for id in &layer_frontier {
-            if self.processed.contains(id) {
-                continue;
-            }
-            self.processed.insert(id.clone());
-
-            // Events are already in storage (eager storage model)
-            let event = self.accumulator.get_event(id).await?;
-
-            // Partition based on whether already in local head ancestry
-            if self.current_head_ancestry.contains(id) {
-                already_applied.push(event);
-            } else {
-                to_apply.push(event);
-            }
-        }
-
-        // Advance to next frontier
-        let mut next_frontier = BTreeSet::new();
-        for id in &layer_frontier {
-            if let Some(children) = self.children_index.get(id) {
-                for child in children {
-                    if !self.processed.contains(child) && !next_frontier.contains(child) {
-                        let all_parents_done = self
-                            .accumulator
-                            .dag
-                            .get(child)
-                            .map(|ps| ps.iter().all(|p| self.processed.contains(p) || !self.accumulator.dag.contains_key(p)))
-                            .unwrap_or(false);
-                        if all_parents_done {
-                            next_frontier.insert(child.clone());
-                        }
-                    }
-                }
-            }
-        }
-        self.frontier = next_frontier;
-
-        if to_apply.is_empty() && already_applied.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(EventLayer { to_apply, already_applied, dag: Arc::clone(&self.dag) }))
-    }
-}
-
-// ---- New EventLayer with DAG structure ----
-
-/// A layer of concurrent events for unified backend application.
-///
-/// This is the new EventLayer that carries DAG structure (parent pointers only)
-/// rather than full event clones. The `compare()` method is infallible since
-/// it only traverses parent pointers, treating missing entries as dead ends.
-///
-/// `pub` only so `PropertyBackend::apply_layer` (a public trait method) has a
-/// reachable parameter type; its constructor and accessors remain
-/// crate-internal while the external backend API surface is designed
-/// (ankurah#267).
-#[derive(Debug, Clone)]
-pub struct EventLayer {
-    pub(crate) already_applied: Vec<Event>,
-    pub(crate) to_apply: Vec<Event>,
-    /// Shared DAG structure for causal comparison: event_id -> parent_ids.
-    dag: Arc<BTreeMap<EventId, Vec<EventId>>>,
-}
-
-impl EventLayer {
-    /// Create a new EventLayer with the given events and DAG structure.
-    pub(crate) fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag: Arc<BTreeMap<EventId, Vec<EventId>>>) -> Self {
-        Self { already_applied, to_apply, dag }
-    }
-
-    /// Check whether an event_id is present in the accumulated DAG.
-    /// Used by LWW to implement the "older than meet" rule.
-    pub(crate) fn dag_contains(&self, id: &EventId) -> bool { self.dag.contains_key(id) }
-
-    /// Compare two event IDs using accumulated DAG context.
-    ///
-    /// Returns the causal relation between `a` and `b`. Missing entries
-    /// are treated as dead ends (below the meet), not errors.
-    pub(crate) fn compare(&self, a: &EventId, b: &EventId) -> CausalRelation {
-        if a == b {
-            return CausalRelation::Descends;
-        }
-        if is_descendant_dag(&self.dag, a, b) {
-            return CausalRelation::Descends;
-        }
-        if is_descendant_dag(&self.dag, b, a) {
-            return CausalRelation::Ascends;
-        }
-        CausalRelation::Concurrent
-    }
-}
-
 // ---- Helper functions ----
 
 /// Compute ancestry set by walking backward through DAG parent pointers.
@@ -313,7 +151,7 @@ mod tests {
     use super::*;
 
     // We can't easily test EventAccumulator with a real GetEvents impl in unit tests,
-    // but we can test the helper functions and EventLayer::compare.
+    // but we can test the helper functions. EventLayer::compare is tested in `layers`.
 
     #[test]
     fn test_compute_ancestry_from_dag() {
@@ -360,42 +198,5 @@ mod tests {
         assert!(is_descendant_dag(&dag, &c, &b)); // C descends from B
         assert!(!is_descendant_dag(&dag, &a, &c)); // A does not descend from C
         assert!(!is_descendant_dag(&dag, &b, &c)); // B does not descend from C
-    }
-
-    #[test]
-    fn test_event_layer_compare() {
-        // DAG: A <- B, A <- C (B and C are concurrent)
-        let mut dag = BTreeMap::new();
-        let a = EventId::from_bytes([1; 32]);
-        let b = EventId::from_bytes([2; 32]);
-        let c = EventId::from_bytes([3; 32]);
-
-        dag.insert(a.clone(), vec![]);
-        dag.insert(b.clone(), vec![a.clone()]);
-        dag.insert(c.clone(), vec![a.clone()]);
-
-        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
-
-        assert_eq!(layer.compare(&b, &a), CausalRelation::Descends);
-        assert_eq!(layer.compare(&a, &b), CausalRelation::Ascends);
-        assert_eq!(layer.compare(&b, &c), CausalRelation::Concurrent);
-        assert_eq!(layer.compare(&a, &a), CausalRelation::Descends); // same = Descends
-    }
-
-    #[test]
-    fn test_event_layer_dag_contains() {
-        let mut dag = BTreeMap::new();
-        let a = EventId::from_bytes([1; 32]);
-        let b = EventId::from_bytes([2; 32]);
-        let c = EventId::from_bytes([3; 32]);
-
-        dag.insert(a.clone(), vec![]);
-        dag.insert(b.clone(), vec![a.clone()]);
-
-        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag: Arc::new(dag) };
-
-        assert!(layer.dag_contains(&a));
-        assert!(layer.dag_contains(&b));
-        assert!(!layer.dag_contains(&c)); // not in DAG
     }
 }
