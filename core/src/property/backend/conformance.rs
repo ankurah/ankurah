@@ -80,7 +80,7 @@ use std::sync::Arc;
 
 use ankurah_proto::{Clock, EntityId, Event, EventId, Operation, OperationSet};
 
-use crate::event_dag::accumulator::EventLayer;
+use crate::event_dag::EventLayer;
 use crate::property::backend::PropertyBackend;
 
 /// The property backend under test, described for the conformance kit.
@@ -420,7 +420,7 @@ fn rotations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
 
 mod lww_conformance {
     use super::*;
-    use crate::event_dag::accumulator::CausalRelation;
+    use crate::event_dag::CausalRelation;
     use crate::property::backend::lww::LWWBackend;
     use crate::value::Value;
 
