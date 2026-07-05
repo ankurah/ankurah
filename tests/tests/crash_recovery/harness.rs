@@ -265,6 +265,17 @@ pub fn handoff_write(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Durably record a full attested event under `key` so the parent can
+/// re-deliver the identical event after reopen (modelling "the peer that sent
+/// the batch re-sends it"). Events are content-addressed, so a re-delivered
+/// event keeps its original id. Encoded as base64(bincode) on one line.
+pub fn handoff_write_event(key: &str, event: &Attested<Event>) -> Result<()> {
+    use base64::Engine as _;
+    let bytes = bincode::serialize(event)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    handoff_write(key, &b64)
+}
+
 /// Parse the handoff file the child produced into key -> values (a key may
 /// repeat). Missing file yields an empty map.
 pub fn handoff_read(path: &Path) -> std::collections::HashMap<String, Vec<String>> {
@@ -298,6 +309,20 @@ impl ChildOutcome {
     /// All values the child recorded for `key`, parsed as [`EventId`]s.
     pub fn event_ids(&self, key: &str) -> Vec<EventId> {
         self.handoff.get(key).map(|vs| vs.iter().filter_map(|s| EventId::from_base64(s.trim()).ok()).collect()).unwrap_or_default()
+    }
+
+    /// All full attested events the child recorded under `key`, in write order.
+    pub fn events(&self, key: &str) -> Vec<Attested<Event>> {
+        use base64::Engine as _;
+        self.handoff
+            .get(key)
+            .map(|vs| {
+                vs.iter()
+                    .filter_map(|s| base64::engine::general_purpose::STANDARD.decode(s.trim()).ok())
+                    .filter_map(|bytes| bincode::deserialize::<Attested<Event>>(&bytes).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
