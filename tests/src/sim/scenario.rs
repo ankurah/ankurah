@@ -84,6 +84,15 @@ impl<'a> Workload<'a> {
     /// concurrent edits deliberately).
     pub fn head_of(&self, entity: proto::EntityId) -> Option<proto::Clock> { self.heads.get(&entity).cloned() }
 
+    /// Drive the scheduler to quiescence mid-workload, so every node has
+    /// received everything committed so far. Use this before issuing concurrent
+    /// edits from multiple origins: a node can only edit an entity it holds, so
+    /// the base state must have reached those origins first. The concurrency is
+    /// still genuine (the concurrent edits do not observe one another until the
+    /// next drain), and faults still perturb their propagation. Faults during a
+    /// mid-workload settle are healed at its barrier, exactly as at the end.
+    pub async fn settle(&mut self) { self.scheduler.run_to_quiescence(self.nodes, self.rng, self.trace).await; }
+
     /// Deliver a raw, harness-constructed subscription-update batch from
     /// `origin` to `dst` through the scheduler. This is the seam scenarios use
     /// to reproduce the V4 (adversarial bridge order) and V6 (unknown-entity
@@ -158,6 +167,10 @@ pub struct SimOutcome {
     /// Full canonical trace text, retained for post-mortem inspection when an
     /// invariant fails.
     pub trace_text: String,
+    /// Largest head-clock length seen at quiescence. `>= 2` proves the run
+    /// produced a genuine multi-head, so the antichain invariant was exercised
+    /// non-trivially.
+    pub max_head_len: usize,
 }
 
 impl SimOutcome {
@@ -257,6 +270,7 @@ where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
 
         let universe = ExpectedUniverse { created };
         let violations = invariants::check_all(&nodes, &universe).await;
+        let max_head_len = invariants::max_head_len(&nodes, &universe).await;
 
         SimOutcome {
             seed,
@@ -266,6 +280,7 @@ where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
             trace_len: trace.len(),
             violations,
             trace_text: trace.canonical(),
+            max_head_len,
         }
     })
 }

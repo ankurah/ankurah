@@ -207,3 +207,20 @@ pub async fn check_all(nodes: &[SimNode], universe: &ExpectedUniverse) -> Vec<Vi
     violations.extend(check_head_antichain(nodes, universe).await);
     violations
 }
+
+/// The largest head-clock length observed across all entities on all nodes at
+/// quiescence. A value >= 2 proves the run actually produced a multi-head, so
+/// the antichain invariant was exercised on genuine concurrent state rather
+/// than trivially satisfied by single-tip heads. Reported on the outcome for
+/// scenarios that mean to assert a multi-head formed.
+pub async fn max_head_len(nodes: &[SimNode], universe: &ExpectedUniverse) -> usize {
+    let mut max = 0;
+    for node in nodes {
+        for &entity in &universe.created {
+            if let Some(state) = node.entity_state(entity).await {
+                max = max.max(state.head.len());
+            }
+        }
+    }
+    max
+}
