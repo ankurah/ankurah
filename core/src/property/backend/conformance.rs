@@ -122,6 +122,12 @@ pub(crate) trait ConformanceBackend {
     /// A deterministic linear sequence of writes for the round-trip laws, applied
     /// one after another to a single backend.
     fn linear_writes() -> Vec<Self::Write>;
+
+    /// Assert the backend's provenance obligation after a single write was applied
+    /// via `apply_operations_with_event` under `event_id`. LWW asserts the event
+    /// id was recorded and is exposed for later resolution; a CRDT that ignores
+    /// provenance leaves this a no-op. Called by [`law_provenance`].
+    fn check_provenance(_backend: &Arc<dyn PropertyBackend>, _event_id: &EventId) {}
 }
 
 // ============================================================================
@@ -190,12 +196,231 @@ pub(crate) fn law_state_buffer_round_trip<B: ConformanceBackend>() {
     );
 }
 
+/// Operation round-trip across two nodes: node A applies a linear sequence of
+/// writes via `apply_operations_with_event`; the operations from each event are
+/// carried to node B (a second, independent backend instance) and applied the
+/// same way. Both nodes must expose identical property values and produce
+/// byte-identical state buffers. This is the wire path (`to_operations` on the
+/// writer, `apply_operations` on the reader) between two nodes that never share
+/// in-memory state.
+pub(crate) fn law_operation_round_trip_across_nodes<B: ConformanceBackend>() {
+    let node_a = B::new_backend();
+    let node_b = B::new_backend();
+
+    let scratch = B::new_backend();
+    for (i, write) in B::linear_writes().iter().enumerate() {
+        let ops = B::stage_write(&scratch, write);
+        let event = make_event(i as u16, B::backend_name(), ops.clone(), &[]);
+        // Node A records the write under its event id.
+        node_a.apply_operations_with_event(&ops, event.id()).expect("node A apply_operations_with_event");
+        // The same operations cross to node B under the same event id.
+        node_b.apply_operations_with_event(&ops, event.id()).expect("node B apply_operations_with_event");
+    }
+
+    assert_eq!(
+        node_a.property_values(),
+        node_b.property_values(),
+        "[{}] two nodes fed the same operations must expose identical property values",
+        B::backend_name()
+    );
+    assert_eq!(
+        node_a.to_state_buffer().expect("node A to_state_buffer"),
+        node_b.to_state_buffer().expect("node B to_state_buffer"),
+        "[{}] two nodes fed the same operations must produce byte-identical state buffers",
+        B::backend_name()
+    );
+}
+
+/// Provenance handling for the `_with_event` variant. This law is asserted at two
+/// levels:
+///
+/// - Universal (all backends): applying an event's operations via
+///   `apply_operations_with_event` and via `apply_operations` produces the same
+///   read-visible values. Provenance may change internal bookkeeping, but it must
+///   not change what a reader sees for a single non-conflicting write.
+/// - Backend-specific (via `check_provenance`): the adopter asserts whatever the
+///   backend promises about the writing event id. LWW asserts the event id was
+///   recorded and is exposed for later conflict resolution; a CRDT asserts
+///   nothing (it is free to ignore the id, so its check is a no-op).
+///
+/// The split exists because provenance is where backends legitimately differ: the
+/// contract requires LWW to track the writing event (so `apply_layer` can resolve
+/// concurrent writes by causal dominance) but explicitly permits a CRDT to ignore
+/// it (RFC #267, `apply_operations_with_event` doc comment).
+pub(crate) fn law_provenance<B: ConformanceBackend>() {
+    let write = B::linear_writes().into_iter().next().expect("linear_writes must be non-empty");
+    let scratch = B::new_backend();
+    let ops = B::stage_write(&scratch, &write);
+    let event = make_event(0, B::backend_name(), ops.clone(), &[]);
+
+    let tracked = B::new_backend();
+    tracked.apply_operations_with_event(&ops, event.id()).expect("apply_operations_with_event");
+
+    let untracked = B::new_backend();
+    untracked.apply_operations(&ops).expect("apply_operations");
+
+    assert_eq!(
+        tracked.property_values(),
+        untracked.property_values(),
+        "[{}] a single non-conflicting write must read the same with or without event tracking",
+        B::backend_name()
+    );
+
+    // Backend-specific provenance obligations.
+    B::check_provenance(&tracked, &event.id());
+}
+
+/// `apply_layer` invariance under permutation of the events WITHIN a layer.
+///
+/// The events in a single layer are mutually concurrent (no causal relationship),
+/// so the contract requires the merge result to be independent of the order they
+/// appear in `to_apply`. This builds a root event plus N concurrent children off
+/// that root, then applies the single concurrent layer under every rotation of
+/// the children and asserts the final state buffer is byte-identical across all
+/// of them.
+///
+/// A backend that fails this law (a Yjs-family sequence CRDT can be
+/// integration-order sensitive; see the module docs and verdict 267-B) is a
+/// finding to pin, not a law to relax for other backends.
+pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
+    let writes = B::concurrent_writes();
+    assert!(writes.len() >= 2, "[{}] concurrent_writes must supply at least two events", B::backend_name());
+
+    // Shared root the concurrent children branch off of.
+    let scratch = B::new_backend();
+    let root_ops = B::stage_write(&scratch, &writes[0]);
+    let root = make_event(1000, B::backend_name(), root_ops.clone(), &[]);
+
+    // Build the concurrent children, all parented on the root.
+    let children: Vec<Event> = writes
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let ops = B::stage_write(&scratch, w);
+            make_event(2000 + i as u16, B::backend_name(), ops, &[root.id()])
+        })
+        .collect();
+
+    let permutations = rotations(&children);
+    let mut reference: Option<Vec<u8>> = None;
+
+    for perm in &permutations {
+        let backend = B::new_backend();
+        // Seed the root as committed state (the meet the layer branches from).
+        if let Some(ops) = root.operations.get(B::backend_name()) {
+            backend.apply_operations_with_event(ops, root.id()).expect("apply root");
+        }
+
+        let to_apply: Vec<&Event> = perm.iter().collect();
+        let context = [&root];
+        let layer = layer_from_events(&[], &to_apply, &context);
+        backend.apply_layer(&layer).expect("apply_layer");
+
+        let buffer = backend.to_state_buffer().expect("to_state_buffer after layer");
+        match &reference {
+            None => reference = Some(buffer),
+            Some(expected) => assert_eq!(
+                *expected,
+                buffer,
+                "[{}] apply_layer must be invariant under within-layer permutation of concurrent events",
+                B::backend_name()
+            ),
+        }
+    }
+}
+
+/// Determinism across delivery orders of the same DAG.
+///
+/// The same event set, delivered under different layer-arrival schedules, must
+/// converge to byte-identical state. This models a diamond DAG (root, two
+/// concurrent branches, a merge event joining them) and applies it two ways:
+///
+/// - schedule 1: the concurrent branches arrive together in one layer, then the
+///   merge event arrives in the next layer;
+/// - schedule 2: one branch arrives in its own layer, then the other branch and
+///   the merge arrive, exercising a different layering of the identical DAG.
+///
+/// Both schedules deliver the same events with the same parent structure, so a
+/// backend whose resolution depends only on graph facts (never arrival order)
+/// must reach the same final state buffer.
+pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
+    let writes = B::concurrent_writes();
+    assert!(writes.len() >= 3, "[{}] cross-order law needs at least three writes", B::backend_name());
+
+    let scratch = B::new_backend();
+
+    // root <- {branch_l, branch_r} <- merge
+    let root = make_event(3000, B::backend_name(), B::stage_write(&scratch, &writes[0]), &[]);
+    let branch_l = make_event(3001, B::backend_name(), B::stage_write(&scratch, &writes[1]), &[root.id()]);
+    let branch_r = make_event(3002, B::backend_name(), B::stage_write(&scratch, &writes[2]), &[root.id()]);
+    let merge = make_event(3003, B::backend_name(), B::stage_write(&scratch, &writes[0]), &[branch_l.id(), branch_r.id()]);
+
+    let context = [&root, &branch_l, &branch_r, &merge];
+
+    // Schedule 1: [branch_l, branch_r] then [merge].
+    let final_1 = {
+        let backend = B::new_backend();
+        apply_committed_root::<B>(&backend, &root);
+        let layer_a = layer_from_events(&[], &[&branch_l, &branch_r], &context);
+        backend.apply_layer(&layer_a).expect("schedule 1 layer a");
+        let layer_b = layer_from_events(&[&branch_l, &branch_r], &[&merge], &context);
+        backend.apply_layer(&layer_b).expect("schedule 1 layer b");
+        backend.to_state_buffer().expect("schedule 1 buffer")
+    };
+
+    // Schedule 2: [branch_r] then [branch_l] then [merge]. Same DAG, different
+    // layering (the two concurrent branches arrive in separate layers, opposite
+    // order), so already_applied context differs at each step.
+    let final_2 = {
+        let backend = B::new_backend();
+        apply_committed_root::<B>(&backend, &root);
+        let layer_a = layer_from_events(&[], &[&branch_r], &context);
+        backend.apply_layer(&layer_a).expect("schedule 2 layer a");
+        let layer_b = layer_from_events(&[&branch_r], &[&branch_l], &context);
+        backend.apply_layer(&layer_b).expect("schedule 2 layer b");
+        let layer_c = layer_from_events(&[&branch_l, &branch_r], &[&merge], &context);
+        backend.apply_layer(&layer_c).expect("schedule 2 layer c");
+        backend.to_state_buffer().expect("schedule 2 buffer")
+    };
+
+    assert_eq!(
+        final_1,
+        final_2,
+        "[{}] the same DAG delivered under different layer-arrival schedules must converge to identical state",
+        B::backend_name()
+    );
+}
+
+/// Apply the backend-relevant operations of `root` as committed state, so the
+/// root is the meet the subsequent layers branch from.
+fn apply_committed_root<B: ConformanceBackend>(backend: &Arc<dyn PropertyBackend>, root: &Event) {
+    if let Some(ops) = root.operations.get(B::backend_name()) {
+        backend.apply_operations_with_event(ops, root.id()).expect("apply committed root");
+    }
+}
+
+/// Every rotation of a slice (n rotations for n elements). Enough distinct
+/// within-layer orderings to catch order sensitivity without factorial blowup;
+/// the reference backends use small concurrent sets so rotations cover the
+/// meaningful cases (first-applied, last-applied, and every position between).
+fn rotations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    (0..items.len())
+        .map(|shift| {
+            let mut v = Vec::with_capacity(items.len());
+            v.extend_from_slice(&items[shift..]);
+            v.extend_from_slice(&items[..shift]);
+            v
+        })
+        .collect()
+}
+
 // ============================================================================
 // Reference implementation: LWW
 // ============================================================================
 
 mod lww_conformance {
     use super::*;
+    use crate::event_dag::accumulator::CausalRelation;
     use crate::property::backend::lww::LWWBackend;
     use crate::value::Value;
 
@@ -226,8 +451,87 @@ mod lww_conformance {
         }
 
         fn linear_writes() -> Vec<Self::Write> { vec![("title", "first"), ("body", "second"), ("title", "third"), ("tag", "fourth")] }
+
+        fn check_provenance(backend: &Arc<dyn PropertyBackend>, event_id: &EventId) {
+            // LWW must record the writing event id so apply_layer can later resolve
+            // concurrent writes by causal dominance (RFC #267).
+            let lww = backend.clone().as_arc_dyn_any().downcast::<LWWBackend>().expect("backend is LWW");
+            let recorded = lww.get_event_id(&"title".to_string());
+            assert_eq!(recorded.as_ref(), Some(event_id), "LWW must record the writing event id for provenance");
+        }
     }
 
     #[test]
     fn state_buffer_round_trip() { law_state_buffer_round_trip::<LwwAdopter>(); }
+
+    #[test]
+    fn operation_round_trip_across_nodes() { law_operation_round_trip_across_nodes::<LwwAdopter>(); }
+
+    #[test]
+    fn provenance() { law_provenance::<LwwAdopter>(); }
+
+    #[test]
+    fn within_layer_permutation_invariance() { law_within_layer_permutation_invariance::<LwwAdopter>(); }
+
+    #[test]
+    fn cross_order_determinism() { law_cross_order_determinism::<LwwAdopter>(); }
+
+    /// Build an LWW event writing a single field, with the given parents.
+    fn lww_write_event(seed: u16, field: &str, value: &str, parents: &[EventId]) -> Event {
+        let scratch = LWWBackend::new();
+        scratch.set(field.to_string(), Some(Value::String(value.to_string())));
+        let ops = scratch.to_operations().unwrap().unwrap();
+        make_event(seed, LwwAdopter::backend_name(), ops, parents)
+    }
+
+    /// Intent law for LWW (verdict 267-C): a causally-LATER write must always beat
+    /// a causally-earlier one, regardless of how the content-hash tiebreak would
+    /// order their event ids. This is the one intent guarantee LWW actually makes
+    /// beyond convergence: it does not merely converge, it converges on the write
+    /// that causally happened last. The content-hash tiebreak in `apply_layer` is
+    /// load-bearing only for truly concurrent writes; it must never override the
+    /// causal order (verdict 267-C promotes this stage ordering from an
+    /// implementation detail to an asserted law).
+    ///
+    /// The test searches seeds for a linear pair (earlier <- later) whose event
+    /// ids sort so that the earlier id is LARGER. If the resolver mistakenly fell
+    /// to the id tiebreak, the causally-earlier write would win; the law requires
+    /// the causally-later write to win anyway.
+    #[test]
+    fn causal_dominance_beats_hash_tiebreak() {
+        let field = "status";
+
+        // Find a seed pair where earlier.id() > later.id() (adversarial for a
+        // naive id-max tiebreak). The pair is a linear chain: earlier <- later.
+        let mut found = None;
+        for early_seed in 0u16..200 {
+            let earlier = lww_write_event(early_seed, field, "earlier-write", &[]);
+            let later = lww_write_event(early_seed.wrapping_add(5000), field, "later-write", &[earlier.id()]);
+            // later descends from earlier by construction; adversarial when the
+            // earlier id would win a raw lexicographic max.
+            if earlier.id() > later.id() {
+                found = Some((earlier, later));
+                break;
+            }
+        }
+        let (earlier, later) = found.expect("expected to find an adversarial id-ordered linear pair within seed budget");
+
+        // Sanity: the pair really is linear (later descends from earlier), so a
+        // correct resolver decides by causal dominance, not by the id tiebreak.
+        let layer = layer_from_events(&[&earlier], &[&later], &[]);
+        assert_eq!(layer.compare(&later.id(), &earlier.id()), CausalRelation::Descends);
+
+        // Apply earlier as committed state, then the later event via a layer.
+        let backend: Arc<dyn PropertyBackend> = Arc::new(LWWBackend::new());
+        if let Some(ops) = earlier.operations.get(LwwAdopter::backend_name()) {
+            backend.apply_operations_with_event(ops, earlier.id()).unwrap();
+        }
+        backend.apply_layer(&layer).unwrap();
+
+        assert_eq!(
+            backend.property_value(&field.to_string()),
+            Some(Value::String("later-write".to_string())),
+            "the causally-later write must win even though the earlier event id sorts larger"
+        );
+    }
 }
