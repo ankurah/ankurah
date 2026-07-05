@@ -176,22 +176,10 @@ Get up and running quickly with our React + Sled template:
 
 ```bash
 cargo generate https://github.com/ankurah/react-sled-template
+cd your-project-name && ./dev.sh
 ```
 
-Or run the example manually:
-
-```bash
-# Start the server
-cargo run -p ankurah-example-server
-
-# Build WASM bindings (in examples/wasm-bindings)
-wasm-pack build --target web --debug
-
-# Run the React app (in examples/react-app)
-bun install && bun dev
-```
-
-Then open http://localhost:5173/ in two browser tabs (one regular, one incognito) to see real-time sync.
+Then open http://localhost:5173/ in two browser tabs (one regular, one incognito) to see real-time sync. For the manual, from-scratch path see the [book's getting-started guide](https://ankurah.org/getting-started/template.html).
 
 ---
 

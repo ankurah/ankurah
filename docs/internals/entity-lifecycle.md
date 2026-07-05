@@ -5,20 +5,18 @@
 An entity in ankurah is a **replicated, convergent data object**. Its lifecycle
 follows four phases:
 
-```text
- ┌──────────┐     ┌──────────────┐     ┌────────────┐     ┌───────────┐
- │ Creation │────▶│ Local Mutation│────▶│   Commit   │────▶│ Persisted │
- └──────────┘     │ (transaction) │     │ (validate, │     │  (stored  │
-                  └──────────────┘     │  relay,     │     │   state)  │
-                                       │  persist)   │     └─────┬─────┘
-                                       └────────────┘           │
-                         ┌──────────────────────────────────────┘
-                         ▼
-                  ┌──────────────┐
-                  │Remote Events │◀─── other nodes
-                  │  (apply or   │
-                  │   merge)     │
-                  └──────────────┘
+```mermaid
+flowchart LR
+    creation["Creation"]
+    mutation["Local Mutation<br/>(transaction)"]
+    commit["Commit<br/>(validate, relay, persist)"]
+    persisted["Persisted<br/>(stored state)"]
+    remote["Remote Events<br/>(apply or merge)"]
+    others["other nodes"]
+
+    creation --> mutation --> commit --> persisted
+    persisted --> remote
+    others --> remote
 ```
 
 At every stage, two things determine what happens next:
@@ -60,7 +58,7 @@ accumulate pending operations.
 When a transaction commits, five phases execute in order:
 
 **1. Generate events.** Each entity's backends are asked for pending operations
-(via [`to_operations()`](property-backends.md#mutation-methods)). These become
+(via [`to_operations()`](property-backends.md#the-propertybackend-trait)). These become
 an `Event` whose parent is the snapshot's current head. Entities with no
 pending operations are skipped. A validation check ensures creation events can
 only come from entities that were actually created through the transaction --
@@ -92,17 +90,23 @@ Remote events arrive via `NodeApplier` through two delivery mechanisms (see
 protocol):
 
 **Subscription updates** come in two forms:
-- *EventOnly* -- the common incremental case. Events are validated, staged, and
-  applied one at a time.
+- *EventOnly* -- the common incremental case.
 - *StateAndEvent* -- used for initial subscription delivery and fetch responses.
   The system first tries the fast path: apply the state snapshot directly. If
   that succeeds, done. If the state diverges (concurrent edits exist), it falls
-  back to applying the accompanying events individually. This two-phase approach
-  ensures events are never silently dropped on divergence.
+  back to the accompanying events. This two-phase approach ensures events are
+  never silently dropped on divergence.
 
 **Delta application** (fetch/query responses) similarly comes as either a
-*StateSnapshot* (applied directly) or an *EventBridge* (events staged for
-[BFS](event-dag.md#bfs-traversal) discovery, then applied in causal order).
+*StateSnapshot* (applied directly) or an *EventBridge* (events connecting the
+requester's known head to the responder's).
+
+For every multi-event payload -- *EventOnly*, *StateAndEvent*, and
+*EventBridge* alike -- the receiver validates and stages the whole batch, then
+topologically sorts it by in-batch parent edges (`event_dag/ordering.rs`) and
+applies parents before children. Sender order is not trusted: applying a child
+before its staged parent would fast-forward the head past the parent, whose
+operations would then be silently dropped as `StrictAscends`.
 
 
 ## How Events Are Applied
@@ -133,15 +137,15 @@ events and empty heads:
 
 After guards pass, `apply_event` enters a bounded retry loop (up to 5
 attempts). Each attempt reads the current head, runs
-[`compare()`](event-dag.md#the-comparison-algorithm) against the event DAG,
-and acts on the [`causal relation`](event-dag.md#core-concepts):
+[`compare()`](event-dag.md#comparing-two-clocks) against the event DAG,
+and acts on the [`causal relation`](event-dag.md#key-concepts):
 
 | Relation | Action |
 |----------|--------|
 | `Equal` | Already integrated -- no-op |
 | `StrictDescends` | Direct descendant -- apply operations, advance head |
 | `StrictAscends` | Event is older than current state -- no-op |
-| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#core-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), update head (remove meet ancestors, insert the event id) so it reflects both tips |
+| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#key-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), update head (remove meet ancestors, insert the event id) so it reflects both tips |
 | `Disjoint` | Different lineage -- error |
 | `BudgetExceeded` | DAG traversal too deep -- error |
 

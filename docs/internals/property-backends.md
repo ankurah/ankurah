@@ -34,9 +34,9 @@ trait covers four responsibilities:
    apply incoming operations from other replicas.
 2. **Serialization** -- snapshot the backend to a byte buffer and restore it
    later. Entity state is persisted as a `State` containing a `Clock` (the
-   [head](event-dag.md#core-concepts)) and a `StateBuffers` map keyed by
+   [head](event-dag.md#key-concepts)) and a `StateBuffers` map keyed by
    backend name (`"lww"`, `"yrs"`). See
-   [Entity State Persistence](entity-lifecycle.md#entity-state-persistence).
+   [Entity State Persistence](entity-lifecycle.md#persistence-ordering).
 3. **Query** -- read the current value of any property.
 4. **Lifecycle** -- fork a copy for transaction isolation and subscribe to
    per-field change notifications.
@@ -60,16 +60,16 @@ persisting incomplete state.
 
 ### Conflict resolution
 
-When [concurrent branches merge](entity-lifecycle.md#apply_event-in-detail),
+When [concurrent branches merge](entity-lifecycle.md#how-events-are-applied),
 the entity feeds each backend a sequence of `EventLayer`s in topological
 order; each layer contains concurrent events. For each layer the LWW backend
 must choose a single winning value per property. The full algorithm is described in
-[LWW Resolution Rules](lww-merge.md#lww-resolution-rules); the conceptual
+[LWW Resolution Rules](lww-merge.md#resolution-rules); the conceptual
 steps are:
 
 1. **Seed winners from stored state.** Every existing Committed value becomes a
    candidate. If its `EventId` is absent from the
-   [accumulated DAG](event-dag.md#core-concepts), the value is flagged
+   [accumulated DAG](event-dag.md#key-concepts), the value is flagged
    **older than meet**.
 
 2. **Process layer events.** Each event in the layer may write to the same
@@ -88,7 +88,7 @@ steps are:
 ### The "older than meet" rule
 
 When the stored value's `EventId` is not in the accumulated DAG, it was
-written by an event that predates the [meet point](event-dag.md#core-concepts).
+written by an event that predates the [meet point](event-dag.md#key-concepts).
 Any layer candidate is guaranteed to be at least as recent as the meet, so it
 wins unconditionally. This avoids expensive ancestry traversals to events
 outside the DAG.
@@ -121,7 +121,8 @@ works because:
 Yrs cannot distinguish between a text field that has never been written and one
 set to the empty string. An entity created with an empty Yrs property produces
 no CRDT operations, which can prevent persistence. This is tracked as issue
-\#175; see also [Known Gaps](testing.md#known-gaps-and-ignored-tests).
+\#236 (originally reported as \#175); see also
+[Known Gaps](testing.md#known-gaps).
 
 
 ## Backend Registration
@@ -130,7 +131,7 @@ Backend instances are created on demand via `backend_from_string` in
 `core/src/property/backend/mod.rs`, which maps a name (`"lww"` or `"yrs"`) to
 a constructor.
 
-During [layer application](entity-lifecycle.md#apply_event-in-detail), if an
+During [layer application](entity-lifecycle.md#how-events-are-applied), if an
 event references a backend that does not yet exist on the entity, a new empty
 backend is created and all earlier layers are replayed on it before the current
 layer is applied. This ensures a backend first encountered mid-merge receives
@@ -150,21 +151,21 @@ derive macro system (defined in `core/src/property/value/`):
 | `Ref<T>` | LWW (via `LWW<Ref<T>>`) | Typed entity reference storing an `EntityId` |
 
 Both `LWW<T>` and `YrsString<P>` enforce write guards: calling a mutating
-method outside an active [transaction](entity-lifecycle.md#local-creation-transaction-path)
+method outside an active [transaction](entity-lifecycle.md#local-transaction-commit)
 returns `PropertyError::TransactionClosed`.
 
 
 ## End-to-End Merge Flow
 
 1. A remote event arrives and is [staged](event-dag.md#the-staging-pattern).
-   [`Entity::apply_event`](entity-lifecycle.md#apply_event-in-detail) calls
-   [`compare()`](event-dag.md#the-comparison-algorithm), which returns
+   [`Entity::apply_event`](entity-lifecycle.md#how-events-are-applied) calls
+   [`compare()`](event-dag.md#comparing-two-clocks), which returns
    `DivergedSince`.
-2. The [`EventAccumulator`](event-dag.md#core-concepts) produces
-   [`EventLayers`](event-dag.md#core-concepts) -- topologically ordered batches
+2. The [`EventAccumulator`](event-dag.md#key-concepts) produces
+   [`EventLayers`](event-dag.md#event-layers) -- topologically ordered batches
    of events from the meet point forward.
 3. Each layer is applied to every backend: LWW
-   [resolves per-property winners](lww-merge.md#lww-resolution-rules); Yrs
+   [resolves per-property winners](lww-merge.md#resolution-rules); Yrs
    applies CRDT updates.
 4. Late-created backends receive replayed earlier layers first.
 5. The entity head is updated and signal subscribers are notified.

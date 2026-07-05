@@ -4,9 +4,9 @@
 
 Tests are structured in three levels, each proving something different:
 
-1. **Unit tests** (`core/src/event_dag/tests.rs`) exercise [DAG comparison](event-dag.md#the-comparison-algorithm) and [conflict resolution](lww-merge.md) algorithms in isolation. No node, storage engine, or transaction is involved -- just hand-built topologies and direct function calls. These prove the algorithms are correct.
+1. **Unit tests** (`core/src/event_dag/tests.rs`) exercise [DAG comparison](event-dag.md#comparing-two-clocks) and [conflict resolution](lww-merge.md) algorithms in isolation. No node, storage engine, or transaction is involved -- just hand-built topologies and direct function calls. These prove the algorithms are correct.
 
-2. **Integration tests** (`tests/tests/`) spin up real [durable and ephemeral](node-architecture.md#durable-vs-ephemeral-nodes) `Node` instances, create entities via the [transaction API](entity-lifecycle.md#local-creation-transaction-path), commit events, and assert on persisted state and cross-node convergence. These prove the system behaves correctly end-to-end.
+2. **Integration tests** (`tests/tests/`) spin up real [durable and ephemeral](node-architecture.md#durable-vs-ephemeral-nodes) `Node` instances, create entities via the [transaction API](entity-lifecycle.md#local-transaction-commit), commit events, and assert on persisted state and cross-node convergence. These prove the system behaves correctly end-to-end.
 
 3. **Staging lifecycle tests** (`core/src/retrieval.rs`) verify the [stage-compare-commit protocol](event-dag.md#the-staging-pattern) -- that staged events are visible to comparison but do not appear committed until explicitly promoted, and that the durable/ephemeral flag is reported correctly.
 
@@ -15,13 +15,13 @@ Tests are structured in three levels, each proving something different:
 
 ### Idempotency
 
-Re-delivery of an already-applied event must be a no-op. This was the motivating bug for the Phase 5 staging rewrite: the old [`compare_unstored_event`](event-dag.md#eliminating-compare_unstored_event) would corrupt the head when a historical event was re-delivered.
+Re-delivery of an already-applied event must be a no-op. This was the motivating bug for the Phase 5 staging rewrite: the old [`compare_unstored_event`](event-dag.md#why-compare-uses-the-events-own-id-not-its-parent-clock) would corrupt the head when a historical event was re-delivered.
 
 At the unit level, re-delivering the current head returns `Equal` and re-delivering an ancestor returns `StrictAscends` -- both no-ops. Integration tests build a linear chain, re-deliver a middle event via [`commit_remote_transaction`](node-architecture.md#durable-node-receives-remote-commit), and confirm the head, entity state, and event count are unchanged.
 
 ### Determinism
 
-The same set of events applied in any order must produce identical state. [LWW resolution](lww-merge.md#determinism) is by depth (deeper branch wins) with [lexicographic `EventId` tiebreak](lww-merge.md#lww-resolution-rules) at equal depth.
+The same set of events applied in any order must produce identical state. [LWW resolution](lww-merge.md#determinism) prefers causally newer writes and uses the [lexicographic `EventId` tiebreak](lww-merge.md#resolution-rules) for truly concurrent ones. (Branch depth is never the rule: a longer branch wins only when its writing event causally descends the incumbent.)
 
 Unit tests cover two-event, three-event (all six permutations), multi-property, and sequential-layer determinism at the `LWWBackend` level. Integration tests create events on one node, replay them in reversed order on a second node, and assert identical values. Three-way concurrent forks verify the winner matches the highest `EventId`.
 
@@ -33,7 +33,7 @@ Several topologies are tested at both levels:
 - **Deep diamond** -- Symmetric and asymmetric branches (up to 8 events) asserting `DivergedSince` with correct meet point and chain lengths.
 - **Three-way concurrency** -- Three branches from the same head, verifying the lexicographic winner and `assert_dag!` structure.
 - **Multiple merge cycles** -- Repeated fork-merge sequences (e.g., A -> B||C -> D -> E||F -> G) verifying the full DAG with final single head.
-- **Missing events / BFS meet** -- Diamonds where the common ancestor is absent from the retriever. [BFS](event-dag.md#bfs-traversal) discovers it on [both frontiers](event-dag.md#unfetchable-events-and-both-frontiers-meet) and returns `DivergedSince` without erroring. A missing event on only one frontier correctly returns `EventNotFound`.
+- **Missing events / BFS meet** -- Diamonds where the common ancestor is absent from the retriever. [BFS](event-dag.md#bfs-traversal) discovers it on [both frontiers](event-dag.md#unfetchable-events-on-both-frontiers) and returns `DivergedSince` without erroring. A missing event on only one frontier correctly returns `EventNotFound`.
 
 ### Durable/ephemeral interaction
 
@@ -73,14 +73,14 @@ clock_eq!(dag, state.payload.state.head, [D]);
 
 ## Known Gaps
 
-**TOCTOU retry exhaustion** (`#[ignore]`) -- Testing retry exhaustion requires a mock that modifies the entity head between comparison and the CAS attempt inside [`try_mutate`](entity-lifecycle.md#the-try_mutate-toctou-protection), which needs interior mutability and precise timing over the entity's `RwLock`. Expected behavior: after `MAX_RETRIES` (5) attempts, `apply_event` returns `Err(MutationError::TOCTOUAttemptsExhausted)`.
+**TOCTOU retry exhaustion** (`#[ignore]`) -- Testing retry exhaustion requires a mock that modifies the entity head between comparison and the CAS attempt inside [`try_mutate`](entity-lifecycle.md#toctou-protection), which needs interior mutability and precise timing over the entity's `RwLock`. Expected behavior: after `MAX_RETRIES` (5) attempts, `apply_event` returns `Err(MutationError::TOCTOUAttemptsExhausted)`.
 
-**Yrs empty-string as null** (`#[ignore]`) -- Blocked on issue #236 ([empty-string treated as null](property-backends.md#the-empty-stringnull-issue)). Creating an entity with empty-string content produces no CRDT operations and no creation event.
+**Yrs empty-string as null** (`#[ignore]`) -- Blocked on issue #236 ([empty-string treated as null](property-backends.md#known-limitation-empty-stringnull-ambiguity)). Creating an entity with empty-string content produces no CRDT operations and no creation event.
 
 **Yrs multi-node concurrency** -- Order-independent convergence is tested at the unit level, but multi-node Yrs-specific concurrency (e.g., concurrent text inserts at the same position across nodes) is not yet covered.
 
-**Notification correctness** -- No tests verify that subscribers receive exactly one notification per event, in causal order, without duplicates.
+**Per-field notification path** -- Entity-level notification correctness is covered by `tests/tests/notifications.rs` (exactly one notification per commit, causal ordering across sequential commits, Add-vs-Update membership semantics, multi-subscriber consistency). What remains untested is the per-field path end to end: per-field subscription from a View is not yet supported, so no test subscribes to a single field and asserts a field-scoped notification.
 
-**`apply_state` divergence path** -- The integration test creates a diverged topology but verifies that both concurrent changes are applied, rather than testing the [`apply_state`](entity-lifecycle.md#apply_state-in-detail) rejection path (`Ok(false)`) directly.
+**`apply_state` divergence path** -- The integration test creates a diverged topology but verifies that both concurrent changes are applied, rather than testing the [`apply_state`](entity-lifecycle.md#how-state-snapshots-are-applied) rejection path (`Ok(false)`) directly.
 
 **Multi-column ORDER BY** (`#[ignore]`) -- Three tests in `tests/tests/sled/multi_column_order_by.rs` are blocked on issue #210 (i64 sorted lexicographically). Unrelated to the event DAG.

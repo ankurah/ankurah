@@ -33,7 +33,7 @@ instead of taking the shortcut. See the
 this matters.
 
 For details on the event-getter implementations that back this behavior, see
-the [Retrieval and Storage Layer](retrieval.md) document.
+the [Event Retrieval and Staging](retrieval.md) document.
 
 
 ## The Replication Protocol
@@ -51,7 +51,7 @@ have the state) or the new entity state plus the events that produced it
 (`StateAndEvent`). `EventOnly` is a valid wire format handled by the
 receiver, though current senders always include state. On the receiving side
 the node validates the state, integrates the events via
-[`apply_event`](entity-lifecycle.md#apply_event-in-detail), and persists the
+[`apply_event`](entity-lifecycle.md#how-events-are-applied), and persists the
 result. If the incoming state diverges from what the receiver already has,
 the receiver falls back to event-by-event `apply_event` with
 [BFS comparison](event-dag.md#comparing-two-clocks).
@@ -76,6 +76,8 @@ collected events into causal (oldest-first) order.
 
 > **Known limitation:** The backward walk currently has no traversal budget. A
 > stale or malicious `known_head` could trigger unbounded event collection.
+> Chunked bridge framing, size limits, and resource governance are tracked in
+> the phase-2 spec (`specs/concurrency/phase-2.md`).
 
 
 ## Subscription Propagation
@@ -124,7 +126,7 @@ step because the durable node is itself the authority.
 ### Durable node receives remote commit
 
 When a durable node receives events from a peer, it validates each event
-against the [policy agent](entity-lifecycle.md#apply_event-in-detail), applies
+against the [policy agent](entity-lifecycle.md#how-events-are-applied), applies
 it to the entity (forking first for safe validation), persists the result, and
 notifies the reactor to propagate the change to other peers. See also the
 [entity lifecycle](entity-lifecycle.md#local-transaction-commit) document for
