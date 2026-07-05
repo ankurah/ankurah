@@ -260,7 +260,7 @@ workstream ends by updating this document's checklist.
 - [x] C1: simulation harness with reorder/drop/dup/partition and convergence invariants
 - [ ] C2: nightly oracle scale-out
 - [ ] C3: backend conformance kit; pn_counter decision
-- [ ] C4: threat model document plus wire-level adversarial suite
+- [x] C4: threat model document plus wire-level adversarial suite
 - [ ] C5: reactor/LiveQuery coherence under merge schedules
 - [ ] C6: crash/recovery fault injection
 - [ ] C7: storage engine conformance suite
