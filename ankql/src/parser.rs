@@ -437,6 +437,22 @@ mod tests {
         );
     }
 
+    /// Identifiers STARTING with the keyword "not" must parse as identifiers,
+    /// not as a unary NOT plus a mangled remainder (NotFlag carries the same
+    /// !IDENT_CONT boundary guard as the other keywords).
+    #[test]
+    fn test_parse_identifier_starting_with_not() {
+        let selection = parse_selection(r#"note IS NULL"#).unwrap();
+        assert_eq!(selection.predicate, ast::Predicate::IsNull(Box::new(ast::Expr::Path(ast::PathExpr::simple("note".to_string())))));
+
+        let selection = parse_selection(r#"notes = 1"#).unwrap();
+        assert!(matches!(selection.predicate, ast::Predicate::Comparison { .. }));
+
+        // The bare keyword keeps working as unary NOT.
+        let selection = parse_selection(r#"NOT (status = 'x')"#).unwrap();
+        assert!(matches!(selection.predicate, ast::Predicate::Not(_)));
+    }
+
     #[test]
     fn unary_not_parenthesized() {
         let input = r#"NOT (status = 'active')"#;
