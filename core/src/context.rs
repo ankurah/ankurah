@@ -506,12 +506,19 @@ where
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let collection = self.node.collections.get(collection_id).await?;
-                let event_getter =
-                    crate::retrieval::CachedEventGetter::new(collection_id.clone(), collection.clone(), &self.node, &self.cdata);
+                let staging = std::sync::Arc::new(crate::ingest::StagingArea::with_default_cap());
+                let event_getter = crate::retrieval::CachedEventGetter::with_staging(
+                    collection_id.clone(),
+                    collection.clone(),
+                    &self.node,
+                    &self.cdata,
+                    staging.clone(),
+                );
                 let state_getter = crate::retrieval::LocalStateGetter::new(collection);
 
                 // 3. Apply deltas to local storage using NodeApplier
-                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &event_getter, &state_getter).await?;
+                crate::node_applier::NodeApplier::apply_deltas(&self.node, &peer_id, deltas, &staging, &event_getter, &state_getter)
+                    .await?;
                 // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
 
                 // 4. Re-fetch entities from local storage after applying deltas

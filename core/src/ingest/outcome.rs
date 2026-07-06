@@ -25,8 +25,7 @@ pub(crate) enum IngestOutcome {
     NeedsEvents { missing: Vec<EventId> },
 }
 
-/// Why an event was skipped. Both variants are idempotency working as
-/// intended, not failures.
+/// Why an event was skipped. None of these are failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipReason {
     /// Already durably committed here (redelivery or retry).
@@ -34,4 +33,7 @@ pub(crate) enum SkipReason {
     /// The comparison verdict was Equal or StrictAscends: the head already
     /// incorporates this event.
     AlreadyIntegrated,
+    /// Scheduled but no longer staged when execution reached it (cap
+    /// eviction raced the plan). The sender's retry re-delivers.
+    NotStaged,
 }

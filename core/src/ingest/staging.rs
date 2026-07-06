@@ -143,16 +143,21 @@ impl StagingArea {
         inner.children_by_parent.get(parent).map(|s| s.iter().cloned().collect()).unwrap_or_default()
     }
 
+    // Observability surface: consumed by tests today, by the R8 bounds test
+    // and D7 counters as they land.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.events.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     /// Total cap evictions since construction. Observability: a nonzero value
     /// under normal operation means either an orphan flood or a cap set too
     /// low for the workload.
+    #[allow(dead_code)]
     pub fn evictions(&self) -> u64 { self.evictions.load(Ordering::Relaxed) }
 }
 

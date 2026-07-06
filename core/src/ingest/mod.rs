@@ -7,18 +7,12 @@
 //! the pipeline returns outcomes and changes, feeders decide notification and
 //! recovery.
 
-// The substrate lands before its consumers; the allows come off when the
-// executor arrives and the API goes live.
-#[allow(dead_code)]
+pub(crate) mod executor;
 pub(crate) mod outcome;
-#[allow(dead_code)]
 pub(crate) mod plan;
-#[allow(dead_code)]
 pub(crate) mod staging;
 
-#[allow(unused_imports)]
-pub(crate) use outcome::{IngestOutcome, SkipReason};
-#[allow(unused_imports)]
-pub(crate) use plan::{plan_entity, IngestPlan};
-#[allow(unused_imports)]
+pub(crate) use executor::{execute_plan, PersistState};
+pub(crate) use outcome::IngestOutcome;
+pub(crate) use plan::plan_entity;
 pub(crate) use staging::StagingArea;
