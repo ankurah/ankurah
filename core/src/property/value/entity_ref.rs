@@ -124,6 +124,9 @@ impl<V: View> From<&V> for Ref<V::Model> {
 }
 
 impl<T> Property for Ref<T> {
+    // References carry the target's id on the wire (RFC 4: the reference row
+    // is value_type "entityid" with target_model as mutable metadata).
+    const VALUE_TYPE: &'static str = "entityid";
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::EntityId(self.id.clone()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {

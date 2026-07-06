@@ -152,6 +152,7 @@ impl wasm_bindgen::convert::FromWasmAbi for Json {
 });
 
 impl Property for Json {
+    const VALUE_TYPE: &'static str = "json";
     fn into_value(&self) -> Result<Option<Value>, PropertyError> { Ok(Some(Value::Json(self.0.clone()))) }
 
     fn from_value(value: Option<Value>) -> Result<Self, PropertyError> {

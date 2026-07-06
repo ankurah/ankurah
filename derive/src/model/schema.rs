@@ -24,11 +24,28 @@ use syn::{spanned::Spanned, Type};
 
 use crate::model::description::ModelDescription;
 
-/// The `(value_type, optional)` mapping for one field, from its original
-/// Rust type per the RFC section 4 normative table.
-struct ValueTypeMapping {
-    value_type: &'static str,
+/// Where a field's normative `value_type` string comes from.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ValueTypeSource {
+    /// A built-in row of the RFC section 4 table: emitted as a string
+    /// literal, exactly as before.
+    Literal(&'static str),
+    /// Outside the built-in table: emitted as
+    /// `<Inner as Property>::VALUE_TYPE`, so the type's own `Property` impl
+    /// declares its normative value_type (an associated const, resolved at
+    /// compile time inside the static initializer). `#[derive(Property)]`
+    /// pins "string" to match its JSON-string serialization; hand-written
+    /// impls declare whatever `Value` variant their `into_value` produces.
+    TraitConst,
+}
+
+/// The `(value_type source, optional)` mapping for one field, from its
+/// original Rust type per the RFC section 4 normative table. `inner` is the
+/// Option-unwrapped type (the type whose `Property` impl governs).
+struct ValueTypeMapping<'a> {
+    source: ValueTypeSource,
     optional: bool,
+    inner: &'a Type,
 }
 
 /// Validate the schema-affecting attributes and collection name, producing
@@ -98,8 +115,14 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let display_name = field_name.to_lowercase();
 
         let mapping = map_value_type(&field.ty);
-        let value_type = mapping.value_type;
         let optional = mapping.optional;
+        let value_type = match mapping.source {
+            ValueTypeSource::Literal(s) => quote! { #s },
+            ValueTypeSource::TraitConst => {
+                let inner = mapping.inner;
+                quote! { <#inner as ::ankurah::Property>::VALUE_TYPE }
+            }
+        };
 
         let backend = desc.backend_key().map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
 
@@ -171,39 +194,39 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
 /// already rejected earlier (description.rs active_field_descs), so this
 /// fallback only ever applies to backend-resolvable custom Property types,
 /// for which it is correct rather than a guess.
-fn map_value_type(ty: &Type) -> ValueTypeMapping {
+fn map_value_type(ty: &Type) -> ValueTypeMapping<'_> {
     if let Some(inner) = option_inner(ty) {
-        let inner = map_value_type(inner);
-        return ValueTypeMapping { value_type: inner.value_type, optional: true };
+        let inner_mapping = map_value_type(inner);
+        return ValueTypeMapping { optional: true, ..inner_mapping };
     }
-    ValueTypeMapping { value_type: scalar_value_type(ty), optional: false }
+    ValueTypeMapping { source: scalar_value_type(ty), optional: false, inner: ty }
 }
 
-/// The value_type string for a non-Option type per the normative table.
-fn scalar_value_type(ty: &Type) -> &'static str {
+/// The value_type source for a non-Option type per the normative table.
+fn scalar_value_type(ty: &Type) -> ValueTypeSource {
+    use ValueTypeSource::Literal;
     // Ref<T> is a reference: value_type "entityid" (RFC 4; the table's
     // reference row is (entityid, target_model=Some)).
     if type_head_is(ty, "Ref") {
-        return "entityid";
+        return Literal("entityid");
     }
     match type_head(ty).as_deref() {
-        Some("String") => "string",
-        Some("i16") => "i16",
-        Some("i32") => "i32",
-        Some("i64") => "i64",
-        Some("f64") => "f64",
-        Some("bool") => "bool",
-        Some("EntityId") => "entityid",
+        Some("String") => Literal("string"),
+        Some("i16") => Literal("i16"),
+        Some("i32") => Literal("i32"),
+        Some("i64") => Literal("i64"),
+        Some("f64") => Literal("f64"),
+        Some("bool") => Literal("bool"),
+        Some("EntityId") => Literal("entityid"),
         // Vec<u8> -> binary; a Vec of anything else is not in the table but
         // also does not resolve to a backend, so it never reaches here.
-        Some("Vec") => "binary",
+        Some("Vec") => Literal("binary"),
         // Json, or any path suffix ending in Json (e.g.
         // crate::property::value::Json), maps to "json".
-        Some("Json") => "json",
-        // Custom Property types (enums/newtypes) serialize to Value::String;
-        // see the module note. Anything unrecognized-but-backend-resolvable
-        // lands here.
-        _ => "string",
+        Some("Json") => Literal("json"),
+        // Anything outside the table declares its own value_type through
+        // its Property impl (associated const; RFC 4 erratum 2 resolution).
+        _ => ValueTypeSource::TraitConst,
     }
 }
 
@@ -389,30 +412,45 @@ mod tests {
 
     #[test]
     fn value_type_table() {
-        let cases: &[(&str, &str, bool)] = &[
-            ("String", "string", false),
-            ("Option < String >", "string", true),
-            ("i16", "i16", false),
-            ("i32", "i32", false),
-            ("i64", "i64", false),
-            ("f64", "f64", false),
-            ("bool", "bool", false),
-            ("Option < bool >", "bool", true),
-            ("Vec < u8 >", "binary", false),
-            ("Json", "json", false),
-            ("crate :: property :: value :: Json", "json", false),
-            ("Ref < Artist >", "entityid", false),
-            ("Option < Ref < Artist > >", "entityid", true),
-            ("EntityId", "entityid", false),
-            // custom Property type -> string (its Value::String serialization)
-            ("Visibility", "string", false),
-            ("Option < Visibility >", "string", true),
+        use ValueTypeSource::{Literal, TraitConst};
+        let cases: &[(&str, ValueTypeSource, bool)] = &[
+            ("String", Literal("string"), false),
+            ("Option < String >", Literal("string"), true),
+            ("i16", Literal("i16"), false),
+            ("i32", Literal("i32"), false),
+            ("i64", Literal("i64"), false),
+            ("f64", Literal("f64"), false),
+            ("bool", Literal("bool"), false),
+            ("Option < bool >", Literal("bool"), true),
+            ("Vec < u8 >", Literal("binary"), false),
+            ("Json", Literal("json"), false),
+            ("crate :: property :: value :: Json", Literal("json"), false),
+            ("Ref < Artist >", Literal("entityid"), false),
+            ("Option < Ref < Artist > >", Literal("entityid"), true),
+            ("EntityId", Literal("entityid"), false),
+            // Custom Property types declare their own value_type through the
+            // trait const (RFC 4 erratum 2 resolution); the derive emits
+            // `<Visibility as Property>::VALUE_TYPE`.
+            ("Visibility", TraitConst, false),
+            ("Option < Visibility >", TraitConst, true),
         ];
-        for (ty_str, expected_vt, expected_opt) in cases {
+        for (ty_str, expected_source, expected_opt) in cases {
             let ty: Type = syn::parse_str(ty_str).unwrap();
             let m = map_value_type(&ty);
-            assert_eq!(m.value_type, *expected_vt, "value_type for {ty_str}");
+            assert_eq!(m.source, *expected_source, "value_type source for {ty_str}");
             assert_eq!(m.optional, *expected_opt, "optional for {ty_str}");
         }
+    }
+
+    /// The Option-unwrapped inner type drives the trait-const emission:
+    /// `Option<Visibility>` must emit `<Visibility as Property>::VALUE_TYPE`
+    /// (the inner type), never `<Option<Visibility> as ...>`.
+    #[test]
+    fn trait_const_uses_the_unwrapped_inner_type() {
+        let ty: Type = syn::parse_str("Option < Visibility >").unwrap();
+        let m = map_value_type(&ty);
+        assert_eq!(m.source, ValueTypeSource::TraitConst);
+        let inner: Type = syn::parse_str("Visibility").unwrap();
+        assert_eq!(m.inner, &inner);
     }
 }

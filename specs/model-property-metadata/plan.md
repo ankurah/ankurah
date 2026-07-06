@@ -556,3 +556,20 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     registration (an old binary re-asserts its compiled name on
     startup); addressing is unaffected because each node resolves
     through its own compiled overlay (RFC 5.8).
+19. **`Property::VALUE_TYPE` (erratum 2 resolution; maintainer
+    direction, 2026-07-05)**: the `Property` trait declares its
+    normative value_type as an associated const (default "string"),
+    and `#[derive(Model)]` emits `<Ty as Property>::VALUE_TYPE` for
+    field types outside the built-in table instead of assuming
+    "string" -- compile-time, zero-cost (const in the static
+    initializer), no per-field annotation. `#[derive(Property)]` pins
+    "string" to match its JSON-string serialization; hand-written
+    impls declare the `Value` variant their `into_value` actually
+    produces. Every existing type keeps its current string (no
+    re-keying); shipped-type changes are retypes by definition.
+    Rejected: keeping the always-string assumption (misdeclares
+    hand impls, and retro-fitting the const post-release would re-key
+    every custom property that then declared a non-string type);
+    a required (defaultless) const (breaks every downstream hand
+    impl for marginal gain -- the default is correct for the
+    JSON-catch-all convention the ecosystem actually uses).

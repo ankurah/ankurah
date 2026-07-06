@@ -291,7 +291,7 @@ types:
 | `LWW<Vec<u8>>` | "lww" | "binary" | false |
 | `LWW<Json>` | "lww" | "json" | false |
 | `Ref<T>` | "lww" | "entityid" | false |
-| custom `#[derive(Property)]` types | "lww" | "string" | false |
+| custom `Property` types | "lww" | `Property::VALUE_TYPE` (derive pins "string") | false |
 | `Option<T>` of any above | same | same | true |
 
 Errata (2026-07-05, implementation verification): #236's table said
@@ -300,9 +300,26 @@ bare `String` to yrs (`accepts: "^String$"`, exactly as section 1 of this
 RFC already describes) and `Option<String>` falls through to LWW's
 catch-all. The row now records shipped behavior, which existing 0.9 data
 already carries; changing the code to match the old row would have re-keyed
-every deployed `Option<String>` field. Also added: custom
-`#[derive(Property)]` types serialize as `Value::String` (JSON in a string
-register), so their normative pair is ("lww", "string").
+every deployed `Option<String>` field. RATIFIED by the maintainer
+2026-07-05 with the deeper rationale: a yrs text CRDT cannot represent
+`None` as distinct from the empty string (once a text root exists there is
+no mergeable "unset" operation; deleting every character yields "", never
+None), so an optional string REQUIRES a register that can hold an explicit
+null -- which is exactly the LWW backend. LWW is not merely the shipped
+fallback; it is the only backend with the right semantics for `Option`.
+The second erratum (custom `Property` types) is RESOLVED by design change
+(maintainer direction, 2026-07-05): rather than assuming "string" for
+every custom type, the `Property` trait declares its own normative
+value_type as an associated const (`Property::VALUE_TYPE`, default
+"string"), which `#[derive(Model)]` reads at compile time for field types
+outside the built-in table. `#[derive(Property)]` pins "string" explicitly
+(matching its JSON-in-a-string serialization); a hand-written impl
+producing another `Value` variant declares it (e.g. "i64"), and the
+compiled schema, the registration request, the catalog, and the
+property-id derivation all carry the declared type. The invariant is
+documented on the const: VALUE_TYPE must equal the `Value` variant
+`into_value` produces, and changing it for a shipped type is a retype
+(a new property identity, RFC 5.8).
 
 value_type strings are the lowercased core::value::ValueType variant names
 (REN vs #236's plan.md prose, which listed a separate `ref` variant; the

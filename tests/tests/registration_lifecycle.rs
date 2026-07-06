@@ -311,3 +311,54 @@ async fn edit_only_commit_registers() -> anyhow::Result<()> {
     assert!(client_b.catalog.is_ensured("contraption"), "the edit-only commit must ensure registration");
     Ok(())
 }
+
+// RFC 4 erratum 2 resolution: a custom Property type DECLARES its own
+// normative value_type through the trait's associated const, and the derive
+// carries it into the compiled schema, the registration request, the
+// catalog, and the property-id derivation. `Stars` is a HAND-WRITTEN impl
+// producing `Value::I64`, so it declares "i64" (the derive(Property) macro
+// pins "string" for its JSON-string serialization).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stars(i64);
+
+impl ankurah::Property for Stars {
+    const VALUE_TYPE: &'static str = "i64";
+    fn into_value(&self) -> Result<Option<ankurah::value::Value>, ankurah::property::PropertyError> {
+        Ok(Some(ankurah::value::Value::I64(self.0)))
+    }
+    fn from_value(value: Option<ankurah::value::Value>) -> Result<Self, ankurah::property::PropertyError> {
+        match value {
+            Some(ankurah::value::Value::I64(v)) => Ok(Stars(v)),
+            Some(other) => Err(ankurah::property::PropertyError::InvalidVariant { given: other, ty: "Stars".to_owned() }),
+            None => Err(ankurah::property::PropertyError::Missing),
+        }
+    }
+}
+
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct Review {
+    pub rating: Stars,
+}
+
+#[tokio::test]
+async fn custom_property_type_declares_its_value_type() -> anyhow::Result<()> {
+    // Compile-time: the schema static carries the trait-declared value_type.
+    let schema = Review::schema();
+    let field = schema.field_by_name("rating").expect("rating field in schema");
+    assert_eq!(field.value_type, "i64", "hand impl declares its real wire type");
+    assert_eq!(field.backend, "lww");
+
+    // And it flows through registration: the catalog records "i64" and the
+    // property id derives from it.
+    let node = durable_sled_setup().await?;
+    let ctx = node.context_async(DEFAULT_CONTEXT).await;
+    ctx.register::<Review>().await?;
+
+    let root = node.system.root().unwrap().payload.entity_id;
+    let model_id = proto::schema_id::model_entity_id(&root, "review");
+    let expected = proto::schema_id::property_entity_id(&root, &model_id, "rating", "lww", "i64");
+    assert_eq!(wait_resolve(&node, "review", "rating").await, Some(expected), "derivation must use the declared value_type");
+    let def = node.catalog.property_by_id(&expected).expect("catalog property def");
+    assert_eq!(def.value_type, "i64");
+    Ok(())
+}
