@@ -10,7 +10,7 @@ use common::*;
 
 fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeRequestBody {
     proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::ModelDescriptor { collection: collection.into(), name: collection.into() }],
+        models: vec![proto::ModelDescriptor { collection: collection.into(), name: collection.into(), explicit_id: None }],
         properties: props
             .iter()
             .map(|(anchor, backend, value_type)| proto::PropertyDescriptor {
@@ -146,6 +146,42 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
     }
     // The retired display name no longer resolves.
     assert!(server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x'")?).is_err());
+
+    Ok(())
+}
+
+/// ORDER BY keys resolve fail-closed under the same rules as predicate
+/// references (codex review finding: sort keys previously bypassed the
+/// resolution pass entirely).
+#[tokio::test]
+async fn order_by_resolves_fail_closed() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, register("album", &[("name", "yrs", "string")])).await?);
+    let collection = "album".into();
+
+    // Known key passes; unknown key fails closed; id passes through.
+    assert!(server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("true ORDER BY name")?).is_ok());
+    assert!(server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("true ORDER BY id")?).is_ok());
+    let err = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("true ORDER BY bogus")?).unwrap_err();
+    assert!(err.to_string().contains("bogus"), "got: {err}");
+
+    // The legacy collection-qualified form normalizes away. The parser
+    // does not produce dotted ORDER BY keys, so build the AST directly
+    // (the form arrives from programmatic selections).
+    let qualified = Selection {
+        predicate: ankql::ast::Predicate::True,
+        order_by: Some(vec![ankql::ast::OrderByItem {
+            path: ankql::ast::PathExpr { steps: vec!["album".into(), "name".into()] },
+            direction: ankql::ast::OrderDirection::Asc,
+        }]),
+        limit: None,
+    };
+    let resolved = server.catalog.resolve_selection(&collection, &qualified)?;
+    let items = resolved.order_by.expect("order_by present");
+    assert_eq!(items[0].path.steps, vec!["name".to_string()]);
 
     Ok(())
 }

@@ -195,7 +195,7 @@ where
             }
         };
         if let Some(binding) = self.catalog.binding_for(collection) {
-            backend.bind_schema(binding);
+            backend.bind_schema_at(binding, &entity.head());
         }
         backend.set_wire_mode(crate::property::backend::lww::WireMode::IdKeyedV2);
     }

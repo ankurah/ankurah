@@ -16,7 +16,7 @@ type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
 fn album_request() -> proto::NodeRequestBody {
     proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into() }],
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),

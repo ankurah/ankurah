@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use ankurah_proto::{EntityId, EventId, Operation};
+use ankurah_proto::{Clock, EntityId, EventId, Operation};
 use ankurah_signals::signal::Listener;
 use serde::{Deserialize, Serialize};
 
@@ -218,11 +218,26 @@ impl LWWBackend {
         }
     }
 
+    /// Attach a name<->id translation table with no head knowledge: name/id
+    /// collisions fall back to the concurrent event-id tiebreak. Prefer
+    /// [`bind_schema_at`] wherever the entity's head clock is available.
+    pub fn bind_schema(&self, binding: Arc<SchemaBinding>) { self.bind_schema_at(binding, &Clock::default()) }
+
     /// Attach a name<->id translation table. Migrates existing name-keyed
-    /// entries whose names the binding resolves onto id keys (see the body for
-    /// the id-wins-on-collision rule). Idempotent-ish: re-binding re-runs the
-    /// migration against the current entries.
-    pub fn bind_schema(&self, binding: Arc<SchemaBinding>) {
+    /// entries whose names the binding resolves onto id keys. Idempotent-ish:
+    /// re-binding re-runs the migration against the current entries.
+    ///
+    /// COLLISION ELECTION: when a name entry migrates onto an id key that
+    /// already holds a value (e.g. a 0xA2-loaded id entry plus a residue
+    /// write made while this backend was unbound), the winner is chosen by
+    /// `head`: an entry whose provenance event is a CURRENT HEAD TIP is
+    /// causally maximal and wins outright; otherwise the standard concurrent
+    /// event-id tiebreak applies (deterministic on every replica). A full
+    /// DAG election needs the apply path's layer machinery; the tip check is
+    /// exact for the dominant collision -- a local unbound write descending
+    /// a loaded id entry -- and never prefers an entry merely for being
+    /// id-keyed (the previous rule, which could regress a newer write).
+    pub fn bind_schema_at(&self, binding: Arc<SchemaBinding>, head: &Clock) {
         {
             let mut values = self.values.write().unwrap();
             let existing = std::mem::take(&mut *values);
@@ -230,14 +245,16 @@ impl LWWBackend {
                 match key {
                     PropertyKey::Name(name) => {
                         if let Some(id) = binding.to_id.get(&name) {
-                            // Migrate the name entry onto its id key. If an id
-                            // entry is already present, keep it and drop this
-                            // name duplicate: an id-keyed entry can only have
-                            // come from newer id-keyed data, so it is
-                            // authoritative over a legacy name residue for the
-                            // same property. Deterministic and lossless in the
-                            // direction that matters.
-                            values.entry(PropertyKey::Id(*id)).or_insert(entry);
+                            match values.entry(PropertyKey::Id(*id)) {
+                                std::collections::btree_map::Entry::Vacant(slot) => {
+                                    slot.insert(entry);
+                                }
+                                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                                    if Self::collision_prefers_incoming(slot.get(), &entry, head) {
+                                        slot.insert(entry);
+                                    }
+                                }
+                            }
                         } else {
                             values.insert(PropertyKey::Name(name), entry);
                         }
@@ -249,6 +266,22 @@ impl LWWBackend {
             }
         }
         *self.binding.write().unwrap() = Some(binding);
+    }
+
+    /// The bind-time collision rule (see [`bind_schema_at`]): head tips win;
+    /// an uncommitted incoming entry (a mid-transaction residue write, which
+    /// necessarily postdates any loaded id entry) wins; otherwise the
+    /// concurrent event-id tiebreak.
+    fn collision_prefers_incoming(current: &ValueEntry, incoming: &ValueEntry, head: &Clock) -> bool {
+        match (current.event_id(), incoming.event_id()) {
+            (Some(current_event), Some(incoming_event)) => match (head.contains(&current_event), head.contains(&incoming_event)) {
+                (false, true) => true,
+                (true, false) => false,
+                _ => incoming_event > current_event,
+            },
+            (_, None) => true,
+            (None, _) => false,
+        }
     }
 
     /// Choose the wire encoding this instance emits.
@@ -1407,6 +1440,48 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(deleted.get_checked(&"title".to_string()).unwrap(), Some(Value::I64(7)));
+    }
+
+    /// Bind-time collision election (codex review finding): a residue write
+    /// made while the backend was unbound must not be discarded in favor of
+    /// an OLDER loaded id entry just because the id key was occupied. The
+    /// entity's head clock decides: a tip is causally maximal.
+    #[test]
+    fn bind_collision_elects_by_head_tip() {
+        let (e_old, e_new) = (EventId::from_bytes([1; 32]), EventId::from_bytes([2; 32]));
+
+        let build = || {
+            let backend =
+                LWWBackend::from_state_buffer(&v2_buffer(vec![(id(0x11), Some(Value::String("old".into())), Some("title"))], vec![]))
+                    .unwrap();
+            // Overwrite the decode-stamped provenance with e_old, then lay a
+            // residue write committed as e_new (an unbound v2-mode edit).
+            backend.values.write().unwrap().insert(
+                PropertyKey::Id(id(0x11)),
+                ValueEntry::Committed { value: Some(Value::String("old".into())), event_id: e_old.clone() },
+            );
+            backend.values.write().unwrap().insert(
+                PropertyKey::Name("title".into()),
+                ValueEntry::Committed { value: Some(Value::String("new".into())), event_id: e_new.clone() },
+            );
+            backend
+        };
+
+        // The residue's event is the head tip: it wins the id slot.
+        let backend = build();
+        backend.bind_schema_at(title_author_binding(), &Clock::new([e_new.clone()]));
+        assert_eq!(backend.get(&"title".to_string()), Some(Value::String("new".into())), "head-tip residue must survive bind");
+
+        // The id entry's event is the head tip (the residue is interior /
+        // foreign): the id entry is kept.
+        let backend = build();
+        backend.bind_schema_at(title_author_binding(), &Clock::new([e_old.clone()]));
+        assert_eq!(backend.get(&"title".to_string()), Some(Value::String("old".into())), "head-tip id entry must be kept");
+
+        // No head knowledge: deterministic event-id tiebreak (e_new > e_old).
+        let backend = build();
+        backend.bind_schema(title_author_binding());
+        assert_eq!(backend.get(&"title".to_string()), Some(Value::String("new".into())));
     }
 
     /// A BOUND backend never projects names outside its contract (RFC 5.4

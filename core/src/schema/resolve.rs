@@ -23,7 +23,7 @@
 //!   single-step path equal to the collection name resolves as a property
 //!   first (a property may legitimately share its collection's name).
 
-use ankql::ast::{Expr, Identifier, Predicate, Selection};
+use ankql::ast::{Expr, Identifier, OrderByItem, PathExpr, Predicate, Selection};
 use ankurah_proto::CollectionId;
 
 use crate::policy::PolicyAgent;
@@ -68,11 +68,32 @@ where
     /// `Identifier` expressions pass through untouched, so the pass is
     /// idempotent.
     pub fn resolve_selection(&self, collection: &CollectionId, selection: &Selection) -> Result<Selection, PropertyError> {
-        Ok(Selection {
-            predicate: self.resolve_predicate(collection, &selection.predicate)?,
-            order_by: selection.order_by.clone(),
-            limit: selection.limit,
-        })
+        let order_by = match &selection.order_by {
+            Some(items) => Some(items.iter().map(|item| self.resolve_order_by(collection, item)).collect::<Result<Vec<_>, _>>()?),
+            None => None,
+        };
+        Ok(Selection { predicate: self.resolve_predicate(collection, &selection.predicate)?, order_by, limit: selection.limit })
+    }
+
+    /// Sort keys resolve under the SAME rules as predicate references
+    /// (fail-closed UnknownProperty, `id` pseudo-property passthrough,
+    /// collection-qualifier normalization) but KEEP the PathExpr
+    /// representation: sorting addresses the resolved display name (the SQL
+    /// column / materialized key); id-keyed sort addressing rides the
+    /// catalog-bound engine work (#312).
+    fn resolve_order_by(&self, collection: &CollectionId, item: &OrderByItem) -> Result<OrderByItem, PropertyError> {
+        let steps = &item.path.steps;
+        if steps.is_empty() || steps[0] == "id" || self.resolve(collection.as_str(), &steps[0]).is_some() {
+            return Ok(item.clone());
+        }
+        // Legacy collection-qualified form: strip the qualifier.
+        if steps.len() > 1 && steps[0] == collection.as_str() {
+            if steps[1] == "id" || self.resolve(collection.as_str(), &steps[1]).is_some() {
+                return Ok(OrderByItem { path: PathExpr { steps: steps[1..].to_vec() }, direction: item.direction.clone() });
+            }
+            return Err(PropertyError::UnknownProperty { collection: collection.to_string(), name: steps[1].clone() });
+        }
+        Err(PropertyError::UnknownProperty { collection: collection.to_string(), name: steps[0].clone() })
     }
 
     fn resolve_predicate(&self, collection: &CollectionId, predicate: &Predicate) -> Result<Predicate, PropertyError> {

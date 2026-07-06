@@ -105,7 +105,11 @@ impl ModelSchema {
 /// executor resolves to the derived id). `optional` rides the membership,
 /// per contract.
 pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<PropertyDescriptor>, Vec<MembershipDescriptor>) {
-    let models = vec![ModelDescriptor { collection: schema.collection.to_string(), name: schema.name.to_string() }];
+    let models = vec![ModelDescriptor {
+        collection: schema.collection.to_string(),
+        name: schema.name.to_string(),
+        explicit_id: schema.explicit_id.map(parse_explicit_id),
+    }];
 
     let mut properties = Vec::with_capacity(schema.properties.len());
     let mut memberships = Vec::with_capacity(schema.properties.len());

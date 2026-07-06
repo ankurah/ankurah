@@ -212,7 +212,7 @@ async fn optional_absent_reads_none_and_is_null_matches() -> anyhow::Result<()> 
 async fn register_optional_note(node: &Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<()> {
     node.execute_schema_registration(
         &DEFAULT_CONTEXT,
-        vec![proto::ModelDescriptor { collection: "record".into(), name: "Record".into() }],
+        vec![proto::ModelDescriptor { collection: "record".into(), name: "Record".into(), explicit_id: None }],
         vec![proto::PropertyDescriptor {
             minting_collection: "record".into(),
             anchor: "note".into(),
@@ -268,7 +268,7 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
     // follow-up HAS arrived.
     node.execute_schema_registration(
         &DEFAULT_CONTEXT,
-        vec![proto::ModelDescriptor { collection: "widget".into(), name: "Widget".into() }],
+        vec![proto::ModelDescriptor { collection: "widget".into(), name: "Widget".into(), explicit_id: None }],
         vec![proto::PropertyDescriptor {
             minting_collection: "widget".into(),
             anchor: "label".into(),

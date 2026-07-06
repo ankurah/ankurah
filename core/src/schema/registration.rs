@@ -42,6 +42,10 @@ pub enum RegistrationError {
     AnchorReuse { property: EntityId, name: String, current: String },
     #[error("explicit property id {property} does not exist in the catalog; explicit binding never mints (RFC 5.9)")]
     ExplicitIdNotFound { property: EntityId },
+    #[error("explicit model id {model} does not exist in the catalog; explicit binding never mints (RFC 5.9)")]
+    ExplicitModelIdNotFound { model: EntityId },
+    #[error("explicit model id {model} is bound to collection '{found_collection}'; binder declares '{collection}'")]
+    ExplicitModelIdMismatch { model: EntityId, found_collection: String, collection: String },
     #[error("explicit property id {property} is ({found_backend}, {found_value_type}); binder declares ({backend}, {value_type})")]
     ExplicitIdMismatch { property: EntityId, found_backend: String, found_value_type: String, backend: String, value_type: String },
     #[error(transparent)]
@@ -87,20 +91,35 @@ where
 
         // Models: genesis sets `collection`; the display name is follow-up
         // metadata (including reverting it to the collection name, which the
-        // map's parse falls back to while the field is unset).
+        // map's parse falls back to while the field is unset). An EXPLICIT
+        // model binding (RFC 5.9) verifies and never mints, exactly like the
+        // property form. The resolved ids seed the request-local scope map
+        // so properties and memberships derive under the BOUND model id,
+        // matching the cache_compiled overlay.
+        let mut model_ids: BTreeMap<String, EntityId> = BTreeMap::new();
         for m in &models {
-            let genesis = super::genesis::model_genesis(&root, &m.collection);
-            let (model_id, genesis_id) = (genesis.entity_id, genesis.id());
-            let current = self.catalog_entity_snapshot(model_collection(), model_id).await?;
-            let head = head_or_genesis(current.as_ref(), &genesis_id);
-            if current.is_none() {
-                push(genesis);
-            }
-            let current_name =
-                current.as_ref().and_then(|(values, _)| string_field(values, "name")).unwrap_or_else(|| m.collection.clone());
-            if m.name != current_name {
-                push(follow_up(model_collection(), model_id, head, vec![("name", Value::String(m.name.clone()))]));
-            }
+            let model_id = match m.explicit_id {
+                Some(id) => {
+                    self.verify_explicit_model_binding(id, m).await?;
+                    id
+                }
+                None => {
+                    let genesis = super::genesis::model_genesis(&root, &m.collection);
+                    let (model_id, genesis_id) = (genesis.entity_id, genesis.id());
+                    let current = self.catalog_entity_snapshot(model_collection(), model_id).await?;
+                    let head = head_or_genesis(current.as_ref(), &genesis_id);
+                    if current.is_none() {
+                        push(genesis);
+                    }
+                    let current_name =
+                        current.as_ref().and_then(|(values, _)| string_field(values, "name")).unwrap_or_else(|| m.collection.clone());
+                    if m.name != current_name {
+                        push(follow_up(model_collection(), model_id, head, vec![("name", Value::String(m.name.clone()))]));
+                    }
+                    model_id
+                }
+            };
+            model_ids.insert(m.collection.clone(), model_id);
         }
 
         // Properties: derived ids under the minting model's scope, or an
@@ -115,7 +134,13 @@ where
                     id
                 }
                 None => {
-                    let scope = schema_id::model_entity_id(&root, &p.minting_collection);
+                    // The minting scope: the request's resolved model id for
+                    // this collection (honoring explicit model bindings),
+                    // else the by-collection derivation.
+                    let scope = model_ids
+                        .get(&p.minting_collection)
+                        .copied()
+                        .unwrap_or_else(|| schema_id::model_entity_id(&root, &p.minting_collection));
                     let genesis = super::genesis::property_genesis(&root, &scope, &p.anchor, &p.backend, &p.value_type);
                     let (id, genesis_id) = (genesis.entity_id, genesis.id());
                     let current = self.catalog_entity_snapshot(property_collection(), id).await?;
@@ -172,7 +197,7 @@ where
         // so required-ness must arrive as data; RFC 5.4). Written on mint
         // and thereafter only when it changes, provenance-ordered.
         for ms in &memberships {
-            let model_id = schema_id::model_entity_id(&root, &ms.collection);
+            let model_id = model_ids.get(&ms.collection).copied().unwrap_or_else(|| schema_id::model_entity_id(&root, &ms.collection));
             let property_id = match &ms.property {
                 PropertyRef::Id(id) => *id,
                 PropertyRef::Anchor(anchor) => *property_ids
@@ -227,6 +252,20 @@ where
                 backend: p.backend.clone(),
                 value_type: p.value_type.clone(),
             });
+        }
+        Ok(())
+    }
+
+    /// RFC 5.9 for models: an explicit binding references a model entity
+    /// authored elsewhere. Absence is a hard failure (never mints), and a
+    /// collection mismatch means the binder points at the wrong contract.
+    async fn verify_explicit_model_binding(&self, id: EntityId, m: &ModelDescriptor) -> Result<(), RegistrationError> {
+        let Some((values, _)) = self.catalog_entity_snapshot(model_collection(), id).await? else {
+            return Err(RegistrationError::ExplicitModelIdNotFound { model: id });
+        };
+        let found_collection = string_field(&values, "collection").unwrap_or_default();
+        if found_collection != m.collection {
+            return Err(RegistrationError::ExplicitModelIdMismatch { model: id, found_collection, collection: m.collection.clone() });
         }
         Ok(())
     }

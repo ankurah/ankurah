@@ -18,7 +18,7 @@ type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
 fn album_request() -> proto::NodeRequestBody {
     proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into() }],
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
@@ -283,7 +283,7 @@ async fn membership_optional_flip_updates() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
 
     let request = |optional: bool| proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into() }],
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
@@ -331,7 +331,7 @@ async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
     assert_eq!(model.get("name"), Some(&Some(Value::String("Album".into()))));
 
     let rename = |name: &str| proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::ModelDescriptor { collection: "album".into(), name: name.into() }],
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: name.into(), explicit_id: None }],
         properties: vec![],
         memberships: vec![],
     };
@@ -363,7 +363,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
     // Model B shares album's property by explicit id, with its own
     // (differing) optionality stance.
     let share = proto::NodeRequestBody::RegisterSchema {
-        models: vec![proto::ModelDescriptor { collection: "playlist".into(), name: "Playlist".into() }],
+        models: vec![proto::ModelDescriptor { collection: "playlist".into(), name: "Playlist".into(), explicit_id: None }],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "playlist".into(),
             anchor: "name".into(),
@@ -421,6 +421,49 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
         memberships: vec![],
     };
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, mismatch).await?, "binder declares");
+
+    Ok(())
+}
+
+/// RFC 5.9 for models: explicit model binding verifies and never mints
+/// (codex review finding: the descriptor previously dropped the binding, so
+/// local and durable catalogs could silently diverge).
+#[tokio::test]
+async fn explicit_model_id_binding() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+
+    let root = server.system.root().unwrap().payload.entity_id;
+    let album_model = schema_id::model_entity_id(&root, "album");
+
+    let bind = |collection: &str, explicit_id, properties| proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: collection.into(), name: collection.into(), explicit_id }],
+        properties,
+        memberships: vec![],
+    };
+
+    // Binding an id that does not exist never mints.
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(EntityId::new()), vec![])).await?, "does not exist");
+
+    // Binding a different collection to album's model entity is a mismatch.
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, bind("albumx", Some(album_model), vec![])).await?, "binder declares");
+
+    // A matching binding succeeds, and a property in the same request
+    // derives under the BOUND model id (the request-local scope map).
+    let genre = proto::PropertyDescriptor {
+        minting_collection: "album".into(),
+        anchor: "genre".into(),
+        anchored: false,
+        name: "genre".into(),
+        backend: "lww".into(),
+        value_type: "string".into(),
+        target_model: None,
+        explicit_id: None,
+    };
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, bind("album", Some(album_model), vec![genre])).await?);
+    let genre_id = schema_id::property_entity_id(&root, &album_model, "genre", "lww", "string");
+    let property = catalog_values(&server, PROPERTY, genre_id).await?;
+    assert_eq!(property.get("name"), Some(&Some(Value::String("genre".into()))));
 
     Ok(())
 }

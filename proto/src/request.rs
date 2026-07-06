@@ -123,6 +123,13 @@ pub struct ModelDescriptor {
     pub collection: String,
     /// Display name (initially the struct name); mutable metadata.
     pub name: String,
+    /// Explicit binding (RFC 5.9): reference an EXISTING model entity
+    /// instead of deriving one by collection. Never mints; hard-fails if
+    /// absent or if the bound entity's collection differs. Properties and
+    /// memberships in the SAME request derive under the bound id, so a
+    /// request touching an explicitly-bound model must include its
+    /// ModelDescriptor.
+    pub explicit_id: Option<EntityId>,
 }
 
 /// A property definition to register. Language-agnostic: `backend` and
