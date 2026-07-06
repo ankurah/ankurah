@@ -185,29 +185,34 @@ workstream D; the optimization pass runs after D stabilizes.
    across DAG shapes (linear deep, uneven diamond chains, wide antichains,
    disjoint), layer iteration, clock operations, topo sort; tracked in CI with
    regression thresholds.
-2. **E-vol: volume tier and macro performance baseline (explicitly scheduled to
-   land DURING workstream D, not deferred to E2).** Split out as its own item
-   because it is not an optimization: it is the instrument that guards the D
-   refactors as they land and feeds E2 with the before-numbers. It is TWO
-   clearly separated instruments, because the simulation harness cannot produce
-   honest wall-clock (single-threaded virtual transport):
-   - VOLUME TIER (deterministic, correctness and memory at scale): env-scaled
-     simulation-harness scenarios (N-entity churn, deep single-entity history,
-     wide concurrent antichain, subscription fan-out) that assert the C1
-     convergence invariants at volume plus peak memory via a counting global
-     allocator, bounded by LOOSE order-of-magnitude sanity ceilings (catastrophe
-     guards, not thresholds). Defaults stay inside a normal `cargo test`; a
-     nightly job scales the VOL_* knobs up. Memory attribution respects the
-     E-A/271-D caveat (a sequence-CRDT tombstone set is lower-bounded by deletion
-     history, folded by sealing, not by the streaming consumer), so the
-     scenarios avoid deletions and never misattribute that floor.
-   - PERF TIER (real wall-clock, advisory): a criterion macro suite over real
-     multi-threaded tokio and LocalProcessConnection multi-node setups
-     (single-writer commit throughput, commit-to-subscriber propagation latency,
-     fresh-fetch snapshot adoption at depth-N history, TRUE bridge catch-up
-     wall time vs gap depth via the stale-client shape with a lane guard
+2. **E-shapes: event-DAG-shape scale tier and lane performance baseline
+   (explicitly scheduled to land DURING workstream D, not deferred to E2).**
+   Split out as its own item because it is not an optimization: it is the
+   instrument that guards the D refactors as they land and feeds E2 with the
+   before-numbers. It is TWO clearly separated instruments, because the
+   simulation harness cannot produce honest wall-clock (single-threaded virtual
+   transport). What this tier scales is EVENT DAG SHAPE under the deterministic
+   sim, not deployment volume: the name volume is reserved for the
+   real-deployment load program in #324 (load and traffic volume) and #325
+   (dataset performance suites), which this tier is not.
+   - EVENT-DAG-SHAPE SCALE TIER (deterministic, correctness and memory at
+     scale): env-scaled simulation-harness scenarios (N-entity churn, deep
+     single-entity history, wide concurrent antichain, subscription fan-out)
+     that assert the C1 convergence invariants at event-DAG-shape scale plus
+     peak memory via a counting global allocator, bounded by LOOSE
+     order-of-magnitude sanity ceilings (catastrophe guards, not thresholds).
+     Defaults stay inside a normal `cargo test`; a nightly job scales the
+     SHAPE_* knobs up. Memory attribution respects the E-A/271-D caveat (a
+     sequence-CRDT tombstone set is lower-bounded by deletion history, folded by
+     sealing, not by the streaming consumer), so the scenarios avoid deletions
+     and never misattribute that floor.
+   - PERF TIER (real wall-clock, advisory): a criterion per-lane end-to-end
+     suite over real multi-threaded tokio and LocalProcessConnection multi-node
+     setups (single-writer commit throughput, commit-to-subscriber propagation
+     latency, fresh-fetch snapshot adoption at depth-N history, TRUE bridge
+     catch-up wall time vs gap depth via the stale-client shape with a lane guard
      proving the EventBridge arm served it, subscription establishment at N
-     resident entities). Medians recorded in `specs/concurrency/MACRO-BASELINE.md`
+     resident entities). Medians recorded in `specs/concurrency/LANE-BASELINE.md`
      with hardware/toolchain disclosure. NOT run in the normal CI test job.
    Measurement only: no core changes, no optimization; the numbers are the
    input to E2, which stays after D.
@@ -305,5 +310,5 @@ workstream ends by updating this document's checklist.
 - [ ] D7: observability counters and alerts
 - [ ] D8: #265 and #267 remainders
 - [x] E1: benchmark harness and baseline (lands at phase 2 start)
-- [x] E-vol: volume tier and macro performance baseline
+- [x] E-shapes: event-DAG-shape scale tier (deep histories, wide antichains, entity churn, subscription fan-out) and lane performance baseline
 - [ ] E2: optimization PR with before/after numbers

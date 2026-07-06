@@ -1,9 +1,9 @@
-//! Volume tier for the concurrency phase 2 macro/volume workstream (E-vol).
+//! Event-DAG-shape scale tier for the concurrency phase 2 E-shapes workstream.
 //!
 //! This is the CORRECTNESS-AND-MEMORY-AT-SCALE instrument, and it is
-//! deliberately kept separate from the perf tier (`tests/benches/macro_perf.rs`,
+//! deliberately kept separate from the perf tier (`tests/benches/lane_perf.rs`,
 //! real wall-clock). It drives the C1 deterministic simulation harness at
-//! configurable scale and asserts, at volume:
+//! configurable event-DAG-shape scale and asserts:
 //!
 //! - the C1 convergence family (all-node convergence, no lost write, no phantom,
 //!   head antichain validity) still holds, via `SimOutcome::assert_converged`;
@@ -12,6 +12,13 @@
 //!   (a runaway accumulator, an unbounded buffer, a per-event leak), NOT noise;
 //!   they are intentionally far from the observed peaks so ordinary run-to-run
 //!   and machine-to-machine variance never trips them.
+//!
+//! What this tier scales is EVENT DAG SHAPE under the deterministic sim: deep
+//! single-entity histories (long chains), wide concurrent antichains,
+//! multi-entity churn, and subscription fan-out. This is NOT volume testing in
+//! the real-deployment sense (millions of records, thousands of concurrent
+//! ephemeral nodes against a durable node); that program is tracked separately
+//! in issues #324 and #325.
 //!
 //! IMPORTANT: the simulation harness runs on a single-threaded virtual
 //! transport. Its timings are meaningless as performance numbers and are NEVER
@@ -24,19 +31,20 @@
 //! (target: this file adds well under the ~30 s smoke budget) while a nightly
 //! job can scale each knob up:
 //!
-//! - `VOL_ENTITIES`      (default 200): entities in the N-entity churn shape.
-//! - `VOL_EVENTS`        (default 200): chain depth for the deep-history shape.
-//! - `VOL_ANTICHAIN`     (default  64): concurrent writers in the wide-antichain
+//! - `SHAPE_ENTITIES`    (default 200): entities in the N-entity churn shape.
+//! - `SHAPE_DEPTH`       (default 200): chain depth (number of sequential edits)
+//!   for the deep single-entity-history shape.
+//! - `SHAPE_ANTICHAIN`   (default  64): concurrent writers in the wide-antichain
 //!   shape.
-//! - `VOL_QUERIES`       (default  16): live queries in the subscription
+//! - `SHAPE_QUERIES`     (default  16): live queries in the subscription
 //!   fan-out shape.
-//! - `VOL_SEEDS`         (default   3): seeds per scenario (each its own swarm
+//! - `SHAPE_SEEDS`       (default   3): seeds per scenario (each its own swarm
 //!   fault subset, except where a scenario needs a fixed schedule).
 //!
 //! Nightly scale example (see .github/workflows/nightly-oracle.yml):
 //!
-//!     VOL_ENTITIES=5000 VOL_EVENTS=5000 VOL_ANTICHAIN=512 VOL_QUERIES=128 \
-//!     VOL_SEEDS=20 cargo test -p ankurah-tests --test sim_volume -- --ignored --nocapture
+//!     SHAPE_ENTITIES=5000 SHAPE_DEPTH=5000 SHAPE_ANTICHAIN=512 SHAPE_QUERIES=128 \
+//!     SHAPE_SEEDS=20 cargo test -p ankurah-tests --test sim_event_dag_shapes -- --ignored --nocapture
 //!
 //! Memory-attribution caveat (design-deltas E-A / 271-D): the "memory bounded
 //! by divergence window, not history" target governs the reverse walk. A
@@ -71,11 +79,11 @@ static MEASURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn env_usize(key: &str, default: usize) -> usize { std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default) }
 
-fn vol_entities() -> usize { env_usize("VOL_ENTITIES", 200) }
-fn vol_events() -> usize { env_usize("VOL_EVENTS", 200) }
-fn vol_antichain() -> usize { env_usize("VOL_ANTICHAIN", 64) }
-fn vol_queries() -> usize { env_usize("VOL_QUERIES", 16) }
-fn vol_seeds() -> u64 { env_usize("VOL_SEEDS", 3) as u64 }
+fn shape_entities() -> usize { env_usize("SHAPE_ENTITIES", 200) }
+fn shape_depth() -> usize { env_usize("SHAPE_DEPTH", 200) }
+fn shape_antichain() -> usize { env_usize("SHAPE_ANTICHAIN", 64) }
+fn shape_queries() -> usize { env_usize("SHAPE_QUERIES", 16) }
+fn shape_seeds() -> u64 { env_usize("SHAPE_SEEDS", 3) as u64 }
 
 // --- Reporting -------------------------------------------------------------
 
@@ -87,14 +95,14 @@ fn vol_seeds() -> u64 { env_usize("VOL_SEEDS", 3) as u64 }
 fn report_and_assert_mem(scenario: &str, seed: u64, scope: &MemScope, budget_bytes: usize, outcome: &SimOutcome) {
     let peak = scope.peak_above_baseline();
     eprintln!(
-        "VOLMEM scenario={scenario} seed={seed} peak_above_baseline_bytes={peak} baseline_bytes={} budget_bytes={budget_bytes} max_head_len={}",
+        "SHAPEMEM scenario={scenario} seed={seed} peak_above_baseline_bytes={peak} baseline_bytes={} budget_bytes={budget_bytes} max_head_len={}",
         scope.baseline(),
         outcome.max_head_len
     );
     outcome.assert_converged();
     assert!(
         peak <= budget_bytes,
-        "VOLMEM ORDER-OF-MAGNITUDE BOUND EXCEEDED scenario={scenario} seed={seed}: \
+        "SHAPEMEM ORDER-OF-MAGNITUDE BOUND EXCEEDED scenario={scenario} seed={seed}: \
          peak_above_baseline={peak} bytes > budget={budget_bytes} bytes. This bound pins a \
          catastrophic memory regression, not noise; investigate an unbounded buffer or leak."
     );
@@ -120,7 +128,7 @@ where
 // --- Order-of-magnitude ceilings -------------------------------------------
 //
 // These are per-run peak-above-baseline ceilings, deliberately LOOSE. At the
-// default scale on the capture machine (Apple M4 Max, see MACRO-BASELINE.md) the
+// default scale on the capture machine (Apple M4 Max, see LANE-BASELINE.md) the
 // observed peaks-above-baseline were roughly: churn ~29 MiB, deep history
 // ~21-43 MiB (the 43 MiB is a first-run baseline-capture artifact on seed 0),
 // wide antichain ~21 MiB, fan-out ~21 MiB. Each ceiling is a fixed floor (which
@@ -136,7 +144,7 @@ where
 const FIXED_FLOOR_BYTES: usize = 128 * 1024 * 1024; // 128 MiB floor: slack + first-run artifact.
 
 fn churn_budget(entities: usize) -> usize { FIXED_FLOOR_BYTES + entities * 512 * 1024 }
-fn deep_budget(events: usize) -> usize { FIXED_FLOOR_BYTES + events * 512 * 1024 }
+fn deep_budget(depth: usize) -> usize { FIXED_FLOOR_BYTES + depth * 512 * 1024 }
 fn antichain_budget(writers: usize) -> usize { FIXED_FLOOR_BYTES + writers * 1024 * 1024 }
 fn fanout_budget(queries: usize, entities: usize) -> usize { FIXED_FLOOR_BYTES + (queries + entities) * 512 * 1024 }
 
@@ -144,18 +152,18 @@ fn fanout_budget(queries: usize, entities: usize) -> usize { FIXED_FLOOR_BYTES +
 // Scenario 1: N-entity multi-node churn (extends the C1 churn shape upward).
 // ===========================================================================
 
-/// Create `VOL_ENTITIES` entities spread across all origins, settle so every
+/// Create `SHAPE_ENTITIES` entities spread across all origins, settle so every
 /// node holds every entity, then edit each from a different origin. Convergence,
-/// no-lost-write, no-phantom, and antichain validity must all hold at volume;
+/// no-lost-write, no-phantom, and antichain validity must all hold at scale;
 /// peak memory must stay within the loose churn bound.
 #[test]
-fn volume_multi_entity_churn() {
-    let entities = vol_entities();
+fn multi_entity_churn() {
+    let entities = shape_entities();
     let budget = churn_budget(entities);
     let mut worst = 0usize;
-    for seed in 0..vol_seeds() {
+    for seed in 0..shape_seeds() {
         let faults = FaultConfig::swarm_from_seed(seed);
-        let peak = run_measured("volume_multi_entity_churn", seed, faults, 4, budget, || {
+        let peak = run_measured("multi_entity_churn", seed, faults, 4, budget, || {
             body(move |w: &mut Workload| {
                 Box::pin(async move {
                     let mut ids = Vec::with_capacity(entities);
@@ -175,38 +183,38 @@ fn volume_multi_entity_churn() {
         });
         worst = worst.max(peak);
     }
-    eprintln!("VOLMEM-SUMMARY volume_multi_entity_churn entities={entities} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}");
+    eprintln!("SHAPEMEM-SUMMARY multi_entity_churn entities={entities} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}");
 }
 
 // ===========================================================================
 // Scenario 2: deep single-entity history, then catch-up under the schedule.
 // ===========================================================================
 
-/// One entity with a chain of `VOL_EVENTS` sequential edits. Every ephemeral
+/// One entity with a chain of `SHAPE_DEPTH` sequential edits. Every ephemeral
 /// node catches up through the scheduler one event at a time (acceptance-retry
 /// on the CommitTransaction path), so this exercises the applier and staging at
 /// depth and asserts all nodes converge on the deep chain.
 ///
 /// NOTE ON SCOPE: this is the deterministic correctness-and-memory view of a
 /// deep chain. Catch-up WALL TIME is a performance question and lives in the
-/// perf tier: `macro_perf.rs::bench_bridge_catchup` (stale-client shape, the
+/// perf tier: `lane_perf.rs::bench_bridge_catchup` (stale-client shape, the
 /// only shape served by the EventBridge lane) and
-/// `macro_perf.rs::bench_fresh_fetch_snapshot` (fresh client, snapshot lane).
+/// `lane_perf.rs::bench_fresh_fetch_snapshot` (fresh client, snapshot lane).
 /// Reporting a sim-harness catch-up time as a performance number is explicitly
 /// forbidden.
 #[test]
-fn volume_deep_single_entity_history() {
-    let events = vol_events();
-    let budget = deep_budget(events);
+fn deep_single_entity_history() {
+    let depth = shape_depth();
+    let budget = deep_budget(depth);
     let mut worst = 0usize;
     // A fixed (fault-free) schedule keeps the deep-chain shape stable across
     // seeds; the depth, not the fault subset, is the variable under study here.
-    for seed in 0..vol_seeds() {
-        let peak = run_measured("volume_deep_single_entity_history", seed, FaultConfig::none(), 3, budget, || {
+    for seed in 0..shape_seeds() {
+        let peak = run_measured("deep_single_entity_history", seed, FaultConfig::none(), 3, budget, || {
             body(move |w: &mut Workload| {
                 Box::pin(async move {
                     let e = w.create_at(0, Field::Title, "genesis").await;
-                    for i in 0..events {
+                    for i in 0..depth {
                         // Alternate fields so successive edits are meaningful
                         // writes; each parents on the tracked head, extending
                         // one linear chain.
@@ -218,9 +226,7 @@ fn volume_deep_single_entity_history() {
         });
         worst = worst.max(peak);
     }
-    eprintln!(
-        "VOLMEM-SUMMARY volume_deep_single_entity_history events={events} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}"
-    );
+    eprintln!("SHAPEMEM-SUMMARY deep_single_entity_history depth={depth} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}");
 }
 
 // ===========================================================================
@@ -228,24 +234,25 @@ fn volume_deep_single_entity_history() {
 // ===========================================================================
 
 /// Build a genuinely wide head: create one entity, settle, then issue
-/// `VOL_ANTICHAIN` concurrent edits all parented on the SAME fork clock (so they
-/// are mutual siblings, not a chain), alternating fields so they commute. After
-/// they all propagate the head is a wide antichain, which the head-antichain
-/// invariant validates non-trivially (`max_head_len` reports the width). A final
-/// edit parented on the full wide head merges it back to a single tip.
+/// `SHAPE_ANTICHAIN` concurrent edits all parented on the SAME fork clock (so
+/// they are mutual siblings, not a chain), alternating fields so they commute.
+/// After they all propagate the head is a wide antichain, which the
+/// head-antichain invariant validates non-trivially (`max_head_len` reports the
+/// width). A final edit parented on the full wide head merges it back to a
+/// single tip.
 #[test]
-fn volume_wide_concurrent_antichain() {
-    let writers = vol_antichain();
+fn wide_concurrent_antichain() {
+    let writers = shape_antichain();
     let budget = antichain_budget(writers);
     let mut worst = 0usize;
     let mut worst_head = 0usize;
-    for seed in 0..vol_seeds() {
+    for seed in 0..shape_seeds() {
         let faults = FaultConfig::swarm_from_seed(seed);
         // Hold the measurement lock across the measured region (see MEASURE_LOCK)
         // so the process-global peak is attributable under parallel test threads.
         let guard = MEASURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let scope = MemScope::begin();
-        let outcome = run_once("volume_wide_concurrent_antichain", seed, faults, 3, {
+        let outcome = run_once("wide_concurrent_antichain", seed, faults, 3, {
             body(move |w: &mut Workload| {
                 Box::pin(async move {
                     let e = w.create_at(0, Field::Title, "base").await;
@@ -268,13 +275,13 @@ fn volume_wide_concurrent_antichain() {
             })
         });
         let peak = scope.peak_above_baseline();
-        report_and_assert_mem("volume_wide_concurrent_antichain", seed, &scope, budget, &outcome);
+        report_and_assert_mem("wide_concurrent_antichain", seed, &scope, budget, &outcome);
         drop(guard);
         worst = worst.max(peak);
         worst_head = worst_head.max(outcome.max_head_len);
     }
     eprintln!(
-        "VOLMEM-SUMMARY volume_wide_concurrent_antichain writers={writers} worst_head_len={worst_head} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}"
+        "SHAPEMEM-SUMMARY wide_concurrent_antichain writers={writers} worst_head_len={worst_head} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}"
     );
 }
 
@@ -282,7 +289,7 @@ fn volume_wide_concurrent_antichain() {
 // Scenario 4: subscription fan-out while churn runs.
 // ===========================================================================
 
-/// Open `VOL_QUERIES` live queries over overlapping predicates on the ephemeral
+/// Open `SHAPE_QUERIES` live queries over overlapping predicates on the ephemeral
 /// nodes, then run entity churn while they are live. The subscriptions stay open
 /// through the quiescence barrier and the invariant checks (the driver lifts
 /// them out for exactly this). Convergence must hold with the reactor and relay
@@ -292,14 +299,14 @@ fn volume_wide_concurrent_antichain() {
 /// refinements) so a single entity change is a candidate for several
 /// subscriptions at once, exercising the reactor's per-subscription fan-out.
 #[test]
-fn volume_subscription_fanout() {
-    let queries = vol_queries();
-    let entities = (vol_entities() / 4).max(8); // Keep the churn modest; the fan-out is the variable.
+fn subscription_fanout() {
+    let queries = shape_queries();
+    let entities = (shape_entities() / 4).max(8); // Keep the churn modest; the fan-out is the variable.
     let budget = fanout_budget(queries, entities);
     let mut worst = 0usize;
-    for seed in 0..vol_seeds() {
+    for seed in 0..shape_seeds() {
         let faults = FaultConfig::swarm_from_seed(seed);
-        let peak = run_measured("volume_subscription_fanout", seed, faults, 3, budget, || {
+        let peak = run_measured("subscription_fanout", seed, faults, 3, budget, || {
             body(move |w: &mut Workload| {
                 Box::pin(async move {
                     // Establish overlapping live queries across the ephemeral
@@ -333,33 +340,33 @@ fn volume_subscription_fanout() {
         worst = worst.max(peak);
     }
     eprintln!(
-        "VOLMEM-SUMMARY volume_subscription_fanout queries={queries} entities={entities} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}"
+        "SHAPEMEM-SUMMARY subscription_fanout queries={queries} entities={entities} worst_peak_above_baseline_bytes={worst} budget_bytes={budget}"
     );
 }
 
 // ===========================================================================
 // Nightly-scale variants: the same four shapes at high scale, `#[ignore]` so
 // the normal test job runs only the default-scale tests above. The nightly job
-// runs these with `--ignored` and the VOL_* knobs turned up.
+// runs these with `--ignored` and the SHAPE_* knobs turned up.
 // ===========================================================================
 
-/// Nightly-scale churn. Same body as `volume_multi_entity_churn`; separated so
-/// the default job stays fast and the nightly job can crank `VOL_ENTITIES`.
+/// Nightly-scale churn. Same body as `multi_entity_churn`; separated so the
+/// default job stays fast and the nightly job can crank `SHAPE_ENTITIES`.
 #[test]
-#[ignore = "nightly scale tier; run with --ignored and VOL_* env knobs"]
-fn nightly_volume_multi_entity_churn() { volume_multi_entity_churn(); }
+#[ignore = "nightly event-DAG-shape scale tier; run with --ignored and SHAPE_* env knobs"]
+fn nightly_multi_entity_churn() { multi_entity_churn(); }
 
 /// Nightly-scale deep history.
 #[test]
-#[ignore = "nightly scale tier; run with --ignored and VOL_* env knobs"]
-fn nightly_volume_deep_single_entity_history() { volume_deep_single_entity_history(); }
+#[ignore = "nightly event-DAG-shape scale tier; run with --ignored and SHAPE_* env knobs"]
+fn nightly_deep_single_entity_history() { deep_single_entity_history(); }
 
 /// Nightly-scale wide antichain.
 #[test]
-#[ignore = "nightly scale tier; run with --ignored and VOL_* env knobs"]
-fn nightly_volume_wide_concurrent_antichain() { volume_wide_concurrent_antichain(); }
+#[ignore = "nightly event-DAG-shape scale tier; run with --ignored and SHAPE_* env knobs"]
+fn nightly_wide_concurrent_antichain() { wide_concurrent_antichain(); }
 
 /// Nightly-scale subscription fan-out.
 #[test]
-#[ignore = "nightly scale tier; run with --ignored and VOL_* env knobs"]
-fn nightly_volume_subscription_fanout() { volume_subscription_fanout(); }
+#[ignore = "nightly event-DAG-shape scale tier; run with --ignored and SHAPE_* env knobs"]
+fn nightly_subscription_fanout() { subscription_fanout(); }

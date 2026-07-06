@@ -1,18 +1,18 @@
-# Macro performance baseline (phase 2, E-vol perf tier)
+# Per-lane end-to-end performance baseline (phase 2, E-shapes perf tier)
 
-Wall-clock macro baseline for the concurrency phase 2 macro/volume workstream
-(E-vol). It is the real-runtime counterpart to the micro baseline in
+Wall-clock per-lane baseline for the concurrency phase 2 E-shapes workstream. It
+is the real-runtime counterpart to the micro baseline in
 `core/benches/BASELINE.md`, captured on the same machine at the same phase-2
-point so later optimization work (workstream E2) has a fixed macro reference
+point so later optimization work (workstream E2) has a fixed per-lane reference
 that predates the workstream D refactors.
 
 ## Why this lives here and not next to BASELINE.md
 
 `core/benches/BASELINE.md` documents the criterion micro-benches in
 `core/benches/`, which reach the crate-internal event-DAG engine through
-`ankurah_core::bench_support`. The macro benches measured here live in the
-`ankurah-tests` crate (`tests/benches/macro_perf.rs`) because they exercise the
-full stack: real multi-threaded tokio and the production in-process connector
+`ankurah_core::bench_support`. The per-lane end-to-end benches measured here live
+in the `ankurah-tests` crate (`tests/benches/lane_perf.rs`) because they exercise
+the full stack: real multi-threaded tokio and the production in-process connector
 (`LocalProcessConnection`) across durable and ephemeral Nodes. That harness is
 not a `core` bench and does not belong beside the core micro doc. It sits with
 the phase-2 spec that governs it (`specs/concurrency/phase-2.md`, workstream E).
@@ -25,12 +25,12 @@ Numbers are criterion medians (the middle value of criterion's
 are meant for relative comparison and regression tracking, not as absolute
 throughput or latency guarantees. They are ADVISORY: the perf tier is not run in
 the normal CI test job (criterion benches are not tests), so these do not gate
-merges. They exist to catch large macro regressions across the workstream D
+merges. They exist to catch large per-lane regressions across the workstream D
 refactors and to give E2 a before-picture.
 
-Only this tier produces performance numbers. The volume tier
-(`tests/tests/sim_volume.rs`) runs on a single-threaded virtual transport; its
-timings are meaningless as wall-clock and are never reported here.
+Only this tier produces performance numbers. The event-DAG-shape scale tier
+(`tests/tests/sim_event_dag_shapes.rs`) runs on a single-threaded virtual
+transport; its timings are meaningless as wall-clock and are never reported here.
 
 ## Hardware and toolchain
 
@@ -47,12 +47,12 @@ timings are meaningless as wall-clock and are never reported here.
 ## Command
 
 ```sh
-cargo bench -p ankurah-tests --bench macro_perf
+cargo bench -p ankurah-tests --bench lane_perf
 ```
 
-Captured on main at `ce2f7cab` plus the E-vol branch (this instrument), all
+Captured on main at `ce2f7cab` plus the E-shapes branch (this instrument), all
 groups in one run, with the criterion sampling shown per group below. Raw
-criterion log kept outside the repo (`macro_bench_corrected.log`).
+criterion log kept outside the repo (`lane_bench_corrected.log`).
 
 ## Measurements
 

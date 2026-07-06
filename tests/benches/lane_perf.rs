@@ -1,27 +1,28 @@
-//! Macro performance benchmarks for concurrency phase 2 (E-vol perf tier).
+//! Per-lane end-to-end benchmarks for concurrency phase 2 (E-shapes perf tier).
 //!
 //! This is the WALL-CLOCK, ADVISORY instrument, and it is deliberately kept
-//! separate from the volume tier (`tests/tests/sim_volume.rs`, deterministic
-//! correctness and memory). Everything here runs on a REAL multi-threaded tokio
-//! runtime over the production in-process connector (`LocalProcessConnection`),
-//! NOT the single-threaded sim transport. Only numbers from this tier are ever
-//! reported as performance figures; sim-harness timings are meaningless as
-//! wall-clock (single-threaded virtual transport) and are never quoted.
+//! separate from the event-DAG-shape scale tier
+//! (`tests/tests/sim_event_dag_shapes.rs`, deterministic correctness and
+//! memory). Everything here runs on a REAL multi-threaded tokio runtime over the
+//! production in-process connector (`LocalProcessConnection`), NOT the
+//! single-threaded sim transport. Only numbers from this tier are ever reported
+//! as performance figures; sim-harness timings are meaningless as wall-clock
+//! (single-threaded virtual transport) and are never quoted.
 //!
 //! Build and run:
 //!
 //! ```text
-//! cargo bench -p ankurah-tests --bench macro_perf
+//! cargo bench -p ankurah-tests --bench lane_perf
 //! ```
 //!
 //! This target is `harness = false` (criterion supplies its own harness) and is
 //! NOT part of the normal `cargo test` job: criterion benches are not tests, and
-//! the wall-clock work here is far heavier than the volume smoke budget.
+//! the wall-clock work here is far heavier than the shape-tier smoke budget.
 //!
-//! Measurements (all medians recorded in specs/concurrency/MACRO-BASELINE.md):
+//! Measurements (all medians recorded in specs/concurrency/LANE-BASELINE.md):
 //!
 //! - `single_writer_commit`: commit throughput on one durable node (one writer,
-//!   no peers), reported by criterion as time per commit; MACRO-BASELINE.md
+//!   no peers), reported by criterion as time per commit; LANE-BASELINE.md
 //!   converts to commits/sec.
 //! - `commit_to_subscriber_latency`: wall time from a server commit to the
 //!   client LiveQuery change notification firing, over a LocalProcessConnection.
@@ -457,11 +458,11 @@ fn bench_subscription_establishment(c: &mut Criterion) {
 }
 
 criterion_group!(
-    macro_perf,
+    lane_perf,
     bench_single_writer_commit,
     bench_commit_to_subscriber_latency,
     bench_fresh_fetch_snapshot,
     bench_bridge_catchup,
     bench_subscription_establishment
 );
-criterion_main!(macro_perf);
+criterion_main!(lane_perf);

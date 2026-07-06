@@ -1,18 +1,19 @@
-//! Counting global allocator for the volume-tier memory measurements (E-vol).
+//! Counting global allocator for the event-DAG-shape tier memory measurements
+//! (E-shapes).
 //!
-//! This is the sanctioned methodology for the volume tier: a small test-only
-//! wrapper around the system allocator that tracks currently-live bytes and the
-//! peak live-bytes high-water mark, so a scenario can read peak heap use without
-//! reaching for process-level RSS (which is noisy, includes the runtime and the
-//! sled page cache, and is not attributable to a single scenario). The counters
-//! are process-global because a `#[global_allocator]` is process-global; a
-//! scenario therefore measures a delta and a peak across a `reset()` boundary,
-//! not an absolute.
+//! This is the sanctioned methodology for the event-DAG-shape scale tier: a
+//! small test-only wrapper around the system allocator that tracks
+//! currently-live bytes and the peak live-bytes high-water mark, so a scenario
+//! can read peak heap use without reaching for process-level RSS (which is
+//! noisy, includes the runtime and the sled page cache, and is not attributable
+//! to a single scenario). The counters are process-global because a
+//! `#[global_allocator]` is process-global; a scenario therefore measures a
+//! delta and a peak across a `reset()` boundary, not an absolute.
 //!
-//! It is installed as the `#[global_allocator]` ONLY in the `sim_volume`
-//! integration-test binary (each integration test is its own binary), so the
-//! per-allocation atomic bookkeeping perturbs nothing else in
-//! `cargo test -p ankurah-tests`.
+//! It is installed as the `#[global_allocator]` ONLY in the
+//! `sim_event_dag_shapes` integration-test binary (each integration test is its
+//! own binary), so the per-allocation atomic bookkeeping perturbs nothing else
+//! in `cargo test -p ankurah-tests`.
 //!
 //! Accounting is deliberately simple and honest about its limits:
 //!
@@ -32,9 +33,9 @@
 //! The E-A / 271-D caveat governs interpretation, not the mechanism: a
 //! sequence-CRDT tombstone set is lower-bounded by deletion history, so a
 //! scenario that accumulates deletions will show peak growth that is a property
-//! of the data model (folded only by sealing), not a leak. The volume scenarios
-//! avoid deletions for exactly this reason and their bounds are documented as
-//! order-of-magnitude sanity checks, never tight thresholds.
+//! of the data model (folded only by sealing), not a leak. The event-DAG-shape
+//! scenarios avoid deletions for exactly this reason and their bounds are
+//! documented as order-of-magnitude sanity checks, never tight thresholds.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
