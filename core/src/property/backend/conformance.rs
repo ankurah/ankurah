@@ -1,5 +1,13 @@
 //! Backend conformance kit: executable laws every `PropertyBackend` must satisfy.
 //!
+//! TEST CODE ONLY. This entire module is `#![cfg(test)]`: it compiles into
+//! core's own test builds and contributes nothing to the shipped library. It
+//! lives inside core (rather than the integration-test crate) because the
+//! laws exercise `apply_layer`, whose `EventLayer` parameter is crate
+//! private; when the #267 remainder designs the public layer-view API (D8),
+//! the kit can graduate to a standalone test-support crate that external
+//! backend authors import directly.
+//!
 //! The property backend boundary (RFC ankurah#267) is a contract that any
 //! implementation, including ones written outside this crate, must honor. This
 //! module encodes that contract as reusable property tests parameterized over a
@@ -36,8 +44,8 @@
 //! Per verdict 267-A ("silence is the one unacceptable option"), intent quality
 //! is addressed rather than ignored:
 //!
-//! - Where intent is mechanically testable against a golden oracle, the kit adds
-//!   a law for it. For LWW this is the causal-dominance law (the
+//! - Where the intended outcome is mechanically checkable, the kit adds a law
+//!   for it. For LWW this is the causal-dominance law (the
 //!   `causal_dominance_beats_hash_tiebreak` test): a causally-later write must
 //!   always beat a causally-earlier one regardless of content-hash tiebreak order
 //!   (verdict 267-C). For Yrs this is the interleaving probe (the
