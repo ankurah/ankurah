@@ -148,49 +148,44 @@ impl NodeApplier {
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
                 let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
-                // Wire order is untrusted for every multi-event shape, not
-                // just bridges: a child applied before its staged parent
-                // gap-jumps the head and drops the parent's operations (V4).
-                let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
 
                 // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
                 let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
                 entities.push(entity.clone());
 
-                let mut applied_events = Vec::new();
-                let mut failure: Option<MutationError> = None;
-                for event in attested_events {
-                    // Events should always be appliable sequentially
-                    let applied = match entity.apply_event(event_getter, &event.payload).await {
-                        Ok(applied) => applied,
-                        Err(e) => {
-                            failure = Some(e);
-                            break;
+                // Second arm on the ingest pipeline (D1 M3). The planner
+                // orders the staged closure parents-first (wire order is
+                // untrusted for every multi-event shape, V4) and the executor
+                // owns apply-then-commit, uniform state persistence, phantom
+                // eviction, and the applied-prefix containment this arm
+                // pioneered (C4-11).
+                let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
+                let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                let persist = NodePersist { node, collection: &collection };
+                let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+
+                // Anything applied before a failure is real progress; notify
+                // it. Streaming updates carry the applied events on the change.
+                if outcome.advanced() {
+                    changes.push(EntityChange::new(entity.clone(), outcome.applied.clone())?);
+                }
+
+                if let Some(failure) = outcome.failure {
+                    return Err(failure);
+                }
+                // Until the typed-error migration (M5), unintegrable events
+                // keep today's per-item error surface: NeedsEvents surfaces
+                // the missing parent as EventNotFound, NeedsState as the
+                // empty-head rejection.
+                for (_, o) in &outcome.outcomes {
+                    match o {
+                        IngestOutcome::NeedsEvents { missing } => {
+                            let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
+                            return Err(RetrievalError::EventNotFound(id).into());
                         }
-                    };
-                    if applied {
-                        if let Err(e) = event_getter.commit_event(&event).await {
-                            failure = Some(e);
-                            break;
-                        }
-                        applied_events.push(event);
+                        IngestOutcome::NeedsState { .. } => return Err(MutationError::InvalidEvent),
+                        _ => {}
                     }
-                }
-
-                // Anything applied before a failure is real progress; notify it.
-                if !applied_events.is_empty() {
-                    changes.push(EntityChange::new(entity.clone(), applied_events)?);
-                }
-
-                if let Some(e) = failure {
-                    // get_retrieve_or_create may have materialized an empty-head
-                    // resident for an entity we know nothing about (e.g. a
-                    // non-creation event for an entity that was never received).
-                    // Evict it, or the entity appears to exist with no state.
-                    // Recovering by requesting state from the peer is tracked as
-                    // a follow-up.
-                    node.entities.remove_if_phantom(&entity_id);
-                    return Err(e);
                 }
             }
 

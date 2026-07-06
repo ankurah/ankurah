@@ -14,9 +14,10 @@
 //! likely descend from the failed one), but the applied prefix is real
 //! progress: it is persisted, reported, and notified. That is the C4-11
 //! semantic the EventOnly arm had and the EventBridge arm lacked; the
-//! executor gives it to every feed. Phantom eviction on failure is likewise
-//! uniform here (C4-12): a speculatively materialized empty-head resident
-//! never survives a failed item.
+//! executor gives it to every feed. Phantom eviction is likewise uniform
+//! here (C4-12): a speculatively materialized empty-head resident never
+//! survives an item that failed to give it state, whether by hard failure
+//! or by an unresolved NeedsState/NeedsEvents outcome.
 //!
 //! Recoverable non-failures (missing parents) surface as typed outcomes,
 //! not errors: the event stays staged for descendant re-drive (268-B).
@@ -144,9 +145,14 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
         }
     }
 
-    if failure.is_some() {
-        // A speculative empty-head resident from get_retrieve_or_create must
-        // not outlive its failed item (C4-12), uniformly on every arm.
+    // A speculative empty-head resident from get_retrieve_or_create must not
+    // outlive an item that failed to give it state (C4-12), uniformly on
+    // every arm. Hard failures and unresolved outcomes (NeedsState,
+    // NeedsEvents) both leave a phantom stateless; the staged events survive
+    // in the staging area, and remove_if_phantom is a no-op for an entity
+    // with real state.
+    let unresolved = outcomes.iter().any(|(_, o)| matches!(o, IngestOutcome::NeedsState { .. } | IngestOutcome::NeedsEvents { .. }));
+    if failure.is_some() || unresolved {
         entities.remove_if_phantom(&entity.id());
     }
 
