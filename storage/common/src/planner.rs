@@ -338,9 +338,11 @@ impl Planner {
     fn extract_comparison(&self, predicate: &Predicate) -> Option<(String, ComparisonOperator, Value)> {
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                // Extract field path from left side (supports multi-step paths)
+                // Extract field path from left side (supports multi-step paths).
+                // A resolved Identifier behaves as the equivalent [name, ..subpath] Path.
                 let field_path = match left.as_ref() {
                     Expr::Path(path) => path.steps.join("."),
+                    Expr::Identifier(identifier) => identifier.path_steps().join("."),
                     _ => return None,
                 };
 
@@ -781,9 +783,17 @@ impl Planner {
     fn extract_primary_key_bound(&self, predicate: &Predicate, primary_key: &str) -> Option<KeyBoundComponent> {
         if let Predicate::Comparison { left, operator, right } = predicate {
             // Check if this is a primary key comparison
+            // A resolved Identifier addresses the primary key when its subpath is
+            // empty and its resolved name matches, mirroring a simple Path.
             let value = match (left.as_ref(), right.as_ref()) {
                 (Expr::Path(path), Expr::Literal(literal)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
                 (Expr::Literal(literal), Expr::Path(path)) if path.is_simple() && path.first() == primary_key => Value::from(literal),
+                (Expr::Identifier(identifier), Expr::Literal(literal)) if identifier.is_simple() && identifier.name == primary_key => {
+                    Value::from(literal)
+                }
+                (Expr::Literal(literal), Expr::Identifier(identifier)) if identifier.is_simple() && identifier.name == primary_key => {
+                    Value::from(literal)
+                }
                 _ => return None,
             };
 
@@ -883,6 +893,8 @@ impl Planner {
         if let Predicate::Comparison { left, operator: _, right: _ } = predicate {
             match left.as_ref() {
                 Expr::Path(path) if path.is_simple() => path.first() == primary_key,
+                // A resolved Identifier mirrors a simple Path on the primary key.
+                Expr::Identifier(identifier) if identifier.is_simple() => identifier.name == primary_key,
                 _ => false,
             }
         } else {
@@ -908,6 +920,8 @@ impl Planner {
                 // Check if this is a primary key comparison with supported operators
                 let is_primary_key_field = match left.as_ref() {
                     Expr::Path(path) if path.is_simple() => path.first() == primary_key,
+                    // A resolved Identifier mirrors a simple Path on the primary key.
+                    Expr::Identifier(identifier) if identifier.is_simple() => identifier.name == primary_key,
                     _ => false,
                 };
 

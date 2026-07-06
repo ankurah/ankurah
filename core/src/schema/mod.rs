@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod genesis;
 pub mod local;
 pub mod registration;
+pub mod resolve;
 
 pub use local::{registration_request, FieldSchema, ModelSchema};
 

@@ -119,6 +119,9 @@ fn can_pushdown_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => true,
         Expr::Path(path) => !path.steps.is_empty(),
+        // A resolved Identifier is pushable exactly like the equivalent Path: it
+        // renders as a column (name) with optional JSON sub-path.
+        Expr::Identifier(_) => true,
         Expr::ExprList(exprs) => exprs.iter().all(can_pushdown_expr),
         Expr::Predicate(_) => false,
         Expr::InfixExpr { .. } => false,
@@ -177,25 +180,11 @@ impl SqlBuilder {
         match expr {
             Expr::Placeholder => return Err(SqlGenerationError::PlaceholderFound),
             Expr::Literal(lit) => self.literal(lit),
-            Expr::Path(path) => {
-                if path.is_simple() {
-                    // Single-step path: regular column reference
-                    let escaped = path.first().replace('"', "\"\"");
-                    self.push_sql(&format!(r#""{}""#, escaped));
-                } else {
-                    // Multi-step path: JSONB traversal
-                    // SQLite's -> operator returns JSONB, but for comparisons we need to extract the value.
-                    // Use json_extract() with the full JSON path for reliable comparisons.
-                    let first = path.first().replace('"', "\"\"");
-                    // Build JSON path: $.step1.step2.step3
-                    let json_path = if path.steps.len() == 2 {
-                        format!("$.{}", path.steps[1].replace('\'', "''"))
-                    } else {
-                        format!("$.{}", path.steps.iter().skip(1).map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."))
-                    };
-                    self.push_sql(&format!(r#"json_extract("{}", '{}')"#, first, json_path));
-                }
-            }
+            Expr::Path(path) => self.path_steps_sql(&path.steps),
+            // A resolved Identifier renders exactly like the equivalent Path with
+            // steps [name, ..subpath]: a column reference, or json_extract() for a
+            // JSON sub-path. Phase A: the resolved name is the SQLite column.
+            Expr::Identifier(identifier) => self.path_steps_sql(&identifier.path_steps()),
             Expr::ExprList(exprs) => {
                 self.push_sql("(");
                 for (i, expr) in exprs.iter().enumerate() {
@@ -209,6 +198,29 @@ impl SqlBuilder {
             _ => return Err(SqlGenerationError::UnsupportedExpression("Only literal, path, and list expressions are supported")),
         }
         Ok(())
+    }
+
+    /// Emit a column reference (or JSON sub-path extraction) for a sequence of
+    /// path steps. Shared by the `Expr::Path` and `Expr::Identifier` arms so both
+    /// render identically.
+    fn path_steps_sql(&mut self, steps: &[String]) {
+        if steps.len() == 1 {
+            // Single-step path: regular column reference
+            let escaped = steps[0].replace('"', "\"\"");
+            self.push_sql(&format!(r#""{}""#, escaped));
+        } else {
+            // Multi-step path: JSONB traversal
+            // SQLite's -> operator returns JSONB, but for comparisons we need to extract the value.
+            // Use json_extract() with the full JSON path for reliable comparisons.
+            let first = steps[0].replace('"', "\"\"");
+            // Build JSON path: $.step1.step2.step3
+            let json_path = if steps.len() == 2 {
+                format!("$.{}", steps[1].replace('\'', "''"))
+            } else {
+                format!("$.{}", steps.iter().skip(1).map(|s| s.replace('\'', "''")).collect::<Vec<_>>().join("."))
+            };
+            self.push_sql(&format!(r#"json_extract("{}", '{}')"#, first, json_path));
+        }
     }
 
     fn literal(&mut self, lit: &Literal) {
@@ -413,6 +425,53 @@ mod tests {
 
         // Numeric comparison with json_extract() - SQLite handles numeric comparison correctly
         assert_eq!(sql_string, r#"json_extract("data", '$.count') > ?"#);
+    }
+
+    /// Build the WHERE clause for a single `left op 'active'` comparison predicate.
+    fn where_for(left: ankql::ast::Expr) -> String {
+        use ankql::ast::{ComparisonOperator, Expr, Literal, Predicate};
+        let predicate = Predicate::Comparison {
+            left: Box::new(left),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("active".to_string()))),
+        };
+        let mut sql = SqlBuilder::new();
+        sql.predicate(&predicate).unwrap();
+        sql.build_where_clause().0
+    }
+
+    #[test]
+    fn test_identifier_renders_like_path_simple() {
+        use ankql::ast::{Expr, Identifier, PathExpr};
+        use ulid::Ulid;
+
+        // A simple resolved Identifier renders as the column named `name`, exactly
+        // like the equivalent single-step Path. (The parser never produces Identifier,
+        // so we construct it programmatically.)
+        let id_sql =
+            where_for(Expr::Identifier(Identifier { property: Ulid::from_bytes([5u8; 16]), name: "status".to_string(), subpath: vec![] }));
+        let path_sql = where_for(Expr::Path(PathExpr::simple("status")));
+
+        assert_eq!(id_sql, r#""status" = ?"#);
+        assert_eq!(id_sql, path_sql);
+    }
+
+    #[test]
+    fn test_identifier_renders_like_path_json_subpath() {
+        use ankql::ast::{Expr, Identifier, PathExpr};
+        use ulid::Ulid;
+
+        // An Identifier with a JSON subpath renders json_extract() identically to the
+        // equivalent multi-step Path.
+        let id_sql = where_for(Expr::Identifier(Identifier {
+            property: Ulid::from_bytes([5u8; 16]),
+            name: "data".to_string(),
+            subpath: vec!["user".to_string(), "name".to_string()],
+        }));
+        let path_sql = where_for(Expr::Path(PathExpr { steps: vec!["data".to_string(), "user".to_string(), "name".to_string()] }));
+
+        assert_eq!(id_sql, r#"json_extract("data", '$.user.name') = ?"#);
+        assert_eq!(id_sql, path_sql);
     }
 
     #[test]

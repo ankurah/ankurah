@@ -463,6 +463,13 @@ fn generate_expr_code_with_replacements(
                 ::ankql::ast::Expr::ExprList(vec![#(#expr_codes),*])
             }
         }
+        // The parser never produces a resolved Identifier -- it is the output of a
+        // resolution pass that runs on already-parsed ASTs, not of parse_selection,
+        // which is what feeds this codegen. This arm exists only to keep the match
+        // exhaustive.
+        ankql::ast::Expr::Identifier(_) => {
+            panic!("selection! macro received a resolved Identifier; the parser only produces PathExpr")
+        }
     }
 }
 

@@ -20,6 +20,14 @@ impl PropertyPath {
         Self { root: steps[0].clone(), sub_path: steps[1..].to_vec() }
     }
 
+    /// Create a PropertyPath from a resolved Identifier. Behaves as the equivalent
+    /// [name, ..subpath] Path: the resolved name is the root, the subpath is the
+    /// JSON sub-path. Phase A: value extraction remains name-based, so this indexes
+    /// identically to the Path it was resolved from.
+    pub fn from_identifier(identifier: &ankql::ast::Identifier) -> Self {
+        Self { root: identifier.name.clone(), sub_path: identifier.subpath.clone() }
+    }
+
     /// Get the root property name
     pub fn root(&self) -> &str { &self.root }
 

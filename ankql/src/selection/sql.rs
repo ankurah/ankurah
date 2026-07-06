@@ -81,6 +81,18 @@ fn generate_expr_sql(
                 buffer.push('"');
             }
         }
+        Expr::Identifier(identifier) => {
+            // Render exactly like the equivalent Path (name, then dotted subpath):
+            // "name"."sub"."path". The resolved name is the SQL column.
+            for (i, step) in identifier.path_steps().iter().enumerate() {
+                if i > 0 {
+                    buffer.push('.');
+                }
+                buffer.push('"');
+                buffer.push_str(step);
+                buffer.push('"');
+            }
+        }
         Expr::ExprList(exprs) => {
             buffer.push('(');
             for (i, expr) in exprs.iter().enumerate() {

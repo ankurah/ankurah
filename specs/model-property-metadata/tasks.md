@@ -133,12 +133,24 @@ DONE: PR #306; decision record posted on #294.
 
 ## 6. ankql Identifier and resolution
 
-- [ ] `Identifier { property, name, subpath }` AST node; PathExpr stays
-      the parse form.
-- [ ] Resolution pass (local compiled schema, then catalog map);
-      UnknownProperty fail-closed naming collection and property;
-      wait_catalog_ready deferral for schema-less consumers; absorbs
-      the TypeResolver pass at its four call sites.
+- [x] `Identifier { property, name, subpath }` AST node (property is a
+      raw Ulid; ankql cannot dep on proto); PathExpr stays the parse
+      form; every Expr match site across ankql/core/storage handles
+      Identifier with Path-equivalent semantics; assume_null keys on
+      the resolved name for subpaths BY DESIGN (the first-vs-last-step
+      fix). NOTE for the resolution slice: Identifier evaluation
+      currently shares Path's legacy collection-qualifier branch; a
+      post-resolution Identifier should skip it (name == collection
+      edge).
+- [x] Resolution pass (CatalogManager::resolve_selection): binds
+      steps[0] via the catalog, UnknownProperty fail-closed naming
+      collection and property, id pseudo-property passthrough, legacy
+      collection-qualifier normalization, idempotent on resolved input,
+      rename follows the property id (tests/tests/resolution.rs).
+      DELIBERATELY UNWIRED from the query paths: fail-closed resolution
+      flips on with the client registration lifecycle + protocol v2
+      epoch (no interim state, rev 3). wait_catalog_ready deferral and
+      TypeResolver absorption land with that flip.
 - [ ] Fetch/SubscribeQuery carry resolved Selections; receiver-side
       pass-through for unknown ids (until #274).
 - [ ] Engines consume Identifier.name for columns; assume_null /

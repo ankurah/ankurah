@@ -56,39 +56,12 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
     match expr {
         Expr::Placeholder => Err(Error::PropertyNotFound("Placeholder values must be replaced before filtering".to_string())),
         Expr::Literal(lit) => Ok(ExprOutput::Value(lit.clone().into())),
-        Expr::Path(path) => {
-            // For simple paths, use the first step as the property name
-            if path.is_simple() {
-                let name = path.first();
-                Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?))
-            } else {
-                // Multi-step path - could be:
-                // 1. Collection.property (legacy, check if first step matches collection)
-                // 2. property.nested.path (JSON traversal)
-
-                let first = path.first();
-
-                // First, check if it's a collection-qualified path
-                if first == item.collection() {
-                    // Treat remaining path as property access
-                    let remaining = &path.steps[1..];
-                    if remaining.len() == 1 {
-                        // Simple collection.property
-                        let name = &remaining[0];
-                        return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
-                    }
-                    // collection.property.nested... - get property and traverse sub-path
-                    let property_name = &remaining[0];
-                    let sub_path = &remaining[1..];
-                    return evaluate_sub_path(item, property_name, sub_path);
-                }
-
-                // Not a collection qualifier - treat first step as property, rest as sub-path
-                let property_name = first;
-                let sub_path: Vec<&str> = path.steps[1..].iter().map(|s| s.as_str()).collect();
-                evaluate_sub_path(item, property_name, &sub_path)
-            }
-        }
+        Expr::Path(path) => evaluate_path_steps(item, &path.steps),
+        // Phase A: evaluate a resolved Identifier EXACTLY like a Path whose steps are
+        // [name, ..subpath] (name-based entity value lookup + sub-path extraction). The
+        // switch to id-based lookup arrives later with the v2 integration -- do not
+        // attempt it now.
+        Expr::Identifier(identifier) => evaluate_path_steps(item, &identifier.path_steps()),
         Expr::ExprList(exprs) => {
             let mut result = Vec::new();
             for expr in exprs {
@@ -98,6 +71,43 @@ fn evaluate_expr<I: Filterable>(item: &I, expr: &Expr) -> Result<ExprOutput<Valu
         }
         _ => Err(Error::UnsupportedExpression("Only literal, path, and list expressions are supported")),
     }
+}
+
+/// Evaluate a sequence of path steps (as produced by `PathExpr::steps` or
+/// `Identifier::path_steps`) against an item. Shared by the `Expr::Path` and
+/// `Expr::Identifier` arms so both evaluate identically (Phase A: name-based).
+fn evaluate_path_steps<I: Filterable>(item: &I, steps: &[String]) -> Result<ExprOutput<Value>, Error> {
+    // For simple paths, use the first step as the property name
+    if steps.len() == 1 {
+        let name = steps[0].as_str();
+        return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
+    }
+
+    // Multi-step path - could be:
+    // 1. Collection.property (legacy, check if first step matches collection)
+    // 2. property.nested.path (JSON traversal)
+
+    let first = steps[0].as_str();
+
+    // First, check if it's a collection-qualified path
+    if first == item.collection() {
+        // Treat remaining path as property access
+        let remaining = &steps[1..];
+        if remaining.len() == 1 {
+            // Simple collection.property
+            let name = &remaining[0];
+            return Ok(ExprOutput::Value(item.value(name).ok_or_else(|| Error::PropertyNotFound(name.to_string()))?));
+        }
+        // collection.property.nested... - get property and traverse sub-path
+        let property_name = &remaining[0];
+        let sub_path = &remaining[1..];
+        return evaluate_sub_path(item, property_name, sub_path);
+    }
+
+    // Not a collection qualifier - treat first step as property, rest as sub-path
+    let property_name = first;
+    let sub_path: Vec<&str> = steps[1..].iter().map(|s| s.as_str()).collect();
+    evaluate_sub_path(item, property_name, &sub_path)
 }
 
 /// Evaluate a sub-path traversal: get property value, extract nested value at path
@@ -279,6 +289,46 @@ mod tests {
     }
 
     #[test]
+    fn test_identifier_evaluates_like_equivalent_path() {
+        // A predicate containing Expr::Identifier (constructed programmatically)
+        // evaluates identically to the same predicate written with Expr::Path.
+        use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, PathExpr, Predicate};
+        use ulid::Ulid;
+
+        let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "25"), TestItem::new("Charlie", "35")];
+
+        // Identifier { name: "name", subpath: [] } = 'Alice'
+        let id_pred = Predicate::Comparison {
+            left: Box::new(Expr::Identifier(Identifier {
+                property: Ulid::from_bytes([9u8; 16]),
+                name: "name".to_string(),
+                subpath: vec![],
+            })),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("Alice".to_string()))),
+        };
+        // The equivalent Path predicate.
+        let path_pred = Predicate::Comparison {
+            left: Box::new(Expr::Path(PathExpr::simple("name"))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("Alice".to_string()))),
+        };
+
+        let id_results: Vec<_> = FilterIterator::new(items.clone().into_iter(), id_pred).collect();
+        let path_results: Vec<_> = FilterIterator::new(items.into_iter(), path_pred).collect();
+
+        assert_eq!(id_results, path_results);
+        assert_eq!(
+            id_results,
+            vec![
+                FilterResult::Pass(TestItem::new("Alice", "30")),
+                FilterResult::Skip(TestItem::new("Bob", "25")),
+                FilterResult::Skip(TestItem::new("Charlie", "35")),
+            ]
+        );
+    }
+
+    #[test]
     fn test_and_condition() {
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "30"), TestItem::new("Charlie", "35")];
 
@@ -430,6 +480,43 @@ mod tests {
             assert!(matches!(results[0], FilterResult::Pass(_)));
             assert!(matches!(results[1], FilterResult::Skip(_)));
             assert!(matches!(results[2], FilterResult::Pass(_)));
+        }
+
+        #[test]
+        fn test_identifier_json_subpath_evaluates_like_path() {
+            // An Identifier with a JSON subpath evaluates identically to the equivalent
+            // multi-step Path (licensing.territory = 'US'), extracting the same nested value.
+            use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, PathExpr, Predicate};
+            use ulid::Ulid;
+
+            let items = vec![
+                TrackItem::new("Track A", serde_json::json!({ "territory": "US" })),
+                TrackItem::new("Track B", serde_json::json!({ "territory": "UK" })),
+                TrackItem::new("Track C", serde_json::json!({ "territory": "US" })),
+            ];
+
+            let id_pred = Predicate::Comparison {
+                left: Box::new(Expr::Identifier(Identifier {
+                    property: Ulid::from_bytes([3u8; 16]),
+                    name: "licensing".to_string(),
+                    subpath: vec!["territory".to_string()],
+                })),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String("US".to_string()))),
+            };
+            let path_pred = Predicate::Comparison {
+                left: Box::new(Expr::Path(PathExpr { steps: vec!["licensing".to_string(), "territory".to_string()] })),
+                operator: ComparisonOperator::Equal,
+                right: Box::new(Expr::Literal(Literal::String("US".to_string()))),
+            };
+
+            let id_results: Vec<_> = FilterIterator::new(items.clone().into_iter(), id_pred).collect();
+            let path_results: Vec<_> = FilterIterator::new(items.into_iter(), path_pred).collect();
+
+            assert_eq!(id_results, path_results);
+            assert!(matches!(id_results[0], FilterResult::Pass(_)));
+            assert!(matches!(id_results[1], FilterResult::Skip(_)));
+            assert!(matches!(id_results[2], FilterResult::Pass(_)));
         }
 
         #[test]

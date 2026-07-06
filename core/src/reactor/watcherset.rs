@@ -168,12 +168,23 @@ impl WatcherSet {
         use ankql::ast::{Expr, Predicate};
         match predicate {
             Predicate::Comparison { left, operator, right } => {
-                if let (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) = (&**left, &**right) {
+                // Extract (property_path, literal) from either a Path or a resolved
+                // Identifier on one side and a Literal on the other. An Identifier
+                // indexes as the equivalent [name, ..subpath] Path (Phase A: name-based).
+                let extracted = match (&**left, &**right) {
+                    (Expr::Path(path), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Path(path)) => {
+                        Some((PropertyPath::from_path(path), literal))
+                    }
+                    (Expr::Identifier(identifier), Expr::Literal(literal)) | (Expr::Literal(literal), Expr::Identifier(identifier)) => {
+                        Some((PropertyPath::from_identifier(identifier), literal))
+                    }
+                    _ => None,
+                };
+                if let Some((property_path, literal)) = extracted {
                     // Use the full path for indexing.
                     // For simple paths like `name`, this is just "name".
                     // For JSON paths like `context.task_id`, this is "context.task_id".
                     // accumulate_interested_watchers will extract the value at this path.
-                    let property_path = PropertyPath::from_path(path);
                     let index = self.index_watchers.entry((collection_id.clone(), property_path)).or_default();
 
                     match op {

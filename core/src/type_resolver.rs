@@ -34,14 +34,22 @@ impl TypeResolver {
     /// - `ValueType::Json` for multi-step paths (nested JSON traversal)
     /// - `ValueType::EntityId` for the "id" field
     /// - `None` for simple paths (caller should use literal's inherent type)
-    pub fn resolve_path(&self, path: &PathExpr) -> Option<ValueType> {
+    pub fn resolve_path(&self, path: &PathExpr) -> Option<ValueType> { self.resolve_steps(path.steps.len(), path.first()) }
+
+    /// Resolve the ValueType from a path's step count and first step. Shared by
+    /// `resolve_path` (parse-time `PathExpr`) and the resolved `Identifier` arm so
+    /// both infer identically:
+    /// - multi-step -> Json (nested JSON traversal)
+    /// - single-step named "id" -> EntityId
+    /// - otherwise None (caller uses the literal's inherent type)
+    fn resolve_steps(&self, step_count: usize, first_step: &str) -> Option<ValueType> {
         // Multi-step paths are JSON subfield traversals
-        if !path.is_simple() {
+        if step_count > 1 {
             return Some(ValueType::Json);
         }
 
         // The "id" field is always EntityId
-        if path.first() == "id" {
+        if first_step == "id" {
             return Some(ValueType::EntityId);
         }
 
@@ -83,6 +91,9 @@ impl TypeResolver {
     fn resolve_expr_type(&self, expr: &Expr) -> Option<ValueType> {
         match expr {
             Expr::Path(path) => self.resolve_path(path),
+            // A resolved Identifier resolves like a Path with steps [name, ..subpath]:
+            // multi-step -> Json, "id"-named -> EntityId. Mirrors resolve_path.
+            Expr::Identifier(identifier) => self.resolve_steps(1 + identifier.subpath.len(), &identifier.name),
             Expr::Literal(lit) => Some(Self::literal_type(lit)),
             _ => None,
         }

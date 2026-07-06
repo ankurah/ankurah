@@ -34,6 +34,17 @@ pub enum PropertyError {
 
     #[error("cast error: {0}")]
     CastError(CastError),
+
+    /// A property reference that neither the local compiled schema nor the
+    /// catalog defines: predicate building fails closed (RFC 5.3, AC5).
+    #[error("unknown property '{name}' in collection '{collection}'")]
+    UnknownProperty { collection: String, name: String },
+
+    /// A same-display-name sibling property (a retype lineage from any
+    /// contract) holds data on this entity: reads fail visible instead of
+    /// fabricating a default (RFC 5.4 rule 4).
+    #[error("type skew on '{name}': sibling property lineages {a} and {b} both hold data here")]
+    TypeSkew { name: String, a: String, b: String },
 }
 
 impl PartialEq for PropertyError {
