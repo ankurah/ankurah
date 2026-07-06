@@ -1,10 +1,14 @@
 # Implementation plan: model and property metadata
 
-Authority: rfc.md in this directory (RATIFIED rev 3, commit ff40a3bf).
-This plan translates the RFC into a build order; it does not re-argue
-design. Where the RFC delegated a decision to implementation, the choice
-is made here and collected in "Decisions made in this plan" at the bottom
-for async review. Code citations verified against this branch (based on
+Authority: rfc.md in this directory (RATIFIED rev 3, commit ff40a3bf;
+AMENDED to rev 4 on 2026-07-06 -- the identity plane pivoted from
+deterministic derivation to durable-allocated ids; ratification pending
+on #289). This plan translates the RFC into a build order; it does not
+re-argue design. Where the RFC delegated a decision to implementation,
+the choice is made here and collected in "Decisions made in this plan"
+at the bottom for async review. Rev 4 reworks A1/A2/A3/A5/A6 and amends
+decisions 8, 16, and 18 (marked in place); decisions 20-24 are the
+pivot's additions. Code citations verified against this branch (based on
 main 05593d0d = 0.9.0).
 
 Scope: Phase 0 (#294) and Phase A in full; Phase C outlined (engine-local,
@@ -18,11 +22,11 @@ data contract (a definition entity); Collection = a storage table name.
 ```
 Phase 0 (#294 protocol version)            <- gates every wire change
   |
-Phase A, one protocol epoch (proto v1 -> v2), build order:
-  A1 derivation  ->  A2 frozen genesis encoder  ->  A5 registration op
-  A1            ->  A3 create-with-derived-id   ->  A5
+Phase A, one protocol epoch (proto v1 -> v2), build order (rev 4):
+  A1 lookup keys + allocation ------------------->  A5 upsert executor
+                                                       + response
   A4 catalog collections + protection ----------->  A5, A6 receiver guard
-  A5, A7 catalog subscription/map -------------->  A8 LWW v2 fallback,
+  A5, A7 catalog subscription/map + response feed -> A8 LWW v2 fallback,
                                                     A9 resolution,
                                                     A11 lifecycle/macro
   A8 LWW v2 (testable early against a resolver trait)
@@ -31,6 +35,10 @@ Phase A, one protocol epoch (proto v1 -> v2), build order:
   A12 errors/guards/audits (cross-cutting, lands with its consumers)
   |
 Phase C (sled rekey, SQL column binding + rename DDL, IndexedDB)
+
+(Rev 4 deletions: A2 frozen genesis encoder is gone outright; A3
+create-with-derived-id reduces to feeding the existing known-id create
+path freshly allocated ids inside the executor.)
 ```
 
 Phase A work packages are ordered so that the pure, heavily-testable core
@@ -96,69 +104,41 @@ existing integration suite green on the bumped handshake.
 
 ## Phase A: the id-keyed epoch
 
-### A1. Identity derivation (RFC 5.1)
+### A1. Identity allocation (RFC 5.1; rev 4, was "Identity derivation")
 
-Pure functions, no I/O; home: proto (beside EntityId; sha2 is already a
-proto dependency for EventId hashing) so core, derive-macro consumers,
-and future bindings share one implementation.
+The rev 3 derivation module (proto/src/schema_id.rs: the three
+`*_entity_id` functions, golden vectors, the standalone-DDL zero scope)
+is DELETED, together with its tests. Identity is allocated: the
+registration executor (A5) mints `EntityId::new()` -- a true ULID -- on
+lookup miss. What A1 contributes now is the normative LOOKUP KEYS, which
+live with the executor rather than in proto:
 
-```rust
-// proto/src/schema_id.rs (new)
-pub fn model_entity_id(root: &EntityId, collection: &str) -> EntityId;
-pub fn property_entity_id(root: &EntityId, minting_model: &EntityId,
-                          anchor: &str, backend: &str, value_type: &str) -> EntityId;
-pub fn membership_entity_id(root: &EntityId, model: &EntityId,
-                            property: &EntityId) -> EntityId;
-```
+- model: by `collection`
+- property: by (model id, current name, backend, value_type) -- the type
+  pair stays in the key so a retype mints a new identity and the RFC 5.4
+  sibling gate keeps firing
+- membership: by (model id, property id)
 
-- SHA-256 over domain tag ("ankurah.model.v1" / "ankurah.property.v1" /
-  "ankurah.membership.v1") with every field length-prefixed as
-  `(len as u64).to_le_bytes()`; first 16 bytes into
-  `EntityId::from_bytes`. Full 16 bytes are hash output; never truncate
-  entropy (RFC 5.1).
-- Standalone-DDL scope (RFC 5.1): a zero model id constant for
-  standalone shared declarations; define it now, used by Phase D.
-- Golden-vector tests: fixed root and inputs, exact expected id bytes,
-  so any accidental change to tags, prefixing, or truncation breaks red.
-- Ulid audit (RFC 11.1): sweep for any code interpreting EntityId
-  timestamp bits; fix dependents or record "none found" in the PR.
+There is nothing to golden-vector: no byte surface participates in
+identity. The Ulid audit (old RFC 11.1) is moot; allocated ids carry
+real timestamps.
 
-### A2. Frozen genesis encoder + self-certification (RFC 5.1)
+### A2. Frozen genesis encoder + self-certification -- DELETED (rev 4)
 
-Home: core (needs core's Value); a standalone module, expressly NOT
-calling the live LWW encoder. Pinned forever to the v1 diff shape as it
-exists today: `Operation { diff: bincode(LWWDiff { version: 1, data:
-bincode(BTreeMap<PropertyName, Option<Value>>) }) }`
-(core/src/property/backend/lww.rs:18, 204-206), scalar Values only.
+core/src/schema/genesis.rs (the frozen encoder, FrozenValue,
+validate_catalog_genesis) and its golden/tamper suites are deleted with
+derivation. Catalog entities are created via ORDINARY events through the
+normal commit machinery; no identity-bearing byte surface exists to
+freeze, and there is nothing for receivers to recompute (RFC 5.1,
+section 4: single-allocator authority replaces self-certification).
 
-```rust
-// core/src/schema/genesis.rs (new)
-pub fn model_genesis(root, collection) -> (EntityId, Event);      // sets: collection
-pub fn property_genesis(root, minting_model, anchor, backend,
-                        value_type) -> (EntityId, Event);          // sets: minted_for, name, backend, value_type
-pub fn membership_genesis(root, model, property) -> (EntityId, Event); // sets: model, property
-pub fn validate_catalog_genesis(collection, event) -> Result<(), CatalogGenesisError>;
-```
+### A3. Creation inside the executor (rev 4, was "Create-with-derived-id")
 
-- Genesis = exactly the identity fields, one LWW operation, empty parent
-  clock; EventId computed the ordinary content-hash way.
-- `validate_catalog_genesis` recomputes the entity id from the decoded
-  payload and the event id from re-encoding; receivers and the executor
-  both use it (self-certifying genesis, RFC 4).
-- Tests: golden byte vectors for all three genesis kinds (encoder
-  drift breaks red, independent of lww.rs changes); two derivations of
-  the same definition produce identical EventIds; tampered payload
-  (field value, field set, or operation count) fails validation.
-
-### A3. Create-with-derived-id
-
-`Entity::create(id, collection)` exists (core/src/entity.rs:145-154) but
-`WeakEntitySet::create` mints ids internally (core/src/entity.rs:680-687)
-and the commit path rejects foreign-id creates via the phantom-entity
-guard (recorded in Transaction::create, core/src/transaction.rs:62-72;
-enforced in commit_local_trx, core/src/context.rs:84-98). Add a pub(crate)
-create-with-known-id path for the registration executor that registers
-with the phantom guard exactly as create() does. No public API.
+The known-id create path threaded through the phantom-entity guard
+(Transaction::create recording, core/src/transaction.rs:62-72; enforced
+in commit_local_trx, core/src/context.rs:84-98) survives, but the
+registration executor now feeds it freshly allocated `EntityId::new()`
+values instead of derived ones. No public API.
 
 ### A4. Catalog collections, protection constants, prefix reservation
 
@@ -175,95 +155,123 @@ with the phantom guard exactly as create() does. No public API.
   derive(Model) (the ouroboros rule, RFC 4); enforce by comment and by
   the derive-time prefix rejection.
 
-### A5. Registration as a protocol operation (RFC 5.2)
+### A5. Registration as an upsert protocol operation (RFC 5.2; rev 4)
 
-proto: language-agnostic descriptors and a new request variant beside
-Fetch/SubscribeQuery (proto/src/request.rs):
+proto: language-agnostic descriptors, a request variant beside
+Fetch/SubscribeQuery (proto/src/request.rs), and a response variant
+carrying the resolved definitions:
 
 ```rust
-pub struct ModelDescriptor      { pub collection: String, pub name: String }
-pub struct PropertyDescriptor   { pub minting_collection: String, pub anchor: String,
-                                  pub name: String, pub backend: String,
-                                  pub value_type: String,
-                                  pub target_model: Option<EntityId>,
+pub struct ModelDescriptor      { pub collection: String, pub name: String,
                                   pub explicit_id: Option<EntityId> }
-pub struct MembershipDescriptor { pub collection: String, pub property_anchor: String,
+pub struct PropertyDescriptor   { pub minting_collection: String, pub name: String,
+                                  pub backend: String, pub value_type: String,
+                                  pub target_collection: Option<String>,
+                                  pub renamed_from: Option<String>,
+                                  pub explicit_id: Option<EntityId> }
+pub struct MembershipDescriptor { pub collection: String, pub property_name: String,
                                   pub optional: bool }
-NodeRequestBody::RegisterSchema { models: Vec<ModelDescriptor>,
-                                  properties: Vec<PropertyDescriptor>,
-                                  memberships: Vec<MembershipDescriptor> }
+NodeRequestBody::RegisterSchema { models, properties, memberships }
+NodeResponseBody::SchemaRegistered { /* full resolved defs, ids included:
+                                       models, properties, memberships */ }
 ```
 
 (Descriptors reference models by collection string and properties by
-anchor within the request, since root-scoped ids are the executor's to
-derive; `explicit_id` carries a 5.9 binding. Exact field spelling may
-shift during implementation; the invariant is: everything the durable
-side needs, no Rust types, no pre-derived ids except explicit bindings.)
+NAME within the request; ids are the executor's to allocate or resolve,
+so no descriptor carries one except `explicit_id` 5.9 bindings.
+Reference-typed properties name their target model by collection,
+resolved executor-side. Exact field spelling may shift during
+implementation; the invariant is: everything the durable side needs, no
+Rust types, no client-supplied ids except explicit bindings, and the
+response returns every id the client needs to bind.)
 
-Durable-side executor in core:
+Durable-side executor in core, under a process-local mutex end to end:
 
-- Derive all ids (A1); consult the catalog map (A7) for existing
-  entities; run the anchor-reuse refusal (RFC 5.8: derived id exists
-  with a different current display name -> refuse, demand an anchor).
+- Look up each definition by its lookup key (A1) against the executor's
+  authoritative lookup state; allocate `EntityId::new()` on miss and
+  create via ordinary events; on hit, emit head-parented follow-ups only
+  where the requested metadata differs (decision 18's machinery,
+  unchanged).
+- Apply rename hints BEFORE lookup-or-create, guarded (RFC 5.8): only
+  when the current-name lookup misses and the hinted lookup hits; a
+  no-op otherwise. The hint write is an ordinary follow-up.
+- Build the resolution plan (creates / metadata updates / resolved
+  no-ops) and submit it to `check_schema_registration` (decision 26)
+  BEFORE emitting anything; refusal fails the whole request.
 - Explicit-id bindings (RFC 5.9): look up the entity, verify (backend,
   value_type), hard-fail on absence or mismatch, mint only the
   membership.
-- Emit frozen genesis events (A2) for unknown entities and ordinary LWW
-  follow-up events for non-identity fields (membership optional,
-  target_model, display name when it differs from the anchor); every
-  event passes `PolicyAgent::check_event` like any write (trait method,
-  core/src/policy.rs:89-96; commit-path call site
+- Resolve target-model collection references; allocate the model entity
+  on miss (RFC 5.2, preserves #236's circular-reference resolution).
+- Every event passes `PolicyAgent::check_event` like any write (trait
+  method, core/src/policy.rs:89-96; commit-path call site
   core/src/context.rs:129), which is the gate on who may define schema
   (data freedom: ephemeral nodes may define schema subject to policy).
-- Persist and relay through the normal commit machinery; idempotence is
-  structural (same derivation + frozen encoder = same EventId = no-op on
-  redelivery, core/src/entity.rs:251-254).
+- Persist and relay through the normal commit machinery; update the
+  executor's lookup state SYNCHRONOUSLY post-commit, before releasing
+  the mutex (the reactor-fed catalog map lags commit; RFC 5.1 executor
+  discipline).
+- Respond with SchemaRegistered carrying the full resolved definitions;
+  idempotence is the upsert's (a repeat request finds every key, emits
+  zero events, returns the same ids).
 - A durable node that runs model code executes the same operation
-  locally; response is success/error only (clients can derive ids
-  themselves).
+  locally and consumes the same response shape.
 
 Client side: on first mutating use of model M (create/edit), ensure
-registration: derive ids, check the local map, issue RegisterSchema if
-absent. Read paths (fetch/query/subscribe) derive and cache only.
-Explicit `ctx.register::<M>().await` issues eagerly. Offline: derive
-ids, write id-keyed data locally, queue the operation for reconnect
-(drain on durable-peer connect, beside the subscription relay's
-notify_peer_connected seam, core/src/node.rs:240-243).
+registration: check the local map, issue RegisterSchema if the binding
+is absent, AWAIT the response, and upsert the returned definitions into
+the CatalogManager map immediately on ack, so binding and id-keyed
+writes proceed right behind it. This replaces cache_compiled's local id
+derivation (impossible under allocation); cache_compiled reduces to
+recording compiled_schemas for the commit-time-registration gap. Read
+paths (fetch/query/subscribe) resolve through the map only. Explicit
+`ctx.register::<M>().await` issues eagerly. OFFLINE (rev 4 ruling): a
+never-registered collection is a strict error at create/commit
+("connect once first"); already-registered collections keep writing
+offline against the cached binding; the pending_registrations queue and
+drain_pending are DELETED (no reconnect drain; residue stays the
+representation for catalog lag and denied registrations, converged by
+normalize/migrate-on-bind).
 
-Tests: two-node concurrent registration converges to identical genesis
-EventIds; re-issued RegisterSchema and two durable executors are
-idempotent; policy denial refuses cleanly; offline queue drains on
-reconnect.
+Tests: upsert idempotency (register twice -> same ids, zero events);
+rename-hint application and its no-op guard; retype mints a distinct id
+(lookup key includes the type pair); policy denial refuses cleanly; the
+strict never-registered-offline error at create/commit.
 
-### A6. Receiver-side structural protection (RFC 4)
+### A6. Receiver-side structural protection (RFC 4; rev 4 trims it)
 
 - Durable nodes reject ordinary CommitTransaction requests carrying
   events that target any protected collection, outright, regardless of
   sender version. The only mutation path is the registration executor.
-- Catalog events arriving via peer replication validate by content:
-  genesis events must pass `validate_catalog_genesis` (A2); follow-ups
-  are policy-checked writes.
-- Tests: commit into `_ankurah_model` refused; tampered genesis refused;
-  legitimate registration relays and applies.
+- Catalog events arriving via peer replication are ordinary
+  policy-trusted events originating from the allocator; the rev 3
+  content self-certification (validate_catalog_genesis) is deleted with
+  derivation (RFC 4: single-allocator authority replaces it).
+- Tests: commit into `_ankurah_model` refused; legitimate registration
+  relays and applies.
 
 ### A7. Catalog subscription and map (RFC 5.2, AC3)
 
-- `CatalogMap` in core: by (minting model, anchor, backend, value_type)
+- `CatalogMap` in core: by (minting model, name, backend, value_type)
   -> property id; by property id -> definition; by model id ->
   membership set (the contract); by collection -> model id; display-name
   index per collection for resolution (A9) and the sibling gate (A10).
 - Warmed by three predicate-True subscriptions at system-ready, ordinary
   LiveQuery machinery (the catalog deliberately does NOT ride the
   Presence handshake the way the system collection does,
-  core/src/node.rs:245-258).
+  core/src/node.rs:245-258), and fed IMMEDIATELY by SchemaRegistered
+  responses (rev 4): ensure_registered upserts the returned definitions
+  on ack, ahead of reactor delivery.
 - `wait_catalog_ready` gate analogous to wait_system_ready
   (core/src/system.rs:97-101): consumers with no compiled schema defer
   resolution until the initial snapshot lands.
-- `hard_reset` flushes the catalog map and every derived-id cache along
-  with what it already clears (core/src/system.rs:208-234): derived ids
-  are root-scoped and must not leak across a root change.
+- `hard_reset` flushes the catalog map and every cached schema binding
+  along with what it already clears (core/src/system.rs:208-234):
+  allocated ids belong to one system and must not leak across a root
+  change.
 - Tests: map warms from a peer with existing catalog; updates arrive via
-  subscription; hard_reset flush verified.
+  subscription; response-fed upsert observed ahead of the subscription;
+  hard_reset flush verified.
 
 ### A8. LWW diff v2 and state 0xA2, id-keyed (RFC 5.5)
 
@@ -295,8 +303,8 @@ struct V2Map<T> {
   through the entity's schema binding before touching the map.
 - Backends learn their keying mode and name<->id binding from the entity
   at construction: catalog/system collections run name-keyed v1/0xA1
-  forever (genesis writes additionally pass through A2's frozen encoder,
-  never this path); user collections run id-keyed v2/0xA2.
+  forever (the RFC 4 bootstrap exemption); user collections run id-keyed
+  v2/0xA2.
 - Read fallback: 0xA1 and pre-0.9 buffers (lww.rs:154-185) decode
   name-keyed, translate name -> id through (local schema, catalog),
   residue for misses; lazy rewrite-on-save emits 0xA2, exactly the 0.9
@@ -384,30 +392,34 @@ read back "".
 
 - The macro (derive/src/model/) emits a static ModelDescriptor: the
   local compiled schema (ModelSchema/FieldSchema per the section-7
-  reconciliation), with per-field (anchor = field name unless pinned,
-  backend, value_type) from the NORMATIVE mapping table (RFC 4);
-  ephemeral fields excluded (derive/src/model/description.rs:31-40).
-- Attributes: `#[property(anchor = "...")]` (rename lineage, RFC 5.8),
-  `#[property(id = "...")]` and `#[model(id = "...")]` (explicit
-  binding, RFC 5.9; parse and validate id format at compile time;
-  verification and membership minting happen at registration).
+  reconciliation), with per-field (name, backend, value_type) from the
+  NORMATIVE mapping table (RFC 4); ephemeral fields excluded
+  (derive/src/model/description.rs:31-40). No anchor field (rev 4).
+- Attributes: `#[property(renamed_from = "...")]` (the rename hint,
+  RFC 5.8; ruled 2026-07-06), `#[property(id = "...")]` and
+  `#[model(id = "...")]` (explicit binding, RFC 5.9; parse and validate
+  id format at compile time; verification and membership minting happen
+  at registration; binding keeps working unchanged beside the hint).
 - `_ankurah_` collection prefix -> compile error at derive time.
 - Registration triggers threaded through context paths: mutating use
-  auto-asserts, read paths derive + cache, `ctx.register::<M>()`.
+  auto-asserts (awaiting the response), read paths resolve via the map,
+  `ctx.register::<M>()`.
 - Tests: descriptor snapshot for a representative model (every table
-  row); anchor chain keeps the original anchor; reserved prefix fails
-  compile (trybuild or equivalent); anchor-reuse refusal; shared
-  property by explicit id readable from two contracts with differing
-  optional; retype mints a distinct property id (and the sibling gate
-  fires on mixed data, A10 test).
+  row); rename-hint application and no-op guard; reserved prefix fails
+  compile (trybuild or equivalent); shared property by explicit id
+  readable from two contracts with differing optional; retype mints a
+  distinct property id (and the sibling gate fires on mixed data, A10
+  test).
 
 ### A12. Errors, guards, audits (cross-cutting)
 
 - New error variants: UnknownProperty, TypeSkew (PropertyError);
-  CatalogGenesisError; registration refusals (anchor reuse, explicit-id
-  mismatch, reserved prefix).
-- PROTECTED_COLLECTIONS readers (with A4/A6); ulid-timestamp audit
-  (with A1); hard_reset flush (with A7).
+  registration refusals (explicit-id mismatch or absence, reserved
+  prefix); the strict never-registered-offline error at create/commit
+  (rev 4). CatalogGenesisError and the anchor-reuse refusal are deleted
+  with the identity-plane pivot.
+- PROTECTED_COLLECTIONS readers (with A4/A6); hard_reset flush (with
+  A7). The ulid-timestamp audit is moot under allocation.
 - Docs: brief internals note under docs/internals/ once shapes settle
   (the schema-evolution book chapter waits on #291).
 
@@ -423,11 +435,17 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
 - sled: property_config keyed by property entity id bytes instead of
   name bytes (storage/sled/src/property.rs:32-63); u32 compaction and
   row format untouched.
-- postgres/sqlite: columns stay human-named; catalog binds property id
-  -> column; renames become ALTER TABLE RENAME COLUMN driven by catalog
-  changes; (name, type) collisions disambiguate the newcomer with a
-  short id suffix (discharges the TODO at
-  storage/postgres/src/lib.rs:368-373). Keep canonical-write vs
+- postgres/sqlite: columns stay human-named; EACH ENGINE persists its
+  own column <-> property-definition-id binding (the sled
+  property_config precedent generalized), because names are mutable
+  and collisions resolve engine-locally; renames become ALTER TABLE
+  RENAME COLUMN driven by catalog changes; display-name collisions
+  among live ids (retype lineage, policy-permitted fork, shared names
+  across contracts) keep the first claimant bare and suffix newcomers
+  from the property id (`name` / `name_bb`; RFC 5.5, mental model
+  ratified 2026-07-06 -- materialization is indexing strategy plus
+  admin legibility, never the data model). Discharges the TODO at
+  storage/postgres/src/lib.rs:368-373. Keep canonical-write vs
   materialization-write seams clean inside set_state
   (storage/postgres/src/lib.rs:342, materialization loop at 364-391)
   per RFC 4a; #304 consumes that cleanliness.
@@ -441,12 +459,12 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
   ahead of everything (it is also #284's missing guard).
 - Phase A lands on this branch (model-property-metadata), rebased over
   Phase 0 once merged; red-to-green commits per work package where a
-  test can pin the change; Opus adversarial review on A2 (frozen
-  encoder), A8 (v2/v1 fallback), and A5 (registration convergence)
-  before the PR.
+  test can pin the change; adversarial review on A5 (upsert atomicity
+  and allocation authority) and A8 (v2/v1 fallback) before the PR.
 - Validation gate before any push: cargo test -p ankurah-core (lib),
-  ankurah-tests, jwt-auth; isolated cargo check -p ankurah-core
-  --features wasm; cargo fmt --all; taplo fmt after Cargo.toml changes.
+  ankurah-tests, ankurah-derive, ankql, jwt-auth; isolated cargo check
+  -p ankurah-core --features wasm; cargo fmt --all; taplo fmt after
+  Cargo.toml changes.
 - Version files untouched; releases go through RELEASES +
   .release/bump-version.sh only (CI auto-publishes on version change).
 
@@ -468,9 +486,11 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
    scalars).
 7. **Field broadcasts stay name-keyed in Phase A** (no consumer needs
    id-keyed signals yet; node-local, no wire impact).
-8. **Registration descriptors reference by collection string + anchor**
-   within the request; the executor derives all ids (except explicit-id
-   bindings, which carry the literal id).
+8. **Registration descriptors reference by collection string + property
+   name** within the request (rev 4; was "+ anchor"); the executor
+   allocates or resolves all ids (except explicit-id bindings, which
+   carry the literal id). Target-model references travel as collection
+   strings, resolved executor-side.
 9. **Phase 0 as a separate PR off main**; Phase A follows on this
    branch.
 10. **Catalog subscriptions are policy-free on durable nodes** (the
@@ -486,7 +506,7 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
 12. **Reactor event-batching fix folded in**: ReactorUpdateItem now
     appends events across same-entity changes within one notify batch
     instead of keeping only the first change's events. A multi-event
-    commit (a registration's genesis + follow-up) previously relayed
+    commit (a registration's creation + follow-up events) previously relayed
     live with entity state ahead of its listed events, which receivers
     reject; latent for any multi-event commit, surfaced by the catalog.
 13. **0xA2 state entries carry an optional display-name hint** for the
@@ -517,10 +537,13 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
 16. **Commit-time registration closes the edit-only gap**: the sync
     edit path cannot await a durable registration, so commit_local_trx
     ensure-registers any touched collection whose compiled schema is
-    recorded but not yet ensured. Auto-assert triggers are best-effort
-    (a denied registration warns and never fails a data write: policy
-    gates schema definition, not data writes); ctx.register::<M>() is
-    the strict form.
+    recorded but not yet ensured. AMENDED by rev 4: for a collection
+    with NO binding at all (never registered on this system), a failed
+    or impossible registration at create/commit is the STRICT
+    never-registered-offline error, failing the write; for an
+    already-bound collection, a denied or unreachable re-assert stays a
+    warning and the write proceeds (unregistered fields land as
+    residue). ctx.register::<M>() remains the eager strict form.
 17. **The schema-blind projection regime of the checked read** (pre-PR
     review finding, 2026-07-05): a backend parsed with NO binding --
     the engines' post-filter TemporaryEntity and policy-agent state
@@ -534,26 +557,20 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     id-keyed property as absent. This is the checked counterpart of the
     property_values materialization projection, and Phase C's
     catalog-bound engines subsume it together with the hints.
-18. **The `anchored` descriptor bit + provenance-ordered follow-ups**
-    (maintainer direction, 2026-07-05). PropertyDescriptor carries
-    `anchored`: whether `#[property(anchor = ...)]` was physically
-    present. The RFC 5.8 reuse guard admits a deliberate rename-back
-    (anchored with anchor == name, restoring the display name to the
-    anchor) while still refusing the attribute-less shape, which is a
-    brand-new field colliding with a retired name. Added now because
-    RegisterSchema is unshipped; after release this would be a
-    versioned descriptor change. Alongside, executor follow-ups
+18. **Provenance-ordered follow-ups** (maintainer direction,
+    2026-07-05; SPLIT by rev 4). The `anchored` descriptor bit and the
+    rename-back admission it enabled die with the anchor apparatus.
+    The follow-up machinery SURVIVES VERBATIM: executor follow-ups
     (property/model display name, target_model, membership optional)
     are emitted only when the current catalog value differs, and parent
     at the entity's CURRENT head instead of the genesis:
     genesis-parenting made every metadata write after the first
     mutually CONCURRENT, so a chained rename or an optional flip was
     decided by event-id tiebreak (hash luck) rather than recency.
-    Head-parenting keeps identical concurrent registrations
-    byte-identical (same parent, same fields; convergence intact) and
-    makes an unchanged re-registration a true no-op (zero events).
-    Mixed-fleet consequence: display names follow the most recent
-    registration (an old binary re-asserts its compiled name on
+    Head-parenting makes an unchanged re-registration a true no-op
+    (zero events); rename-hint name updates (RFC 5.8) ride this same
+    machinery. Mixed-fleet consequence: display names follow the most
+    recent registration (an old binary re-asserts its compiled name on
     startup); addressing is unaffected because each node resolves
     through its own compiled overlay (RFC 5.8).
 19. **`Property::VALUE_TYPE` (erratum 2 resolution; maintainer
@@ -572,4 +589,69 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     every custom property that then declared a non-string type);
     a required (defaultless) const (breaks every downstream hand
     impl for marginal gain -- the default is correct for the
-    JSON-catch-all convention the ecosystem actually uses).
+    JSON-catch-all convention the ecosystem actually uses). Rev 4
+    note: VALUE_TYPE now feeds the property LOOKUP KEY instead of a
+    hash input; the decision and its invariant are otherwise
+    unchanged.
+20. **Upsert executor under a process-local mutex** (rev 4, RFC 5.1):
+    the whole RegisterSchema execution serializes on one async mutex;
+    ids are allocated with `EntityId::new()`; the executor's lookup
+    state is updated synchronously post-commit BEFORE the mutex
+    releases, because the reactor-fed catalog map lags commit and the
+    executor must not race itself into double-allocation.
+21. **SchemaRegistered response feeds the catalog map** (rev 4, RFC
+    5.2): the response carries the full resolved definitions;
+    ensure_registered upserts them into the CatalogManager map
+    immediately on ack, ahead of reactor delivery, so binding and
+    id-keyed writes proceed right behind registration. cache_compiled
+    reduces to recording compiled_schemas for the
+    commit-time-registration gap; its local id derivation is deleted.
+22. **Strict never-registered-offline error** (rev 4 maintainer
+    ruling, RFC 5.2): creating entities in a collection with no cached
+    binding while no durable peer is reachable fails at create/commit
+    with an actionable "connect once first" error. The offline
+    pending_registrations queue and drain_pending are deleted; residue
+    remains the representation for catalog lag and denied
+    registrations, converged by normalize/migrate-on-bind.
+23. **Rename hint semantics** (rev 4, RFC 5.8): transient, idempotent,
+    guarded (applies only when the current-name lookup misses and the
+    hinted lookup hits; never merges identities, never creates a
+    second live property under one lookup key). Attribute form RULED
+    2026-07-06: `#[property(renamed_from = "old")]`, a convenience
+    beside explicit-id binding, which stays fully load-bearing (5.9).
+24. **Single-allocator routing** (rev 4, RFC 5.1): one durable node
+    per system executes RegisterSchema; multi-durable deployments
+    route registration to it. Documented as a constraint on #309; a
+    real allocator protocol (leases or consensus) is future work
+    there.
+25. **Stale-writer rename fork is policy-governed** (maintainer
+    ruling, 2026-07-06; RFC 5.8): no former-names fallback or other
+    dedicated convergence mechanism. A pre-rename binary
+    re-registering the old name is an ordinary schema-definition
+    request: permissive systems allocate (visible orphan lineage,
+    tooling reconciles), restrictive systems refuse via the
+    PolicyAgent in either style -- object-based (that property
+    definition is not writable) or principal-based (that user may not
+    define schema) -- and the denied field lands as name-keyed
+    residue per decisions 16 and 22. The policy surface must support
+    BOTH discrimination axes (RFC 5.2, 5.7).
+26. **`check_schema_registration` PolicyAgent verb** (maintainer
+    direction, 2026-07-06; RFC 5.7): a new trait method with a
+    default-allow implementation, called by the executor after its
+    lookup phase and before any event is emitted, still under the
+    mutex: `fn check_schema_registration(&self, node, cdata, plan) ->
+    Result<(), AccessDenied>`. The plan is a core-side type (never on
+    the wire) listing what the request will actually do: definitions
+    to CREATE (descriptors), metadata UPDATES (entity id, field,
+    old -> new: renames, optional flips, retargets), and resolved
+    no-ops. Rationale: check_request cannot know whether a descriptor
+    exists (an agent gating "actual creation" there would duplicate
+    the executor's lookup and race the mutex), and check_event fires
+    per event mid-commit, where creation-ness must be
+    reverse-engineered from is_entity_create + collection; the
+    executor holds the answer for free at exactly the decision point.
+    Refusal fails the whole registration (all-or-nothing, matching
+    the single commit_remote_transaction); check_event still gates
+    every emitted event underneath (defense in depth); sync, matching
+    check_event. Registration-scoped: the broader per-property policy
+    surface stays deferred to the #264/#274 consolidated design.
