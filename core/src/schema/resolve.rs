@@ -8,10 +8,11 @@
 //! reference whose property is absent on a given entity evaluates under
 //! the RFC 5.4 read rules.
 //!
-//! NOT yet wired into the query paths: fail-closed resolution becomes the
-//! default together with the client-side registration lifecycle and the
-//! protocol v2 epoch (there is no interim name-on-the-wire state, rev 3).
-//! Until then this pass is invoked explicitly (and by tests).
+//! Wired (since the protocol v2 epoch) at the four query ORIGIN sites --
+//! context fetch, `EntityLiveQuery`, and the node-level local-fetch and
+//! remote-subscribe paths -- via [`CatalogManager::resolve_selection_deferred`];
+//! receivers pass already-resolved selections through (the pass is
+//! idempotent, and `Identifier` expressions are left untouched).
 //!
 //! Special cases:
 //! - `id` is the entity-id pseudo-property, not a catalog property: it

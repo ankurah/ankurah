@@ -391,6 +391,74 @@ mod tests {
         );
     }
 
+    /// The storage engines' post-filter shape, end to end: a RESOLVED
+    /// Identifier predicate evaluated via a schema-blind [`TemporaryEntity`]
+    /// over an id-keyed (0xA2) state buffer, exactly as
+    /// `post_filter_states` does in the sqlite/postgres engines (and as a
+    /// policy agent inspecting a raw state does). Regression: before the
+    /// hint-projection regime of `get_checked`, every id-keyed property
+    /// evaluated as absent (NULL) here, silently dropping matching rows.
+    #[test]
+    fn temporary_entity_post_filter_reads_id_keyed_state() {
+        use crate::entity::TemporaryEntity;
+        use crate::property::backend::{LWWBackend, PropertyBackend};
+        use ankql::ast::{ComparisonOperator, Expr, Identifier, Literal, PathExpr, Predicate};
+        use ankurah_proto as proto;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use ulid::Ulid;
+
+        // A bound id-keyed writer, as any post-epoch user entity is.
+        let title_id = proto::EntityId::from_bytes([0x11; 16]);
+        let binding = Arc::new(crate::property::backend::lww::SchemaBinding {
+            to_id: BTreeMap::from([("title".to_string(), title_id)]),
+            to_name: BTreeMap::from([(title_id, "title".to_string())]),
+        });
+        let writer = LWWBackend::new();
+        writer.bind_schema(binding);
+        writer.set_wire_mode(crate::property::backend::lww::WireMode::IdKeyedV2);
+        writer.set("title".to_string(), Some(crate::value::Value::String("alpha".to_string())));
+        let ops = writer.to_operations().unwrap().unwrap();
+        writer.apply_operations_with_event(&ops, proto::EventId::from_bytes([3; 32])).unwrap();
+        let buffer = writer.to_state_buffer().unwrap();
+
+        let state =
+            proto::State { state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_string(), buffer)])), head: Default::default() };
+        let entity = TemporaryEntity::new(proto::EntityId::from_bytes([0x77; 16]), "album".into(), &state).unwrap();
+
+        // Resolved-Identifier predicate (the checked read path).
+        let id_pred = Predicate::Comparison {
+            left: Box::new(Expr::Identifier(Identifier {
+                property: Ulid::from_bytes(title_id.to_bytes()),
+                name: "title".to_string(),
+                subpath: vec![],
+            })),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
+        };
+        assert!(evaluate_predicate(&entity, &id_pred).unwrap(), "id-keyed value must be readable through its hint");
+
+        // Path predicate (the lenient read path used for unresolved refs).
+        let path_pred = Predicate::Comparison {
+            left: Box::new(Expr::Path(PathExpr::simple("title"))),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
+        };
+        assert!(evaluate_predicate(&entity, &path_pred).unwrap(), "lenient projection must also read the hint");
+
+        // A property nothing claims evaluates as NULL: comparison false, no error.
+        let absent_pred = Predicate::Comparison {
+            left: Box::new(Expr::Identifier(Identifier {
+                property: Ulid::from_bytes([8; 16]),
+                name: "ghost".to_string(),
+                subpath: vec![],
+            })),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Literal::String("alpha".to_string()))),
+        };
+        assert!(!evaluate_predicate(&entity, &absent_pred).unwrap());
+    }
+
     #[test]
     fn test_and_condition() {
         let items = vec![TestItem::new("Alice", "30"), TestItem::new("Bob", "30"), TestItem::new("Charlie", "35")];

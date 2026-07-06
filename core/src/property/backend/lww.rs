@@ -64,11 +64,13 @@ pub enum PropertyKey {
 /// A name<->id translation table for one collection's properties, supplied by
 /// the schema layer (local compiled schema and/or the replicated catalog).
 ///
-/// Invariant: `to_id` and `to_name` are mutual inverses -- for every
-/// `(name, id)` in `to_id` there is `(id, name)` in `to_name`, and vice
-/// versa. Callers that build a binding are responsible for upholding this;
-/// the backend relies on it when reverse-translating id keys back to names
-/// for projection and for v1/0xA1 emission.
+/// Invariant: every `(name, id)` in `to_id` has its `(id, name)` in
+/// `to_name`. The reverse is NOT required: `to_name` may additionally carry
+/// ids whose display name forward-maps to a DIFFERENT id -- retype-lineage
+/// losers (same name, two ids in one contract; no tombstones until #303) --
+/// kept so projection and the RFC 5.4 sibling gate can still name them.
+/// Builders pick the forward winner consistently with query resolution
+/// (first membership in id order; see `CatalogMapInner::binding_for`).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaBinding {
     pub to_id: BTreeMap<String, EntityId>,
@@ -280,8 +282,8 @@ impl LWWBackend {
     /// ANY contract stamp a display-name hint, so a foreign lineage's value is
     /// visible here (RFC 5.4 rule 4; the A10 spec's gate section).
     ///
-    /// Two regimes, after the cross-root-transplant ruling (2026-07-05):
-    /// - The binding RESOLVES `name` to id A.
+    /// Three regimes, after the cross-root-transplant ruling (2026-07-05):
+    /// - The binding RESOLVES `name` to id A (contract semantics).
     ///   - A holds a value -> `Ok(Some)`.
     ///   - A is absent: scan for ANY OTHER `Id` key that holds data and whose
     ///     display name (binding reverse map, else decode-time hint) equals
@@ -292,18 +294,51 @@ impl LWWBackend {
     ///     read refuses rather than substituting the foreign value.
     ///   - No skewing sibling: check the bare `Name` key (legacy residue not
     ///     yet migrated onto A) -> `Ok(Some/None)`.
-    /// - The binding does NOT resolve `name` (no contract knowledge of it):
-    ///   there is no id A to skew against and no contract that owns the name,
-    ///   so read ONLY the bare `Name` key -> `Ok(Some/None)`. There is
-    ///   deliberately no cross-id scan without a contract: an unbound backend
-    ///   never routes a name onto a foreign id (RFC 5.4 ruling).
+    /// - A binding EXISTS but does not resolve `name` (the contract does not
+    ///   contain it): read ONLY the bare `Name` key -> `Ok(Some/None)`. There
+    ///   is deliberately no cross-id scan here: a bound backend never routes a
+    ///   name onto an id outside its contract (RFC 5.4 ruling).
+    /// - NO binding at all (the schema-blind projection tier: the storage
+    ///   engines' `from_state_buffer` parse and `TemporaryEntity`, which have
+    ///   no contract by construction): bare `Name` residue first, then the
+    ///   decode-time hint projection -- exactly ONE id-keyed entry with data
+    ///   claiming this display name reads as that entry (the checked
+    ///   counterpart of the `property_values` materialization projection, so
+    ///   engine post-filtering and policy state inspection see the same
+    ///   fields the engine materializes); TWO OR MORE claimants (a retype
+    ///   lineage) is a same-name skew -> `Err(TypeSkew)` rather than a guess.
     pub fn get_checked(&self, property_name: &PropertyName) -> Result<Option<Value>, PropertyError> {
         let values = self.values.read().unwrap();
         let binding = self.binding.read().unwrap();
 
         let Some(resolved_id) = binding.as_ref().and_then(|b| b.to_id.get(property_name).copied()) else {
-            // No binding knowledge of this name: read only the bare Name key.
-            return Ok(values.get(&PropertyKey::Name(property_name.clone())).and_then(|e| e.value()));
+            // Not contract-resolvable. Bare Name residue is the primary
+            // address in both remaining regimes (it is also the winner the
+            // `property_values` projection materializes on a name collision).
+            if let Some(value) = values.get(&PropertyKey::Name(property_name.clone())).and_then(|e| e.value()) {
+                return Ok(Some(value));
+            }
+            if binding.is_some() {
+                // Bound, but the contract does not contain this name: no
+                // cross-id scan outside the contract (RFC 5.4 ruling).
+                return Ok(None);
+            }
+            // Unbound: project through the decode-time hints, refusing to
+            // guess between same-name claimants.
+            let hints = self.hints.read().unwrap();
+            let mut matched: Option<(EntityId, Value)> = None;
+            for (key, entry) in values.iter() {
+                let PropertyKey::Id(id) = key else { continue };
+                if hints.get(id).map(|h| h.as_str()) != Some(property_name.as_str()) {
+                    continue;
+                }
+                let Some(value) = entry.value() else { continue };
+                if let Some((first, _)) = matched {
+                    return Err(PropertyError::TypeSkew { name: property_name.clone(), a: first.to_base64(), b: id.to_base64() });
+                }
+                matched = Some((*id, value));
+            }
+            return Ok(matched.map(|(_, value)| value));
         };
 
         // The binding-resolved id holds a value -> return it directly.
@@ -334,6 +369,41 @@ impl LWWBackend {
         Ok(values.get(&PropertyKey::Name(property_name.clone())).and_then(|e| e.value()))
     }
 
+    /// Lenient projection read for schema-blind consumers ([`crate::entity::
+    /// TemporaryEntity`]'s `Filterable::value`, and through it engine
+    /// post-filtering of `Path` expressions and policy-agent state
+    /// inspection): [`get`] first (binding id, then bare Name residue), then
+    /// -- only when this backend has NO binding -- the decode-time hint
+    /// projection: a UNIQUE id-keyed entry with data claiming this display
+    /// name reads as that entry, and an ambiguous claim (a retype lineage)
+    /// reads as `None` rather than a guess (`get_checked` is the variant that
+    /// surfaces the ambiguity as `TypeSkew`). Never consulted for writes, and
+    /// never applies to a bound backend: hints are projection only (RFC 5.4
+    /// ruling, 2026-07-05).
+    pub fn get_projected(&self, property_name: &PropertyName) -> Option<Value> {
+        if let Some(value) = self.get(property_name) {
+            return Some(value);
+        }
+        if self.binding.read().unwrap().is_some() {
+            return None;
+        }
+        let values = self.values.read().unwrap();
+        let hints = self.hints.read().unwrap();
+        let mut matched: Option<Value> = None;
+        for (key, entry) in values.iter() {
+            let PropertyKey::Id(id) = key else { continue };
+            if hints.get(id).map(|h| h.as_str()) != Some(property_name.as_str()) {
+                continue;
+            }
+            let Some(value) = entry.value() else { continue };
+            if matched.is_some() {
+                return None; // ambiguous projection: refuse to guess
+            }
+            matched = Some(value);
+        }
+        matched
+    }
+
     /// Find the stored entry for a display name, in priority order:
     ///   1. the id the BINDING maps the name to ([`key_for_name`]);
     ///   2. the bare Name key (legacy residue not yet migrated).
@@ -345,6 +415,8 @@ impl LWWBackend {
     /// with different roots yields foreign ids that never match a local
     /// binding, and the ruling makes that fail-visible (via `get_checked`'s
     /// sibling gate) rather than silently substituting the foreign value here.
+    /// The schema-blind projection tier is separate: [`get_projected`] /
+    /// `get_checked`'s no-binding regime, which only ever run UNBOUND.
     fn lookup_entry(&self, property_name: &PropertyName) -> Option<ValueEntry> {
         let values = self.values.read().unwrap();
         let key = self.key_for_name(property_name);
@@ -798,13 +870,14 @@ impl LWWBackend {
         broadcast.id()
     }
 
-    /// Normalize a just-decoded key against the current binding/hints so that
-    /// an incoming NAME-keyed change (a v1 diff, or v2 residue) for a property
+    /// Normalize a just-decoded key against the current BINDING so that an
+    /// incoming NAME-keyed change (a v1 diff, or v2 residue) for a property
     /// this backend knows by id lands on the SAME id key as its existing
     /// id-keyed value, and therefore COMPETES in LWW election instead of
     /// splitting into a shadow name entry (RFC 5.5 mixed-version convergence).
-    /// Id keys pass through unchanged. Uses [`key_for_name`], so the binding
-    /// wins and the decode-time hints cover ids no binding resolves.
+    /// Id keys pass through unchanged. Uses [`key_for_name`], which consults
+    /// the binding ONLY: hints never route keys (RFC 5.4 ruling, 2026-07-05),
+    /// so on an unbound backend a name-keyed change stays name-keyed residue.
     fn normalize_key(&self, key: PropertyKey) -> PropertyKey {
         match key {
             PropertyKey::Id(_) => key,
@@ -1249,5 +1322,107 @@ mod tests {
         backend.apply_operations_with_event(&ops, EventId::from_bytes([1; 32])).unwrap();
 
         assert_eq!(fired.load(Ordering::SeqCst), 1, "id-keyed change must still fire the name-keyed broadcast");
+    }
+
+    /// Serialize a 0xA2 buffer directly from V2State parts (bypassing a
+    /// writer) so tests can shape by_id/residue/hint combinations exactly.
+    fn v2_buffer(by_id: Vec<(EntityId, Option<Value>, Option<&str>)>, residue: Vec<(&str, Option<Value>)>) -> Vec<u8> {
+        let state = V2State {
+            by_id: by_id
+                .into_iter()
+                .map(|(id, value, name)| {
+                    (id, V2CommittedEntry { value, event_id: EventId::from_bytes([6; 32]), name: name.map(|n| n.to_string()) })
+                })
+                .collect(),
+            residue: residue
+                .into_iter()
+                .map(|(name, value)| {
+                    (name.to_string(), V2CommittedEntry { value, event_id: EventId::from_bytes([6; 32]), name: Some(name.to_string()) })
+                })
+                .collect(),
+        };
+        let mut buffer = vec![LWW_STATE_VERSION_2];
+        bincode::serialize_into(&mut buffer, &state).unwrap();
+        buffer
+    }
+
+    /// The schema-blind projection regime of the checked read (RFC 5.4): an
+    /// UNBOUND backend -- the storage engines' post-filter parse and
+    /// TemporaryEntity -- reads an id-keyed 0xA2 entry by its display-name
+    /// hint when exactly one entry claims the name, and fails visible
+    /// (TypeSkew) when two claim it (a retype lineage). Without this, engine
+    /// post-filtering and policy state inspection would silently see every
+    /// id-keyed property as absent.
+    #[test]
+    fn unbound_checked_read_projects_unique_hint_and_skews_ambiguity() {
+        // One claimant: reads through the hint.
+        let unbound =
+            LWWBackend::from_state_buffer(&v2_buffer(vec![(id(0x11), Some(Value::String("alpha".into())), Some("title"))], vec![]))
+                .unwrap();
+        assert_eq!(unbound.get_checked(&"title".to_string()).unwrap(), Some(Value::String("alpha".into())));
+        assert_eq!(unbound.get_projected(&"title".to_string()), Some(Value::String("alpha".into())));
+        // The plain contract-scoped read still does NOT hint-route.
+        assert_eq!(unbound.get(&"title".to_string()), None);
+        // A name nothing claims is absent, not an error.
+        assert_eq!(unbound.get_checked(&"author".to_string()).unwrap(), None);
+
+        // Bare Name residue outranks a hinted id entry (matches the winner
+        // the property_values projection materializes on a collision).
+        let collided = LWWBackend::from_state_buffer(&v2_buffer(
+            vec![(id(0x11), Some(Value::String("old".into())), Some("title"))],
+            vec![("title", Some(Value::String("new".into())))],
+        ))
+        .unwrap();
+        assert_eq!(collided.get_checked(&"title".to_string()).unwrap(), Some(Value::String("new".into())));
+
+        // Two claimants with data: ambiguous projection fails visible.
+        let skewed = LWWBackend::from_state_buffer(&v2_buffer(
+            vec![(id(0x33), Some(Value::String("as-string".into())), Some("title")), (id(0x44), Some(Value::I64(7)), Some("title"))],
+            vec![],
+        ))
+        .unwrap();
+        assert!(matches!(skewed.get_checked(&"title".to_string()), Err(PropertyError::TypeSkew { .. })));
+        // The lenient projection refuses to guess instead of erroring.
+        assert_eq!(skewed.get_projected(&"title".to_string()), None);
+
+        // A claimant with a None value does not count (deletion tombstone).
+        let deleted = LWWBackend::from_state_buffer(&v2_buffer(
+            vec![(id(0x33), None, Some("title")), (id(0x44), Some(Value::I64(7)), Some("title"))],
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(deleted.get_checked(&"title".to_string()).unwrap(), Some(Value::I64(7)));
+    }
+
+    /// A BOUND backend never projects names outside its contract (RFC 5.4
+    /// ruling): a hinted id-keyed entry for a name the binding does not
+    /// contain stays unreadable by name, and the sibling gate still fires
+    /// for names the binding DOES contain.
+    #[test]
+    fn bound_backend_does_not_hint_route_names_outside_its_contract() {
+        let backend = LWWBackend::from_state_buffer(&v2_buffer(
+            vec![
+                // A foreign/hinted entry whose name is NOT in the binding.
+                (id(0x55), Some(Value::String("mystery".into())), Some("legacy_hinted")),
+                // A retype sibling for a name that IS in the binding: id 0x33
+                // is not the binding's "title" id (0x11), but hints "title".
+                (id(0x33), Some(Value::I64(7)), Some("title")),
+            ],
+            vec![],
+        ))
+        .unwrap();
+        backend.bind_schema(title_author_binding());
+
+        // Outside the contract: bare Name only -> absent, no hint routing,
+        // lenient projection likewise refuses once a binding exists.
+        assert_eq!(backend.get_checked(&"legacy_hinted".to_string()).unwrap(), None);
+        assert_eq!(backend.get_projected(&"legacy_hinted".to_string()), None);
+
+        // Inside the contract: the resolved id (0x11) is absent and the
+        // hinted sibling (0x33) holds data -> the gate fails visible.
+        assert!(matches!(backend.get_checked(&"title".to_string()), Err(PropertyError::TypeSkew { .. })));
+
+        // An unclaimed in-contract name is absent, not an error.
+        assert_eq!(backend.get_checked(&"author".to_string()).unwrap(), None);
     }
 }

@@ -633,9 +633,25 @@ impl Filterable for TemporaryEntity {
         if name == "id" {
             Some(Value::EntityId(self.0.id))
         } else {
-            // Iterate through backends to find one that has this property
             let state = self.0.state.read().expect("other thread panicked, panic here too");
-            state.backends.values().find_map(|backend| backend.property_value(&name.to_owned()))
+            let lww_name = crate::property::backend::LWWBackend::property_backend_name();
+            // LWW reads through the schema-blind PROJECTION (bare name, then a
+            // unique decode-time hint): a TemporaryEntity parses its backends
+            // UNBOUND, so a plain name read would miss every id-keyed entry in
+            // a 0xA2 buffer. This is the engines' post-filter/policy
+            // inspection tier and sees the same fields materialization does.
+            if let Some(backend) = state.backends.get(lww_name) {
+                if let Ok(lww) = backend.clone().as_arc_dyn_any().downcast::<crate::property::backend::LWWBackend>() {
+                    if let Some(value) = lww.get_projected(&name.to_owned()) {
+                        return Some(value);
+                    }
+                }
+            }
+            state
+                .backends
+                .iter()
+                .filter(|(backend_name, _)| backend_name.as_str() != lww_name)
+                .find_map(|(_, backend)| backend.property_value(&name.to_owned()))
         }
     }
 
@@ -643,9 +659,11 @@ impl Filterable for TemporaryEntity {
     /// mirroring [`Entity::value_checked`]: the LWW backend's `get_checked`
     /// first (so a same-display-name retype lineage fails visible `TypeSkew`
     /// rather than evaluating as a silent NULL), then the other backends via
-    /// the lenient `property_value`. Materialized `TemporaryEntity`s parse
-    /// their backends UNBOUND, so the gate there scans the bare Name key and
-    /// the decode-time hints, exactly as the storage-engine read path needs.
+    /// the lenient `property_value`. A materialized `TemporaryEntity` parses
+    /// its backends UNBOUND, so `get_checked` runs in its schema-blind
+    /// projection regime: bare Name residue, then the decode-time hints
+    /// (unique claimant reads, ambiguous claimants skew) -- exactly the
+    /// fields the storage-engine materialization path projects.
     fn value_checked(&self, name: &str) -> Result<Option<Value>, crate::property::PropertyError> {
         if name == "id" {
             return Ok(Some(Value::EntityId(self.0.id)));

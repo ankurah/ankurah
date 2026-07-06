@@ -290,12 +290,14 @@ impl CatalogMapInner {
     /// Build a name<->id translation table for every property reachable via
     /// `collection`'s model and its memberships (RFC 5.5 v2 binding). Returns
     /// `None` when the collection has no model in the map yet (nothing to
-    /// bind). The two directions are mutual inverses by construction, as
-    /// [`SchemaBinding`] requires; on a display-name collision (two ids share
-    /// a name in one contract, e.g. mid-retype) the last membership wins the
-    /// forward entry while both id->name entries are kept, which is
-    /// acceptable for projection (the reverse map is what materialization
-    /// reads) and never fabricates an id the contract does not contain.
+    /// bind). On a display-name collision (two ids share a name in one
+    /// contract, i.e. a retype lineage: no tombstones until #303) the FIRST
+    /// membership in id order wins the forward entry -- the SAME pick
+    /// [`Self::resolve`] makes, so query resolution and backend write/read
+    /// routing agree on which lineage a display name addresses -- while both
+    /// id->name entries are kept for projection and the RFC 5.4 sibling
+    /// gate. The loser is only reachable by id. Never fabricates an id the
+    /// contract does not contain.
     fn binding_for(&self, collection: &str) -> Option<SchemaBinding> {
         let model_id = self.by_collection.get(collection)?;
         let membership_ids = self.model_memberships.get(model_id)?;
@@ -304,7 +306,7 @@ impl CatalogMapInner {
         for mid in membership_ids {
             if let Some(membership) = self.memberships.get(mid) {
                 if let Some(prop) = self.properties.get(&membership.property) {
-                    to_id.insert(prop.name.clone(), prop.id);
+                    to_id.entry(prop.name.clone()).or_insert(prop.id);
                     to_name.insert(prop.id, prop.name.clone());
                 }
             }
@@ -737,8 +739,18 @@ where
     pub fn is_catalog_ready(&self) -> bool { *self.0.ready.read().unwrap() }
 
     pub async fn wait_catalog_ready(&self) {
-        if !self.is_catalog_ready() {
-            self.0.ready_notify.notified().await;
+        // `Notify::notify_waiters` wakes only waiters REGISTERED at that
+        // moment (it stores no permit), so the `Notified` future must be
+        // created BEFORE the readiness check: checking first and creating the
+        // future after would lose a `mark_ready` that lands in between and
+        // hang this waiter (and its query) forever. Loop because `reset` can
+        // flip readiness back off between the wake and our re-check.
+        loop {
+            let notified = self.0.ready_notify.notified();
+            if self.is_catalog_ready() {
+                return;
+            }
+            notified.await;
         }
     }
 
