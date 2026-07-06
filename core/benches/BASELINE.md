@@ -158,3 +158,14 @@ tree has a `Clock` type but the phase 1 work changed it materially (normalizing
 construction and binary-search membership are #201-era invariants), and
 `topo_sort_events` did not exist pre-#201 (it is the V4 ordered-application fix).
 They are recorded here as forward baselines rather than old-vs-new comparisons.
+
+## Re-run confirmation (2026-07-06, post-merge main)
+
+Re-run of the identical command on main at a2bed145 (post 0.9.0 release, PR
+#299 no-op-suppression fix, and PR #278 sim harness; none touch the bench
+path). All 27 cases landed within the noise band of the medians above (worst
+regression +4.7% on compare/wide_antichain/64, well inside criterion
+run-to-run variance on this machine); toposort/shuffled_chain/1024 improved
+about 10% (623-638 us vs 704.3 us), plausibly from the post-#201 layer
+machinery refactor. The baseline above remains the valid E2/D1 reference.
+Raw criterion log: bench-main-a2bed145-2026-07-06.log (kept outside the repo).
