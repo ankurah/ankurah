@@ -181,12 +181,36 @@ foundation; each item is or becomes an RFC issue.
 The benchmark HARNESS lands at phase 2 start so the baseline predates
 workstream D; the optimization pass runs after D stabilizes.
 
-1. Criterion micro-benchmarks: compare() across DAG shapes (linear deep,
-   uneven diamond chains, wide antichains, disjoint), layer iteration, clock
-   operations, topo sort; tracked in CI with regression thresholds.
-2. Macro benchmarks: N-entity multi-node churn via the simulation harness
-   (throughput, convergence latency, memory high-water).
-3. Optimization targets, informed by measurements rather than assumption:
+1. **E1 (lands at phase 2 start).** Criterion micro-benchmarks: compare()
+   across DAG shapes (linear deep, uneven diamond chains, wide antichains,
+   disjoint), layer iteration, clock operations, topo sort; tracked in CI with
+   regression thresholds.
+2. **E-vol: volume tier and macro performance baseline (explicitly scheduled to
+   land DURING workstream D, not deferred to E2).** Split out as its own item
+   because it is not an optimization: it is the instrument that guards the D
+   refactors as they land and feeds E2 with the before-numbers. It is TWO
+   clearly separated instruments, because the simulation harness cannot produce
+   honest wall-clock (single-threaded virtual transport):
+   - VOLUME TIER (deterministic, correctness and memory at scale): env-scaled
+     simulation-harness scenarios (N-entity churn, deep single-entity history,
+     wide concurrent antichain, subscription fan-out) that assert the C1
+     convergence invariants at volume plus peak memory via a counting global
+     allocator, bounded by LOOSE order-of-magnitude sanity ceilings (catastrophe
+     guards, not thresholds). Defaults stay inside a normal `cargo test`; a
+     nightly job scales the VOL_* knobs up. Memory attribution respects the
+     E-A/271-D caveat (a sequence-CRDT tombstone set is lower-bounded by deletion
+     history, folded by sealing, not by the streaming consumer), so the
+     scenarios avoid deletions and never misattribute that floor.
+   - PERF TIER (real wall-clock, advisory): a criterion macro suite over real
+     multi-threaded tokio and LocalProcessConnection multi-node setups
+     (single-writer commit throughput, commit-to-subscriber propagation latency,
+     bridge catch-up wall time vs history depth, subscription establishment at N
+     resident entities). Medians recorded in `specs/concurrency/MACRO-BASELINE.md`
+     with hardware/toolchain disclosure. NOT run in the normal CI test job.
+   Measurement only: no core changes, no optimization; the numbers are the
+   input to E2, which stays after D.
+3. **E2 (optimization, runs as its own PR AFTER D).** Optimization targets,
+   informed by measurements rather than assumption:
    - **Streaming application** (question raised 2026-07-04): the
      architecture is already streaming-shaped in its skeleton/payload split;
      the accumulator keeps the parent-edge map (small, unbounded) separate
@@ -279,4 +303,5 @@ workstream ends by updating this document's checklist.
 - [ ] D7: observability counters and alerts
 - [ ] D8: #265 and #267 remainders
 - [x] E1: benchmark harness and baseline (lands at phase 2 start)
+- [x] E-vol: volume tier and macro performance baseline
 - [ ] E2: optimization PR with before/after numbers

@@ -476,6 +476,7 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "bincode",
+ "criterion",
  "ctor 0.2.9",
  "itertools 0.14.0",
  "js-sys",

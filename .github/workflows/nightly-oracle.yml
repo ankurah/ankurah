@@ -37,6 +37,26 @@ on:
         description: "First dag_seed value to run (ORACLE_SEED_BASE)"
         required: false
         default: "1"
+      vol_entities:
+        description: "Volume tier: entities in the N-entity churn shape (VOL_ENTITIES)"
+        required: false
+        default: "5000"
+      vol_events:
+        description: "Volume tier: chain depth for the deep-history shape (VOL_EVENTS)"
+        required: false
+        default: "5000"
+      vol_antichain:
+        description: "Volume tier: concurrent writers in the wide-antichain shape (VOL_ANTICHAIN)"
+        required: false
+        default: "512"
+      vol_queries:
+        description: "Volume tier: live queries in the subscription fan-out shape (VOL_QUERIES)"
+        required: false
+        default: "128"
+      vol_seeds:
+        description: "Volume tier: seeds per scenario (VOL_SEEDS)"
+        required: false
+        default: "20"
 
 jobs:
   oracle-scale-out:
@@ -103,5 +123,48 @@ jobs:
         with:
           name: sim-swarm-failure-output
           path: sim-swarm-output.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The E-vol volume tier at nightly scale: the same four volume scenarios the
+  # normal test job runs at small defaults (N-entity churn, deep single-entity
+  # history, wide concurrent antichain, subscription fan-out), driven up via the
+  # VOL_* env knobs and the `--ignored` nightly variants. Each scenario asserts
+  # the C1 convergence invariants at volume and a loose order-of-magnitude peak
+  # memory bound (counting global allocator). A VOLMEM bound breach or an
+  # invariant violation fails the job; the VOLMEM lines in the log are the
+  # per-scenario peak-memory record. This is the deterministic volume instrument
+  # only; wall-clock perf numbers come from the criterion macro suite, which is
+  # advisory and NOT run here.
+  volume-tier-nightly:
+    name: Volume tier (env-scaled)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the volume tier at scale
+        run: |
+          set -o pipefail
+          VOL_ENTITIES="${{ github.event.inputs.vol_entities || '5000' }}" \
+          VOL_EVENTS="${{ github.event.inputs.vol_events || '5000' }}" \
+          VOL_ANTICHAIN="${{ github.event.inputs.vol_antichain || '512' }}" \
+          VOL_QUERIES="${{ github.event.inputs.vol_queries || '128' }}" \
+          VOL_SEEDS="${{ github.event.inputs.vol_seeds || '20' }}" \
+            cargo test -p ankurah-tests --test sim_volume -- --ignored --nocapture 2>&1 | tee volume-output.log
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Upload failure output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: volume-tier-failure-output
+          path: volume-output.log
           if-no-files-found: warn
           retention-days: 30
