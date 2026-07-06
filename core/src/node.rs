@@ -1062,16 +1062,17 @@ where
 
     /// The currently-resident (in-memory) entity for `id`, if one is held.
     ///
-    /// The resident entity carries the authoritative materialized state, which
-    /// can be ahead of the persisted state buffer: the EventOnly apply path
-    /// commits events and advances the in-memory entity but does not rewrite the
-    /// state buffer in storage (state is a rebuildable cache of the event log).
-    /// A test or tool that must observe a node's true materialized state
-    /// (e.g. the phase 2 simulation harness checking cross-node convergence)
-    /// needs this resident view; reading the storage state buffer alone
-    /// under-reports EventOnly progress. Returns `None` if no strong reference
-    /// keeps the entity resident, in which case the caller falls back to the
-    /// persisted state.
+    /// The resident entity carries the authoritative materialized state. The
+    /// ingest executor persists the state buffer after an entity's events on
+    /// every arm (uniform state persistence, D1), so buffer and resident rest
+    /// at the same head once an apply call returns. The resident view still
+    /// matters to a reader that can interleave with an in-flight apply (the
+    /// buffer write lands after the events), and after a crash between
+    /// commit_event and save_state, the one window where the buffer
+    /// legitimately rests behind the event log until the entity's next write
+    /// (rehydration-time repair of that window is D5's contract). Returns
+    /// `None` if no strong reference keeps the entity resident, in which case
+    /// the caller falls back to the persisted state.
     pub fn get_resident_entity(&self, id: proto::EntityId) -> Option<crate::entity::Entity> { self.entities.get(&id) }
 
     pub fn context(&self, data: PA::ContextData) -> Result<Context, anyhow::Error> {
