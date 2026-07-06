@@ -50,9 +50,9 @@ timings are meaningless as wall-clock and are never reported here.
 cargo bench -p ankurah-tests --bench macro_perf
 ```
 
-Captured on main at `ce2f7cab` plus the E-vol branch (this instrument), with the
-default criterion sampling shown per group below. Raw criterion log kept outside
-the repo (`macro_bench_full.log`).
+Captured on main at `ce2f7cab` plus the E-vol branch (this instrument), all
+groups in one run, with the criterion sampling shown per group below. Raw
+criterion log kept outside the repo (`macro_bench_corrected.log`).
 
 ## Measurements
 
@@ -60,22 +60,26 @@ Each case uses criterion `iter_custom`, so per-iteration setup (building nodes,
 seeding history, connecting peers, establishing the subscription) is EXCLUDED
 from the measured region. Only the operation under study is timed.
 
-| Group / case                                    | Param | Median    | Derived           |
-| ----------------------------------------------- | ----- | --------- | ----------------- |
-| single_writer_commit / durable_lww_overwrite    | n/a   | 37.16 us  | ~26.9k commits/s  |
-| commit_to_subscriber_latency / server_to_client | n/a   | 82.62 us  |                   |
-| bridge_catchup                                  | 100   | 99.21 us  |                   |
-| bridge_catchup                                  | 1000  | 137.13 us |                   |
-| bridge_catchup                                  | 5000  | 151.75 us |                   |
-| subscription_establishment                      | 10    | 353.63 us |                   |
-| subscription_establishment                      | 100   | 2.884 ms  |                   |
-| subscription_establishment                      | 1000  | 36.278 ms |                   |
+| Group / case                                    | Param | Median    | Derived          |
+| ----------------------------------------------- | ----- | --------- | ---------------- |
+| single_writer_commit / durable_lww_overwrite    | n/a   | 37.06 us  | ~27.0k commits/s |
+| commit_to_subscriber_latency / server_to_client | n/a   | 84.37 us  |                  |
+| fresh_fetch_snapshot                            | 100   | 110.06 us |                  |
+| fresh_fetch_snapshot                            | 1000  | 132.61 us |                  |
+| fresh_fetch_snapshot                            | 5000  | 136.98 us |                  |
+| bridge_catchup                                  | 100   | 3.325 ms  | ~33 us/event     |
+| bridge_catchup                                  | 1000  | 38.41 ms  | ~38 us/event     |
+| bridge_catchup                                  | 5000  | 196.2 ms  | ~39 us/event     |
+| subscription_establishment                      | 10    | 379.87 us |                  |
+| subscription_establishment                      | 100   | 3.412 ms  |                  |
+| subscription_establishment                      | 1000  | 39.24 ms  |                  |
 
 Sampling: `single_writer_commit` and `commit_to_subscriber_latency` use enough
 iterations to fill criterion's default 100-sample / 30-sample windows;
-`bridge_catchup` uses 10 samples and `subscription_establishment` uses 20,
-because each of their iterations does heavy per-iteration setup (a fresh
-N-deep history or N resident entities) and a full round trip.
+`fresh_fetch_snapshot` and `bridge_catchup` use 10 samples and
+`subscription_establishment` uses 20, because each of their iterations does
+heavy per-iteration setup (a fresh N-deep history or N resident entities) and a
+full round trip.
 
 ### What each case measures
 
@@ -89,11 +93,35 @@ N-deep history or N resident entities) and a full round trip.
   until the client's `LiveQuery` change notification fires. This is the
   end-to-end propagation latency of a single steady-state update (server commit
   to client reactor notification).
-- **bridge_catchup**: durable server carrying an entity with a `param`-deep
-  chain of edits; a fresh ephemeral client connects and fetches. The measured
-  region is only the catch-up fetch, which the EventBridge serves. A correctness
-  guard asserts the client reaches the final state, so a broken bridge cannot
-  read as a fast one.
+- **fresh_fetch_snapshot**: durable server carrying an entity with a
+  `param`-deep chain of edits; a FRESH ephemeral client connects and fetches
+  for the first time. LANE: a fresh fetch sends empty known_matches, so the
+  server answers with a full StateSnapshot (`generate_entity_delta` Case 3),
+  never an EventBridge. Depth therefore affects only the excluded setup; the
+  measured region is one final-state snapshot adoption, and the numbers are
+  expected to be roughly flat in depth. A lane guard asserts the client
+  committed NO events locally (the snapshot arm commits none), so the lane
+  cannot silently change without failing the bench. This is a useful number
+  (fresh-client first-fetch latency at depth-N server history) but it is NOT
+  catch-up replay.
+- **bridge_catchup**: the TRUE EventBridge lane, via the stale-client shape,
+  which is the only shape that produces `DeltaContent::EventBridge`. Setup
+  (excluded): the server creates the entity; the client connects, fetches once
+  so it persists the entity at that head, then disconnects (dropping the
+  `LocalProcessConnection`); the server advances by `param` edits. Measured:
+  the client reconnects and re-fetches; known_matches now carries the stale
+  head, the server builds the bridge from stale head to current head
+  (`generate_entity_delta` Case 2, including the server-side causal comparison
+  and backward event walk), and the client applies the `param` gap events
+  through the bridge arm (validate, stage, topo-sort, apply, commit each).
+  Reconnect (two peer registrations, two task spawns) is inside the measured
+  region and negligible against the bridge at any gap. Guards: the client must
+  reach the final state, AND a lane guard asserts the client committed at
+  least `param` events locally, which only the bridge arm does; if the server
+  fell back to a StateSnapshot the count stays 0 and the bench fails rather
+  than recording the wrong lane. A one-off instrumented run confirmed the lane
+  switch on this exact shape (stored events: 0 after the fresh fetch, exactly
+  `gap` after the stale re-fetch).
 - **subscription_establishment**: durable server holding `param` resident
   matching entities; a fresh ephemeral client establishes and initializes a
   broad live query (via `nocache`, so it waits on the server round trip rather
@@ -106,24 +134,35 @@ N-deep history or N resident entities) and a full round trip.
   path on sled, NOT the bare `compare()`/engine microcost in
   `core/benches/BASELINE.md`. They are not comparable; this one includes
   storage, event creation, and state materialization.
-- `bridge_catchup` grows strongly sublinearly in history depth (100 -> 1000 adds
-  ~38 us, but 1000 -> 5000 adds only ~15 us on the median). The EventBridge
-  ships the missing events in bulk rather than per-event round trips, so beyond a
-  few hundred events the fixed fetch and round-trip cost dominates and the
-  marginal per-event application cost is small at these depths. The 5000 case has
-  a wide band on 10 samples (`[132.93 151.75 184.10] us`); treat its median as
-  indicative, not precise. This sublinearity is exactly the property the E
-  streaming-application target (bounded by divergence window, not history) means
-  to preserve or improve; it is the number E2 must not regress.
+- `fresh_fetch_snapshot` is roughly flat in history depth (110 -> 133 -> 137 us
+  for 100 -> 1000 -> 5000), as the lane predicts: the response is one snapshot
+  of final state regardless of depth. The small rise plausibly reflects
+  server-side storage reads over a larger store. Do not read these as catch-up
+  numbers: the first capture of this baseline made exactly that mistake,
+  labeling this lane "bridge_catchup", which would imply ~30 ns/event replay;
+  the E1 micro baseline alone shows that is impossible (one comparison over a
+  1000-deep history is ~2.6 ms).
+- `bridge_catchup` scales LINEARLY with gap depth: ~33-39 us per bridge-applied
+  event, i.e. ~25-30k events/s through the bridge arm. The per-event cost is
+  the same order as a local commit (~37 us), which is coherent: each bridge
+  event is validated, staged, applied, and committed on the client, and the
+  server additionally pays the causal comparison plus the backward walk to
+  assemble the bridge. This linear-in-gap wall time is the honest catch-up
+  baseline and the number E2's streaming/application work would move; the
+  divergence-window target in workstream E governs its memory, not its time.
 - `subscription_establishment` grows roughly linearly in resident-entity count
-  (10 -> ~0.35 ms, 100 -> ~2.9 ms, 1000 -> ~36 ms, i.e. about 10x per 10x). The
+  (10 -> ~0.38 ms, 100 -> ~3.4 ms, 1000 -> ~39 ms, i.e. about 10x per 10x). The
   server matches the predicate over all N entities and ships a snapshot the
   client initializes on; that per-entity cost is the dominant term. This is the
   before-number for any future establishment-path optimization.
-- Latency (~83 us) and throughput (~37 us) are single-connection, single-writer,
+- Latency (~84 us) and throughput (~37 us) are single-connection, single-writer,
   in-process figures. Multi-writer contention, multi-peer relay fan-out, and
   real network transports are out of scope for this baseline and are separate
   measurements if and when they matter.
+- Run-to-run variance on the multi-ms cases (bridge_catchup,
+  subscription_establishment) is a few percent to ~15% at these sample counts;
+  as stated above, capture a local baseline before reading a regression into a
+  small delta.
 
 ## Re-running
 

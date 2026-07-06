@@ -188,11 +188,12 @@ fn volume_multi_entity_churn() {
 /// depth and asserts all nodes converge on the deep chain.
 ///
 /// NOTE ON SCOPE: this is the deterministic correctness-and-memory view of a
-/// deep chain. The bridge catch-up WALL TIME versus history depth is a
-/// performance question and lives in the perf tier
-/// (`macro_perf.rs::bridge_catchup`), which drives a genuinely fresh
-/// `LocalProcessConnection` client fetching after N server edits. Reporting a
-/// sim-harness catch-up time as a performance number is explicitly forbidden.
+/// deep chain. Catch-up WALL TIME is a performance question and lives in the
+/// perf tier: `macro_perf.rs::bench_bridge_catchup` (stale-client shape, the
+/// only shape served by the EventBridge lane) and
+/// `macro_perf.rs::bench_fresh_fetch_snapshot` (fresh client, snapshot lane).
+/// Reporting a sim-harness catch-up time as a performance number is explicitly
+/// forbidden.
 #[test]
 fn volume_deep_single_entity_history() {
     let events = vol_events();
