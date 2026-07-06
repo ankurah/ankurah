@@ -81,8 +81,7 @@ impl NodeApplier {
                 // shares the same area so BFS discovery and pipeline
                 // scheduling see one buffer.
                 let staging = Arc::new(StagingArea::with_default_cap());
-                let event_getter =
-                    CachedEventGetter::with_staging(collection_id, collection.clone(), node, &cdata, staging.clone());
+                let event_getter = CachedEventGetter::with_staging(collection_id, collection.clone(), node, &cdata, staging.clone());
                 let state_getter = LocalStateGetter::new(collection);
                 Self::apply_update(node, from_peer_id, update, &staging, &event_getter, &state_getter, &mut changes, &mut ()).await
             }
