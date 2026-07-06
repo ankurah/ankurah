@@ -5,11 +5,11 @@
 //! where incoming events are temporarily staged for BFS discovery before being committed
 //! to permanent storage.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::{
     error::{MutationError, RetrievalError},
+    ingest::StagingArea,
     policy::PolicyAgent,
     storage::{StorageCollectionWrapper, StorageEngine},
     util::Iterable,
@@ -87,12 +87,21 @@ impl<R: GetState + Send + Sync + ?Sized> GetState for &R {
 pub struct LocalEventGetter {
     collection: StorageCollectionWrapper,
     durable: bool,
-    staging: Arc<RwLock<HashMap<EventId, Event>>>,
+    staging: Arc<StagingArea>,
 }
 
 impl LocalEventGetter {
+    /// Private per-call staging, the historical lifetime: everything staged
+    /// through this getter is dropped with it unless committed first.
     pub fn new(collection: StorageCollectionWrapper, durable: bool) -> Self {
-        Self { collection, durable, staging: Arc::new(RwLock::new(HashMap::new())) }
+        Self::with_staging(collection, durable, Arc::new(StagingArea::with_default_cap()))
+    }
+
+    /// Shared staging with caller-controlled lifetime. The ingest pipeline
+    /// passes the node-scoped area so staged-but-unapplied events survive
+    /// across deliveries (gap replay, NeedsState/NeedsEvents buffering).
+    pub fn with_staging(collection: StorageCollectionWrapper, durable: bool, staging: Arc<StagingArea>) -> Self {
+        Self { collection, durable, staging }
     }
 }
 
@@ -100,11 +109,8 @@ impl LocalEventGetter {
 impl GetEvents for LocalEventGetter {
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
         // Check staging first
-        {
-            let staging = self.staging.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(event) = staging.get(event_id) {
-                return Ok(event.clone());
-            }
+        if let Some(event) = self.staging.get(event_id) {
+            return Ok(event);
         }
         // Fall back to permanent storage
         let events = self.collection.get_events(vec![event_id.clone()]).await?;
@@ -123,14 +129,16 @@ impl GetEvents for LocalEventGetter {
 #[async_trait]
 impl SuspenseEvents for LocalEventGetter {
     fn stage_event(&self, event: Event) {
-        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
-        staging.insert(event.id(), event);
+        // The bare-Event form carries no attestations; that is fine for the
+        // discovery-only lifetime this trait serves (attestations travel
+        // separately to commit_event). Pipeline intake stages Attested
+        // events directly on the shared area when retention matters.
+        self.staging.stage(Attested::opt(event, None));
     }
 
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
         self.collection.add_event(attested).await?;
-        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
-        staging.remove(&attested.payload.id());
+        self.staging.remove(&attested.payload.id());
         Ok(())
     }
 }
@@ -149,7 +157,7 @@ where
     collection: StorageCollectionWrapper,
     node: &'a Node<SE, PA>,
     cdata: &'a C,
-    staging: Arc<RwLock<HashMap<EventId, Event>>>,
+    staging: Arc<StagingArea>,
 }
 
 impl<'a, SE, PA, C> CachedEventGetter<'a, SE, PA, C>
@@ -158,8 +166,20 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
+    /// Private per-call staging, the historical lifetime.
     pub fn new(collection_id: proto::CollectionId, collection: StorageCollectionWrapper, node: &'a Node<SE, PA>, cdata: &'a C) -> Self {
-        Self { collection_id, collection, node, cdata, staging: Arc::new(RwLock::new(HashMap::new())) }
+        Self::with_staging(collection_id, collection, node, cdata, Arc::new(StagingArea::with_default_cap()))
+    }
+
+    /// Shared staging with caller-controlled lifetime (see LocalEventGetter).
+    pub fn with_staging(
+        collection_id: proto::CollectionId,
+        collection: StorageCollectionWrapper,
+        node: &'a Node<SE, PA>,
+        cdata: &'a C,
+        staging: Arc<StagingArea>,
+    ) -> Self {
+        Self { collection_id, collection, node, cdata, staging }
     }
 }
 
@@ -172,11 +192,8 @@ where
 {
     async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
         // Check staging first
-        {
-            let staging = self.staging.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(event) = staging.get(event_id) {
-                return Ok(event.clone());
-            }
+        if let Some(event) = self.staging.get(event_id) {
+            return Ok(event);
         }
 
         // Try local storage
@@ -225,15 +242,11 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData> + Send + Sync + 'a,
 {
-    fn stage_event(&self, event: Event) {
-        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
-        staging.insert(event.id(), event);
-    }
+    fn stage_event(&self, event: Event) { self.staging.stage(Attested::opt(event, None)); }
 
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
         self.collection.add_event(attested).await?;
-        let mut staging = self.staging.write().unwrap_or_else(|e| e.into_inner());
-        staging.remove(&attested.payload.id());
+        self.staging.remove(&attested.payload.id());
         Ok(())
     }
 }
