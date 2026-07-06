@@ -204,7 +204,9 @@ workstream D; the optimization pass runs after D stabilizes.
    - PERF TIER (real wall-clock, advisory): a criterion macro suite over real
      multi-threaded tokio and LocalProcessConnection multi-node setups
      (single-writer commit throughput, commit-to-subscriber propagation latency,
-     bridge catch-up wall time vs history depth, subscription establishment at N
+     fresh-fetch snapshot adoption at depth-N history, TRUE bridge catch-up
+     wall time vs gap depth via the stale-client shape with a lane guard
+     proving the EventBridge arm served it, subscription establishment at N
      resident entities). Medians recorded in `specs/concurrency/MACRO-BASELINE.md`
      with hardware/toolchain disclosure. NOT run in the normal CI test job.
    Measurement only: no core changes, no optimization; the numbers are the
