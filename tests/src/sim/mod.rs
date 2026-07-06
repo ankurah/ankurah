@@ -46,34 +46,39 @@
 //!   collections are `Vec`/`BTreeSet`/`BTreeMap`. HashMaps in the harness are
 //!   membership-only and never feed the trace. The scaled determinism audit is
 //!   what guards this invariant against regression.
-//! - Node-side emission order (latent, not reached by the audited scenarios).
-//!   When a single `handle_message` emits more than one outbound message, their
-//!   relative order in the capture queue is the order the production code
-//!   emitted them, and two production paths order emission by hash iteration:
-//!   the reactor buffers per-subscription candidates in a `HashMap`
-//!   (`reactor.rs`, `candidates_by_sub`) so a node with two peer subscriptions
-//!   emits its two `Update`s in randomized order, and `get_durable_peers`
-//!   iterates a `HashSet`-backed `SafeSet` so a multi-durable relay emits its
-//!   per-peer requests in randomized order. The relay also sends on
-//!   `task::spawn` tasks whose polling interleaving the seeded RNG does not
-//!   control. None of this is reachable by the current scenarios: they use one
-//!   durable node and no live subscriptions, so every `handle_message` emits at
-//!   most one captured message, and the audit is clean across 1500+ seeds. But
-//!   the first scenario that establishes multiple subscriptions or a
-//!   multi-durable topology and runs under the determinism audit can see a
-//!   non-identical trace for one seed until those production emission orders are
-//!   made deterministic. Flagged for the workstream-D scenarios.
+//! - Node-side emission order. When a single `handle_message` emits more than
+//!   one outbound message, their relative order in the capture queue is the
+//!   order the production code emitted them. Two paths that once ordered emission
+//!   by hash iteration were made deterministic by PR #285: the reactor now
+//!   buffers per-subscription candidates in a `BTreeMap` keyed on
+//!   `ReactorSubscriptionId` (`reactor.rs`, `candidates_by_sub`), and
+//!   `get_durable_peers` returns its peers id-sorted with a node-owned seedable
+//!   RNG for random selection. The C5 coherence scenarios (`sim_coherence.rs`)
+//!   are the first to establish live subscriptions under the determinism audit,
+//!   and they reproduce identically, confirming those fixes hold. One residual
+//!   boundary remains: the client-relay subscription-setup retry uses a real
+//!   5-second `futures_timer` (`client_relay.rs`), so a schedule that reorders
+//!   the setup handshake fails the first attempt and then waits on that timer,
+//!   which the drain-based scheduler cannot advance. Subscription scenarios
+//!   therefore avoid `reorder` via `FaultConfig::swarm_subscription_safe`; the
+//!   underlying gap is tracked in issue #321.
 
+pub mod coherence;
 pub mod faults;
 pub mod invariants;
 pub mod model;
 pub mod node;
+pub mod recorder;
 pub mod rng;
 pub mod scenario;
 pub mod scheduler;
 pub mod trace;
 pub mod transport;
 
+pub use coherence::LocalWrite;
 pub use faults::FaultConfig;
+pub use invariants::Violation;
 pub use model::{Field, SimRecord, SimRecordView};
-pub use scenario::{body, run_once, run_with_determinism_audit, sweep, ScenarioFut, SimOutcome, Workload};
+pub use node::SimNode;
+pub use recorder::{RecordedChangeSet, RecordedItem, SubscriptionRecorder};
+pub use scenario::{body, run_once, run_recording, run_with_determinism_audit, sweep, CheckFut, ScenarioFut, SimOutcome, Workload};
