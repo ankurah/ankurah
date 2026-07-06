@@ -44,6 +44,22 @@ pub fn entity_id(counter: u64) -> proto::EntityId {
 /// The `SimRecord` collection id.
 pub fn sim_collection() -> proto::CollectionId { SimRecord::collection() }
 
+/// Decode the `(title, body)` LWW field values from a materialized `proto::State`
+/// as a subscriber would read them, for the C5 coherence checks that compare a
+/// recorded read against the converged truth. An unset field, or a state with no
+/// LWW buffer, reads as `None`, matching how the view getter surfaces an unset
+/// field. Decoding failure is treated as absence rather than panicking, so a
+/// malformed buffer degrades to a comparison miss, not a harness crash.
+pub fn field_values(state: &proto::State) -> (Option<String>, Option<String>) {
+    let Some(buffer) = state.state_buffers.0.get("lww") else { return (None, None) };
+    let Ok(backend) = LWWBackend::from_state_buffer(buffer) else { return (None, None) };
+    let read = |name: &str| match backend.get(&name.to_string()) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    };
+    (read("title"), read("body"))
+}
+
 /// Which LWW field a write targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {

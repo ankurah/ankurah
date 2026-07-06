@@ -37,6 +37,11 @@ pub struct Workload<'a> {
     /// `LiveQuery` tears down its relay context, so scenarios that inject
     /// SubscriptionUpdates keep them alive here.
     subscriptions: Vec<ankurah::LiveQuery<super::model::SimRecordView>>,
+    /// Recording subscriptions whose observed notification stream is checked for
+    /// the C5 session guarantees after quiescence. Each also holds its `LiveQuery`
+    /// and guard alive, so a recording subscription need not also be pushed to
+    /// `subscriptions`.
+    recorders: Vec<super::recorder::SubscriptionRecorder>,
     /// Entity ids that must NEVER be materialized on any node (reserved unknown
     /// entities in phantom-eviction scenarios). Checked at quiescence via the
     /// resident-first read, so even a resident-only phantom is caught.
@@ -110,6 +115,23 @@ impl<'a> Workload<'a> {
         let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
         self.subscriptions.push(lq);
         self.settle().await;
+    }
+
+    /// Establish a live subscription on `node` against `predicate` and attach a
+    /// synchronous recorder to its notification stream, then settle. Returns the
+    /// index of the recorder for reading its stream in the post-quiescence check
+    /// (see [`run_recording`]). The recorder holds the `LiveQuery` and its guard
+    /// alive for the run, so a recording subscription need not be registered via
+    /// [`Workload::subscribe`] as well. The recorder's listener runs inline on the
+    /// harness runtime when the reactor broadcasts, so it does not perturb the
+    /// determinism audit.
+    pub async fn subscribe_recording(&mut self, node: usize, predicate: &str) -> usize {
+        let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
+        let recorder = super::recorder::SubscriptionRecorder::attach(node, predicate.to_owned(), lq);
+        let index = self.recorders.len();
+        self.recorders.push(recorder);
+        self.settle().await;
+        index
     }
 
     /// Build and deliver a `StateAndEvent` SubscriptionUpdate carrying `origin`'s
@@ -304,11 +326,44 @@ where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
     f
 }
 
+/// The future a post-quiescence coherence check returns. Borrows the nodes and
+/// recorders for the duration of the check so an async check can read converged
+/// storage (causal ancestry) while the recorders are still alive.
+pub type CheckFut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Violation>> + 'a>>;
+
 /// Run one scenario at one seed with one fault config, returning the outcome
 /// (trace hash + invariant violations). Drives everything on a single-threaded
 /// runtime for deterministic intra-node scheduling.
 pub fn run_once<F>(scenario_name: &'static str, seed: u64, faults: FaultConfig, node_count: usize, body: F) -> SimOutcome
 where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
+    run_inner(scenario_name, seed, faults, node_count, body, |_nodes, _recorders| Box::pin(async { Vec::new() }))
+}
+
+/// Run one scenario, then apply a post-quiescence coherence check over the
+/// recording subscriptions the scenario established via
+/// [`Workload::subscribe_recording`]. The check runs after the final drain, when
+/// each recorder's notification stream is complete and deterministic, is awaited
+/// on the harness runtime (so it may read converged storage), and its returned
+/// violations are merged into the outcome so a failure produces the same
+/// reproducible `artifact_line` as any other invariant. This is the C5 driver:
+/// convergence and the session guarantees are asserted in one run.
+pub fn run_recording<F, C>(scenario_name: &'static str, seed: u64, faults: FaultConfig, node_count: usize, body: F, check: C) -> SimOutcome
+where
+    F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b>,
+    C: for<'a> FnOnce(&'a [SimNode], &'a [super::recorder::SubscriptionRecorder]) -> CheckFut<'a>,
+{
+    run_inner(scenario_name, seed, faults, node_count, body, check)
+}
+
+/// Shared runtime core for [`run_once`] and [`run_recording`]. Builds the nodes,
+/// runs the body, drains to the quiescence barrier, checks the convergence
+/// invariants, then runs the caller's coherence check over the recorders (empty
+/// for `run_once`). Both violation sets land in one `SimOutcome`.
+fn run_inner<F, C>(scenario_name: &'static str, seed: u64, faults: FaultConfig, node_count: usize, body: F, check: C) -> SimOutcome
+where
+    F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b>,
+    C: for<'a> FnOnce(&'a [SimNode], &'a [super::recorder::SubscriptionRecorder]) -> CheckFut<'a>,
+{
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("current-thread runtime builds");
 
     runtime.block_on(async move {
@@ -346,9 +401,9 @@ where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
 
         // Run the workload in an inner scope so its mutable borrows of the
         // scheduler/rng/trace end before the quiescence barrier reuses them.
-        // Subscriptions are lifted out so their relay contexts stay alive
-        // through the final barrier and the invariant checks.
-        let (created, forbidden, _subscriptions) = {
+        // Subscriptions and recorders are lifted out so their relay contexts and
+        // listeners stay alive through the final barrier and the checks.
+        let (created, forbidden, _subscriptions, recorders) = {
             let mut workload = Workload {
                 nodes: &nodes,
                 scheduler: &mut scheduler,
@@ -358,22 +413,33 @@ where F: for<'w, 'b> FnOnce(&'b mut Workload<'w>) -> ScenarioFut<'b> {
                 created: Vec::new(),
                 heads: std::collections::HashMap::new(),
                 subscriptions: Vec::new(),
+                recorders: Vec::new(),
                 forbidden: Vec::new(),
             };
             body(&mut workload).await;
             let created = std::mem::take(&mut workload.created);
             let forbidden = std::mem::take(&mut workload.forbidden);
             let subs = std::mem::take(&mut workload.subscriptions);
-            (created, forbidden, subs)
+            let recorders = std::mem::take(&mut workload.recorders);
+            (created, forbidden, subs, recorders)
         };
 
         // Quiescence barrier: drain all in-flight messages, healing partitions,
-        // so the convergence check is well posed.
+        // so the convergence check is well posed and every recorder's stream is
+        // complete.
         scheduler.run_to_quiescence(&nodes, &mut rng, &mut trace).await;
 
         let universe = ExpectedUniverse { created, forbidden };
-        let violations = invariants::check_all(&nodes, &universe).await;
+        let mut violations = invariants::check_all(&nodes, &universe).await;
         let max_head_len = invariants::max_head_len(&nodes, &universe).await;
+
+        // Coherence check over the recorded notification streams, after the
+        // stream is complete. Awaited on the harness runtime and handed the nodes
+        // so it can reconstruct causal ancestry from converged storage (as the
+        // invariants do). Sorted into the violation set so the artifact line stays
+        // reproducible regardless of the order the check emitted them.
+        violations.extend(check(&nodes, &recorders).await);
+        violations.sort_by(|a, b| (a.invariant, &a.detail).cmp(&(b.invariant, &b.detail)));
 
         SimOutcome {
             seed,

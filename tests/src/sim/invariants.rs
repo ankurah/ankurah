@@ -26,6 +26,13 @@ impl std::fmt::Display for Violation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "[{}] {}", self.invariant, self.detail) }
 }
 
+impl Violation {
+    /// Construct a violation. Used by the C5 coherence checks (which live in the
+    /// scenario file, outside this module) to report session-guarantee failures
+    /// into the same outcome set as the convergence invariants.
+    pub fn new(invariant: &'static str, detail: String) -> Self { Self { invariant, detail } }
+}
+
 /// The set of entity ids the harness knows were legitimately created (the
 /// "acknowledged writes" universe). Used by no-lost-write and no-phantom.
 pub struct ExpectedUniverse {
@@ -193,6 +200,40 @@ pub async fn check_head_antichain(nodes: &[SimNode], universe: &ExpectedUniverse
         }
     }
     violations
+}
+
+/// The causal closure of `frontier` for `entity` as reconstructed from `node`'s
+/// stored events: every event that is in `frontier` or is an ancestor of some
+/// event in it. Used by the C5 monotonic-reads check to decide whether an event
+/// the subscriber previously observed is still causally reflected in a later
+/// head (member of the head, or an ancestor of a member). Read at quiescence,
+/// when every node's stored history is complete, so any node is authoritative.
+/// Returns an empty set if the entity has no stored events on `node`.
+pub async fn causal_closure(
+    node: &SimNode,
+    entity: proto::EntityId,
+    frontier: &[proto::EventId],
+) -> std::collections::HashSet<proto::EventId> {
+    let events = {
+        let collection = match node.node.collections.get(&super::model::SimRecord::collection()).await {
+            Ok(c) => c,
+            Err(_) => return std::collections::HashSet::new(),
+        };
+        collection.dump_entity_events(entity).await.unwrap_or_default()
+    };
+    let parent_of: std::collections::HashMap<proto::EventId, Vec<proto::EventId>> =
+        events.iter().map(|e| (e.payload.id(), e.payload.parent.to_vec())).collect();
+
+    let mut closure = std::collections::HashSet::new();
+    let mut stack: Vec<proto::EventId> = frontier.to_vec();
+    while let Some(id) = stack.pop() {
+        if closure.insert(id.clone()) {
+            if let Some(parents) = parent_of.get(&id) {
+                stack.extend(parents.iter().cloned());
+            }
+        }
+    }
+    closure
 }
 
 /// Strict ancestor set of `start` via the parent map (bounded walk; the map is

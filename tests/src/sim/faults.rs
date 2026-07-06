@@ -84,6 +84,44 @@ impl FaultConfig {
         Self::swarm(&mut rng)
     }
 
+    /// Swarm fault subset for scenarios that establish a live subscription, drawn
+    /// from the seed but with `reorder` excluded. Reordering the subscription
+    /// setup handshake (SubscribeQuery / QuerySubscribed) makes the initial setup
+    /// fail, and the client relay then waits on a real 5-second `futures_timer`
+    /// retry (core/src/peer_subscription/client_relay.rs) that the deterministic,
+    /// drain-based scheduler cannot advance. That injects multi-second wall-clock
+    /// stalls into the quiescence barrier and, because the timer fires on a
+    /// separate thread, makes the trace non-deterministic, so a subscription
+    /// scenario cannot pass the determinism audit under `reorder`. The other fault
+    /// kinds (delay, duplicate, drop, partition) still perturb propagation order
+    /// (delay requeues to a later round, which reorders relative to prompt
+    /// traffic) without failing the setup handshake. Tracked as a harness gap:
+    /// see the FIXME in tests/tests/sim_swarm.rs. The delay probability is capped
+    /// lower than the generic swarm to keep setup on its first-attempt path.
+    pub fn swarm_subscription_safe(seed: u64) -> Self {
+        let mut rng = SimRng::new(seed ^ 0x53554253_4b4559); // "SUBS_KEY"
+        let mut cfg = Self {
+            reorder: false,
+            delay: rng.bool(),
+            duplicate: rng.bool(),
+            drop: rng.bool(),
+            partition: rng.bool(),
+            delay_p: rng.range_inclusive(10, 30) as f64 / 100.0,
+            duplicate_p: rng.range_inclusive(10, 40) as f64 / 100.0,
+            drop_p: rng.range_inclusive(10, 40) as f64 / 100.0,
+            partition_toggle_p: rng.range_inclusive(5, 25) as f64 / 100.0,
+        };
+        if !(cfg.delay || cfg.duplicate || cfg.drop || cfg.partition) {
+            match rng.below(4) {
+                0 => cfg.delay = true,
+                1 => cfg.duplicate = true,
+                2 => cfg.drop = true,
+                _ => cfg.partition = true,
+            }
+        }
+        cfg
+    }
+
     /// Draw a random subset of fault kinds from the seed (swarm testing). At
     /// least one kind is guaranteed on, so a "faulty" run is never silently a
     /// no-fault run.
