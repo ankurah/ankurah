@@ -147,8 +147,7 @@ impl NodeApplier {
         match content {
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
-                let attested_events =
-                    Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
+                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
                 // Wire order is untrusted for every multi-event shape, not
                 // just bridges: a child applied before its staged parent
                 // gap-jumps the head and drops the parent's operations (V4).
@@ -197,8 +196,7 @@ impl NodeApplier {
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
-                let attested_events =
-                    Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
+                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
                 // Sorted for the same reason as the EventOnly arm: the
                 // fallback below applies event by event.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
@@ -381,8 +379,7 @@ impl NodeApplier {
             proto::DeltaContent::EventBridge { events } => {
                 // Bridge events pass the same policy gate as subscription
                 // updates; transport must not decide trust.
-                let attested_events =
-                    Self::validate_and_stage(node, from_peer_id, delta.entity_id, &delta.collection, events, staging)?;
+                let attested_events = Self::validate_and_stage(node, from_peer_id, delta.entity_id, &delta.collection, events, staging)?;
 
                 // Get or create entity
                 let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &delta.collection, &delta.entity_id).await?;
