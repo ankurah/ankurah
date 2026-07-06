@@ -292,7 +292,7 @@ workstream ends by updating this document's checklist.
 - [x] C2: nightly comparison-vs-oracle property sweep and simulation swarm
 - [x] C3: backend conformance kit; pn_counter decision
 - [x] C4: threat model document plus wire-level adversarial suite
-- [ ] C5: reactor/LiveQuery coherence under merge schedules
+- [x] C5: reactor/LiveQuery coherence under merge schedules
 - [x] C6: crash/recovery fault injection
 - [ ] C7: storage engine conformance suite
 - [ ] C8 (optional): scheduler model check
