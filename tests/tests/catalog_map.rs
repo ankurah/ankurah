@@ -233,7 +233,7 @@ async fn hard_reset_flushes_catalog() -> anyhow::Result<()> {
 // Test 6: rename follow-up -- the display-name index updates (old name gone,
 // new present) while the derived property id is unchanged.
 #[tokio::test]
-async fn rename_updates_display_names() -> anyhow::Result<()> {
+async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.catalog.wait_catalog_ready().await;
 

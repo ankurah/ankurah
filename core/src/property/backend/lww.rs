@@ -61,6 +61,14 @@ pub enum PropertyKey {
     Name(String),
 }
 
+/// Result of the decode-time-hint claimant scan (see
+/// [`LWWBackend::hint_claimant`]).
+enum HintClaim {
+    None,
+    Unique(Value),
+    Ambiguous(EntityId, EntityId),
+}
+
 /// A name<->id translation table for one collection's properties, supplied by
 /// the schema layer (local compiled schema and/or the replicated catalog).
 ///
@@ -325,20 +333,13 @@ impl LWWBackend {
             }
             // Unbound: project through the decode-time hints, refusing to
             // guess between same-name claimants.
-            let hints = self.hints.read().unwrap();
-            let mut matched: Option<(EntityId, Value)> = None;
-            for (key, entry) in values.iter() {
-                let PropertyKey::Id(id) = key else { continue };
-                if hints.get(id).map(|h| h.as_str()) != Some(property_name.as_str()) {
-                    continue;
+            return match Self::hint_claimant(&values, &self.hints.read().unwrap(), property_name) {
+                HintClaim::None => Ok(None),
+                HintClaim::Unique(value) => Ok(Some(value)),
+                HintClaim::Ambiguous(a, b) => {
+                    Err(PropertyError::TypeSkew { name: property_name.clone(), a: a.to_base64(), b: b.to_base64() })
                 }
-                let Some(value) = entry.value() else { continue };
-                if let Some((first, _)) = matched {
-                    return Err(PropertyError::TypeSkew { name: property_name.clone(), a: first.to_base64(), b: id.to_base64() });
-                }
-                matched = Some((*id, value));
-            }
-            return Ok(matched.map(|(_, value)| value));
+            };
         };
 
         // The binding-resolved id holds a value -> return it directly.
@@ -387,21 +388,35 @@ impl LWWBackend {
         if self.binding.read().unwrap().is_some() {
             return None;
         }
-        let values = self.values.read().unwrap();
-        let hints = self.hints.read().unwrap();
-        let mut matched: Option<Value> = None;
+        match Self::hint_claimant(&self.values.read().unwrap(), &self.hints.read().unwrap(), property_name) {
+            HintClaim::Unique(value) => Some(value),
+            // Ambiguous projection: refuse to guess (the checked read is the
+            // variant that surfaces it as TypeSkew).
+            HintClaim::None | HintClaim::Ambiguous(..) => None,
+        }
+    }
+
+    /// Scan id-keyed entries for decode-time-hint claimants of `name`:
+    /// the ONE shared projection primitive behind `get_checked`'s no-binding
+    /// regime and [`get_projected`], so the "exactly one claimant reads,
+    /// two claimants are a skew" rule cannot drift between them.
+    fn hint_claimant(values: &BTreeMap<PropertyKey, ValueEntry>, hints: &BTreeMap<EntityId, String>, name: &PropertyName) -> HintClaim {
+        let mut matched: Option<(EntityId, Value)> = None;
         for (key, entry) in values.iter() {
             let PropertyKey::Id(id) = key else { continue };
-            if hints.get(id).map(|h| h.as_str()) != Some(property_name.as_str()) {
+            if hints.get(id).map(|h| h.as_str()) != Some(name.as_str()) {
                 continue;
             }
             let Some(value) = entry.value() else { continue };
-            if matched.is_some() {
-                return None; // ambiguous projection: refuse to guess
+            if let Some((first, _)) = matched {
+                return HintClaim::Ambiguous(first, *id);
             }
-            matched = Some(value);
+            matched = Some((*id, value));
         }
-        matched
+        match matched {
+            Some((_, value)) => HintClaim::Unique(value),
+            None => HintClaim::None,
+        }
     }
 
     /// Find the stored entry for a display name, in priority order:

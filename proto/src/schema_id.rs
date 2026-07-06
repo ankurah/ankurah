@@ -23,7 +23,9 @@ const PROPERTY_TAG: &[u8] = b"ankurah.property.v1";
 const MEMBERSHIP_TAG: &[u8] = b"ankurah.membership.v1";
 
 /// The minting scope for standalone declarations that belong to no model
-/// (e.g. shared properties authored declaratively; RFC 5.1, 5.10).
+/// (e.g. shared properties authored declaratively; RFC 5.1, 5.10). Ships
+/// ahead of its consumer: the declarative DDL path (#301) is the caller;
+/// it lives here because the scope constant is derivation-normative.
 pub fn standalone_scope() -> EntityId { EntityId::from_bytes([0u8; 16]) }
 
 /// id of the model definition entity for `collection`, scoped to `root`.

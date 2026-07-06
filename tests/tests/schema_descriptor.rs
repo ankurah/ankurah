@@ -28,14 +28,9 @@ pub struct DescArtist {
 pub struct DescAllTypes {
     // String (default YrsString) -> ("yrs", "string")
     pub yrs_name: String,
-    // Option<String> -> ("lww", "string", optional). NOTE: the RFC section 4
-    // table lists `Option<String> (YrsString) -> "yrs"`, but the ACTUAL
-    // in-tree backend registry resolves it to LWW: yrs's `accepts` is
-    // `^String$` (bare String only), while lww lists `Option<String>` among
-    // its provided types (core/src/property/value/{yrs,lww}.ron). The schema
-    // records what the backend registry actually resolves, which is the
-    // authoritative source for the (backend, value_type) identity pair; the
-    // divergence from the RFC prose is a documented finding for A11a.
+    // Option<String> -> ("lww", "string", optional): yrs accepts only bare
+    // String (`^String$`), and a yrs text cannot represent None as distinct
+    // from "" -- RFC section 4 erratum 1, ratified 2026-07-05.
     pub yrs_opt: Option<String>,
     // #[active_type(LWW)] String -> ("lww", "string")
     #[active_type(LWW)]

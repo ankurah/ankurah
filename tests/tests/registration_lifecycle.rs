@@ -118,7 +118,7 @@ async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
 // reconnect with a NEW connection; `register_peer` drains the queue to the
 // durable, whose catalog then gains the entries.
 //
-// Shaping note (reported): a commit is NOT attempted while disconnected. An
+// Shaping note: a commit is NOT attempted while disconnected. An
 // ephemeral with no durable peer cannot relay a commit (relay_to_required_peers
 // has no peer), so committing offline would be a separate concern; the RFC's
 // registration trigger fires on `create` itself, so `create` (without commit)

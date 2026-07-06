@@ -60,11 +60,6 @@ impl<T: Property> LWW<T> {
         }
     }
 
-    /// The raw stored value via the LENIENT backend read (no sibling gate, no
-    /// default). Retained for callers that want the backend's stored value as
-    /// is; the compiled projection uses [`get`] / [`get_checked_value`].
-    pub fn get_value(&self) -> Option<Value> { self.backend.get(&self.property_name) }
-
     /// The stored value under the RFC 5.4 sibling gate: `Ok(Some)` present,
     /// `Ok(None)` absent, `Err(TypeSkew)` when a retype lineage holds data
     /// here (delegates to [`LWWBackend::get_checked`]).

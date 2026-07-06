@@ -1,6 +1,7 @@
 //! RFC 5.3: the resolution pass binds property references against the
-//! catalog, producing resolved Identifiers and failing closed on unknowns
-//! (AC4, AC5). Not yet wired into the query paths; invoked explicitly.
+//! catalog, producing resolved Identifiers and failing closed on unknowns.
+//! It is wired at the query origin sites since the protocol v2 epoch; these
+//! tests drive the pass directly for precise shape assertions.
 
 mod common;
 use ankql::ast::{Expr, Predicate, Selection};

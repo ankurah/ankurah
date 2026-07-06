@@ -252,7 +252,7 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
     // that is `None` until the follow-up lands (core/src/schema/catalog.rs,
     // `parse_membership`). This test pins that catalog datum for BOTH states.
     //
-    // SCOPE (flagged for Daniel, RFC 5.4 vs REN-ish strictness): predicate
+    // SCOPE (RFC 5.4 vs REN-ish strictness; see plan decision 14): predicate
     // evaluation does NOT consult per-membership optionality in Phase A -- the
     // filter's absent-as-NULL cut (test 3 above) unifies all three historical
     // missing-property behaviors, and required-defaults at the predicate level

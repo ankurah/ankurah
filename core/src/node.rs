@@ -179,7 +179,7 @@ where
     ///
     /// The yrs backend is deliberately untouched: yrs roots stay name-keyed
     /// by decision (RFC 5.5 Phase C).
-    pub fn bind_entity(&self, entity: &Entity) {
+    pub(crate) fn bind_entity(&self, entity: &Entity) {
         let collection = entity.collection();
         // System + catalog collections are the bootstrap exemption: never bind.
         if collection.as_str() == crate::system::SYSTEM_COLLECTION_ID || crate::schema::is_catalog_collection(collection) {
@@ -255,6 +255,17 @@ where
         }
 
         node.catalog.start(node.weak());
+        // Assembly-time binding choke point (RFC 5.5): every entity handed
+        // out by the entity set gets the id-keyed contract flip, so no
+        // assembly path can forget it.
+        node.entities.set_bind_hook(Box::new({
+            let weak = node.weak();
+            move |entity| {
+                if let Some(node) = weak.upgrade() {
+                    node.bind_entity(entity);
+                }
+            }
+        }));
         node.policy_agent.on_node_ready(node.weak());
 
         node
@@ -642,11 +653,6 @@ where
                 .entities
                 .get_retrieve_or_create(&state_getter, &event_getter, &event.payload.collection, &event.payload.entity_id)
                 .await?;
-            // Flip to id-keyed (v2) BEFORE applying the event, so the rewritten
-            // state (to_state below) is a 0xA2 buffer and id-keyed values
-            // project (RFC 5.5). No-op for system/catalog collections.
-            self.bind_entity(&entity);
-
             // Stage the event so BFS can discover it
             event_getter.stage_event(event.payload.clone());
 
@@ -1028,8 +1034,6 @@ where
                 .entities
                 .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
                 .await?;
-            // Flip to id-keyed (v2) for user collections (RFC 5.5).
-            self.bind_entity(&entity);
             entities.push(entity);
         }
         Ok(entities)

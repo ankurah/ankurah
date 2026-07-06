@@ -159,14 +159,11 @@ async fn legacy_v1_state_reads_then_rewrites_to_0xa2_on_edit() -> Result<()> {
 
     // Register the record schema so the node's binding can resolve record
     // fields (create+commit any record; we only need the catalog warmed).
-    let seed_id = {
+    {
         let trx = ctx.begin();
-        let rec = trx.create(&Record { title: "seed".to_owned(), artist: "seed".to_owned() }).await?;
-        let id = rec.id();
+        trx.create(&Record { title: "seed".to_owned(), artist: "seed".to_owned() }).await?;
         trx.commit().await?;
-        id
-    };
-    let _ = seed_id;
+    }
 
     // Build a LEGACY name-keyed (0xA1) state for a NEW record id, exactly as a
     // pre-flip node would have written it, and set it directly into storage.

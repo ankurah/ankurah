@@ -75,13 +75,9 @@ pub trait TContext {
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> TContext for NodeAndContext<SE, PA> {
     fn node_id(&self) -> proto::EntityId { self.node.id }
     fn create_entity(&self, collection: proto::CollectionId, trx_alive: Arc<AtomicBool>) -> Entity {
+        // Assembly binds the PRIMARY to the id-keyed contract before we
+        // snapshot, so the fork carries binding + wire mode (RFC 5.5).
         let primary_entity = self.node.entities.create(collection);
-        // Flip a user-collection entity to the id-keyed (v2) wire encoding
-        // (RFC 5.5 Phase A) on the PRIMARY, BEFORE snapshotting: the snapshot
-        // forks the bound backend (fork carries binding + wire mode), and the
-        // commit save path persists the primary (upstream), so both the diff
-        // and the rewritten state buffer are v2. No-op for system/catalog.
-        self.node.bind_entity(&primary_entity);
         primary_entity.snapshot(trx_alive)
     }
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> { self.node.policy_agent.check_write(&self.cdata, entity, None) }
@@ -387,10 +383,6 @@ where
 
         if let Some(local) = self.node.entities.get(&id) {
             debug!("Node({}).get_entity found local entity - returning", self.node.id);
-            // Defensive re-bind of the resident (idempotent): guarantees the
-            // returned user entity is id-keyed (v2) even if it was first
-            // assembled on a path that predates binding (RFC 5.5).
-            self.node.bind_entity(&local);
             let state = local.to_state()?;
             let entity_id = local.id();
             self.node.policy_agent.check_read(&self.cdata, &entity_id, collection_id, &state)?;
@@ -414,9 +406,6 @@ where
                     .entities
                     .with_state(&state_getter, &event_getter, id, collection_id.clone(), entity_state.payload.state)
                     .await?;
-                // Flip to id-keyed (v2) so a subsequent edit rewrites 0xA2 and
-                // id-keyed values project through the binding (RFC 5.5).
-                self.node.bind_entity(&entity);
                 Ok(entity)
             }
             Err(e) => Err(e),
@@ -456,8 +445,6 @@ where
                     .entities
                     .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id.clone(), state.payload.state)
                     .await?;
-                // Flip to id-keyed (v2) for user collections (RFC 5.5).
-                self.node.bind_entity(&entity);
                 entities.push(entity);
             }
             Ok(entities)

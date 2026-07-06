@@ -245,6 +245,16 @@ DONE: PR #306; decision record posted on #294.
   display-name hints AND shrinks the stored 16-byte ids. Events are
   exempt by nature (hashed identity: full ids forever). Design it once
   with the E2EE transform seam in view.
+- CatalogManager split (pre-PR architectural review, 2026-07-05): the
+  manager bundles the passive catalog projection (map + warm/subscribe +
+  readiness) with the registration-lifecycle coordinator (ensured latch,
+  compiled overlay, offline queue, drain). Split into CatalogMap +
+  RegistrationCoordinator before Phase C piles the transform layer onto
+  the same type. Internal only; no API/wire impact.
+- Resolution pass decoupling (same review): resolve.rs bolts AST
+  resolution onto CatalogManager<SE, PA> though it needs only
+  name->id + readiness; extract a narrow NameResolver trait so the
+  pass is unit-testable without a manager. Internal only.
 - System-transaction refactor of the registration executor (maintainer
   nod, 2026-07-05): replace the hand-built follow-up events in
   core/src/schema/registration.rs (follow_up/head_or_genesis) with the

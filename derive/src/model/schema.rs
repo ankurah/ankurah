@@ -75,12 +75,11 @@ pub fn validate_schema_attrs(model: &ModelDescription) -> syn::Result<()> {
     }
 
     for field in model.active_fields() {
-        // Surfaces malformed #[property(...)] and validates #[property(id)].
+        // Surfaces any malformed #[property(...)] list (the walk LitStr-parses
+        // every anchor/id value it passes) and validates #[property(id)].
         if let Some(id) = property_str_attr(&field.attrs, "id")? {
             validate_explicit_id(&id).map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
         }
-        // Also parse anchor so a malformed anchor attribute is caught here.
-        let _ = property_str_attr(&field.attrs, "anchor")?;
     }
 
     if let Some(id) = model_str_attr(model, "id")? {
@@ -286,10 +285,13 @@ fn property_str_attr(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<
 
 /// Parse a `#[model(key = "value")]` string attribute off the struct.
 /// Coexists with the existing flag form `#[model(ephemeral)]`-style parsing
-/// (get_model_flag): a bare-ident meta is skipped here, a `key = "lit"` is
-/// captured. Returns an error only for a `key = <non-string>` value.
+/// (get_model_flag): a bare-ident meta and unrelated keys are skipped, a
+/// `key = "lit"` is captured, and a `key = <non-string>` value is a hard
+/// error (previously it was silently ignored, so `#[model(id = 5)]` would
+/// fall back to derivation without a diagnostic).
 fn model_str_attr(model: &ModelDescription, key: &str) -> syn::Result<Option<String>> {
     let mut found = None;
+    let mut bad_value: Option<syn::Error> = None;
     for attr in model.struct_attrs() {
         if !attr.path().is_ident("model") {
             continue;
@@ -298,10 +300,14 @@ fn model_str_attr(model: &ModelDescription, key: &str) -> syn::Result<Option<Str
         // which is not a name-value list; only capture name = "value".
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident(key) {
-                // Only treat it as ours if it is a name-value with a string.
+                // Only ours if it is a name-value; a bare flag is skipped.
                 if let Ok(value) = meta.value() {
-                    let lit: syn::LitStr = value.parse()?;
-                    found = Some(lit.value());
+                    match value.parse::<syn::LitStr>() {
+                        Ok(lit) => found = Some(lit.value()),
+                        Err(_) => {
+                            bad_value = Some(syn::Error::new(meta.path.span(), format!("#[model({key} = ...)] expects a string literal")));
+                        }
+                    }
                 }
             }
             // Consume any value token for unrelated keys so the walk
@@ -312,6 +318,9 @@ fn model_str_attr(model: &ModelDescription, key: &str) -> syn::Result<Option<Str
             }
             Ok(())
         });
+    }
+    if let Some(err) = bad_value {
+        return Err(err);
     }
     Ok(found)
 }

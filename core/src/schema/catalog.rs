@@ -101,11 +101,6 @@ struct CatalogMapInner {
     by_collection: BTreeMap<String, EntityId>,
     /// model id -> its membership ids (the contract edge set).
     model_memberships: BTreeMap<EntityId, BTreeSet<EntityId>>,
-    /// (collection, property display name) -> property ids. Resolution and
-    /// the per-collection sibling gate index. Best-effort: kept in step with
-    /// property and model arrivals; [`CatalogMapInner::resolve`] is the
-    /// authoritative path (via memberships) and does not depend on it.
-    display_names: BTreeMap<(String, String), BTreeSet<EntityId>>,
     /// property display name -> property ids, across ALL contracts. The
     /// cross-contract sibling gate (RFC 5.4 rule 4) scans this.
     names_global: BTreeMap<String, BTreeSet<EntityId>>,
@@ -118,7 +113,6 @@ impl CatalogMapInner {
         self.memberships.clear();
         self.by_collection.clear();
         self.model_memberships.clear();
-        self.display_names.clear();
         self.names_global.clear();
     }
 
@@ -162,11 +156,7 @@ impl CatalogMapInner {
             }
         }
         self.by_collection.insert(def.collection.clone(), def.id);
-        let collection = def.collection.clone();
         self.models.insert(def.id, def);
-        // A property whose minting model just arrived may now be placeable in
-        // the per-collection display-name index.
-        self.reindex_display_names_for_model(&collection);
     }
 
     fn remove_model(&mut self, id: &EntityId) {
@@ -207,12 +197,7 @@ impl CatalogMapInner {
         }
     }
 
-    fn index_property_names(&mut self, def: &PropertyDef) {
-        self.names_global.entry(def.name.clone()).or_default().insert(def.id);
-        if let Some(collection) = self.minting_collection(def) {
-            self.display_names.entry((collection, def.name.clone())).or_default().insert(def.id);
-        }
-    }
+    fn index_property_names(&mut self, def: &PropertyDef) { self.names_global.entry(def.name.clone()).or_default().insert(def.id); }
 
     fn deindex_property_names(&mut self, def: &PropertyDef) {
         if let Some(set) = self.names_global.get_mut(&def.name) {
@@ -220,33 +205,6 @@ impl CatalogMapInner {
             if set.is_empty() {
                 self.names_global.remove(&def.name);
             }
-        }
-        if let Some(collection) = self.minting_collection(def) {
-            let key = (collection, def.name.clone());
-            if let Some(set) = self.display_names.get_mut(&key) {
-                set.remove(&def.id);
-                if set.is_empty() {
-                    self.display_names.remove(&key);
-                }
-            }
-        }
-    }
-
-    fn minting_collection(&self, def: &PropertyDef) -> Option<String> {
-        def.minted_for.and_then(|m| self.models.get(&m)).map(|m| m.collection.clone())
-    }
-
-    /// When a model arrives, place any already-known properties minted under
-    /// it into the per-collection display-name index.
-    fn reindex_display_names_for_model(&mut self, collection: &str) {
-        let placements: Vec<(String, EntityId)> = self
-            .properties
-            .values()
-            .filter(|p| self.minting_collection(p).as_deref() == Some(collection))
-            .map(|p| (p.name.clone(), p.id))
-            .collect();
-        for (name, id) in placements {
-            self.display_names.entry((collection.to_string(), name)).or_default().insert(id);
         }
     }
 
@@ -513,7 +471,6 @@ where PA: PolicyAgent
     /// Holds the compiled schema (a `&'static`) and the cdata to forward
     /// with.
     pending_registrations: Mutex<Vec<(&'static ModelSchema, PA::ContextData)>>,
-    _phantom: std::marker::PhantomData<PA>,
 }
 
 impl<SE, PA> CatalogManager<SE, PA>
@@ -537,7 +494,6 @@ where
             ensured: RwLock::new(BTreeSet::new()),
             compiled_schemas: RwLock::new(BTreeMap::new()),
             pending_registrations: Mutex::new(Vec::new()),
-            _phantom: std::marker::PhantomData,
         }))
     }
 
