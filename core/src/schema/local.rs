@@ -58,6 +58,12 @@ pub struct FieldSchema {
     /// lineage. Feeds the property-id derivation, so it never changes once
     /// pinned.
     pub anchor: &'static str,
+    /// Whether `#[property(anchor = "...")]` was physically present on the
+    /// field. Distinguishes a deliberate lineage reference whose display
+    /// name equals the anchor (a rename-back, allowed) from the
+    /// attribute-less default (a possible retired-name collision, refused
+    /// by the RFC 5.8 anchor-reuse guard).
+    pub anchored: bool,
     /// Backend registry name, "yrs" or "lww", per the active type the
     /// backend registry resolved for this field (RFC 4).
     pub backend: &'static str,
@@ -110,6 +116,7 @@ pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<
         properties.push(PropertyDescriptor {
             minting_collection: schema.collection.to_string(),
             anchor: field.anchor.to_string(),
+            anchored: field.anchored,
             name: field.name.to_string(),
             backend: field.backend.to_string(),
             value_type: field.value_type.to_string(),

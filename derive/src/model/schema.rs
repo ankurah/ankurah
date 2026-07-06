@@ -104,8 +104,14 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
         let backend = desc.backend_key().map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
 
         // #[property(anchor = "...")]: the permanent derivation name for a
-        // rename lineage. Defaults to the display name.
-        let anchor = property_str_attr(&field.attrs, "anchor")?.unwrap_or_else(|| display_name.clone());
+        // rename lineage. Defaults to the display name. `anchored` records
+        // whether the attribute was physically present: a deliberate
+        // `anchor == name` (a rename-back) must be distinguishable from the
+        // default, or the RFC 5.8 anchor-reuse guard cannot tell it apart
+        // from an accidental retired-name collision.
+        let anchor_attr = property_str_attr(&field.attrs, "anchor")?;
+        let anchored = anchor_attr.is_some();
+        let anchor = anchor_attr.unwrap_or_else(|| display_name.clone());
 
         // #[property(id = "...")]: explicit binding to a known property
         // entity (RFC 5.9). Validated as URL-safe base64 / 16 bytes.
@@ -120,6 +126,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
                 field: #field_name,
                 name: #display_name,
                 anchor: #anchor,
+                anchored: #anchored,
                 backend: #backend,
                 value_type: #value_type,
                 optional: #optional,

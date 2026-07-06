@@ -22,6 +22,7 @@ fn album_request() -> proto::NodeRequestBody {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
+            anchored: false,
             name: "name".into(),
             backend: "yrs".into(),
             value_type: "string".into(),
@@ -153,6 +154,7 @@ async fn anchor_rename_and_reuse_refusal() -> anyhow::Result<()> {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
+            anchored: true,
             name: "title".into(),
             backend: "yrs".into(),
             value_type: "string".into(),
@@ -172,6 +174,7 @@ async fn anchor_rename_and_reuse_refusal() -> anyhow::Result<()> {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
+            anchored: false,
             name: "name".into(),
             backend: "yrs".into(),
             value_type: "string".into(),
@@ -181,6 +184,166 @@ async fn anchor_rename_and_reuse_refusal() -> anyhow::Result<()> {
         memberships: vec![],
     };
     expect_error(client.request(server.id, &DEFAULT_CONTEXT, reuse).await?, "anchor");
+
+    Ok(())
+}
+
+/// RFC 5.8 rename-back: an EXPRESS anchor whose display name equals the
+/// anchor is a deliberate lineage reference (the descriptor's `anchored`
+/// bit), so it passes the reuse guard and restores the display name. The
+/// byte-identical descriptor WITHOUT the attribute stays refused: that
+/// shape is a brand-new field accidentally colliding with a retired name.
+#[tokio::test]
+async fn anchored_rename_back_restores_display_name() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+
+    let root = server.system.root().unwrap().payload.entity_id;
+    let model_id = schema_id::model_entity_id(&root, "album");
+    let property_id = schema_id::property_entity_id(&root, &model_id, "name", "yrs", "string");
+
+    let request = |anchored: bool, name: &str| proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "album".into(),
+            anchor: "name".into(),
+            anchored,
+            name: name.into(),
+            backend: "yrs".into(),
+            value_type: "string".into(),
+            target_model: None,
+            explicit_id: None,
+        }],
+        memberships: vec![],
+    };
+
+    // Rename away: display name becomes "title".
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, request(true, "title")).await?);
+    let property = catalog_values(&server, PROPERTY, property_id).await?;
+    assert_eq!(property.get("name"), Some(&Some(Value::String("title".into()))));
+
+    // Rename back WITHOUT the attribute: indistinguishable from a new field
+    // re-using the retired name; refused.
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, request(false, "name")).await?, "anchor");
+
+    // Rename back WITH the express anchor: allowed, display name restored.
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, request(true, "name")).await?);
+    let property = catalog_values(&server, PROPERTY, property_id).await?;
+    assert_eq!(property.get("name"), Some(&Some(Value::String("name".into()))), "rename-back restores the display name");
+
+    Ok(())
+}
+
+/// Follow-up metadata is PROVENANCE-ORDERED (RFC 5.8): each successive
+/// rename descends the previous one, so recency decides. Under
+/// genesis-parented follow-ups (the previous behavior) every rename after
+/// the first was concurrent with its predecessor and won by event-id hash,
+/// making this test a coin flip; head-parenting makes it deterministic.
+#[tokio::test]
+async fn chained_renames_win_by_recency_not_tiebreak() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+
+    let root = server.system.root().unwrap().payload.entity_id;
+    let model_id = schema_id::model_entity_id(&root, "album");
+    let property_id = schema_id::property_entity_id(&root, &model_id, "name", "yrs", "string");
+
+    let rename = |name: &str| proto::NodeRequestBody::RegisterSchema {
+        models: vec![],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "album".into(),
+            anchor: "name".into(),
+            anchored: true,
+            name: name.into(),
+            backend: "yrs".into(),
+            value_type: "string".into(),
+            target_model: None,
+            explicit_id: None,
+        }],
+        memberships: vec![],
+    };
+
+    let mut last_head = catalog_head(&server, PROPERTY, property_id).await?;
+    for display in ["title", "caption", "headline"] {
+        expect_success(client.request(server.id, &DEFAULT_CONTEXT, rename(display)).await?);
+        let property = catalog_values(&server, PROPERTY, property_id).await?;
+        assert_eq!(property.get("name"), Some(&Some(Value::String((*display).into()))), "latest rename must win");
+        let head = catalog_head(&server, PROPERTY, property_id).await?;
+        assert_ne!(head, last_head, "each rename must advance the head (descend, not fork)");
+        last_head = head;
+    }
+
+    Ok(())
+}
+
+/// Membership `optional` flips are provenance-ordered metadata updates:
+/// the newest registration's stance wins deterministically.
+#[tokio::test]
+async fn membership_optional_flip_updates() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let request = |optional: bool| proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into() }],
+        properties: vec![proto::PropertyDescriptor {
+            minting_collection: "album".into(),
+            anchor: "name".into(),
+            anchored: false,
+            name: "name".into(),
+            backend: "yrs".into(),
+            value_type: "string".into(),
+            target_model: None,
+            explicit_id: None,
+        }],
+        memberships: vec![proto::MembershipDescriptor {
+            collection: "album".into(),
+            property: proto::PropertyRef::Anchor("name".into()),
+            optional,
+        }],
+    };
+
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, request(false)).await?);
+    let root = server.system.root().unwrap().payload.entity_id;
+    let model_id = schema_id::model_entity_id(&root, "album");
+    let property_id = schema_id::property_entity_id(&root, &model_id, "name", "yrs", "string");
+    let membership_id = schema_id::membership_entity_id(&root, &model_id, &property_id);
+
+    for expected in [true, false, true] {
+        expect_success(client.request(server.id, &DEFAULT_CONTEXT, request(expected)).await?);
+        let membership = catalog_values(&server, MEMBERSHIP, membership_id).await?;
+        assert_eq!(membership.get("optional"), Some(&Some(Value::Bool(expected))), "the newest optionality stance must win");
+    }
+
+    Ok(())
+}
+
+/// Model display names are ordinary follow-up metadata: they rename and,
+/// unlike before, REVERT to the collection name (the follow-up is emitted
+/// whenever the catalog's current name differs from the descriptor's, not
+/// only when the descriptor's name differs from the collection).
+#[tokio::test]
+async fn model_display_name_renames_and_reverts() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+
+    let root = server.system.root().unwrap().payload.entity_id;
+    let model_id = schema_id::model_entity_id(&root, "album");
+    let model = catalog_values(&server, MODEL, model_id).await?;
+    assert_eq!(model.get("name"), Some(&Some(Value::String("Album".into()))));
+
+    let rename = |name: &str| proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "album".into(), name: name.into() }],
+        properties: vec![],
+        memberships: vec![],
+    };
+
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, rename("Discography")).await?);
+    let model = catalog_values(&server, MODEL, model_id).await?;
+    assert_eq!(model.get("name"), Some(&Some(Value::String("Discography".into()))));
+
+    // Revert to the collection name itself.
+    expect_success(client.request(server.id, &DEFAULT_CONTEXT, rename("album")).await?);
+    let model = catalog_values(&server, MODEL, model_id).await?;
+    assert_eq!(model.get("name"), Some(&Some(Value::String("album".into()))), "display name reverts to the collection name");
 
     Ok(())
 }
@@ -204,6 +367,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "playlist".into(),
             anchor: "name".into(),
+            anchored: false,
             name: "name".into(),
             backend: "yrs".into(),
             value_type: "string".into(),
@@ -230,6 +394,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "playlist".into(),
             anchor: "ghost".into(),
+            anchored: false,
             name: "ghost".into(),
             backend: "lww".into(),
             value_type: "string".into(),
@@ -246,6 +411,7 @@ async fn explicit_id_binding_and_sharing() -> anyhow::Result<()> {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "playlist".into(),
             anchor: "name".into(),
+            anchored: false,
             name: "name".into(),
             backend: "lww".into(),
             value_type: "i64".into(),

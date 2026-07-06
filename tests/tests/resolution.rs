@@ -15,6 +15,7 @@ fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeReques
             .map(|(anchor, backend, value_type)| proto::PropertyDescriptor {
                 minting_collection: collection.into(),
                 anchor: (*anchor).into(),
+                anchored: false,
                 name: (*anchor).into(),
                 backend: (*backend).into(),
                 value_type: (*value_type).into(),
@@ -126,6 +127,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
+            anchored: false,
             name: "title".into(),
             backend: "yrs".into(),
             value_type: "string".into(),

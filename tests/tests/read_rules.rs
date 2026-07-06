@@ -216,6 +216,7 @@ async fn register_optional_note(node: &Node<SledStorageEngine, PermissiveAgent>)
         vec![proto::PropertyDescriptor {
             minting_collection: "record".into(),
             anchor: "note".into(),
+            anchored: false,
             name: "note".into(),
             backend: "lww".into(),
             value_type: "string".into(),
@@ -271,6 +272,7 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
         vec![proto::PropertyDescriptor {
             minting_collection: "widget".into(),
             anchor: "label".into(),
+            anchored: false,
             name: "label".into(),
             backend: "lww".into(),
             value_type: "string".into(),

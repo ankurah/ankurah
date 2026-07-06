@@ -73,13 +73,33 @@ where
         let mut events: Vec<Attested<proto::Event>> = Vec::new();
         let mut push = |event: proto::Event| events.push(Attested::opt(event, None));
 
-        // Models: genesis sets `collection`; the display name is follow-up.
+        // Follow-up metadata is written PROVENANCE-ORDERED (RFC 5.8): each
+        // follow-up event parents at the entity's CURRENT head, so a newer
+        // metadata write DESCENDS the one it supersedes and LWW recency --
+        // not the concurrent-sibling event-id tiebreak -- decides. Parenting
+        // every follow-up at the genesis (the previous behavior) made all
+        // metadata writes after the first mutually concurrent, so a chained
+        // rename or an `optional` flip won by hash coin-flip. Follow-ups are
+        // emitted only when the current catalog value differs, so a
+        // re-issued registration of unchanged definitions produces NO events
+        // (and identical concurrent registrations still mint byte-identical
+        // events: same parent, same fields).
+
+        // Models: genesis sets `collection`; the display name is follow-up
+        // metadata (including reverting it to the collection name, which the
+        // map's parse falls back to while the field is unset).
         for m in &models {
             let genesis = super::genesis::model_genesis(&root, &m.collection);
             let (model_id, genesis_id) = (genesis.entity_id, genesis.id());
-            push(genesis);
-            if m.name != m.collection {
-                push(follow_up(model_collection(), model_id, genesis_id, [("name", Value::String(m.name.clone()))]));
+            let current = self.catalog_entity_snapshot(model_collection(), model_id).await?;
+            let head = head_or_genesis(current.as_ref(), &genesis_id);
+            if current.is_none() {
+                push(genesis);
+            }
+            let current_name =
+                current.as_ref().and_then(|(values, _)| string_field(values, "name")).unwrap_or_else(|| m.collection.clone());
+            if m.name != current_name {
+                push(follow_up(model_collection(), model_id, head, vec![("name", Value::String(m.name.clone()))]));
             }
         }
 
@@ -98,13 +118,48 @@ where
                     let scope = schema_id::model_entity_id(&root, &p.minting_collection);
                     let genesis = super::genesis::property_genesis(&root, &scope, &p.anchor, &p.backend, &p.value_type);
                     let (id, genesis_id) = (genesis.entity_id, genesis.id());
-                    self.check_anchor_reuse(id, p).await?;
-                    push(genesis);
-                    if p.name != p.anchor {
-                        push(follow_up(property_collection(), id, genesis_id.clone(), [("name", Value::String(p.name.clone()))]));
+                    let current = self.catalog_entity_snapshot(property_collection(), id).await?;
+                    let current_name = current.as_ref().and_then(|(values, _)| string_field(values, "name"));
+
+                    // RFC 5.8 anchor-reuse guard: refuse to address a lineage
+                    // whose current display name differs from this field's,
+                    // UNLESS the author expressly anchored. An express
+                    // `anchor == name` is the rename-back case (restore the
+                    // display name to the anchor); without the attribute the
+                    // same descriptor bytes would mean a brand-new field
+                    // accidentally colliding with a retired name, which must
+                    // keep failing loudly.
+                    if !p.anchored && p.anchor == p.name {
+                        if let Some(ref current) = current_name {
+                            if *current != p.name {
+                                return Err(RegistrationError::AnchorReuse {
+                                    property: id,
+                                    name: p.name.clone(),
+                                    current: current.clone(),
+                                });
+                            }
+                        }
+                    }
+
+                    let head = head_or_genesis(current.as_ref(), &genesis_id);
+                    if current.is_none() {
+                        push(genesis);
+                    }
+                    // The display name the catalog holds if we write nothing:
+                    // the current follow-up value, else the genesis anchor.
+                    let mut fields: Vec<(&str, Value)> = Vec::new();
+                    let effective_name = current_name.unwrap_or_else(|| p.anchor.clone());
+                    if p.name != effective_name {
+                        fields.push(("name", Value::String(p.name.clone())));
                     }
                     if let Some(target) = p.target_model {
-                        push(follow_up(property_collection(), id, genesis_id.clone(), [("target_model", Value::EntityId(target))]));
+                        let current_target = current.as_ref().and_then(|(values, _)| entity_id_field(values, "target_model"));
+                        if current_target != Some(target) {
+                            fields.push(("target_model", Value::EntityId(target)));
+                        }
+                    }
+                    if !fields.is_empty() {
+                        push(follow_up(property_collection(), id, head, fields));
                     }
                     id
                 }
@@ -114,7 +169,8 @@ where
 
         // Memberships: the contract edges. `optional` is always follow-up
         // (readers treat a membership with no optional flag as optional,
-        // so required-ness must arrive as data; RFC 5.4).
+        // so required-ness must arrive as data; RFC 5.4). Written on mint
+        // and thereafter only when it changes, provenance-ordered.
         for ms in &memberships {
             let model_id = schema_id::model_entity_id(&root, &ms.collection);
             let property_id = match &ms.property {
@@ -125,13 +181,27 @@ where
             };
             let genesis = super::genesis::membership_genesis(&root, &model_id, &property_id);
             let (membership_id, genesis_id) = (genesis.entity_id, genesis.id());
-            push(genesis);
-            push(follow_up(model_property_collection(), membership_id, genesis_id, [("optional", Value::Bool(ms.optional))]));
+            let current = self.catalog_entity_snapshot(model_property_collection(), membership_id).await?;
+            let head = head_or_genesis(current.as_ref(), &genesis_id);
+            if current.is_none() {
+                push(genesis);
+            }
+            let current_optional = current.as_ref().and_then(|(values, _)| bool_field(values, "optional"));
+            if current_optional != Some(ms.optional) {
+                push(follow_up(model_property_collection(), membership_id, head, vec![("optional", Value::Bool(ms.optional))]));
+            }
+        }
+
+        // A re-registration of unchanged definitions produces no events at
+        // all: nothing to commit, nothing to relay.
+        if events.is_empty() {
+            return Ok(());
         }
 
         // The ordinary remote-commit pipeline: policy check (check_event),
         // attest, persist, apply, reactor notify. Redelivered events (same
-        // content hash) are no-ops, which is what makes this idempotent.
+        // content hash) are no-ops, which keeps racing registrations
+        // idempotent.
         self.commit_remote_transaction(cdata, TransactionId::new(), events).await?;
         Ok(())
     }
@@ -161,66 +231,81 @@ where
         Ok(())
     }
 
-    /// RFC 5.8: refuse to mint a genesis for a field whose derived id
-    /// already exists in the catalog under a DIFFERENT current display
-    /// name, unless the author expressly anchored (anchor != name). This
-    /// is what keeps a retired display name from being silently re-minted
-    /// into an unrelated lineage.
-    async fn check_anchor_reuse(&self, id: EntityId, p: &PropertyDescriptor) -> Result<(), RegistrationError> {
-        if p.anchor != p.name {
-            return Ok(()); // expressly anchored: this IS the rename case
-        }
-        if let Some(values) = self.catalog_entity_values(property_collection(), id).await? {
-            if let Some(Some(Value::String(current))) = values.get("name") {
-                if *current != p.name {
-                    return Err(RegistrationError::AnchorReuse { property: id, name: p.name.clone(), current: current.clone() });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Read a catalog entity's LWW values straight from storage (catalog
-    /// entities are system models: raw backend access, never a View).
-    async fn catalog_entity_values(
+    /// Read a catalog entity's LWW values and head straight from storage
+    /// (catalog entities are system models: raw backend access, never a
+    /// View). `None` when the entity does not exist yet.
+    async fn catalog_entity_snapshot(
         &self,
         collection: CollectionId,
         id: EntityId,
-    ) -> Result<Option<BTreeMap<String, Option<Value>>>, RetrievalError> {
+    ) -> Result<Option<(BTreeMap<String, Option<Value>>, proto::Clock)>, RetrievalError> {
         let storage = self.collections.get(&collection).await?;
         let state = match storage.get_state(id).await {
             Ok(state) => state,
             Err(RetrievalError::EntityNotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
+        let head = state.payload.state.head.clone();
         let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else {
             return Ok(None);
         };
         let backend = LWWBackend::from_state_buffer(buffer)?;
-        Ok(Some(backend.property_values()))
+        Ok(Some((backend.property_values(), head)))
+    }
+
+    /// Values-only convenience over [`Self::catalog_entity_snapshot`].
+    async fn catalog_entity_values(
+        &self,
+        collection: CollectionId,
+        id: EntityId,
+    ) -> Result<Option<BTreeMap<String, Option<Value>>>, RetrievalError> {
+        Ok(self.catalog_entity_snapshot(collection, id).await?.map(|(values, _)| values))
     }
 }
 
-/// A follow-up event carrying non-identity metadata. These merge as
-/// ordinary LWW updates and may use the node's current encoding; catalog
-/// collections stay name-keyed at the backend layer permanently (the
-/// bootstrap exemption, RFC 4), which today coincides with the only
-/// encoding there is.
-fn follow_up<const N: usize>(
-    collection: CollectionId,
-    entity_id: EntityId,
-    parent: proto::EventId,
-    fields: [(&str, Value); N],
-) -> proto::Event {
+/// The parent clock for follow-up metadata: the entity's current head when
+/// it exists (provenance-ordered, RFC 5.8), else the genesis being minted
+/// alongside in this same registration.
+fn head_or_genesis(current: Option<&(BTreeMap<String, Option<Value>>, proto::Clock)>, genesis_id: &proto::EventId) -> proto::Clock {
+    match current {
+        Some((_, head)) => head.clone(),
+        None => proto::Clock::new([genesis_id.clone()]),
+    }
+}
+
+fn string_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<String> {
+    match values.get(field) {
+        Some(Some(Value::String(s))) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn entity_id_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<EntityId> {
+    match values.get(field) {
+        Some(Some(Value::EntityId(id))) => Some(*id),
+        _ => None,
+    }
+}
+
+fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<bool> {
+    match values.get(field) {
+        Some(Some(Value::Bool(b))) => Some(*b),
+        _ => None,
+    }
+}
+
+/// A follow-up event carrying non-identity metadata, parented at the
+/// entity's current head (provenance-ordered, RFC 5.8: it must DESCEND the
+/// metadata it supersedes so LWW recency decides, not the concurrent
+/// tiebreak). These merge as ordinary LWW updates and may use the node's
+/// current encoding; catalog collections stay name-keyed at the backend
+/// layer permanently (the bootstrap exemption, RFC 4), which today
+/// coincides with the only encoding there is.
+fn follow_up(collection: CollectionId, entity_id: EntityId, parent: proto::Clock, fields: Vec<(&str, Value)>) -> proto::Event {
     let backend = LWWBackend::new();
     for (name, value) in fields {
         backend.set(name.to_string(), Some(value));
     }
     let operations = backend.to_operations().expect("LWW encoding of scalar values is infallible").expect("fields are non-empty");
-    proto::Event {
-        collection,
-        entity_id,
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
-        parent: proto::Clock::new([parent]),
-    }
+    proto::Event { collection, entity_id, operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])), parent }
 }

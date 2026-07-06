@@ -135,6 +135,13 @@ pub struct PropertyDescriptor {
     /// Permanent derivation name: equals `name` unless an anchor pinned an
     /// earlier name (rename lineage, RFC 5.8).
     pub anchor: String,
+    /// Whether the anchor was EXPRESSLY declared in the source (the
+    /// attribute was present), rather than defaulting to the field name.
+    /// This is what lets the RFC 5.8 anchor-reuse guard distinguish a
+    /// deliberate lineage reference whose display name equals the anchor (a
+    /// rename-back) from an accidental collision with a retired display
+    /// name (refused, fresh anchor demanded).
+    pub anchored: bool,
     /// Current display name.
     pub name: String,
     /// Backend registry name, e.g. "lww", "yrs".

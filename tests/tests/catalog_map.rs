@@ -20,6 +20,7 @@ fn album_request() -> proto::NodeRequestBody {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
+            anchored: false,
             name: "name".into(),
             backend: "yrs".into(),
             value_type: "string".into(),
@@ -41,6 +42,7 @@ fn album_year_request() -> proto::NodeRequestBody {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "year".into(),
+            anchored: false,
             name: "year".into(),
             backend: "lww".into(),
             value_type: "i64".into(),
@@ -244,6 +246,7 @@ async fn rename_updates_display_names() -> anyhow::Result<()> {
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
             anchor: "name".into(),
+            anchored: false,
             name: "title".into(),
             backend: "yrs".into(),
             value_type: "string".into(),

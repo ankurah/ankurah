@@ -534,3 +534,25 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     id-keyed property as absent. This is the checked counterpart of the
     property_values materialization projection, and Phase C's
     catalog-bound engines subsume it together with the hints.
+18. **The `anchored` descriptor bit + provenance-ordered follow-ups**
+    (maintainer direction, 2026-07-05). PropertyDescriptor carries
+    `anchored`: whether `#[property(anchor = ...)]` was physically
+    present. The RFC 5.8 reuse guard admits a deliberate rename-back
+    (anchored with anchor == name, restoring the display name to the
+    anchor) while still refusing the attribute-less shape, which is a
+    brand-new field colliding with a retired name. Added now because
+    RegisterSchema is unshipped; after release this would be a
+    versioned descriptor change. Alongside, executor follow-ups
+    (property/model display name, target_model, membership optional)
+    are emitted only when the current catalog value differs, and parent
+    at the entity's CURRENT head instead of the genesis:
+    genesis-parenting made every metadata write after the first
+    mutually CONCURRENT, so a chained rename or an optional flip was
+    decided by event-id tiebreak (hash luck) rather than recency.
+    Head-parenting keeps identical concurrent registrations
+    byte-identical (same parent, same fields; convergence intact) and
+    makes an unchanged re-registration a true no-op (zero events).
+    Mixed-fleet consequence: display names follow the most recent
+    registration (an old binary re-asserts its compiled name on
+    startup); addressing is unaffected because each node resolves
+    through its own compiled overlay (RFC 5.8).
