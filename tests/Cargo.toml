@@ -48,6 +48,13 @@ bb8                      = { version = "0.9", optional = true }
 bb8-postgres             = { version = "0.9", optional = true }
 tokio-postgres           = { version = "0.7", optional = true }
 
+[dev-dependencies]
+# Macro performance benchmarks (E-vol perf tier). criterion drives real
+# multi-threaded tokio + LocalProcessConnection multi-node setups; harness =
+# false because criterion provides its own harness. This is advisory wall-clock
+# tracking, not a CI test.
+criterion = { version = "0.5", features = ["async_tokio"] }
+
 [features]
 # Enables the postgres crash-recovery arm (scenarios over a real postgres
 # container). Requires Docker to be available. Not part of the default build.
@@ -59,3 +66,10 @@ postgres-crash = [
     "dep:bb8-postgres",
     "dep:tokio-postgres",
 ]
+
+# Macro performance benchmark (E-vol perf tier). harness = false because
+# criterion provides its own harness. Advisory wall-clock only; NOT run in the
+# normal CI test job (criterion benches are not tests).
+[[bench]]
+name    = "macro_perf"
+harness = false

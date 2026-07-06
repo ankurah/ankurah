@@ -63,6 +63,7 @@
 //!   therefore avoid `reorder` via `FaultConfig::swarm_subscription_safe`; the
 //!   underlying gap is tracked in issue #321.
 
+pub mod alloc;
 pub mod coherence;
 pub mod faults;
 pub mod invariants;
