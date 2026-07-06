@@ -14,15 +14,16 @@ use ankurah_proto::{self as proto};
 use futures::stream::StreamExt;
 use proto::Attested;
 
-/// PersistState adapter for the ingest executor: attestation needs the
-/// node's PolicyAgent, so the applier supplies persistence.
-struct NodePersist<'a, SE, PA>
+/// PersistState adapter for the ingest pipeline: attestation needs the
+/// node's PolicyAgent, so the feeder supplies persistence. Shared by the
+/// applier arms and the node's Get response lane.
+pub(crate) struct NodePersist<'a, SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    node: &'a Node<SE, PA>,
-    collection: &'a crate::storage::StorageCollectionWrapper,
+    pub(crate) node: &'a Node<SE, PA>,
+    pub(crate) collection: &'a crate::storage::StorageCollectionWrapper,
 }
 
 #[async_trait::async_trait]
@@ -192,39 +193,56 @@ impl NodeApplier {
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
                 let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
-                // Sorted for the same reason as the EventOnly arm: the
-                // fallback below applies event by event.
-                let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
 
                 let state = (entity_id, collection_id.clone(), state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
-                // with_state only updates the in-memory entity, it does NOT persist to storage
-                let (changed, entity) =
-                    node.entities.with_state(state_getter, event_getter, entity_id, collection_id.clone(), state.payload.state).await?;
-                entities.push(entity.clone());
+                // Fast path through the shared state-apply: fresh adoption or
+                // strict descent takes the snapshot wholesale, committing the
+                // accompanying events before the buffer persists.
+                let persist = NodePersist { node, collection: &collection };
+                let applied = ingest::apply_state_feed(
+                    &node.entities,
+                    state_getter,
+                    event_getter,
+                    entity_id,
+                    collection_id.clone(),
+                    state.payload.state,
+                    &attested_events,
+                    &persist,
+                )
+                .await?;
+                let entity = applied.entity.clone();
+                entities.push(applied.entity);
 
-                if matches!(changed, Some(true) | None) {
-                    // State applied successfully (new entity or strictly descends)
-                    // Commit all staged events
-                    for event in &attested_events {
-                        event_getter.commit_event(event).await?;
-                    }
-                    Self::save_state(node, &entity, &collection).await?;
+                if applied.advanced {
                     changes.push(EntityChange::new(entity, attested_events)?);
                 } else {
-                    // State not applied (divergence or older) - fall back to event-by-event application
-                    // This handles DivergedSince where we need to merge concurrent branches
-                    let mut applied_events = Vec::new();
-                    for event in attested_events {
-                        if entity.apply_event(event_getter, &event.payload).await? {
-                            event_getter.commit_event(&event).await?;
-                            applied_events.push(event);
-                        }
+                    // State not applied (divergence or older): fall back to
+                    // event-by-event application through the pipeline, which
+                    // handles DivergedSince by merging concurrent branches.
+                    // The events are already staged; the planner orders them.
+                    let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
+                    let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                    let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+
+                    if outcome.advanced() {
+                        changes.push(EntityChange::new(entity.clone(), outcome.applied.clone())?);
                     }
-                    if !applied_events.is_empty() {
-                        Self::save_state(node, &entity, &collection).await?;
-                        changes.push(EntityChange::new(entity, applied_events)?);
+                    if let Some(failure) = outcome.failure {
+                        return Err(failure);
+                    }
+                    // Same per-item error surface as the EventOnly arm until
+                    // the typed-error migration (M5).
+                    for (_, o) in &outcome.outcomes {
+                        match o {
+                            IngestOutcome::NeedsEvents { missing } => {
+                                let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
+                                return Err(RetrievalError::EventNotFound(id).into());
+                            }
+                            IngestOutcome::NeedsState { .. } => return Err(MutationError::InvalidEvent),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -345,30 +363,36 @@ impl NodeApplier {
                 let attested_state = (delta.entity_id, delta.collection.clone(), state).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
-                let (changed, entity) = node
-                    .entities
-                    .with_state(state_getter, event_getter, delta.entity_id, delta.collection, attested_state.payload.state)
-                    .await?;
+                // Shared state-apply: advance-gated persistence and the
+                // advance-only change. A no-op snapshot (the entity is
+                // already resident at this head, or the snapshot is older)
+                // must not notify: notify_change is global across every
+                // subscription on the node, so a no-op snapshot for one
+                // subscribing query surfaces on ANOTHER already-established
+                // query, which holds the same entity, as an empty-events
+                // ItemChange::Update. That is the subscription-notification
+                // race behind the intermittent server_edits_subscription
+                // failure. Fresh adoption and strict descent are real
+                // changes and still notify.
+                let persist = NodePersist { node, collection: &collection };
+                let applied = ingest::apply_state_feed(
+                    &node.entities,
+                    state_getter,
+                    event_getter,
+                    delta.entity_id,
+                    delta.collection,
+                    attested_state.payload.state,
+                    &[],
+                    &persist,
+                )
+                .await?;
 
-                // Save state to storage
-                Self::save_state(node, &entity, &collection).await?;
-
-                // Only notify if the snapshot actually advanced the entity. with_state
-                // returns Some(false) when the state did not apply (the entity is
-                // already resident at this head, or the snapshot is older). Emitting a
-                // change here would be spurious: notify_change is global across every
-                // subscription on the node, so a no-op snapshot for one subscribing
-                // query surfaces on ANOTHER already-established query - which holds the
-                // same entity - as an empty-events ItemChange::Update. That is the
-                // subscription-notification race behind the intermittent
-                // server_edits_subscription failure. None (freshly created) and
-                // Some(true) (advanced) are real changes and still notify.
-                if matches!(changed, Some(false)) {
+                if !applied.advanced {
                     return Ok(None);
                 }
 
                 // Snapshots carry no events, so the change reports an empty events list.
-                Ok(Some(EntityChange::new(entity, Vec::new())?))
+                Ok(Some(EntityChange::new(applied.entity, Vec::new())?))
             }
 
             proto::DeltaContent::EventBridge { events } => {

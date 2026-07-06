@@ -24,7 +24,7 @@ use crate::{
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
     reactor::{AbstractEntity, Reactor},
-    retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
+    retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
     system::SystemManager,
     util::{safemap::SafeMap, safeset::SafeSet, Iterable},
@@ -762,6 +762,27 @@ where
         Context::new(Node::clone(self), data)
     }
 
+    /// True when an error bottoms out in EventNotFound through any nesting
+    /// of the mutual MutationError/RetrievalError boxing: the lineage
+    /// between a fetched state and the local head is unobtainable here.
+    /// The typed taxonomy replaces this unwrapping at the M5 call-site
+    /// migration.
+    fn lineage_unobtainable(e: &MutationError) -> Option<proto::EventId> {
+        match e {
+            MutationError::RetrievalError(RetrievalError::EventNotFound(id)) => Some(id.clone()),
+            MutationError::RetrievalError(RetrievalError::MutationError(inner)) => Self::lineage_unobtainable(inner),
+            _ => None,
+        }
+    }
+
+    /// Fetch entities by id from a durable peer and integrate the returned
+    /// states through the shared state-apply.
+    ///
+    /// Contract (D1 plan 2.9): this must never be called from reactor
+    /// evaluation paths. It notifies the reactor after apply returns, and
+    /// reactor evaluation holds a non-reentrant lock; a call from inside
+    /// evaluation would deadlock. The reactor's own gap-fill uses the Fetch
+    /// lane, not this one.
     pub(crate) async fn get_from_peer(
         &self,
         collection_id: &CollectionId,
@@ -778,11 +799,61 @@ where
             proto::NodeResponseBody::Get(states) => {
                 let collection = self.collections.get(collection_id).await?;
 
-                // do we have the ability to merge states?
-                // because that's what we have to do I think
+                // Entity-mediated adoption (D1 M4, replacing the raw
+                // set_state this lane carried next to its TODO): with_state
+                // comparison decides what each fetched state may do, so a
+                // stale or divergent fetch cannot clobber a newer local
+                // state, persistence is advance-gated, and matching
+                // established queries hear about fetched entities.
+                let state_getter = LocalStateGetter::new(collection.clone());
+                let event_getter = CachedEventGetter::new(collection_id.clone(), collection.clone(), self, cdata);
+                let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
+                let mut changes = Vec::new();
                 for state in states {
                     self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    collection.set_state(state).await.map_err(|e| RetrievalError::Other(format!("{:?}", e)))?;
+                    match crate::ingest::apply_state_feed(
+                        &self.entities,
+                        &state_getter,
+                        &event_getter,
+                        state.payload.entity_id,
+                        state.payload.collection.clone(),
+                        state.payload.state.clone(),
+                        &[],
+                        &persist,
+                    )
+                    .await
+                    {
+                        Ok(applied) => {
+                            if applied.advanced {
+                                changes.push(
+                                    EntityChange::new(applied.entity, Vec::new()).map_err(|e| RetrievalError::Other(format!("{:?}", e)))?,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(missing) = Self::lineage_unobtainable(&e) {
+                                // The fetched state's lineage cannot be
+                                // verified from here: the events between it
+                                // and the local head are unobtainable
+                                // (possibly read-denied upstream).
+                                // Unverifiable state is never adopted;
+                                // whatever local state exists keeps serving,
+                                // stale but honest. Deep-gap recovery
+                                // without event bodies is the
+                                // attested-comparison work (D5, #199/#323).
+                                tracing::warn!(
+                                    "get_from_peer: not adopting unverifiable state for {} (missing event {})",
+                                    state.payload.entity_id,
+                                    missing
+                                );
+                            } else {
+                                return Err(RetrievalError::Other(format!("{:?}", e)));
+                            }
+                        }
+                    }
+                }
+                if !changes.is_empty() {
+                    self.reactor.notify_change(changes).await;
                 }
                 Ok(())
             }

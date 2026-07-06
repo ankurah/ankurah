@@ -188,6 +188,21 @@ where
         let collection_id = CollectionId::fixed_name(SYSTEM_COLLECTION_ID);
         let storage = self.0.collectionset.get(&collection_id).await?;
 
+        // Entity-mediated adoption (D1 M4): the root state materializes
+        // through with_state like every other state feed, so the resident
+        // set and the reactor see the root this node just adopted.
+        // Validation semantics are UNCHANGED on this trust-bootstrap path
+        // (admission unification is #274's jurisdiction), and the peer's
+        // attested bytes persist verbatim below: re-attesting the trust
+        // anchor locally would swap its provenance.
+        let state_getter = LocalStateGetter::new(storage.clone());
+        let event_getter = LocalEventGetter::new(storage.clone(), self.0.durable);
+        let (_, root_entity) = self
+            .0
+            .entities
+            .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id, state.payload.state.clone())
+            .await?;
+
         // Set the state
         storage.set_state(state.clone()).await?;
 
@@ -198,6 +213,11 @@ where
         }
         *self.0.system_ready.write().unwrap() = true;
         self.0.system_ready_notify.notify_waiters();
+
+        // Notification flows for uniformity with every other state feed;
+        // pre-ready nothing can be subscribed, so this is a no-op today.
+        let change = crate::changes::EntityChange::new(root_entity, Vec::new())?;
+        self.0.reactor.notify_change(vec![change]).await;
 
         Ok(())
     }
