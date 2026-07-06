@@ -1,5 +1,9 @@
-name: Nightly Oracle Scale-Out
+name: "Nightly sweep: comparison engine vs reachability oracle"
 
+# The question this workflow answers nightly: does the causal-comparison
+# engine ever disagree with brute-force ground truth on a randomly generated
+# DAG?
+#
 # C2 (concurrency phase 2, workstream C item 2). Terminology: an "oracle" is
 # the testing term of art for an independent source of expected answers, not
 # a runner. Here the oracle is a brute-force reachability computation over a
@@ -68,40 +72,36 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # Placeholder for the C1 simulation swarm nightly (SIM_SEEDS-driven large
-  # tier: tests/tests/sim_swarm.rs, `--ignored` swarm_* tests). Disabled until
-  # PR #278 (C1: deterministic multi-node simulation harness) lands, since
-  # that harness does not exist on this branch yet and this PR must not
-  # depend on C1's branch content. Once #278 lands, uncomment this job (it is
-  # deliberately left as a `run:` block below rather than removed, so the
-  # follow-up is "uncomment and verify" rather than "reconstruct from
-  # memory").
-  #
-  # sim-swarm-nightly:
-  #   name: Simulation swarm (high-seed)
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - name: Set up Rust
-  #       uses: dtolnay/rust-toolchain@stable
-  #
-  #     - name: Cache dependencies
-  #       uses: Swatinem/rust-cache@v2
-  #
-  #     - name: Run the simulation swarm at high seed count
-  #       run: |
-  #         set -o pipefail
-  #         SIM_SEEDS="${{ github.event.inputs.oracle_seeds || '100000' }}" \
-  #           cargo test -p ankurah-tests --test sim_swarm -- --ignored --nocapture 2>&1 | tee sim-swarm-output.log
-  #       env:
-  #         RUST_BACKTRACE: 1
-  #
-  #     - name: Upload failure output
-  #       if: failure()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: sim-swarm-failure-output
-  #         path: sim-swarm-output.log
-  #         if-no-files-found: warn
-  #         retention-days: 30
+  # The C1 simulation swarm at nightly scale: the same swarm_* scenarios the
+  # normal test job runs at their default 500 seeds, driven to 100k seeds of
+  # fault schedules (reorder/delay/dup/drop/partition subsets per seed).
+  # Activated 2026-07-06 after PR #278 (C1 harness) merged; SIMFAIL lines in
+  # the log are self-contained repro commands.
+  sim-swarm-nightly:
+    name: Simulation swarm (high-seed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the simulation swarm at high seed count
+        run: |
+          set -o pipefail
+          SIM_SEEDS="${{ github.event.inputs.oracle_seeds || '100000' }}" \
+            cargo test -p ankurah-tests --test sim_swarm -- --ignored --nocapture 2>&1 | tee sim-swarm-output.log
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Upload failure output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-swarm-failure-output
+          path: sim-swarm-output.log
+          if-no-files-found: warn
+          retention-days: 30
