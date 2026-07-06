@@ -49,7 +49,7 @@ bb8-postgres             = { version = "0.9", optional = true }
 tokio-postgres           = { version = "0.7", optional = true }
 
 [dev-dependencies]
-# Macro performance benchmarks (E-vol perf tier). criterion drives real
+# Per-lane end-to-end benchmarks (E-shapes perf tier). criterion drives real
 # multi-threaded tokio + LocalProcessConnection multi-node setups; harness =
 # false because criterion provides its own harness. This is advisory wall-clock
 # tracking, not a CI test.
@@ -67,9 +67,9 @@ postgres-crash = [
     "dep:tokio-postgres",
 ]
 
-# Macro performance benchmark (E-vol perf tier). harness = false because
+# Per-lane end-to-end benchmark (E-shapes perf tier). harness = false because
 # criterion provides its own harness. Advisory wall-clock only; NOT run in the
 # normal CI test job (criterion benches are not tests).
 [[bench]]
-name    = "macro_perf"
+name    = "lane_perf"
 harness = false
