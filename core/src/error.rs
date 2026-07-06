@@ -167,6 +167,8 @@ pub enum MutationError {
     Anyhow(anyhow::Error),
     #[error("TOCTOU attempts exhausted")]
     TOCTOUAttemptsExhausted,
+    #[error("ingest: {0}")]
+    Ingest(IngestError),
 }
 
 impl From<tokio::task::JoinError> for MutationError {
@@ -175,6 +177,72 @@ impl From<tokio::task::JoinError> for MutationError {
 
 impl From<anyhow::Error> for MutationError {
     fn from(err: anyhow::Error) -> Self { MutationError::Anyhow(err) }
+}
+
+/// The typed taxonomy at the application boundary (RFC #268 item 4).
+///
+/// Replaces stringly `General`/`InvalidUpdate` on the ingest paths so callers
+/// and ack payloads can distinguish outcome classes without matching strings.
+/// Budget is deliberately NOT a lineage rejection: a budget-exhausted
+/// comparison is a resumable liveness anomaly carrying its frontiers, never a
+/// verdict (C4-08); two nodes of different cache depth must not disagree on
+/// rejections.
+#[derive(Error, Debug)]
+pub enum IngestError {
+    /// The PolicyAgent refused the event at admission or commit time.
+    #[error("policy denied: {0}")]
+    PolicyDenied(AccessDenied),
+    /// The event's lineage makes it permanently unappliable here.
+    #[error("lineage rejection: {0}")]
+    Lineage(LineageRejection),
+    /// Comparison exhausted its budget before reaching a verdict. Resumable:
+    /// the event stays uncommitted and a retry with warmer caches (or, after
+    /// D2, generation bounds) can succeed.
+    #[error("budget exhausted before verdict (budget {original_budget})")]
+    Budget { original_budget: usize, subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
+    /// Head-mutation retries exhausted under concurrent writers.
+    #[error("contention: head mutation retries exhausted after {attempts}")]
+    Contention { attempts: u32 },
+    /// Durable storage failed while persisting an event or state.
+    #[error("storage: {0}")]
+    Storage(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Structural validation of the payload failed before staging.
+    #[error("validation: {0}")]
+    Validation(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// A wire shape the pipeline recognizes but does not implement.
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
+}
+
+/// Permanent lineage-shaped rejections. Every variant is a function of
+/// grounded graph facts, reachable only through completed exploration, never
+/// through a budget-limited walk (268-B).
+#[derive(Debug)]
+pub enum LineageRejection {
+    /// Proven different genesis events (single-root invariant violated).
+    Disjoint,
+    /// Non-creation event addressed to an entity with an empty head.
+    NonCreationOverEmptyHead,
+    /// Creation event for an entity that already has committed history.
+    CreationOverNonEmptyHead,
+    /// The batch's parent edges form a cycle (malformed or malicious input;
+    /// impossible for honest content-addressed ids).
+    BatchCycle,
+}
+
+impl std::fmt::Display for LineageRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineageRejection::Disjoint => write!(f, "disjoint (different genesis events)"),
+            LineageRejection::NonCreationOverEmptyHead => write!(f, "non-creation event over an empty head"),
+            LineageRejection::CreationOverNonEmptyHead => write!(f, "creation event over a non-empty head"),
+            LineageRejection::BatchCycle => write!(f, "event batch contains a parent cycle"),
+        }
+    }
+}
+
+impl From<IngestError> for MutationError {
+    fn from(err: IngestError) -> Self { MutationError::Ingest(err) }
 }
 
 #[derive(Debug)]
