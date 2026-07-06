@@ -8,13 +8,17 @@
 //! recovery.
 
 // The substrate lands before its consumers; the allows come off when the
-// planner and executor arrive and the API goes live.
+// executor arrives and the API goes live.
 #[allow(dead_code)]
 pub(crate) mod outcome;
+#[allow(dead_code)]
+pub(crate) mod plan;
 #[allow(dead_code)]
 pub(crate) mod staging;
 
 #[allow(unused_imports)]
 pub(crate) use outcome::{IngestOutcome, SkipReason};
+#[allow(unused_imports)]
+pub(crate) use plan::{plan_entity, IngestPlan};
 #[allow(unused_imports)]
 pub(crate) use staging::StagingArea;
