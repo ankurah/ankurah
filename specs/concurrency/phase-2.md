@@ -132,8 +132,9 @@ foundation; each item is or becomes an RFC issue.
 2. **#266 indexed causality plus applied-set.** Persistent per-event
    generation numbers, then a per-entity applied-set membership index (local,
    derived, never trusted from the wire). Redelivery and StrictAscends become
-   O(1); gap detection becomes set difference; budget demotes to an anomaly
-   guard.
+   O(1); gap detection becomes set difference over event ids, never a
+   generation-range test (266-B: a range proxy reproduces the crossed-linkrev
+   bug class); budget demotes to an anomaly guard.
 3. **History lifecycle (RFC to file).** Sealed-prefix checkpoints: fold
    history below clock C into an attested snapshot, prune beneath, clamp
    traversals at C, carry a genesis attestation so Disjoint detection and
@@ -199,7 +200,11 @@ workstream D; the optimization pass runs after D stabilizes.
      EventBridge materializes full batches on both ends (chunked bridge
      framing, coordinate with #246 size limits). True O(1)-memory reverse
      search is not achievable without precomputed indexes; bounded-by-
-     divergence-window is the honest target and is sufficient.
+     divergence-window is the honest target and is sufficient. Caveat
+     (271-D, E-A): the bounded-by-divergence-window target governs the
+     reverse walk; a sequence-CRDT tombstone set is lower-bounded by
+     deletion history and is folded by sealing, not by the streaming
+     consumer.
    - Accumulator memory (dag map plus LRU clone duplication; Arc<Event>).
    - Grounding-ancestry incremental maintenance if benchmarks show it.
 4. Success criteria: no correctness gate regressions; published
