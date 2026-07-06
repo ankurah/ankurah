@@ -1,0 +1,172 @@
+# Tasks
+
+Companion to plan.md (authority: rfc.md, ratified rev 3). Groups are in
+landing order; each checkbox is intended to be a commit or a small commit
+train, red-to-green where a test can pin the change.
+
+## 1. Phase 0: #294 protocol version (separate PR off main)
+
+- [ ] `PROTOCOL_VERSION: u32 = 1` in proto; `protocol_version: u32`
+      appended as the last field of `Presence`; compatibility check
+      isolated in one function (equality for now).
+- [ ] `Message::PresenceRejected { expected: u32, received: u32 }`
+      variant.
+- [ ] Fallible `register_peer`: version mismatch (including implied
+      version 0) refuses with `PresenceRejected` sent best-effort, then
+      teardown via the existing deregister path; all four connectors
+      (websocket-server, websocket-client, websocket-client-wasm,
+      local-process) propagate the refusal and close instead of
+      dropping the frame.
+- [ ] Presence decode failure before establishment closes the
+      connection with an actionable log (version-0 peer guidance)
+      instead of leaving it open.
+- [ ] Tests: same-version connect; mismatch refused in both directions
+      (rejection observed); hand-crafted version-0 Presence bytes
+      (old-shape mirror enum) refused without panic; existing
+      integration suite green.
+- [ ] Close out #294: record refuse-semantics decision and the deferred
+      policy-hook question on the issue.
+
+## 2. Phase A foundation: derivation, frozen encoder, create-with-id
+
+- [ ] `proto/src/schema_id.rs`: model/property/membership id derivation
+      (domain tags v1, u64-LE length prefixes, SHA-256 first 16 bytes);
+      zero-model-id standalone scope constant; golden-vector tests.
+- [ ] Ulid audit: verify nothing interprets EntityId timestamp bits
+      (fact-checked once already: no readers); record in PR
+      description; regression test that from_bytes round-trips
+      hash-derived ids.
+- [ ] `core/src/schema/genesis.rs`: frozen genesis encoder for the
+      three catalog kinds (pinned LWWDiff v1 name-keyed shape, scalar
+      Values, empty parent clock); golden byte vectors independent of
+      lww.rs.
+- [ ] `validate_catalog_genesis`: recompute entity id from payload and
+      event id from re-encoding; tamper tests (field value, field set,
+      operation count).
+- [ ] Create-with-derived-id: pub(crate) WeakEntitySet path registering
+      with the phantom guard (Transaction::create /
+      commit_local_trx:84-98 parity); test that a derived-id create
+      commits and a phantom still refuses.
+
+## 3. Catalog collections, protection, registration operation
+
+- [ ] Collection constants `_ankurah_model`, `_ankurah_property`,
+      `_ankurah_model_property`; PROTECTED_COLLECTIONS extended to all
+      four system collections.
+- [ ] `_ankurah_` prefix reservation in CollectionSet::get (user paths
+      refused, system callers allowed); test.
+- [ ] Catalog entity accessors in the SysRoot raw-entity style (system
+      models; never derive(Model)).
+- [ ] proto descriptors (ModelDescriptor, PropertyDescriptor,
+      MembershipDescriptor) + `NodeRequestBody::RegisterSchema`.
+- [ ] Durable-side executor: derive ids, catalog lookups, anchor-reuse
+      refusal, explicit-id verification, frozen genesis + LWW follow-up
+      events, PolicyAgent::check_event on every event, persist + relay;
+      Success/Error response.
+- [ ] Receiver-side protection: CommitTransaction events targeting
+      protected collections refused outright; relayed catalog genesis
+      validated by self-certification.
+- [ ] Client lifecycle: ensure-registration on first mutating use;
+      derive+cache on read paths; `ctx.register::<M>()`; offline queue
+      drained on durable-peer connect.
+- [ ] Tests: two-node concurrent registration converges to identical
+      genesis EventIds; RegisterSchema idempotent across re-issue and
+      across two durable executors; policy denial; commit into
+      `_ankurah_model` refused; tampered genesis refused; offline queue
+      drains on reconnect.
+
+## 4. Catalog subscription and map
+
+- [ ] CatalogMap: (minting model, anchor, backend, value_type) -> id;
+      id -> definition; model -> membership set; collection -> model;
+      per-collection display-name index.
+- [ ] Warm via three predicate-True subscriptions at system-ready;
+      updates applied from changesets.
+- [ ] `wait_catalog_ready` gate; `hard_reset` flushes catalog map and
+      derived-id caches; tests for both.
+
+## 5. LWW v2 / state 0xA2
+
+- [ ] Wire shapes: LWW_DIFF_VERSION_2, LWW_STATE_VERSION_2 (0xA2);
+      by_id + residue two-map payloads; round-trip tests.
+- [ ] In-memory PropertyKey::{Id, Name} over the ValueEntry lifecycle;
+      name-keyed mode pinned for catalog/system collections; entity
+      access resolves name -> id through the schema binding.
+- [ ] Read fallback: 0xA1 and pre-0.9 buffers translate name -> id via
+      (local schema, catalog), residue on miss, lazy rewrite-on-save to
+      0xA2; v1 diffs apply the same way.
+- [ ] Unknown-id v2 payloads apply and persist opaquely (catalog lag);
+      projection yields UnknownProperty until the entry arrives.
+- [ ] Compatibility tests: simulated 0.9 binary refuses 0xA2/v2 cleanly
+      (pin lww.rs:176-180 behavior); catalog collections still write
+      v1/0xA1; residue preserved through rewrite when unresolvable.
+- [ ] PROTOCOL_VERSION -> 2 lands with this epoch (one bump covering
+      LWW v2, Identifier AST, RegisterSchema).
+
+## 6. ankql Identifier and resolution
+
+- [ ] `Identifier { property, name, subpath }` AST node; PathExpr stays
+      the parse form.
+- [ ] Resolution pass (local compiled schema, then catalog map);
+      UnknownProperty fail-closed naming collection and property;
+      wait_catalog_ready deferral for schema-less consumers; absorbs
+      the TypeResolver pass at its four call sites.
+- [ ] Fetch/SubscribeQuery carry resolved Selections; receiver-side
+      pass-through for unknown ids (until #274).
+- [ ] Engines consume Identifier.name for columns; assume_null /
+      referenced_columns keyed consistently via Identifier.
+- [ ] Unify missing-property semantics (filter error / reactor
+      unwrap_or(false) / SQL assume_null) under the one rule.
+- [ ] Tests: resolve via schema, via catalog only, UnknownProperty on
+      neither; subpath preservation; cross-node rename scenario
+      resolves both display names to one property id.
+
+## 7. Read-path rules (#175 fix)
+
+- [ ] Rule ladder with membership-sourced optionality
+      (optional-on-ambiguity; contract in play); View getters keep
+      compiled optionality.
+- [ ] Cross-contract sibling gate -> PropertyError::TypeSkew naming
+      both ids; test with retype lineages from two contracts.
+- [ ] Type defaults for required-absent scalars; entityid exception
+      stays Missing.
+- [ ] Zero-op creation events; un-ignore
+      tests/tests/yrs_backend.rs:303-332; integration: create with
+      empty string, reload, read back "".
+
+## 8. Derive macro, attributes, lifecycle glue
+
+- [ ] ModelDescriptor/FieldSchema emission per the normative mapping
+      table; ephemeral fields excluded; descriptor snapshot test
+      covering every table row.
+- [ ] `#[property(anchor = "...")]`; anchor chains keep the original
+      anchor; anchor-reuse refusal test (retired name re-minted ->
+      refusal demanding an anchor).
+- [ ] `#[model(id = "...")]` / `#[property(id = "...")]`: compile-time
+      id parse; registration-time verification (backend/value_type
+      match, cold-start hard fail); shared-property membership minting;
+      test: shared property read from two contracts with differing
+      optional.
+- [ ] `_ankurah_` collection prefix -> derive-time compile error
+      (trybuild or equivalent).
+- [ ] Registration triggers in context paths (mutating auto-assert,
+      read-path cache-only, explicit register).
+
+## 9. Cross-cutting and pre-PR
+
+- [ ] Error variants: UnknownProperty, TypeSkew, CatalogGenesisError,
+      registration refusals.
+- [ ] Nomenclature pass over new code/docs (#305: Model = contract
+      definition entity, Collection = storage table).
+- [ ] Opus adversarial review: frozen encoder, v2/v1 fallback,
+      registration convergence.
+- [ ] Validation gate: cargo test -p ankurah-core (lib), ankurah-tests,
+      jwt-auth; cargo check -p ankurah-core --features wasm; cargo fmt
+      --all; taplo fmt if Cargo.toml changed.
+- [ ] Progress note on #289; PR when reviewable.
+
+## Phase C (tasks written when Phase A stabilizes)
+
+- sled property_config rekey; postgres/sqlite catalog-bound columns,
+  rename DDL, collision suffixes; IndexedDB re-materialization; seam
+  cleanliness per RFC 4a.
