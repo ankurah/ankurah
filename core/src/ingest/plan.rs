@@ -103,11 +103,24 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
     // scheduling is harmless and the outcome reports AlreadyIntegrated.
     // D2's applied-set later restores an O(1) skip that tests
     // incorporation, not mere storage.
+    //
+    // The converse hole matters too: head containment only implies
+    // committedness while the commit-before-state discipline held. A
+    // commit_event failure after its apply leaves a head-contained,
+    // staged, UNSTORED event; skipping that would strand it forever
+    // (nothing else re-commits it), so it schedules, and the executor's
+    // integrated-but-unstored backfill commits it. The extra event_stored
+    // read runs only for head-contained redeliveries of still-staged
+    // events, a shape that requires a prior local failure.
     let mut preresolved: Vec<(EventId, IngestOutcome)> = Vec::new();
     let mut scheduled: BTreeSet<EventId> = BTreeSet::new();
     for id in &members {
         if head.contains(id) {
-            preresolved.push((id.clone(), IngestOutcome::Skipped(SkipReason::AlreadyCommitted)));
+            if staging.contains(id) && !getter.event_stored(id).await? {
+                scheduled.insert(id.clone());
+            } else {
+                preresolved.push((id.clone(), IngestOutcome::Skipped(SkipReason::AlreadyCommitted)));
+            }
         } else {
             scheduled.insert(id.clone());
         }
@@ -443,13 +456,14 @@ mod tests {
     #[tokio::test]
     async fn head_contained_but_unstored_member_schedules_for_backfill() {
         let entity = EntityId::new();
-        let ([_, e1, _], [_, i1, _]) = chain(entity);
+        let ([_, e1, _], [g, i1, _]) = chain(entity);
         let staging = StagingArea::with_default_cap();
         staging.stage(e1);
 
-        // e1 is in the head (applied) but the store has no record of it.
+        // e1 is in the head (applied) but the store has no record of it;
+        // its parent (genesis) is committed, as in the real failure shape.
         let head = Clock::from(vec![i1.clone()]);
-        let plan = plan_entity(&head, &[i1.clone()], &staging, &store(&[])).await.unwrap();
+        let plan = plan_entity(&head, &[i1.clone()], &staging, &store(&[g.clone()])).await.unwrap();
 
         assert_eq!(plan.schedule, vec![i1], "head-contained but unstored must schedule so the executor backfills the log");
         assert!(plan.preresolved.is_empty());

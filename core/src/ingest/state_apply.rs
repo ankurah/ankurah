@@ -7,12 +7,13 @@
 //! no-ops (a stale fetch can never regress a newer resident, and a
 //! divergent snapshot waits for its events). Events that arrived with the
 //! state commit BEFORE the buffer persists: a crash must never yield
-//! persisted state referencing uncommitted events. Persistence is
-//! advance-gated, so a no-op apply writes nothing (the redundant-write
-//! elision the bridge arm adopted at M2, uniform here). The caller builds
-//! an advance-only change and notifies; validation is NOT here, because
-//! each arm keeps its own admission gate (unifying WHICH validation runs
-//! is #274's jurisdiction).
+//! persisted state referencing uncommitted events. Persistence runs on
+//! every apply with a non-empty head, advance or not: a no-op verdict is
+//! not proof the buffer is current (the comment at the persist call
+//! carries the race that killed the earlier elision). NOTIFICATION stays
+//! advance-only. The caller builds the change; validation is NOT here,
+//! because each arm keeps its own admission gate (unifying WHICH
+//! validation runs is #274's jurisdiction).
 
 use ankurah_proto::{Attested, CollectionId, EntityId, Event, State};
 

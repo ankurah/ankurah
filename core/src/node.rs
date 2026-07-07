@@ -623,7 +623,10 @@ where
         // Fork-policy phase over the planned schedule: every event
         // previews on a fork (before and after states), the real
         // entity untouched until phase two. check_event attestations
-        // are attached by restaging the attested event.
+        // are attached by REPLACING the staged envelope (restage;
+        // plain stage is an idempotent no-op for an already-staged id,
+        // which silently discarded these attestations before the codex
+        // review caught it).
         use std::sync::atomic::AtomicBool;
         let fork = entity.snapshot(Arc::new(AtomicBool::new(true)));
         for event_id in &plan.schedule {
@@ -634,7 +637,7 @@ where
                 Ok(Some(attestation)) => {
                     let mut updated = attested.clone();
                     updated.attestations.push(attestation);
-                    staging.stage(updated);
+                    staging.restage(updated);
                 }
                 Ok(None) => {}
                 Err(denied) => {
