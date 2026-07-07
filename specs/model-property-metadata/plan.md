@@ -635,8 +635,8 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     define schema) -- and the denied field lands as name-keyed
     residue per decisions 16 and 22. The policy surface must support
     BOTH discrimination axes (RFC 5.2, 5.7).
-25b. **First-use registration on read paths + the anticipated-collection
-    fallback** (rev 4 corollary, RFC 5.2/5.3; surfaced by the
+25b. **First-use registration on read paths; unresolvable references
+    fail loud** (rev 4 corollary, RFC 5.2/5.3; surfaced by the
     subscribe-before-create tests, REVISED 2026-07-06 by the
     replica-lag flake -- REN 2 second ruling, ratified in session): a
     warm catalog REPLICA cannot prove a collection unregistered (it may
