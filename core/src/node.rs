@@ -1,5 +1,5 @@
 use crate::selection::filter::Filterable;
-use ankurah_proto::{self as proto, Attested, CollectionId, EntityState};
+use ankurah_proto::{self as proto, Attested, CollectionId};
 use anyhow::anyhow;
 
 use rand::prelude::*;
@@ -24,7 +24,7 @@ use crate::{
     peer_subscription::{SubscriptionHandler, SubscriptionRelay},
     policy::{AccessDenied, PolicyAgent},
     reactor::{AbstractEntity, Reactor},
-    retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter, SuspenseEvents},
+    retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter},
     schema::catalog::CatalogManager,
     storage::StorageEngine,
     system::SystemManager,
@@ -865,63 +865,165 @@ where
         &self,
         cdata: &PA::ContextData,
         id: proto::TransactionId,
-        mut events: Vec<Attested<proto::Event>>,
+        events: Vec<Attested<proto::Event>>,
     ) -> Result<(), MutationError> {
         debug!("{self} commiting transaction {id} with {} events", events.len());
-        let mut changes = Vec::new();
 
-        for event in events.iter_mut() {
-            // INGRESS (#330): the envelope carries a model id; resolve it to
-            // the local collection (well-knowns, then catalog) or reject.
-            let collection_id = self.resolve_model_wait(&event.payload.model).await?;
-            let collection = self.collections.get(&collection_id).await?;
-
-            // When applying an event, we should only look at the local storage for the lineage
-            let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
-            let state_getter = LocalStateGetter::new(collection.clone());
-            let entity =
-                self.entities.get_retrieve_or_create(&state_getter, &event_getter, &collection_id, &event.payload.entity_id).await?;
-            // Stage the event so BFS can discover it
-            event_getter.stage_event(event.payload.clone());
-
-            // Handle creates vs updates differently for policy validation
-            let (entity_before, entity_after, already_applied) = if event.payload.is_entity_create() && entity.head().is_empty() {
-                // Create: apply to entity directly, use as both before/after
-                entity.apply_event(&event_getter, &event.payload).await?;
-                (entity.clone(), entity.clone(), true)
-            } else {
-                // Update: snapshot, apply to fork for validation
-                use std::sync::atomic::AtomicBool;
-                let trx_alive = Arc::new(AtomicBool::new(true));
-                let forked = entity.snapshot(trx_alive);
-                forked.apply_event(&event_getter, &event.payload).await?;
-                (entity.clone(), forked, false)
-            };
-
-            // Check policy with before/after states
-            if let Some(attestation) = self.policy_agent.check_event(self, cdata, &entity_before, &entity_after, &event.payload)? {
-                event.attestations.push(attestation);
+        // Group by entity, preserving first-appearance order. Cross-entity
+        // order is not semantic (per-entity order comes from parent edges);
+        // first-appearance keeps the walk deterministic. The envelope
+        // carries a MODEL id (INGRESS, #330); phase one resolves it to the
+        // local collection per group.
+        let mut groups: Vec<(proto::EntityId, proto::EntityId, Vec<Attested<proto::Event>>)> = Vec::new();
+        for event in events {
+            match groups.iter_mut().find(|(eid, _, _)| *eid == event.payload.entity_id) {
+                Some((_, _, list)) => list.push(event),
+                None => groups.push((event.payload.entity_id, event.payload.model, vec![event])),
             }
+        }
 
-            // Commit the staged event to permanent storage
-            event_getter.commit_event(event).await?;
+        // Atomic mode, phase one (D1 M6): stage, plan, and run the
+        // fork-policy phase for EVERY event, creations included (closing
+        // the C4-19 asymmetry), BEFORE anything commits. Any denial or
+        // unappliable event means nothing durable. Speculative residents
+        // materialized along the way are evicted on failure.
+        let mut touched: Vec<proto::EntityId> = Vec::new();
+        let mut ready: Vec<(
+            Entity,
+            Arc<crate::ingest::StagingArea>,
+            LocalEventGetter,
+            crate::storage::StorageCollectionWrapper,
+            crate::ingest::plan::IngestPlan,
+        )> = Vec::new();
+        let phase_one = async {
+            for (entity_id, model, group) in &groups {
+                // INGRESS (#330): the envelope carries a model id; resolve
+                // it to the local collection (well-knowns, then catalog) or
+                // reject the transaction.
+                let collection_id = self.resolve_model_wait(model).await?;
+                let collection = self.collections.get(&collection_id).await?;
+                let staging = Arc::new(crate::ingest::StagingArea::with_default_cap());
+                // Lineage lookups stay local-plus-staged on this lane, as
+                // before.
+                let event_getter = LocalEventGetter::with_staging(collection.clone(), self.durable, staging.clone());
+                let state_getter = LocalStateGetter::new(collection.clone());
 
-            // For updates only: apply event to real entity (creates already applied above)
-            // Event is now in storage, so BFS will find it
-            let applied = if already_applied { true } else { entity.apply_event(&event_getter, &event.payload).await? };
+                for attested in group {
+                    staging.stage(attested.clone());
+                }
 
-            if applied {
-                let state = entity.to_state()?;
-                let entity_state = EntityState { entity_id: entity.id(), model: entity.model_id()?, state };
-                let attestation = self.policy_agent.attest_state(self, &entity_state);
-                let attested = Attested::opt(entity_state, attestation);
-                collection.set_state(attested).await?;
-                changes.push(EntityChange::new(entity.clone(), vec![event.clone()])?);
+                let entity = self.entities.get_retrieve_or_create(&state_getter, &event_getter, &collection_id, entity_id).await?;
+                touched.push(*entity_id);
+
+                let batch: Vec<proto::EventId> = group.iter().map(|e| e.payload.id()).collect();
+                let plan = crate::ingest::plan_entity(&entity.head(), &batch, &staging, &event_getter).await?;
+
+                // NeedsState on this lane fails typed, fast, and atomically;
+                // the sender's retry recovers once state arrives through the
+                // normal lanes. The plan originally wired an inline Get
+                // fetch here (2.4); amended by the maintainer 2026-07-06: a
+                // nested round-trip inside a request handler deadlocks the
+                // sim's inline delivery, amplifies requests on the server
+                // (unknown-entity commits would fan out Gets while holding
+                // the inbound request open), and is futile on the common
+                // single-durable topology, where the receiving node has no
+                // durable peer to ask. Active deep-gap recovery is
+                // revisited with the attested-comparison work (D5,
+                // #199/#323).
+                for (eid, outcome) in &plan.preresolved {
+                    match outcome {
+                        crate::ingest::IngestOutcome::NeedsState { .. } => {
+                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
+                        }
+                        crate::ingest::IngestOutcome::NeedsEvents { missing } => {
+                            // Atomic mode cannot partially apply: a missing
+                            // parent fails the whole transaction before
+                            // anything commits. Retryable retrieval truth,
+                            // same surface as the PerItem arms (M5).
+                            let missing = missing.first().cloned().unwrap_or_else(|| eid.clone());
+                            return Err(RetrievalError::EventNotFound(missing).into());
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Fork-policy phase over the planned schedule: every event
+                // previews on a fork (before and after states), the real
+                // entity untouched until phase two. check_event attestations
+                // are attached by restaging the attested event.
+                use std::sync::atomic::AtomicBool;
+                let fork = entity.snapshot(Arc::new(AtomicBool::new(true)));
+                for event_id in &plan.schedule {
+                    let Some(attested) = staging.get_attested(event_id) else { continue };
+                    let fork_before = fork.snapshot(Arc::new(AtomicBool::new(true)));
+                    fork.apply_event(&event_getter, &attested.payload).await.map_err(crate::ingest::type_comparison_error)?;
+                    match self.policy_agent.check_event(self, cdata, &fork_before, &fork, &attested.payload) {
+                        Ok(Some(attestation)) => {
+                            let mut updated = attested.clone();
+                            updated.attestations.push(attestation);
+                            staging.stage(updated);
+                        }
+                        Ok(None) => {}
+                        Err(denied) => {
+                            return Err(crate::error::IngestError::PolicyDenied(denied).into());
+                        }
+                    }
+                }
+
+                ready.push((entity, staging, event_getter, collection, plan));
+            }
+            Ok::<(), MutationError>(())
+        }
+        .await;
+
+        if let Err(e) = phase_one {
+            // Nothing durable; a speculative empty-head resident must not
+            // survive the denial (C4-12).
+            for entity_id in &touched {
+                self.entities.remove_if_phantom(entity_id);
+            }
+            return Err(e);
+        }
+
+        // Phase two: execute. Policy has passed for every event; failures
+        // from here are storage-class, reported per event, not rolled back
+        // (same as local commit today). The applied prefix is persisted and
+        // notified.
+        let mut changes = Vec::new();
+        let mut failure: Option<MutationError> = None;
+        for (entity, staging, event_getter, collection, plan) in ready {
+            let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
+            let outcome = crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &event_getter, &persist).await;
+            // One change per entity carrying its applied events in
+            // application order. The old per-event shape was an artifact of
+            // building each change mid-loop while the head sat at that
+            // event; built after execution, an ancestor is only
+            // constructible inside a multi-event batch (EntityChange's own
+            // containment rule), which is the sanctioned shape bridges and
+            // multi-event subscription items already use (V4).
+            if !outcome.applied.is_empty() {
+                changes.push(EntityChange::new(entity.clone(), outcome.applied.clone())?);
+            }
+            if let Some(e) = outcome.failure {
+                failure = Some(e);
+                break;
+            }
+            for (eid, o) in &outcome.outcomes {
+                if let crate::ingest::IngestOutcome::NeedsEvents { missing } = o {
+                    failure = Some(RetrievalError::EventNotFound(missing.first().cloned().unwrap_or_else(|| eid.clone())).into());
+                    break;
+                }
+            }
+            if failure.is_some() {
+                break;
             }
         }
 
         self.reactor.notify_change(changes).await;
 
+        if let Some(e) = failure {
+            return Err(e);
+        }
         Ok(())
     }
 

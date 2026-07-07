@@ -81,14 +81,22 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
         }
     }
 
-    // Plan-time skip: an already-committed event is a redelivery; skipping it
-    // here (success, not error) is the idempotency half of the ack/retry
-    // guarantee (268-A). event_stored is definitive-or-conservative: true
-    // always means committed here, on both node types.
+    // Plan-time skip: an event the head already contains is a redelivery;
+    // skipping it (success, not error) is the idempotency half of the
+    // ack/retry guarantee (268-A). The test is head containment, NOT
+    // event_stored: committed does not imply incorporated. A crash between
+    // commit_event and save_state leaves an event durably committed while
+    // the rehydrated entity has never applied it (the gap-jump class's
+    // crash-window face); a redelivery must SCHEDULE that event so the
+    // apply repairs the window. For committed events the head does cover,
+    // apply_event's own comparison no-ops them (Equal/StrictAscends), so
+    // scheduling is harmless and the outcome reports AlreadyIntegrated.
+    // D2's applied-set later restores an O(1) skip that tests
+    // incorporation, not mere storage.
     let mut preresolved: Vec<(EventId, IngestOutcome)> = Vec::new();
     let mut scheduled: BTreeSet<EventId> = BTreeSet::new();
     for id in &members {
-        if getter.event_stored(id).await? {
+        if head.contains(id) {
             preresolved.push((id.clone(), IngestOutcome::Skipped(SkipReason::AlreadyCommitted)));
         } else {
             scheduled.insert(id.clone());

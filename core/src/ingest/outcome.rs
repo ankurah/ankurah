@@ -28,7 +28,10 @@ pub(crate) enum IngestOutcome {
 /// Why an event was skipped. None of these are failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipReason {
-    /// Already durably committed here (redelivery or retry).
+    /// Already in the entity's current head (redelivery or retry); head
+    /// events are durably committed by the crash invariant. Committed
+    /// events the head does not contain are scheduled instead, so a
+    /// crash-window redelivery repairs the state buffer.
     AlreadyCommitted,
     /// The comparison verdict was Equal or StrictAscends: the head already
     /// incorporates this event.
