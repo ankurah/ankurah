@@ -301,7 +301,7 @@ workstream ends by updating this document's checklist.
 - [x] C6: crash/recovery fault injection
 - [ ] C7: storage engine conformance suite
 - [ ] C8 (optional): scheduler model check
-- [ ] D1: #268 scheduler pipeline
+- [x] D1: #268 scheduler pipeline
 - [ ] D2: #266 generations plus applied-set index
 - [ ] D3: lifecycle RFC filed and implemented (checkpoints, rejection horizon)
 - [ ] D4: transactional visibility RFC filed and decided
