@@ -737,4 +737,62 @@ mod tests {
         sorted2.sort();
         assert_eq!(order2, sorted2, "emission order must be sorted by subscription id on the second run too");
     }
+
+    /// A change's events fold into the per-entity update item exactly once,
+    /// no matter how many of the subscription's queries match the entity.
+    ///
+    /// A subscription may hold several queries whose predicates all match
+    /// the same entity (a peer's SubscriptionHandler holds every query that
+    /// peer has; two client LiveQueries on one predicate are routine). The
+    /// per-query candidate walk visits the same change once per matching
+    /// query; if each visit appends the change's events, the update item
+    /// carries every event N times for N matching queries, and receivers
+    /// that echo item events into their own change notifications report
+    /// duplicates downstream.
+    #[tokio::test]
+    async fn test_change_events_fold_once_across_matching_queries() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new();
+        let rsub = reactor.subscribe();
+        let (w, check) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = rsub.subscribe(w);
+
+        let collection_id = CollectionId::fixed_name("album");
+        let entity = TestEntity::new("Test Album", "pending");
+
+        // Two queries on one subscription, both matching the entity.
+        for selection_str in ["status = 'pending'", "name = 'Test Album'"] {
+            let selection: ankql::ast::Selection = selection_str.try_into().unwrap();
+            let resultset: EntityResultSet<TestEntity> = EntityResultSet::empty();
+            let mock_gap_fetcher = Arc::new(MockGapFetcher::new());
+            let mock_node = MockNode { entities: vec![entity.clone()] };
+            reactor
+                .add_query_and_notify(
+                    rsub.id(),
+                    QueryId::new(),
+                    collection_id.clone(),
+                    selection,
+                    &mock_node,
+                    resultset,
+                    mock_gap_fetcher,
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+        check(); // drain the two Initial notifications
+
+        // One change carrying one event.
+        let event = TestEvent { id: proto::EventId::from_bytes([7u8; 32]), collection: collection_id, changes: HashMap::new() };
+        let change = TestChange { entity: entity.clone(), events: vec![event.clone()] };
+        reactor.notify_change(vec![change]).await;
+
+        let updates = check();
+        assert_eq!(updates.len(), 1, "one batch, one update");
+        assert_eq!(updates[0].items.len(), 1, "one entity, one item");
+        assert_eq!(
+            updates[0].items[0].events,
+            vec![event],
+            "the change's events must appear once in the item, not once per matching query"
+        );
+    }
 }
