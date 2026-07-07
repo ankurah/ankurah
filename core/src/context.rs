@@ -155,76 +155,67 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             }
         }
 
-        // Now commit the events
-        let mut attested_events = Vec::new();
-        let mut entity_attested_events = Vec::new();
-
-        // Phase 1: check policy and collect attestations for EVERY event
-        // before persisting ANY of them, so a later denial leaves nothing
-        // durable (failure atomicity, V7).
+        // Phase one (D1 M7): plan and policy-check every entity's event
+        // through the shared commit-lane phase (planner ordering and
+        // classification, fork-policy preview) before persisting ANY of
+        // them, so a later denial leaves nothing durable (failure
+        // atomicity, V7). The preview forks the CANONICAL entity (the
+        // upstream resident for transaction forks), so the policy judges
+        // the event against everything the node currently knows, including
+        // history committed after this transaction forked; check_event
+        // attestations are attached in staging.
+        let mut planned = Vec::new();
         for (entity, event) in entity_events {
-            // Create a temporary fork to apply the event for validation
-            use std::sync::atomic::AtomicBool;
-            let trx_alive = Arc::new(AtomicBool::new(true));
-            let forked = entity.snapshot(trx_alive);
-
-            // Get the canonical (upstream) entity for before state
-            let entity_before = match &entity.kind {
+            let canonical = match &entity.kind {
                 crate::entity::EntityKind::Transacted { upstream, .. } => upstream.clone(),
                 crate::entity::EntityKind::Primary => entity.clone(),
             };
-
-            // Stage event and apply to fork for after state (no commit_event call here)
-            let collection = self.node.collections.get(entity.collection()).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.stage_event(event.clone());
-            forked.apply_event(&event_getter, &event).await?;
-
-            let attestation = self.node.policy_agent.check_event(&self.node, &self.cdata, &entity_before, &forked, &event)?;
-            let attested = Attested::opt(event.clone(), attestation);
-
-            attested_events.push(attested.clone());
-            entity_attested_events.push((entity, attested));
+            let event_id = event.id();
+            let group = self.node.plan_and_check_entity_group(&self.cdata, &canonical, &[Attested::opt(event, None)]).await?;
+            planned.push((entity, canonical, event_id, group));
         }
 
-        // Phase 2: all events attested; persist them.
-        for (entity, attested) in &entity_attested_events {
-            let collection = self.node.collections.get(entity.collection()).await?;
-            let event_getter = crate::retrieval::LocalEventGetter::new(collection, self.node.durable);
-            event_getter.commit_event(attested).await?;
+        // Phase two: every event checked; make them durable. Macro-order
+        // preserved from the pre-pipeline lane: commit events, advance the
+        // transaction forks' heads, relay and await required peers, and
+        // only then materialize onto the canonical residents, persist
+        // state, and notify once.
+        let mut attested_events = Vec::new();
+        for (_, _, event_id, group) in &planned {
+            let attested =
+                group.staging.get_attested(event_id).ok_or_else(|| MutationError::General("staged event evicted mid-commit".into()))?;
+            group.getter.commit_event(&attested).await?;
+            attested_events.push(attested);
         }
 
         // Update heads BEFORE relaying (makes entities visible to server echo)
-        for (entity, attested_event) in &entity_attested_events {
-            entity.commit_head(Clock::new([attested_event.payload.id()]));
+        for (entity, _, event_id, _) in &planned {
+            entity.commit_head(Clock::new([event_id.clone()]));
         }
         // Relay to peers and wait for confirmation
         self.node.relay_to_required_peers(&self.cdata, trx_id, &attested_events).await?;
 
-        // All peers confirmed, persist state to storage
+        // All peers confirmed: materialize onto the canonical entities and
+        // persist state, one change per entity, one notification for the
+        // transaction.
         let mut changes: Vec<EntityChange> = Vec::new();
-        for (entity, attested_event) in entity_attested_events {
-            let collection = self.node.collections.get(entity.collection()).await?;
+        for ((entity, canonical, _, group), attested_event) in planned.iter().zip(&attested_events) {
+            // The event is durable and no longer staged, so the getter
+            // resolves it (and any concurrent history) from storage. A
+            // primary entity already carries the operations; only upstream
+            // residents of transaction forks apply here.
+            if matches!(&entity.kind, crate::entity::EntityKind::Transacted { .. }) {
+                canonical.apply_event(&group.getter, &attested_event.payload).await?;
+            }
 
-            // Persist canonical entity (upstream for transactional forks, entity itself for primary)
-            let canonical_entity = match &entity.kind {
-                crate::entity::EntityKind::Transacted { upstream, .. } => {
-                    // Event is now in storage, construct fresh getter for upstream apply
-                    let event_getter = crate::retrieval::LocalEventGetter::new(collection.clone(), self.node.durable);
-                    upstream.apply_event(&event_getter, &attested_event.payload).await?;
-                    upstream.clone()
-                }
-                crate::entity::EntityKind::Primary => entity,
-            };
+            let state = canonical.to_state()?;
 
-            let state = canonical_entity.to_state()?;
-
-            let entity_state = EntityState { entity_id: canonical_entity.id(), model: canonical_entity.model_id()?, state };
+            let entity_state = EntityState { entity_id: canonical.id(), model: canonical.model_id()?, state };
             let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
             let attested = Attested::opt(entity_state, attestation);
-            collection.set_state(attested).await?;
+            group.collection.set_state(attested).await?;
 
-            changes.push(EntityChange::new(canonical_entity, vec![attested_event])?);
+            changes.push(EntityChange::new(canonical.clone(), vec![attested_event.clone()])?);
         }
 
         // Notify reactor of ALL changes
