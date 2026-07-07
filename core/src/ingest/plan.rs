@@ -436,6 +436,25 @@ mod tests {
         assert!(plan.preresolved.is_empty());
     }
 
+    /// Head containment normally implies durably committed (the crash
+    /// invariant), but a commit_event failure after an apply leaves a
+    /// head-contained, staged, UNSTORED event. Skipping it would strand the
+    /// backfill forever; it must schedule.
+    #[tokio::test]
+    async fn head_contained_but_unstored_member_schedules_for_backfill() {
+        let entity = EntityId::new();
+        let ([_, e1, _], [_, i1, _]) = chain(entity);
+        let staging = StagingArea::with_default_cap();
+        staging.stage(e1);
+
+        // e1 is in the head (applied) but the store has no record of it.
+        let head = Clock::from(vec![i1.clone()]);
+        let plan = plan_entity(&head, &[i1.clone()], &staging, &store(&[])).await.unwrap();
+
+        assert_eq!(plan.schedule, vec![i1], "head-contained but unstored must schedule so the executor backfills the log");
+        assert!(plan.preresolved.is_empty());
+    }
+
     #[tokio::test]
     async fn batch_carrying_its_own_genesis_schedules_cleanly() {
         let entity = EntityId::new();
