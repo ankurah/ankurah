@@ -363,6 +363,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
         let mut items: IndexMap<proto::EntityId, ReactorUpdateItem<E, Ev>> = IndexMap::new();
+        // A change folds its events into an entity's item exactly ONCE, even
+        // when several of this subscription's queries surface it (a peer's
+        // handler holds every query that peer registered; two queries over
+        // one predicate are routine). Batch offsets identify changes, since
+        // the generic event type carries no id to dedupe by.
+        let mut folded: std::collections::HashSet<(proto::EntityId, usize)> = std::collections::HashSet::new();
 
         // Take the state lock once for all evaluations
         let mut state_guard = self.state.lock().unwrap();
@@ -382,7 +388,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             debug!("\tevaluate_changes query: {} {:?}", query_id, selection);
 
             // Process all candidate changes for this query
-            for change in query_candidate.iter() {
+            for (offset, change) in query_candidate.iter_with_offsets() {
                 let entity = change.entity();
                 let entity_id = *AbstractEntity::id(entity);
 
@@ -433,9 +439,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                     // whole head the entity now reflects. Previously the first
                     // change's events won and the rest were dropped, leaving the
                     // item's state ahead of its listed events -- which a receiver
-                    // rejects in EntityChange::new.
-                    item.entity = entity.clone();
-                    item.events.extend(change.events().iter().cloned());
+                    // rejects in EntityChange::new. The fold is gated per
+                    // (entity, change): a SECOND QUERY matching the same change
+                    // must not append its events again.
+                    if folded.insert((entity_id, offset)) {
+                        item.entity = entity.clone();
+                        item.events.extend(change.events().iter().cloned());
+                    }
 
                     if let Some(mc) = membership_change {
                         item.predicate_relevance.push((query_id, mc));
