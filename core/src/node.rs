@@ -152,6 +152,18 @@ where PA: PolicyAgent
     pub(crate) type_resolver: crate::TypeResolver,
 }
 
+/// One entity's planned, policy-checked commit group: the phase-one output
+/// of the Atomic commit lanes (M6 remote, M7 local), consumed by their
+/// phase two. The staging area holds the group's events, check_event
+/// attestations attached; nothing durable has happened yet.
+pub(crate) struct PlannedEntityGroup {
+    pub(crate) entity: Entity,
+    pub(crate) staging: Arc<crate::ingest::StagingArea>,
+    pub(crate) getter: LocalEventGetter,
+    pub(crate) collection: crate::storage::StorageCollectionWrapper,
+    pub(crate) plan: crate::ingest::plan::IngestPlan,
+}
+
 impl<SE, PA> Node<SE, PA>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -539,6 +551,87 @@ where
         Ok(())
     }
 
+    /// Phase one of the Atomic commit lanes (M6 remote, M7 local): stage one
+    /// entity's events into per-call staging, plan them, typed-fail anything
+    /// the plan cannot resolve, and preview every scheduled event on a fork
+    /// for the policy check. Nothing durable happens here; the caller owns
+    /// phase two and failure cleanup.
+    pub(crate) async fn plan_and_check_entity_group(
+        &self,
+        cdata: &PA::ContextData,
+        entity: &Entity,
+        group: &[Attested<proto::Event>],
+    ) -> Result<PlannedEntityGroup, MutationError> {
+        let collection = self.collections.get(entity.collection()).await?;
+        let staging = Arc::new(crate::ingest::StagingArea::with_default_cap());
+        // Lineage lookups stay local-plus-staged on the commit lanes, as
+        // before.
+        let getter = LocalEventGetter::with_staging(collection.clone(), self.durable, staging.clone());
+
+        for attested in group {
+            staging.stage(attested.clone());
+        }
+
+        let batch: Vec<proto::EventId> = group.iter().map(|e| e.payload.id()).collect();
+        let plan = crate::ingest::plan_entity(&entity.head(), &batch, &staging, &getter).await?;
+
+        // NeedsState on the commit lanes fails typed, fast, and atomically;
+        // the sender's retry recovers once state arrives through the
+        // normal lanes. The plan originally wired an inline Get
+        // fetch here (2.4); amended by the maintainer 2026-07-06: a
+        // nested round-trip inside a request handler deadlocks the
+        // sim's inline delivery, amplifies requests on the server
+        // (unknown-entity commits would fan out Gets while holding
+        // the inbound request open), and is futile on the common
+        // single-durable topology, where the receiving node has no
+        // durable peer to ask. Active deep-gap recovery is
+        // revisited with the attested-comparison work (D5,
+        // #199/#323). The local lane cannot reach these outcomes (a
+        // transaction's parents are its own resident's lineage); the
+        // guards are shared defense.
+        for (eid, outcome) in &plan.preresolved {
+            match outcome {
+                crate::ingest::IngestOutcome::NeedsState { .. } => {
+                    return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
+                }
+                crate::ingest::IngestOutcome::NeedsEvents { missing } => {
+                    // Atomic mode cannot partially apply: a missing
+                    // parent fails the whole transaction before
+                    // anything commits. Retryable retrieval truth,
+                    // same surface as the PerItem arms (M5).
+                    let missing = missing.first().cloned().unwrap_or_else(|| eid.clone());
+                    return Err(RetrievalError::EventNotFound(missing).into());
+                }
+                _ => {}
+            }
+        }
+
+        // Fork-policy phase over the planned schedule: every event
+        // previews on a fork (before and after states), the real
+        // entity untouched until phase two. check_event attestations
+        // are attached by restaging the attested event.
+        use std::sync::atomic::AtomicBool;
+        let fork = entity.snapshot(Arc::new(AtomicBool::new(true)));
+        for event_id in &plan.schedule {
+            let Some(attested) = staging.get_attested(event_id) else { continue };
+            let fork_before = fork.snapshot(Arc::new(AtomicBool::new(true)));
+            fork.apply_event(&getter, &attested.payload).await.map_err(crate::ingest::type_comparison_error)?;
+            match self.policy_agent.check_event(self, cdata, &fork_before, &fork, &attested.payload) {
+                Ok(Some(attestation)) => {
+                    let mut updated = attested.clone();
+                    updated.attestations.push(attestation);
+                    staging.stage(updated);
+                }
+                Ok(None) => {}
+                Err(denied) => {
+                    return Err(crate::error::IngestError::PolicyDenied(denied).into());
+                }
+            }
+        }
+
+        Ok(PlannedEntityGroup { entity: entity.clone(), staging, getter, collection, plan })
+    }
+
     /// Does all the things necessary to commit a remote transaction
     pub async fn commit_remote_transaction(
         &self,
@@ -565,85 +658,17 @@ where
         // unappliable event means nothing durable. Speculative residents
         // materialized along the way are evicted on failure.
         let mut touched: Vec<proto::EntityId> = Vec::new();
-        let mut ready: Vec<(
-            Entity,
-            Arc<crate::ingest::StagingArea>,
-            LocalEventGetter,
-            crate::storage::StorageCollectionWrapper,
-            crate::ingest::plan::IngestPlan,
-        )> = Vec::new();
+        let mut ready: Vec<PlannedEntityGroup> = Vec::new();
         let phase_one = async {
             for (entity_id, collection_id, group) in &groups {
                 let collection = self.collections.get(collection_id).await?;
-                let staging = Arc::new(crate::ingest::StagingArea::with_default_cap());
-                // Lineage lookups stay local-plus-staged on this lane, as
-                // before.
-                let event_getter = LocalEventGetter::with_staging(collection.clone(), self.durable, staging.clone());
-                let state_getter = LocalStateGetter::new(collection.clone());
-
-                for attested in group {
-                    staging.stage(attested.clone());
-                }
+                let event_getter = LocalEventGetter::new(collection.clone(), self.durable);
+                let state_getter = LocalStateGetter::new(collection);
 
                 let entity = self.entities.get_retrieve_or_create(&state_getter, &event_getter, collection_id, entity_id).await?;
                 touched.push(*entity_id);
 
-                let batch: Vec<proto::EventId> = group.iter().map(|e| e.payload.id()).collect();
-                let plan = crate::ingest::plan_entity(&entity.head(), &batch, &staging, &event_getter).await?;
-
-                // NeedsState on this lane fails typed, fast, and atomically;
-                // the sender's retry recovers once state arrives through the
-                // normal lanes. The plan originally wired an inline Get
-                // fetch here (2.4); amended by the maintainer 2026-07-06: a
-                // nested round-trip inside a request handler deadlocks the
-                // sim's inline delivery, amplifies requests on the server
-                // (unknown-entity commits would fan out Gets while holding
-                // the inbound request open), and is futile on the common
-                // single-durable topology, where the receiving node has no
-                // durable peer to ask. Active deep-gap recovery is
-                // revisited with the attested-comparison work (D5,
-                // #199/#323).
-                for (eid, outcome) in &plan.preresolved {
-                    match outcome {
-                        crate::ingest::IngestOutcome::NeedsState { .. } => {
-                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
-                        }
-                        crate::ingest::IngestOutcome::NeedsEvents { missing } => {
-                            // Atomic mode cannot partially apply: a missing
-                            // parent fails the whole transaction before
-                            // anything commits. Retryable retrieval truth,
-                            // same surface as the PerItem arms (M5).
-                            let missing = missing.first().cloned().unwrap_or_else(|| eid.clone());
-                            return Err(RetrievalError::EventNotFound(missing).into());
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Fork-policy phase over the planned schedule: every event
-                // previews on a fork (before and after states), the real
-                // entity untouched until phase two. check_event attestations
-                // are attached by restaging the attested event.
-                use std::sync::atomic::AtomicBool;
-                let fork = entity.snapshot(Arc::new(AtomicBool::new(true)));
-                for event_id in &plan.schedule {
-                    let Some(attested) = staging.get_attested(event_id) else { continue };
-                    let fork_before = fork.snapshot(Arc::new(AtomicBool::new(true)));
-                    fork.apply_event(&event_getter, &attested.payload).await.map_err(crate::ingest::type_comparison_error)?;
-                    match self.policy_agent.check_event(self, cdata, &fork_before, &fork, &attested.payload) {
-                        Ok(Some(attestation)) => {
-                            let mut updated = attested.clone();
-                            updated.attestations.push(attestation);
-                            staging.stage(updated);
-                        }
-                        Ok(None) => {}
-                        Err(denied) => {
-                            return Err(crate::error::IngestError::PolicyDenied(denied).into());
-                        }
-                    }
-                }
-
-                ready.push((entity, staging, event_getter, collection, plan));
+                ready.push(self.plan_and_check_entity_group(cdata, &entity, group).await?);
             }
             Ok::<(), MutationError>(())
         }
@@ -664,9 +689,9 @@ where
         // notified.
         let mut changes = Vec::new();
         let mut failure: Option<MutationError> = None;
-        for (entity, staging, event_getter, collection, plan) in ready {
+        for PlannedEntityGroup { entity, staging, getter, collection, plan } in ready {
             let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
-            let outcome = crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &event_getter, &persist).await;
+            let outcome = crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &getter, &persist).await;
             // One change per entity carrying its applied events in
             // application order. The old per-event shape was an artifact of
             // building each change mid-loop while the head sat at that
