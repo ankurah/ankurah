@@ -189,3 +189,94 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
 
     ExecutionOutcome { outcomes, applied, failure }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::Entity;
+    use crate::error::RetrievalError;
+    use crate::ingest::plan_entity;
+    use ankurah_proto::{Clock, EntityId, OperationSet};
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+
+    fn event(entity_id: EntityId, parent_ids: &[EventId]) -> Attested<Event> {
+        let event = Event {
+            entity_id,
+            collection: "test".into(),
+            parent: Clock::from(parent_ids.to_vec()),
+            operations: OperationSet(BTreeMap::new()),
+        };
+        Attested::opt(event, None)
+    }
+
+    /// Getter whose `commit_event` fails for one designated event id:
+    /// the deterministic stand-in for a transient storage fault.
+    struct FailingCommitStore {
+        staging: std::sync::Arc<StagingArea>,
+        fail_commit_of: EventId,
+    }
+
+    #[async_trait]
+    impl crate::retrieval::GetEvents for FailingCommitStore {
+        async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+            self.staging.get(event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+        }
+        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
+        fn storage_is_definitive(&self) -> bool { true }
+    }
+
+    #[async_trait]
+    impl SuspenseEvents for FailingCommitStore {
+        fn stage_event(&self, event: Event) { self.staging.stage(Attested::opt(event, None)); }
+        async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError> {
+            if attested.payload.id() == self.fail_commit_of {
+                return Err(MutationError::General("injected transient commit failure".into()));
+            }
+            self.staging.remove(&attested.payload.id());
+            Ok(())
+        }
+    }
+
+    struct NoopPersist;
+    #[async_trait]
+    impl PersistState for NoopPersist {
+        async fn persist(&self, _entity: &Entity) -> Result<(), MutationError> { Ok(()) }
+    }
+
+    /// The retention sweep must not delete a carryover orphan (buffered by an
+    /// EARLIER delivery, acked as success then) when a transient hard failure
+    /// stops the schedule at or before it: nobody will redeliver that event,
+    /// so sweeping it permanently orphans its operations. Batch members are
+    /// different: their item errors and the sender's retry re-delivers them.
+    #[tokio::test]
+    async fn transient_failure_keeps_carryover_orphans_staged() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let g = genesis.payload.id();
+        let parent = event(entity_id, &[g.clone()]);
+        let p = parent.payload.id();
+        let orphan = event(entity_id, &[p.clone()]);
+        let b = orphan.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore { staging: staging.clone(), fail_commit_of: p.clone() };
+
+        // The resident holds genesis; the orphan B buffered from an earlier
+        // delivery; THIS delivery carries only the parent P.
+        let entity = Entity::create(entity_id, "test".into());
+        entity.apply_event(&getter, &genesis.payload).await.expect("genesis applies");
+        staging.stage(orphan);
+        staging.stage(parent);
+
+        let plan = plan_entity(&entity.head(), &[p.clone()], &staging, &getter).await.expect("plan builds");
+        assert_eq!(plan.schedule, vec![p.clone(), b.clone()], "re-drive schedules the buffered orphan behind its parent");
+
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
+
+        assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
+        assert!(staging.contains(&b), "a carryover orphan the plan never resolved must stay buffered; sweeping it loses an acked event");
+        assert!(!staging.contains(&p), "the batch member leaves the area; its item error drives the sender's retry");
+    }
+}
