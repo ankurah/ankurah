@@ -551,7 +551,7 @@ where
         );
         // 3. Apply deltas to local node using NodeApplier
         let collection = node.collections.get(&collection_id).await?;
-        let staging = std::sync::Arc::new(crate::ingest::StagingArea::with_default_cap());
+        let staging = node.staging_for(&collection_id);
         let event_getter =
             crate::retrieval::CachedEventGetter::with_staging(collection_id, collection.clone(), &node, context_data, staging.clone());
         let state_getter = crate::retrieval::LocalStateGetter::new(collection);

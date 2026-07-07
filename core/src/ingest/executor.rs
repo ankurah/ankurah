@@ -73,6 +73,11 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     getter: &G,
     persist: &dyn PersistState,
 ) -> ExecutionOutcome {
+    // Plan membership, captured for the retention sweep at the end: with
+    // node-held staging, whatever this plan does not explicitly retain must
+    // leave the area.
+    let members: Vec<EventId> = plan.preresolved.iter().map(|(id, _)| id.clone()).chain(plan.schedule.iter().cloned()).collect();
+
     let mut outcomes: Vec<(EventId, IngestOutcome)> = plan.preresolved;
     let mut applied: Vec<Attested<Event>> = Vec::new();
     let mut failure: Option<MutationError> = None;
@@ -162,6 +167,24 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     let unresolved = outcomes.iter().any(|(_, o)| matches!(o, IngestOutcome::NeedsState { .. } | IngestOutcome::NeedsEvents { .. }));
     if failure.is_some() || unresolved {
         entities.remove_if_phantom(&entity.id());
+    }
+
+    // Retention sweep (the 2.4 rule, live at M8): only events WAITING on
+    // something stay staged. Applied and back-filled events were promoted
+    // by commit_event; everything else this plan touched leaves the area
+    // now that staging outlives the call: plan-time skips are redeliveries,
+    // and a hard failure plus its unattempted suffix are the sender's retry
+    // to re-deliver (rejection is not buffering). Events staged by OTHER
+    // deliveries and not in this plan's membership are untouched.
+    let keep: std::collections::BTreeSet<&EventId> = outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, IngestOutcome::NeedsState { .. } | IngestOutcome::NeedsEvents { .. }))
+        .map(|(id, _)| id)
+        .collect();
+    for id in &members {
+        if !keep.contains(id) {
+            staging.remove(id);
+        }
     }
 
     ExecutionOutcome { outcomes, applied, failure }

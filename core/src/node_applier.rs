@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use crate::{
     changes::EntityChange,
-    error::{ApplyError, ApplyErrorItem, MutationError, RetrievalError},
+    error::{ApplyError, ApplyErrorItem, MutationError},
     ingest::{self, IngestOutcome, StagingArea},
     node::Node,
     policy::PolicyAgent,
@@ -75,10 +73,11 @@ impl NodeApplier {
             let item_collection = update.collection.clone();
             let result = async {
                 let collection = node.collections.get(&update.collection).await?;
-                // Per-item staging, the historical lifetime; the getter
-                // shares the same area so BFS discovery and pipeline
-                // scheduling see one buffer.
-                let staging = Arc::new(StagingArea::with_default_cap());
+                // Node-held staging (M8): staged-but-unapplied events
+                // survive across deliveries, which is what descendant
+                // re-drive integrates from. The getter shares the same area
+                // so BFS discovery and pipeline scheduling see one buffer.
+                let staging = node.staging_for(&update.collection);
                 let event_getter =
                     CachedEventGetter::with_staging(update.collection.clone(), collection.clone(), node, &cdata, staging.clone());
                 let state_getter = LocalStateGetter::new(collection);
@@ -119,7 +118,9 @@ impl NodeApplier {
     /// Validate each event fragment against policy and stage it for BFS
     /// discovery. Shared by every update arm that carries events. Stages the
     /// ATTESTED event so a buffered or scheduled event can later be
-    /// committed with the attestations it arrived with.
+    /// committed with the attestations it arrived with. Validation runs for
+    /// the WHOLE batch before anything stages: with node-held staging, a
+    /// rejected item must leave nothing behind (rejection is not buffering).
     fn validate_and_stage<SE, PA>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
@@ -136,10 +137,22 @@ impl NodeApplier {
         for fragment in event_fragments {
             let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
             node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
-            staging.stage(attested_event.clone());
             attested_events.push(attested_event);
         }
+        for attested_event in &attested_events {
+            staging.stage(attested_event.clone());
+        }
         Ok(attested_events)
+    }
+
+    /// Unstage a batch whose item failed between staging and execution
+    /// (entity retrieval or planning): with the node-held area those events
+    /// must not linger as if buffered; the sender's retry re-stages them.
+    /// Retention for events that reach execution is the executor's sweep.
+    fn unstage_batch(staging: &StagingArea, batch: &[proto::EventId]) {
+        for id in batch {
+            staging.remove(id);
+        }
     }
 
     async fn apply_update<SE, PA, E, S>(
@@ -166,19 +179,30 @@ impl NodeApplier {
             // EventOnly: equivalent to old SubscriptionItem::Change
             proto::UpdateContent::EventOnly(event_fragments) => {
                 let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
-
-                // We did not receive an entity fragment, so we need to retrieve it from local storage or a remote peer
-                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
-                entities.push(entity.clone());
+                let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
 
                 // Second arm on the ingest pipeline (D1 M3). The planner
                 // orders the staged closure parents-first (wire order is
                 // untrusted for every multi-event shape, V4) and the executor
                 // owns apply-then-commit, uniform state persistence, phantom
                 // eviction, and the applied-prefix containment this arm
-                // pioneered (C4-11).
-                let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
-                let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                // pioneered (C4-11). The entity comes from local storage or
+                // a remote peer, since this shape carries no fragment.
+                let planned = async {
+                    let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &collection_id, &entity_id).await?;
+                    let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                    Ok::<_, MutationError>((entity, plan))
+                }
+                .await;
+                let (entity, plan) = match planned {
+                    Ok(v) => v,
+                    Err(e) => {
+                        Self::unstage_batch(staging, &batch);
+                        return Err(e);
+                    }
+                };
+                entities.push(entity.clone());
+
                 let persist = NodePersist { node, collection: &collection };
                 let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
 
@@ -192,47 +216,53 @@ impl NodeApplier {
                     return Err(failure);
                 }
                 // Per-item error surface, typed at M5: NeedsState is the
-                // typed empty-head lineage rejection. NeedsEvents
-                // deliberately stays EventNotFound: a missing parent is a
-                // retryable retrieval truth, not a lineage verdict, and it
-                // becomes a buffered non-error outcome when retention flips
-                // live (M8).
+                // typed empty-head lineage rejection (the event stays
+                // buffered awaiting state through any lane, but this node
+                // cannot apply it now and the ack says so). NeedsEvents is a
+                // buffered NON-error since the M8 retention flip: the event
+                // is retained in the node-held area and integrates via
+                // descendant re-drive when its parent arrives; failing the
+                // item would make the sender retry what is already safely
+                // buffered.
                 for (_, o) in &outcome.outcomes {
-                    match o {
-                        IngestOutcome::NeedsEvents { missing } => {
-                            let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
-                            return Err(RetrievalError::EventNotFound(id).into());
-                        }
-                        IngestOutcome::NeedsState { .. } => {
-                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into())
-                        }
-                        _ => {}
+                    if matches!(o, IngestOutcome::NeedsState { .. }) {
+                        return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
                     }
                 }
             }
 
             // StateAndEvent: equivalent to old SubscriptionItem::Add
             proto::UpdateContent::StateAndEvent(state_fragment, event_fragments) => {
-                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
-
-                let state = (entity_id, collection_id.clone(), state_fragment.clone()).into();
+                // State validation runs before anything stages so a rejected
+                // item leaves nothing in the node-held area.
+                let state: Attested<proto::EntityState> = (entity_id, collection_id.clone(), state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
+                let attested_events = Self::validate_and_stage(node, from_peer_id, entity_id, &collection_id, event_fragments, staging)?;
+                let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
 
                 // Fast path through the shared state-apply: fresh adoption or
                 // strict descent takes the snapshot wholesale, committing the
                 // accompanying events before the buffer persists.
                 let persist = NodePersist { node, collection: &collection };
-                let applied = ingest::apply_state_feed(
+                let applied = match ingest::apply_state_feed(
                     &node.entities,
                     state_getter,
                     event_getter,
+                    staging,
                     entity_id,
                     collection_id.clone(),
                     state.payload.state,
                     &attested_events,
                     &persist,
                 )
-                .await?;
+                .await
+                {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        Self::unstage_batch(staging, &batch);
+                        return Err(e);
+                    }
+                };
                 let entity = applied.entity.clone();
                 entities.push(applied.entity);
 
@@ -243,8 +273,13 @@ impl NodeApplier {
                     // event-by-event application through the pipeline, which
                     // handles DivergedSince by merging concurrent branches.
                     // The events are already staged; the planner orders them.
-                    let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
-                    let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                    let plan = match ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await {
+                        Ok(plan) => plan,
+                        Err(e) => {
+                            Self::unstage_batch(staging, &batch);
+                            return Err(e);
+                        }
+                    };
                     let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
 
                     if outcome.advanced() {
@@ -253,21 +288,12 @@ impl NodeApplier {
                     if let Some(failure) = outcome.failure {
                         return Err(failure);
                     }
-                    // Same per-item error surface as the EventOnly arm
-                    // (typed at M5; NeedsEvents stays EventNotFound until
-                    // the M8 retention flip).
+                    // Same per-item error surface as the EventOnly arm:
+                    // NeedsState is typed, NeedsEvents is a buffered
+                    // non-error since the M8 retention flip.
                     for (_, o) in &outcome.outcomes {
-                        match o {
-                            IngestOutcome::NeedsEvents { missing } => {
-                                let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
-                                return Err(RetrievalError::EventNotFound(id).into());
-                            }
-                            IngestOutcome::NeedsState { .. } => {
-                                return Err(
-                                    crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into()
-                                )
-                            }
-                            _ => {}
+                        if matches!(o, IngestOutcome::NeedsState { .. }) {
+                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
                         }
                     }
                 }
@@ -405,6 +431,7 @@ impl NodeApplier {
                     &node.entities,
                     state_getter,
                     event_getter,
+                    staging,
                     delta.entity_id,
                     delta.collection,
                     attested_state.payload.state,
@@ -425,17 +452,27 @@ impl NodeApplier {
                 // Bridge events pass the same policy gate as subscription
                 // updates; transport must not decide trust.
                 let attested_events = Self::validate_and_stage(node, from_peer_id, delta.entity_id, &delta.collection, events, staging)?;
-
-                // Get or create entity
-                let entity = node.entities.get_retrieve_or_create(state_getter, event_getter, &delta.collection, &delta.entity_id).await?;
+                let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
 
                 // First arm on the ingest pipeline (D1 M2). The planner
                 // orders parents-first over the staging closure (wire order
                 // untrusted, V4) and the executor owns apply-then-commit,
                 // back-fill of integrated-but-unstored events, advance-gated
                 // state persistence, and phantom eviction on failure.
-                let batch: Vec<proto::EventId> = attested_events.iter().map(|e| e.payload.id()).collect();
-                let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                let planned = async {
+                    let entity =
+                        node.entities.get_retrieve_or_create(state_getter, event_getter, &delta.collection, &delta.entity_id).await?;
+                    let plan = ingest::plan_entity(&entity.head(), &batch, staging, event_getter).await?;
+                    Ok::<_, MutationError>((entity, plan))
+                }
+                .await;
+                let (entity, plan) = match planned {
+                    Ok(v) => v,
+                    Err(e) => {
+                        Self::unstage_batch(staging, &batch);
+                        return Err(e);
+                    }
+                };
                 let persist = NodePersist { node, collection: &collection };
                 let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
 
@@ -444,18 +481,11 @@ impl NodeApplier {
                 }
                 // Per-item error surface, typed at M5. NeedsState should not
                 // arise on bridges (they include genesis); if it does, the
-                // typed empty-head rejection says so honestly. NeedsEvents
-                // stays EventNotFound until the M8 retention flip.
+                // typed empty-head rejection says so honestly. NeedsEvents is
+                // a buffered non-error since the M8 retention flip.
                 for (_, o) in &outcome.outcomes {
-                    match o {
-                        IngestOutcome::NeedsEvents { missing } => {
-                            let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
-                            return Err(RetrievalError::EventNotFound(id).into());
-                        }
-                        IngestOutcome::NeedsState { .. } => {
-                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into())
-                        }
-                        _ => {}
+                    if matches!(o, IngestOutcome::NeedsState { .. }) {
+                        return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
                     }
                 }
 

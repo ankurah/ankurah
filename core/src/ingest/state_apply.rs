@@ -17,6 +17,7 @@
 use ankurah_proto::{Attested, CollectionId, EntityId, Event, State};
 
 use super::executor::PersistState;
+use super::staging::StagingArea;
 use crate::entity::{Entity, WeakEntitySet};
 use crate::error::MutationError;
 use crate::retrieval::{GetState, SuspenseEvents};
@@ -35,6 +36,7 @@ pub(crate) async fn apply_state_feed<S, E>(
     entities: &WeakEntitySet,
     state_getter: &S,
     event_getter: &E,
+    staging: &StagingArea,
     entity_id: EntityId,
     collection_id: CollectionId,
     state: State,
@@ -68,5 +70,31 @@ where
     if !entity.head().is_empty() {
         persist.persist(&entity).await?;
     }
+
+    // A state adoption can be exactly the thing a buffered orphan was
+    // waiting for (268-B liveness; 2.4's post-recovery semantics are a
+    // re-plan against the staging area with an empty batch). Head-seeded
+    // re-drive schedules any staged event the new head satisfies; the
+    // common case schedules nothing and costs one reverse-index lookup per
+    // head id. Nothing here may fail the feed: the state already applied
+    // and persisted, and failing now would swallow its notification.
+    // Buffered events keep their own outcome surface from their original
+    // delivery, so re-drive trouble is logged and the events follow the
+    // retention rule.
+    if advanced {
+        match super::plan_entity(&entity.head(), &[], staging, event_getter).await {
+            Ok(plan) if !plan.schedule.is_empty() => {
+                let outcome = super::execute_plan(plan, &entity, entities, staging, event_getter, persist).await;
+                if let Some(failure) = outcome.failure {
+                    tracing::warn!(entity_id = %entity.id(), "buffered-event re-drive after state adoption failed: {failure}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(entity_id = %entity.id(), "re-drive planning after state adoption failed: {e}");
+            }
+        }
+    }
+
     Ok(StateApplied { entity, advanced })
 }
