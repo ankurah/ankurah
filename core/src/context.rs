@@ -52,16 +52,18 @@ pub trait TContext {
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
     /// RFC 5.2 model first-use registration, object-safe so the mutating
     /// transaction paths (`create`/`edit`) can trigger it without the
-    /// concrete `<SE, PA>`. BEST-EFFORT: a denied registration only warns and
-    /// must NOT fail the write. Policy gates schema DEFINITION, not data
-    /// writes; a create for a model the caller may not register still
-    /// succeeds (RFC 5.2, binding rationale).
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema);
-    /// RFC 5.2 read-path caching: overlay a compiled model's derived catalog
-    /// entries so resolution answers for it, WITHOUT any durable write.
-    /// Object-safe so read paths (`get`/`fetch`/`query`) can call it without
-    /// the concrete `<SE, PA>`. Cheap and synchronous; no-op if the system
-    /// root is not yet known.
+    /// concrete `<SE, PA>`. Discriminates per plan decision 16 (rev 4): for
+    /// a collection the catalog already KNOWS (bound), any registration
+    /// failure only warns and the data write proceeds; for a
+    /// NEVER-registered collection, a failed or impossible registration is
+    /// the strict rev 4 surface and returns Err, failing the write
+    /// ("connect once first").
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError>;
+    /// Record a compiled model's schema pointer for the commit-time
+    /// registration gap (RFC 5.2, plan decision 16). Object-safe so read
+    /// paths (`get`/`fetch`/`query`) and the sync `edit` path can call it
+    /// without the concrete `<SE, PA>`. Cheap and synchronous. (Rev 4: no
+    /// local id overlay; ids exist only in the catalog.)
     fn cache_compiled(&self, schema: &'static crate::schema::ModelSchema);
     /// RFC 5.2 STRICT registration (the eager explicit `ctx.register::<M>()`
     /// form): propagate the error instead of swallowing it. Object-safe.
@@ -101,13 +103,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // first mutating use"): Transaction::edit is sync and cannot await a
         // durable registration, so ensure-register here for any touched
         // collection whose compiled schema is known but not yet ensured.
-        // Best-effort, like the create-path trigger: policy gates schema
-        // definition, not data writes.
+        // Same discrimination as the create-path trigger (plan decision 16):
+        // bound collections warn and proceed; a never-registered collection
+        // fails the commit (the rev 4 strict offline surface).
         for entity in trx.entities.iter() {
             if let Some(schema) = self.node.catalog.unensured_schema_for(entity.collection().as_str()) {
-                if let Err(e) = self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await {
-                    tracing::warn!("commit-time registration for '{}' failed: {e}", schema.collection);
-                }
+                TContext::ensure_registered(self, schema).await?;
             }
         }
 
@@ -228,14 +229,22 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError> {
         self.node.system.collection(id).await
     }
-    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) {
-        // BEST-EFFORT (RFC 5.2): a registration refusal must not fail the
-        // caller's data write, so a strict Err only warns. The catalog latch,
-        // the compiled-overlay cache, and the offline queue all live inside
-        // ensure_registered.
+    async fn ensure_registered(&self, schema: &'static crate::schema::ModelSchema) -> Result<(), MutationError> {
         if let Err(e) = self.node.catalog.ensure_registered(&self.node, &self.cdata, schema).await {
-            tracing::warn!("ensure_registered for collection '{}' failed (data write proceeds): {}", schema.collection, e);
+            // Plan decision 16 (rev 4): a collection the catalog already
+            // knows keeps writing against its cached binding; the re-assert
+            // is deferrable and only warns. A NEVER-registered collection
+            // failing registration (offline, or refused) fails the write:
+            // identity does not exist yet and only the allocator can mint it.
+            if self.node.catalog.model_by_collection(schema.collection).is_some() {
+                tracing::warn!("ensure_registered for bound collection '{}' failed (data write proceeds): {}", schema.collection, e);
+            } else {
+                return Err(MutationError::General(
+                    format!("cannot write into unregistered collection '{}': {e}", schema.collection).into(),
+                ));
+            }
         }
+        Ok(())
     }
     fn cache_compiled(&self, schema: &'static crate::schema::ModelSchema) { self.node.catalog.cache_compiled(schema); }
     async fn register_strict(
@@ -294,8 +303,9 @@ impl Context {
     }
 
     pub async fn get<R: View>(&self, id: proto::EntityId) -> Result<R, RetrievalError> {
-        // Read-path caching (RFC 5.2): overlay the compiled schema so
-        // resolution answers for R's model without a durable write.
+        // Record the compiled schema. Gets (id addressed, no predicate
+        // resolution) do not trigger first-use registration; this feeds the
+        // commit-time registration gap.
         self.0.cache_compiled(<R::Model as crate::model::Model>::schema());
         let entity = self.0.get_entity(id, &R::collection(), false).await?;
         Ok(R::from_entity(entity))
@@ -313,8 +323,11 @@ impl Context {
         use crate::model::Model;
         let collection_id = R::Model::collection();
 
-        // Read-path caching (RFC 5.2): derive-and-cache, never durably
-        // register. Predicate resolution needs the ids before any create.
+        // Record the compiled schema. Resolution registers it at first use
+        // (REN 2 revised, plan decision 25b): an idempotent upsert that
+        // no-ops when the catalog already carries the schema. Denied or
+        // offline registration falls back to the anticipated-collection
+        // rule (empty fetch / deferred live query).
         self.0.cache_compiled(R::Model::schema());
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;
@@ -334,7 +347,8 @@ impl Context {
     where R: View {
         let args: MatchArgs = args.try_into().map_err(|e| e.into())?;
         use crate::model::Model;
-        // Read-path caching (RFC 5.2): overlay before building the query.
+        // Record the compiled schema before building the query; the async
+        // resolution path registers it at first use (REN 2 revised).
         self.0.cache_compiled(R::Model::schema());
         Ok(self.0.query(R::Model::collection(), args)?.map::<R>())
     }
@@ -422,7 +436,15 @@ where
         // PathExpr -> Identifier, failing closed on unknown properties, with
         // the catalog-lag deferral. Idempotent, so a selection resolved by an
         // outer caller passes through unchanged here.
-        args.selection = self.node.catalog.resolve_selection_deferred(collection_id, &args.selection).await?;
+        args.selection =
+            match self.node.catalog.resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, &args.selection).await {
+                Ok(resolved) => resolved,
+                // Rev 4 (RFC 5.3): an anticipated-but-unregistered collection
+                // provably holds no entities (creation requires registration
+                // first), so the correct fetch answer is empty, not an error.
+                Err(crate::property::PropertyError::UnregisteredCollection { .. }) => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            };
 
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);

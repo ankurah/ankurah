@@ -5,33 +5,48 @@
 
 mod common;
 use ankql::ast::{Expr, Predicate, Selection};
-use ankurah::proto::schema_id;
+use ankurah::proto::EntityId;
 use common::*;
+use std::collections::BTreeMap;
 
+/// A RegisterSchema request for `collection` with the given `(name, backend,
+/// value_type)` properties, each a required membership.
 fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeRequestBody {
     proto::NodeRequestBody::RegisterSchema {
         models: vec![proto::ModelDescriptor { collection: collection.into(), name: collection.into(), explicit_id: None }],
         properties: props
             .iter()
-            .map(|(anchor, backend, value_type)| proto::PropertyDescriptor {
+            .map(|(name, backend, value_type)| proto::PropertyDescriptor {
                 minting_collection: collection.into(),
-                anchor: (*anchor).into(),
-                anchored: false,
-                name: (*anchor).into(),
+                name: (*name).into(),
+                renamed_from: None,
                 backend: (*backend).into(),
                 value_type: (*value_type).into(),
-                target_model: None,
+                target_collection: None,
                 explicit_id: None,
             })
             .collect(),
         memberships: props
             .iter()
-            .map(|(anchor, _, _)| proto::MembershipDescriptor {
+            .map(|(name, _, _)| proto::MembershipDescriptor {
                 collection: collection.into(),
-                property: proto::PropertyRef::Anchor((*anchor).into()),
+                property: proto::PropertyRef::Name((*name).into()),
                 optional: false,
             })
             .collect(),
+    }
+}
+
+/// Send `register` and return the allocator-assigned property ids by display
+/// name (sourced from the SchemaRegistered response).
+async fn register_and_map(
+    client: &Node<SledStorageEngine, PermissiveAgent>,
+    server_id: EntityId,
+    request: proto::NodeRequestBody,
+) -> anyhow::Result<BTreeMap<String, EntityId>> {
+    match client.request(server_id, &DEFAULT_CONTEXT, request).await? {
+        proto::NodeResponseBody::SchemaRegistered { properties, .. } => Ok(properties.into_iter().map(|p| (p.name, p.id)).collect()),
+        other => panic!("expected SchemaRegistered, got {other}"),
     }
 }
 
@@ -49,18 +64,14 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
-    expect_success(
-        client.request(server.id, &DEFAULT_CONTEXT, register("album", &[("name", "yrs", "string"), ("payload", "lww", "json")])).await?,
-    );
-
-    let root = server.system.root().unwrap().payload.entity_id;
-    let album = schema_id::model_entity_id(&root, "album");
-    let name_id = schema_id::property_entity_id(&root, &album, "name", "yrs", "string");
-    let payload_id = schema_id::property_entity_id(&root, &album, "payload", "lww", "json");
+    // Source the allocated property ids from the registration response.
+    let ids = register_and_map(&client, server.id, register("album", &[("name", "yrs", "string"), ("payload", "lww", "json")])).await?;
+    let name_id = ids["name"];
+    let payload_id = ids["payload"];
 
     let collection = "album".into();
 
-    // Simple reference resolves to the derived property id.
+    // Simple reference resolves to the allocated property id.
     let resolved = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x'")?).unwrap();
     match first_expr(&resolved) {
         Expr::Identifier(ident) => {
@@ -104,8 +115,8 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RFC 5.8: after an anchor rename, the new display name resolves to the
-/// SAME property id the old name resolved to before the rename.
+/// RFC 5.8: after a rename hint, the new display name resolves to the SAME
+/// property id the old name resolved to before the rename.
 #[tokio::test]
 async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
@@ -113,7 +124,7 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, register("album", &[("name", "yrs", "string")])).await?);
+    register_and_map(&client, server.id, register("album", &[("name", "yrs", "string")])).await?;
     let collection = "album".into();
 
     let before = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("name = 'x'")?).unwrap();
@@ -122,22 +133,24 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
         other => panic!("expected Identifier, got {other:?}"),
     };
 
-    // Rename: anchor "name", display name "title".
+    // Rename: hint renamed_from "name", display name "title".
     let rename = proto::NodeRequestBody::RegisterSchema {
         models: vec![],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
-            anchor: "name".into(),
-            anchored: false,
             name: "title".into(),
+            renamed_from: Some("name".into()),
             backend: "yrs".into(),
             value_type: "string".into(),
-            target_model: None,
+            target_collection: None,
             explicit_id: None,
         }],
         memberships: vec![],
     };
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
+    match client.request(server.id, &DEFAULT_CONTEXT, rename).await? {
+        proto::NodeResponseBody::SchemaRegistered { .. } => {}
+        other => panic!("expected SchemaRegistered, got {other}"),
+    }
 
     let after = server.catalog.resolve_selection(&collection, &ankql::parser::parse_selection("title = 'x'")?).unwrap();
     match first_expr(&after) {
@@ -159,7 +172,7 @@ async fn order_by_resolves_fail_closed() -> anyhow::Result<()> {
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, register("album", &[("name", "yrs", "string")])).await?);
+    register_and_map(&client, server.id, register("album", &[("name", "yrs", "string")])).await?;
     let collection = "album".into();
 
     // Known key passes; unknown key fails closed; id passes through.
@@ -184,11 +197,4 @@ async fn order_by_resolves_fail_closed() -> anyhow::Result<()> {
     assert_eq!(items[0].path.steps, vec!["name".to_string()]);
 
     Ok(())
-}
-
-fn expect_success(resp: proto::NodeResponseBody) {
-    match resp {
-        proto::NodeResponseBody::Success => {}
-        other => panic!("expected Success, got {other}"),
-    }
 }

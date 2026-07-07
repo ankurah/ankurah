@@ -7,11 +7,12 @@
 //! (RFC section 3): `#[derive(Model)]` emits a [`ModelSchema`] whose
 //! `(backend, value_type)` pairs come from the NORMATIVE mapping table
 //! (RFC section 4), so that every node maps a given field to the same
-//! descriptor pair byte-for-byte and thus derives the same catalog ids
-//! without coordination. The catalog entities themselves remain the
-//! definitive schema; this type is how a compiled binary resolves property
-//! references locally (the "local compiled schema" the resolution pass
-//! consults first, RFC 5.3) and how it builds a RegisterSchema request.
+//! descriptor pair byte-for-byte -- the pair is part of the property
+//! LOOKUP KEY at registration (RFC 5.1), so disagreement would register
+//! distinct identities for one field. The catalog entities themselves
+//! remain the definitive schema; ids exist only there and in registration
+//! responses. This type is how a compiled binary names its properties and
+//! how it builds a RegisterSchema request.
 //!
 //! These types are entirely `&'static`: the derive macro emits a `static
 //! ModelSchema` and a `Model::schema()` returning `&'static` to it, so
@@ -25,9 +26,9 @@ use ankurah_proto::{MembershipDescriptor, ModelDescriptor, PropertyDescriptor, P
 /// `#[derive(Model)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSchema {
-    /// The collection this model's entities live in (the derivation anchor;
-    /// RFC 4). Today this is the lowercased struct name
-    /// (derive/src/model/description.rs).
+    /// The collection this model's entities live in (the model lookup key
+    /// at registration; RFC 4, 5.1). Today this is the lowercased struct
+    /// name (derive/src/model/description.rs).
     pub collection: &'static str,
     /// Display name, initially the struct name (mutable catalog metadata).
     pub name: &'static str,
@@ -43,27 +44,23 @@ pub struct ModelSchema {
 }
 
 /// The compiled schema for one active field of a model. `(backend,
-/// value_type)` are the NORMATIVE descriptor pair (RFC 4 table); `anchor`
-/// is the permanent derivation name; `explicit_id` is a 5.9 shared-property
-/// binding.
+/// value_type)` are the NORMATIVE descriptor pair (RFC 4 table) and part
+/// of the property lookup key; `renamed_from` is the transient rename hint
+/// (RFC 5.8); `explicit_id` is a 5.9 shared-property binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSchema {
     /// The Rust field identifier (as declared).
     pub field: &'static str,
     /// The display name. Equals `field` (lowercased) today; this is the
-    /// name catalog resolution and SQL columns use.
+    /// name catalog resolution and SQL columns use, and part of the
+    /// property lookup key at registration.
     pub name: &'static str,
-    /// The permanent derivation name (RFC 5.8): equals `name` unless
-    /// `#[property(anchor = "...")]` pinned an earlier name for a rename
-    /// lineage. Feeds the property-id derivation, so it never changes once
-    /// pinned.
-    pub anchor: &'static str,
-    /// Whether `#[property(anchor = "...")]` was physically present on the
-    /// field. Distinguishes a deliberate lineage reference whose display
-    /// name equals the anchor (a rename-back, allowed) from the
-    /// attribute-less default (a possible retired-name collision, refused
-    /// by the RFC 5.8 anchor-reuse guard).
-    pub anchored: bool,
+    /// `#[property(renamed_from = "...")]`: the transient rename hint (RFC
+    /// 5.8). The registration executor applies "a property under this old
+    /// name exists on this model -> update its name" before
+    /// lookup-or-create, guarded; the attribute is removable once every
+    /// target system has seen it.
+    pub renamed_from: Option<&'static str>,
     /// Backend registry name, "yrs" or "lww", per the active type the
     /// backend registry resolved for this field (RFC 4).
     pub backend: &'static str,
@@ -93,16 +90,16 @@ impl ModelSchema {
 /// [`PropertyDescriptor`] per active field, and one [`MembershipDescriptor`]
 /// per active field.
 ///
-/// No root is needed: descriptors are id-FREE except for explicit bindings.
-/// The durable executor derives every id from its own system root (RFC 5.2),
-/// so a request is portable across systems; only `#[..(id = ...)]` bindings
-/// carry a literal id, and those reference definitions that already exist.
+/// Descriptors are id-FREE except for explicit bindings: ids are the
+/// executor's to allocate or resolve (RFC 5.1), so a request is portable
+/// across systems; only `#[..(id = ...)]` bindings carry a literal id, and
+/// those reference definitions that already exist.
 ///
-/// Anchors and explicit ids are respected: a field with `explicit_id`
+/// Rename hints and explicit ids are respected: a field with `explicit_id`
 /// becomes a `PropertyDescriptor.explicit_id` binding and its membership
 /// references the property by `PropertyRef::Id`; otherwise the membership
-/// references it by `PropertyRef::Anchor` within the request (which the
-/// executor resolves to the derived id). `optional` rides the membership,
+/// references it by `PropertyRef::Name` within the request (which the
+/// executor resolves to the upserted id). `optional` rides the membership,
 /// per contract.
 pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<PropertyDescriptor>, Vec<MembershipDescriptor>) {
     let models = vec![ModelDescriptor {
@@ -119,24 +116,22 @@ pub fn registration_request(schema: &ModelSchema) -> (Vec<ModelDescriptor>, Vec<
 
         properties.push(PropertyDescriptor {
             minting_collection: schema.collection.to_string(),
-            anchor: field.anchor.to_string(),
-            anchored: field.anchored,
             name: field.name.to_string(),
+            renamed_from: field.renamed_from.map(|s| s.to_string()),
             backend: field.backend.to_string(),
             value_type: field.value_type.to_string(),
-            // The local schema does not carry the reference target's model
-            // id (it is a per-system derived value, and the value_type
-            // "entityid" already records reference-ness). A later lifecycle
-            // step may populate this from the referenced Model's schema;
-            // absence is fine (target_model is mutable metadata, not
-            // identity, RFC 4).
-            target_model: None,
+            // The local schema does not yet carry the reference target's
+            // collection (a later lifecycle step may populate this from the
+            // referenced Model's schema; the value_type "entityid" already
+            // records reference-ness). Absence is fine: target_model is
+            // mutable metadata, not identity (RFC 4).
+            target_collection: None,
             explicit_id,
         });
 
         let property_ref = match explicit_id {
             Some(id) => PropertyRef::Id(id),
-            None => PropertyRef::Anchor(field.anchor.to_string()),
+            None => PropertyRef::Name(field.name.to_string()),
         };
         memberships.push(MembershipDescriptor {
             collection: schema.collection.to_string(),

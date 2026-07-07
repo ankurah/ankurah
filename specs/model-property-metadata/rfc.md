@@ -495,9 +495,9 @@ collection + name + type identifier verbatim):
 - membership: by (model id, property id)
 
 A miss creates the entity via ORDINARY events through the normal commit
-machinery (no frozen encoder, no special genesis; identity fields written
-at creation, everything else -- membership `optional`, `target_model`,
-display-name changes -- by follow-up events). A hit emits
+machinery (no frozen encoder, no special genesis; with nothing
+byte-frozen, the creation event simply carries the full definition
+state). A hit emits
 provenance-ordered follow-ups ONLY where the requested metadata differs
 from the catalog, parented at the entity's current head (the rev 3
 follow-up machinery, plan decision 18, survives verbatim); an unchanged
@@ -570,18 +570,26 @@ in 5.2 remains hygiene, not a correctness requirement.
 
 ### 5.2 Registration lifecycle
 
-**Trigger: model first-use per process, durable registration on first
-mutating use.** When a context first touches a model M (create, edit,
-fetch, query, subscribe), the node ensures registration of M, all its
-declared active fields (ephemeral fields are excluded,
-derive/src/model/description.rs:31-40), and the (M, property) membership
-records: check the local catalog map, and if the binding is absent, on a
-mutating path (create/edit), issue the registration operation and AWAIT
-its response; the returned definitions are upserted into the catalog map
-immediately on ack, so schema binding and id-keyed writes proceed right
-behind it. Read-only paths cannot mint and do not write: they resolve
-through the catalog map (warmed by subscription or by an earlier
-response) and defer or fail closed per 5.3. An explicit
+**Trigger: model first-use per process, durable registration at first
+use on ANY path (REN 2 revised 2026-07-06).** When a context first
+touches a model M (create, edit, fetch, query, subscribe), the node
+ensures registration of M, all its declared active fields (ephemeral
+fields are excluded, derive/src/model/description.rs:31-40), and the
+(M, property) membership records: check the local catalog map, and if
+the binding is absent, issue the registration operation and AWAIT its
+response; the returned definitions are upserted into the catalog map
+immediately on ack, so schema binding, id-keyed writes, and predicate
+resolution proceed right behind it. Because the operation is an
+idempotent UPSERT (below), a read path whose schema the catalog already
+carries resolves to a no-op plan: nothing is emitted, the policy verb
+is skipped (5.7), and the response simply feeds the map. That is what
+makes first-use registration safe as the read path's warm-up, and it
+closes the replica-lag window: a warm-but-lagging catalog replica
+would otherwise misclassify a just-registered collection as
+anticipated (5.3) and answer empty where the authority has rows. When
+registration cannot run on a read path (policy denial, no durable
+peer), the read falls back to 5.3's anticipated-collection semantics;
+mutating paths enforce strictly as before. An explicit
 `ctx.register::<M>().await` issues the same operation eagerly (e.g.
 before first render).
 
@@ -720,6 +728,28 @@ first-vs-last-step inconsistency on JSON paths (ankql/src/ast.rs:241-333
 keying on path.property() vs path.first(); acknowledged in a sqlite comment,
 storage/sqlite/src/engine.rs:462-468), because the resolution pass fixes
 which step is the property once, in one place.
+
+**The anticipated-collection rule (rev 4 corollary, revised with the
+REN 2 revision of 2026-07-06; flagged for ratification).** Rev 4 makes
+creation impossible without registration, which yields a provable fact:
+an UNREGISTERED collection holds no entities anywhere in the system.
+But a warm catalog REPLICA cannot by itself prove non-registration --
+it may simply lag the authority by a subscription hop -- so the primary
+path never renders the verdict from the replica alone: a compiled model
+REGISTERS AT FIRST USE (5.2), and the upsert response is the
+authoritative answer (existing rows on the no-op, fresh rows on
+allocation), after which resolution proceeds normally. The vacuous
+emptiness rule survives as the FALLBACK for references first-use
+registration cannot serve: the principal may not define schema (policy
+denial), or no durable peer is reachable. There a FETCH answers the
+provably-correct empty result, and a LIVE QUERY activates empty
+(forwarding a Predicate::False placeholder subscription) and defers
+until the catalog learns the collection from a writer who can register
+it, upgrading through the ordinary selection-update path so the initial
+population arrives as ordinary changes. An unknown property within a
+REGISTERED collection, or a reference no compiled schema anticipates,
+still fails closed at build time -- AC5's letter is untouched where it
+can catch a real mistake.
 
 Where resolution runs: at predicate build on the querying node (parse or
 programmatic construction, then resolve; the existing TypeResolver pass at
@@ -1283,10 +1313,17 @@ Phase A.)
    identifier), concretized as (model entity, current name, backend,
    value_type) under section 4's normative mapping; rev 4 made the upsert
    literal (a durable-side lookup-or-create) rather than derivational.
-2. AC2 read-path timing: read-only usage resolves through the catalog map
-   but does not durably upsert; the durable write happens at first
-   mutating use or explicit register() (5.2). AC2's parenthetical had
-   read accessors registering durably.
+2. AC2 read-path timing: REVISED 2026-07-06 (second ruling). As first
+   ratified, read-only usage resolved through the catalog map without
+   durably upserting. Rev 4's replica-lag experience (a warm replica
+   misclassifying a just-registered collection as anticipated, answering
+   empty where the authority had rows) restored AC2's original
+   parenthetical: read accessors DO register at first use -- safely,
+   because the rev 4 operation is an idempotent upsert whose no-op plan
+   emits nothing and skips the policy verb (5.7). Denied or offline
+   registration falls back to 5.3's anticipated-collection semantics,
+   preserving the read-only-principal posture the first ruling
+   protected.
 3. AC4 vehicle: a new resolved `Identifier` node produced by a resolution
    pass, rather than mutating `PathExpr` in place (5.3); PathExpr remains
    the parse-time form.
@@ -1311,8 +1348,10 @@ Everything else in #85 is adopted as written, including the
    Allocated ids are real ULIDs with genuine timestamp and randomness;
    the question no longer exists.
 2. **Registration writes from read-only contexts** (5.2): RESOLVED
-   2026-07-05, strictly cache-only for readers; durable entries appear at
-   first mutating use or explicit register().
+   2026-07-05 as strictly cache-only for readers; REVISED 2026-07-06 --
+   reads register at first use through the idempotent upsert (an
+   existing schema is a no-op plan: no events, no policy question),
+   with denial/offline falling back to 5.3. See renegotiation 2.
 3. **sys::Item::Collection disposition** (4): superseded by the
    Collection-vs-Model terminology deconfliction, tracked as #305
    (maintainer direction: Collection becomes a storage-only concern;

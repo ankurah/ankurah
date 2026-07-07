@@ -54,12 +54,11 @@ fn lww_diff_version(event: &proto::Event) -> u8 {
     header.version
 }
 
-/// The derived property id of a Record LWW field on a node (for locating its
-/// catalog `_ankurah_property` entity).
-fn record_property_id(node: &Node<SledStorageEngine, PermissiveAgent>, anchor: &str) -> proto::EntityId {
-    let root = node.system.root().unwrap().payload.entity_id;
-    let model_id = proto::schema_id::model_entity_id(&root, "record");
-    proto::schema_id::property_entity_id(&root, &model_id, anchor, "lww", "string")
+/// The allocated property id of a Record LWW field on a node (for locating its
+/// catalog `_ankurah_property` entity), sourced from the catalog after the
+/// record's create-time registration has landed.
+fn record_property_id(node: &Node<SledStorageEngine, PermissiveAgent>, name: &str) -> proto::EntityId {
+    node.catalog.resolve("record", name).expect("record property resolves in the catalog after registration")
 }
 
 // -- (a) create + commit emits 0xA2 state and a v2 diff; catalog/system stay v1
@@ -263,19 +262,23 @@ async fn resolution_fails_closed_on_unknown_property() -> Result<()> {
 }
 
 #[tokio::test]
-async fn resolution_via_read_path_overlay_for_untouched_model() -> Result<()> {
-    // A model that is READ before any write: the read-path resolves it via the
-    // cache_compiled overlay (RFC 5.2), so a fetch on a known field succeeds
-    // (returning no rows) rather than failing closed.
+async fn untouched_model_fetch_answers_empty() -> Result<()> {
+    // A model that is READ before any write. Rev 4 (RFC 5.1) deleted the
+    // cache_compiled id overlay: ids exist only in the catalog and its
+    // registration responses. Under the REN 2 revision (plan decision 25b)
+    // the read REGISTERS the compiled model at first use -- an idempotent
+    // upsert -- and then answers EMPTY because the freshly registered
+    // collection holds no entities.
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await;
 
-    // No record has ever been created on this node. A fetch on a real record
-    // field must resolve (via the compiled-schema overlay) and simply return
-    // an empty set -- NOT an UnknownProperty error.
     let results = ctx.fetch::<RecordView>("title = 'anything'").await?;
-    assert!(results.is_empty(), "no rows exist yet, but the property resolves");
+    assert!(results.is_empty(), "a just-registered collection holds no entities");
+    assert!(node.catalog.resolve("record", "title").is_some(), "first-use registration fed the catalog");
+
+    // (Typo'd references in a REGISTERED collection still fail closed, AC5;
+    // pinned in registration_lifecycle.rs.)
 
     Ok(())
 }

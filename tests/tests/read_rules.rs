@@ -2,7 +2,7 @@
 //!
 //! Four behaviors, pinned end to end:
 //!  1. Retype lineage (the crown): a same-display-name property from a
-//!     different derived id holds data on an entity; reading the field through
+//!     different property id holds data on an entity; reading the field through
 //!     the new contract is fail-visible `TypeSkew` -- from the compiled View
 //!     getter AND from a resolved-identifier predicate comparison -- never a
 //!     fabricated default over the sibling's real value (rule 4).
@@ -18,7 +18,7 @@
 //!     Phase A (documented below).
 //!
 //! The cross-root transplant ruling (2026-07-05) applies throughout: the
-//! sibling gate makes a foreign-root value fail visible rather than silently
+//! sibling gate makes a foreign value fail visible rather than silently
 //! substituting it; there is no lenient foreign-id fallback under the checked
 //! read. See `core/src/property/backend/lww.rs::get_checked`.
 
@@ -31,28 +31,43 @@ use ankurah::core::property::value::LWW;
 use ankurah::core::property::{FromEntity, PropertyError};
 use ankurah::core::selection::filter::{evaluate_predicate, Error as FilterError};
 use ankurah::model::View;
-use ankurah::proto::schema_id;
 use ankurah::proto::{self, EntityId};
 use ankurah::value::Value;
 use common::*;
 use std::collections::BTreeMap;
 
-// A Record's `title` LWW property id on `node` (anchor "title", backend "lww",
-// value_type "string"), the string-lineage id the node's binding resolves
-// "title" to.
-fn record_title_string_id(node: &Node<SledStorageEngine, PermissiveAgent>) -> EntityId {
-    let root = node.system.root().unwrap().payload.entity_id;
-    let model_id = schema_id::model_entity_id(&root, "record");
-    schema_id::property_entity_id(&root, &model_id, "title", "lww", "string")
-}
-
-// The RETYPE sibling: same anchor "title" but value_type "i64" -- a distinct
-// derived id by design (RFC 5.1), standing in for an older i64 lineage of the
-// same display name.
-fn record_title_i64_id(node: &Node<SledStorageEngine, PermissiveAgent>) -> EntityId {
-    let root = node.system.root().unwrap().payload.entity_id;
-    let model_id = schema_id::model_entity_id(&root, "record");
-    schema_id::property_entity_id(&root, &model_id, "title", "lww", "i64")
+/// Register the Record schema on a durable node (via the durable execution
+/// path: a durable node registers itself) so the node's binding resolves
+/// "record"/"title" to the allocator-assigned STRING-lineage id, and return
+/// that id. Blocks until the catalog reflects it.
+async fn register_record_and_title_id(node: &Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<EntityId> {
+    node.execute_schema_registration(
+        &DEFAULT_CONTEXT,
+        vec![proto::ModelDescriptor { collection: "record".into(), name: "Record".into(), explicit_id: None }],
+        vec![proto::PropertyDescriptor {
+            minting_collection: "record".into(),
+            name: "title".into(),
+            renamed_from: None,
+            backend: "lww".into(),
+            value_type: "string".into(),
+            target_collection: None,
+            explicit_id: None,
+        }],
+        vec![proto::MembershipDescriptor {
+            collection: "record".into(),
+            property: proto::PropertyRef::Name("title".into()),
+            optional: false,
+        }],
+    )
+    .await?;
+    node.catalog.wait_catalog_ready().await;
+    for _ in 0..100 {
+        if let Some(id) = node.catalog.resolve("record", "title") {
+            return Ok(id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("catalog never reflected the record `title` property");
 }
 
 /// Build a 0xA2 LWW state buffer holding `value` under `foreign_id`, carrying
@@ -82,16 +97,14 @@ async fn retype_lineage_type_skews_getter_and_filter() -> anyhow::Result<()> {
     let node = durable_sled_setup().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await;
 
-    // Register the Record schema (create+commit one) so the node's binding
-    // resolves "record"/"title" to the STRING-lineage id A.
-    {
-        let trx = ctx.begin();
-        trx.create(&Record { title: "real".to_owned(), artist: "bob".to_owned() }).await?;
-        trx.commit().await?;
-    }
-    let a_string = record_title_string_id(&node); // the binding resolves title -> A
-    let b_i64 = record_title_i64_id(&node); // a DIFFERENT id, the retype sibling
-    assert_ne!(a_string, b_i64, "retype mints a distinct property id");
+    // Register the Record schema so the node's binding resolves "record"/
+    // "title" to the allocated STRING-lineage id A.
+    let a_string = register_record_and_title_id(&node).await?; // the binding resolves title -> A
+                                                               // A DIFFERENT id: a sibling lineage the local binding does not resolve,
+                                                               // standing in for an older i64 lineage of the same display name (a value
+                                                               // under a foreign id, exactly what a cross-root state copy looks like).
+    let b_i64 = EntityId::new();
+    assert_ne!(a_string, b_i64, "the sibling is a distinct property id");
 
     // Seed a NEW record entity whose stored LWW data lives ONLY under the
     // sibling id B (the old i64 lineage), with the display-name hint "title".
@@ -215,17 +228,16 @@ async fn register_optional_note(node: &Node<SledStorageEngine, PermissiveAgent>)
         vec![proto::ModelDescriptor { collection: "record".into(), name: "Record".into(), explicit_id: None }],
         vec![proto::PropertyDescriptor {
             minting_collection: "record".into(),
-            anchor: "note".into(),
-            anchored: false,
             name: "note".into(),
+            renamed_from: None,
             backend: "lww".into(),
             value_type: "string".into(),
-            target_model: None,
+            target_collection: None,
             explicit_id: None,
         }],
         vec![proto::MembershipDescriptor {
             collection: "record".into(),
-            property: proto::PropertyRef::Anchor("note".into()),
+            property: proto::PropertyRef::Name("note".into()),
             optional: true,
         }],
     )
@@ -265,32 +277,31 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
     // Register a widget model + label property + membership normally (directly
     // through the durable execution path). The registration protocol always
     // writes `optional`, so the applied membership reports Some(true): the
-    // follow-up HAS arrived.
-    node.execute_schema_registration(
-        &DEFAULT_CONTEXT,
-        vec![proto::ModelDescriptor { collection: "widget".into(), name: "Widget".into(), explicit_id: None }],
-        vec![proto::PropertyDescriptor {
-            minting_collection: "widget".into(),
-            anchor: "label".into(),
-            anchored: false,
-            name: "label".into(),
-            backend: "lww".into(),
-            value_type: "string".into(),
-            target_model: None,
-            explicit_id: None,
-        }],
-        vec![proto::MembershipDescriptor {
-            collection: "widget".into(),
-            property: proto::PropertyRef::Anchor("label".into()),
-            optional: true,
-        }],
-    )
-    .await?;
+    // follow-up HAS arrived. The allocator returns the resolved ids.
+    let (models, _properties, _memberships) = node
+        .execute_schema_registration(
+            &DEFAULT_CONTEXT,
+            vec![proto::ModelDescriptor { collection: "widget".into(), name: "Widget".into(), explicit_id: None }],
+            vec![proto::PropertyDescriptor {
+                minting_collection: "widget".into(),
+                name: "label".into(),
+                renamed_from: None,
+                backend: "lww".into(),
+                value_type: "string".into(),
+                target_collection: None,
+                explicit_id: None,
+            }],
+            vec![proto::MembershipDescriptor {
+                collection: "widget".into(),
+                property: proto::PropertyRef::Name("label".into()),
+                optional: true,
+            }],
+        )
+        .await?;
     node.catalog.wait_catalog_ready().await;
 
-    let root = node.system.root().unwrap().payload.entity_id;
-    let model_id = schema_id::model_entity_id(&root, "widget");
-    let label_id = schema_id::property_entity_id(&root, &model_id, "label", "lww", "string");
+    let model_id = models.iter().find(|m| m.collection == "widget").expect("widget model returned").id;
+    let label_id = node.catalog.resolve("widget", "label").expect("label resolves after registration");
     let applied = wait_membership(&node, &model_id, &label_id).await.expect("membership present after registration");
     assert_eq!(applied.optional, Some(true), "an applied membership carries Some(optional) once the follow-up lands");
 
@@ -299,15 +310,15 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
     // `optional` field. This is exactly the "follow-up not yet arrived" state.
     // The membership references a distinct (synthetic) property id so it does
     // not collide with the label membership above.
-    let ghost_property = schema_id::property_entity_id(&root, &model_id, "ghost", "lww", "string");
+    let ghost_property = EntityId::new();
 
-    // Commit the FROZEN membership genesis (exactly the identity fields, no
+    // Commit the membership genesis (exactly the identity fields, no
     // `optional`) through commit_remote_transaction: the pipeline every
     // relayed catalog event takes -- it policy-checks, persists, applies, and
     // notifies the reactor, which is what feeds the catalog map's fetch-free
     // subscription. (A raw storage set_state would persist silently and the
     // map would never hear about it.)
-    let genesis = ankurah::core::schema::genesis::membership_genesis(&root, &model_id, &ghost_property);
+    let genesis = membership_genesis(&model_id, &ghost_property);
     node.commit_remote_transaction(&DEFAULT_CONTEXT, proto::TransactionId::new(), vec![proto::Attested::opt(genesis, None)]).await?;
 
     // Once the map applies it, `optional` is None -> treated optional.
@@ -315,6 +326,25 @@ async fn membership_without_optional_follow_up_is_treated_optional() -> anyhow::
     assert_eq!(ghost.optional, None, "a membership whose `optional` follow-up has not arrived reports None (treated optional)");
 
     Ok(())
+}
+
+/// Build a genesis-only `_ankurah_model_property` event carrying just the
+/// identity fields `model` + `property` (NO `optional` follow-up), the
+/// "follow-up not yet arrived" catalog state. Mirrors the registration
+/// executor's creation event: a name-keyed LWW backend (catalog bootstrap
+/// exemption) with an empty parent clock. The genesis module was removed with
+/// derivation (rev 4), so tests build this event directly.
+fn membership_genesis(model: &EntityId, property: &EntityId) -> proto::Event {
+    let backend = LWWBackend::new();
+    backend.set("model".into(), Some(Value::EntityId(*model)));
+    backend.set("property".into(), Some(Value::EntityId(*property)));
+    let operations = backend.to_operations().unwrap().unwrap();
+    proto::Event {
+        collection: ankurah::core::schema::model_property_collection(),
+        entity_id: EntityId::new(),
+        operations: proto::OperationSet(BTreeMap::from([("lww".to_string(), operations)])),
+        parent: proto::Clock::default(),
+    }
 }
 
 /// Poll the catalog for a (model, property) membership, giving its wildcard

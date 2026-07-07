@@ -6,7 +6,8 @@
 //! initial state plus updates through the ordinary subscription relay once a
 //! context triggers `ensure_subscribed`. These tests drive RegisterSchema
 //! over the wire (the same schema-less-durable harness as
-//! schema_registration.rs) and assert the map resolves.
+//! schema_registration.rs) and assert the map resolves to the ids the
+//! allocator handed back in the SchemaRegistered response.
 
 mod common;
 use common::*;
@@ -19,17 +20,16 @@ fn album_request() -> proto::NodeRequestBody {
         models: vec![proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None }],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
-            anchor: "name".into(),
-            anchored: false,
             name: "name".into(),
+            renamed_from: None,
             backend: "yrs".into(),
             value_type: "string".into(),
-            target_model: None,
+            target_collection: None,
             explicit_id: None,
         }],
         memberships: vec![proto::MembershipDescriptor {
             collection: "album".into(),
-            property: proto::PropertyRef::Anchor("name".into()),
+            property: proto::PropertyRef::Name("name".into()),
             optional: false,
         }],
     }
@@ -41,17 +41,16 @@ fn album_year_request() -> proto::NodeRequestBody {
         models: vec![],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
-            anchor: "year".into(),
-            anchored: false,
             name: "year".into(),
+            renamed_from: None,
             backend: "lww".into(),
             value_type: "i64".into(),
-            target_model: None,
+            target_collection: None,
             explicit_id: None,
         }],
         memberships: vec![proto::MembershipDescriptor {
             collection: "album".into(),
-            property: proto::PropertyRef::Anchor("year".into()),
+            property: proto::PropertyRef::Name("year".into()),
             optional: true,
         }],
     }
@@ -66,10 +65,13 @@ async fn connected_pair(
     Ok((server, client, conn))
 }
 
-fn expect_success(resp: proto::NodeResponseBody) {
+/// Unpack a SchemaRegistered response (the resolved definitions, ids included).
+fn expect_registered(
+    resp: proto::NodeResponseBody,
+) -> (Vec<proto::RegisteredModel>, Vec<proto::RegisteredProperty>, Vec<proto::RegisteredMembership>) {
     match resp {
-        proto::NodeResponseBody::Success => {}
-        other => panic!("expected Success, got {other}"),
+        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => (models, properties, memberships),
+        other => panic!("expected SchemaRegistered, got {other}"),
     }
 }
 
@@ -90,7 +92,8 @@ async fn wait_resolve(node: &TestNode, collection: &str, name: &str) -> Option<E
 }
 
 // Test 1: durable node -- register schema, map resolves (collection,name) ->
-// property id; membership optional flag visible; wait_catalog_ready resolves.
+// the allocated property id; membership optional flag visible;
+// wait_catalog_ready resolves.
 #[tokio::test]
 async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
@@ -99,29 +102,29 @@ async fn durable_map_resolves_after_registration() -> anyhow::Result<()> {
     server.catalog.wait_catalog_ready().await;
     assert!(server.catalog.is_catalog_ready());
 
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    // The allocator hands back the resolved ids in the response.
+    let (models, properties, memberships) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let (model_id, property_id, membership_id) = (models[0].id, properties[0].id, memberships[0].id);
 
-    let property_id = wait_resolve(&server, "album", "name").await.expect("catalog should resolve album.name on the durable node");
-
-    let root = server.system.root().unwrap().payload.entity_id;
-    let expected_model = proto::schema_id::model_entity_id(&root, "album");
-    let expected_property = proto::schema_id::property_entity_id(&root, &expected_model, "name", "yrs", "string");
-    assert_eq!(property_id, expected_property);
+    // The reactor-fed map resolves the display name to the allocated id.
+    let resolved = wait_resolve(&server, "album", "name").await.expect("catalog should resolve album.name on the durable node");
+    assert_eq!(resolved, property_id, "the map resolves to the allocated property id");
 
     // Property definition is parsed.
     let prop = server.catalog.property_by_id(&property_id).expect("property def present");
     assert_eq!(prop.name, "name");
     assert_eq!(prop.backend, "yrs");
     assert_eq!(prop.value_type, "string");
-    assert_eq!(prop.minted_for, Some(expected_model));
+    assert_eq!(prop.minted_for, Some(model_id));
 
-    // Model is indexed by collection.
+    // Model is indexed by collection at the allocated id.
     let model = server.catalog.model_by_collection("album").expect("model def present");
-    assert_eq!(model.id, expected_model);
+    assert_eq!(model.id, model_id);
     assert_eq!(model.name, "Album");
 
-    // Membership carries the (required) optional flag.
-    let membership = server.catalog.membership(&expected_model, &property_id).expect("membership present");
+    // Membership carries the (required) optional flag, at the allocated id.
+    let membership = server.catalog.membership(&model_id, &property_id).expect("membership present");
+    assert_eq!(membership.id, membership_id);
     assert_eq!(membership.optional, Some(false), "required membership => optional=Some(false)");
 
     Ok(())
@@ -134,17 +137,15 @@ async fn durable_map_updates_incrementally() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.catalog.wait_catalog_ready().await;
 
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let (models, _, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let model_id = models[0].id;
     wait_resolve(&server, "album", "name").await.expect("name resolves");
 
     // Second registration adds `year` -- no restart.
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
+    let (_, properties, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
+    let year_property_id = properties[0].id;
     let year_id = wait_resolve(&server, "album", "year").await.expect("year resolves incrementally");
-
-    let root = server.system.root().unwrap().payload.entity_id;
-    let model_id = proto::schema_id::model_entity_id(&root, "album");
-    let expected_year = proto::schema_id::property_entity_id(&root, &model_id, "year", "lww", "i64");
-    assert_eq!(year_id, expected_year);
+    assert_eq!(year_id, year_property_id, "the map resolves year to the allocated id");
 
     // Both properties are now memberships of the album model.
     let memberships = server.catalog.memberships_of(&model_id);
@@ -161,7 +162,8 @@ async fn ephemeral_map_warms_from_relay() -> anyhow::Result<()> {
     server.catalog.wait_catalog_ready().await;
 
     // The durable side already has the catalog before the ephemeral subscribes.
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let (_, properties, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let property_id = properties[0].id;
     wait_resolve(&server, "album", "name").await.expect("server resolves first");
 
     // Creating a context triggers ensure_subscribed on the ephemeral node.
@@ -169,12 +171,10 @@ async fn ephemeral_map_warms_from_relay() -> anyhow::Result<()> {
     client.catalog.wait_catalog_ready().await;
     assert!(client.catalog.is_catalog_ready());
 
-    // The ephemeral map is warm: resolve works over the relay.
-    let property_id = wait_resolve(&client, "album", "name").await.expect("ephemeral resolves album.name via relay");
-    let root = server.system.root().unwrap().payload.entity_id;
-    let model_id = proto::schema_id::model_entity_id(&root, "album");
-    let expected = proto::schema_id::property_entity_id(&root, &model_id, "name", "yrs", "string");
-    assert_eq!(property_id, expected);
+    // The ephemeral map is warm: resolve works over the relay, to the SAME
+    // allocated id the durable executor returned.
+    let resolved = wait_resolve(&client, "album", "name").await.expect("ephemeral resolves album.name via relay");
+    assert_eq!(resolved, property_id, "the ephemeral map resolves to the allocated id");
 
     Ok(())
 }
@@ -186,7 +186,7 @@ async fn ephemeral_map_live_update() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.catalog.wait_catalog_ready().await;
 
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
 
     // Subscribe the ephemeral node before the second registration.
     let _ctx = client.context_async(DEFAULT_CONTEXT).await;
@@ -194,14 +194,12 @@ async fn ephemeral_map_live_update() -> anyhow::Result<()> {
     wait_resolve(&client, "album", "name").await.expect("ephemeral has name");
 
     // Register `year` on the durable while the ephemeral is subscribed.
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
+    let (_, properties, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_year_request()).await?);
+    let year_property_id = properties[0].id;
 
-    // The ephemeral map picks it up live.
+    // The ephemeral map picks it up live, at the allocated id.
     let year_id = wait_resolve(&client, "album", "year").await.expect("ephemeral picks up year live");
-    let root = server.system.root().unwrap().payload.entity_id;
-    let model_id = proto::schema_id::model_entity_id(&root, "album");
-    let expected_year = proto::schema_id::property_entity_id(&root, &model_id, "year", "lww", "i64");
-    assert_eq!(year_id, expected_year);
+    assert_eq!(year_id, year_property_id, "the ephemeral map resolves year to the allocated id");
 
     Ok(())
 }
@@ -215,7 +213,7 @@ async fn hard_reset_flushes_catalog() -> anyhow::Result<()> {
     client.system.wait_system_ready().await;
     server.catalog.wait_catalog_ready().await;
 
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
     wait_resolve(&server, "album", "name").await.expect("server resolves before reset");
     let (models, properties, memberships) = server.catalog.counts();
     assert!(models > 0 && properties > 0 && memberships > 0, "map is populated before reset");
@@ -231,35 +229,37 @@ async fn hard_reset_flushes_catalog() -> anyhow::Result<()> {
 }
 
 // Test 6: rename follow-up -- the display-name index updates (old name gone,
-// new present) while the derived property id is unchanged.
+// new present) while the allocated property id is unchanged.
 #[tokio::test]
 async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
     server.catalog.wait_catalog_ready().await;
 
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
-    let property_id = wait_resolve(&server, "album", "name").await.expect("resolves under original name");
+    let (_, properties, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let property_id = properties[0].id;
+    wait_resolve(&server, "album", "name").await.expect("resolves under original name");
 
-    // Rename: the anchor pins the lineage, the display name moves to "title".
+    // Rename: the renamed_from hint moves the display name to "title" WITHOUT
+    // re-keying (same allocated property id).
     let rename = proto::NodeRequestBody::RegisterSchema {
         models: vec![],
         properties: vec![proto::PropertyDescriptor {
             minting_collection: "album".into(),
-            anchor: "name".into(),
-            anchored: false,
             name: "title".into(),
+            renamed_from: Some("name".into()),
             backend: "yrs".into(),
             value_type: "string".into(),
-            target_model: None,
+            target_collection: None,
             explicit_id: None,
         }],
         memberships: vec![],
     };
-    expect_success(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
+    let (_, renamed, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, rename).await?);
+    assert_eq!(renamed[0].id, property_id, "the hint preserves the lineage id");
 
     // New display name resolves to the SAME property id; old name is gone.
     let renamed_id = wait_resolve(&server, "album", "title").await.expect("resolves under new name after rename");
-    assert_eq!(renamed_id, property_id, "rename keeps the derived id (anchor-pinned)");
+    assert_eq!(renamed_id, property_id, "rename keeps the allocated id (hint-moved lineage)");
     assert!(server.catalog.resolve("album", "name").is_none(), "old display name no longer resolves");
 
     // The global sibling index reflects the current display name.

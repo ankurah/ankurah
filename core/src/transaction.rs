@@ -60,10 +60,11 @@ impl Transaction {
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
-        // RFC 5.2 model first-use: ensure M is registered BEFORE creating the
-        // entity. Best-effort (a denied registration only warns; policy gates
-        // schema definition, not data writes).
-        self.dyncontext.ensure_registered(M::schema()).await;
+        // RFC 5.2 model first-use: ensure M is registered BEFORE creating
+        // the entity. Bound collections proceed on a failed re-assert; a
+        // NEVER-registered collection fails here (the rev 4 strict offline
+        // surface: identity does not exist until the allocator mints it).
+        self.dyncontext.ensure_registered(M::schema()).await?;
         let entity = self.dyncontext.create_entity(M::collection(), self.alive.clone());
         model.initialize_new_entity(&entity);
         self.dyncontext.check_write(&entity)?;
@@ -76,10 +77,13 @@ impl Transaction {
     }
     fn get_trx_entity(&self, id: &EntityId) -> Option<&Entity> { self.entities.iter().find(|e| e.id == *id) }
     pub async fn get<'rec, 'trx: 'rec, M: Model>(&'trx self, id: &EntityId) -> Result<MutableBorrow<'rec, M::Mutable>, RetrievalError> {
-        // RFC 5.2 model first-use on the mutating fetch-to-edit path: ensure
-        // M is registered. Best-effort (warns on refusal, never fails the
-        // edit; the async durable path mirrors `create`).
-        self.dyncontext.ensure_registered(M::schema()).await;
+        // RFC 5.2 model first-use on the mutating fetch-to-edit path.
+        // Fetching does not mint identity, so a strict registration failure
+        // is deferred here (warn only); commit_local_trx enforces it before
+        // any write lands (plan decision 16).
+        if let Err(e) = self.dyncontext.ensure_registered(M::schema()).await {
+            tracing::warn!("registration unavailable on fetch-to-edit for '{}'; commit will enforce: {}", M::collection(), e);
+        }
         match self.get_trx_entity(id) {
             Some(entity) => Ok(MutableBorrow::new(entity)),
             None => {

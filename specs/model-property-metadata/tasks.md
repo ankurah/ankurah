@@ -1,8 +1,16 @@
 # Tasks
 
-Companion to plan.md (authority: rfc.md, ratified rev 3). Groups are in
-landing order; each checkbox is intended to be a commit or a small commit
-train, red-to-green where a test can pin the change.
+Companion to plan.md (authority: rfc.md, ratified rev 3; AMENDED to rev 4
+on 2026-07-06 -- the identity plane pivoted from derivation to
+durable-allocated ids). Groups are in landing order; each checkbox is
+intended to be a commit or a small commit train, red-to-green where a
+test can pin the change.
+
+REV 4 PIVOT NOTE: groups 2 and 3 below record the rev 3 build as it
+happened; items marked [REMOVED rev 4] were subsequently DELETED by the
+pivot (schema_id derivation, the frozen genesis encoder,
+self-certification, the anchor apparatus, the offline queue). Group 12
+records the pivot work itself.
 
 ## 1. Phase 0: #294 protocol version (separate PR off main)
 
@@ -31,25 +39,21 @@ DONE: PR #306; decision record posted on #294.
 
 ## 2. Phase A foundation: derivation, frozen encoder, create-with-id
 
-- [x] `proto/src/schema_id.rs`: model/property/membership id derivation
-      (domain tags v1, u64-LE length prefixes, SHA-256 first 16 bytes);
-      zero-model-id standalone scope constant; golden-vector tests.
-- [x] Ulid audit: verify nothing interprets EntityId timestamp bits
-      (fact-checked once already: no readers); record in PR
-      description; regression test that from_bytes round-trips
-      hash-derived ids.
-- [x] `core/src/schema/genesis.rs`: frozen genesis encoder for the
-      three catalog kinds (pinned LWWDiff v1 name-keyed shape, scalar
-      Values, empty parent clock); golden byte vectors independent of
-      lww.rs.
-- [x] `validate_catalog_genesis`: recompute entity id from payload and
-      event id from re-encoding; tamper tests (field value, field set,
-      operation count).
-- [x] Create-with-derived-id: RESOLVED without new plumbing. The
+- [x] [REMOVED rev 4] `proto/src/schema_id.rs`: id derivation + golden
+      vectors + standalone scope. Deleted with the pivot; identity is
+      allocated (`EntityId::new()`) by the executor.
+- [x] [REMOVED rev 4] Ulid audit: moot under allocation (real ULIDs).
+- [x] [REMOVED rev 4] `core/src/schema/genesis.rs`: frozen genesis
+      encoder + golden byte vectors. Deleted; creation events are
+      ordinary and carry the full definition state.
+- [x] [REMOVED rev 4] `validate_catalog_genesis` + tamper tests.
+      Deleted; single-allocator authority replaces self-certification.
+- [x] Create-with-known-id: RESOLVED without new plumbing. The
       executor rides `get_retrieve_or_create` +
       `commit_remote_transaction` (the receive path), which already
-      materializes entities under given ids; the phantom guard only
-      constrains client transactions, which registration does not use.
+      materializes entities under given ids (rev 4: freshly allocated
+      ones); the phantom guard only constrains client transactions,
+      which registration does not use.
 
 ## 3. Catalog collections, protection, registration operation
 
@@ -62,22 +66,27 @@ DONE: PR #306; decision record posted on #294.
       models; never derive(Model)).
 - [x] proto descriptors (ModelDescriptor, PropertyDescriptor,
       MembershipDescriptor) + `NodeRequestBody::RegisterSchema`.
-- [x] Durable-side executor: derive ids, catalog lookups, anchor-reuse
-      refusal, explicit-id verification, frozen genesis + LWW follow-up
-      events, PolicyAgent::check_event on every event, persist + relay;
-      Success/Error response.
+- [x] Durable-side executor (REWORKED by rev 4, group 12): upsert by
+      lookup key under the allocator mutex, `EntityId::new()` on miss,
+      rename-hint pre-pass, explicit-id verification, ordinary creation
+      + difference-only follow-up events, check_schema_registration on
+      the resolved plan, PolicyAgent::check_event on every event,
+      persist + relay, synchronous map upsert, SchemaRegistered
+      response.
 - [x] Receiver-side protection: CommitTransaction events targeting
       protected collections refused outright (local and remote paths);
       tests.
-- [x] Tests: registration from descriptors alone on a schema-less
-      server; idempotent re-issue (heads unchanged); anchor rename then
-      reuse-refusal; explicit-id sharing with per-contract optionality;
-      not-found and retype-mismatch hard-fails; ephemeral refusal.
-- [x] Relay-side self-certification: validate_catalog_genesis runs in
-      NodeApplier::validate_and_stage (the shared funnel for subscription
-      updates AND fetch/subscribe delta bridges) for every genesis
-      targeting a catalog collection; forged and payload-swapped geneses
-      are refused before staging (tests/tests/catalog_genesis_relay.rs).
+- [x] Tests (REWORKED by rev 4): registration from descriptors alone on
+      a schema-less server; upsert idempotence (same ids, zero events);
+      renamed_from lineage moves + guard + stale-writer fork; retype
+      mints distinct identity; explicit-id sharing with per-contract
+      optionality; not-found and retype-mismatch hard-fails; ephemeral
+      refusal; policy-verb denial.
+- [x] [REMOVED rev 4] Relay-side self-certification in
+      NodeApplier::validate_and_stage and its
+      tests/tests/catalog_genesis_relay.rs suite. Deleted; relayed
+      catalog events are policy-trusted allocator output behind the
+      structural write ban.
 - [ ] Multi-durable propagation: CommitTransaction is refused for
       catalog collections by design, so durable-durable catalog
       transport is the registration operation re-issued or the
@@ -197,8 +206,9 @@ DONE: PR #306; decision record posted on #294.
       LWW-backed in shipped code, and custom derive(Property) types map
       to (lww, string)); ephemeral fields excluded; descriptor test
       covers every table row; Model trait gains schema().
-- [x] `#[property(anchor = "...")]` parsed and emitted into FieldSchema
-      (executor-side anchor-reuse refusal already tested in group 3).
+- [x] `#[property(renamed_from = "...")]` parsed and emitted into
+      FieldSchema (rev 4; replaced the anchor attribute; executor-side
+      hint semantics tested in group 3's reworked suite).
 - [x] `#[model(id = "...")]` / `#[property(id = "...")]`: compile-time
       base64/16-byte validation; carried on the schema and into
       descriptors (registration-time verification already tested in
@@ -213,23 +223,62 @@ DONE: PR #306; decision record posted on #294.
       auto-assert (best-effort; policy gates schema definition, not
       data writes); sync edit caches, and COMMIT closes the edit-only
       gap by ensure-registering touched unensured collections; read
-      paths overlay the compiled schema without durable writes;
-      strict ctx.register::<M>(); offline queue drains on durable-peer
-      connect; hard_reset clears the latch and queue
-      (tests/tests/registration_lifecycle.rs, 6 tests).
+      paths record the compiled schema without durable writes and fail
+      closed pre-registration (rev 4: the id overlay is gone); strict
+      ctx.register::<M>(); the rev 4 strict never-registered-offline
+      error at create/commit (the offline queue is deleted); hard_reset
+      clears the latch and map
+      (tests/tests/registration_lifecycle.rs, 7 tests).
 
 ## 9. Cross-cutting and pre-PR
 
-- [ ] Error variants: UnknownProperty, TypeSkew, CatalogGenesisError,
-      registration refusals.
+- [x] Error variants: UnknownProperty, TypeSkew, registration refusals
+      (explicit-id absence/mismatch, PolicyDenied, NoDurablePeer).
+      CatalogGenesisError and AnchorReuse died with rev 4.
 - [ ] Nomenclature pass over new code/docs (#305: Model = contract
       definition entity, Collection = storage table).
-- [ ] Opus adversarial review: frozen encoder, v2/v1 fallback,
-      registration convergence.
+- [x] Adversarial review (rev 3 scope: frozen encoder, v2/v1 fallback,
+      registration convergence) completed pre-pivot; rev 4's identity
+      plane gets its own external re-review post-push.
 - [ ] Validation gate: cargo test -p ankurah-core (lib), ankurah-tests,
-      jwt-auth; cargo check -p ankurah-core --features wasm; cargo fmt
-      --all; taplo fmt if Cargo.toml changed.
-- [ ] Progress note on #289; PR when reviewable.
+      ankurah-derive, ankql, jwt-auth; cargo check -p ankurah-core
+      --features wasm; cargo fmt --all; taplo fmt if Cargo.toml changed.
+- [x] Progress note on #289; PR when reviewable.
+
+## 12. Rev 4 pivot: durable-allocated identity plane (2026-07-06)
+
+DONE in one train on this branch (ratification trail on #289):
+
+- [x] DELETE proto/src/schema_id.rs, core/src/schema/genesis.rs, the
+      NodeApplier self-cert block, catalog_genesis_relay.rs, the anchor
+      apparatus (attribute parsing, FieldSchema.anchor/.anchored,
+      PropertyDescriptor.anchor/.anchored, AnchorReuse), and the offline
+      pending_registrations queue + drain_pending.
+- [x] proto: PropertyDescriptor gains renamed_from, target_model ->
+      target_collection; PropertyRef::Anchor -> Name;
+      NodeResponseBody::SchemaRegistered + Registered{Model,Property,
+      Membership}.
+- [x] Executor rework: upsert by lookup key under the allocator mutex;
+      EntityId::new() on miss; rename-hint pre-pass (guarded); ordinary
+      full-state creation events; difference-only head-parented
+      follow-ups; target_collection resolution (stub model on miss);
+      synchronous map upsert before mutex release; RegisteredDefs
+      return.
+- [x] PolicyAgent::check_schema_registration (default-allow) +
+      RegistrationPlan/PlannedMembership/PlannedUpdate; called on the
+      resolved plan before any event is emitted.
+- [x] Client lifecycle: ensure_registered consumes SchemaRegistered
+      into the map; cache_compiled reduced to schema-pointer recording;
+      strict never-registered-offline error at create/commit (bound
+      collections warn and proceed); TContext::ensure_registered
+      returns Result and commit_local_trx enforces it.
+- [x] derive: renamed_from attribute replaces anchor; explicit-id
+      binding unchanged.
+- [x] Tests reworked: upsert idempotence, rename-hint application +
+      guard + stale-writer fork, retype distinct identity, policy-verb
+      denial, strict offline, response-fed maps, fail-closed
+      pre-registration reads; golden-vector and self-cert suites
+      deleted.
 
 ## Phase C (tasks written when Phase A stabilizes)
 
@@ -248,7 +297,7 @@ DONE: PR #306; decision record posted on #294.
 - CatalogManager split (pre-PR architectural review, 2026-07-05): the
   manager bundles the passive catalog projection (map + warm/subscribe +
   readiness) with the registration-lifecycle coordinator (ensured latch,
-  compiled overlay, offline queue, drain). Split into CatalogMap +
+  compiled-schema records, the allocator mutex). Split into CatalogMap +
   RegistrationCoordinator before Phase C piles the transform layer onto
   the same type. Internal only; no API/wire impact.
 - Resolution pass decoupling (same review): resolve.rs bolts AST
@@ -256,21 +305,20 @@ DONE: PR #306; decision record posted on #294.
   name->id + readiness; extract a narrow NameResolver trait so the
   pass is unit-testable without a manager. Internal only.
 - System-transaction refactor of the registration executor (maintainer
-  nod, 2026-07-05): replace the hand-built follow-up events in
-  core/src/schema/registration.rs (follow_up/head_or_genesis) with the
+  nod, 2026-07-05; SIMPLIFIED by rev 4, tracked as #313): replace the
+  hand-built creation/follow-up events in
+  core/src/schema/registration.rs (creation/follow_up) with the
   ordinary Entity/Transaction machinery, via an internal
   system-transaction capability: a constructor reachable only by
   system code, permitted on the protected catalog collections,
   committing through the check_event-gated commit_remote_transaction
-  pipeline, with the FROZEN genesis injected as the creation event
-  (never generated by the live backend -- byte identity). On a fresh
-  mint the genesis must apply to the resident before edits so
-  follow-ups descend it. Entity::generate_commit_event head-parents
+  pipeline. Rev 4 removed the hard part: there is no frozen genesis to
+  inject (creation events are ordinary), so the whole executor can ride
+  the live backend. Entity::generate_commit_event head-parents
   automatically, making the genesis-parenting bug class structurally
   impossible. Behavior-preserving refactor: the current executor is
-  correct and test-pinned (chained renames, optional flips,
-  rename-back, idempotent re-registration), so this can land any time
-  after Phase A.
+  correct and test-pinned (upsert idempotence, chained renames,
+  optional flips, hint guard), so this can land any time after Phase A.
 - Cast-at-read retype evolution (maintainer direction, 2026-07-05;
   the coercion half of #303): a sanctioned retype should not rewrite
   data. value_type stays an identity input (collision safety, #85), so

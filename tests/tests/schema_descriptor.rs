@@ -1,14 +1,15 @@
 //! The compiled schema `#[derive(Model)]` emits (work package A11a;
 //! specs/model-property-metadata/rfc.md sections 4, 5.8, 5.9). Asserts the
-//! NORMATIVE (backend, value_type) mapping row-by-row, the anchor and
+//! NORMATIVE (backend, value_type) mapping row-by-row, the renamed_from and
 //! explicit-id attributes, ephemeral exclusion, and the RegisterSchema
 //! descriptor conversion. Ends with an end-to-end registration built from a
-//! Model::schema() and driven through the durable/ephemeral harness.
+//! Model::schema() and driven through the durable/ephemeral harness, sourcing
+//! the allocated ids from the SchemaRegistered response.
 
 mod common;
 use ankurah::core::schema::registration_request;
 use ankurah::property::{Json, Ref};
-use ankurah::proto::{self, schema_id, PropertyRef};
+use ankurah::proto::{self, PropertyRef};
 use ankurah::value::Value;
 use ankurah::Model;
 use common::*;
@@ -70,33 +71,33 @@ fn schema_covers_every_normative_row() {
     assert_eq!(schema.name, "DescAllTypes");
     assert_eq!(schema.explicit_id, None);
 
-    // (field, name, anchor, backend, value_type, optional)
-    let expected: &[(&str, &str, &str, &str, &str, bool)] = &[
-        ("yrs_name", "yrs_name", "yrs_name", "yrs", "string", false),
+    // (field, name, backend, value_type, optional)
+    let expected: &[(&str, &str, &str, &str, bool)] = &[
+        ("yrs_name", "yrs_name", "yrs", "string", false),
         // Option<String> -> lww (in-tree resolution; see field comment).
-        ("yrs_opt", "yrs_opt", "yrs_opt", "lww", "string", true),
-        ("lww_str", "lww_str", "lww_str", "lww", "string", false),
-        ("num_i16", "num_i16", "num_i16", "lww", "i16", false),
-        ("num_i32", "num_i32", "num_i32", "lww", "i32", false),
-        ("num_i64", "num_i64", "num_i64", "lww", "i64", false),
-        ("num_f64", "num_f64", "num_f64", "lww", "f64", false),
-        ("flag", "flag", "flag", "lww", "bool", false),
-        ("blob", "blob", "blob", "lww", "binary", false),
-        ("doc", "doc", "doc", "lww", "json", false),
-        ("artist", "artist", "artist", "lww", "entityid", false),
-        ("maybe_i32", "maybe_i32", "maybe_i32", "lww", "i32", true),
-        ("maybe_artist", "maybe_artist", "maybe_artist", "lww", "entityid", true),
+        ("yrs_opt", "yrs_opt", "lww", "string", true),
+        ("lww_str", "lww_str", "lww", "string", false),
+        ("num_i16", "num_i16", "lww", "i16", false),
+        ("num_i32", "num_i32", "lww", "i32", false),
+        ("num_i64", "num_i64", "lww", "i64", false),
+        ("num_f64", "num_f64", "lww", "f64", false),
+        ("flag", "flag", "lww", "bool", false),
+        ("blob", "blob", "lww", "binary", false),
+        ("doc", "doc", "lww", "json", false),
+        ("artist", "artist", "lww", "entityid", false),
+        ("maybe_i32", "maybe_i32", "lww", "i32", true),
+        ("maybe_artist", "maybe_artist", "lww", "entityid", true),
     ];
 
     assert_eq!(schema.properties.len(), expected.len(), "ephemeral `scratch` must be excluded");
-    for (i, (field, name, anchor, backend, value_type, optional)) in expected.iter().enumerate() {
+    for (i, (field, name, backend, value_type, optional)) in expected.iter().enumerate() {
         let f = &schema.properties[i];
         assert_eq!(f.field, *field, "field[{i}] name");
         assert_eq!(f.name, *name, "field[{i}] display name");
-        assert_eq!(f.anchor, *anchor, "field[{i}] anchor");
         assert_eq!(f.backend, *backend, "field[{i}] backend");
         assert_eq!(f.value_type, *value_type, "field[{i}] value_type");
         assert_eq!(f.optional, *optional, "field[{i}] optional");
+        assert_eq!(f.renamed_from, None, "field[{i}] renamed_from");
         assert_eq!(f.explicit_id, None, "field[{i}] explicit_id");
     }
 
@@ -104,23 +105,23 @@ fn schema_covers_every_normative_row() {
     assert!(schema.field_by_name("scratch").is_none());
 }
 
-// -- anchor attribute --------------------------------------------------------
+// -- renamed_from attribute --------------------------------------------------
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct DescRenamed {
-    // Renamed from "name": the anchor pins the derivation lineage while the
-    // display name (the field name, lowercased) moves.
-    #[property(anchor = "name")]
+    // Renamed from "name": the transient rename hint moves the lineage to the
+    // new display name (the field name, lowercased) WITHOUT re-keying.
+    #[property(renamed_from = "name")]
     pub headline: String,
 }
 
 #[test]
-fn anchor_attribute_pins_derivation_name() {
+fn renamed_from_attribute_carries_the_hint() {
     let schema = DescRenamed::schema();
     let f = &schema.properties[0];
     assert_eq!(f.field, "headline");
     assert_eq!(f.name, "headline", "display name is the (lowercased) field name");
-    assert_eq!(f.anchor, "name", "anchor is the pinned earlier name");
+    assert_eq!(f.renamed_from, Some("name"), "renamed_from carries the prior name as the rename hint");
 }
 
 // -- explicit id attributes --------------------------------------------------
@@ -155,20 +156,21 @@ fn registration_request_from_schema() {
     assert_eq!(models[0].name, "DescAllTypes");
 
     assert_eq!(properties.len(), 13);
-    // Spot-check the reference row: entityid, and no pre-derived target
-    // model id (target_model is per-system, filled by later lifecycle work).
-    let artist = properties.iter().find(|p| p.anchor == "artist").unwrap();
+    // Spot-check the reference row: entityid, and no target collection yet
+    // (the derive does not know the referenced Model's collection; a later
+    // lifecycle step populates it, RFC 5.2).
+    let artist = properties.iter().find(|p| p.name == "artist").unwrap();
     assert_eq!(artist.minting_collection, "descalltypes");
     assert_eq!((artist.backend.as_str(), artist.value_type.as_str()), ("lww", "entityid"));
-    assert_eq!(artist.target_model, None);
+    assert_eq!(artist.target_collection, None);
     assert_eq!(artist.explicit_id, None);
 
-    // Non-explicit memberships reference the property by anchor within the
+    // Non-explicit memberships reference the property by name within the
     // request; optionality rides the membership.
     assert_eq!(memberships.len(), 13);
-    let yrs_opt = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Anchor(a) if a == "yrs_opt")).unwrap();
+    let yrs_opt = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Name(n) if n == "yrs_opt")).unwrap();
     assert!(yrs_opt.optional, "Option<String> is optional per contract");
-    let flag = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Anchor(a) if a == "flag")).unwrap();
+    let flag = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Name(n) if n == "flag")).unwrap();
     assert!(!flag.optional);
 }
 
@@ -177,16 +179,16 @@ fn registration_request_honors_explicit_ids() {
     let (_models, properties, memberships) = registration_request(DescBound::schema());
 
     // The bound field carries its explicit id as a PropertyDescriptor
-    // binding and its membership references the property by Id, not anchor.
-    let label = properties.iter().find(|p| p.anchor == "label").unwrap();
+    // binding and its membership references the property by Id, not name.
+    let label = properties.iter().find(|p| p.name == "label").unwrap();
     assert!(label.explicit_id.is_some(), "explicit-id binding preserved");
     let bound_id = label.explicit_id.unwrap();
 
     let label_ms = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Id(id) if *id == bound_id));
     assert!(label_ms.is_some(), "bound field's membership references the property by id");
 
-    // The unbound field references by anchor.
-    let other_ms = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Anchor(a) if a == "other"));
+    // The unbound field references by name.
+    let other_ms = memberships.iter().find(|m| matches!(&m.property, PropertyRef::Name(n) if n == "other"));
     assert!(other_ms.is_some());
 }
 
@@ -206,8 +208,9 @@ async fn catalog_values(
 
 /// Build a RegisterSchema request from `Model::schema()` via
 /// `registration_request`, send it to a schema-less durable node, and
-/// confirm the catalog resolves the fields with the derived ids and the
-/// normative (backend, value_type) descriptors.
+/// confirm the catalog holds each field at the allocator-assigned id (sourced
+/// from the SchemaRegistered response) with the normative (backend,
+/// value_type) descriptors.
 #[tokio::test]
 async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
@@ -220,32 +223,33 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
     let (models, properties, memberships) = registration_request(DescAllTypes::schema());
     let request = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
 
-    match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
-        proto::NodeResponseBody::Success => {}
-        other => panic!("expected Success, got {other}"),
-    }
+    let (reg_models, reg_properties, reg_memberships) = match client.request(server.id, &DEFAULT_CONTEXT, request).await? {
+        proto::NodeResponseBody::SchemaRegistered { models, properties, memberships } => (models, properties, memberships),
+        other => panic!("expected SchemaRegistered, got {other}"),
+    };
 
-    let root = server.system.root().unwrap().payload.entity_id;
-    let model_id = schema_id::model_entity_id(&root, "descalltypes");
+    // The allocator resolved the ids; index them by display name for lookup.
+    let model_id = reg_models.iter().find(|m| m.collection == "descalltypes").expect("model returned").id;
+    let property_ids: BTreeMap<String, EntityId> = reg_properties.iter().map(|p| (p.name.clone(), p.id)).collect();
 
     // The model entity exists with its collection + display name.
     let model = catalog_values(&server, "_ankurah_model", model_id).await?;
     assert_eq!(model.get("collection"), Some(&Some(Value::String("descalltypes".into()))));
     assert_eq!(model.get("name"), Some(&Some(Value::String("DescAllTypes".into()))));
 
-    // Every active field resolves to a property entity with the exact
-    // normative descriptor pair the schema declared, at the derived id.
+    // Every active field is present as a property entity with the exact
+    // normative descriptor pair the schema declared, at the allocated id.
     for f in DescAllTypes::schema().properties {
-        let property_id = schema_id::property_entity_id(&root, &model_id, f.anchor, f.backend, f.value_type);
+        let property_id = property_ids[f.name];
         let property = catalog_values(&server, "_ankurah_property", property_id).await?;
         assert_eq!(property.get("backend"), Some(&Some(Value::String(f.backend.into()))), "backend for {}", f.field);
         assert_eq!(property.get("value_type"), Some(&Some(Value::String(f.value_type.into()))), "value_type for {}", f.field);
-        assert_eq!(property.get("name"), Some(&Some(Value::String(f.anchor.into()))), "anchor/name for {}", f.field);
+        assert_eq!(property.get("name"), Some(&Some(Value::String(f.name.into()))), "name for {}", f.field);
         assert_eq!(property.get("minted_for"), Some(&Some(Value::EntityId(model_id))), "minted_for for {}", f.field);
 
         // And the (model, property) membership exists with the field's
-        // optionality.
-        let membership_id = schema_id::membership_entity_id(&root, &model_id, &property_id);
+        // optionality, at the allocated membership id.
+        let membership_id = reg_memberships.iter().find(|m| m.property == property_id).expect("membership for property").id;
         let membership = catalog_values(&server, "_ankurah_model_property", membership_id).await?;
         assert_eq!(membership.get("property"), Some(&Some(Value::EntityId(property_id))), "membership property for {}", f.field);
         assert_eq!(membership.get("optional"), Some(&Some(Value::Bool(f.optional))), "membership optional for {}", f.field);

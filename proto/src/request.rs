@@ -119,14 +119,15 @@ pub struct EntityDelta {
 /// collection (specs/model-property-metadata/rfc.md section 4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDescriptor {
-    /// The collection this model's entities live in (the identity anchor).
+    /// The collection this model's entities live in (the model lookup key
+    /// at registration time, RFC 5.1).
     pub collection: String,
     /// Display name (initially the struct name); mutable metadata.
     pub name: String,
     /// Explicit binding (RFC 5.9): reference an EXISTING model entity
-    /// instead of deriving one by collection. Never mints; hard-fails if
+    /// instead of looking one up by collection. Never mints; hard-fails if
     /// absent or if the bound entity's collection differs. Properties and
-    /// memberships in the SAME request derive under the bound id, so a
+    /// memberships in the SAME request resolve under the bound id, so a
     /// request touching an explicitly-bound model must include its
     /// ModelDescriptor.
     pub explicit_id: Option<EntityId>,
@@ -136,38 +137,37 @@ pub struct ModelDescriptor {
 /// `value_type` follow the normative mapping table (RFC section 4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropertyDescriptor {
-    /// Collection of the minting model: the derivation SCOPE (provenance,
-    /// not ownership).
+    /// Collection of the minting model: the lookup SCOPE (provenance, not
+    /// ownership; RFC 5.1).
     pub minting_collection: String,
-    /// Permanent derivation name: equals `name` unless an anchor pinned an
-    /// earlier name (rename lineage, RFC 5.8).
-    pub anchor: String,
-    /// Whether the anchor was EXPRESSLY declared in the source (the
-    /// attribute was present), rather than defaulting to the field name.
-    /// This is what lets the RFC 5.8 anchor-reuse guard distinguish a
-    /// deliberate lineage reference whose display name equals the anchor (a
-    /// rename-back) from an accidental collision with a retired display
-    /// name (refused, fresh anchor demanded).
-    pub anchored: bool,
-    /// Current display name.
+    /// Current display name; part of the upsert lookup key.
     pub name: String,
+    /// Transient rename hint (RFC 5.8): the name this property carried
+    /// before a rename. Applied by the executor before lookup-or-create,
+    /// GUARDED (only when the current-name lookup misses and the old-name
+    /// lookup hits); a no-op once applied or when nothing matches.
+    /// Removable from source after every target system has seen it.
+    pub renamed_from: Option<String>,
     /// Backend registry name, e.g. "lww", "yrs".
     pub backend: String,
     /// Language-agnostic value type, e.g. "string", "i64".
     pub value_type: String,
-    /// For reference-typed properties: the target model entity. Mutable
-    /// metadata, not identity.
-    pub target_model: Option<EntityId>,
+    /// For reference-typed properties: the target model, named by its
+    /// COLLECTION (ids are the executor's to allocate or resolve; RFC 5.2).
+    /// The executor resolves this against the catalog, allocating the model
+    /// entity on miss. Mutable metadata, not identity.
+    pub target_collection: Option<String>,
     /// Explicit binding (RFC 5.9): reference an EXISTING property entity
-    /// instead of deriving one. Never mints; hard-fails if absent.
+    /// instead of looking one up by name. Never mints; hard-fails if absent.
     pub explicit_id: Option<EntityId>,
 }
 
 /// How a membership names its property within a RegisterSchema request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PropertyRef {
-    /// A property declared in this request for the same model, by anchor.
-    Anchor(String),
+    /// A property declared in this request for the same model, by current
+    /// display name.
+    Name(String),
     /// An existing (possibly shared) property entity, by explicit id.
     Id(EntityId),
 }
@@ -212,16 +212,52 @@ pub enum NodeRequestBody {
         version: u32,
         known_matches: Vec<KnownEntity>,
     },
-    /// Register schema definitions (RFC 5.2). Carries everything a durable
-    /// node needs to execute registration itself: the receiver derives the
-    /// ids, mints frozen genesis events, policy-checks, persists, and
-    /// relays. Idempotent by construction. The catalog collections are not
-    /// writable any other way.
+    /// Register schema definitions (RFC 5.2): an UPSERT the durable node
+    /// executes under a process-local mutex. Carries everything the durable
+    /// side needs: the receiver policy-checks, looks each definition up by
+    /// its lookup key, allocates a fresh EntityId on miss, emits ordinary
+    /// events, persists, relays, and responds with
+    /// [`NodeResponseBody::SchemaRegistered`] carrying the full resolved
+    /// definitions. Idempotent as an upsert: a repeat registration finds
+    /// every key, emits zero events, and returns the same ids. The catalog
+    /// collections are not writable any other way.
     RegisterSchema {
         models: Vec<ModelDescriptor>,
         properties: Vec<PropertyDescriptor>,
         memberships: Vec<MembershipDescriptor>,
     },
+}
+
+/// A resolved model definition, as returned by
+/// [`NodeResponseBody::SchemaRegistered`]: the allocated (or existing)
+/// entity id plus the definition state the catalog now holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredModel {
+    pub id: EntityId,
+    pub collection: String,
+    pub name: String,
+}
+
+/// A resolved property definition (see [`RegisteredModel`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredProperty {
+    pub id: EntityId,
+    /// The model in whose scope this property was minted (provenance).
+    pub model: EntityId,
+    pub name: String,
+    pub backend: String,
+    pub value_type: String,
+    /// Resolved target model id for reference-typed properties.
+    pub target_model: Option<EntityId>,
+}
+
+/// A resolved contract-membership (see [`RegisteredModel`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredMembership {
+    pub id: EntityId,
+    pub model: EntityId,
+    pub property: EntityId,
+    pub optional: bool,
 }
 
 /// A response from one node to another
@@ -236,11 +272,26 @@ pub struct NodeResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeResponseBody {
     // Response to CommitEvents
-    CommitComplete { id: TransactionId },
+    CommitComplete {
+        id: TransactionId,
+    },
     Fetch(Vec<EntityDelta>),
     Get(Vec<Attested<EntityState>>),
     GetEvents(Vec<Attested<Event>>),
-    QuerySubscribed { query_id: QueryId, deltas: Vec<EntityDelta> },
+    QuerySubscribed {
+        query_id: QueryId,
+        deltas: Vec<EntityDelta>,
+    },
+    /// Response to RegisterSchema (RFC 5.2): the full resolved definitions,
+    /// ids included -- allocated on this execution or already existing. The
+    /// requester upserts these into its catalog map immediately on ack, so
+    /// schema binding and id-keyed writes proceed without waiting for the
+    /// catalog subscription.
+    SchemaRegistered {
+        models: Vec<RegisteredModel>,
+        properties: Vec<RegisteredProperty>,
+        memberships: Vec<RegisteredMembership>,
+    },
     Success,
     Error(String),
 }
@@ -295,6 +346,9 @@ impl std::fmt::Display for NodeResponseBody {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
+            NodeResponseBody::SchemaRegistered { models, properties, memberships } => {
+                write!(f, "SchemaRegistered models:{} properties:{} memberships:{}", models.len(), properties.len(), memberships.len())
+            }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
         }

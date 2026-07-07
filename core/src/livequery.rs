@@ -253,11 +253,21 @@ where
     if args.cached || !has_relay {
         // Durable node: spawn initialization task directly (no remote subscription needed)
         let inner2 = inner.clone();
-        // Capture the catalog + collection so the async task can run property
-        // RESOLUTION (with the catalog-lag deferral) that create_inner cannot,
+        // Capture the catalog + collection (and the node + cdata the
+        // deferral needs to kick an ephemeral catalog subscription) so the
+        // async task can run property RESOLUTION that create_inner cannot,
         // being sync. The resolved selection is written back into `inner`
         // before activate reads it (see below).
+        //
+        // The node is captured WEAK and upgraded transiently around each
+        // resolve attempt: a strong clone baked into the closure would keep
+        // the node alive from construction until the task finishes -- which
+        // for a deferred (anticipated-collection) query is unbounded -- and
+        // would break the new_weak_node contract outright. The deferral wait
+        // itself needs only the catalog.
         let catalog = node.catalog.clone();
+        let resolve_node = node.weak();
+        let resolve_cdata = cdata.clone();
         let resolve_collection = collection_id.clone();
 
         debug!("LiveQuery::new() spawning initialization task for durable node predicate {}", query_id);
@@ -265,19 +275,65 @@ where
             debug!("LiveQuery initialization task starting for predicate {}", query_id);
             // RFC 5.5 resolution: PathExpr -> Identifier, failing closed, with
             // deferral. Runs before activate so the reactor query is resolved.
+            // Compiled models REGISTER AT FIRST USE inside the resolve (REN 2
+            // revised), so this loop's UnregisteredCollection arm engages only
+            // when registration could not run (policy denial, no durable
+            // peer): the query then activates provably-empty and DEFERS until
+            // the catalog learns the collection from someone who can.
             let (current, current_version) = inner2.selection.value();
-            match catalog.resolve_selection_deferred(&resolve_collection, &current).await {
-                Ok(resolved) => inner2.selection.set((resolved, current_version)),
-                Err(e) => {
-                    debug!("LiveQuery resolution failed for predicate {}: {}", query_id, e);
-                    inner2.error.set(Some(e.into()));
-                    // Still mark initialized so waiters do not hang on a query
-                    // that fails closed; the error is surfaced via `error`.
-                    inner2.mark_initialized(1);
-                    return;
+            let mut activation_version = current_version;
+            loop {
+                // Transient strong ref for the resolve attempt only; released
+                // before any deferral wait so a parked query cannot pin the node.
+                let resolved = match resolve_node.upgrade() {
+                    Some(node) => catalog.resolve_selection_deferred(&node, Some(&resolve_cdata), &resolve_collection, &current).await,
+                    None => {
+                        inner2.error.set(Some(RetrievalError::Other("Node has been dropped".into())));
+                        inner2.mark_initialized(activation_version.max(1));
+                        return;
+                    }
+                };
+                match resolved {
+                    Ok(resolved) => {
+                        inner2.selection.set((resolved, activation_version));
+                        break;
+                    }
+                    Err(crate::property::PropertyError::UnregisteredCollection { .. }) => {
+                        // Subscribe-before-create: the query is provably
+                        // EMPTY right now (an unregistered collection holds
+                        // no entities), so ACTIVATE it as such immediately --
+                        // Predicate::False through the ordinary add_query
+                        // path populates an empty resultset and marks
+                        // initialized, so query_wait-then-create proceeds
+                        // instead of deadlocking. The REAL selection
+                        // re-activates at version+1 below once the collection
+                        // registers; the update path then delivers the
+                        // entities as ordinary changes.
+                        if activation_version == current_version {
+                            let empty = ankql::ast::Selection { predicate: ankql::ast::Predicate::False, order_by: None, limit: None };
+                            inner2.selection.set((empty, current_version));
+                            if let Err(e) = inner2.activate(current_version).await {
+                                debug!("LiveQuery empty pre-activation failed for predicate {}: {}", query_id, e);
+                                inner2.error.set(Some(e));
+                                inner2.mark_initialized(current_version);
+                                return;
+                            }
+                            activation_version = current_version + 1;
+                        }
+                        catalog.wait_collection_registered(resolve_collection.as_str()).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        debug!("LiveQuery resolution failed for predicate {}: {}", query_id, e);
+                        inner2.error.set(Some(e.into()));
+                        // Still mark initialized so waiters do not hang on a query
+                        // that fails closed; the error is surfaced via `error`.
+                        inner2.mark_initialized(1);
+                        return;
+                    }
                 }
             }
-            if let Err(e) = inner2.activate(1).await {
+            if let Err(e) = inner2.activate(activation_version).await {
                 debug!("LiveQuery initialization failed for predicate {}: {}", query_id, e);
                 inner2.error.set(Some(e));
             } else {

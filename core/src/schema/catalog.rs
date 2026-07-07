@@ -34,13 +34,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
 };
 
-use ankurah_proto::{self as proto, schema_id, CollectionId, EntityId, QueryId};
+use ankurah_proto::{self as proto, CollectionId, EntityId, QueryId};
 use ankurah_signals::{porcelain::subscribe::SubscriptionGuard, Subscribe};
 use tokio::sync::Notify;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::{
     collectionset::CollectionSet,
@@ -52,7 +52,6 @@ use crate::{
     reactor::{AbstractEntity, GapFetcher, MembershipChange, Reactor, ReactorSubscription, ReactorUpdate},
     resultset::EntityResultSet,
     storage::StorageEngine,
-    system::SystemManager,
     value::Value,
 };
 
@@ -431,16 +430,20 @@ where PA: PolicyAgent
     entities: WeakEntitySet,
     reactor: Reactor,
     durable: bool,
-    /// The system root accessor. `cache_compiled` and `ensure_registered`
-    /// need the root to derive catalog ids (RFC 5.1); it is unknown until
-    /// the system is ready, in which case those paths no-op or defer. Stored
-    /// (separately from `Node`, which is not held here) after `start`
-    /// upgrades the weak node; `SystemManager` is `Clone` and outlives the
-    /// node, so this keeps derivation possible without holding the node.
-    system: RwLock<Option<SystemManager<SE, PA>>>,
+    /// The allocator mutex (RFC 5.1 executor discipline): the registration
+    /// executor serializes every RegisterSchema execution on this lock and
+    /// upserts its allocations into the map synchronously before releasing
+    /// it, because the reactor-fed map alone lags commit and consecutive
+    /// registrations must never double-allocate.
+    allocator: tokio::sync::Mutex<()>,
     map: RwLock<CatalogMapInner>,
     ready: RwLock<bool>,
     ready_notify: Notify,
+    /// Notified on every map mutation (reactor updates, response upserts,
+    /// warm completion). `wait_collection_registered` loops on it so a live
+    /// query over an anticipated-but-unregistered collection can defer
+    /// until the catalog learns the collection (RFC 5.3 deferral).
+    map_notify: Notify,
     /// Durable: the reactor subscription that keeps the map fresh; dropping
     /// it unsubscribes. Ephemeral: unused.
     durable_sub: RwLock<Option<(ReactorSubscription, SubscriptionGuard)>>,
@@ -452,25 +455,23 @@ where PA: PolicyAgent
     subscribed: RwLock<bool>,
     /// Collections whose registration has been ENSURED for this process
     /// (RFC 5.2 model first-use latch). Latched on a successful durable
-    /// write, a successful forwarded RegisterSchema, or on queueing an
-    /// offline registration. A strict error (executor/policy refusal) does
-    /// NOT latch. Cleared by `reset` (root-scoped derivations must not
-    /// survive hard_reset).
+    /// execution or a successful forwarded RegisterSchema (the response
+    /// consumed into the map). A strict error (executor/policy refusal, or
+    /// the rev 4 never-registered-offline error) does NOT latch. Cleared by
+    /// `reset` (allocated ids belong to one system and must not survive
+    /// hard_reset).
     ensured: RwLock<BTreeSet<String>>,
     /// collection -> compiled schema pointer, recorded by every
-    /// cache_compiled call (root or not). Lets the COMMIT path close the
-    /// edit-only registration gap: `Transaction::edit` is sync and cannot
-    /// await a durable registration, so commit_local_trx ensure-registers
-    /// any touched collection whose schema is known but not yet ensured
+    /// cache_compiled call. Lets the COMMIT path close the edit-only
+    /// registration gap: `Transaction::edit` is sync and cannot await a
+    /// durable registration, so commit_local_trx ensure-registers any
+    /// touched collection whose schema is known but not yet ensured
     /// (RFC 5.2 "durable write on first mutating use"). Pointers are
-    /// 'static and root-free, so this survives reset().
+    /// 'static and system-free, so this survives reset().
     compiled_schemas: RwLock<BTreeMap<String, &'static ModelSchema>>,
-    /// Offline queue (RFC 5.2 OFFLINE ephemeral flow): registrations an
-    /// ephemeral node could not deliver because no durable peer was
-    /// connected. Drained by `drain_pending` when a durable peer connects.
-    /// Holds the compiled schema (a `&'static`) and the cdata to forward
-    /// with.
-    pending_registrations: Mutex<Vec<(&'static ModelSchema, PA::ContextData)>>,
+    /// The manager stays generic over the node's PolicyAgent for its
+    /// Node-taking methods (ensure_registered, ensure_subscribed).
+    _pa: std::marker::PhantomData<PA>,
 }
 
 impl<SE, PA> CatalogManager<SE, PA>
@@ -484,16 +485,17 @@ where
             entities,
             reactor,
             durable,
-            system: RwLock::new(None),
+            allocator: tokio::sync::Mutex::new(()),
             map: RwLock::new(CatalogMapInner::default()),
             ready: RwLock::new(false),
             ready_notify: Notify::new(),
+            map_notify: Notify::new(),
             durable_sub: RwLock::new(None),
             ephemeral_queries: RwLock::new(Vec::new()),
             subscribed: RwLock::new(false),
             ensured: RwLock::new(BTreeSet::new()),
             compiled_schemas: RwLock::new(BTreeMap::new()),
-            pending_registrations: Mutex::new(Vec::new()),
+            _pa: std::marker::PhantomData,
         }))
     }
 
@@ -503,12 +505,6 @@ where
     /// hard-reset hook and otherwise waits for `ensure_subscribed`.
     pub(crate) fn start(&self, node: WeakNode<SE, PA>) {
         let Some(strong) = node.upgrade() else { return };
-
-        // Store the SystemManager so cache_compiled/ensure_registered can
-        // reach the system root for id derivation (RFC 5.1) on BOTH node
-        // kinds, without holding the Node itself. SystemManager is a separate
-        // Arc that outlives the node.
-        *self.0.system.write().unwrap() = Some(strong.system.clone());
 
         // Install the hard-reset flush hook on the system manager so
         // SystemManager::hard_reset can clear the catalog in-place (it does
@@ -615,17 +611,39 @@ where
     /// Ephemeral path: on the first call, stand up three
     /// [`EntityLiveQuery`]s (`Predicate::True`) over the catalog
     /// collections, feed their reactor updates into the map, wait for all
-    /// three to initialize, and mark ready. Subsequent calls are no-ops.
+    /// three to initialize, and mark ready. CONCURRENT callers wait for the
+    /// claimant's outcome instead of returning early (returning with a cold
+    /// catalog made the second of two racing queries fail closed, rev 4),
+    /// and retry the claim themselves if the claimant rolled back.
     pub async fn ensure_subscribed(&self, cdata: PA::ContextData, node: &Node<SE, PA>) {
         if self.0.durable {
             return; // durable nodes warm from storage, never subscribe via relay
         }
-        {
-            let mut subscribed = self.0.subscribed.write().unwrap();
-            if *subscribed {
+        loop {
+            let claimed = {
+                let mut subscribed = self.0.subscribed.write().unwrap();
+                if *subscribed {
+                    false
+                } else {
+                    *subscribed = true;
+                    true
+                }
+            };
+            if claimed {
+                break;
+            }
+            // Another caller is (or was) setting up. Wait for readiness,
+            // re-checking the latch so a rollback sends us back to claim.
+            // Register the Notified future BEFORE the checks (the
+            // wait_catalog_ready lost-wakeup discipline).
+            let notified = self.0.ready_notify.notified();
+            if self.is_catalog_ready() {
                 return;
             }
-            *subscribed = true;
+            if !*self.0.subscribed.read().unwrap() {
+                continue; // claimant rolled back: try to claim it ourselves
+            }
+            notified.await;
         }
 
         let mut queries = Vec::with_capacity(3);
@@ -642,8 +660,11 @@ where
                 Ok(lq) => lq,
                 Err(e) => {
                     error!("CatalogManager ephemeral subscribe to {} failed: {}", collection, e);
-                    // Roll back the latch so a later context can retry.
+                    // Roll back the latch so a later context can retry, and
+                    // WAKE waiters so they observe the rollback rather than
+                    // sleeping on a readiness that will never come.
                     *self.0.subscribed.write().unwrap() = false;
+                    self.0.ready_notify.notify_waiters();
                     return;
                 }
             };
@@ -679,20 +700,28 @@ where
     /// Apply one reactor update to the map: Remove drops, everything else
     /// upserts. Idempotent (keyed by entity id).
     fn apply_reactor_update(&self, update: ReactorUpdate) {
-        let mut map = self.0.map.write().unwrap();
-        for item in update.items {
-            let is_remove = item.predicate_relevance.iter().any(|(_, change)| matches!(change, MembershipChange::Remove));
-            if is_remove {
-                map.remove(&AbstractEntity::collection(&item.entity), AbstractEntity::id(&item.entity));
-            } else {
-                map.upsert(&item.entity);
+        {
+            let mut map = self.0.map.write().unwrap();
+            for item in update.items {
+                let is_remove = item.predicate_relevance.iter().any(|(_, change)| matches!(change, MembershipChange::Remove));
+                if is_remove {
+                    map.remove(&AbstractEntity::collection(&item.entity), AbstractEntity::id(&item.entity));
+                } else {
+                    map.upsert(&item.entity);
+                }
             }
         }
+        self.0.map_notify.notify_waiters();
     }
 
     // -- readiness ----------------------------------------------------------
 
     pub fn is_catalog_ready(&self) -> bool { *self.0.ready.read().unwrap() }
+
+    /// Whether this manager belongs to a durable node (warms from storage)
+    /// as opposed to an ephemeral one (warms by subscription). The
+    /// resolution deferral branches on this (resolve.rs).
+    pub(crate) fn is_durable(&self) -> bool { self.0.durable }
 
     pub async fn wait_catalog_ready(&self) {
         // `Notify::notify_waiters` wakes only waiters REGISTERED at that
@@ -713,27 +742,52 @@ where
     fn mark_ready(&self) {
         *self.0.ready.write().unwrap() = true;
         self.0.ready_notify.notify_waiters();
+        // The warm may have filled the map wholesale; wake collection waiters.
+        self.0.map_notify.notify_waiters();
     }
+
+    /// Wait until the catalog holds a model for `collection` (RFC 5.3
+    /// deferral for anticipated-but-unregistered collections). Register the
+    /// `Notified` future BEFORE checking, in a loop, exactly like
+    /// [`Self::wait_catalog_ready`], so a mutation landing between the check
+    /// and the await is never lost.
+    pub async fn wait_collection_registered(&self, collection: &str) {
+        loop {
+            let notified = self.0.map_notify.notified();
+            if self.0.map.read().unwrap().by_collection.contains_key(collection) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Whether a compiled schema for `collection` has been recorded this
+    /// process (the binary ANTICIPATES the collection even if the catalog
+    /// does not know it yet).
+    pub fn has_compiled(&self, collection: &str) -> bool { self.0.compiled_schemas.read().unwrap().contains_key(collection) }
 
     /// Flush the map and readiness (RFC 5.2: hard_reset must flush the
     /// catalog map along with the state SystemManager clears, because
-    /// derived ids are root-scoped and a node re-joining a different system
-    /// must re-derive everything). Does NOT delete storage collections; that
-    /// is SystemManager's job. Drops live subscriptions and clears the
-    /// ephemeral latch so the next context re-subscribes; a durable node is
-    /// expected to re-join/re-create the system, which re-warms.
+    /// allocated ids belong to one system and a node re-joining a different
+    /// system must re-register against that system's allocator). Does NOT
+    /// delete storage collections; that is SystemManager's job. Drops live
+    /// subscriptions and clears the ephemeral latch so the next context
+    /// re-subscribes; a durable node is expected to re-join/re-create the
+    /// system, which re-warms.
     pub fn reset(&self) {
         self.0.map.write().unwrap().clear();
         *self.0.ready.write().unwrap() = false;
         *self.0.durable_sub.write().unwrap() = None;
         self.0.ephemeral_queries.write().unwrap().clear();
         *self.0.subscribed.write().unwrap() = false;
-        // Root-scoped derivations must not survive hard_reset (RFC 5.2): a
-        // node re-joining a different system must re-derive and re-ensure
-        // everything against the new root, so drop the ensured latch and any
-        // queued (old-root) registrations.
+        // Allocations belong to one system and must not survive hard_reset
+        // (RFC 5.2): a node re-joining a different system must re-register
+        // everything against the new system's allocator.
         self.0.ensured.write().unwrap().clear();
-        self.0.pending_registrations.lock().unwrap().clear();
+        // Wake any ensure_subscribed waiters so they observe the cleared
+        // latch instead of sleeping on a readiness that will never come.
+        self.0.ready_notify.notify_waiters();
+        self.0.map_notify.notify_waiters();
         debug!("CatalogManager reset (map cleared, not ready)");
     }
 
@@ -770,101 +824,99 @@ where
     /// cross-contract sibling gate, RFC 5.4 rule 4).
     pub fn siblings_by_name(&self, name: &str) -> Vec<EntityId> { self.0.map.read().unwrap().siblings_by_name(name) }
 
-    // -- registration lifecycle (RFC 5.2, work package A11b) ----------------
+    // -- registration lifecycle (RFC 5.2, work package A11b; rev 4) ---------
 
-    /// The system root entity id, if the system is ready. Derivation of
-    /// catalog ids (RFC 5.1) is impossible without it, so callers no-op or
-    /// defer when this is `None`.
-    fn root(&self) -> Option<EntityId> {
-        let system = self.0.system.read().unwrap();
-        system.as_ref().and_then(|s| s.root()).map(|r| r.payload.entity_id)
-    }
-
-    /// RFC 5.2 read-path caching ("read paths derive and cache"): overlay a
-    /// compiled model's derived catalog entries into the map so `resolve`
-    /// answers for it BEFORE any durable registration. No-op if the system
-    /// root is unknown (ids are not derivable yet). NEVER writes durably.
+    /// Record a compiled model's schema pointer for the commit-time
+    /// registration gap (plan decision 16): `Transaction::edit` is sync and
+    /// cannot await a durable registration, so `commit_local_trx`
+    /// ensure-registers any touched collection whose compiled schema is
+    /// recorded but not yet ensured.
     ///
-    /// The entries are minted with the SAME shapes the durable executor
-    /// produces (RFC 5.1 genesis + follow-up), so a real catalog entry
-    /// arriving later from storage or a peer overwrites them identically:
-    /// model records `collection`/`name`; each property records
-    /// `minted_for = model id`, `name`/`anchor`, `backend`, `value_type`;
-    /// each membership records `model`, `property`, `optional`. Explicit-id
-    /// bindings (RFC 5.9) are honored: the property id is the bound id, not a
-    /// derived one. Idempotent (keyed by entity id).
+    /// Rev 4 note: this used to ALSO overlay locally-derived catalog ids
+    /// into the map; under allocation (RFC 5.1) ids exist only in the
+    /// catalog and its registration responses, so there is nothing local to
+    /// overlay. Resolution before first registration correctly reports the
+    /// property as unknown or defers (RFC 5.3).
     pub fn cache_compiled(&self, schema: &'static ModelSchema) {
         self.0.compiled_schemas.write().unwrap().insert(schema.collection.to_string(), schema);
-        let Some(root) = self.root() else {
-            return; // system root unknown: ids are not derivable, nothing to overlay
-        };
+    }
 
-        // Model id: an explicit binding (RFC 5.9) or the by-collection
-        // derivation (RFC 5.1). The explicit id is validated at derive time,
-        // so a parse failure is a derive-macro bug.
-        let model_id = match schema.explicit_id {
-            Some(id) => match EntityId::from_base64(id) {
-                Ok(id) => id,
-                Err(e) => {
-                    error!("cache_compiled: invalid model explicit id {id:?}: {e}");
-                    return;
-                }
-            },
-            None => schema_id::model_entity_id(&root, schema.collection),
-        };
+    // -- allocator support (RFC 5.1 executor discipline) ---------------------
 
+    /// Serialize a registration execution. The executor holds this across
+    /// its whole lookup/allocate/commit/upsert sequence.
+    pub(crate) async fn lock_allocator(&self) -> tokio::sync::MutexGuard<'_, ()> { self.0.allocator.lock().await }
+
+    /// The property lookup key (RFC 5.1): (minting model, current name,
+    /// backend, value_type). Used by the executor's upsert and the rename
+    /// hint pre-pass.
+    pub fn property_by_key(&self, model: &EntityId, name: &str, backend: &str, value_type: &str) -> Option<PropertyDef> {
+        let map = self.0.map.read().unwrap();
+        map.names_global.get(name)?.iter().find_map(|id| {
+            let p = map.properties.get(id)?;
+            (p.minted_for == Some(*model) && p.backend == backend && p.value_type == value_type).then(|| p.clone())
+        })
+    }
+
+    /// Fold resolved definitions into the map: the executor calls this
+    /// synchronously post-commit (before releasing the allocator mutex),
+    /// and `ensure_registered` calls it with a SchemaRegistered response so
+    /// binding proceeds ahead of the catalog subscription (RFC 5.2).
+    /// Idempotent (keyed by entity id); the reactor later re-delivers the
+    /// same entities harmlessly.
+    pub fn upsert_registered(
+        &self,
+        models: &[proto::RegisteredModel],
+        properties: &[proto::RegisteredProperty],
+        memberships: &[proto::RegisteredMembership],
+    ) {
         let mut map = self.0.map.write().unwrap();
-        map.upsert_model(ModelDef { id: model_id, collection: schema.collection.to_string(), name: schema.name.to_string() });
-
-        for field in schema.properties {
-            let property_id = match field.explicit_id {
-                Some(id) => match EntityId::from_base64(id) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("cache_compiled: invalid property explicit id {id:?} on field {}: {e}", field.field);
-                        continue;
-                    }
-                },
-                None => schema_id::property_entity_id(&root, &model_id, field.anchor, field.backend, field.value_type),
-            };
+        for m in models {
+            map.upsert_model(ModelDef { id: m.id, collection: m.collection.clone(), name: m.name.clone() });
+        }
+        for p in properties {
             map.upsert_property(PropertyDef {
-                id: property_id,
-                minted_for: Some(model_id),
-                name: field.name.to_string(),
-                backend: field.backend.to_string(),
-                value_type: field.value_type.to_string(),
-                target_model: None,
-            });
-            let membership_id = schema_id::membership_entity_id(&root, &model_id, &property_id);
-            map.upsert_membership(MembershipDef {
-                id: membership_id,
-                model: model_id,
-                property: property_id,
-                optional: Some(field.optional),
+                id: p.id,
+                minted_for: Some(p.model),
+                name: p.name.clone(),
+                backend: p.backend.clone(),
+                value_type: p.value_type.clone(),
+                target_model: p.target_model,
             });
         }
+        for ms in memberships {
+            map.upsert_membership(MembershipDef { id: ms.id, model: ms.model, property: ms.property, optional: Some(ms.optional) });
+        }
+        drop(map);
+        self.0.map_notify.notify_waiters();
     }
 
     /// RFC 5.2 model first-use registration ("ensure registration"). Called
-    /// on the mutating path (create/edit) before the write. Fast-returns if
-    /// the collection is already ensured this process. Always
-    /// [`cache_compiled`] first (so local resolution works even before the
-    /// durable round trip completes), then durably registers:
+    /// on the mutating path (create/edit) before the write, and by predicate
+    /// RESOLUTION at a read path's first use of a compiled model (REN 2
+    /// revised, plan decision 25b) -- an existing schema resolves to a no-op
+    /// plan, so the common read-path case emits nothing and skips the policy
+    /// verb while the response feeds the map. Fast-returns if the collection
+    /// is already ensured this process. Records the compiled
+    /// schema first (for the commit-time gap), then durably registers:
     ///
     /// - DURABLE node: execute the registration locally
-    ///   ([`Node::execute_schema_registration`]); latch on Ok.
-    /// - EPHEMERAL node with a durable peer: forward RegisterSchema to it and
-    ///   expect Success; latch on Ok.
-    /// - EPHEMERAL node with NO durable peer: queue the registration for
-    ///   reconnect (RFC 5.2 OFFLINE flow) and latch (queued); return Ok. The
-    ///   offline data write proceeds immediately; the durable side
-    ///   materializes fully once the queued registration lands.
+    ///   ([`Node::execute_schema_registration`], which updates the map
+    ///   itself under the allocator mutex); latch on Ok.
+    /// - EPHEMERAL node with a durable peer: forward RegisterSchema, consume
+    ///   the SchemaRegistered response into the map (binding and id-keyed
+    ///   writes proceed immediately, ahead of the catalog subscription);
+    ///   latch on Ok.
+    /// - EPHEMERAL node with NO durable peer: the rev 4 STRICT OFFLINE rule.
+    ///   Registration is impossible without the allocator, so this returns
+    ///   [`RegistrationError::NoDurablePeer`] WITHOUT latching. The caller
+    ///   discriminates (plan decision 16): a collection the catalog already
+    ///   knows keeps writing offline against its cached binding (the
+    ///   re-assert is deferrable); a NEVER-registered collection fails the
+    ///   write ("connect once first").
     ///
-    /// A STRICT error (executor refusal, or an Error response from the peer)
-    /// returns Err WITHOUT latching, so a later attempt retries. This is the
-    /// strict surface; the auto-assert trigger on `create`/`edit` swallows
-    /// the Err to a warning (policy gates schema definition, not data writes;
-    /// RFC 5.2 data-freedom rationale).
+    /// Every error path returns WITHOUT latching, so a later attempt
+    /// retries.
     pub async fn ensure_registered(
         &self,
         node: &Node<SE, PA>,
@@ -876,27 +928,29 @@ where
             return Ok(());
         }
 
-        // Overlay the compiled entries locally FIRST (fail-open, cheap): even
-        // if the durable registration is refused or deferred, local
-        // resolution answers for this model.
+        // Record the compiled schema for the commit-time registration gap.
         self.cache_compiled(schema);
 
         let (models, properties, memberships) = super::registration_request(schema);
 
         if node.durable {
-            // A durable node executes registration itself (no forwarding).
+            // A durable node executes registration itself (no forwarding);
+            // the executor upserts the map before returning.
             node.execute_schema_registration(cdata, models, properties, memberships).await?;
             self.0.ensured.write().unwrap().insert(collection);
             return Ok(());
         }
 
-        // Ephemeral: forward to a connected durable peer if one exists,
-        // otherwise queue for reconnect.
+        // Ephemeral: forward to a connected durable peer; there is no
+        // offline queue (rev 4 deleted it with derivation).
         match node.get_durable_peers().first().copied() {
             Some(peer) => {
                 let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
                 match node.request(peer, cdata, body).await {
-                    Ok(proto::NodeResponseBody::Success) => {
+                    Ok(proto::NodeResponseBody::SchemaRegistered { models, properties, memberships }) => {
+                        // The response is the fast path into the map (RFC
+                        // 5.2): fold it in on ack so binding proceeds now.
+                        self.upsert_registered(&models, &properties, &memberships);
                         self.0.ensured.write().unwrap().insert(collection);
                         Ok(())
                     }
@@ -908,14 +962,7 @@ where
                     Err(e) => Err(RegistrationError::Retrieval(crate::error::RetrievalError::Other(format!("{e:?}")))),
                 }
             }
-            None => {
-                // No durable peer: queue and latch (queued). The offline data
-                // write proceeds; drain_pending forwards this on reconnect.
-                self.0.pending_registrations.lock().unwrap().push((schema, cdata.clone()));
-                self.0.ensured.write().unwrap().insert(collection);
-                debug!("catalog: queued offline registration for '{}' (no durable peer)", schema.collection);
-                Ok(())
-            }
+            None => Err(RegistrationError::NoDurablePeer(collection)),
         }
     }
 
@@ -930,46 +977,6 @@ where
             return None;
         }
         self.0.compiled_schemas.read().unwrap().get(collection).copied()
-    }
-
-    /// RFC 5.2 OFFLINE flow drain: forward every queued registration to a
-    /// connected durable peer. Spawns a task (callers are sync, e.g.
-    /// `register_peer`). A transport failure RE-QUEUES the entry (the peer
-    /// may have dropped mid-drain); a policy refusal is logged and dropped
-    /// (re-queuing a refusal would loop). Called from `Node::register_peer`
-    /// when a durable peer connects.
-    pub(crate) fn drain_pending(&self, node: &Node<SE, PA>) {
-        let drained: Vec<(&'static ModelSchema, PA::ContextData)> = { std::mem::take(&mut *self.0.pending_registrations.lock().unwrap()) };
-        if drained.is_empty() {
-            return;
-        }
-        let me = self.clone();
-        let node = node.clone();
-        crate::task::spawn(async move {
-            for (schema, cdata) in drained {
-                let Some(peer) = node.get_durable_peers().first().copied() else {
-                    // Lost the peer before we got to this entry: re-queue.
-                    me.0.pending_registrations.lock().unwrap().push((schema, cdata));
-                    continue;
-                };
-                let (models, properties, memberships) = super::registration_request(schema);
-                let body = proto::NodeRequestBody::RegisterSchema { models, properties, memberships };
-                match node.request(peer, &cdata, body).await {
-                    Ok(proto::NodeResponseBody::Success) => {}
-                    Ok(proto::NodeResponseBody::Error(e)) => {
-                        warn!("catalog: durable peer refused queued registration for '{}': {}", schema.collection, e);
-                    }
-                    Ok(other) => {
-                        warn!("catalog: unexpected response to queued registration for '{}': {}", schema.collection, other);
-                    }
-                    Err(e) => {
-                        // Transport failure: re-queue for the next reconnect.
-                        warn!("catalog: transport error draining registration for '{}', re-queuing: {:?}", schema.collection, e);
-                        me.0.pending_registrations.lock().unwrap().push((schema, cdata));
-                    }
-                }
-            }
-        });
     }
 
     /// TEST/INTROSPECTION: number of parsed entities of each kind

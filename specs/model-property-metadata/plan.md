@@ -635,6 +635,32 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     define schema) -- and the denied field lands as name-keyed
     residue per decisions 16 and 22. The policy surface must support
     BOTH discrimination axes (RFC 5.2, 5.7).
+25b. **First-use registration on read paths + the anticipated-collection
+    fallback** (rev 4 corollary, RFC 5.2/5.3; surfaced by the
+    subscribe-before-create tests, REVISED 2026-07-06 by the
+    replica-lag flake -- REN 2 second ruling, ratified in session): a
+    warm catalog REPLICA cannot prove a collection unregistered (it may
+    lag the authority by a subscription hop), so resolution never
+    renders that verdict alone. When the warm map cannot resolve a
+    reference and the binary carries a compiled schema, the model
+    REGISTERS AT FIRST USE via the ordinary idempotent upsert: an
+    existing schema resolves to a no-op plan (zero events, policy verb
+    skipped) whose response feeds the map synchronously, so reads warm
+    against authoritative rows and query_wait initializes populated.
+    The anticipated-collection rule survives as the FALLBACK when
+    registration cannot run (policy denial, no durable peer): an
+    unregistered collection provably holds no entities (creation
+    requires registration), so the fetch answers EMPTY and a live query
+    activates empty (Predicate::False placeholder) and DEFERS
+    (wait_collection_registered), upgrading through the ordinary
+    selection-update path when registration lands. The resolution
+    deferral also KICKS the ephemeral catalog subscription inline when
+    a sync-context node never subscribed (ensure_subscribed is
+    idempotent and awaited), and fails closed when neither the kick nor
+    registration can warm the catalog (offline). Fail-closed is
+    unchanged for unknown properties in registered collections and for
+    references no compiled schema anticipates (AC5). PropertyError
+    gains UnregisteredCollection to carry the distinction.
 26. **`check_schema_registration` PolicyAgent verb** (maintainer
     direction, 2026-07-06; RFC 5.7): a new trait method with a
     default-allow implementation, called by the executor after its

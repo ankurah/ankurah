@@ -86,26 +86,14 @@ impl NodeApplier {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
             let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
+            // Relayed catalog events are trusted the way every other event
+            // is (RFC section 4, rev 4): they originate from the allocating
+            // durable node's policy-checked registration executor, and the
+            // structural write ban (receivers reject ordinary transactions
+            // into _ankurah_*) is the protection. The rev 3 content
+            // self-certification died with derivation: there is no
+            // derivation to recompute against an allocated id.
             node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
-            // Catalog genesis is SELF-CERTIFYING (RFC section 4): the entity
-            // id must equal the derivation over the payload and the event id
-            // must equal the frozen encoding, so any relayed catalog genesis
-            // is validated by recomputation regardless of who sent it or what
-            // it claims. Follow-up (non-genesis) catalog events merge as
-            // ordinary LWW writes; they were policy-checked where the
-            // registration executed.
-            if attested_event.payload.is_entity_create() && crate::schema::is_catalog_collection(collection_id) {
-                let root = node
-                    .system
-                    .root()
-                    .ok_or_else(|| {
-                        MutationError::General("received catalog genesis before the system root is known; cannot validate".into())
-                    })?
-                    .payload
-                    .entity_id;
-                crate::schema::genesis::validate_catalog_genesis(&root, &attested_event.payload)
-                    .map_err(|e| MutationError::General(format!("rejected relayed catalog genesis: {e}").into()))?;
-            }
             event_getter.stage_event(attested_event.payload.clone());
             attested_events.push(attested_event);
         }

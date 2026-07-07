@@ -3,8 +3,9 @@
 //!
 //! This module generates the `static` [`ankurah::core::schema::ModelSchema`]
 //! and the `Model::schema()` method. Two facts per field are NORMATIVE and
-//! must match every node byte-for-byte, because the catalog property id is
-//! derived from them (RFC 5.1):
+//! must match every node byte-for-byte, because the catalog property LOOKUP
+//! KEY includes them (RFC 5.1): two nodes disagreeing on a mapping row
+//! register distinct property identities for the same field.
 //!
 //! - `backend`: the backend-registry name the active type resolves to
 //!   ("yrs" / "lww"), obtained from the backend registry
@@ -13,10 +14,10 @@
 //!   from the field's ORIGINAL Rust type (before active-type wrapping) via
 //!   the RFC section 4 table.
 //!
-//! Attributes parsed here: `#[property(anchor = "...")]` (rename lineage,
-//! RFC 5.8) and `#[property(id = "...")]` / `#[model(id = "...")]` (explicit
-//! binding, RFC 5.9). Explicit-id values are validated at compile time as
-//! URL-safe base64 of exactly 16 bytes.
+//! Attributes parsed here: `#[property(renamed_from = "...")]` (the
+//! transient rename hint, RFC 5.8) and `#[property(id = "...")]` /
+//! `#[model(id = "...")]` (explicit binding, RFC 5.9). Explicit-id values
+//! are validated at compile time as URL-safe base64 of exactly 16 bytes.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -125,15 +126,12 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
 
         let backend = desc.backend_key().map_err(|msg| syn::Error::new(field.ty.span(), msg))?;
 
-        // #[property(anchor = "...")]: the permanent derivation name for a
-        // rename lineage. Defaults to the display name. `anchored` records
-        // whether the attribute was physically present: a deliberate
-        // `anchor == name` (a rename-back) must be distinguishable from the
-        // default, or the RFC 5.8 anchor-reuse guard cannot tell it apart
-        // from an accidental retired-name collision.
-        let anchor_attr = property_str_attr(&field.attrs, "anchor")?;
-        let anchored = anchor_attr.is_some();
-        let anchor = anchor_attr.unwrap_or_else(|| display_name.clone());
+        // #[property(renamed_from = "...")]: the transient rename hint (RFC
+        // 5.8). Applied by the registration executor before lookup-or-create,
+        // guarded; removable from source once every target system has seen
+        // it.
+        let renamed_from = property_str_attr(&field.attrs, "renamed_from")?;
+        let renamed_from_tokens = option_str_tokens(renamed_from.as_deref());
 
         // #[property(id = "...")]: explicit binding to a known property
         // entity (RFC 5.9). Validated as URL-safe base64 / 16 bytes.
@@ -147,8 +145,7 @@ pub fn schema_impl(model: &ModelDescription) -> syn::Result<TokenStream> {
             ::ankurah::core::schema::FieldSchema {
                 field: #field_name,
                 name: #display_name,
-                anchor: #anchor,
-                anchored: #anchored,
+                renamed_from: #renamed_from_tokens,
                 backend: #backend,
                 value_type: #value_type,
                 optional: #optional,
@@ -263,12 +260,12 @@ fn property_str_attr(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<
         if !attr.path().is_ident("property") {
             continue;
         }
-        // #[property(anchor = "...", id = "...")] -- a comma-separated list of
-        // name = "value" pairs.
+        // #[property(renamed_from = "...", id = "...")] -- a comma-separated
+        // list of name = "value" pairs.
         attr.parse_nested_meta(|meta| {
             let ident = meta.path.get_ident().map(|i| i.to_string());
             match ident.as_deref() {
-                Some("anchor") | Some("id") => {
+                Some("renamed_from") | Some("id") => {
                     let value = meta.value()?;
                     let lit: syn::LitStr = value.parse()?;
                     if meta.path.is_ident(key) {
@@ -276,7 +273,7 @@ fn property_str_attr(attrs: &[syn::Attribute], key: &str) -> syn::Result<Option<
                     }
                     Ok(())
                 }
-                _ => Err(meta.error("unsupported #[property(...)] key; expected `anchor` or `id`")),
+                _ => Err(meta.error("unsupported #[property(...)] key; expected `renamed_from` or `id`")),
             }
         })?;
     }

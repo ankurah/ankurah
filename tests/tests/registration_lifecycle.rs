@@ -1,20 +1,24 @@
 //! A11b: the client-side registration lifecycle
-//! (specs/model-property-metadata/rfc.md section 5.2).
+//! (specs/model-property-metadata/rfc.md section 5.2, rev 4).
 //!
 //! These tests drive registration through the ORDINARY client surface --
 //! `trx.create`, `ctx.register::<M>()`, and the read paths -- rather than
 //! hand-built RegisterSchema requests (that lower layer is covered by
-//! schema_registration.rs / catalog_map.rs). They assert the five lifecycle
+//! schema_registration.rs / catalog_map.rs). They assert the lifecycle
 //! behaviors the RFC pins:
 //!
-//!   a. auto-assert: `trx.create` on an ephemeral registers durably;
-//!   b. offline queue: a create with no durable peer queues, and a later
-//!      reconnect drains it to the durable;
+//!   a. auto-assert: `trx.create` on an ephemeral registers durably, and
+//!      the ids everywhere are the durable's allocations;
+//!   b. strict offline: creating into a NEVER-registered collection with
+//!      no durable peer fails at create ("connect once first"), while a
+//!      collection the catalog already knows keeps writing offline;
 //!   c. explicit `register::<M>()` on a durable: catalog entries appear
 //!      locally, and a second call is a no-op (heads unchanged);
-//!   d. read-path cache: `fetch` overlays the compiled schema locally
-//!      WITHOUT durably registering (durable catalog stays empty);
-//!   e. hard_reset flushes the ensured latch and the compiled overlay.
+//!   d. read paths do not mint and do not register: resolution over an
+//!      unregistered collection fails closed (AC5), and nothing lands in
+//!      the durable catalog;
+//!   e. hard_reset flushes the map and the ensured latch (allocations
+//!      belong to one system).
 
 mod common;
 use common::*;
@@ -23,7 +27,7 @@ use std::time::Duration;
 
 type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
-// Distinct models per behavior so the derived collections never collide.
+// Distinct models per behavior so the collections never collide.
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Widget {
     pub label: String,
@@ -75,19 +79,11 @@ async fn wait_resolve(node: &TestNode, collection: &str, name: &str) -> Option<E
     }
 }
 
-/// The property id the durable node WOULD derive for (collection, anchor,
-/// backend, value_type) under its own system root.
-fn derived_property_id(server: &TestNode, collection: &str, anchor: &str, backend: &str, value_type: &str) -> EntityId {
-    let root = server.system.root().unwrap().payload.entity_id;
-    let model_id = proto::schema_id::model_entity_id(&root, collection);
-    proto::schema_id::property_entity_id(&root, &model_id, anchor, backend, value_type)
-}
-
-// (a) Auto-assert: create a derived model on the ephemeral; the durable's
-// catalog resolves the derived property id. `create` awaits the RegisterSchema
-// request internally, so the durable has executed registration by the time
-// commit returns; the durable's map catches up via its reactor subscription
-// (hence the poll).
+// (a) Auto-assert: create on the ephemeral; the durable executes the
+// registration (allocating the ids) and both sides converge on the same
+// allocations. `create` awaits the RegisterSchema response internally, so
+// the client map is seeded on ack; the durable's own map is updated
+// synchronously by the executor.
 #[tokio::test]
 async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     let (server, client, _conn) = connected_pair().await?;
@@ -98,12 +94,20 @@ async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     trx.create(&Widget { label: "hello".into(), size: 42 }).await?;
     trx.commit().await?;
 
-    // The durable resolves (collection, field) to the derived property id.
+    // The durable resolves (collection, field) to its own allocations, with
+    // the normative (backend, value_type) pairs recorded in the catalog.
     let label_id = wait_resolve(&server, "widget", "label").await.expect("durable resolves widget.label after auto-assert");
-    assert_eq!(label_id, derived_property_id(&server, "widget", "label", "yrs", "string"), "String field -> (yrs, string)");
+    let label = server.catalog.property_by_id(&label_id).expect("label def");
+    assert_eq!((label.backend.as_str(), label.value_type.as_str()), ("yrs", "string"), "String field -> (yrs, string)");
 
     let size_id = wait_resolve(&server, "widget", "size").await.expect("durable resolves widget.size");
-    assert_eq!(size_id, derived_property_id(&server, "widget", "size", "lww", "i32"), "i32 field -> (lww, i32)");
+    let size = server.catalog.property_by_id(&size_id).expect("size def");
+    assert_eq!((size.backend.as_str(), size.value_type.as_str()), ("lww", "i32"), "i32 field -> (lww, i32)");
+
+    // The client's map was seeded from the SchemaRegistered response: the
+    // SAME ids, no waiting on the catalog subscription.
+    assert_eq!(client.catalog.resolve("widget", "label"), Some(label_id), "response-fed client map agrees with the allocator");
+    assert_eq!(client.catalog.resolve("widget", "size"), Some(size_id));
 
     // The model entity is indexed by its collection with the struct name.
     let model = server.catalog.model_by_collection("widget").expect("model present on durable");
@@ -112,33 +116,28 @@ async fn auto_assert_create_registers_on_durable() -> anyhow::Result<()> {
     Ok(())
 }
 
-// (b) Offline queue: connect, go ready, DISCONNECT (drop the connection so
-// the ephemeral has no durable peer), then `trx.create` -- which QUEUES the
-// registration (no commit needed; create is enough to trigger ensure). Then
-// reconnect with a NEW connection; `register_peer` drains the queue to the
-// durable, whose catalog then gains the entries.
-//
-// Shaping note: a commit is NOT attempted while disconnected. An
-// ephemeral with no durable peer cannot relay a commit (relay_to_required_peers
-// has no peer), so committing offline would be a separate concern; the RFC's
-// registration trigger fires on `create` itself, so `create` (without commit)
-// exercises the queue-and-drain path cleanly. The context was created BEFORE
-// disconnecting (an ephemeral needs a peer to become system-ready).
+// (b) Strict offline (rev 4, plan decisions 16/22): a create into a
+// NEVER-registered collection with no durable peer fails at create with an
+// actionable error; after reconnecting, the same create succeeds. A
+// collection the catalog already KNOWS (bound) keeps working offline: the
+// re-assert is deferrable and only warns.
 #[tokio::test]
-async fn offline_create_queues_then_drains_on_reconnect() -> anyhow::Result<()> {
+async fn offline_create_unregistered_is_strict_registered_proceeds() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
     server.catalog.wait_catalog_ready().await;
 
-    // Build the context while connected (join_system needs a peer).
+    // Build the context while connected (join_system needs a peer), and
+    // register Widget while connected so it is a KNOWN collection later.
     let ctx = client.context_async(DEFAULT_CONTEXT).await;
+    ctx.register::<Widget>().await?;
+    assert!(client.catalog.model_by_collection("widget").is_some(), "widget bound while connected");
 
-    // DISCONNECT: dropping the connection deregisters the peer on both sides,
-    // so the ephemeral now has no durable peer.
+    // DISCONNECT: dropping the connection deregisters the peer on both
+    // sides, so the ephemeral now has no durable peer.
     drop(conn);
-    // Let the deregistration propagate.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !client.get_durable_peers().is_empty() {
         if std::time::Instant::now() >= deadline {
@@ -147,20 +146,28 @@ async fn offline_create_queues_then_drains_on_reconnect() -> anyhow::Result<()> 
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // create (no commit) -- triggers ensure_registered, which queues because
-    // there is no durable peer. Best-effort, so this does not error.
+    // A NEVER-registered collection cannot mint identity offline: strict
+    // error at create ("connect once first").
     {
         let trx = ctx.begin();
-        let _w = trx.create(&Gadget { name: "offline".into() }).await?;
-        // Drop the trx without committing; the registration is already queued.
+        let err =
+            trx.create(&Gadget { name: "offline".into() }).await.expect_err("offline create into an unregistered collection must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unregistered collection 'gadget'"), "actionable strict error, got: {msg}");
+    }
+    assert!(server.catalog.resolve("gadget", "name").is_none(), "nothing reached the durable");
+    assert!(!client.catalog.is_ensured("gadget"), "a strict failure must not latch");
+
+    // The BOUND collection keeps writing offline (no commit attempted: an
+    // ephemeral cannot relay a commit without a peer; create alone
+    // exercises the trigger).
+    {
+        let trx = ctx.begin();
+        let _w = trx.create(&Widget { label: "offline-ok".into(), size: 1 }).await?;
     }
 
-    // The durable does NOT have the schema yet (it was never reachable).
-    assert!(server.catalog.resolve("gadget", "name").is_none(), "durable has nothing before reconnect");
-
-    // RECONNECT with a fresh connection; register_peer drains the queue.
+    // RECONNECT: the same Gadget create now registers and succeeds.
     let _conn2 = LocalProcessConnection::new(&server, &client).await?;
-    // (client re-joins the same system; wait for the peer to be back.)
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while client.get_durable_peers().is_empty() {
         if std::time::Instant::now() >= deadline {
@@ -168,17 +175,20 @@ async fn offline_create_queues_then_drains_on_reconnect() -> anyhow::Result<()> 
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-
-    // After the drain, the durable's catalog gains the queued registration.
-    let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable gains gadget.name after drain");
-    assert_eq!(name_id, derived_property_id(&server, "gadget", "name", "yrs", "string"));
+    {
+        let trx = ctx.begin();
+        let _g = trx.create(&Gadget { name: "online".into() }).await?;
+    }
+    let name_id = wait_resolve(&server, "gadget", "name").await.expect("durable allocates gadget.name after reconnect");
+    assert_eq!(client.catalog.resolve("gadget", "name"), Some(name_id), "client map seeded from the response");
 
     Ok(())
 }
 
 // (c) Explicit register::<M>() on a durable node's context: catalog entries
 // exist locally afterwards, and a second call is a no-op (catalog heads
-// unchanged, using the same head-comparison pattern as schema_registration.rs).
+// unchanged, using the same head-comparison pattern as
+// schema_registration.rs).
 #[tokio::test]
 async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
@@ -188,82 +198,78 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
     // Strict register: propagates errors (here, succeeds).
     ctx.register::<Gizmo>().await?;
 
-    // Catalog entries exist locally after the explicit register.
+    // Catalog entries exist locally after the explicit register; the ids
+    // are this durable's allocations.
     let title_id = wait_resolve(&server, "gizmo", "title").await.expect("gizmo.title resolves after register");
-    assert_eq!(title_id, derived_property_id(&server, "gizmo", "title", "yrs", "string"));
+    let model_id = server.catalog.model_by_collection("gizmo").expect("gizmo model").id;
+    let membership = server.catalog.membership(&model_id, &title_id).expect("gizmo.title membership");
 
-    let root = server.system.root().unwrap().payload.entity_id;
-    let model_id = proto::schema_id::model_entity_id(&root, "gizmo");
     let head_before = catalog_head(&server, "_ankurah_property", title_id).await?;
-    let membership_id = proto::schema_id::membership_entity_id(&root, &model_id, &title_id);
-    let ms_head_before = catalog_head(&server, "_ankurah_model_property", membership_id).await?;
+    let ms_head_before = catalog_head(&server, "_ankurah_model_property", membership.id).await?;
 
     // Second call: the collection is latched as ensured, so it is a pure
     // no-op -- no new events, catalog heads unchanged.
     ctx.register::<Gizmo>().await?;
 
     let head_after = catalog_head(&server, "_ankurah_property", title_id).await?;
-    let ms_head_after = catalog_head(&server, "_ankurah_model_property", membership_id).await?;
+    let ms_head_after = catalog_head(&server, "_ankurah_model_property", membership.id).await?;
     assert_eq!(head_before, head_after, "second register must not mint new property events");
     assert_eq!(ms_head_before, ms_head_after, "second register must not mint new membership events");
 
     Ok(())
 }
 
-// (d) Read-path cache: a fresh durable node with NO registration; a fetch
-// overlays the compiled schema so `resolve` answers, while the durable
-// CATALOG COLLECTIONS remain empty (storage get_state for the derived property
-// id errors NotFound). Read paths must not durably register.
+// (d) Reads register at first use (REN 2 revised, plan decision 25b): a
+// compiled model's first query triggers the idempotent registration
+// upsert, so resolution runs against authoritative rows instead of
+// classifying the collection as anticipated. The fetch still answers
+// EMPTY -- the freshly registered collection holds no entities -- and a
+// second, explicit register is a no-op against the same rows.
 #[tokio::test]
-async fn read_path_caches_without_registering() -> anyhow::Result<()> {
+async fn read_path_registers_at_first_use() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     server.catalog.wait_catalog_ready().await;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
-    // A fetch (with a predicate referencing a field) overlays the compiled
-    // schema. No entities exist, so the result is empty; the point is the
-    // side-effect on the catalog overlay.
+    // The compiled schema anticipates `doohickey`; the catalog does not
+    // know it yet. The fetch registers it at first use and answers empty.
+    let results = ctx.fetch::<DoohickeyView>("tag = 'x'").await?;
+    assert!(results.is_empty(), "a just-registered collection holds no entities");
+
+    // The read path durably registered and latched the collection.
+    let tag_id = server.catalog.resolve("doohickey", "tag");
+    assert!(tag_id.is_some(), "first-use registration fed the catalog");
+    assert!(server.catalog.is_ensured("doohickey"), "first-use registration latches");
+
+    // The explicit register is an idempotent no-op against the same rows.
+    ctx.register::<Doohickey>().await?;
+    assert_eq!(server.catalog.resolve("doohickey", "tag"), tag_id, "re-register must not re-mint");
     let results = ctx.fetch::<DoohickeyView>("tag = 'x'").await?;
     assert!(results.is_empty(), "no entities were created");
 
-    // The compiled overlay makes resolve() answer for the derived property...
-    let tag_id = server.catalog.resolve("doohickey", "tag").expect("compiled overlay resolves doohickey.tag");
-    assert_eq!(tag_id, derived_property_id(&server, "doohickey", "tag", "yrs", "string"));
-
-    // ...but NOTHING was durably registered: the property entity is absent
-    // from storage (get_state errors NotFound), proving the read path did not
-    // write the catalog.
-    let storage = server.collections.get(&"_ankurah_property".into()).await?;
-    match storage.get_state(tag_id).await {
-        Err(ankurah::error::RetrievalError::EntityNotFound(_)) => {}
-        Ok(_) => panic!("read path must NOT durably register the property entity"),
-        Err(e) => panic!("expected EntityNotFound, got {e:?}"),
-    }
+    // A typo'd property in a REGISTERED collection still fails closed (AC5).
+    let err = ctx.fetch::<DoohickeyView>("tyop = 'x'").await.expect_err("unknown property in a registered collection fails closed");
+    assert!(format!("{err:?}").to_lowercase().contains("unknown"), "fail-closed unknown-property error");
 
     Ok(())
 }
 
-// (e) hard_reset clears the ensured latch and the compiled overlay: after
-// reset, resolve is None again for the overlay entries.
+// (e) hard_reset clears the map and the ensured latch: allocations belong
+// to one system and must not survive into another (RFC 5.2).
 #[tokio::test]
-async fn hard_reset_clears_ensured_and_overlay() -> anyhow::Result<()> {
+async fn hard_reset_clears_ensured_and_map() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     server.catalog.wait_catalog_ready().await;
     let ctx = server.context(DEFAULT_CONTEXT)?;
 
-    // Populate the overlay via a read path, and the durable catalog + latch
-    // via an explicit register.
-    let _ = ctx.fetch::<WidgetView>("label = 'x'").await?;
     ctx.register::<Gizmo>().await?;
     wait_resolve(&server, "gizmo", "title").await.expect("gizmo resolves before reset");
-    assert!(server.catalog.resolve("widget", "label").is_some(), "overlay populated before reset");
+    assert!(server.catalog.is_ensured("gizmo"));
 
-    // hard_reset flushes the map, the ensured latch, and the pending queue
-    // (RFC 5.2: root-scoped derivations must not survive).
     server.system.hard_reset().await?;
 
-    assert!(server.catalog.resolve("gizmo", "title").is_none(), "durable overlay gone after reset");
-    assert!(server.catalog.resolve("widget", "label").is_none(), "compiled overlay gone after reset");
+    assert!(server.catalog.resolve("gizmo", "title").is_none(), "map flushed after reset");
+    assert!(!server.catalog.is_ensured("gizmo"), "ensured latch flushed after reset");
     assert_eq!(server.catalog.counts(), (0, 0, 0), "catalog map empty after reset");
 
     Ok(())
@@ -315,9 +321,10 @@ async fn edit_only_commit_registers() -> anyhow::Result<()> {
 // RFC 4 erratum 2 resolution: a custom Property type DECLARES its own
 // normative value_type through the trait's associated const, and the derive
 // carries it into the compiled schema, the registration request, the
-// catalog, and the property-id derivation. `Stars` is a HAND-WRITTEN impl
-// producing `Value::I64`, so it declares "i64" (the derive(Property) macro
-// pins "string" for its JSON-string serialization).
+// catalog, and the property LOOKUP KEY (rev 4: it feeds the upsert key
+// instead of a hash). `Stars` is a HAND-WRITTEN impl producing
+// `Value::I64`, so it declares "i64" (the derive(Property) macro pins
+// "string" for its JSON-string serialization).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stars(i64);
 
@@ -348,17 +355,15 @@ async fn custom_property_type_declares_its_value_type() -> anyhow::Result<()> {
     assert_eq!(field.value_type, "i64", "hand impl declares its real wire type");
     assert_eq!(field.backend, "lww");
 
-    // And it flows through registration: the catalog records "i64" and the
-    // property id derives from it.
+    // And it flows through registration: the catalog records "i64" as part
+    // of the allocated definition.
     let node = durable_sled_setup().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await;
     ctx.register::<Review>().await?;
 
-    let root = node.system.root().unwrap().payload.entity_id;
-    let model_id = proto::schema_id::model_entity_id(&root, "review");
-    let expected = proto::schema_id::property_entity_id(&root, &model_id, "rating", "lww", "i64");
-    assert_eq!(wait_resolve(&node, "review", "rating").await, Some(expected), "derivation must use the declared value_type");
-    let def = node.catalog.property_by_id(&expected).expect("catalog property def");
-    assert_eq!(def.value_type, "i64");
+    let rating_id = wait_resolve(&node, "review", "rating").await.expect("review.rating resolves after register");
+    let def = node.catalog.property_by_id(&rating_id).expect("catalog property def");
+    assert_eq!(def.value_type, "i64", "the catalog carries the declared value_type into the lookup key");
+    assert_eq!(def.backend, "lww");
     Ok(())
 }

@@ -38,27 +38,144 @@ where
 {
     /// Resolve a selection with the Phase A CATALOG-LAG DEFERRAL rule (RFC
     /// 5.5): attempt [`resolve_selection`]; if it fails `UnknownProperty`
-    /// only because the catalog is not ready yet, await readiness and retry
-    /// ONCE, then propagate. A compiled model resolves immediately via the
-    /// `cache_compiled` overlay, so this awaits only when a reference is
-    /// genuinely unknown on a not-yet-warm catalog. Any non-`UnknownProperty`
-    /// error, or an `UnknownProperty` when the catalog IS ready (a real
-    /// unknown reference), propagates without waiting (fail closed).
-    pub async fn resolve_selection_deferred(&self, collection: &CollectionId, selection: &Selection) -> Result<Selection, PropertyError> {
+    /// only because the catalog is not warm yet, warm it and retry ONCE,
+    /// then propagate. Rev 4: ids exist only in the catalog and its
+    /// registration responses (the compiled-schema overlay is gone), so
+    /// resolution is the point where a cold catalog must actually get
+    /// warmed:
+    ///
+    /// - DURABLE node: the storage warm always completes; await readiness.
+    /// - EPHEMERAL node with `cdata`: the subscription may never have been
+    ///   kicked (the sync `Node::context` cannot await it), so KICK it here,
+    ///   awaited inline -- [`CatalogManager::ensure_subscribed`] is
+    ///   idempotent and returns with readiness set on success. If the
+    ///   catalog is still not ready afterwards (no durable peer, subscribe
+    ///   failed), FAIL CLOSED rather than wait for a warm that cannot
+    ///   arrive.
+    /// - EPHEMERAL node without `cdata` (the update path of an
+    ///   already-registered query): the original subscribe already kicked
+    ///   the catalog, so awaiting readiness is bounded.
+    ///
+    /// If the WARM catalog still cannot resolve the reference and the
+    /// binary carries a compiled schema for the collection, the model
+    /// REGISTERS AT FIRST USE ([`Self::register_first_use`], REN 2 revised)
+    /// and resolution retries against the authoritative rows fed by the
+    /// response. Only when that is impossible or refused does the
+    /// anticipated-collection rule (RFC 5.3) classify the miss for the
+    /// caller to defer or answer empty.
+    ///
+    /// Any non-`UnknownProperty` error, or a remaining `UnknownProperty`
+    /// that classification does not soften (a real unknown reference),
+    /// propagates without waiting (fail closed, AC5).
+    pub async fn resolve_selection_deferred(
+        &self,
+        node: &crate::node::Node<SE, PA>,
+        cdata: Option<&PA::ContextData>,
+        collection: &CollectionId,
+        selection: &Selection,
+    ) -> Result<Selection, PropertyError> {
         match self.resolve_selection(collection, selection) {
             Ok(resolved) => Ok(resolved),
             Err(PropertyError::UnknownProperty { collection: c, name }) => {
-                if self.is_catalog_ready() {
-                    // Catalog is warm and still cannot resolve it: a real
-                    // unknown reference. Fail closed.
-                    return Err(PropertyError::UnknownProperty { collection: c, name });
+                if !self.is_catalog_ready() {
+                    if self.is_durable() {
+                        // The storage warm is in flight and always completes.
+                        self.wait_catalog_ready().await;
+                    } else if let Some(cdata) = cdata {
+                        self.ensure_subscribed(cdata.clone(), node).await;
+                        if !self.is_catalog_ready() {
+                            // The kick could not warm the catalog (offline or
+                            // subscribe failure). First-use registration may
+                            // still succeed -- it needs a durable peer, not a
+                            // working subscription -- and its response feeds
+                            // the map directly. Otherwise fail closed: with a
+                            // cold catalog nothing can be proven about the
+                            // collection.
+                            if self.register_first_use(node, Some(cdata), collection).await {
+                                return match self.resolve_selection(collection, selection) {
+                                    Err(PropertyError::UnknownProperty { collection: c, name }) => {
+                                        Err(self.classify_unknown(collection, c, name))
+                                    }
+                                    other => other,
+                                };
+                            }
+                            return Err(PropertyError::UnknownProperty { collection: c, name });
+                        }
+                    } else {
+                        self.wait_catalog_ready().await;
+                    }
                 }
-                // Data may have outrun metadata: wait for the catalog to warm,
-                // then retry exactly once.
-                self.wait_catalog_ready().await;
-                self.resolve_selection(collection, selection)
+                match self.resolve_selection(collection, selection) {
+                    Err(PropertyError::UnknownProperty { collection: c, name }) => {
+                        // Warm catalog, still unresolvable. First-use
+                        // registration (REN 2 revised, plan decision 25b): a
+                        // compiled model registers at first use -- an
+                        // idempotent upsert that no-ops (zero events, policy
+                        // verb skipped) when the catalog already carries the
+                        // schema -- so a replica lagging the authority learns
+                        // the rows synchronously from the response instead of
+                        // misclassifying the collection as anticipated. If no
+                        // registration is possible (no cdata, no compiled
+                        // schema, already ensured, denied, offline), classify:
+                        // a real unknown reference fails closed; an
+                        // anticipated unregistered collection is the caller's
+                        // to defer or answer empty.
+                        if self.register_first_use(node, cdata, collection).await {
+                            return match self.resolve_selection(collection, selection) {
+                                Err(PropertyError::UnknownProperty { collection: c, name }) => {
+                                    Err(self.classify_unknown(collection, c, name))
+                                }
+                                other => other,
+                            };
+                        }
+                        Err(self.classify_unknown(collection, c, name))
+                    }
+                    other => other,
+                }
             }
             Err(other) => Err(other),
+        }
+    }
+
+    /// Attempt first-use registration of `collection`'s compiled schema
+    /// (rev 4 + REN 2 revision: reads may trigger the idempotent
+    /// registration upsert; an existing schema is a no-op plan that emits
+    /// nothing and skips the policy verb). Returns true only when a
+    /// registration ran and the map was fed, so the caller should
+    /// re-resolve. Returns false when no attempt applies (no cdata on this
+    /// path, no compiled schema, or the collection is already ensured this
+    /// process) or the attempt failed (policy denial, no durable peer) --
+    /// those fall back to the anticipated-collection deferral semantics.
+    async fn register_first_use(
+        &self,
+        node: &crate::node::Node<SE, PA>,
+        cdata: Option<&PA::ContextData>,
+        collection: &CollectionId,
+    ) -> bool {
+        let Some(cdata) = cdata else { return false };
+        let Some(schema) = self.unensured_schema_for(collection.as_str()) else { return false };
+        match self.ensure_registered(node, cdata, schema).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("first-use registration of '{}' failed; deferral semantics apply: {}", collection, e);
+                false
+            }
+        }
+    }
+
+    /// Classify an `UnknownProperty` from a WARM catalog (rev 4, RFC 5.3):
+    /// if the queried collection has no model in the catalog but this
+    /// binary carries a compiled schema for it, the schema is ANTICIPATED
+    /// and merely unregistered -- and an unregistered collection provably
+    /// holds no entities (creation requires registration first), so callers
+    /// can answer a fetch with an empty result or defer a live query until
+    /// the collection registers. Anything else is a genuinely unresolvable
+    /// reference: fail closed (AC5).
+    fn classify_unknown(&self, collection: &CollectionId, c: String, name: String) -> PropertyError {
+        if self.model_by_collection(collection.as_str()).is_none() && self.has_compiled(collection.as_str()) {
+            PropertyError::UnregisteredCollection { collection: c }
+        } else {
+            PropertyError::UnknownProperty { collection: c, name }
         }
     }
 

@@ -6,16 +6,17 @@
 //!
 //! - WIRE (a registration request): `ModelDescriptor` / `PropertyDescriptor`
 //!   / `MembershipDescriptor` (ankurah-proto). Language-agnostic, id-free
-//!   except explicit bindings; the durable executor derives ids from them.
+//!   except explicit bindings; the durable executor allocates or resolves
+//!   ids for them and returns the resolved definitions
+//!   (`SchemaRegistered`).
 //! - PARSED CATALOG (the replicated entities, projected into the in-memory
 //!   map): `ModelDef` / `PropertyDef` / `MembershipDef` ([`catalog`]). The
-//!   definitive schema; keyed by derived entity ids.
+//!   definitive schema; keyed by the allocated entity ids.
 //! - COMPILED LOCAL (one binary's `derive(Model)` output): [`ModelSchema`] /
 //!   [`FieldSchema`] ([`local`]). A static, per-binary BINDING to the
 //!   catalog, never the definitive schema (RFC section 3).
 
 pub mod catalog;
-pub mod genesis;
 pub mod local;
 pub mod registration;
 pub mod resolve;

@@ -222,7 +222,12 @@ impl WatcherSet {
                 }
             }
             Predicate::False => {
-                unimplemented!("Not sure how to implement this")
+                // Matches nothing, ever: no index or wildcard watcher can make
+                // an entity enter or leave the resultset, so Add installs
+                // nothing and Remove has nothing to tear down. The rev-4
+                // placeholder activation (subscribe-before-create, RFC 5.3)
+                // registers queries with this predicate until the collection
+                // registers and the real selection swaps in.
             }
             // Placeholder should be transformed before reaching this point
             Predicate::Placeholder => {
