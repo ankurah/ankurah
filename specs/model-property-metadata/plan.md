@@ -678,8 +678,15 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     per event mid-commit, where creation-ness must be
     reverse-engineered from is_entity_create + collection; the
     executor holds the answer for free at exactly the decision point.
-    Refusal fails the whole registration (all-or-nothing, matching
-    the single commit_remote_transaction); check_event still gates
-    every emitted event underneath (defense in depth); sync, matching
-    check_event. Registration-scoped: the broader per-property policy
-    surface stays deferred to the #264/#274 consolidated design.
+    Refusal fails the whole registration before anything is emitted;
+    check_event still gates every emitted event underneath (defense in
+    depth) -- individually, not transactionally: a mid-batch event
+    denial leaves earlier catalog events durable (maintainer ruling
+    2026-07-06: registration need not be atomic; the allocator's
+    storage-checked lookups keep identity convergent across partials;
+    #313 tracks the transactional upgrade). The executor also requires
+    can_access_collection on every collection a request names (second
+    2026-07-06 ruling: the verb-skipped no-op upsert must not serve as
+    an existence oracle). Sync, matching check_event.
+    Registration-scoped: the broader per-property policy surface stays
+    deferred to the #264/#274 consolidated design.

@@ -110,10 +110,15 @@ DONE: PR #306; decision record posted on #294.
       (tests/tests/catalog_map.rs, 6 tests incl. rename re-indexing and
       ephemeral live updates).
 - [ ] StorageEngine::list_collections overrides for postgres, sqlite,
-      and IndexedDB (default is empty, so a RESTARTING durable node on
-      those engines currently warms cold and relies on live updates
-      only; sled is covered). Small, engine-local; fits Phase C or
-      earlier.
+      and IndexedDB (#310; the default is empty and sled is the only
+      override). Until they land, a RESTARTING durable node on those
+      engines warms the catalog map LAZILY. Identity stays safe
+      regardless: the allocator double-checks durable storage on every
+      map miss (registration.rs *_lookup_checked, added after external
+      review found the restart double-allocation hazard). What the
+      overrides still buy: eager startup warm, and scanning existing
+      catalog trees without materializing empty ones. Small,
+      engine-local; fits Phase C or earlier.
 
 ## 5. LWW v2 / state 0xA2
 

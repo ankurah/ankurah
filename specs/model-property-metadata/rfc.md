@@ -8,19 +8,22 @@ operation executed by durable nodes; catalog protection is enforced
 receiver-side and structurally; the data contract is id-keyed from the
 FIRST landing, which promotes #294 to Phase 0 of the ladder (sections 4,
 5.2, 5.3, 5.5, 9).
-Rev 4 (maintainer ruling, 2026-07-06; ratification pending on #289): the
-IDENTITY PLANE is redesigned. Deterministic derivation, the frozen genesis
-encoder, genesis self-certification, and the anchor apparatus are REMOVED;
-the durable node ALLOCATES true EntityIds (real ULIDs) on first sighting,
-via an upsert-by-current-name RegisterSchema whose response returns the
+Rev 4 (maintainer ruling 2026-07-06; RATIFIED same day on #289 after the
+full design walkthrough, and IMPLEMENTED on PR #307): the IDENTITY PLANE
+is redesigned. Deterministic derivation, the frozen genesis encoder,
+genesis self-certification, and the anchor apparatus are REMOVED; the
+durable node ALLOCATES true EntityIds (real ULIDs) on first sighting, via
+an upsert-by-current-name RegisterSchema whose response returns the
 allocated definitions (sections 3, 4, 5.1, 5.2, 5.8). The data plane (LWW
 v2/0xA2, binding, read rules, resolution, protocol v2, catalog protection)
-is unchanged. Originally: DRAFT for review on #289. Scope agreed 2026-07-05: each model gets its
-own defining entity id, and each property gets its own defining entity id;
-model and property metadata become first-class, replicated entities rather
-than compile-time-only facts. This document decides the design axes and
-proposes a phased landing order. Implementation is expressly out of scope
-until the direction is signed off on #289.
+is unchanged. Two same-day follow-on rulings are folded into 5.2/5.3/5.7:
+reads register at first use, and unresolvable references FAIL LOUD
+(25b second ruling; the defer-empty draft is superseded).
+Originally: DRAFT for review on #289. Scope agreed 2026-07-05: each model
+gets its own defining entity id, and each property gets its own defining
+entity id; model and property metadata become first-class, replicated
+entities rather than compile-time-only facts. This document decides the
+design axes and proposes a phased landing order.
 
 Medium and convention: #289 asks for "a design doc in specs/ following the
 phase-2 RFC conventions", and the phase-2 convention files strategy in RFC
@@ -461,12 +464,17 @@ all. A receiving durable node rejects any CommitTransaction event targeting
 them outright, regardless of the sender's software version; the only
 mutation path is the registration operation (5.2), which the durable node
 policy-checks and executes itself. Catalog events replicating between
-peers are trusted the way every other event is: they originate from the
-registration executor on the allocating durable node, pass policy there,
-and relay through ordinary channels. Rev 4 deleted the content
+peers are trusted FROM THE SERVING PEER the way every other served event
+is: the write ban covers the transaction paths, while the
+subscription/delta ingest paths carry no allocator-identity check -- in
+the single-allocator topology the serving durable IS the allocator, so
+the trust boundary is the peering relationship itself, and
+allocator-identity enforcement for multi-peer topologies rides #309's
+routing work (validate_received_event/state are the per-agent hooks for
+deployments that want to gate ingest earlier). Rev 4 deleted the content
 self-certification that rev 3 attached to genesis events (with derivation
 gone there is nothing to recompute); single-allocator authority plus the
-structural write ban replaces it. The `_ankurah_` prefix is
+transaction-path write ban replaces it. The `_ankurah_` prefix is
 reserved and rejected for user-model collection ids at derive time and at
 CollectionSet::get. Because enforcement sits on the receiving durable node,
 mixed-fleet safety is a deployment ORDER (upgrade durable nodes first), not
@@ -987,8 +995,17 @@ performing its own catalog lookup (the request-level check_request cannot
 know existence, and check_event fires per event mid-commit, where
 creation-ness must be reverse-engineered). Default implementation
 allows, so existing agents are unaffected; refusal fails the whole
-registration (all-or-nothing, matching the single commit); check_event
-still gates every emitted event underneath, as defense in depth. The
+registration before anything is emitted; check_event still gates every
+emitted event underneath, as defense in depth -- individually, not
+transactionally: an agent that allows the plan but denies a constituent
+event aborts the remainder and leaves earlier catalog events durable
+(maintainer ruling 2026-07-06: registration need not be atomic; the
+allocator's storage-checked lookups keep identity convergent across such
+partials, and #313 tracks the transactional upgrade). Schema knowledge
+follows collection access: the executor requires can_access_collection
+for every collection a request names, before any lookup, so the
+verb-skipped no-op upsert cannot serve as an existence oracle for
+principals that may not read the collection (second 2026-07-06 ruling). The
 plan type is core-side and never crosses the wire; (c) catalog
 collections are protected (section 4); (d) the
 PolicyAgent surface for per-property gates should be designed ONCE together

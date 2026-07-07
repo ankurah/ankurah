@@ -486,14 +486,21 @@ async fn ephemeral_node_refuses_execution() -> anyhow::Result<()> {
 
 // -- the exists-aware policy verb (RFC 5.7, plan decision 26) ---------------
 
-/// A PermissiveAgent clone that refuses schema registrations whose plan
-/// CREATES a model for the "forbidden" collection: the object-based
-/// discrimination style, judged on the executor's resolved plan.
-#[derive(Clone)]
-struct DenyForbiddenCreates;
+/// One configurable PermissiveAgent clone driving every policy-verb test in
+/// this file. It is permissive everywhere except the three customization
+/// points the tests exercise, each an optional hook closure: a schema plan
+/// gate, a per-event gate, and a collection-access gate. A `Default` (all
+/// hooks unset) instance is fully permissive -- the inert client side.
+#[derive(Clone, Default)]
+struct ProbeAgent {
+    on_schema_registration:
+        Option<std::sync::Arc<dyn Fn(&ankurah::policy::RegistrationPlan) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
+    on_event: Option<std::sync::Arc<dyn Fn(&proto::Event) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
+    on_collection_access: Option<std::sync::Arc<dyn Fn(&proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied> + Send + Sync>>,
+}
 
 #[async_trait::async_trait]
-impl ankurah::policy::PolicyAgent for DenyForbiddenCreates {
+impl ankurah::policy::PolicyAgent for ProbeAgent {
     type ContextData = &'static ankurah::policy::DefaultContext;
 
     fn sign_request<SE: ankurah::core::storage::StorageEngine, C>(
@@ -526,8 +533,11 @@ impl ankurah::policy::PolicyAgent for DenyForbiddenCreates {
         _cdata: &Self::ContextData,
         _entity_before: &ankurah::core::entity::Entity,
         _entity_after: &ankurah::core::entity::Entity,
-        _event: &proto::Event,
+        event: &proto::Event,
     ) -> Result<Option<proto::Attestation>, ankurah::policy::AccessDenied> {
+        if let Some(hook) = &self.on_event {
+            hook(event)?;
+        }
         Ok(None)
     }
 
@@ -537,8 +547,8 @@ impl ankurah::policy::PolicyAgent for DenyForbiddenCreates {
         _cdata: &Self::ContextData,
         plan: &ankurah::policy::RegistrationPlan,
     ) -> Result<(), ankurah::policy::AccessDenied> {
-        if plan.creates_models.iter().any(|(_, m)| m.collection == "forbidden") {
-            return Err(ankurah::policy::AccessDenied::ByPolicy("schema definition for 'forbidden' is not writable"));
+        if let Some(hook) = &self.on_schema_registration {
+            hook(plan)?;
         }
         Ok(())
     }
@@ -569,8 +579,11 @@ impl ankurah::policy::PolicyAgent for DenyForbiddenCreates {
         Ok(())
     }
 
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
+    fn can_access_collection<C>(&self, _data: &C, collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
     where C: ankurah::core::util::Iterable<Self::ContextData> {
+        if let Some(hook) = &self.on_collection_access {
+            hook(collection)?;
+        }
         Ok(())
     }
 
@@ -628,9 +641,18 @@ impl ankurah::policy::PolicyAgent for DenyForbiddenCreates {
 /// an unrelated registration on the same node passes.
 #[tokio::test]
 async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
-    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), DenyForbiddenCreates);
+    let deny_forbidden = ProbeAgent {
+        on_schema_registration: Some(std::sync::Arc::new(|plan: &ankurah::policy::RegistrationPlan| {
+            if plan.creates_models.iter().any(|(_, m)| m.collection == "forbidden") {
+                return Err(ankurah::policy::AccessDenied::ByPolicy("schema definition for 'forbidden' is not writable"));
+            }
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_forbidden.clone());
     server.system.create().await?;
-    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), DenyForbiddenCreates);
+    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_forbidden);
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
@@ -649,139 +671,6 @@ async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Counts check_schema_registration invocations; allows everything.
-#[derive(Clone)]
-struct CountingAgent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-#[async_trait::async_trait]
-impl ankurah::policy::PolicyAgent for CountingAgent {
-    type ContextData = &'static ankurah::policy::DefaultContext;
-
-    fn sign_request<SE: ankurah::core::storage::StorageEngine, C>(
-        &self,
-        _node: &ankurah::core::node::NodeInner<SE, Self>,
-        cdata: &C,
-        _request: &proto::NodeRequest,
-    ) -> Result<Vec<proto::AuthData>, ankurah::policy::AccessDenied>
-    where
-        C: ankurah::core::util::Iterable<Self::ContextData>,
-    {
-        Ok(cdata.iterable().map(|_| proto::AuthData(vec![])).collect())
-    }
-
-    async fn check_request<SE: ankurah::core::storage::StorageEngine, A>(
-        &self,
-        _node: &Node<SE, Self>,
-        auth: &A,
-        _request: &proto::NodeRequest,
-    ) -> Result<Vec<Self::ContextData>, ankurah::core::error::ValidationError>
-    where
-        A: ankurah::core::util::Iterable<proto::AuthData> + Send + Sync,
-    {
-        Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
-    }
-
-    fn check_event<SE: ankurah::core::storage::StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _cdata: &Self::ContextData,
-        _entity_before: &ankurah::core::entity::Entity,
-        _entity_after: &ankurah::core::entity::Entity,
-        _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, ankurah::policy::AccessDenied> {
-        Ok(None)
-    }
-
-    fn check_schema_registration<SE: ankurah::core::storage::StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _cdata: &Self::ContextData,
-        _plan: &ankurah::policy::RegistrationPlan,
-    ) -> Result<(), ankurah::policy::AccessDenied> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn validate_received_event<SE: ankurah::core::storage::StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
-        _event: &proto::Attested<proto::Event>,
-    ) -> Result<(), ankurah::policy::AccessDenied> {
-        Ok(())
-    }
-
-    fn attest_state<SE: ankurah::core::storage::StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _state: &proto::EntityState,
-    ) -> Option<proto::Attestation> {
-        None
-    }
-
-    fn validate_received_state<SE: ankurah::core::storage::StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
-        _state: &proto::Attested<proto::EntityState>,
-    ) -> Result<(), ankurah::policy::AccessDenied> {
-        Ok(())
-    }
-
-    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
-    where C: ankurah::core::util::Iterable<Self::ContextData> {
-        Ok(())
-    }
-
-    fn filter_predicate<C>(
-        &self,
-        _data: &C,
-        _collection: &proto::CollectionId,
-        predicate: ankql::ast::Predicate,
-    ) -> Result<ankql::ast::Predicate, ankurah::policy::AccessDenied>
-    where
-        C: ankurah::core::util::Iterable<Self::ContextData>,
-    {
-        Ok(predicate)
-    }
-
-    fn check_read<C>(
-        &self,
-        _data: &C,
-        _id: &proto::EntityId,
-        _collection: &proto::CollectionId,
-        _state: &proto::State,
-    ) -> Result<(), ankurah::policy::AccessDenied>
-    where
-        C: ankurah::core::util::Iterable<Self::ContextData>,
-    {
-        Ok(())
-    }
-
-    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), ankurah::policy::AccessDenied>
-    where C: ankurah::core::util::Iterable<Self::ContextData> {
-        Ok(())
-    }
-
-    fn check_write(
-        &self,
-        _context: &Self::ContextData,
-        _entity: &ankurah::core::entity::Entity,
-        _event: Option<&proto::Event>,
-    ) -> Result<(), ankurah::policy::AccessDenied> {
-        Ok(())
-    }
-
-    fn validate_causal_assertion<SE: ankurah::core::storage::StorageEngine>(
-        &self,
-        _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
-        _head_relation: &proto::CausalAssertion,
-    ) -> Result<(), ankurah::policy::AccessDenied> {
-        Ok(())
-    }
-}
-
 /// The policy verb fires once for a plan with effects and is SKIPPED for a
 /// pure no-op re-registration (REN 2 second ruling: read paths lean on the
 /// upsert's idempotence, so a no-op registration must not consult the
@@ -791,9 +680,19 @@ async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let count = std::sync::Arc::new(AtomicUsize::new(0));
-    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), CountingAgent(count.clone()));
+    let counting = {
+        let count = count.clone();
+        ProbeAgent {
+            on_schema_registration: Some(std::sync::Arc::new(move |_plan: &ankurah::policy::RegistrationPlan| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        }
+    };
+    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), counting.clone());
     server.system.create().await?;
-    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), CountingAgent(count.clone()));
+    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), counting);
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await;
 
@@ -804,6 +703,149 @@ async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
     assert_eq!(count.load(Ordering::SeqCst), 1, "a pure no-op re-registration skips the policy verb");
     assert_eq!(models1[0].id, models2[0].id, "the skipped no-op still returns the same ids");
     assert_eq!(props1[0].id, props2[0].id, "the skipped no-op still returns the same ids");
+
+    Ok(())
+}
+
+/// Rows currently stored for `collection` (allocator-truth assertions).
+async fn count_rows<PA>(node: &Node<SledStorageEngine, PA>, collection: &str) -> anyhow::Result<usize>
+where PA: ankurah::policy::PolicyAgent + Send + Sync + 'static {
+    let storage = node.collections.get(&collection.into()).await?;
+    let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
+    Ok(storage.fetch_states(&selection).await?.len())
+}
+
+/// The stored entity ids for `collection`, for identity-stability pins.
+async fn row_ids<PA>(node: &Node<SledStorageEngine, PA>, collection: &str) -> anyhow::Result<Vec<EntityId>>
+where PA: ankurah::policy::PolicyAgent + Send + Sync + 'static {
+    let storage = node.collections.get(&collection.into()).await?;
+    let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
+    Ok(storage.fetch_states(&selection).await?.into_iter().map(|s| s.payload.entity_id).collect())
+}
+
+/// Duplicate descriptors inside ONE request must coalesce onto a single
+/// allocation (the in-flight tables are consulted before the catalog map,
+/// which only learns this request's ids at the post-commit fold).
+#[tokio::test]
+async fn duplicate_descriptors_in_one_request_do_not_double_allocate() -> anyhow::Result<()> {
+    let (server, client, _conn) = connected_pair().await?;
+
+    let request = proto::NodeRequestBody::RegisterSchema {
+        models: vec![
+            proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None },
+            proto::ModelDescriptor { collection: "album".into(), name: "Album".into(), explicit_id: None },
+        ],
+        properties: vec![property("name", None, "yrs", "string"), property("name", None, "yrs", "string")],
+        memberships: vec![
+            proto::MembershipDescriptor { collection: "album".into(), property: proto::PropertyRef::Name("name".into()), optional: false },
+            proto::MembershipDescriptor { collection: "album".into(), property: proto::PropertyRef::Name("name".into()), optional: false },
+        ],
+    };
+    let (models, properties, memberships) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, request).await?);
+    assert_eq!(models.len(), 1, "duplicate model descriptors coalesce (first occurrence wins)");
+    assert_eq!(properties.len(), 1, "duplicate property descriptors coalesce");
+    assert_eq!(memberships.len(), 1, "duplicate membership descriptors coalesce");
+
+    assert_eq!(count_rows(&server, MODEL).await?, 1, "exactly one model row durable");
+    assert_eq!(count_rows(&server, PROPERTY).await?, 1, "exactly one property row durable");
+    assert_eq!(count_rows(&server, MEMBERSHIP).await?, 1, "exactly one membership row durable");
+
+    Ok(())
+}
+
+/// The commit batch is NOT transactional (maintainer ruling 2026-07-06):
+/// a mid-batch check_event denial leaves earlier catalog events durable.
+/// Identity must survive that: the retry's allocator lookup double-checks
+/// STORAGE on its map miss (the aborted commit skipped the map fold) and
+/// converges on the stored model id instead of re-minting.
+#[tokio::test]
+async fn partial_registration_retry_does_not_double_allocate() -> anyhow::Result<()> {
+    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let deny_property_once = {
+        let armed = armed.clone();
+        ProbeAgent {
+            on_event: Some(std::sync::Arc::new(move |event: &proto::Event| {
+                if event.collection.as_str() == PROPERTY && armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ankurah::policy::AccessDenied::ByPolicy("property event denied once"));
+                }
+                Ok(())
+            })),
+            ..Default::default()
+        }
+    };
+    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_property_once);
+    server.system.create().await?;
+    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), ProbeAgent::default());
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    // First attempt: the model creation commits, then the property event is
+    // denied mid-batch -- a durable partial, and no map fold.
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?, "denied");
+    assert_eq!(count_rows(&server, MODEL).await?, 1, "partial: the model event preceded the denial and is durable");
+    assert_eq!(count_rows(&server, PROPERTY).await?, 0, "the denied property event must not be durable");
+    let stored = row_ids(&server, MODEL).await?;
+
+    // Retry (agent now allows): the map missed the fold, so the allocator's
+    // storage-backed lookup must find the stored model and reuse its id.
+    let (models, properties, memberships) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    assert_eq!(models[0].id, stored[0], "retry converges on the stored model identity (no re-mint)");
+    assert_eq!(count_rows(&server, MODEL).await?, 1, "still exactly one model row after the retry");
+    assert_eq!(count_rows(&server, PROPERTY).await?, 1, "the retry completes the property");
+    assert_eq!(count_rows(&server, MEMBERSHIP).await?, 1, "and the membership");
+    assert_eq!(properties.len(), 1);
+    assert_eq!(memberships.len(), 1);
+
+    Ok(())
+}
+
+/// Schema knowledge follows collection access (RFC 5.7 addendum, ruling
+/// 2026-07-06): the executor requires can_access_collection on every
+/// collection a request names, BEFORE any lookup -- so the verb-skipped
+/// no-op upsert cannot serve as an existence oracle. A denied principal
+/// gets the same refusal whether the collection exists or not.
+#[tokio::test]
+async fn noop_probe_requires_collection_access() -> anyhow::Result<()> {
+    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let deny_secret = {
+        let armed = armed.clone();
+        ProbeAgent {
+            on_collection_access: Some(std::sync::Arc::new(move |collection: &proto::CollectionId| {
+                if armed.load(std::sync::atomic::Ordering::SeqCst) && collection.as_str().starts_with("secret") {
+                    return Err(ankurah::policy::AccessDenied::ByPolicy("no access to secret collections"));
+                }
+                Ok(())
+            })),
+            ..Default::default()
+        }
+    };
+    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_secret);
+    server.system.create().await?;
+    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), ProbeAgent::default());
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    // Setup (gate disarmed): "secret" gets registered legitimately.
+    let secret = || proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "secret".into(), name: "Secret".into(), explicit_id: None }],
+        properties: vec![],
+        memberships: vec![],
+    };
+    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, secret()).await?);
+
+    // Gate armed: the no-op probe of the EXISTING collection is refused
+    // before any lookup -- no ids escape.
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, secret()).await?, "Access denied");
+
+    // And a NEVER-registered collection under the same rule gets the same
+    // refusal shape: existence is not distinguishable.
+    let unseen = proto::NodeRequestBody::RegisterSchema {
+        models: vec![proto::ModelDescriptor { collection: "secretx".into(), name: "SecretX".into(), explicit_id: None }],
+        properties: vec![],
+        memberships: vec![],
+    };
+    expect_error(client.request(server.id, &DEFAULT_CONTEXT, unseen).await?, "Access denied");
 
     Ok(())
 }

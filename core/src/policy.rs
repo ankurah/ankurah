@@ -163,9 +163,14 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// what will be updated, what already exists. Agents may discriminate
     /// on the principal (`cdata`: who may define schema) or on the object
     /// (the planned definitions themselves); both styles are first-class.
-    /// Refusal fails the whole registration (all-or-nothing, matching the
-    /// single commit). Every emitted event still passes [`Self::check_event`]
-    /// afterwards. The default allows.
+    /// Refusal fails the whole registration before anything is emitted.
+    /// Every emitted event still passes [`Self::check_event`] afterwards,
+    /// INDIVIDUALLY: the commit batch is not transactional, so an agent
+    /// that allows the plan but denies a constituent event aborts the
+    /// remainder and leaves earlier catalog events durable (accepted by
+    /// maintainer ruling 2026-07-06; the allocator's storage-checked
+    /// lookups keep identity convergent across such partials, and #313
+    /// tracks the transactional upgrade). The default allows.
     fn check_schema_registration<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,

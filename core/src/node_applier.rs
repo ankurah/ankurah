@@ -86,13 +86,15 @@ impl NodeApplier {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
             let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
-            // Relayed catalog events are trusted the way every other event
-            // is (RFC section 4, rev 4): they originate from the allocating
-            // durable node's policy-checked registration executor, and the
-            // structural write ban (receivers reject ordinary transactions
-            // into _ankurah_*) is the protection. The rev 3 content
-            // self-certification died with derivation: there is no
-            // derivation to recompute against an allocated id.
+            // Relayed catalog events are trusted FROM THE SERVING PEER the
+            // way every other served event is (RFC section 4, rev 4). The
+            // structural write ban covers the transaction paths
+            // (CommitTransaction and local commits); this ingest path has
+            // no allocator-identity check -- in the single-allocator
+            // topology the serving durable IS the allocator, and
+            // allocator-identity enforcement for multi-peer topologies is
+            // #309's routing work. validate_received_event is the
+            // per-agent hook if a deployment wants to gate this earlier.
             node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)?;
             event_getter.stage_event(attested_event.payload.clone());
             attested_events.push(attested_event);

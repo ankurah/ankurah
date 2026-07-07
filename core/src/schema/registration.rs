@@ -95,9 +95,38 @@ where
         if self.system.root().is_none() {
             return Err(RegistrationError::SystemNotReady);
         }
-        // The catalog map is the executor's lookup source; the storage warm
-        // must have landed before the first lookup, or a cold-started
-        // allocator could double-allocate existing definitions.
+        // Schema knowledge follows collection access (RFC 5.7 addendum,
+        // maintainer ruling 2026-07-06): every collection this request
+        // names must pass can_access_collection for the requesting
+        // principal. Without this, a catalog-unprivileged principal could
+        // use the no-op upsert -- which skips the policy verb by design --
+        // as an existence oracle and harvest definition ids from the
+        // response. Denied access and a denied registration are
+        // indistinguishable to the requester, so the probe learns nothing.
+        {
+            let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            for m in &models {
+                named.insert(m.collection.as_str());
+            }
+            for p in &properties {
+                named.insert(p.minting_collection.as_str());
+                if let Some(tc) = &p.target_collection {
+                    named.insert(tc.as_str());
+                }
+            }
+            for ms in &memberships {
+                named.insert(ms.collection.as_str());
+            }
+            for collection in named {
+                self.policy_agent.can_access_collection(cdata, &CollectionId::fixed_name(collection))?;
+            }
+        }
+        // The catalog map is the executor's primary lookup source; wait for
+        // the warm so the common case looks up against a full map. The map
+        // is NOT trusted alone on a miss: every miss double-checks durable
+        // storage before minting (see the *_lookup_checked helpers), so a
+        // lagging or cold map (partial-commit abort skipped the fold, or a
+        // lazily-warming engine, #310) can never fork identity.
         self.catalog.wait_catalog_ready().await;
 
         // RFC 5.1 executor discipline: the whole upsert -- lookups,
@@ -118,6 +147,13 @@ where
         let mut model_ids: BTreeMap<String, EntityId> = BTreeMap::new();
         let mut out_models: Vec<RegisteredModel> = Vec::new();
         for m in &models {
+            // A duplicate descriptor in ONE request must not re-mint: the
+            // catalog map only learns this request's allocations at the
+            // post-commit fold, so the in-flight table is the authority for
+            // keys this request already resolved. First occurrence wins.
+            if model_ids.contains_key(&m.collection) {
+                continue;
+            }
             let (model_id, resolved_name) = match m.explicit_id {
                 Some(id) => {
                     // RFC 5.9: verify, never mint, never mutate the bound
@@ -127,7 +163,7 @@ where
                     plan.existing.push(id);
                     (id, name)
                 }
-                None => match self.catalog.model_by_collection(&m.collection) {
+                None => match self.model_lookup_checked(&m.collection).await? {
                     Some(def) => {
                         // Display names follow the most recent registration
                         // (plan decision 18); emit only on difference.
@@ -173,7 +209,7 @@ where
                 let c: &str = $collection;
                 match model_ids.get(c) {
                     Some(id) => *id,
-                    None => match self.catalog.model_by_collection(c) {
+                    None => match self.model_lookup_checked(c).await? {
                         Some(def) => {
                             model_ids.insert(c.to_string(), def.id);
                             def.id
@@ -200,6 +236,11 @@ where
         let mut property_ids: BTreeMap<(String, String), EntityId> = BTreeMap::new();
         let mut out_properties: Vec<RegisteredProperty> = Vec::new();
         for p in &properties {
+            // Duplicate descriptor in one request: first occurrence wins
+            // (same in-flight rule as models).
+            if property_ids.contains_key(&(p.minting_collection.clone(), p.name.clone())) {
+                continue;
+            }
             match p.explicit_id {
                 Some(id) => {
                     // RFC 5.9: verify (backend, value_type), never mint. The
@@ -229,13 +270,13 @@ where
                 None => None,
             };
 
-            let current = self.catalog.property_by_key(&scope, &p.name, &p.backend, &p.value_type);
+            let current = self.property_lookup_checked(&scope, &p.name, &p.backend, &p.value_type).await?;
 
             // RFC 5.8 rename-hint pre-pass, GUARDED: only when the
             // current-name lookup misses and the hinted lookup hits. The
             // hint is an ordinary name follow-up; the property keeps its id.
             let renamed = match (&current, &p.renamed_from) {
-                (None, Some(old)) => self.catalog.property_by_key(&scope, old, &p.backend, &p.value_type),
+                (None, Some(old)) => self.property_lookup_checked(&scope, old, &p.backend, &p.value_type).await?,
                 _ => None,
             };
 
@@ -329,12 +370,13 @@ where
 
         // -- memberships: looked up by (model, property) ---------------------
         let mut out_memberships: Vec<RegisteredMembership> = Vec::new();
+        let mut membership_seen: Vec<(EntityId, EntityId)> = Vec::new();
         for ms in &memberships {
             let model_id = match model_ids.get(&ms.collection) {
                 Some(id) => *id,
                 None => self
-                    .catalog
-                    .model_by_collection(&ms.collection)
+                    .model_lookup_checked(&ms.collection)
+                    .await?
                     .map(|def| def.id)
                     .ok_or_else(|| RegistrationError::UnknownMintingCollection(ms.collection.clone()))?,
             };
@@ -344,8 +386,13 @@ where
                     .get(&(ms.collection.clone(), name.clone()))
                     .ok_or_else(|| RegistrationError::UnresolvedPropertyRef(name.clone(), ms.collection.clone()))?,
             };
+            // Duplicate descriptor in one request: first occurrence wins.
+            if membership_seen.contains(&(model_id, property_id)) {
+                continue;
+            }
+            membership_seen.push((model_id, property_id));
 
-            let membership_id = match self.catalog.membership(&model_id, &property_id) {
+            let membership_id = match self.membership_lookup_checked(&model_id, &property_id).await? {
                 Some(def) => {
                     if def.optional != Some(ms.optional) {
                         let (_, head) = self
@@ -391,7 +438,15 @@ where
         }
 
         // RFC 5.7 / plan decision 26: the exists-aware policy gate judges
-        // the resolved plan before anything is emitted. All-or-nothing.
+        // the resolved plan before anything is emitted; refusal fails the
+        // request before any write. Underneath, check_event still gates
+        // each event individually inside the commit pipeline, and the batch
+        // is NOT transactional: a mid-batch event denial leaves the earlier
+        // catalog events durable (maintainer ruling 2026-07-06: registration
+        // does not need to be atomic; #313 tracks the transactional
+        // upgrade). Identity survives such partials because every allocator
+        // lookup double-checks storage on a map miss, so a retry converges
+        // on the stored ids instead of re-minting.
         self.policy_agent.check_schema_registration(self, cdata, &plan)?;
 
         // The ordinary remote-commit pipeline: policy check (check_event),
@@ -404,6 +459,127 @@ where
         self.catalog.upsert_registered(&out_models, &out_properties, &out_memberships);
 
         Ok((out_models, out_properties, out_memberships))
+    }
+
+    /// Allocator lookup for a model: the catalog map first, then durable
+    /// STORAGE on a miss (rev 4 hardening). The in-memory map can lag
+    /// durable truth -- a partial-commit abort skips the post-commit fold,
+    /// and non-sled engines warm lazily (#310) -- and minting from a cold
+    /// map would fork identity for a key that already exists. A storage hit
+    /// is folded into the map so the rest of the request (and the next one)
+    /// sees it; ordinary first sightings miss both and pay one bounded
+    /// fetch under the allocator mutex.
+    async fn model_lookup_checked(&self, collection: &str) -> Result<Option<super::catalog::ModelDef>, RetrievalError> {
+        if let Some(def) = self.catalog.model_by_collection(collection) {
+            return Ok(Some(def));
+        }
+        let Some((id, values)) = self.catalog_row_by_key(model_collection(), field_eq_str("collection", collection)).await? else {
+            return Ok(None);
+        };
+        let def = super::catalog::ModelDef {
+            id,
+            collection: collection.to_string(),
+            name: string_field(&values, "name").unwrap_or_else(|| collection.to_string()),
+        };
+        self.catalog.upsert_registered(
+            &[RegisteredModel { id: def.id, collection: def.collection.clone(), name: def.name.clone() }],
+            &[],
+            &[],
+        );
+        Ok(Some(def))
+    }
+
+    /// Allocator lookup for a property by its full key (model, name,
+    /// backend, value_type): map first, storage on a miss (see
+    /// [`Self::model_lookup_checked`]).
+    async fn property_lookup_checked(
+        &self,
+        model: &EntityId,
+        name: &str,
+        backend: &str,
+        value_type: &str,
+    ) -> Result<Option<super::catalog::PropertyDef>, RetrievalError> {
+        if let Some(def) = self.catalog.property_by_key(model, name, backend, value_type) {
+            return Ok(Some(def));
+        }
+        let predicate = and(
+            and(field_eq_id("minted_for", *model), field_eq_str("name", name)),
+            and(field_eq_str("backend", backend), field_eq_str("value_type", value_type)),
+        );
+        let Some((id, values)) = self.catalog_row_by_key(property_collection(), predicate).await? else {
+            return Ok(None);
+        };
+        let def = super::catalog::PropertyDef {
+            id,
+            minted_for: Some(*model),
+            name: name.to_string(),
+            backend: backend.to_string(),
+            value_type: value_type.to_string(),
+            target_model: entity_id_field(&values, "target_model"),
+        };
+        self.catalog.upsert_registered(
+            &[],
+            &[RegisteredProperty {
+                id: def.id,
+                model: *model,
+                name: def.name.clone(),
+                backend: def.backend.clone(),
+                value_type: def.value_type.clone(),
+                target_model: def.target_model,
+            }],
+            &[],
+        );
+        Ok(Some(def))
+    }
+
+    /// Allocator lookup for a membership by (model, property): map first,
+    /// storage on a miss (see [`Self::model_lookup_checked`]).
+    async fn membership_lookup_checked(
+        &self,
+        model: &EntityId,
+        property: &EntityId,
+    ) -> Result<Option<super::catalog::MembershipDef>, RetrievalError> {
+        if let Some(def) = self.catalog.membership(model, property) {
+            return Ok(Some(def));
+        }
+        let predicate = and(field_eq_id("model", *model), field_eq_id("property", *property));
+        let Some((id, values)) = self.catalog_row_by_key(model_property_collection(), predicate).await? else {
+            return Ok(None);
+        };
+        let optional = bool_field(&values, "optional");
+        let def = super::catalog::MembershipDef { id, model: *model, property: *property, optional };
+        // Fold only when the flag is present: a flag-less row is TREATED as
+        // optional (never defaulted, catalog.rs MembershipDef), and the
+        // executor's diff arm emits the repairing follow-up either way.
+        if let Some(optional) = optional {
+            self.catalog.upsert_registered(&[], &[], &[RegisteredMembership { id: def.id, model: *model, property: *property, optional }]);
+        }
+        Ok(Some(def))
+    }
+
+    /// Fetch the catalog row matching `predicate` straight from durable
+    /// storage (no map, no policy: allocator-internal, under the mutex).
+    /// Returns the lowest entity id on multiple matches so repeated calls
+    /// are deterministic even over historical duplicates.
+    async fn catalog_row_by_key(
+        &self,
+        collection: CollectionId,
+        predicate: ankql::ast::Predicate,
+    ) -> Result<Option<(EntityId, BTreeMap<String, Option<Value>>)>, RetrievalError> {
+        let storage = self.collections.get(&collection).await?;
+        let selection = ankql::ast::Selection { predicate, order_by: None, limit: None };
+        let mut best: Option<(EntityId, BTreeMap<String, Option<Value>>)> = None;
+        for state in storage.fetch_states(&selection).await? {
+            let id = state.payload.entity_id;
+            if best.as_ref().is_some_and(|(b, _)| *b <= id) {
+                continue;
+            }
+            let Some(buffer) = state.payload.state.state_buffers.0.get("lww") else {
+                continue;
+            };
+            best = Some((id, LWWBackend::from_state_buffer(buffer)?.property_values()));
+        }
+        Ok(best)
     }
 
     /// RFC 5.9: an explicit binding references a definition authored
@@ -493,6 +669,33 @@ fn string_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option
         _ => None,
     }
 }
+
+fn bool_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<bool> {
+    match values.get(field) {
+        Some(Some(Value::Bool(b))) => Some(*b),
+        _ => None,
+    }
+}
+
+// -- allocator storage-lookup predicate builders ------------------------------
+
+fn field_eq_str(field: &str, value: &str) -> ankql::ast::Predicate {
+    ankql::ast::Predicate::Comparison {
+        left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr { steps: vec![field.to_string()] })),
+        operator: ankql::ast::ComparisonOperator::Equal,
+        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::String(value.to_string()))),
+    }
+}
+
+fn field_eq_id(field: &str, id: EntityId) -> ankql::ast::Predicate {
+    ankql::ast::Predicate::Comparison {
+        left: Box::new(ankql::ast::Expr::Path(ankql::ast::PathExpr { steps: vec![field.to_string()] })),
+        operator: ankql::ast::ComparisonOperator::Equal,
+        right: Box::new(ankql::ast::Expr::Literal(ankql::ast::Literal::EntityId(id.to_ulid()))),
+    }
+}
+
+fn and(a: ankql::ast::Predicate, b: ankql::ast::Predicate) -> ankql::ast::Predicate { ankql::ast::Predicate::And(Box::new(a), Box::new(b)) }
 
 fn entity_id_field(values: &BTreeMap<String, Option<Value>>, field: &str) -> Option<EntityId> {
     match values.get(field) {
