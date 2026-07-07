@@ -2907,6 +2907,25 @@ mod comparison_property {
                 if !verdict_matches(&expected, &result.relation) {
                     panic!("{}", artifact_line(dag_seed, &subject_ids, &comparison_ids, &expected, &result.relation));
                 }
+
+                // Chain COMPLETENESS for grounded StrictDescends verdicts
+                // (REV 4): gap replay applies the chain's events, so every
+                // event strictly between the comparison cover and the
+                // subject must be in it. The chain may carry extras the
+                // head already incorporates (BFS overshoot); the layer
+                // partition makes those harmless, so only completeness is
+                // asserted.
+                if let AbstractCausalRelation::StrictDescends { chain } = &result.relation {
+                    let chain_set: BTreeSet<EventId> = chain.iter().cloned().collect();
+                    let s_cover = ancestry(&parents_map, &subject_ids);
+                    let c_cover = ancestry(&parents_map, &comparison_ids);
+                    for id in s_cover.difference(&c_cover) {
+                        assert!(
+                            chain_set.contains(id),
+                            "ORACLEFAIL chain incomplete dag_seed={dag_seed} missing={id:?} subject={subject_ids:?} comparison={comparison_ids:?} chain={chain:?} reproduce=\"ORACLE_SEED_BASE={dag_seed} ORACLE_SEEDS=1 cargo test -p ankurah-core --lib event_dag::tests::comparison_property::randomized_dags_match_reachability_oracle -- --exact --nocapture\""
+                        );
+                    }
+                }
             }
         }
     }

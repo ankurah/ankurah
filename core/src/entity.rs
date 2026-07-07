@@ -225,6 +225,78 @@ impl Entity {
         }
     }
 
+    /// Apply an accumulated comparison's layers from the meet forward and
+    /// supersede the meet's head entries with `new_tip`, atomically under one
+    /// state lock. Shared by apply_event's DivergedSince arm (true
+    /// concurrency: both sides advanced since the meet) and its StrictDescends
+    /// gap-replay arm (linear history the resident never incorporated), which
+    /// is the degenerate case with an empty divergent branch and meet equal to
+    /// the current head. Layers partition each generation into to_apply and
+    /// already_applied against the current head's ancestry, so a chain that
+    /// includes already-incorporated events costs only the walk.
+    ///
+    /// Returns Ok(false) when the head moved between the comparison and the
+    /// lock; the caller re-compares and retries (the TOCTOU discipline).
+    async fn apply_accumulated_layers<G: GetEvents + Send + Sync>(
+        &self,
+        mut layers: crate::event_dag::layers::EventLayers<G>,
+        meet: &[EventId],
+        expected_head: &mut Clock,
+        new_tip: EventId,
+    ) -> Result<bool, MutationError> {
+        let mut applied_layers: Vec<crate::event_dag::EventLayer> = Vec::new();
+
+        // Collect all layers first, then apply under lock
+        let mut all_layers = Vec::new();
+        while let Some(layer) = layers.next().await? {
+            all_layers.push(layer);
+        }
+
+        // Atomic update: apply layers and augment head under single lock
+        {
+            let mut state = self.state.write().unwrap();
+            // Re-check that head hasn't changed since lineage comparison
+            if state.head != *expected_head {
+                warn!("Head changed during lineage comparison, retrying...");
+                *expected_head = state.head.clone();
+                return Ok(false);
+            }
+
+            // Apply layers in causal order
+            for layer in all_layers {
+                // Check for backends that first appear in this layer's to_apply events
+                for evt in &layer.to_apply {
+                    for (backend_name, _) in evt.operations.iter() {
+                        if !state.backends.contains_key(backend_name) {
+                            let backend = backend_from_string(backend_name, None)?;
+                            // Replay earlier layers for this newly-created backend
+                            for earlier in &applied_layers {
+                                backend.apply_layer(earlier)?;
+                            }
+                            state.backends.insert(backend_name.clone(), backend);
+                        }
+                    }
+                }
+
+                // Apply to all backends
+                for (_backend_name, backend) in state.backends.iter() {
+                    backend.apply_layer(&layer)?;
+                }
+                applied_layers.push(layer);
+            }
+
+            // Update head: remove superseded tips, add the new event. The
+            // new tip extends tips in its parent clock (the meet); any of
+            // those in the current head are now superseded.
+            for parent_id in meet {
+                state.head.remove(parent_id);
+            }
+            state.head.insert(new_tip);
+        }
+        self.broadcast.send(());
+        Ok(true)
+    }
+
     /// Attempt to apply an event to the entity
     #[cfg_attr(feature = "instrument", tracing::instrument(level="debug", skip_all, fields(entity = %self, event = %event)))]
     pub async fn apply_event<E>(&self, getter: &E, event: &Event) -> Result<bool, MutationError>
@@ -296,10 +368,40 @@ impl Entity {
                     debug!("Equal - skip");
                     return Ok(false);
                 }
-                AbstractCausalRelation::StrictDescends { .. } => {
+                AbstractCausalRelation::StrictDescends { ref chain } => {
                     debug!("Descends - apply (attempt {})", attempt + 1);
-                    let new_head: Clock = event.id().into();
                     let event_id = event.id();
+                    // Verdict-driven gap replay (R10). A chain longer than
+                    // the event itself means the comparison walked history
+                    // the current head does not contain: committed-but-
+                    // unincorporated events (the commit_event/save_state
+                    // crash window) that a plain head jump would orphan
+                    // while the new head transitively claims them. Route
+                    // those applies through the layer machinery, which
+                    // incorporates the gap events' operations and the
+                    // incoming event atomically; chain members the head
+                    // already covers land in the already_applied partition
+                    // and cost only the walk. The plan (REV 4, 2.3) placed
+                    // this replay in the executor with apply_event
+                    // unchanged; amended by the maintainer 2026-07-06
+                    // (option "Fix the arm"): the defect is this arm's
+                    // single-event assumption, and fixing it here heals
+                    // every caller (the commit lanes' fork previews cross
+                    // the same gap), applies under one lock inside the
+                    // existing TOCTOU discipline, and reuses the layer path
+                    // the DivergedSince arm already trusts, of which the
+                    // linear gap is the degenerate case (empty divergent
+                    // branch, meet = current head).
+                    if chain.iter().any(|id| *id != event_id) {
+                        let meet: Vec<EventId> = head.as_slice().to_vec();
+                        let (_relation, accumulator) = comparison_result.into_parts();
+                        let layers = accumulator.into_layers(meet.clone(), meet.clone());
+                        if self.apply_accumulated_layers(layers, &meet, &mut head, event_id).await? {
+                            return Ok(true);
+                        }
+                        continue;
+                    }
+                    let new_head: Clock = event.id().into();
                     if self.try_mutate(&mut head, |state| -> Result<(), MutationError> {
                         for (backend_name, operations) in event.operations.iter() {
                             state.apply_operations_from_event(backend_name.clone(), operations, event_id.clone())?;
@@ -325,59 +427,12 @@ impl Entity {
                     // Decompose the result to get the accumulator.
                     // The event is already in the accumulated DAG (found via staging in BFS).
                     let (_relation, accumulator) = comparison_result.into_parts();
-                    let mut layers = accumulator.into_layers(meet.clone(), head.as_slice().to_vec());
+                    let layers = accumulator.into_layers(meet.clone(), head.as_slice().to_vec());
 
-                    let mut applied_layers: Vec<crate::event_dag::EventLayer> = Vec::new();
-
-                    // Collect all layers first, then apply under lock
-                    let mut all_layers = Vec::new();
-                    while let Some(layer) = layers.next().await? {
-                        all_layers.push(layer);
+                    if self.apply_accumulated_layers(layers, &meet, &mut head, event.id()).await? {
+                        return Ok(true);
                     }
-
-                    // Atomic update: apply layers and augment head under single lock
-                    {
-                        let mut state = self.state.write().unwrap();
-                        // Re-check that head hasn't changed since lineage comparison
-                        if state.head != head {
-                            warn!("Head changed during lineage comparison, retrying...");
-                            head = state.head.clone();
-                            continue;
-                        }
-
-                        // Apply layers in causal order
-                        for layer in all_layers {
-                            // Check for backends that first appear in this layer's to_apply events
-                            for evt in &layer.to_apply {
-                                for (backend_name, _) in evt.operations.iter() {
-                                    if !state.backends.contains_key(backend_name) {
-                                        let backend = backend_from_string(backend_name, None)?;
-                                        // Replay earlier layers for this newly-created backend
-                                        for earlier in &applied_layers {
-                                            backend.apply_layer(earlier)?;
-                                        }
-                                        state.backends.insert(backend_name.clone(), backend);
-                                    }
-                                }
-                            }
-
-                            // Apply to all backends
-                            for (_backend_name, backend) in state.backends.iter() {
-                                backend.apply_layer(&layer)?;
-                            }
-                            applied_layers.push(layer);
-                        }
-
-                        // Update head: remove superseded tips, add new event
-                        // The incoming event extends tips in its parent clock (meet).
-                        // Any of those that are in the current head are now superseded.
-                        for parent_id in &meet {
-                            state.head.remove(parent_id);
-                        }
-                        state.head.insert(event.id());
-                    }
-                    self.broadcast.send(());
-                    return Ok(true);
+                    continue;
                 }
                 AbstractCausalRelation::Disjoint { .. } => {
                     return Err(LineageError::Disjoint.into());
