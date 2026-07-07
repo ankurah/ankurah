@@ -1280,7 +1280,11 @@ where
                 // state, persistence is advance-gated, and matching
                 // established queries hear about fetched entities.
                 let state_getter = LocalStateGetter::new(collection.clone());
-                let event_getter = CachedEventGetter::new(collection_id.clone(), collection.clone(), self, cdata);
+                // The node-held staging area: a fetched state that advances
+                // the head may be exactly what a buffered orphan was waiting
+                // for, and the feed's re-drive drains it from here.
+                let staging = self.staging_for(collection_id);
+                let event_getter = CachedEventGetter::with_staging(collection_id.clone(), collection.clone(), self, cdata, staging.clone());
                 let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
                 let mut changes = Vec::new();
                 for state in states {
@@ -1289,6 +1293,7 @@ where
                         &self.entities,
                         &state_getter,
                         &event_getter,
+                        &staging,
                         state.payload.entity_id,
                         state.payload.collection.clone(),
                         state.payload.state.clone(),

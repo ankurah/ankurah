@@ -497,7 +497,7 @@ where
         {
             proto::NodeResponseBody::Fetch(deltas) => {
                 let collection = self.node.collections.get(collection_id).await?;
-                let staging = std::sync::Arc::new(crate::ingest::StagingArea::with_default_cap());
+                let staging = self.node.staging_for(collection_id);
                 let event_getter = crate::retrieval::CachedEventGetter::with_staging(
                     collection_id.clone(),
                     collection.clone(),

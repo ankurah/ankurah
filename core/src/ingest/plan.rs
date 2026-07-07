@@ -22,9 +22,11 @@
 //!    structurally.
 //! 3. Descendant re-drive: staged events from previous deliveries whose
 //!    parents all become satisfied by this plan (or are already committed or
-//!    in the head), found through the staging area's reverse index. This is
-//!    how a buffered orphan integrates when the thing it was waiting for
-//!    finally arrives; an ancestors-only walk can never find it.
+//!    in the head), found through the staging area's reverse index, seeded
+//!    from the scheduled set and the current head. This is how a buffered
+//!    orphan integrates when the thing it was waiting for finally arrives,
+//!    whether that thing came as an event or as a state adoption; an
+//!    ancestors-only walk can never find it.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -106,8 +108,14 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
     // 3: descendant re-drive to fixpoint. A staged event from a previous
     // delivery is schedulable once every parent is scheduled here, in the
     // head, or committed. Candidates come from the reverse index, seeded by
-    // everything scheduled so far, processed in id order for determinism.
-    let mut candidates: VecDeque<EventId> = scheduled.iter().flat_map(|id| staging.staged_children_of(id)).collect();
+    // everything scheduled so far PLUS the current head: a buffered child
+    // whose parent arrived through a state adoption has no scheduled seed
+    // (the parent was never an event in any plan), so the head is its only
+    // anchor. This is what makes the empty-batch re-plan after a state
+    // apply drain waiting orphans (the 2.4 post-recovery semantics).
+    // Processed in id order for determinism.
+    let mut candidates: VecDeque<EventId> =
+        scheduled.iter().chain(head.as_slice().iter()).flat_map(|id| staging.staged_children_of(id)).collect();
     while let Some(candidate) = candidates.pop_front() {
         if scheduled.contains(&candidate) || !staging.contains(&candidate) {
             continue;
@@ -399,6 +407,24 @@ mod tests {
         let plan = plan_entity(&head, &[i2.clone()], &staging, &ephemeral_store(&[])).await.unwrap();
 
         assert_eq!(plan.schedule, vec![i2]);
+        assert!(plan.preresolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_batch_redrive_schedules_buffered_children_of_the_head() {
+        let entity = EntityId::new();
+        let ([_, e1, e2], [g, i1, i2]) = chain(entity);
+        let staging = StagingArea::with_default_cap();
+        staging.stage(e1);
+        staging.stage(e2);
+
+        // The head reached genesis through a state adoption; the batch is
+        // empty, so the head is the only re-drive anchor for the buffered
+        // chain.
+        let head = Clock::from(vec![g]);
+        let plan = plan_entity(&head, &[], &staging, &store(&[])).await.unwrap();
+
+        assert_eq!(plan.schedule, vec![i1, i2], "head-seeded re-drive drains the buffered chain");
         assert!(plan.preresolved.is_empty());
     }
 
