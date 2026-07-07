@@ -99,6 +99,23 @@ impl NodeApplier {
         Ok(())
     }
 
+    /// TEST ONLY: drive the subscription-update applier directly, returning
+    /// the aggregate per-item error that handle_message otherwise folds into
+    /// the update ack where tests cannot inspect it. Typed-error pins match
+    /// on the per-item causes this returns.
+    #[cfg(feature = "test-helpers")]
+    pub async fn apply_updates_for_test<SE, PA>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        items: Vec<proto::SubscriptionUpdateItem>,
+    ) -> Result<(), ApplyError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        Self::apply_updates(node, from_peer_id, items).await
+    }
+
     /// Validate each event fragment against policy and stage it for BFS
     /// discovery. Shared by every update arm that carries events. Stages the
     /// ATTESTED event so a buffered or scheduled event can later be
