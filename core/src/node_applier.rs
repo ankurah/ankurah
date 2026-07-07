@@ -205,17 +205,21 @@ impl NodeApplier {
                 if let Some(failure) = outcome.failure {
                     return Err(failure);
                 }
-                // Until the typed-error migration (M5), unintegrable events
-                // keep today's per-item error surface: NeedsEvents surfaces
-                // the missing parent as EventNotFound, NeedsState as the
-                // empty-head rejection.
+                // Per-item error surface, typed at M5: NeedsState is the
+                // typed empty-head lineage rejection. NeedsEvents
+                // deliberately stays EventNotFound: a missing parent is a
+                // retryable retrieval truth, not a lineage verdict, and it
+                // becomes a buffered non-error outcome when retention flips
+                // live (M8).
                 for (_, o) in &outcome.outcomes {
                     match o {
                         IngestOutcome::NeedsEvents { missing } => {
                             let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
                             return Err(RetrievalError::EventNotFound(id).into());
                         }
-                        IngestOutcome::NeedsState { .. } => return Err(MutationError::InvalidEvent),
+                        IngestOutcome::NeedsState { .. } => {
+                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into())
+                        }
                         _ => {}
                     }
                 }
@@ -263,15 +267,20 @@ impl NodeApplier {
                     if let Some(failure) = outcome.failure {
                         return Err(failure);
                     }
-                    // Same per-item error surface as the EventOnly arm until
-                    // the typed-error migration (M5).
+                    // Same per-item error surface as the EventOnly arm
+                    // (typed at M5; NeedsEvents stays EventNotFound until
+                    // the M8 retention flip).
                     for (_, o) in &outcome.outcomes {
                         match o {
                             IngestOutcome::NeedsEvents { missing } => {
                                 let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
                                 return Err(RetrievalError::EventNotFound(id).into());
                             }
-                            IngestOutcome::NeedsState { .. } => return Err(MutationError::InvalidEvent),
+                            IngestOutcome::NeedsState { .. } => {
+                                return Err(
+                                    crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into()
+                                )
+                            }
                             _ => {}
                         }
                     }
@@ -450,16 +459,19 @@ impl NodeApplier {
                 if let Some(failure) = outcome.failure {
                     return Err(failure);
                 }
-                // Until the typed-error migration (M5), a bridge that cannot
-                // integrate keeps today's error surface: the error the apply
-                // loop would have produced at the first unappliable event.
+                // Per-item error surface, typed at M5. NeedsState should not
+                // arise on bridges (they include genesis); if it does, the
+                // typed empty-head rejection says so honestly. NeedsEvents
+                // stays EventNotFound until the M8 retention flip.
                 for (_, o) in &outcome.outcomes {
                     match o {
                         IngestOutcome::NeedsEvents { missing } => {
                             let id = missing.first().cloned().ok_or(MutationError::InvalidEvent)?;
                             return Err(RetrievalError::EventNotFound(id).into());
                         }
-                        IngestOutcome::NeedsState { .. } => return Err(MutationError::InvalidEvent),
+                        IngestOutcome::NeedsState { .. } => {
+                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into())
+                        }
                         _ => {}
                     }
                 }
