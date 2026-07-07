@@ -1,3 +1,8 @@
+# Build artifacts include generated TOML (trybuild writes a scratch
+# Cargo.toml under target/tests/trybuild on every derive_compile_fail
+# run) that must not fail the tracked-source format check.
+exclude = ["**/target/**"]
+
 [formatting]
 column_width   = 100
 indent_string  = "    "
