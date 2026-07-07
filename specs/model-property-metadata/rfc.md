@@ -741,8 +741,9 @@ storage/sqlite/src/engine.rs:462-468), because the resolution pass fixes
 which step is the property once, in one place.
 
 **The unregistered-collection rule (rev 4 corollary, revised 2026-07-06
-with the REN 2 second ruling and its fail-loud corollary; flagged for
-ratification).** Rev 4 makes creation impossible without registration.
+with the REN 2 second ruling and its fail-loud corollary; CONFIRMED by
+the maintainer 2026-07-07 after a read-path semantics walkthrough,
+recorded on #289).** Rev 4 makes creation impossible without registration.
 But a warm catalog REPLICA cannot by itself prove non-registration --
 it may simply lag the authority by a subscription hop -- so resolution
 never renders a verdict from the replica alone: a compiled model

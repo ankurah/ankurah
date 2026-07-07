@@ -638,7 +638,9 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
 25b. **First-use registration on read paths; unresolvable references
     fail loud** (rev 4 corollary, RFC 5.2/5.3; surfaced by the
     subscribe-before-create tests, REVISED 2026-07-06 by the
-    replica-lag flake -- REN 2 second ruling, ratified in session): a
+    replica-lag flake -- REN 2 second ruling, ratified in session;
+    fail-loud corollary CONFIRMED by the maintainer 2026-07-07,
+    recorded on #289): a
     warm catalog REPLICA cannot prove a collection unregistered (it may
     lag the authority by a subscription hop), so resolution never
     renders that verdict alone. When the warm map cannot resolve a
