@@ -11,7 +11,7 @@ pub fn derive_property_impl(input: TokenStream) -> TokenStream {
         impl ::ankurah::Property for #name {
             // Pinned to match into_value below: derived Property types
             // serialize as JSON in a string register, so their normative
-            // catalog value_type is "string" (RFC 4). A hand-written impl
+            // catalog value_type is "string" (RFC 4 in specs/model-property-metadata/rfc.md). A hand-written impl
             // producing a different Value variant overrides this to match.
             const VALUE_TYPE: &'static str = "string";
 

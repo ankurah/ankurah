@@ -78,7 +78,7 @@ impl<Projected> FromEntity for YrsString<Projected> {
 impl<Projected, S: FromActiveType<YrsString<Projected>>> FromActiveType<YrsString<Projected>> for Option<S> {
     fn from_active(active: YrsString<Projected>) -> Result<Self, PropertyError> {
         // Compiled-OPTIONAL: an absent root is None, never a fabricated
-        // default (RFC 5.4 rule 2). Checked here because the required
+        // default (RFC 5.4 in specs/model-property-metadata/rfc.md rule 2). Checked here because the required
         // projections below default instead of erroring.
         if active.value().is_none() {
             return Ok(None);

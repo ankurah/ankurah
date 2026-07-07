@@ -87,7 +87,7 @@ impl NodeApplier {
         for fragment in event_fragments {
             let attested_event: Attested<proto::Event> = (entity_id, collection_id.clone(), fragment).into();
             // Relayed catalog events are trusted FROM THE SERVING PEER the
-            // way every other served event is (RFC section 4, rev 4). The
+            // way every other served event is (RFC section 4 in specs/model-property-metadata/rfc.md, rev 4). The
             // structural write ban covers the transaction paths
             // (CommitTransaction and local commits); this ingest path has
             // no allocator-identity check -- in the single-allocator

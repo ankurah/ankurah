@@ -19,7 +19,7 @@ use crate::storage::{StorageCollectionWrapper, StorageEngine};
 use crate::{property::backend::LWWBackend, value::Value};
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 /// Collections that are not mutable through ordinary transactions: the
-/// system collection and the metadata catalog (RFC section 4). Consulted
+/// system collection and the metadata catalog (RFC section 4 in specs/model-property-metadata/rfc.md). Consulted
 /// by the commit path (durable nodes refuse CommitTransaction events
 /// targeting these) and by CollectionSet::get's reserved-prefix check.
 pub const PROTECTED_COLLECTIONS: &[&str] = &[

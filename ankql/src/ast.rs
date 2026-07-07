@@ -25,19 +25,9 @@ mod json_as_bytes {
 pub enum Expr {
     Literal(Literal),
     Path(PathExpr),
-    /// A resolved property reference (RFC section 5.3). This is the OUTPUT of a
-    /// resolution pass that binds a parse-time `PathExpr` to a concrete property
-    /// entity id; the parser NEVER produces it, and `PathExpr` remains the
-    /// parse-time AST shape. The resolution pass lives in ankurah-core
-    /// (core/src/schema/resolve.rs) and runs at the query origin sites;
-    /// receivers pass Identifiers through.
     Identifier(Identifier),
     Predicate(Predicate),
-    InfixExpr {
-        left: Box<Expr>,
-        operator: InfixOperator,
-        right: Box<Expr>,
-    },
+    InfixExpr { left: Box<Expr>, operator: InfixOperator, right: Box<Expr> },
     ExprList(Vec<Expr>), // New variant for handling lists like (1,2,3) in IN clauses
     Placeholder,
 }
@@ -84,27 +74,27 @@ impl std::fmt::Display for PathExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.steps.join(".")) }
 }
 
-/// A resolved property reference: a property entity id plus the resolved-at
-/// display name and any remaining JSON sub-path steps. Produced by the
-/// resolution pass (RFC section 5.3); the parser never emits this. See
-/// `Expr::Identifier`.
+/// A property reference resolved against the catalog: the property's stable
+/// entity id, its display name, and any JSON sub-path into the property's
+/// value. This is the resolved counterpart of [`PathExpr`], which names a
+/// property by string alone. The parser only ever produces `PathExpr`; an
+/// `Identifier` appears after the resolution pass (in ankurah-core) has
+/// bound that name to an id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Identifier {
-    /// The defining property entity id (16 bytes; ankql cannot depend on
-    /// proto, so this is the raw Ulid exactly like Literal::EntityId).
+    /// The property's stable entity id. Held as a raw `Ulid` because ankql
+    /// cannot depend on proto's `EntityId` (same as [`Literal::EntityId`]).
     pub property: Ulid,
-    /// Resolved-at display name, for SQL columns and human output.
+    /// The property's display name, used for SQL columns and rendered output.
     pub name: String,
-    /// Remaining JSON sub-path steps (possibly empty).
+    /// JSON sub-path into the property's value; empty for a plain reference.
     pub subpath: Vec<String>,
 }
 
 impl Identifier {
-    /// The equivalent parse-time path steps: the resolved property name
-    /// followed by the JSON sub-path. Used everywhere an Identifier must
-    /// behave like the Path it was resolved from (Phase A: name-based
-    /// evaluation; the switch to id-based lookup arrives with the v2
-    /// integration).
+    /// The `[name, ..subpath]` steps, the same shape as the [`PathExpr`] this
+    /// was resolved from. Used where an `Identifier` must act like a
+    /// name-addressed path (evaluation and SQL still key on the name).
     pub fn path_steps(&self) -> Vec<String> {
         let mut steps = Vec::with_capacity(1 + self.subpath.len());
         steps.push(self.name.clone());
@@ -112,17 +102,16 @@ impl Identifier {
         steps
     }
 
-    /// The referenced property name. The property step is fixed once by the
-    /// resolution pass; the subpath does NOT change which property is
-    /// referenced.
+    /// The referenced property's name. A sub-path addresses into that
+    /// property's value; it never changes which property is referenced.
     pub fn property_name(&self) -> &str { &self.name }
 
-    /// Whether this identifier has no JSON sub-path (a bare column reference).
+    /// True when there is no JSON sub-path: a plain property reference.
     pub fn is_simple(&self) -> bool { self.subpath.is_empty() }
 }
 
 impl std::fmt::Display for Identifier {
-    /// Renders consistently with how PathExpr renders: name then dotted subpath.
+    /// Renders like [`PathExpr`]: the name, then any sub-path dotted on.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)?;
         for step in &self.subpath {
@@ -249,11 +238,10 @@ impl Selection {
     }
 }
 
-/// The column name an expression references, if it references a property.
-/// For a Path this is the FIRST step (the actual column; for `licensing.territory`
-/// the column is `licensing`). For a resolved Identifier this is `name` -- the
-/// resolution pass fixed the property step, and the subpath does NOT change which
-/// column is referenced. Returns None for expressions that reference no property.
+/// The column an expression addresses, if any. For a `Path` this is the FIRST
+/// step (`licensing` in `licensing.territory` -- the column holding the JSON
+/// value); for an `Identifier`, its `name`. `None` when the expression
+/// addresses no property.
 fn expr_referenced_column(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Path(path) => Some(path.first().to_string()),
@@ -262,16 +250,14 @@ fn expr_referenced_column(expr: &Expr) -> Option<String> {
     }
 }
 
-/// The property name an expression references, if it references a property.
-/// For a Path this is the LAST step (`path.property()`). For a resolved
-/// Identifier this is `name` (the property step is fixed by the resolution pass;
-/// the subpath does NOT change which property is referenced). Returns None for
-/// expressions that reference no property.
+/// The property an expression addresses, if any. For a `Path` this is the LAST
+/// step ([`PathExpr::property`]); for an `Identifier`, its `name`. `None` when
+/// the expression addresses no property.
 ///
-/// Note: for a JSON path like `licensing.territory`, Path::property() returns the
-/// last step (`territory`) while expr_referenced_column returns the first
-/// (`licensing`); this mirrors the pre-existing first-vs-last inconsistency the
-/// resolution pass ultimately collapses. For an Identifier both agree on `name`.
+/// Note the asymmetry on JSON paths: for `licensing.territory`,
+/// [`expr_referenced_column`] returns `licensing` (the column) while this
+/// returns `territory` (the field within it). For an `Identifier` the two
+/// agree, since the property is already resolved to a single `name`.
 fn expr_referenced_property(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Path(path) => Some(path.property()),
@@ -651,7 +637,7 @@ mod tests {
         assert_eq!(populated, selection.predicate);
     }
 
-    // -- Identifier (resolved property reference, RFC 5.3) --
+    // -- Identifier (resolved property reference) --
 
     /// A Selection whose predicate compares a resolved Identifier against a literal.
     fn identifier_selection(name: &str, subpath: Vec<&str>) -> Selection {

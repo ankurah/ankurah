@@ -1,4 +1,4 @@
-//! RFC 5.3: the resolution pass binds property references against the
+//! RFC 5.3 (specs/model-property-metadata/rfc.md): the resolution pass binds property references against the
 //! catalog, producing resolved Identifiers and failing closed on unknowns.
 //! It is wired at the query origin sites since the protocol v2 epoch; these
 //! tests drive the pass directly for precise shape assertions.

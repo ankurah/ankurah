@@ -8,7 +8,7 @@ pub struct ModelDescription {
     name: Ident,
 
     // Struct-level attributes (for #[model(id = "...")] explicit binding,
-    // RFC 5.9; the flag form #[model(ephemeral)]-style is parsed separately
+    // RFC 5.9 (specs/model-property-metadata/rfc.md); the flag form #[model(ephemeral)]-style is parsed separately
     // via get_model_flag).
     struct_attrs: Vec<syn::Attribute>,
 

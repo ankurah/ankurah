@@ -50,7 +50,7 @@ pub trait TContext {
     async fn commit_local_trx(&self, trx: &Transaction) -> Result<Vec<Event>, MutationError>;
     fn query(&self, collection_id: proto::CollectionId, args: MatchArgs) -> Result<EntityLiveQuery, RetrievalError>;
     async fn collection(&self, id: &proto::CollectionId) -> Result<StorageCollectionWrapper, RetrievalError>;
-    /// RFC 5.2 model first-use registration, object-safe so the mutating
+    /// RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use registration, object-safe so the mutating
     /// transaction paths (`create`/`edit`) can trigger it without the
     /// concrete `<SE, PA>`. Discriminates per plan decision 16 (rev 4): for
     /// a collection the catalog already KNOWS (bound), any registration

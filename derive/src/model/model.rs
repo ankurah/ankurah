@@ -14,7 +14,7 @@ pub fn model_impl(model: &crate::model::description::ModelDescription) -> TokenS
         Err(e) => return e.into_compile_error(),
     };
 
-    // The compiled schema: static ModelSchema + fn schema() (RFC 4, 5.8, 5.9).
+    // The compiled schema: static ModelSchema + fn schema() (RFC 4 in specs/model-property-metadata/rfc.md, 5.8, 5.9).
     let schema_method = match crate::model::schema::schema_impl(model) {
         Ok(tokens) => tokens,
         Err(e) => return e.into_compile_error(),

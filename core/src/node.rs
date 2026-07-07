@@ -147,7 +147,7 @@ where PA: PolicyAgent
     pub(crate) policy_agent: PA,
     pub system: SystemManager<SE, PA>,
 
-    /// The metadata catalog map (RFC section 5.2). Warmed from storage on
+    /// The metadata catalog map (RFC section 5.2 in specs/model-property-metadata/rfc.md). Warmed from storage on
     /// durable nodes and via the subscription relay on ephemeral nodes.
     pub catalog: CatalogManager<SE, PA>,
 

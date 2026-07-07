@@ -314,7 +314,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     }
 
     /// The collection a registered query belongs to. Used by the ephemeral
-    /// update path to RESOLVE a new selection (RFC 5.5) before forwarding, as
+    /// update path to RESOLVE a new selection (RFC 5.5 in specs/model-property-metadata/rfc.md) before forwarding, as
     /// the trait method carries no collection parameter.
     pub fn collection_for_query(&self, query_id: proto::QueryId) -> Option<CollectionId> {
         let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());

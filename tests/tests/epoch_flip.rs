@@ -1,4 +1,4 @@
-//! Phase A "epoch flip" integration tests (RFC 5.5): after the wire switch,
+//! Phase A "epoch flip" integration tests (RFC 5.5 in specs/model-property-metadata/rfc.md): after the wire switch,
 //! USER-collection entities emit the id-keyed (v2) LWW encoding -- state
 //! buffer header 0xA2, diff version byte 2, resolved Identifier selections --
 //! while the catalog and system collections stay name-keyed (0xA1/v1, the RFC

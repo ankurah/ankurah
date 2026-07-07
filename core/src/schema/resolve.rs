@@ -1,4 +1,4 @@
-//! The resolution pass: `PathExpr` -> `Identifier` (RFC 5.3, AC4/AC5).
+//! The resolution pass: `PathExpr` -> `Identifier` (RFC 5.3 in specs/model-property-metadata/rfc.md, AC4/AC5).
 //!
 //! Resolution binds a property reference's first step against the catalog
 //! map, producing the resolved `Expr::Identifier` form and failing CLOSED

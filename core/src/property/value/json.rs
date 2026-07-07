@@ -169,7 +169,7 @@ impl Property for Json {
         }
     }
 
-    /// A required absent `Json` reads as JSON null (RFC 5.4 rule 3): null is a
+    /// A required absent `Json` reads as JSON null (RFC 5.4 in specs/model-property-metadata/rfc.md rule 3): null is a
     /// legitimate `Value::Json`, so unlike `EntityId` there IS a representable
     /// default to return rather than erroring `Missing`.
     fn absent_default() -> Option<Value> { Some(Value::Json(serde_json::Value::Null)) }

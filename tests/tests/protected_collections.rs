@@ -1,4 +1,4 @@
-//! RFC section 4: the system collection and the metadata catalog are not
+//! RFC section 4 (specs/model-property-metadata/rfc.md): the system collection and the metadata catalog are not
 //! mutable through ordinary transactions, and the `_ankurah_` collection
 //! prefix is reserved.
 

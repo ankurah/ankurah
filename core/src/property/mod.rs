@@ -15,7 +15,7 @@ pub trait Property: Sized {
     /// The NORMATIVE catalog value_type this Rust type carries on the wire: a
     /// lowercased `core::value::ValueType` variant name ("string", "i64",
     /// "entityid", ...) that MUST equal the `Value` variant [`into_value`]
-    /// actually produces (RFC 4 mapping table).
+    /// actually produces (RFC 4 in specs/model-property-metadata/rfc.md mapping table).
     ///
     /// IDENTITY-CRITICAL: `#[derive(Model)]` reads this const (at compile
     /// time, via the associated const) for field types outside the built-in

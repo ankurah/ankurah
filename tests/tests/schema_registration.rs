@@ -1,4 +1,4 @@
-//! RFC 5.2 (rev 4): registration is an UPSERT protocol operation executed
+//! RFC 5.2 (specs/model-property-metadata/rfc.md, rev 4): registration is an UPSERT protocol operation executed
 //! by the durable node as the system's allocator. These tests drive
 //! RegisterSchema over the wire with no model code on the server, exactly
 //! the way a schema-less durable node serves ephemeral clients, and pin

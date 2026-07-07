@@ -60,7 +60,7 @@ impl Transaction {
     }
 
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
-        // RFC 5.2 model first-use: ensure M is registered BEFORE creating
+        // RFC 5.2 (specs/model-property-metadata/rfc.md) model first-use: ensure M is registered BEFORE creating
         // the entity. Bound collections proceed on a failed re-assert; a
         // NEVER-registered collection fails here (the rev 4 strict offline
         // surface: identity does not exist until the allocator mints it).

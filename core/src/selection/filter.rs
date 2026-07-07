@@ -16,7 +16,7 @@ pub enum Error {
     UnsupportedExpression(&'static str),
     #[error("Unsupported operator: {0}")]
     UnsupportedOperator(&'static str),
-    /// A checked property read hit the RFC 5.4 sibling gate: a same-display-
+    /// A checked property read hit the RFC 5.4 (specs/model-property-metadata/rfc.md) sibling gate: a same-display-
     /// name retype lineage holds data on this item, so the read is fail-visible
     /// (a `TypeSkew` from `Filterable::value_checked`) rather than a silent
     /// NULL. Predicate evaluation surfaces it as an error, so the offending

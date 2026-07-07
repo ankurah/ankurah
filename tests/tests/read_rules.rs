@@ -1,4 +1,4 @@
-//! RFC 5.4 read-path rules with the sibling gate (work package A10).
+//! RFC 5.4 (specs/model-property-metadata/rfc.md) read-path rules with the sibling gate (work package A10).
 //!
 //! Four behaviors, pinned end to end:
 //!  1. Retype lineage (the crown): a same-display-name property from a

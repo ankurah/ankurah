@@ -38,7 +38,7 @@ impl<T: Property> LWW<T> {
         Ok(())
     }
 
-    /// Project the property under the RFC 5.4 read rules (the #175 fix):
+    /// Project the property under the RFC 5.4 (specs/model-property-metadata/rfc.md) read rules (the #175 fix):
     ///   - present -> the value;
     ///   - absent + REQUIRED (a defaulting value type, e.g. `String`/`i64`) ->
     ///     the type default via [`Property::absent_default`];

@@ -44,7 +44,7 @@ async fn test_two_event_determinism_same_property() -> Result<()> {
     // Get final value from node1 (order: A, B, C). This node holds all three
     // events under ITS OWN root; the layered DAG merge elects the LWW winner
     // deterministically here regardless of the order the events were applied
-    // (RFC 5.5). Same-root order-independent convergence -- the subject of
+    // (RFC 5.5 in specs/model-property-metadata/rfc.md). Same-root order-independent convergence -- the subject of
     // this test -- is asserted below via the winner check, and is exercised
     // across arrival orders by the sibling tests in this file
     // (test_multi_property_determinism, test_three_way_concurrent_determinism),

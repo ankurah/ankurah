@@ -16,7 +16,7 @@ use crate::{
 };
 
 const LWW_DIFF_VERSION: u8 = 1;
-/// Diff version for the id-keyed (v2) encoding (RFC 5.5, plan.md A8). Payload
+/// Diff version for the id-keyed (v2) encoding (RFC 5.5 in specs/model-property-metadata/rfc.md, plan.md A8). Payload
 /// is a [`V2Diff`]: an id-keyed map plus a name-keyed residue.
 const LWW_DIFF_VERSION_2: u8 = 2;
 

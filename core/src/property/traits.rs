@@ -36,7 +36,7 @@ pub enum PropertyError {
     CastError(CastError),
 
     /// A property reference that neither the local compiled schema nor the
-    /// catalog defines: predicate building fails closed (RFC 5.3, AC5).
+    /// catalog defines: predicate building fails closed (RFC 5.3 in specs/model-property-metadata/rfc.md, AC5).
     #[error("unknown property '{name}' in collection '{collection}'")]
     UnknownProperty { collection: String, name: String },
 

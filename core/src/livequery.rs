@@ -213,7 +213,7 @@ where
     node.policy_agent.can_access_collection(&cdata, &collection_id)?;
     args.selection.predicate = node.policy_agent.filter_predicate(&cdata, &collection_id, args.selection.predicate)?;
 
-    // NOTE: property RESOLUTION (PathExpr -> Identifier, RFC 5.5) cannot run
+    // NOTE: property RESOLUTION (PathExpr -> Identifier, RFC 5.5 in specs/model-property-metadata/rfc.md) cannot run
     // here: create_inner is SYNC (called from the LiveQuery constructors) and
     // the catalog-lag deferral must be able to await catalog readiness. It is
     // therefore deferred into the async paths that follow this function:

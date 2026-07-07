@@ -230,7 +230,7 @@ async fn test_system_root_change_behavior() -> Result<()> {
         trx.commit().await?;
 
         // Data collections (ignoring the metadata catalog): the `pet` entity
-        // lands on both nodes; the durable also EXECUTES the RFC 5.2
+        // lands on both nodes; the durable also EXECUTES the RFC 5.2 (specs/model-property-metadata/rfc.md)
         // registration the ephemeral forwarded (A11b auto-assert), which
         // additionally creates the catalog collections filtered out here.
         assert_eq!(data_collections(&ephemeral_engine)?, sorted_names(&["_ankurah_system", "pet"]));
