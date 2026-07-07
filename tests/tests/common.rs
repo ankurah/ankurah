@@ -121,11 +121,11 @@ impl GatedConnection {
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
 
         other.register_peer(
-            proto::Presence { node_id: gated.id, durable: gated.durable, system_root: gated.system.root() },
+            proto::Presence { node_id: gated.id, durable: gated.durable, system_root: gated.system.root(), protocol_version: proto::PROTOCOL_VERSION },
             Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
         );
         gated.register_peer(
-            proto::Presence { node_id: other.id, durable: other.durable, system_root: other.system.root() },
+            proto::Presence { node_id: other.id, durable: other.durable, system_root: other.system.root(), protocol_version: proto::PROTOCOL_VERSION },
             Box::new(GatedSender { sender: other_tx, node_id: other.id }),
         );
 

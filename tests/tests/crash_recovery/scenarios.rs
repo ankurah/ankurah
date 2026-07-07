@@ -37,6 +37,12 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     node.system.create().await?;
+    // Rev 4 (RFC 5.2): a local create auto-registers its model, and the
+    // registration executor persists the catalog entities' state first --
+    // which would consume `BeforeSetState(0)` before the workload's own
+    // write. Register the scenario model as setup so the crash point counts
+    // only the workload under test.
+    node.context(c)?.register::<Album>().await?;
     // Bootstrap complete: from here on, operations are the workload under test.
     engine.arm();
     Ok((node, engine))
