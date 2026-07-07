@@ -204,3 +204,32 @@ async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
 
     Ok(())
 }
+
+/// R1 (268-A): redelivering an already-committed batch is success for ack
+/// purposes, applies nothing, and drifts no head. The planner's plan-time
+/// head-containment skip plus apply_event's own idempotency make a lost-ack
+/// sender retry harmless, and the retention sweep leaves nothing staged
+/// behind the skip.
+#[tokio::test]
+async fn r1_redelivered_committed_batch_is_idempotent() -> Result<()> {
+    let (server, client, rec_id, _view, _relay, _conn) = setup().await?;
+    let ctx_c = client.context(c)?;
+
+    let head = client.get_resident_entity(rec_id).expect("record resident").head();
+    let ev = forge_title_event(rec_id, head, "once");
+    let ev_id = ev.id();
+
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(ev.clone())]).await.expect("first delivery applies");
+    assert_eq!(client.get_resident_entity(rec_id).unwrap().head(), proto::Clock::from(vec![ev_id.clone()]));
+
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(ev)])
+        .await
+        .expect("redelivery of a committed batch is success, not an error");
+
+    assert_eq!(client.get_resident_entity(rec_id).unwrap().head(), proto::Clock::from(vec![ev_id.clone()]), "no head drift");
+    let view = ctx_c.get::<RecordView>(rec_id).await?;
+    assert_eq!(view.title().unwrap(), "once", "single application");
+    assert!(!client.staging_contains_for_test(&Record::collection(), &ev_id), "the skip leaves nothing staged");
+
+    Ok(())
+}

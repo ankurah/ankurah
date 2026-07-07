@@ -106,6 +106,38 @@ impl<'a> Workload<'a> {
     /// mid-workload settle are healed at its barrier, exactly as at the end.
     pub async fn settle(&mut self) { self.scheduler.run_to_quiescence(self.nodes, self.rng, self.trace).await; }
 
+    /// Create a new entity at `origin` WITHOUT propagating it: the entity
+    /// exists only where it was written, and joins the convergence universe,
+    /// so the scenario must move it to the other nodes itself (a Get, a
+    /// delivered update, a bridge). This is the setup half of every
+    /// cross-peer gap-fill shape.
+    pub async fn create_local_at(&mut self, origin: usize, field: Field, value: &str) -> proto::EntityId {
+        let id = model::entity_id(self.next_entity);
+        self.next_entity += 1;
+
+        let event = model::genesis_event(id, field, value);
+        let head = proto::Clock::from(vec![event.id()]);
+        self.nodes[origin].origin_commit(vec![model::attest(event)]).await.expect("origin commit applies");
+        self.trace.record(TraceEvent::Origin { node: origin, entity: id.to_base64_short(), head: head.to_base64_short() });
+        self.created.push(id);
+        self.heads.insert(id, head);
+        id
+    }
+
+    /// Fetch an entity at `node` through the real Get request lane: this is
+    /// the cross-peer gap-fill path (get_from_peer, durable-peer selection
+    /// from the node-held seeded RNG, entity-mediated adoption of the
+    /// response, and the post-adoption re-drive of any buffered orphans).
+    /// The get must run as a spawned task because its response can only
+    /// arrive through the scheduler; the settle drives it to completion and
+    /// the join asserts the fetch succeeded.
+    pub async fn get_at(&mut self, node: usize, entity: proto::EntityId) {
+        let ctx = self.nodes[node].node.context(ankurah::policy::DEFAULT_CONTEXT).expect("context builds");
+        let handle = tokio::spawn(async move { ctx.get::<super::model::SimRecordView>(entity).await });
+        self.settle().await;
+        handle.await.expect("get task joins").expect("cross-peer get succeeds");
+    }
+
     /// Establish a live subscription on an (ephemeral) node against `predicate`,
     /// then settle so the SubscribeQuery request and its response flow. This is
     /// the precondition for injecting SubscriptionUpdates at that node: the
