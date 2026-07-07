@@ -997,61 +997,28 @@ where
             return;
         }
         // The selection this ephemeral node forwards to its durable peer must
-        // be RESOLVED (PathExpr -> Identifier, RFC 5.5 Phase A), and resolution
-        // carries the catalog-lag deferral, which must be able to await. This
-        // path is sync (called from the LiveQuery constructor), so resolve +
-        // forward inside a spawned task. The relay registration is already
-        // asynchronous with respect to activation, so deferring it one hop is
-        // safe; a resolution failure is surfaced on the livequery's `error`.
+        // be RESOLVED (PathExpr -> Identifier, RFC 5.5 Phase A), and
+        // resolution can await (catalog warm-up, first-use registration).
+        // This path is sync (called from the LiveQuery constructor), so
+        // resolve + forward inside a spawned task. The relay registration is
+        // already asynchronous with respect to activation, so deferring it
+        // one hop is safe. Compiled models REGISTER AT FIRST USE inside the
+        // resolve (REN 2 revised); if neither the catalog cache nor
+        // registration can resolve the reference (policy denial, no durable
+        // peer), the query fails LOUD on the livequery's `error` -- there is
+        // nothing truthful a subscription could ask for.
         let node = self.clone();
         crate::task::spawn(async move {
-            // Compiled models REGISTER AT FIRST USE inside the resolve
-            // (REN 2 revised), so the UnregisteredCollection arm below is the
-            // FALLBACK for registration that could not run (policy denial,
-            // no durable peer). In that case forward a provably-EMPTY
-            // subscription immediately -- the collection holds no entities,
-            // so Predicate::False is the exact truth, and the livequery
-            // initializes with zero matches instead of blocking. Once the
-            // catalog learns the collection, upgrade through the ORDINARY
-            // selection-update path (version bump + relay forward), which
-            // delivers the entities as ordinary changes.
-            let mut deferred = false;
-            let resolved = loop {
-                match node.catalog.resolve_selection_deferred(&node, Some(&cdata), &collection_id, &selection).await {
-                    Ok(resolved) => break resolved,
-                    Err(crate::property::PropertyError::UnregisteredCollection { .. }) => {
-                        if !deferred {
-                            deferred = true;
-                            let empty = ankql::ast::Selection { predicate: ankql::ast::Predicate::False, order_by: None, limit: None };
-                            node.predicate_context.insert(query_id, cdata.clone());
-                            if let Some(ref relay) = node.subscription_relay {
-                                relay.subscribe_query(query_id, collection_id.clone(), empty, cdata.clone(), version, livequery.clone());
-                            }
-                        }
-                        node.catalog.wait_collection_registered(collection_id.as_str()).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!("subscribe_remote_query resolution failed for {query_id}: {e}");
-                        if let Some(lq) = livequery.upgrade() {
-                            lq.set_error(e.into());
-                        }
-                        return;
-                    }
-                }
-            };
-            if deferred {
-                // The collection just registered: upgrade the placeholder
-                // subscription via update_selection, which re-resolves (the
-                // catalog now answers) and forwards with a proper version.
-                if let Some(lq) = livequery.upgrade() {
-                    if let Err(e) = lq.update_selection(selection.clone()) {
-                        debug!("subscribe_remote_query deferred upgrade failed for {query_id}: {e}");
+            let resolved = match node.catalog.resolve_selection_deferred(&node, Some(&cdata), &collection_id, &selection).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    debug!("subscribe_remote_query resolution failed for {query_id}: {e}");
+                    if let Some(lq) = livequery.upgrade() {
                         lq.set_error(e.into());
                     }
+                    return;
                 }
-                return;
-            }
+            };
             // Resolve types in the AST (converts literals for JSON path comparisons).
             let selection = node.type_resolver.resolve_selection_types(resolved);
             node.predicate_context.insert(query_id, cdata.clone());
@@ -1116,27 +1083,20 @@ where
             return Ok(());
         };
         // As with subscribe_remote_query, the forwarded selection must be
-        // RESOLVED (RFC 5.5) with the catalog-lag deferral, which must await;
-        // this trait method is sync, so resolve + forward in a spawned task.
-        // A resolution or forward failure is logged (the sync caller has
-        // already returned); the selection version guards against regressions.
+        // RESOLVED (RFC 5.5), which can await; this trait method is sync, so
+        // resolve + forward in a spawned task. A resolution or forward
+        // failure is logged (the sync caller has already returned); the
+        // selection version guards against regressions.
         let node = self.clone();
         crate::task::spawn(async move {
             // No cdata on this sync trait path: the original subscribe
-            // already kicked the catalog for this query, so the deferral's
-            // pure-wait branch is bounded; the unregistered-collection defer
-            // mirrors the subscribe path.
-            let selection = loop {
-                match node.catalog.resolve_selection_deferred(&node, None, &collection_id, &selection).await {
-                    Ok(resolved) => break resolved,
-                    Err(crate::property::PropertyError::UnregisteredCollection { .. }) => {
-                        node.catalog.wait_collection_registered(collection_id.as_str()).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!("update_remote_query resolution failed for {query_id}: {e}");
-                        return;
-                    }
+            // already resolved (registering at first use if needed), so a
+            // failure here is a genuinely unresolvable update.
+            let selection = match node.catalog.resolve_selection_deferred(&node, None, &collection_id, &selection).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    debug!("update_remote_query resolution failed for {query_id}: {e}");
+                    return;
                 }
             };
             // Resolve types in the AST (converts literals for JSON path comparisons).

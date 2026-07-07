@@ -439,11 +439,6 @@ where PA: PolicyAgent
     map: RwLock<CatalogMapInner>,
     ready: RwLock<bool>,
     ready_notify: Notify,
-    /// Notified on every map mutation (reactor updates, response upserts,
-    /// warm completion). `wait_collection_registered` loops on it so a live
-    /// query over an anticipated-but-unregistered collection can defer
-    /// until the catalog learns the collection (RFC 5.3 deferral).
-    map_notify: Notify,
     /// Durable: the reactor subscription that keeps the map fresh; dropping
     /// it unsubscribes. Ephemeral: unused.
     durable_sub: RwLock<Option<(ReactorSubscription, SubscriptionGuard)>>,
@@ -489,7 +484,6 @@ where
             map: RwLock::new(CatalogMapInner::default()),
             ready: RwLock::new(false),
             ready_notify: Notify::new(),
-            map_notify: Notify::new(),
             durable_sub: RwLock::new(None),
             ephemeral_queries: RwLock::new(Vec::new()),
             subscribed: RwLock::new(false),
@@ -648,13 +642,15 @@ where
 
         let mut queries = Vec::with_capacity(3);
         for collection in catalog_collections() {
-            // cached: false -- the ephemeral catalog view is purely
-            // relay-driven; a `cached: true` query would also spawn a local
-            // reactor activation, adding concurrent reactor traffic that can
-            // perturb unrelated subscription lifecycles during setup.
+            // cached: true -- the catalog subscription is a CACHE (maintainer
+            // ruling 2026-07-06): it accelerates resolution and enables
+            // offline use; registration is the source of truth for any
+            // doubt. The cached query activates from local storage
+            // immediately (catalog entities persisted by earlier sessions),
+            // then merges the relay snapshot and live updates as they land.
             let args = crate::node::MatchArgs {
                 selection: ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
-                cached: false,
+                cached: true,
             };
             let lq = match EntityLiveQuery::new_weak_node(node, collection.clone(), args, cdata.clone()) {
                 Ok(lq) => lq,
@@ -711,7 +707,6 @@ where
                 }
             }
         }
-        self.0.map_notify.notify_waiters();
     }
 
     // -- readiness ----------------------------------------------------------
@@ -742,23 +737,6 @@ where
     fn mark_ready(&self) {
         *self.0.ready.write().unwrap() = true;
         self.0.ready_notify.notify_waiters();
-        // The warm may have filled the map wholesale; wake collection waiters.
-        self.0.map_notify.notify_waiters();
-    }
-
-    /// Wait until the catalog holds a model for `collection` (RFC 5.3
-    /// deferral for anticipated-but-unregistered collections). Register the
-    /// `Notified` future BEFORE checking, in a loop, exactly like
-    /// [`Self::wait_catalog_ready`], so a mutation landing between the check
-    /// and the await is never lost.
-    pub async fn wait_collection_registered(&self, collection: &str) {
-        loop {
-            let notified = self.0.map_notify.notified();
-            if self.0.map.read().unwrap().by_collection.contains_key(collection) {
-                return;
-            }
-            notified.await;
-        }
     }
 
     /// Whether a compiled schema for `collection` has been recorded this
@@ -787,7 +765,6 @@ where
         // Wake any ensure_subscribed waiters so they observe the cleared
         // latch instead of sleeping on a readiness that will never come.
         self.0.ready_notify.notify_waiters();
-        self.0.map_notify.notify_waiters();
         debug!("CatalogManager reset (map cleared, not ready)");
     }
 
@@ -887,8 +864,6 @@ where
         for ms in memberships {
             map.upsert_membership(MembershipDef { id: ms.id, model: ms.model, property: ms.property, optional: Some(ms.optional) });
         }
-        drop(map);
-        self.0.map_notify.notify_waiters();
     }
 
     /// RFC 5.2 model first-use registration ("ensure registration"). Called

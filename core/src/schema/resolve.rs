@@ -60,13 +60,13 @@ where
     /// binary carries a compiled schema for the collection, the model
     /// REGISTERS AT FIRST USE ([`Self::register_first_use`], REN 2 revised)
     /// and resolution retries against the authoritative rows fed by the
-    /// response. Only when that is impossible or refused does the
-    /// anticipated-collection rule (RFC 5.3) classify the miss for the
-    /// caller to defer or answer empty.
+    /// response. The catalog map is a CACHE; registration is the source of
+    /// truth and the doubt-resolver. When registration cannot run either
+    /// (policy denial, no durable peer), the miss surfaces LOUD as
+    /// [`PropertyError::UnregisteredCollection`] -- callers error rather
+    /// than idle.
     ///
-    /// Any non-`UnknownProperty` error, or a remaining `UnknownProperty`
-    /// that classification does not soften (a real unknown reference),
-    /// propagates without waiting (fail closed, AC5).
+    /// Any other error propagates without waiting (fail closed, AC5).
     pub async fn resolve_selection_deferred(
         &self,
         node: &crate::node::Node<SE, PA>,
@@ -113,13 +113,12 @@ where
                         // idempotent upsert that no-ops (zero events, policy
                         // verb skipped) when the catalog already carries the
                         // schema -- so a replica lagging the authority learns
-                        // the rows synchronously from the response instead of
-                        // misclassifying the collection as anticipated. If no
+                        // the rows synchronously from the response. If no
                         // registration is possible (no cdata, no compiled
                         // schema, already ensured, denied, offline), classify:
-                        // a real unknown reference fails closed; an
-                        // anticipated unregistered collection is the caller's
-                        // to defer or answer empty.
+                        // a real unknown reference fails closed, and a
+                        // compiled-but-unregisterable collection surfaces as
+                        // the loud UnregisteredCollection error.
                         if self.register_first_use(node, cdata, collection).await {
                             return match self.resolve_selection(collection, selection) {
                                 Err(PropertyError::UnknownProperty { collection: c, name }) => {
@@ -145,7 +144,7 @@ where
     /// re-resolve. Returns false when no attempt applies (no cdata on this
     /// path, no compiled schema, or the collection is already ensured this
     /// process) or the attempt failed (policy denial, no durable peer) --
-    /// those fall back to the anticipated-collection deferral semantics.
+    /// those surface as `UnregisteredCollection` via `classify_unknown`.
     async fn register_first_use(
         &self,
         node: &crate::node::Node<SE, PA>,
@@ -165,12 +164,11 @@ where
 
     /// Classify an `UnknownProperty` from a WARM catalog (rev 4, RFC 5.3):
     /// if the queried collection has no model in the catalog but this
-    /// binary carries a compiled schema for it, the schema is ANTICIPATED
-    /// and merely unregistered -- and an unregistered collection provably
-    /// holds no entities (creation requires registration first), so callers
-    /// can answer a fetch with an empty result or defer a live query until
-    /// the collection registers. Anything else is a genuinely unresolvable
-    /// reference: fail closed (AC5).
+    /// binary carries a compiled schema for it, the reference failed
+    /// DESPITE first-use registration being the resolution path --
+    /// registration was denied or unreachable -- and the caller surfaces
+    /// `UnregisteredCollection` as a loud, actionable error. Anything else
+    /// is a genuinely unresolvable reference: fail closed (AC5).
     fn classify_unknown(&self, collection: &CollectionId, c: String, name: String) -> PropertyError {
         if self.model_by_collection(collection.as_str()).is_none() && self.has_compiled(collection.as_str()) {
             PropertyError::UnregisteredCollection { collection: c }

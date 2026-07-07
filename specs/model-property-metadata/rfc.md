@@ -586,10 +586,13 @@ is skipped (5.7), and the response simply feeds the map. That is what
 makes first-use registration safe as the read path's warm-up, and it
 closes the replica-lag window: a warm-but-lagging catalog replica
 would otherwise misclassify a just-registered collection as
-anticipated (5.3) and answer empty where the authority has rows. When
-registration cannot run on a read path (policy denial, no durable
-peer), the read falls back to 5.3's anticipated-collection semantics;
-mutating paths enforce strictly as before. An explicit
+anticipated (5.3) and answer empty where the authority has rows. The catalog
+subscription is a CACHE -- an accelerator and offline enabler (the
+ephemeral catalog queries run cached) -- never the arbiter: any doubt
+is resolved by the registration upsert itself. When registration
+cannot run on a read path (policy denial, no durable peer), the read
+FAILS LOUD with the unregistered-collection error (5.3); mutating
+paths enforce strictly as before. An explicit
 `ctx.register::<M>().await` issues the same operation eagerly (e.g.
 before first render).
 
@@ -729,27 +732,26 @@ keying on path.property() vs path.first(); acknowledged in a sqlite comment,
 storage/sqlite/src/engine.rs:462-468), because the resolution pass fixes
 which step is the property once, in one place.
 
-**The anticipated-collection rule (rev 4 corollary, revised with the
-REN 2 revision of 2026-07-06; flagged for ratification).** Rev 4 makes
-creation impossible without registration, which yields a provable fact:
-an UNREGISTERED collection holds no entities anywhere in the system.
+**The unregistered-collection rule (rev 4 corollary, revised 2026-07-06
+with the REN 2 second ruling and its fail-loud corollary; flagged for
+ratification).** Rev 4 makes creation impossible without registration.
 But a warm catalog REPLICA cannot by itself prove non-registration --
-it may simply lag the authority by a subscription hop -- so the primary
-path never renders the verdict from the replica alone: a compiled model
+it may simply lag the authority by a subscription hop -- so resolution
+never renders a verdict from the replica alone: a compiled model
 REGISTERS AT FIRST USE (5.2), and the upsert response is the
 authoritative answer (existing rows on the no-op, fresh rows on
-allocation), after which resolution proceeds normally. The vacuous
-emptiness rule survives as the FALLBACK for references first-use
-registration cannot serve: the principal may not define schema (policy
-denial), or no durable peer is reachable. There a FETCH answers the
-provably-correct empty result, and a LIVE QUERY activates empty
-(forwarding a Predicate::False placeholder subscription) and defers
-until the catalog learns the collection from a writer who can register
-it, upgrading through the ordinary selection-update path so the initial
-population arrives as ordinary changes. An unknown property within a
-REGISTERED collection, or a reference no compiled schema anticipates,
-still fails closed at build time -- AC5's letter is untouched where it
-can catch a real mistake.
+allocation), after which resolution proceeds normally. When first-use
+registration cannot run -- the principal may not define schema (policy
+denial), or no durable peer is reachable -- the reference FAILS LOUD as
+UnregisteredCollection on fetch and live query alike (maintainer
+ruling, superseding this addendum's earlier defer-empty draft): a
+lagging cache cannot prove emptiness, and a subscription that can never
+answer truthfully (the earlier draft forwarded a Predicate::False
+placeholder) serves no one; callers retry once the schema is registered
+or connectivity returns. An unknown property within a REGISTERED
+collection, or a reference no compiled schema anticipates, equally
+fails closed at build time -- AC5's letter is untouched where it can
+catch a real mistake.
 
 Where resolution runs: at predicate build on the querying node (parse or
 programmatic construction, then resolve; the existing TypeResolver pass at
@@ -1321,9 +1323,9 @@ Phase A.)
    parenthetical: read accessors DO register at first use -- safely,
    because the rev 4 operation is an idempotent upsert whose no-op plan
    emits nothing and skips the policy verb (5.7). Denied or offline
-   registration falls back to 5.3's anticipated-collection semantics,
-   preserving the read-only-principal posture the first ruling
-   protected.
+   registration fails loud (5.3, same-day corollary ruling); read-only
+   principals in schema-complete deployments are unaffected because
+   their registrations resolve to no-op plans.
 3. AC4 vehicle: a new resolved `Identifier` node produced by a resolution
    pass, rather than mutating `PathExpr` in place (5.3); PathExpr remains
    the parse-time form.
@@ -1351,7 +1353,7 @@ Everything else in #85 is adopted as written, including the
    2026-07-05 as strictly cache-only for readers; REVISED 2026-07-06 --
    reads register at first use through the idempotent upsert (an
    existing schema is a no-op plan: no events, no policy question),
-   with denial/offline falling back to 5.3. See renegotiation 2.
+   with denial/offline failing loud per 5.3. See renegotiation 2.
 3. **sys::Item::Collection disposition** (4): superseded by the
    Collection-vs-Model terminology deconfliction, tracked as #305
    (maintainer direction: Collection becomes a storage-only concern;

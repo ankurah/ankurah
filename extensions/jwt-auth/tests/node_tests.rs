@@ -102,6 +102,11 @@ async fn test_write_scope_allows_matching_ref_and_denies_other_ref() -> anyhow::
     node.system.create().await?;
 
     let root = node.context(JwtContext::system())?;
+    // Schema definition is the ADMIN's act (rev 4: registration is
+    // policy-gated, and this config grants the writer role no catalog
+    // privileges): the system context registers the collection; the scoped
+    // writer below only writes data into it.
+    root.register::<ScopedRecord>().await?;
     let (allowed_account_id, denied_account_id) = {
         let trx = root.begin();
         let allowed_account = trx.create(&Account { name: "Allowed".into() }).await?;

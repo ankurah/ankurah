@@ -40,13 +40,15 @@ pub enum PropertyError {
     #[error("unknown property '{name}' in collection '{collection}'")]
     UnknownProperty { collection: String, name: String },
 
-    /// The queried collection has no model in the catalog, but this binary
-    /// carries a compiled schema for it: the schema is ANTICIPATED and
-    /// simply not registered yet (rev 4: an unregistered collection
-    /// provably holds no entities, since creation requires registration).
-    /// Fetches resolve this to an empty result; live queries defer until
-    /// the catalog learns the collection (RFC 5.3 deferral).
-    #[error("collection '{collection}' is not registered in the catalog yet")]
+    /// The queried collection has no model in the catalog, this binary
+    /// carries a compiled schema for it, and FIRST-USE REGISTRATION could
+    /// not resolve the doubt (policy denied the definition, or no durable
+    /// peer is reachable). Surfaced as a loud error on query and fetch
+    /// paths (REN 2 second ruling, 2026-07-06): a lagging catalog cache
+    /// cannot prove emptiness, and idling on an unanswerable subscription
+    /// helps no one -- retry once the schema is registered or connectivity
+    /// returns.
+    #[error("collection '{collection}' is not registered and could not be registered from this node")]
     UnregisteredCollection { collection: String },
 
     /// A same-display-name sibling property (a retype lineage from any

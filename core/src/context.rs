@@ -433,18 +433,20 @@ where
         args.selection.predicate = self.node.policy_agent.filter_predicate(&self.cdata, collection_id, args.selection.predicate)?;
 
         // Resolve property references against the catalog (RFC 5.5 Phase A):
-        // PathExpr -> Identifier, failing closed on unknown properties, with
-        // the catalog-lag deferral. Idempotent, so a selection resolved by an
-        // outer caller passes through unchanged here.
-        args.selection =
-            match self.node.catalog.resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, &args.selection).await {
-                Ok(resolved) => resolved,
-                // Rev 4 (RFC 5.3): an anticipated-but-unregistered collection
-                // provably holds no entities (creation requires registration
-                // first), so the correct fetch answer is empty, not an error.
-                Err(crate::property::PropertyError::UnregisteredCollection { .. }) => return Ok(Vec::new()),
-                Err(e) => return Err(e.into()),
-            };
+        // PathExpr -> Identifier, failing closed on unknown properties,
+        // registering compiled models at first use (REN 2 revised).
+        // Idempotent, so a selection resolved by an outer caller passes
+        // through unchanged here. A collection that neither the catalog
+        // cache nor first-use registration can resolve fails LOUD
+        // (UnregisteredCollection): a lagging replica cannot prove
+        // emptiness, and a successful registration answers empty truthfully
+        // by querying the real, entity-free collection.
+        args.selection = self
+            .node
+            .catalog
+            .resolve_selection_deferred(&self.node, Some(&self.cdata), collection_id, &args.selection)
+            .await
+            .map_err(RetrievalError::from)?;
 
         // Resolve types in the AST (converts literals for JSON path comparisons)
         args.selection = self.node.type_resolver.resolve_selection_types(args.selection);

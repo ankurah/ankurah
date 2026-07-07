@@ -647,20 +647,22 @@ simultaneous upgrade). No interim name-keyed-with-catalog state ships.
     existing schema resolves to a no-op plan (zero events, policy verb
     skipped) whose response feeds the map synchronously, so reads warm
     against authoritative rows and query_wait initializes populated.
-    The anticipated-collection rule survives as the FALLBACK when
-    registration cannot run (policy denial, no durable peer): an
-    unregistered collection provably holds no entities (creation
-    requires registration), so the fetch answers EMPTY and a live query
-    activates empty (Predicate::False placeholder) and DEFERS
-    (wait_collection_registered), upgrading through the ordinary
-    selection-update path when registration lands. The resolution
-    deferral also KICKS the ephemeral catalog subscription inline when
-    a sync-context node never subscribed (ensure_subscribed is
-    idempotent and awaited), and fails closed when neither the kick nor
-    registration can warm the catalog (offline). Fail-closed is
-    unchanged for unknown properties in registered collections and for
-    references no compiled schema anticipates (AC5). PropertyError
-    gains UnregisteredCollection to carry the distinction.
+    When registration cannot run (policy denial, no durable peer), the
+    reference FAILS LOUD as UnregisteredCollection on fetch and live
+    query alike (second same-day ruling: the catalog subscription is a
+    CACHE -- an accelerator and offline enabler, run cached: true --
+    and registration is the sole doubt-resolver; a lagging replica
+    cannot prove emptiness, and the earlier draft's Predicate::False
+    placeholder subscription answered a question nobody asked). The
+    placeholder and wait_collection_registered deferral machinery are
+    deleted. The resolution path still KICKS the ephemeral catalog
+    subscription inline when a sync-context node never subscribed
+    (ensure_subscribed is idempotent and awaited), and fails closed
+    when neither the kick nor registration can warm the catalog
+    (offline). Fail-closed is unchanged for unknown properties in
+    registered collections and for references no compiled schema
+    anticipates (AC5). PropertyError carries UnregisteredCollection as
+    the loud, actionable variant.
 26. **`check_schema_registration` PolicyAgent verb** (maintainer
     direction, 2026-07-06; RFC 5.7): a new trait method with a
     default-allow implementation, called by the executor after its
