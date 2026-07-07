@@ -107,6 +107,11 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     let mut outcomes: Vec<(EventId, IngestOutcome)> = preresolved;
     let mut applied: Vec<Attested<Event>> = Vec::new();
     let mut failure: Option<MutationError> = None;
+    // Set when commit_event failed for an event whose effect the resident
+    // already carries: persisting now would write a state whose head names
+    // an event the log lacks, and the staged body is the only material the
+    // backfill can later commit from.
+    let mut uncommitted_in_head: Option<EventId> = None;
 
     for id in schedule {
         let Some(attested) = staging.get_attested(&id) else {
@@ -117,11 +122,14 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
         match entity.apply_event(getter, &attested.payload).await {
             Ok(true) => {
                 if let Err(e) = getter.commit_event(&attested).await {
-                    // Applied to the resident but not durable: the same
-                    // window today's arms have on a commit failure. The
-                    // failure stops the item; redelivery re-applies
-                    // idempotently.
-                    tracing::warn!(event_id = %id, "commit_event failed after the apply advanced the resident; the log lags until redelivery: {e}");
+                    // Applied to the resident but not durable: the resident
+                    // may run ahead of the log in memory (the safe
+                    // direction), but nothing of this shape may persist,
+                    // and the body must stay staged so a redelivery's
+                    // backfill (the planner schedules head-contained
+                    // unstored members) can commit it.
+                    tracing::warn!(event_id = %id, "commit_event failed after the apply advanced the resident; suppressing persist until the log catches up: {e}");
+                    uncommitted_in_head = Some(id);
                     failure = Some(e);
                     break;
                 }
@@ -139,6 +147,9 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
                 match getter.event_stored(&id).await {
                     Ok(false) => {
                         if let Err(e) = getter.commit_event(&attested).await {
+                            // Same shape as above: the head carries it, the
+                            // log does not; hold the body for the backfill.
+                            uncommitted_in_head = Some(id);
                             failure = Some(e);
                             break;
                         }
@@ -176,10 +187,15 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     // result sets when they return (read-your-application). Persisting the
     // resident's current state is always monotone-safe; the M2 no-op
     // elision raced exactly that window. A storage-backed currency check
-    // (D2's applied-set) is the sound way to skip this write later. The
-    // one exception: an empty-head entity has nothing true to persist (a
-    // phantom's empty state must not land in storage).
-    if !entity.head().is_empty() {
+    // (D2's applied-set) is the sound way to skip this write later. Two
+    // exceptions: an empty-head entity has nothing true to persist (a
+    // phantom's empty state must not land in storage), and a resident
+    // whose head names an event a commit failure kept out of the log must
+    // NOT persist, or the buffer would durably reference an uncommitted
+    // event, the one ordering the crash invariant forbids. In that case
+    // the buffer lags the log's coverage instead, the safe direction the
+    // gap-replay machinery already repairs.
+    if !entity.head().is_empty() && uncommitted_in_head.is_none() {
         if let Err(e) = persist.persist(entity).await {
             failure.get_or_insert(e);
         }
@@ -211,9 +227,16 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     // operations, the exact loss class buffering exists to prevent. Events
     // staged by OTHER deliveries and outside this plan's membership are
     // untouched either way.
+    // One more retention override: an event the resident carries but the
+    // log lacks (its commit failed) keeps its body staged regardless of
+    // provenance; that body is the only material the redelivery backfill
+    // can commit from.
     let disposition: std::collections::BTreeMap<&EventId, bool> =
         outcomes.iter().map(|(id, o)| (id, matches!(o, IngestOutcome::NeedsState { .. } | IngestOutcome::NeedsEvents { .. }))).collect();
     for id in &members {
+        if uncommitted_in_head.as_ref() == Some(id) {
+            continue;
+        }
         match disposition.get(id) {
             Some(true) => {}
             Some(false) => {
@@ -250,11 +273,19 @@ mod tests {
         Attested::opt(event, None)
     }
 
-    /// Getter whose `commit_event` fails for one designated event id:
-    /// the deterministic stand-in for a transient storage fault.
+    /// Getter whose `commit_event` fails for one designated event id (the
+    /// deterministic stand-in for a transient storage fault) and records
+    /// successful commits so `event_stored` answers like real storage.
     struct FailingCommitStore {
         staging: std::sync::Arc<StagingArea>,
+        committed: std::sync::RwLock<std::collections::BTreeSet<EventId>>,
         fail_commit_of: EventId,
+    }
+
+    impl FailingCommitStore {
+        fn new(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
+            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeSet::new()), fail_commit_of }
+        }
     }
 
     #[async_trait]
@@ -262,7 +293,9 @@ mod tests {
         async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
             self.staging.get(event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
         }
-        async fn event_stored(&self, _event_id: &EventId) -> Result<bool, RetrievalError> { Ok(false) }
+        async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+            Ok(self.committed.read().unwrap().contains(event_id))
+        }
         fn storage_is_definitive(&self) -> bool { true }
     }
 
@@ -273,6 +306,7 @@ mod tests {
             if attested.payload.id() == self.fail_commit_of {
                 return Err(MutationError::General("injected transient commit failure".into()));
             }
+            self.committed.write().unwrap().insert(attested.payload.id());
             self.staging.remove(&attested.payload.id());
             Ok(())
         }
@@ -314,12 +348,13 @@ mod tests {
 
         let entities = crate::entity::WeakEntitySet::default();
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
-        let getter = FailingCommitStore { staging: staging.clone(), fail_commit_of: p.clone() };
+        let getter = FailingCommitStore::new(staging.clone(), p.clone());
 
         // The resident holds genesis; the orphan B buffered from an earlier
         // delivery; THIS delivery carries only the parent P.
         let entity = Entity::create(entity_id, "test".into());
         entity.apply_event(&getter, &genesis.payload).await.expect("genesis applies");
+        getter.commit_event(&genesis).await.expect("genesis commits");
         staging.stage(orphan);
         staging.stage(parent);
 
@@ -330,7 +365,10 @@ mod tests {
 
         assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
         assert!(staging.contains(&b), "a carryover orphan the plan never resolved must stay buffered; sweeping it loses an acked event");
-        assert!(!staging.contains(&p), "the batch member leaves the area; its item error drives the sender's retry");
+        // The commit-failed batch member is the one batch exception: its
+        // effect is in the resident's head, so its body stays staged as the
+        // backfill source (the redelivery pin below exercises the recovery).
+        assert!(staging.contains(&p), "an applied-but-uncommitted event keeps its body staged for the backfill");
     }
 
     /// A commit_event failure AFTER the apply advanced the resident leaves
@@ -349,10 +387,11 @@ mod tests {
 
         let entities = crate::entity::WeakEntitySet::default();
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
-        let getter = FailingCommitStore { staging: staging.clone(), fail_commit_of: x_id.clone() };
+        let getter = FailingCommitStore::new(staging.clone(), x_id.clone());
 
         let entity = Entity::create(entity_id, "test".into());
         entity.apply_event(&getter, &genesis.payload).await.expect("genesis applies");
+        getter.commit_event(&genesis).await.expect("genesis commits");
         staging.stage(x);
 
         let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &getter).await.expect("plan builds");
@@ -379,10 +418,11 @@ mod tests {
 
         let entities = crate::entity::WeakEntitySet::default();
         let staging = std::sync::Arc::new(StagingArea::with_default_cap());
-        let failing = FailingCommitStore { staging: staging.clone(), fail_commit_of: x_id.clone() };
+        let failing = FailingCommitStore::new(staging.clone(), x_id.clone());
 
         let entity = Entity::create(entity_id, "test".into());
         entity.apply_event(&failing, &genesis.payload).await.expect("genesis applies");
+        failing.commit_event(&genesis).await.expect("genesis commits");
         staging.stage(x.clone());
 
         let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &failing).await.expect("plan builds");
@@ -391,7 +431,8 @@ mod tests {
 
         // The store heals (a different designated failure id); the sender
         // redelivers the same batch.
-        let healed = FailingCommitStore { staging: staging.clone(), fail_commit_of: EventId::from_bytes([0xEE; 32]) };
+        let healed = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        healed.commit_event(&genesis).await.expect("the healed store still holds genesis");
         let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &healed).await.expect("re-plan builds");
         assert!(plan.schedule.contains(&x_id), "a head-contained member that is staged but unstored must schedule for backfill");
 

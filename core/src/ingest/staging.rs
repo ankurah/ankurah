@@ -108,6 +108,24 @@ impl StagingArea {
         }
     }
 
+    /// Replace an already-staged entry's attested envelope. Event ids are
+    /// content hashes, so the payload is identical by construction; what
+    /// changes is the attestation set (the commit lanes attach check_event
+    /// attestations this way). Arrival order and the reverse index are
+    /// untouched. Falls back to a plain stage when the id is absent (cap
+    /// eviction raced the caller), so the envelope is never lost.
+    pub fn restage(&self, attested: Attested<Event>) {
+        let id = attested.payload.id();
+        {
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = inner.events.get_mut(&id) {
+                *entry = attested;
+                return;
+            }
+        }
+        self.stage(attested);
+    }
+
     /// The staged event payload, if present. Mirrors what `get_event` needs.
     pub fn get(&self, id: &EventId) -> Option<Event> {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
