@@ -27,10 +27,10 @@ pub enum Expr {
     Path(PathExpr),
     /// A resolved property reference (RFC section 5.3). This is the OUTPUT of a
     /// resolution pass that binds a parse-time `PathExpr` to a concrete property
-    /// entity id; the parser NEVER produces it. `PathExpr` remains the parse-time
-    /// resolution pass lives in ankurah-core (core/src/schema/resolve.rs) and
-    /// runs at the query origin sites; receivers pass Identifiers through.
-    /// AST shape it will target.
+    /// entity id; the parser NEVER produces it, and `PathExpr` remains the
+    /// parse-time AST shape. The resolution pass lives in ankurah-core
+    /// (core/src/schema/resolve.rs) and runs at the query origin sites;
+    /// receivers pass Identifiers through.
     Identifier(Identifier),
     Predicate(Predicate),
     InfixExpr {

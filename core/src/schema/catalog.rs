@@ -941,8 +941,8 @@ where
         }
     }
 
-    /// Whether this collection's registration is latched (durably executed,
-    /// forwarded successfully, or queued for reconnect) this process.
+    /// Whether this collection's registration is latched (durably executed
+    /// or forwarded successfully) this process.
     pub fn is_ensured(&self, collection: &str) -> bool { self.0.ensured.read().unwrap().contains(collection) }
 
     /// The compiled schema recorded for `collection`, if any and if NOT yet

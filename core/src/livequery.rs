@@ -261,10 +261,10 @@ where
         //
         // The node is captured WEAK and upgraded transiently around each
         // resolve attempt: a strong clone baked into the closure would keep
-        // the node alive from construction until the task finishes -- which
-        // for a deferred (anticipated-collection) query is unbounded -- and
-        // would break the new_weak_node contract outright. The deferral wait
-        // itself needs only the catalog.
+        // the node alive from construction until the task finishes --
+        // resolution can span a subscription kick and a registration
+        // round-trip -- and would break the new_weak_node contract outright.
+        // The readiness wait itself needs only the catalog.
         let catalog = node.catalog.clone();
         let resolve_node = node.weak();
         let resolve_cdata = cdata.clone();

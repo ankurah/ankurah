@@ -14,11 +14,14 @@
 //!      collection the catalog already knows keeps writing offline;
 //!   c. explicit `register::<M>()` on a durable: catalog entries appear
 //!      locally, and a second call is a no-op (heads unchanged);
-//!   d. read paths do not mint and do not register: resolution over an
-//!      unregistered collection fails closed (AC5), and nothing lands in
-//!      the durable catalog;
+//!   d. reads register at first use (REN 2 revised, plan decision 25b): a
+//!      compiled model's first query triggers the idempotent registration
+//!      upsert and answers from the authoritative rows;
 //!   e. hard_reset flushes the map and the ensured latch (allocations
-//!      belong to one system).
+//!      belong to one system);
+//!   f. fail-loud offline read (RFC 5.3 addendum): with no durable peer, a
+//!      fetch over a never-registered collection surfaces the loud
+//!      UnregisteredCollection error instead of answering empty.
 
 mod common;
 use common::*;
@@ -222,9 +225,9 @@ async fn explicit_register_is_strict_and_idempotent() -> anyhow::Result<()> {
 // (d) Reads register at first use (REN 2 revised, plan decision 25b): a
 // compiled model's first query triggers the idempotent registration
 // upsert, so resolution runs against authoritative rows instead of
-// classifying the collection as anticipated. The fetch still answers
-// EMPTY -- the freshly registered collection holds no entities -- and a
-// second, explicit register is a no-op against the same rows.
+// failing loud as unregistered. The fetch still answers EMPTY -- the
+// freshly registered collection holds no entities -- and a second,
+// explicit register is a no-op against the same rows.
 #[tokio::test]
 async fn read_path_registers_at_first_use() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
@@ -271,6 +274,41 @@ async fn hard_reset_clears_ensured_and_map() -> anyhow::Result<()> {
     assert!(server.catalog.resolve("gizmo", "title").is_none(), "map flushed after reset");
     assert!(!server.catalog.is_ensured("gizmo"), "ensured latch flushed after reset");
     assert_eq!(server.catalog.counts(), (0, 0, 0), "catalog map empty after reset");
+
+    Ok(())
+}
+
+// (f) Fail-loud offline read (RFC 5.3 addendum, plan decision 25b second
+// ruling): with no durable peer, a fetch over a NEVER-registered compiled
+// collection cannot run first-use registration, and the reference surfaces
+// the loud UnregisteredCollection error naming the collection -- never an
+// empty resultset, and never the weaker unknown-property shape.
+#[tokio::test]
+async fn offline_read_unregistered_fails_loud() -> anyhow::Result<()> {
+    let server = durable_sled_setup().await?;
+    let client = ephemeral_sled_setup().await?;
+    let conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+    server.catalog.wait_catalog_ready().await;
+
+    // Context built while connected (join needs a peer); the catalog warms
+    // (empty) via the context kick. Contraption is never registered.
+    let ctx = client.context_async(DEFAULT_CONTEXT).await;
+
+    drop(conn);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client still has a durable peer after disconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let err =
+        ctx.fetch::<ContraptionView>("state = 'x'").await.expect_err("offline fetch over a never-registered collection must fail loud");
+    let msg = err.to_string();
+    assert!(msg.contains("not registered") && msg.contains("contraption"), "loud error naming the collection, got: {msg}");
+    assert!(!client.catalog.is_ensured("contraption"), "a failed first-use registration must not latch");
 
     Ok(())
 }

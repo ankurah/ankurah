@@ -268,3 +268,45 @@ async fn rename_updates_resolution_and_sibling_index() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// The catalog subscription is a CACHE -- an accelerator and offline
+// enabler (maintainer ruling 2026-07-06; the three catalog queries run
+// cached: true). After syncing while connected, a disconnected ephemeral
+// still resolves the collection from its map, still builds a schema
+// binding, and a cached query over the known collection initializes
+// OFFLINE from local storage instead of erroring or hanging. Uses
+// common's Album model: the wire registration above defines `album.name`,
+// which is the only reference the predicate resolves.
+#[tokio::test]
+async fn ephemeral_resolves_known_collection_offline_from_cache() -> anyhow::Result<()> {
+    use ankurah::signals::With;
+
+    let (server, client, conn) = connected_pair().await?;
+    let ctx = client.context_async(DEFAULT_CONTEXT).await;
+
+    expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    let name_id = wait_resolve(&client, "album", "name").await.expect("client map warms while connected");
+
+    drop(conn);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client.get_durable_peers().is_empty() {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("client still has a durable peer after disconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Resolution and binding still answer from the cached map.
+    assert_eq!(client.catalog.resolve("album", "name"), Some(name_id), "cache survives disconnect");
+    assert!(client.catalog.binding_for(&"album".into()).is_some(), "binding built from the cache offline");
+
+    // A cached live query initializes offline: resolution runs against the
+    // cached catalog, activation reads local storage (empty), and the relay
+    // registration waits quietly for a reconnect.
+    let lq = ctx.query::<AlbumView>("name = 'x'")?;
+    lq.wait_initialized().await;
+    lq.error().with(|e| assert!(e.is_none(), "offline cached query must not error: {e:?}"));
+    assert!(lq.ids().is_empty(), "no local entities for a fresh cache");
+
+    Ok(())
+}

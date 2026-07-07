@@ -151,3 +151,42 @@ async fn unregistered_collection_query_fails_loud() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// The same fail-loud contract surfaces through a LIVE QUERY (the ruling
+/// covers fetch and live query alike): the sync query() constructor
+/// succeeds -- resolution is deferred into the async init task --
+/// wait_initialized returns instead of hanging, and the loud
+/// unregistered-collection error lands in the query's error slot.
+#[tokio::test]
+async fn unregistered_collection_live_query_fails_loud() -> anyhow::Result<()> {
+    use ankurah::signals::With;
+
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_ephemeral();
+    agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
+    agent.set_keys(JwtKeys::Signing(keys.clone()));
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
+    node.system.create().await?;
+
+    let member_claims = JwtClaims {
+        sub: "member-1".into(),
+        roles: vec!["Member".into()],
+        email: "member@example.com".into(),
+        name: None,
+        custom: serde_json::Map::new(),
+    };
+    let token = keys.sign(&member_claims, Duration::from_hours(1))?;
+    let member_ctx = node.context(JwtContext::from_claims(member_claims, token))?;
+
+    let lq = member_ctx.query::<ScopeItemView>("label = 'x'")?;
+    lq.wait_initialized().await;
+
+    let msg = lq
+        .error()
+        .with(|e| e.as_ref().map(|e| e.to_string()))
+        .expect("live query over an unregistered collection must surface the loud error");
+    assert!(msg.contains("not registered") && msg.contains("scopeitem"), "actionable error naming the collection, got: {msg}");
+    assert!(lq.ids().is_empty(), "an errored live query must not fabricate results");
+
+    Ok(())
+}

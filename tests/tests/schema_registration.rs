@@ -648,3 +648,162 @@ async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Counts check_schema_registration invocations; allows everything.
+#[derive(Clone)]
+struct CountingAgent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl ankurah::policy::PolicyAgent for CountingAgent {
+    type ContextData = &'static ankurah::policy::DefaultContext;
+
+    fn sign_request<SE: ankurah::core::storage::StorageEngine, C>(
+        &self,
+        _node: &ankurah::core::node::NodeInner<SE, Self>,
+        cdata: &C,
+        _request: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, ankurah::policy::AccessDenied>
+    where
+        C: ankurah::core::util::Iterable<Self::ContextData>,
+    {
+        Ok(cdata.iterable().map(|_| proto::AuthData(vec![])).collect())
+    }
+
+    async fn check_request<SE: ankurah::core::storage::StorageEngine, A>(
+        &self,
+        _node: &Node<SE, Self>,
+        auth: &A,
+        _request: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, ankurah::core::error::ValidationError>
+    where
+        A: ankurah::core::util::Iterable<proto::AuthData> + Send + Sync,
+    {
+        Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
+    }
+
+    fn check_event<SE: ankurah::core::storage::StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _cdata: &Self::ContextData,
+        _entity_before: &ankurah::core::entity::Entity,
+        _entity_after: &ankurah::core::entity::Entity,
+        _event: &proto::Event,
+    ) -> Result<Option<proto::Attestation>, ankurah::policy::AccessDenied> {
+        Ok(None)
+    }
+
+    fn check_schema_registration<SE: ankurah::core::storage::StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _cdata: &Self::ContextData,
+        _plan: &ankurah::policy::RegistrationPlan,
+    ) -> Result<(), ankurah::policy::AccessDenied> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn validate_received_event<SE: ankurah::core::storage::StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _from_node: &proto::EntityId,
+        _event: &proto::Attested<proto::Event>,
+    ) -> Result<(), ankurah::policy::AccessDenied> {
+        Ok(())
+    }
+
+    fn attest_state<SE: ankurah::core::storage::StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<proto::Attestation> {
+        None
+    }
+
+    fn validate_received_state<SE: ankurah::core::storage::StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _from_node: &proto::EntityId,
+        _state: &proto::Attested<proto::EntityState>,
+    ) -> Result<(), ankurah::policy::AccessDenied> {
+        Ok(())
+    }
+
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), ankurah::policy::AccessDenied>
+    where C: ankurah::core::util::Iterable<Self::ContextData> {
+        Ok(())
+    }
+
+    fn filter_predicate<C>(
+        &self,
+        _data: &C,
+        _collection: &proto::CollectionId,
+        predicate: ankql::ast::Predicate,
+    ) -> Result<ankql::ast::Predicate, ankurah::policy::AccessDenied>
+    where
+        C: ankurah::core::util::Iterable<Self::ContextData>,
+    {
+        Ok(predicate)
+    }
+
+    fn check_read<C>(
+        &self,
+        _data: &C,
+        _id: &proto::EntityId,
+        _collection: &proto::CollectionId,
+        _state: &proto::State,
+    ) -> Result<(), ankurah::policy::AccessDenied>
+    where
+        C: ankurah::core::util::Iterable<Self::ContextData>,
+    {
+        Ok(())
+    }
+
+    fn check_read_event<C>(&self, _data: &C, _event: &proto::Attested<proto::Event>) -> Result<(), ankurah::policy::AccessDenied>
+    where C: ankurah::core::util::Iterable<Self::ContextData> {
+        Ok(())
+    }
+
+    fn check_write(
+        &self,
+        _context: &Self::ContextData,
+        _entity: &ankurah::core::entity::Entity,
+        _event: Option<&proto::Event>,
+    ) -> Result<(), ankurah::policy::AccessDenied> {
+        Ok(())
+    }
+
+    fn validate_causal_assertion<SE: ankurah::core::storage::StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _peer_id: &proto::EntityId,
+        _head_relation: &proto::CausalAssertion,
+    ) -> Result<(), ankurah::policy::AccessDenied> {
+        Ok(())
+    }
+}
+
+/// The policy verb fires once for a plan with effects and is SKIPPED for a
+/// pure no-op re-registration (REN 2 second ruling: read paths lean on the
+/// upsert's idempotence, so a no-op registration must not consult the
+/// agent -- zero events, zero policy calls, full definitions returned).
+#[tokio::test]
+async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), CountingAgent(count.clone()));
+    server.system.create().await?;
+    let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), CountingAgent(count.clone()));
+    let _conn = LocalProcessConnection::new(&server, &client).await?;
+    client.system.wait_system_ready().await;
+
+    let (models1, props1, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    assert_eq!(count.load(Ordering::SeqCst), 1, "a plan with creates consults the agent exactly once");
+
+    let (models2, props2, _) = expect_registered(client.request(server.id, &DEFAULT_CONTEXT, album_request()).await?);
+    assert_eq!(count.load(Ordering::SeqCst), 1, "a pure no-op re-registration skips the policy verb");
+    assert_eq!(models1[0].id, models2[0].id, "the skipped no-op still returns the same ids");
+    assert_eq!(props1[0].id, props2[0].id, "the skipped no-op still returns the same ids");
+
+    Ok(())
+}

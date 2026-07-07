@@ -55,7 +55,7 @@ struct Inner<SE, PA> {
     /// the in-memory catalog map, which the SystemManager cannot reach
     /// directly (the Node owns the CatalogManager). RFC 5.2 requires the
     /// catalog map to be flushed alongside the state hard_reset clears,
-    /// because derived catalog ids are root-scoped.
+    /// because allocated catalog ids belong to one system's allocator.
     catalog_reset_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     _phantom: PhantomData<PA>,
 }
@@ -247,9 +247,10 @@ where
             collection_map.clear();
         }
 
-        // Flush the in-memory catalog map (RFC 5.2): derived catalog ids are
-        // root-scoped, so a node re-joining a different system must re-derive
-        // everything; a stale map would leak the old system's ids. Runs after
+        // Flush the in-memory catalog map (RFC 5.2): allocated catalog ids
+        // belong to one system, so a node re-joining a different system must
+        // re-register against that system's allocator; a stale map would leak
+        // the old system's ids. Runs after
         // collection_map.clear() and before reactor.system_reset(), which the
         // catalog's own reactor subscriptions also observe. The hook clears
         // maps and drops subscriptions but never deletes storage collections

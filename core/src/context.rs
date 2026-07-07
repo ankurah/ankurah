@@ -326,8 +326,8 @@ impl Context {
         // Record the compiled schema. Resolution registers it at first use
         // (REN 2 revised, plan decision 25b): an idempotent upsert that
         // no-ops when the catalog already carries the schema. Denied or
-        // offline registration falls back to the anticipated-collection
-        // rule (empty fetch / deferred live query).
+        // offline registration surfaces as the loud UnregisteredCollection
+        // error (RFC 5.3 addendum).
         self.0.cache_compiled(R::Model::schema());
 
         let entities = self.0.fetch_entities(&collection_id, args).await?;

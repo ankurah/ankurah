@@ -224,10 +224,10 @@ impl WatcherSet {
             Predicate::False => {
                 // Matches nothing, ever: no index or wildcard watcher can make
                 // an entity enter or leave the resultset, so Add installs
-                // nothing and Remove has nothing to tear down. The rev-4
-                // placeholder activation (subscribe-before-create, RFC 5.3)
-                // registers queries with this predicate until the collection
-                // registers and the real selection swaps in.
+                // nothing and Remove has nothing to tear down. Predicate
+                // algebra can legitimately produce False (fold rules,
+                // assume_null, PolicyAgent::filter_predicate narrowing a
+                // fully-denied principal), so this arm must be well-defined.
             }
             // Placeholder should be transformed before reaching this point
             Predicate::Placeholder => {

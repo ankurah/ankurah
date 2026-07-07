@@ -200,7 +200,6 @@ where
         backend.set_wire_mode(crate::property::backend::lww::WireMode::IdKeyedV2);
     }
 
-
     pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, SmallRng::from_entropy()) }
     pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, true, SmallRng::from_entropy()) }
 

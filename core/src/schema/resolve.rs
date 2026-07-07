@@ -88,9 +88,10 @@ where
                             // subscribe failure). First-use registration may
                             // still succeed -- it needs a durable peer, not a
                             // working subscription -- and its response feeds
-                            // the map directly. Otherwise fail closed: with a
-                            // cold catalog nothing can be proven about the
-                            // collection.
+                            // the map directly. Otherwise classify exactly as
+                            // the warm path does: a compiled-but-unregisterable
+                            // collection surfaces the loud UnregisteredCollection
+                            // error (RFC 5.3), anything else fails closed.
                             if self.register_first_use(node, Some(cdata), collection).await {
                                 return match self.resolve_selection(collection, selection) {
                                     Err(PropertyError::UnknownProperty { collection: c, name }) => {
@@ -99,7 +100,7 @@ where
                                     other => other,
                                 };
                             }
-                            return Err(PropertyError::UnknownProperty { collection: c, name });
+                            return Err(self.classify_unknown(collection, c, name));
                         }
                     } else {
                         self.wait_catalog_ready().await;
@@ -156,7 +157,7 @@ where
         match self.ensure_registered(node, cdata, schema).await {
             Ok(()) => true,
             Err(e) => {
-                tracing::debug!("first-use registration of '{}' failed; deferral semantics apply: {}", collection, e);
+                tracing::debug!("first-use registration of '{}' failed; the miss surfaces loud: {}", collection, e);
                 false
             }
         }
