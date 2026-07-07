@@ -35,7 +35,13 @@ migration steps were resequenced; Get-path reentrancy gets an explicit
 analysis and test; two new sign-off items (section 4).
 
 Status note: approved by the maintainer 2026-07-06 (all section 4 items);
-implementation in flight on PR #318. Inputs: RFC #268 body and comments, the
+implementation in flight on PR #318. Two maintainer amendments were ruled
+during implementation and are recorded in code comments at their sites, per
+convention: (1) the commit lanes' NeedsState recovery is a typed atomic
+failure, not an inline Get fetch (2.4; node.rs, plan_and_check_entity_group);
+(2) verdict-driven gap replay lives in apply_event's StrictDescends arm,
+reusing the DivergedSince layer machinery, not in the executor (2.3;
+entity.rs). Where the sections below say otherwise, the code comments govern. Inputs: RFC #268 body and comments, the
 book factorization chapter (ankurah.org), a verbatim requirements dossier
 compiled from design-deltas.md and threat-model.md (citations spot-checked
 against sources), a code inventory of the ingest surface whose sharpest
@@ -230,6 +236,14 @@ walk from the event down to the head via the getter, same result, one extra
 walk only on gap-detected paths. Entity-level apply_event semantics are
 unchanged; the executor orchestrates, which honors the RFC's ruling that gap
 replay is a planning-layer concern, not an apply_event concern.
+[AMENDED at M8 (maintainer, 2026-07-06, option "Fix the arm"): the replay
+lives in apply_event's StrictDescends arm, reusing the DivergedSince layer
+machinery (the linear gap is its degenerate case: meet = current head,
+empty divergent branch). This heals every caller including the commit
+lanes' fork previews, applies the chain atomically under one lock, and
+makes apply_event no longer a single-event primitive. The completeness
+assertion landed with M8. The paragraph above is kept for the record;
+entity.rs governs.]
 
 State-buffer persistence is UNIFORM (REV 3, maintainer ruling): after an
 entity's events in a plan, the executor persists state, on every arm. The
@@ -335,9 +349,9 @@ only the feed shape and containment mode.
 | EventBridge arm (node_applier.rs:345) | intake -> plan -> execute | PerItem |
 | StateSnapshot arm (node_applier.rs:315) | shared state-apply | PerItem |
 | Get response (node.rs:782) | shared state-apply (entity-mediated, notifying) | PerItem |
-| join_system (system.rs:192) | shared state-apply (entity-mediated; validation semantics UNCHANGED, trust bootstrap documented as a #274 item; notification is a no-op pre-ready but flows for uniformity) | PerItem |
+| join_system (system.rs:192) | entity-mediated via with_state, but NOT the shared state-apply function: the peer-attested root persists verbatim (re-attesting the trust anchor would swap its provenance), so it skips PersistState and the re-drive. Validation semantics UNCHANGED; trust bootstrap documented as a #274 item | PerItem |
 | commit_remote_transaction (node.rs:548) | intake -> plan -> policy phase (fork, check_event) -> execute | Atomic |
-| commit_local_trx (context.rs:70) | plan (ordering) + policy phase + execute; two-phase preserved | Atomic |
+| commit_local_trx (context.rs:70) | plan (ordering) + policy phase shared with the remote lane; phase two stays lane-owned (commit, fork heads, relay, then materialize+persist), so execute_plan serves PerItem plus remote commit only | Atomic |
 
 ### 2.8 The staging area (new in REV 2; the B3 substrate)
 
@@ -511,7 +525,11 @@ passes the full validation gate.
 
 ## 7. Risks and explicitly out-of-scope magnets
 
-Risks: TOCTOU interplay (apply_event's internal retry untouched); two-phase
+Risks: the unconditional-persist guard (persist gated only on a nonempty
+head) is open-coded at three sites (executor, shared state-apply, and the
+NodePersist seam); D5 changes when and whether state persists and should
+collapse them to one policy seam, separating phantom suppression from
+buffer-currency. TOCTOU interplay (apply_event's internal retry untouched); two-phase
 Atomic mode fork-staleness under concurrent local writers (commit_local_trx
 already has this shape and tolerates it via upstream re-apply, context.rs:161;
 red-team could not construct a divergence; watched, not redesigned);
