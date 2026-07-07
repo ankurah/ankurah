@@ -173,6 +173,13 @@ where PA: PolicyAgent
 
     pub(crate) subscription_relay: Option<SubscriptionRelay<PA::ContextData, crate::livequery::WeakEntityLiveQuery>>,
 
+    /// Node-held staging, one area per collection (the D1 2.8 substrate):
+    /// staged-but-unapplied events survive across applier calls here, which
+    /// is what makes NeedsState/NeedsEvents buffering and descendant
+    /// re-drive real. The commit lanes keep per-call areas (Atomic mode
+    /// retains nothing); the PerItem ingest lanes draw from this map.
+    pub(crate) staging: SafeMap<CollectionId, Arc<crate::ingest::StagingArea>>,
+
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
     pub(crate) type_resolver: crate::TypeResolver,
 }
@@ -255,6 +262,7 @@ where
             catalog: catalog_manager,
             predicate_context: SafeMap::new(),
             subscription_relay,
+            staging: SafeMap::new(),
             type_resolver: crate::TypeResolver::new(),
         }));
 
@@ -1376,6 +1384,28 @@ where
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
     pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.durable_peers.insert(peer_id); }
+
+    /// The node-held staging area for one collection, created on first use.
+    /// Staged-but-unapplied events survive across applier calls here; see
+    /// the `staging` field.
+    pub(crate) fn staging_for(&self, collection: &CollectionId) -> Arc<crate::ingest::StagingArea> {
+        self.staging.get_or_default(collection.clone())
+    }
+
+    /// (len, evictions, cap) of one collection's node-held staging area.
+    /// R6/R8 observability: buffering and cap eviction must be visible from
+    /// outside the crate.
+    #[cfg(feature = "test-helpers")]
+    pub fn staging_probe_for_test(&self, collection: &CollectionId) -> (usize, u64, usize) {
+        let area = self.staging_for(collection);
+        (area.len(), area.evictions(), area.cap())
+    }
+
+    /// Whether one event is buffered in the collection's node-held area.
+    #[cfg(feature = "test-helpers")]
+    pub fn staging_contains_for_test(&self, collection: &CollectionId, id: &proto::EventId) -> bool {
+        self.staging_for(collection).contains(id)
+    }
 }
 
 impl<SE, PA> NodeInner<SE, PA>

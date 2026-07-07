@@ -54,6 +54,12 @@ pub(crate) struct StagingArea {
     evictions: AtomicU64,
 }
 
+impl Default for StagingArea {
+    /// The node-held per-collection areas are created lazily through
+    /// `SafeMap::get_or_default`; default means the default cap.
+    fn default() -> Self { Self::with_default_cap() }
+}
+
 impl StagingArea {
     pub fn new(cap: usize) -> Self {
         Self {
@@ -64,6 +70,11 @@ impl StagingArea {
     }
 
     pub fn with_default_cap() -> Self { Self::new(DEFAULT_STAGING_CAP) }
+
+    /// The configured cap. Observability surface alongside `len` and
+    /// `evictions`, so bounds tests need not hardcode the default.
+    #[allow(dead_code)]
+    pub fn cap(&self) -> usize { self.cap }
 
     /// Stage an event. A no-op if the id is already staged: event ids are
     /// content hashes, so an identical id carries identical content and
