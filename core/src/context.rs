@@ -179,7 +179,11 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         // preserved from the pre-pipeline lane: commit events, advance the
         // transaction forks' heads, relay and await required peers, and
         // only then materialize onto the canonical residents, persist
-        // state, and notify once.
+        // state, and notify once. This lane deliberately reads only the
+        // group's staging, getter, and collection; the plan is consumed by
+        // the remote lane's executor phase two, while here the relay
+        // barrier between event commit and state persist rules that
+        // sequence out (see the executor module doc).
         let mut attested_events = Vec::new();
         for (_, _, event_id, group) in &planned {
             let attested =

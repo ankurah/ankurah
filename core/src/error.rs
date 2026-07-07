@@ -188,6 +188,11 @@ impl From<anyhow::Error> for MutationError {
 /// verdict (C4-08); two nodes of different cache depth must not disagree on
 /// rejections.
 #[derive(Error, Debug)]
+/// Several variants are forward-declared design surface (T7): `Contention`,
+/// `Storage`, `Validation`, and `Unsupported`, plus
+/// `LineageRejection::{CreationOverNonEmptyHead, BatchCycle}`, have no D1
+/// construction site by design (red-team F5: later milestones migrate onto
+/// complete types; D3's rejection horizon extends this surface).
 pub enum IngestError {
     /// The PolicyAgent refused the event at admission or commit time.
     #[error("policy denied: {0}")]

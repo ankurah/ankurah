@@ -1,5 +1,11 @@
-//! The executor: one owner for the application sequence every arm used to
-//! hand-roll.
+//! The executor: the application sequence for every pipeline feed. The
+//! PerItem arms and the remote commit lane execute through here; the LOCAL
+//! commit lane shares only the planned, policy-checked phase one and keeps
+//! its own phase-two macro-order (commit, advance the transaction forks,
+//! relay to required peers, only then materialize and persist), because an
+//! ephemeral node must not expose state its durable peer has not accepted.
+//! That lane's ordering lives in context.rs; D4 (transactional visibility)
+//! inherits both seams.
 //!
 //! Canonical order (the T8 pinning from the D1 plan): per event, apply to
 //! the resident entity (TOCTOU compare-and-retry stays inside apply_event,
@@ -21,9 +27,11 @@
 //!
 //! Recoverable non-failures (missing parents) surface as typed outcomes,
 //! not errors: the event stays staged for descendant re-drive (268-B).
-//! Verdict-driven gap replay hooks in here at M8, when the entity exposes
-//! its comparison chain; until then the planner's ordering guarantees cover
-//! the staged-ancestor cases.
+//! Verdict-driven gap replay does NOT live here: the maintainer amendment
+//! (2026-07-06, recorded at the StrictDescends arm in entity.rs) placed it
+//! inside apply_event, which this executor calls opaquely. The planner's
+//! parents-first ordering covers the staged-ancestor cases; the
+//! committed-but-unincorporated crash window is repaired inside the apply.
 
 use ankurah_proto::{Attested, Event, EventId};
 
@@ -36,7 +44,11 @@ use crate::retrieval::SuspenseEvents;
 use async_trait::async_trait;
 
 /// State persistence, supplied by the feeder because attestation needs the
-/// node's PolicyAgent and the executor sits below the node layer.
+/// node's PolicyAgent and the executor sits below the node layer. The
+/// executor's other upward-flavored reach, phantom eviction, deliberately
+/// stays a plain `&WeakEntitySet` parameter rather than a second capability
+/// trait: eviction is entity-set surgery with no policy in D1; if D3 gates
+/// eviction behind lifecycle policy, that is where it grows a seam.
 #[async_trait]
 pub(crate) trait PersistState: Send + Sync {
     async fn persist(&self, entity: &Entity) -> Result<(), MutationError>;
@@ -61,6 +73,18 @@ impl ExecutionOutcome {
     /// True when the entity advanced: the advance-only notification rule
     /// (the no-op suppression from PR #299, uniform across arms).
     pub fn advanced(&self) -> bool { !self.applied.is_empty() }
+
+    /// The typed per-item error for a NeedsState outcome, if one occurred:
+    /// the single edit point for the M5 surface every PerItem feeder maps
+    /// that outcome onto. NeedsEvents is deliberately absent here; it is a
+    /// buffered NON-error since the M8 retention flip. The Atomic commit
+    /// lanes do not use this: they typed-fail both outcomes at plan time.
+    pub fn needs_state_error(&self) -> Option<MutationError> {
+        self.outcomes
+            .iter()
+            .any(|(_, o)| matches!(o, IngestOutcome::NeedsState { .. }))
+            .then(|| crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into())
+    }
 }
 
 /// Execute a plan against one entity. PerItem containment semantics; the
@@ -74,15 +98,17 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     persist: &dyn PersistState,
 ) -> ExecutionOutcome {
     // Plan membership, captured for the retention sweep at the end: with
-    // node-held staging, whatever this plan does not explicitly retain must
-    // leave the area.
-    let members: Vec<EventId> = plan.preresolved.iter().map(|(id, _)| id.clone()).chain(plan.schedule.iter().cloned()).collect();
+    // node-held staging, whatever this plan resolves must leave the area,
+    // and whatever it does not resolve is judged by provenance (batch vs
+    // carryover).
+    let IngestPlan { schedule, preresolved, batch } = plan;
+    let members: Vec<EventId> = preresolved.iter().map(|(id, _)| id.clone()).chain(schedule.iter().cloned()).collect();
 
-    let mut outcomes: Vec<(EventId, IngestOutcome)> = plan.preresolved;
+    let mut outcomes: Vec<(EventId, IngestOutcome)> = preresolved;
     let mut applied: Vec<Attested<Event>> = Vec::new();
     let mut failure: Option<MutationError> = None;
 
-    for id in plan.schedule {
+    for id in schedule {
         let Some(attested) = staging.get_attested(&id) else {
             outcomes.push((id, IngestOutcome::Skipped(SkipReason::NotStaged)));
             continue;
@@ -95,6 +121,7 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
                     // window today's arms have on a commit failure. The
                     // failure stops the item; redelivery re-applies
                     // idempotently.
+                    tracing::warn!(event_id = %id, "commit_event failed after the apply advanced the resident; the log lags until redelivery: {e}");
                     failure = Some(e);
                     break;
                 }
@@ -171,19 +198,32 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
 
     // Retention sweep (the 2.4 rule, live at M8): only events WAITING on
     // something stay staged. Applied and back-filled events were promoted
-    // by commit_event; everything else this plan touched leaves the area
-    // now that staging outlives the call: plan-time skips are redeliveries,
-    // and a hard failure plus its unattempted suffix are the sender's retry
-    // to re-deliver (rejection is not buffering). Events staged by OTHER
-    // deliveries and not in this plan's membership are untouched.
-    let keep: std::collections::BTreeSet<&EventId> = outcomes
-        .iter()
-        .filter(|(_, o)| matches!(o, IngestOutcome::NeedsState { .. } | IngestOutcome::NeedsEvents { .. }))
-        .map(|(id, _)| id)
-        .collect();
+    // by commit_event; members with a resolving outcome (skips) leave the
+    // area now that staging outlives the call: plan-time skips are
+    // redeliveries, and rejection is not buffering. Members the plan never
+    // resolved (the event a hard failure broke at, and the unattempted
+    // suffix) are judged by provenance: a BATCH member leaves, because its
+    // item error drives the sender's retry and idempotency makes the
+    // redelivery safe; a CARRYOVER member (staged closure or re-drive, from
+    // an earlier delivery) stays, because its delivery was acked as
+    // buffered back then and nobody will redeliver it. Sweeping an
+    // unresolved carryover would permanently orphan an acked event's
+    // operations, the exact loss class buffering exists to prevent. Events
+    // staged by OTHER deliveries and outside this plan's membership are
+    // untouched either way.
+    let disposition: std::collections::BTreeMap<&EventId, bool> =
+        outcomes.iter().map(|(id, o)| (id, matches!(o, IngestOutcome::NeedsState { .. } | IngestOutcome::NeedsEvents { .. }))).collect();
     for id in &members {
-        if !keep.contains(id) {
-            staging.remove(id);
+        match disposition.get(id) {
+            Some(true) => {}
+            Some(false) => {
+                staging.remove(id);
+            }
+            None => {
+                if batch.contains(id) {
+                    staging.remove(id);
+                }
+            }
         }
     }
 
