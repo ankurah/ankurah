@@ -136,10 +136,18 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
         }
     }
 
-    // The applied prefix is real progress even when a failure follows:
-    // persist it (uniform state persistence, REV 3) so the buffer never
-    // rests behind what this call committed to the log.
-    if !applied.is_empty() {
+    // Persist on every plan, advance or not (uniform state persistence,
+    // REV 3). The applied prefix is real progress even when a failure
+    // follows, and a no-op plan is not proof the buffer is current: a
+    // sibling lane may have integrated these events with its own persist
+    // still in flight, and the delta lanes re-read local storage to build
+    // result sets when they return (read-your-application). Persisting the
+    // resident's current state is always monotone-safe; the M2 no-op
+    // elision raced exactly that window. A storage-backed currency check
+    // (D2's applied-set) is the sound way to skip this write later. The
+    // one exception: an empty-head entity has nothing true to persist (a
+    // phantom's empty state must not land in storage).
+    if !entity.head().is_empty() {
         if let Err(e) = persist.persist(entity).await {
             failure.get_or_insert(e);
         }

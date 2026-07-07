@@ -54,6 +54,18 @@ where
         for event in events_to_commit {
             event_getter.commit_event(event).await?;
         }
+    }
+    // Persist on every apply, advance or not. A no-op apply is not proof
+    // the buffer is current: a sibling lane may have materialized this
+    // resident an instant ago with its own persist still in flight, and the
+    // delta lanes re-read local storage to build result sets when they
+    // return (read-your-application). Persisting the resident's current
+    // state is always monotone-safe; eliding it raced exactly that window.
+    // A storage-backed currency check (D2's applied-set) is the sound way
+    // to skip this write later. Notification stays advance-only. Empty-head
+    // guard for symmetry with the executor: a phantom's empty state must
+    // not land in storage.
+    if !entity.head().is_empty() {
         persist.persist(&entity).await?;
     }
     Ok(StateApplied { entity, advanced })
