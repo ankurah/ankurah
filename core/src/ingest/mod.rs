@@ -18,3 +18,24 @@ pub(crate) use outcome::IngestOutcome;
 pub(crate) use plan::plan_entity;
 pub(crate) use staging::StagingArea;
 pub(crate) use state_apply::apply_state_feed;
+
+use crate::error::{IngestError, LineageError, LineageRejection, MutationError, RetrievalError};
+
+/// Translate comparison-layer failures into the typed taxonomy at the
+/// pipeline boundary (M5). LineageError conflates the permanent Disjoint
+/// verdict with the resumable BudgetExceeded liveness anomaly; the taxonomy
+/// separates them (C4-08). Mutual MutationError/RetrievalError boxing from
+/// the with_state path is flattened so the classification sees through it.
+/// Everything else passes through unchanged: admission errors stay on their
+/// existing surface (#274's jurisdiction), and storage-class failures keep
+/// their engine detail.
+pub(crate) fn type_comparison_error(e: MutationError) -> MutationError {
+    match e {
+        MutationError::LineageError(LineageError::Disjoint) => IngestError::Lineage(LineageRejection::Disjoint).into(),
+        MutationError::LineageError(LineageError::BudgetExceeded { original_budget, subject_frontier, other_frontier }) => {
+            IngestError::Budget { original_budget, subject_frontier, other_frontier }.into()
+        }
+        MutationError::RetrievalError(RetrievalError::MutationError(inner)) => type_comparison_error(*inner),
+        other => other,
+    }
+}

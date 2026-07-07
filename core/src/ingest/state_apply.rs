@@ -45,7 +45,10 @@ where
     S: GetState + Send + Sync,
     E: SuspenseEvents + Send + Sync,
 {
-    let (changed, entity) = entities.with_state(state_getter, event_getter, entity_id, collection_id, state).await?;
+    let (changed, entity) = entities
+        .with_state(state_getter, event_getter, entity_id, collection_id, state)
+        .await
+        .map_err(|e| super::type_comparison_error(e.into()))?;
     let advanced = !matches!(changed, Some(false));
     if advanced {
         for event in events_to_commit {

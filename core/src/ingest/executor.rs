@@ -130,7 +130,7 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
                 break;
             }
             Err(e) => {
-                failure = Some(e);
+                failure = Some(super::type_comparison_error(e));
                 break;
             }
         }
