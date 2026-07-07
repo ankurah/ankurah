@@ -284,6 +284,19 @@ mod tests {
         async fn persist(&self, _entity: &Entity) -> Result<(), MutationError> { Ok(()) }
     }
 
+    struct RecordingPersist(std::sync::atomic::AtomicBool);
+    impl RecordingPersist {
+        fn new() -> Self { Self(std::sync::atomic::AtomicBool::new(false)) }
+        fn called(&self) -> bool { self.0.load(std::sync::atomic::Ordering::SeqCst) }
+    }
+    #[async_trait]
+    impl PersistState for RecordingPersist {
+        async fn persist(&self, _entity: &Entity) -> Result<(), MutationError> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     /// The retention sweep must not delete a carryover orphan (buffered by an
     /// EARLIER delivery, acked as success then) when a transient hard failure
     /// stops the schedule at or before it: nobody will redeliver that event,
@@ -318,5 +331,74 @@ mod tests {
         assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
         assert!(staging.contains(&b), "a carryover orphan the plan never resolved must stay buffered; sweeping it loses an acked event");
         assert!(!staging.contains(&p), "the batch member leaves the area; its item error drives the sender's retry");
+    }
+
+    /// A commit_event failure AFTER the apply advanced the resident leaves
+    /// the head naming an event the log lacks. Persisting that state would
+    /// durably violate the commit-before-state invariant (the one crash
+    /// discipline this module pins), and the planner's head-containment
+    /// skip would make redelivery unable to repair it. The executor must
+    /// suppress this plan's persist and keep the event's body staged so
+    /// the backfill can commit it later.
+    #[tokio::test]
+    async fn commit_failure_never_persists_a_head_the_log_lacks() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let x = event(entity_id, &[genesis.payload.id()]);
+        let x_id = x.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore { staging: staging.clone(), fail_commit_of: x_id.clone() };
+
+        let entity = Entity::create(entity_id, "test".into());
+        entity.apply_event(&getter, &genesis.payload).await.expect("genesis applies");
+        staging.stage(x);
+
+        let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &getter).await.expect("plan builds");
+        let persist = RecordingPersist::new();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &persist).await;
+
+        assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
+        assert!(entity.head().contains(&x_id), "the resident advanced in memory (safe: buffer may lag the log)");
+        assert!(!persist.called(), "state whose head names an uncommitted event must never persist");
+        assert!(staging.contains(&x_id), "the unstored event's body stays staged; it is the backfill source");
+    }
+
+    /// The recovery half: redelivering the same batch after the failed
+    /// commit re-plans the head-contained-but-unstored event (the planner
+    /// schedules it instead of skipping), and the executor's
+    /// integrated-but-unstored backfill commits it with a now-working
+    /// store. Persist resumes.
+    #[tokio::test]
+    async fn redelivery_backfills_a_head_contained_unstored_event() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let x = event(entity_id, &[genesis.payload.id()]);
+        let x_id = x.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let failing = FailingCommitStore { staging: staging.clone(), fail_commit_of: x_id.clone() };
+
+        let entity = Entity::create(entity_id, "test".into());
+        entity.apply_event(&failing, &genesis.payload).await.expect("genesis applies");
+        staging.stage(x.clone());
+
+        let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &failing).await.expect("plan builds");
+        let _ = execute_plan(plan, &entity, &entities, &staging, &failing, &NoopPersist).await;
+        assert!(staging.contains(&x_id), "precondition: body retained after the failed commit");
+
+        // The store heals (a different designated failure id); the sender
+        // redelivers the same batch.
+        let healed = FailingCommitStore { staging: staging.clone(), fail_commit_of: EventId::from_bytes([0xEE; 32]) };
+        let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &healed).await.expect("re-plan builds");
+        assert!(plan.schedule.contains(&x_id), "a head-contained member that is staged but unstored must schedule for backfill");
+
+        let persist = RecordingPersist::new();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &healed, &persist).await;
+        assert!(outcome.failure.is_none(), "backfill commit succeeds: {:?}", outcome.failure);
+        assert!(!staging.contains(&x_id), "promotion removes the backfilled event from staging");
+        assert!(persist.called(), "persist resumes once the log caught up");
     }
 }

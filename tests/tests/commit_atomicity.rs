@@ -338,6 +338,143 @@ async fn test_local_commit_preview_includes_concurrent_history() -> Result<()> {
     Ok(())
 }
 
+/// An agent whose check_event ATTESTS album events. Pins that the commit
+/// lanes carry the returned attestation onto the committed (and relayed)
+/// event; the shared phase one attaches it in staging.
+#[derive(Clone)]
+struct AttestingAgent;
+
+#[async_trait]
+impl PolicyAgent for AttestingAgent {
+    type ContextData = &'static DefaultContext;
+
+    fn sign_request<SE: StorageEngine, C>(
+        &self,
+        _node: &NodeInner<SE, Self>,
+        cdata: &C,
+        _request: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        Ok(cdata.iterable().map(|_| proto::AuthData(vec![])).collect())
+    }
+
+    async fn check_request<SE: StorageEngine, A>(
+        &self,
+        _node: &NodeInnerAlias<SE, Self>,
+        auth: &A,
+        _request: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, ValidationError>
+    where
+        A: Iterable<proto::AuthData> + Send + Sync,
+    {
+        Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
+    }
+
+    fn check_event<SE: StorageEngine>(
+        &self,
+        _node: &NodeInnerAlias<SE, Self>,
+        _cdata: &Self::ContextData,
+        _entity_before: &Entity,
+        _entity_after: &Entity,
+        event: &proto::Event,
+    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+        if event.collection.as_str() == "album" {
+            return Ok(Some(proto::Attestation(vec![0xA7])));
+        }
+        Ok(None)
+    }
+
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        _node: &NodeInnerAlias<SE, Self>,
+        _from_node: &proto::EntityId,
+        _event: &proto::Attested<proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn attest_state<SE: StorageEngine>(&self, _node: &NodeInnerAlias<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
+        None
+    }
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _node: &NodeInnerAlias<SE, Self>,
+        _from_node: &proto::EntityId,
+        _state: &Attested<proto::EntityState>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn can_access_collection<C>(&self, _data: &C, _collection: &proto::CollectionId) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        Ok(())
+    }
+
+    fn filter_predicate<C>(&self, _data: &C, _collection: &proto::CollectionId, predicate: Predicate) -> Result<Predicate, AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        Ok(predicate)
+    }
+
+    fn check_read<C>(
+        &self,
+        _data: &C,
+        _id: &proto::EntityId,
+        _collection: &proto::CollectionId,
+        _state: &proto::State,
+    ) -> Result<(), AccessDenied>
+    where
+        C: Iterable<Self::ContextData>,
+    {
+        Ok(())
+    }
+
+    fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
+    where C: Iterable<Self::ContextData> {
+        Ok(())
+    }
+
+    fn check_write(&self, _data: &Self::ContextData, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _node: &NodeInnerAlias<SE, Self>,
+        _peer_id: &proto::EntityId,
+        _assertion: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+}
+
+/// The attestation check_event returns must survive onto the committed
+/// event: it is the policy's provenance mark, and peers receive it on the
+/// relayed transaction. Pins the shared phase one's staging attachment
+/// (both commit lanes run it).
+#[tokio::test]
+async fn test_check_event_attestation_survives_to_the_log() -> Result<()> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), AttestingAgent);
+    node.system.create().await?;
+    let ctx = node.context(DEFAULT_CONTEXT)?;
+
+    let trx = ctx.begin();
+    let album = trx.create(&Album { name: "Attested".to_owned(), year: "2026".to_owned() }).await?;
+    let album_id = album.id();
+    trx.commit().await?;
+
+    let collection = ctx.collection(&Album::collection()).await?;
+    let events = collection.dump_entity_events(album_id).await?;
+    assert_eq!(events.len(), 1, "one creation event");
+    assert!(
+        events[0].attestations.iter().any(|a| a.0 == vec![0xA7]),
+        "the check_event attestation must be carried on the committed event, got {:?}",
+        events[0].attestations
+    );
+
+    Ok(())
+}
+
 /// M7: a policy denial on the local commit lane surfaces through the typed
 /// ingest taxonomy, the same surface the remote lane adopted in M6, instead
 /// of the bare AccessDenied passthrough.
