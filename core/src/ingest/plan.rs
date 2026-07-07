@@ -48,6 +48,13 @@ pub(crate) struct IngestPlan {
     /// already-committed redeliveries and events that cannot apply before
     /// the entity has state. Events with a NeedsState outcome remain staged.
     pub preresolved: Vec<(EventId, IngestOutcome)>,
+    /// The members that arrived in THIS delivery's batch, as opposed to
+    /// closure/re-drive carryover buffered by earlier deliveries. The
+    /// executor's retention sweep needs the distinction: an unresolved batch
+    /// member may leave the area (its item error drives the sender's retry),
+    /// but an unresolved carryover was acked back when it buffered, and
+    /// nobody will redeliver it.
+    pub batch: BTreeSet<EventId>,
 }
 
 /// Plan the application of `batch` (plus whatever the staging area makes
@@ -70,6 +77,7 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
             worklist.push_back(id.clone());
         }
     }
+    let batch_members: BTreeSet<EventId> = members.clone();
     while let Some(id) = worklist.pop_front() {
         let Some(event) = staging.get(&id) else { continue };
         for parent in event.parent.as_slice() {
@@ -203,7 +211,7 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
         }
     }
 
-    Ok(IngestPlan { schedule, preresolved })
+    Ok(IngestPlan { schedule, preresolved, batch: batch_members })
 }
 
 #[cfg(test)]

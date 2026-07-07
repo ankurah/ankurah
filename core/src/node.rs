@@ -153,6 +153,12 @@ where PA: PolicyAgent
     /// is what makes NeedsState/NeedsEvents buffering and descendant
     /// re-drive real. The commit lanes keep per-call areas (Atomic mode
     /// retains nothing); the PerItem ingest lanes draw from this map.
+    /// Boundary consequence: re-drive is a node-held-area property, so a
+    /// parent arriving through a COMMIT lane does not drain a buffered
+    /// PerItem orphan; it integrates on that entity's next PerItem or
+    /// state-adoption touch, or after cap eviction and redelivery.
+    /// Tightening that (a post-commit re-plan against this map) is D3
+    /// lifecycle territory.
     pub(crate) staging: SafeMap<CollectionId, Arc<crate::ingest::StagingArea>>,
 
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
@@ -168,7 +174,7 @@ pub(crate) struct PlannedEntityGroup {
     pub(crate) staging: Arc<crate::ingest::StagingArea>,
     pub(crate) getter: LocalEventGetter,
     pub(crate) collection: crate::storage::StorageCollectionWrapper,
-    pub(crate) plan: crate::ingest::plan::IngestPlan,
+    pub(crate) plan: crate::ingest::IngestPlan,
 }
 
 impl<SE, PA> Node<SE, PA>
@@ -894,8 +900,8 @@ where
     /// True when an error bottoms out in EventNotFound through any nesting
     /// of the mutual MutationError/RetrievalError boxing: the lineage
     /// between a fetched state and the local head is unobtainable here.
-    /// The typed taxonomy replaces this unwrapping at the M5 call-site
-    /// migration.
+    /// This lane keeps hand-unwrapping the mutual boxing until deep-gap
+    /// recovery is typed with the attested-comparison work (D5, #199/#323).
     fn lineage_unobtainable(e: &MutationError) -> Option<proto::EventId> {
         match e {
             MutationError::RetrievalError(RetrievalError::EventNotFound(id)) => Some(id.clone()),
@@ -941,27 +947,40 @@ where
                 let staging = self.staging_for(collection_id);
                 let event_getter = CachedEventGetter::with_staging(collection_id.clone(), collection.clone(), self, cdata, staging.clone());
                 let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
+                // PerItem containment (plan 2.7): one bad state must not
+                // abort the batch, and entities that already adopted and
+                // persisted must still notify, or an established matching
+                // query silently misses an entity this node now holds. The
+                // first failure is remembered and returned AFTER the
+                // applied subset notifies.
                 let mut changes = Vec::new();
+                let mut first_failure: Option<RetrievalError> = None;
                 for state in states {
-                    self.policy_agent.validate_received_state(self, &peer_id, &state)?;
-                    match crate::ingest::apply_state_feed(
-                        &self.entities,
-                        &state_getter,
-                        &event_getter,
-                        &staging,
-                        state.payload.entity_id,
-                        state.payload.collection.clone(),
-                        state.payload.state.clone(),
-                        &[],
-                        &persist,
-                    )
-                    .await
-                    {
+                    let result = async {
+                        self.policy_agent.validate_received_state(self, &peer_id, &state)?;
+                        crate::ingest::apply_state_feed(
+                            &self.entities,
+                            &state_getter,
+                            &event_getter,
+                            &staging,
+                            state.payload.entity_id,
+                            state.payload.collection.clone(),
+                            state.payload.state.clone(),
+                            &[],
+                            &persist,
+                        )
+                        .await
+                    }
+                    .await;
+                    match result {
                         Ok(applied) => {
                             if applied.advanced {
-                                changes.push(
-                                    EntityChange::new(applied.entity, Vec::new()).map_err(|e| RetrievalError::Other(format!("{:?}", e)))?,
-                                );
+                                match EntityChange::new(applied.entity, Vec::new()) {
+                                    Ok(change) => changes.push(change),
+                                    Err(e) => {
+                                        first_failure.get_or_insert(RetrievalError::Other(format!("{:?}", e)));
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -981,7 +1000,7 @@ where
                                     missing
                                 );
                             } else {
-                                return Err(RetrievalError::Other(format!("{:?}", e)));
+                                first_failure.get_or_insert(RetrievalError::Other(format!("{:?}", e)));
                             }
                         }
                     }
@@ -989,7 +1008,10 @@ where
                 if !changes.is_empty() {
                     self.reactor.notify_change(changes).await;
                 }
-                Ok(())
+                match first_failure {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             }
             proto::NodeResponseBody::Error(e) => {
                 debug!("Error from peer fetch: {}", e);

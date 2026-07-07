@@ -224,10 +224,8 @@ impl NodeApplier {
                 // descendant re-drive when its parent arrives; failing the
                 // item would make the sender retry what is already safely
                 // buffered.
-                for (_, o) in &outcome.outcomes {
-                    if matches!(o, IngestOutcome::NeedsState { .. }) {
-                        return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
-                    }
+                if let Some(e) = outcome.needs_state_error() {
+                    return Err(e);
                 }
             }
 
@@ -288,13 +286,9 @@ impl NodeApplier {
                     if let Some(failure) = outcome.failure {
                         return Err(failure);
                     }
-                    // Same per-item error surface as the EventOnly arm:
-                    // NeedsState is typed, NeedsEvents is a buffered
-                    // non-error since the M8 retention flip.
-                    for (_, o) in &outcome.outcomes {
-                        if matches!(o, IngestOutcome::NeedsState { .. }) {
-                            return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
-                        }
+                    // Same per-item error surface as the EventOnly arm.
+                    if let Some(e) = outcome.needs_state_error() {
+                        return Err(e);
                     }
                 }
             }
@@ -481,12 +475,9 @@ impl NodeApplier {
                 }
                 // Per-item error surface, typed at M5. NeedsState should not
                 // arise on bridges (they include genesis); if it does, the
-                // typed empty-head rejection says so honestly. NeedsEvents is
-                // a buffered non-error since the M8 retention flip.
-                for (_, o) in &outcome.outcomes {
-                    if matches!(o, IngestOutcome::NeedsState { .. }) {
-                        return Err(crate::error::IngestError::Lineage(crate::error::LineageRejection::NonCreationOverEmptyHead).into());
-                    }
+                // typed empty-head rejection says so honestly.
+                if let Some(e) = outcome.needs_state_error() {
+                    return Err(e);
                 }
 
                 // Advance-only notification, exactly as before: a bridge whose

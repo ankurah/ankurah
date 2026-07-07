@@ -237,6 +237,12 @@ impl Entity {
     ///
     /// Returns Ok(false) when the head moved between the comparison and the
     /// lock; the caller re-compares and retries (the TOCTOU discipline).
+    ///
+    /// A consequence downstream layers must not forget: because the
+    /// StrictDescends arm routes gap-crossing applies through here,
+    /// `apply_event` is no longer a single-event primitive. One call may
+    /// incorporate several committed-but-unincorporated events on the way
+    /// to the incoming one.
     async fn apply_accumulated_layers<G: GetEvents + Send + Sync>(
         &self,
         mut layers: crate::event_dag::layers::EventLayers<G>,
