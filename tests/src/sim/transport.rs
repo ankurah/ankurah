@@ -175,7 +175,7 @@ fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
 /// false-pass the determinism audit.
 fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> String {
     let mut ids: Vec<String> =
-        fragments.iter().map(|f| proto::EventId::from_parts(&entity, &f.operations, &f.parent).to_base64_short()).collect();
+        fragments.iter().map(|f| proto::EventId::from_parts(&entity, &f.operations, &f.parent, f.generation).to_base64_short()).collect();
     ids.sort();
     ids.join("+")
 }

@@ -86,7 +86,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ankurah_proto::{Clock, EntityId, Event, EventId, Operation, OperationSet};
+use ankurah_proto::{EntityId, Event, EventId, Operation, OperationSet};
 
 use crate::event_dag::EventLayer;
 use crate::property::backend::PropertyBackend;
@@ -150,12 +150,7 @@ fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
-    Event {
-        entity_id,
-        collection: "conformance".into(),
-        parent: Clock::from(parents.to_vec()),
-        operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
-    }
+    crate::test_gen::stamped(entity_id, "conformance", OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])), parents)
 }
 
 /// Assemble an [`EventLayer`] from event references, deriving the DAG skeleton

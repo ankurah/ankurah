@@ -41,6 +41,9 @@ pub mod value;
 pub mod collectionset;
 pub mod schema;
 
+#[cfg(test)]
+pub(crate) mod test_gen;
+
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 pub use model::Model;

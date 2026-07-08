@@ -104,9 +104,10 @@ fn smoke_cross_peer_gap_fill_is_deterministic() {
                     // origin: the ephemerals have a real gap to fill.
                     let a = w.create_local_at(0, Field::Title, "gap").await;
                     let head = w.head_of(a).expect("harness tracks the head it produced");
-                    let e1 = model::attest(model::edit_event(a, head, Field::Body, "b1"));
+                    // Linear lineage over the genesis (generation 1): e1 is 2, e2 is 3.
+                    let e1 = model::attest(model::edit_event(a, head, Field::Body, "b1", 2));
                     let e1_head = proto::Clock::from(vec![e1.payload.id()]);
-                    let e2 = model::attest(model::edit_event(a, e1_head, Field::Body, "b2"));
+                    let e2 = model::attest(model::edit_event(a, e1_head, Field::Body, "b2", 3));
                     w.apply_events_at(0, a, vec![e1, e2]).await;
 
                     // Both ephemerals fill the gap through the Get lane.

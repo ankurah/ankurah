@@ -119,8 +119,7 @@ impl GetEvents for LocalEventGetter {
 
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
         // Check permanent storage only (not staging)
-        let events = self.collection.get_events(vec![event_id.clone()]).await?;
-        Ok(events.into_iter().next().is_some())
+        self.collection.has_event(event_id).await
     }
 
     fn storage_is_definitive(&self) -> bool { self.durable }
@@ -230,8 +229,7 @@ where
 
     async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
         // Check permanent storage only (not staging)
-        let events = self.collection.get_events(vec![event_id.clone()]).await?;
-        Ok(events.into_iter().next().is_some())
+        self.collection.has_event(event_id).await
     }
 }
 
@@ -277,7 +275,7 @@ impl GetState for LocalStateGetter {
 mod tests {
     use super::*;
     use crate::storage::{StorageCollection, StorageCollectionWrapper};
-    use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventId, OperationSet};
+    use ankurah_proto::{AttestationSet, Attested, EntityId, EntityState, Event, EventId, OperationSet};
     use async_trait::async_trait;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -323,7 +321,7 @@ mod tests {
         entity_id_bytes[0] = seed;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-        Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids)
     }
 
     // ====================================================================

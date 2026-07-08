@@ -50,7 +50,7 @@ fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
     entity_id_bytes[0] = seed;
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids)
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
@@ -59,7 +59,7 @@ fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
-    Event { entity_id, collection: "test".into(), parent: Clock::from(parent_ids.to_vec()), operations: OperationSet(BTreeMap::new()) }
+    crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids)
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -71,7 +71,10 @@ macro_rules! clock {
 
 /// Create a test event with LWW operations.
 /// Uses a seed to create deterministic but different entity IDs for each event.
-fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
+fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event { make_lww_event_with_parent(seed, properties, &[]) }
+
+/// Like make_lww_event but with an explicit parent clock, for multi-layer DAG scenarios.
+fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
     // Use seed for entity_id to get different event hashes
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0] = seed;
@@ -82,19 +85,7 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
         backend.set(name.into(), Some(Value::String(value.into())));
     }
     let ops = backend.to_operations().unwrap().unwrap();
-    Event {
-        entity_id,
-        collection: "test".into(),
-        parent: Clock::default(),
-        operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-    }
-}
-
-/// Like make_lww_event but with an explicit parent clock, for multi-layer DAG scenarios.
-fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
-    let mut event = make_lww_event(seed, properties);
-    event.parent = Clock::from(parent_ids.to_vec());
-    event
+    crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), parent_ids)
 }
 
 fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
@@ -1341,12 +1332,7 @@ mod yrs_layer_tests {
         backend.insert(text_field, 0, insert_text).unwrap();
         let ops = backend.to_operations().unwrap().unwrap();
 
-        Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("yrs".to_string(), ops)])),
-        }
+        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("yrs".to_string(), ops)])), &[])
     }
 
     #[test]
@@ -1577,12 +1563,7 @@ mod edge_case_tests {
 
         // Create an event with empty operations
         let entity_id = EntityId::from_bytes([99u8; 16]);
-        let empty_event = Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::new()), // No operations
-        };
+        let empty_event = crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), &[]);
 
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&empty_event];
@@ -1643,12 +1624,7 @@ mod edge_case_tests {
         let delete_backend = LWWBackend::new();
         delete_backend.set("x".into(), None); // Delete
         let ops = delete_backend.to_operations().unwrap().unwrap();
-        let delete_event = Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        };
+        let delete_event = crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), &[]);
 
         backend.apply_layer(&layer_from_refs_with_context(&[], &[&delete_event], &[&init_event])).unwrap();
 
@@ -1816,12 +1792,8 @@ mod phase4_duplicate_creation {
         backend.set("x".into(), Some(Value::String(format!("value_{}", seed))));
         let ops = backend.to_operations().unwrap().unwrap();
 
-        Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::default(), // empty parent = creation event
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-        }
+        // empty parent = creation event
+        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), &[])
     }
 
     #[tokio::test]
@@ -2975,12 +2947,7 @@ mod entity_change_batches {
             backend.set(name.into(), Some(Value::String(value.into())));
         }
         let ops = backend.to_operations().unwrap().unwrap();
-        Event {
-            entity_id,
-            collection: "test".into(),
-            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
-            parent: Clock::from(parent_ids.to_vec()),
-        }
+        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), parent_ids)
     }
 
     /// An ordered parent-then-child batch applies cleanly, leaving only the

@@ -40,12 +40,12 @@ fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &s
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event {
+    ankurah_tests::gen::stamped_event(
         entity_id,
-        collection: Record::collection(),
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        Record::collection(),
+        proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
-    }
+    )
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -203,12 +203,12 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         let backend = LWWBackend::new();
         backend.set("artist".into(), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            collection: Record::collection(),
-            operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: head0.clone(),
-        }
+        ankurah_tests::gen::stamped_event(
+            rec_id,
+            Record::collection(),
+            proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+            head0.clone(),
+        )
     };
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
@@ -289,12 +289,12 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         let backend = LWWBackend::new();
         backend.set("artist".into(), Some(Value::String("foreign-x".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            collection: Record::collection(),
-            operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: proto::Clock::default(),
-        }
+        ankurah_tests::gen::stamped_event(
+            rec_id,
+            Record::collection(),
+            proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+            proto::Clock::default(),
+        )
     };
     let id_b = ev_b.id();
     let id_x = ev_x.id();

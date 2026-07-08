@@ -95,7 +95,7 @@ mod tests {
     /// parent edges passed to topo_sort_ids are explicit pairs, so shapes
     /// impossible for honest content (cycles) remain constructible here.
     fn tid(n: u8) -> EventId {
-        EventId::from_parts(&EntityId::from_bytes([n; 16]), &OperationSet(Default::default()), &Clock::from(Vec::new()))
+        EventId::from_parts(&EntityId::from_bytes([n; 16]), &OperationSet(Default::default()), &Clock::from(Vec::new()), 1)
     }
 
     #[test]

@@ -42,6 +42,9 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
         entity_id: EntityId::new(),
         operations: proto::OperationSet(BTreeMap::new()),
         parent: proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
+        // The parent is fabricated and the entity does not exist; this event is
+        // rejected before generation matters, so a plausible child value suffices.
+        generation: 2,
     };
 
     let resp = client
@@ -78,6 +81,8 @@ async fn server_rejects_create_for_existing() -> anyhow::Result<()> {
         entity_id: existing_id,
         operations: proto::OperationSet(BTreeMap::new()),
         parent: proto::Clock::new([]),
+        // Genesis event (empty parent): generation is always 1.
+        generation: 1,
     };
 
     let resp = client

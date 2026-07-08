@@ -33,6 +33,10 @@ pub struct Workload<'a> {
     /// reading a node (reads would be nondeterministic mid-flight; the harness
     /// tracks the origin head it just produced).
     heads: std::collections::HashMap<proto::EntityId, proto::Clock>,
+    /// Generation of every forged event, so a child stamps `1 + max(parent
+    /// generations)`. The real ingest's admission verification rejects a
+    /// mis-stamped generation, so the harness must stamp the topological level.
+    gens: std::collections::HashMap<proto::EventId, u32>,
     /// Live subscriptions held open for the run's duration. Dropping a
     /// `LiveQuery` tears down its relay context, so scenarios that inject
     /// SubscriptionUpdates keep them alive here.
@@ -55,6 +59,12 @@ impl<'a> Workload<'a> {
     /// Pick a node index uniformly from the seed (e.g. to choose an origin).
     pub fn any_node(&mut self) -> usize { self.rng.below(self.nodes.len()) }
 
+    /// The generation a child parented on `parent` must carry: `1 + max` of the
+    /// tracked generations of the parent tips (`1` when the parent is empty).
+    fn child_generation(&self, parent: &proto::Clock) -> u32 {
+        proto::Event::generation_from_parents(parent.iter().map(|id| self.gens.get(id).copied().unwrap_or(0)))
+    }
+
     /// Create a new entity at `origin` with an initial field write, propagate
     /// it to all other nodes through the scheduler, and return its id. The id
     /// is deterministic (seed-derived counter).
@@ -63,7 +73,9 @@ impl<'a> Workload<'a> {
         self.next_entity += 1;
 
         let event = model::genesis_event(id, field, value);
-        let head = proto::Clock::from(vec![event.id()]);
+        let event_id = event.id();
+        self.gens.insert(event_id.clone(), event.generation);
+        let head = proto::Clock::from(vec![event_id]);
         let attested = model::attest(event);
 
         self.commit_and_propagate(origin, id, vec![attested], &head).await;
@@ -86,8 +98,11 @@ impl<'a> Workload<'a> {
     /// multi-head shape: capture a head, let another edit advance the tracked
     /// head, then edit again from the captured (now stale) head.
     pub async fn edit_from(&mut self, origin: usize, entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) {
-        let event = model::edit_event(entity, parent, field, value);
-        let new_head = proto::Clock::from(vec![event.id()]);
+        let generation = self.child_generation(&parent);
+        let event = model::edit_event(entity, parent, field, value, generation);
+        let event_id = event.id();
+        self.gens.insert(event_id.clone(), generation);
+        let new_head = proto::Clock::from(vec![event_id]);
         let attested = model::attest(event);
         self.commit_and_propagate(origin, entity, vec![attested], &new_head).await;
         self.heads.insert(entity, new_head);
@@ -116,7 +131,9 @@ impl<'a> Workload<'a> {
         self.next_entity += 1;
 
         let event = model::genesis_event(id, field, value);
-        let head = proto::Clock::from(vec![event.id()]);
+        let event_id = event.id();
+        self.gens.insert(event_id.clone(), event.generation);
+        let head = proto::Clock::from(vec![event_id]);
         self.nodes[origin].origin_commit(vec![model::attest(event)]).await.expect("origin commit applies");
         self.trace.record(TraceEvent::Origin { node: origin, entity: id.to_base64_short(), head: head.to_base64_short() });
         self.created.push(id);
@@ -444,6 +461,7 @@ where
                 next_entity: 0,
                 created: Vec::new(),
                 heads: std::collections::HashMap::new(),
+                gens: std::collections::HashMap::new(),
                 subscriptions: Vec::new(),
                 recorders: Vec::new(),
                 forbidden: Vec::new(),

@@ -4,4 +4,5 @@
 //! deterministic multi-node simulation harness (`sim`) so both the smoke-tier
 //! scenario tests and the future C2 nightly scale-out can drive it.
 
+pub mod gen;
 pub mod sim;

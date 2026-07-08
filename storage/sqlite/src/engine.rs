@@ -133,12 +133,15 @@ fn create_state_table(conn: &Connection, collection_id: &CollectionId) -> Result
 
 fn create_event_table(conn: &Connection, collection_id: &CollectionId) -> Result<(), SqliteError> {
     let table_name = format!("{}_event", collection_id.as_str());
+    // generation is mandatory (fresh-database ruling); a pre-D2 table lacks the
+    // column and inserts fail loudly.
     let query = format!(
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY,
             "entity_id" TEXT,
             "operations" BLOB,
             "parent" TEXT,
+            "generation" INTEGER NOT NULL,
             "attestations" BLOB
         )"#,
         table_name
@@ -555,15 +558,16 @@ impl StorageCollection for SqliteBucket {
         let table_name = self.event_table();
         let event_id = entity_event.payload.id().to_base64();
         let entity_id = entity_event.payload.entity_id.to_base64();
+        let generation = entity_event.payload.generation;
 
         let query = format!(
-            r#"INSERT INTO "{}"("id", "entity_id", "operations", "parent", "attestations") VALUES(?, ?, ?, ?, ?)
+            r#"INSERT INTO "{}"("id", "entity_id", "operations", "parent", "generation", "attestations") VALUES(?, ?, ?, ?, ?, ?)
                ON CONFLICT ("id") DO NOTHING"#,
             table_name
         );
 
         conn.with_connection(move |c| {
-            let affected = c.execute(&query, rusqlite::params![event_id, entity_id, operations, parent_json, attestations])?;
+            let affected = c.execute(&query, rusqlite::params![event_id, entity_id, operations, parent_json, generation, attestations])?;
             Ok(affected > 0)
         })
         .await
@@ -585,7 +589,7 @@ impl StorageCollection for SqliteBucket {
         conn.with_connection(move |c| {
             let placeholders = (0..num_ids).map(|_| "?").collect::<Vec<_>>().join(", ");
             let query = format!(
-                r#"SELECT "id", "entity_id", "operations", "parent", "attestations" FROM "{}" WHERE "id" IN ({})"#,
+                r#"SELECT "id", "entity_id", "operations", "parent", "generation", "attestations" FROM "{}" WHERE "id" IN ({})"#,
                 table_name, placeholders
             );
 
@@ -596,13 +600,14 @@ impl StorageCollection for SqliteBucket {
                 let entity_id_str: String = row.get(1)?;
                 let operations: Vec<u8> = row.get(2)?;
                 let parent_json: String = row.get(3)?;
-                let attestations_blob: Vec<u8> = row.get(4)?;
-                Ok((entity_id_str, operations, parent_json, attestations_blob))
+                let generation: u32 = row.get(4)?;
+                let attestations_blob: Vec<u8> = row.get(5)?;
+                Ok((entity_id_str, operations, parent_json, generation, attestations_blob))
             })?;
 
             let mut events = Vec::with_capacity(num_ids);
             for row in rows {
-                let (entity_id_str, operations_blob, parent_json, attestations_blob) = row?;
+                let (entity_id_str, operations_blob, parent_json, generation, attestations_blob) = row?;
 
                 let entity_id = EntityId::from_base64(&entity_id_str).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
@@ -614,13 +619,30 @@ impl StorageCollection for SqliteBucket {
                     rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
                 })?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
+                    rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
                 })?;
 
-                events.push(Attested { payload: Event { collection: collection_id.clone(), entity_id, operations, parent }, attestations });
+                events.push(Attested {
+                    payload: Event { collection: collection_id.clone(), entity_id, operations, parent, generation },
+                    attestations,
+                });
             }
 
             Ok(events)
+        })
+        .await
+        .map_err(|e| RetrievalError::StorageError(Box::new(e)))
+    }
+
+    async fn has_event(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
+        let table_name = self.event_table().to_owned();
+        let id_string = event_id.to_base64();
+
+        conn.with_connection(move |c| {
+            let query = format!(r#"SELECT 1 FROM "{}" WHERE "id" = ? LIMIT 1"#, table_name);
+            let mut stmt = c.prepare(&query)?;
+            Ok(stmt.exists(rusqlite::params![id_string])?)
         })
         .await
         .map_err(|e| RetrievalError::StorageError(Box::new(e)))
@@ -634,20 +656,22 @@ impl StorageCollection for SqliteBucket {
         let entity_id_str = entity_id.to_base64();
 
         conn.with_connection(move |c| {
-            let query = format!(r#"SELECT "id", "operations", "parent", "attestations" FROM "{}" WHERE "entity_id" = ?"#, table_name);
+            let query =
+                format!(r#"SELECT "id", "operations", "parent", "generation", "attestations" FROM "{}" WHERE "entity_id" = ?"#, table_name);
 
             let mut stmt = c.prepare(&query)?;
             let rows = stmt.query_map([&entity_id_str], |row| {
                 let _event_id: String = row.get(0)?;
                 let operations: Vec<u8> = row.get(1)?;
                 let parent_json: String = row.get(2)?;
-                let attestations_blob: Vec<u8> = row.get(3)?;
-                Ok((operations, parent_json, attestations_blob))
+                let generation: u32 = row.get(3)?;
+                let attestations_blob: Vec<u8> = row.get(4)?;
+                Ok((operations, parent_json, generation, attestations_blob))
             })?;
 
             let mut events = Vec::new();
             for row in rows {
-                let (operations_blob, parent_json, attestations_blob) = row?;
+                let (operations_blob, parent_json, generation, attestations_blob) = row?;
 
                 let operations: OperationSet = bincode::deserialize(&operations_blob).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
@@ -656,10 +680,13 @@ impl StorageCollection for SqliteBucket {
                     rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(std::io::Error::other(e)))
                 })?;
                 let attestations: AttestationSet = bincode::deserialize(&attestations_blob).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
+                    rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Blob, Box::new(std::io::Error::other(e)))
                 })?;
 
-                events.push(Attested { payload: Event { collection: collection_id.clone(), entity_id, operations, parent }, attestations });
+                events.push(Attested {
+                    payload: Event { collection: collection_id.clone(), entity_id, operations, parent, generation },
+                    attestations,
+                });
             }
 
             Ok(events)

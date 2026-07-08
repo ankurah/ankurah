@@ -233,6 +233,9 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
         collection: denied_record.collection().clone(),
         operations: OperationSet(BTreeMap::new()),
         parent: Clock::new(denied_record.head().to_vec()),
+        // Child of the record's genesis head (generation 1); this drives a direct
+        // policy check, not ingest admission, so the value is untested.
+        generation: 2,
     };
 
     let result = agent.check_event(&node, &context, &denied_record, &allowed_record, &retag_event);
