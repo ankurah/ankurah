@@ -2997,3 +2997,53 @@ mod entity_change_batches {
         assert!(bad.is_err(), "an event outside the head and unsuperseded in the batch must be rejected");
     }
 }
+
+/// D2 M1 identity pins: the generation is inside the hashed content, so an
+/// event's id commits to its generation and a mis-stamped forgery cannot wear
+/// the correct event's identity (266-E). These live in core because the
+/// validation gate runs `-p ankurah-core`, not the proto crate's own tests.
+mod generation_identity {
+    use ankurah_proto::{Clock, EntityId, Event, OperationSet};
+    use std::collections::BTreeMap;
+
+    fn event(entity: EntityId, parent: Clock, generation: u32) -> Event {
+        Event { entity_id: entity, collection: "test".into(), operations: OperationSet(BTreeMap::new()), parent, generation }
+    }
+
+    /// R-D2-1a: two events differing ONLY in generation get different ids.
+    #[test]
+    fn r_d2_1a_generation_differentiates_identity() {
+        let entity = EntityId::from_bytes([7u8; 16]);
+        let a = event(entity, Clock::default(), 1);
+        let b = event(entity, Clock::default(), 2);
+        assert_ne!(a.id(), b.id(), "events differing only in generation must have different ids");
+    }
+
+    /// R-D2-1b: a mis-stamped event is BUILDABLE, but its id commits to the
+    /// stamped value (round-trip pins the field is hashed), so a forgery gets a
+    /// distinct id from the correctly-stamped event rather than colliding with it.
+    #[test]
+    fn r_d2_1b_misstamped_generation_is_hashed_into_identity() {
+        let entity = EntityId::from_bytes([9u8; 16]);
+
+        // A mis-stamped genesis (claims 5, must be 1) is buildable, but its id
+        // differs from the correct genesis.
+        let genesis_correct = event(entity, Clock::default(), 1);
+        let genesis_misstamped = event(entity, Clock::default(), 5);
+        assert_ne!(genesis_correct.id(), genesis_misstamped.id(), "a mis-stamped genesis must not share the correct genesis's id");
+
+        // The stamped value round-trips through bincode and the decoded event
+        // recomputes the same id: the id commits to the stored field.
+        let bytes = bincode::serialize(&genesis_misstamped).unwrap();
+        let decoded: Event = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.generation, 5, "generation must survive serialization");
+        assert_eq!(decoded.id(), genesis_misstamped.id(), "the id must commit to the stored generation");
+
+        // A mis-stamped child (claims 9, must be 1 + parent) likewise gets a
+        // distinct id from the correctly-stamped child.
+        let parent = Clock::from(vec![genesis_correct.id()]);
+        let child_correct = event(entity, parent.clone(), 2);
+        let child_misstamped = event(entity, parent, 9);
+        assert_ne!(child_correct.id(), child_misstamped.id(), "a mis-stamped child must not share the correct child's id");
+    }
+}
