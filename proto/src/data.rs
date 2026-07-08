@@ -21,7 +21,7 @@ impl EventId {
         hasher.update(bincode::serialize(&entity_id).unwrap());
         hasher.update(bincode::serialize(&operations).unwrap());
         hasher.update(bincode::serialize(&parent).unwrap());
-        let _ = generation;
+        hasher.update(bincode::serialize(&generation).unwrap());
         Self(hasher.finalize().into())
     }
     pub fn to_base64(&self) -> String {
