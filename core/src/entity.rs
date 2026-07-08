@@ -393,7 +393,9 @@ impl Entity {
             Ok(None)
         } else {
             let operations = OperationSet(operations);
-            let event = Event { entity_id: self.id, model: self.model_id()?, operations, parent: state.head.clone() };
+            // generation is stamped 1 here; the resident does not yet track head
+            // generations, so 1 + max(parent generations) stamping (D2-2) lands in M2.
+            let event = Event { entity_id: self.id, model: self.model_id()?, operations, parent: state.head.clone(), generation: 1 };
             Ok(Some(event))
         }
     }

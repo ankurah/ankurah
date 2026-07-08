@@ -93,6 +93,13 @@ pub trait StorageCollection: Send + Sync {
     /// Retrieve a list of events
     async fn get_events(&self, event_ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError>;
 
+    /// Whether an event is in permanent storage. The default fetches and
+    /// deserializes the whole event; engines override with a cheap existence
+    /// probe (a keyed `SELECT`, a `contains_key`) that reads no payload.
+    async fn has_event(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        Ok(!self.get_events(vec![event_id.clone()]).await?.is_empty())
+    }
+
     /// Retrieve all events from the collection
     async fn dump_entity_events(&self, id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError>;
 }

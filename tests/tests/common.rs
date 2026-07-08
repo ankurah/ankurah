@@ -681,4 +681,51 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     }
 
     Err(anyhow::anyhow!("Failed to start test server after {} attempts. Last error: {:?}", MAX_PORT_RETRIES, last_error))
+
+// ---------------------------------------------------------------------------
+// CountingGetEvents: a `GetEvents` wrapper that counts fetch calls, so a test
+// can prove a fast path (D2's applied-set skip, a generation precheck) served
+// a redelivery WITHOUT walking history. The counters are the observable an
+// O(1)-skip assertion checks: a served fast path fetches zero events.
+// ---------------------------------------------------------------------------
+
+use ankurah::core::retrieval::GetEvents;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub struct CountingGetEvents<G> {
+    inner: G,
+    get_event_calls: AtomicUsize,
+    event_stored_calls: AtomicUsize,
+}
+
+#[allow(dead_code)]
+impl<G> CountingGetEvents<G> {
+    pub fn new(inner: G) -> Self { Self { inner, get_event_calls: AtomicUsize::new(0), event_stored_calls: AtomicUsize::new(0) } }
+
+    /// Number of `get_event` calls seen since construction.
+    pub fn get_event_calls(&self) -> usize { self.get_event_calls.load(Ordering::Relaxed) }
+
+    /// Number of `event_stored` calls seen since construction.
+    pub fn event_stored_calls(&self) -> usize { self.event_stored_calls.load(Ordering::Relaxed) }
+
+    /// Reset both counters to zero (to measure a single operation in isolation).
+    pub fn reset(&self) {
+        self.get_event_calls.store(0, Ordering::Relaxed);
+        self.event_stored_calls.store(0, Ordering::Relaxed);
+    }
+}
+
+#[async_trait::async_trait]
+impl<G: GetEvents + Send + Sync> GetEvents for CountingGetEvents<G> {
+    async fn get_event(&self, event_id: &proto::EventId) -> Result<proto::Event, ankurah::core::error::RetrievalError> {
+        self.get_event_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_event(event_id).await
+    }
+
+    async fn event_stored(&self, event_id: &proto::EventId) -> Result<bool, ankurah::core::error::RetrievalError> {
+        self.event_stored_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.event_stored(event_id).await
+    }
+
+    fn storage_is_definitive(&self) -> bool { self.inner.storage_is_definitive() }
 }

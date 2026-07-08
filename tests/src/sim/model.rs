@@ -123,12 +123,21 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 /// it as a create (`Event::is_entity_create`). `field`/`value` seed the initial
 /// state.
 pub fn genesis_event(entity: proto::EntityId, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent: proto::Clock::default() }
+    proto::Event {
+        collection: SimRecord::collection(),
+        entity_id: entity,
+        operations: lww_ops(field, value),
+        parent: proto::Clock::default(),
+        // A genesis event has no parents, so its generation is always 1 (266-A).
+        generation: 1,
+    }
 }
 
 /// Forge a non-genesis event parented on `parent`, setting `field` to `value`.
-pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) -> proto::Event {
-    proto::Event { model: sim_model_id(), entity_id: entity, operations: lww_ops(field, value), parent }
+/// `generation` must be `1 + max(parent generations)`: forged events flow through
+/// the real ingest, whose admission verification rejects a mis-stamped generation.
+pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str, generation: u32) -> proto::Event {
+    proto::Event { collection: SimRecord::collection(), entity_id: entity, operations: lww_ops(field, value), parent, generation }
 }
 
 /// Wrap a forged event as an unsigned `Attested<Event>`. Under `PermissiveAgent`

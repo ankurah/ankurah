@@ -259,18 +259,12 @@ mod tests {
     use crate::entity::Entity;
     use crate::error::RetrievalError;
     use crate::ingest::plan_entity;
-    use ankurah_proto::{Clock, EntityId, OperationSet};
+    use ankurah_proto::{EntityId, OperationSet};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
 
     fn event(entity_id: EntityId, parent_ids: &[EventId]) -> Attested<Event> {
-        let event = Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::from(parent_ids.to_vec()),
-            operations: OperationSet(BTreeMap::new()),
-        };
-        Attested::opt(event, None)
+        Attested::opt(crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids), None)
     }
 
     /// Getter whose `commit_event` fails for one designated event id (the

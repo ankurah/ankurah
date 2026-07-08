@@ -15,11 +15,13 @@ impl std::fmt::Debug for EventId {
 impl EventId {
     /// Generate an EventID from the parts of an Event
     /// notably, we are not including the collection in the hash because collection is getting excised from identity
-    pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock) -> Self {
+    /// The generation is inside the hashed content (266-E): two events differing only in generation are distinct events.
+    pub fn from_parts(entity_id: &EntityId, operations: &OperationSet, parent: &Clock, generation: u32) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(bincode::serialize(&entity_id).unwrap());
         hasher.update(bincode::serialize(&operations).unwrap());
         hasher.update(bincode::serialize(&parent).unwrap());
+        let _ = generation;
         Self(hasher.finalize().into())
     }
     pub fn to_base64(&self) -> String {
@@ -111,29 +113,55 @@ pub struct Event {
     pub operations: OperationSet,
     /// The set of concurrent events (usually only one) which is the precursor of this event
     pub parent: Clock,
+    /// The git-v1 topological level of this event: `1 + max(parent generations)`,
+    /// or `1` for a genesis event (266-A, 266-E). Stamped by the committer, carried
+    /// inside the hashed content, and verified per edge at admission. A mandatory
+    /// field: there is no way to represent an event without one.
+    pub generation: u32,
 }
 
 impl Event {
     // TODO: figure out how we actually want to signify entity creation. This is a hack for now
     pub fn is_entity_create(&self) -> bool { self.parent.is_empty() }
+
+    /// The generation an event must carry given the generations of its parents:
+    /// `1 + max(parent generations)`, or `1` for a genesis event (no parents).
+    /// Saturates at `u32::MAX` (266-C.iv); a comparison touching a saturated value
+    /// disables the generation accelerations and falls back to the plain walk.
+    pub fn generation_from_parents(parent_generations: impl IntoIterator<Item = u32>) -> u32 {
+        parent_generations.into_iter().max().map_or(1, |m| m.saturating_add(1))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EventFragment {
     pub operations: OperationSet,
     pub parent: Clock,
+    /// See [`Event::generation`]. Carried on the wire inside the hashed content.
+    pub generation: u32,
     pub attestations: AttestationSet,
 }
 
 impl From<Attested<Event>> for EventFragment {
     fn from(attested: Attested<Event>) -> Self {
-        Self { operations: attested.payload.operations, parent: attested.payload.parent, attestations: attested.attestations }
+        Self {
+            operations: attested.payload.operations,
+            parent: attested.payload.parent,
+            generation: attested.payload.generation,
+            attestations: attested.attestations,
+        }
     }
 }
 
 impl From<(EntityId, EntityId, EventFragment)> for Attested<Event> {
     fn from(value: (EntityId, EntityId, EventFragment)) -> Self {
-        let event = Event { entity_id: value.0, model: value.1, operations: value.2.operations, parent: value.2.parent };
+        let event = Event {
+            entity_id: value.0,
+            model: value.1,
+            operations: value.2.operations,
+            parent: value.2.parent,
+            generation: value.2.generation,
+        };
         Attested { payload: event, attestations: value.2.attestations }
     }
 }
@@ -155,7 +183,7 @@ impl From<(EntityId, EntityId, StateFragment)> for Attested<EntityState> {
 }
 
 impl Event {
-    pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent) }
+    pub fn id(&self) -> EventId { EventId::from_parts(&self.entity_id, &self.operations, &self.parent, self.generation) }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -213,8 +241,9 @@ impl std::fmt::Display for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Event({} {}/{} {}{} {})",
+            "Event({} g{} {}/{} {}{} {})",
             self.id().to_base64_short(),
+            self.generation,
             self.model.to_base64_short(),
             self.entity_id.to_base64_short(),
             if self.is_entity_create() { "(create) " } else { "" },
@@ -280,7 +309,10 @@ impl Attested<EntityState> {
 
 impl Attested<Event> {
     pub fn from_parts(entity_id: EntityId, model: EntityId, frag: EventFragment) -> Self {
-        Self { payload: Event { entity_id, model, operations: frag.operations, parent: frag.parent }, attestations: frag.attestations }
+        Self {
+            payload: Event { entity_id, model, operations: frag.operations, parent: frag.parent, generation: frag.generation },
+            attestations: frag.attestations,
+        }
     }
 }
 

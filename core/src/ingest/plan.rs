@@ -256,13 +256,7 @@ mod tests {
     }
 
     fn event(entity_id: EntityId, parent_ids: &[EventId]) -> Attested<Event> {
-        let event = Event {
-            entity_id,
-            collection: "test".into(),
-            parent: Clock::from(parent_ids.to_vec()),
-            operations: OperationSet(BTreeMap::new()),
-        };
-        Attested::opt(event, None)
+        Attested::opt(crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids), None)
     }
 
     /// genesis <- e1 <- e2 for one entity, returned with their ids.

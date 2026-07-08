@@ -25,6 +25,18 @@ use ankurah_storage_common::{filtering::ValueSetStream, OrderByComponents, Plan}
 use futures::StreamExt;
 use tracing::{debug, warn};
 
+/// Read the mandatory u32 generation off a stored event object. Numbers round-trip
+/// through JS as f64 and a u32 is exactly representable, so this is lossless. There
+/// is no numeric `TryFrom<JsValue>` to route through `Object::get`, hence the direct
+/// reflect-and-`as_f64` read.
+fn read_generation(event_obj: &Object) -> Result<u32, RetrievalError> {
+    let raw = js_sys::Reflect::get(event_obj, &GENERATION_KEY)
+        .map_err(|_| RetrievalError::StorageError(anyhow::anyhow!("Failed to get generation").into()))?;
+    raw.as_f64()
+        .map(|n| n as u32)
+        .ok_or_else(|| RetrievalError::StorageError(anyhow::anyhow!("event generation missing or not a number").into()))
+}
+
 #[derive(Debug)]
 pub struct IndexedDBBucket {
     pub(crate) db: Database,
@@ -307,6 +319,8 @@ impl StorageCollection for IndexedDBBucket {
             event_obj.set(&*OPERATIONS_KEY, &payload.operations)?;
             event_obj.set(&*ATTESTATIONS_KEY, &attested_event.attestations)?;
             event_obj.set(&*PARENT_KEY, &payload.parent)?;
+            // generation is a u32, stored as a JS number (exactly representable).
+            event_obj.set(&*GENERATION_KEY, payload.generation)?;
 
             let request = store.put_with_key(&event_obj, &(&payload.id()).into()).require("put event in store")?;
 
@@ -348,6 +362,7 @@ impl StorageCollection for IndexedDBBucket {
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
                         operations: event_obj.get(&OPERATIONS_KEY)?,
                         parent: event_obj.get(&PARENT_KEY)?,
+                        generation: read_generation(&event_obj)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,
                 };
@@ -355,6 +370,20 @@ impl StorageCollection for IndexedDBBucket {
             }
 
             Ok(events)
+        })
+        .await
+    }
+
+    async fn has_event(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        let db_connection = self.db.get_connection().await;
+        let key = event_id.to_base64();
+        SendWrapper::new(async move {
+            let transaction = db_connection.transaction_with_str("events").require("create transaction")?;
+            let store = transaction.object_store("events").require("get object store")?;
+            let request = store.get(&key.into()).require("get event")?;
+            cb_future(&request, "success", "error").await.require("await event request")?;
+            let result = request.result().require("get result")?;
+            Ok(!(result.is_undefined() || result.is_null()))
         })
         .await
     }
@@ -389,6 +418,7 @@ impl StorageCollection for IndexedDBBucket {
                         entity_id: event_obj.get(&ENTITY_ID_KEY)?,
                         operations: event_obj.get(&OPERATIONS_KEY)?,
                         parent: event_obj.get(&PARENT_KEY)?,
+                        generation: read_generation(&event_obj)?,
                     },
                     attestations: event_obj.get(&ATTESTATIONS_KEY)?,
                 };

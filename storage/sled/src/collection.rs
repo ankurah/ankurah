@@ -92,6 +92,12 @@ impl StorageCollection for SledStorageCollection {
         Ok(task::spawn_blocking(move || inner.get_events_blocking(event_ids)).await??)
     }
 
+    async fn has_event(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        let inner = self.0.clone();
+        let event_id = event_id.clone();
+        Ok(task::spawn_blocking(move || inner.has_event_blocking(&event_id)).await??)
+    }
+
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
         let inner = self.0.clone();
         Ok(task::spawn_blocking(move || inner.dump_entity_events_blocking(entity_id)).await??)
@@ -387,6 +393,10 @@ impl SledStorageCollectionInner {
             }
         }
         Ok(events)
+    }
+
+    fn has_event_blocking(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        Ok(self.database.events_tree.contains_key(event_id.as_bytes()).map_err(SledRetrievalError::StorageError)?)
     }
 
     fn dump_entity_events_blocking(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {

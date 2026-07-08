@@ -18,12 +18,12 @@ fn forge_lww_event(entity_id: proto::EntityId, parent: proto::Clock, property: &
     let backend = LWWBackend::new();
     backend.set(property.into(), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event {
+    ankurah_tests::gen::stamped_event(
         entity_id,
-        collection: Record::collection(),
-        operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        Record::collection(),
+        proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
-    }
+    )
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {

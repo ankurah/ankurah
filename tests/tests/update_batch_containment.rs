@@ -27,7 +27,12 @@ fn forge_title_event(
     let backend = LWWBackend::new();
     backend.set(PropertyKey::Id(title_prop), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event { entity_id, model, operations: proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])), parent }
+    ankurah_tests::gen::stamped_event(
+        entity_id,
+        Record::collection(),
+        proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
+        parent,
+    )
 }
 
 fn event_only_item(event: proto::Event, source_query: proto::QueryId) -> proto::SubscriptionUpdateItem {
@@ -84,12 +89,12 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         let backend = LWWBackend::new();
         backend.set(PropertyKey::Id(record_artist), Some(Value::String("artist-p1".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event {
-            entity_id: rec_id,
-            model: ev_parent.model,
-            operations: proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
-            parent: ev_parent.parent.clone(),
-        }
+        ankurah_tests::gen::stamped_event(
+            rec_id,
+            ev_parent.collection.clone(),
+            proto::OperationSet(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
+            ev_parent.parent.clone(),
+        )
     };
     let ev_child = forge_title_event(rec_id, record_model, record_title, proto::Clock::from(vec![ev_parent.id()]), "t-child");
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
