@@ -89,6 +89,8 @@ impl ExecutionOutcome {
 
 /// Execute a plan against one entity. PerItem containment semantics; the
 /// Atomic (transaction) mode arrives with the commit-lane cutover (M6/M7).
+/// `unverified` is the node's admitted-unverified set (D2-3); the admission
+/// verification that populates it lands with the M2 verification commit.
 pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     plan: IngestPlan,
     entity: &Entity,
@@ -96,12 +98,13 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     staging: &StagingArea,
     getter: &G,
     persist: &dyn PersistState,
+    _unverified: &super::UnverifiedEvents,
 ) -> ExecutionOutcome {
     // Plan membership, captured for the retention sweep at the end: with
     // node-held staging, whatever this plan resolves must leave the area,
     // and whatever it does not resolve is judged by provenance (batch vs
     // carryover).
-    let IngestPlan { schedule, preresolved, batch } = plan;
+    let IngestPlan { schedule, preresolved, batch, backfill: _backfill, preverified: _preverified } = plan;
     let members: Vec<EventId> = preresolved.iter().map(|(id, _)| id.clone()).chain(schedule.iter().cloned()).collect();
 
     let mut outcomes: Vec<(EventId, IngestOutcome)> = preresolved;
@@ -277,27 +280,36 @@ mod tests {
     }
 
     /// Getter whose `commit_event` fails for one designated event id (the
-    /// deterministic stand-in for a transient storage fault) and records
-    /// successful commits so `event_stored` answers like real storage.
+    /// deterministic stand-in for a transient storage fault) and retains
+    /// successful commits (bodies included) so `event_stored` and
+    /// `get_local_event` answer like real storage.
     struct FailingCommitStore {
         staging: std::sync::Arc<StagingArea>,
-        committed: std::sync::RwLock<std::collections::BTreeSet<EventId>>,
+        committed: std::sync::RwLock<std::collections::BTreeMap<EventId, Attested<Event>>>,
         fail_commit_of: EventId,
     }
 
     impl FailingCommitStore {
         fn new(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
-            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeSet::new()), fail_commit_of }
+            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeMap::new()), fail_commit_of }
         }
     }
 
     #[async_trait]
     impl crate::retrieval::GetEvents for FailingCommitStore {
         async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
-            self.staging.get(event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+            if let Some(event) = self.staging.get(event_id) {
+                return Ok(event);
+            }
+            self.committed
+                .read()
+                .unwrap()
+                .get(event_id)
+                .map(|e| e.payload.clone())
+                .ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
         }
         async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
-            Ok(self.committed.read().unwrap().contains(event_id))
+            Ok(self.committed.read().unwrap().contains_key(event_id))
         }
         fn storage_is_definitive(&self) -> bool { true }
     }
@@ -309,9 +321,15 @@ mod tests {
             if attested.payload.id() == self.fail_commit_of {
                 return Err(MutationError::General("injected transient commit failure".into()));
             }
-            self.committed.write().unwrap().insert(attested.payload.id());
+            self.committed.write().unwrap().insert(attested.payload.id(), attested.clone());
             self.staging.remove(&attested.payload.id());
             Ok(())
+        }
+        async fn get_local_event(&self, event_id: &EventId) -> Result<Option<Event>, RetrievalError> {
+            if let Some(event) = self.staging.get(event_id) {
+                return Ok(Some(event));
+            }
+            Ok(self.committed.read().unwrap().get(event_id).map(|e| e.payload.clone()))
         }
     }
 
@@ -363,7 +381,8 @@ mod tests {
         let plan = plan_entity(&entity.head(), &[p.clone()], &staging, &getter).await.expect("plan builds");
         assert_eq!(plan.schedule, vec![p.clone(), b.clone()], "re-drive schedules the buffered orphan behind its parent");
 
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist).await;
+        let outcome =
+            execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &crate::ingest::UnverifiedEvents::default()).await;
 
         assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
         assert!(staging.contains(&b), "a carryover orphan the plan never resolved must stay buffered; sweeping it loses an acked event");
@@ -398,7 +417,8 @@ mod tests {
 
         let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &getter).await.expect("plan builds");
         let persist = RecordingPersist::new();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &persist).await;
+        let outcome =
+            execute_plan(plan, &entity, &entities, &staging, &getter, &persist, &crate::ingest::UnverifiedEvents::default()).await;
 
         assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
         assert!(entity.head().contains(&x_id), "the resident advanced in memory (safe: buffer may lag the log)");
@@ -428,7 +448,7 @@ mod tests {
         staging.stage(x.clone());
 
         let plan = plan_entity(&entity.head(), &[x_id.clone()], &staging, &failing).await.expect("plan builds");
-        let _ = execute_plan(plan, &entity, &entities, &staging, &failing, &NoopPersist).await;
+        let _ = execute_plan(plan, &entity, &entities, &staging, &failing, &NoopPersist, &crate::ingest::UnverifiedEvents::default()).await;
         assert!(staging.contains(&x_id), "precondition: body retained after the failed commit");
 
         // The store heals (a different designated failure id); the sender
@@ -439,7 +459,8 @@ mod tests {
         assert!(plan.schedule.contains(&x_id), "a head-contained member that is staged but unstored must schedule for backfill");
 
         let persist = RecordingPersist::new();
-        let outcome = execute_plan(plan, &entity, &entities, &staging, &healed, &persist).await;
+        let outcome =
+            execute_plan(plan, &entity, &entities, &staging, &healed, &persist, &crate::ingest::UnverifiedEvents::default()).await;
         assert!(outcome.failure.is_none(), "backfill commit succeeds: {:?}", outcome.failure);
         assert!(!staging.contains(&x_id), "promotion removes the backfilled event from staging");
         assert!(persist.called(), "persist resumes once the log caught up");

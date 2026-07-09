@@ -233,6 +233,13 @@ pub enum LineageRejection {
     /// The batch's parent edges form a cycle (malformed or malicious input;
     /// impossible for honest content-addressed ids).
     BatchCycle,
+    /// The event's claimed generation fails the admission equation
+    /// `generation == 1 + max(parent generations)` against locally resolved
+    /// parent payloads (genesis events must claim exactly 1). The stamp is
+    /// deterministic given the parents, so this is only ever reachable by a
+    /// buggy or malicious writer; contained like any malformed event
+    /// (plan REV 4, D2-3).
+    GenerationMismatch { event: EventId, claimed: u32, expected: u32 },
 }
 
 impl std::fmt::Display for LineageRejection {
@@ -242,6 +249,9 @@ impl std::fmt::Display for LineageRejection {
             LineageRejection::NonCreationOverEmptyHead => write!(f, "non-creation event over an empty head"),
             LineageRejection::CreationOverNonEmptyHead => write!(f, "creation event over a non-empty head"),
             LineageRejection::BatchCycle => write!(f, "event batch contains a parent cycle"),
+            LineageRejection::GenerationMismatch { event, claimed, expected } => {
+                write!(f, "generation mismatch for event {event}: claimed {claimed}, expected {expected} from its parents")
+            }
         }
     }
 }

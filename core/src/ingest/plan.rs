@@ -55,6 +55,20 @@ pub(crate) struct IngestPlan {
     /// but an unresolved carryover was acked back when it buffered, and
     /// nobody will redeliver it.
     pub batch: BTreeSet<EventId>,
+    /// Members scheduled through the integrated-but-unstored backfill branch
+    /// (head-contained, staged, absent from the log at plan time): the
+    /// adopted-history admission lane (D2-3). The executor admits these
+    /// WITHOUT generation verification and records them in the unverified
+    /// set; verifying them could reject an event the resident's head already
+    /// carries, wedging that entity's log backfill forever (retroactive
+    /// rejection of committed history is D3's jurisdiction, expressly out of
+    /// scope).
+    pub backfill: BTreeSet<EventId>,
+    /// True when the commit-lane phase one already ran admission
+    /// verification over this plan's schedule (D2-3: verification runs ONCE
+    /// per admission). The executor skips re-verification for such plans;
+    /// backfill members still record as unverified there.
+    pub preverified: bool,
 }
 
 /// Plan the application of `batch` (plus whatever the staging area makes
@@ -114,10 +128,12 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
     // events, a shape that requires a prior local failure.
     let mut preresolved: Vec<(EventId, IngestOutcome)> = Vec::new();
     let mut scheduled: BTreeSet<EventId> = BTreeSet::new();
+    let mut backfill: BTreeSet<EventId> = BTreeSet::new();
     for id in &members {
         if head.contains(id) {
             if staging.contains(id) && !getter.event_stored(id).await? {
                 scheduled.insert(id.clone());
+                backfill.insert(id.clone());
             } else {
                 preresolved.push((id.clone(), IngestOutcome::Skipped(SkipReason::AlreadyCommitted)));
             }
@@ -224,7 +240,7 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
         }
     }
 
-    Ok(IngestPlan { schedule, preresolved, batch: batch_members })
+    Ok(IngestPlan { schedule, preresolved, batch: batch_members, backfill, preverified: false })
 }
 
 #[cfg(test)]

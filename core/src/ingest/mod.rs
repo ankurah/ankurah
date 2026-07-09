@@ -16,12 +16,14 @@ pub(crate) mod outcome;
 pub(crate) mod plan;
 pub(crate) mod staging;
 pub(crate) mod state_apply;
+pub(crate) mod unverified;
 
 pub(crate) use executor::{execute_plan, PersistState};
 pub(crate) use outcome::IngestOutcome;
 pub(crate) use plan::{plan_entity, IngestPlan};
 pub(crate) use staging::StagingArea;
 pub(crate) use state_apply::apply_state_feed;
+pub(crate) use unverified::UnverifiedEvents;
 
 use crate::error::{IngestError, LineageError, LineageRejection, MutationError, RetrievalError};
 
