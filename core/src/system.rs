@@ -179,10 +179,13 @@ where
         let lww_backend = system_entity.get_backend::<LWWBackend>().expect("LWW Backend should exist");
         lww_backend.set(crate::property::PropertyKey::name("item"), proto::sys::Item::SysRoot.into_value()?);
 
-        let event = system_entity.generate_commit_event()?.ok_or(anyhow!("Expected event"))?;
+        // The system root is a fresh entity: its commit event is a genesis
+        // (empty head), so the D2-2 stamp is exactly 1 and the getter
+        // resolves nothing.
+        let event_getter = LocalEventGetter::new(storage.clone(), true);
+        let event = system_entity.generate_commit_event(&event_getter).await?.ok_or(anyhow!("Expected event"))?;
 
         // Stage the event, apply, then commit
-        let event_getter = LocalEventGetter::new(storage.clone(), true);
         event_getter.stage_event(event.clone());
 
         // Apply the creation event so LWW values are tagged with event_id before serialization.

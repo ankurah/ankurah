@@ -123,11 +123,26 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             entity.resolve_pending_keys()?;
         }
 
-        // Generate events from the transaction entities
+        // Generate events from the transaction entities. The commit-lane
+        // stamp (D2-2) reads each parent's generation from its event
+        // payload, resolved staging-then-local-then-peer: on an ephemeral
+        // node a snapshot-adopted head's events are not in local storage,
+        // and the CachedEventGetter fetches (and caches) them from a
+        // durable peer, the pre-accepted per-commit cost. The node-held
+        // staging area is shared so a commit over a head whose event a
+        // prior commit failure left staged-but-unstored still resolves.
         let trx_id = trx.id.clone();
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
-            if let Some(event) = entity.generate_commit_event()? {
+            let stamp_collection = self.node.collections.get(entity.collection()).await?;
+            let stamp_getter = crate::retrieval::CachedEventGetter::with_staging(
+                entity.collection().clone(),
+                stamp_collection,
+                &self.node,
+                &self.cdata,
+                self.node.staging_for(entity.collection()),
+            );
+            if let Some(event) = entity.generate_commit_event(&stamp_getter).await? {
                 // Protected collections (system + metadata catalog) are not
                 // mutable through ordinary transactions; the catalog's only
                 // mutation path is the registration operation (RFC 4).
