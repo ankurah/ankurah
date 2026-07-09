@@ -86,7 +86,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ankurah_proto::{EntityId, Event, EventId, Operation, OperationSet};
+use ankurah_proto::{Clock, EntityId, Event, EventId, Operation, OperationSet};
 
 use crate::event_dag::EventLayer;
 use crate::property::backend::PropertyBackend;
@@ -143,14 +143,22 @@ pub(crate) trait ConformanceBackend {
 // ============================================================================
 
 /// Build an event carrying `operations` for `backend_name`, with the given
-/// parents. Entity id is derived from `seed` so distinct seeds yield distinct
-/// content-hashed event ids. Mirrors the event-building idiom in
-/// `event_dag::tests`.
-fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents: &[EventId]) -> Event {
+/// parent EVENTS (the clock is their ids, the generation `1 + max` of their
+/// payload generations; genesis 1). Entity id is derived from `seed` so
+/// distinct seeds yield distinct content-hashed event ids. Mirrors the
+/// event-building idiom in `event_dag::tests`; payload-authoritative per the
+/// registry ban (M1 review follow-up ruling, 2026-07-09).
+fn make_event(seed: u16, backend_name: &str, operations: Vec<Operation>, parents: &[&Event]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
-    crate::test_gen::stamped(entity_id, "conformance", OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])), parents)
+    Event {
+        entity_id,
+        collection: "conformance".into(),
+        operations: OperationSet(BTreeMap::from([(backend_name.to_string(), operations)])),
+        parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+        generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+    }
 }
 
 /// Assemble an [`EventLayer`] from event references, deriving the DAG skeleton
@@ -300,7 +308,7 @@ pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
         .enumerate()
         .map(|(i, w)| {
             let ops = B::stage_write(&scratch, w);
-            make_event(2000 + i as u16, B::backend_name(), ops, &[root.id()])
+            make_event(2000 + i as u16, B::backend_name(), ops, &[&root])
         })
         .collect();
 
@@ -354,9 +362,9 @@ pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
 
     // root <- {branch_l, branch_r} <- merge
     let root = make_event(3000, B::backend_name(), B::stage_write(&scratch, &writes[0]), &[]);
-    let branch_l = make_event(3001, B::backend_name(), B::stage_write(&scratch, &writes[1]), &[root.id()]);
-    let branch_r = make_event(3002, B::backend_name(), B::stage_write(&scratch, &writes[2]), &[root.id()]);
-    let merge = make_event(3003, B::backend_name(), B::stage_write(&scratch, &writes[0]), &[branch_l.id(), branch_r.id()]);
+    let branch_l = make_event(3001, B::backend_name(), B::stage_write(&scratch, &writes[1]), &[&root]);
+    let branch_r = make_event(3002, B::backend_name(), B::stage_write(&scratch, &writes[2]), &[&root]);
+    let merge = make_event(3003, B::backend_name(), B::stage_write(&scratch, &writes[0]), &[&branch_l, &branch_r]);
 
     let context = [&root, &branch_l, &branch_r, &merge];
 
@@ -480,7 +488,7 @@ mod lww_conformance {
     fn cross_order_determinism() { law_cross_order_determinism::<LwwAdopter>(); }
 
     /// Build an LWW event writing a single field, with the given parents.
-    fn lww_write_event(seed: u16, field: &str, value: &str, parents: &[EventId]) -> Event {
+    fn lww_write_event(seed: u16, field: &str, value: &str, parents: &[&Event]) -> Event {
         let scratch = LWWBackend::new();
         scratch.set(field.to_string().into(), Some(Value::String(value.to_string())));
         let ops = scratch.to_operations().unwrap().unwrap();
@@ -509,7 +517,7 @@ mod lww_conformance {
         let mut found = None;
         for early_seed in 0u16..200 {
             let earlier = lww_write_event(early_seed, field, "earlier-write", &[]);
-            let later = lww_write_event(early_seed.wrapping_add(5000), field, "later-write", &[earlier.id()]);
+            let later = lww_write_event(early_seed.wrapping_add(5000), field, "later-write", &[&earlier]);
             // later descends from earlier by construction; adversarial when the
             // earlier id would win a raw lexicographic max.
             if earlier.id() > later.id() {

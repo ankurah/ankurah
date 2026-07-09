@@ -14,16 +14,17 @@ use std::time::Duration;
 
 use common::{Record, RecordView, TestWatcher};
 
-/// Forge a Record LWW event setting `title`, parented on the given clock.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+/// Forge a Record LWW event setting `title`, parented on the given parent
+/// EVENTS (generation stamped from their payloads; the registry ban).
+fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::gen::stamped_event(
+    ankurah_tests::forge::event_with_parents(
         entity_id,
         Record::collection(),
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
+        parents,
     )
 }
 
@@ -138,12 +139,12 @@ async fn test_stale_fetch_cannot_regress_newer_state() -> Result<()> {
     // Relay context for the EventOnly delivery below.
     let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
 
-    let rec_id = {
+    let (rec_id, genesis) = {
         let trx = ctx_s.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
@@ -151,7 +152,7 @@ async fn test_stale_fetch_cannot_regress_newer_state() -> Result<()> {
     // Advance the CLIENT past the server with a forged linear descendant.
     // The server never sees this event, so its Get responses are now stale
     // relative to the client.
-    let ev = forge_title_event(rec_id, view.entity().head().clone(), "t1-client-ahead");
+    let ev = forge_title_event(rec_id, &[&genesis], "t1-client-ahead");
     let forged_head = proto::Clock::from(vec![ev.id()]);
     client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, ev))).await?;
     assert_eq!(view.title().unwrap(), "t1-client-ahead");
@@ -196,12 +197,12 @@ async fn test_get_racing_notify_storm_does_not_deadlock() -> Result<()> {
     // evaluation (the notify storm has an audience).
     let _query = ctx_c.query_wait::<RecordView>("artist = 'a0'").await?;
 
-    let rec_id = {
+    let (rec_id, genesis) = {
         let trx = ctx_s.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
 
@@ -217,11 +218,11 @@ async fn test_get_racing_notify_storm_does_not_deadlock() -> Result<()> {
     }
 
     // Notify storm: a forged linear chain delivered while the gets run.
-    let mut parent = view.entity().head().clone();
+    let mut parent = genesis;
     for i in 0..20 {
-        let ev = forge_title_event(rec_id, parent.clone(), &format!("t{}", i + 1));
-        parent = proto::Clock::from(vec![ev.id()]);
-        client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, ev))).await?;
+        let ev = forge_title_event(rec_id, &[&parent], &format!("t{}", i + 1));
+        client.handle_message(proto::NodeMessage::Update(event_only_update(&server.id, &client.id, ev.clone()))).await?;
+        parent = ev;
     }
 
     tokio::time::timeout(Duration::from_secs(15), async {

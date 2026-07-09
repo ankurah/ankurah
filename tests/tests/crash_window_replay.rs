@@ -13,16 +13,17 @@ use std::sync::Arc;
 
 use common::{Record, RecordView};
 
-/// Forge a Record LWW event setting one property, parented on the given clock.
-fn forge_lww_event(entity_id: proto::EntityId, parent: proto::Clock, property: &str, value: &str) -> proto::Event {
+/// Forge a Record LWW event setting one property, parented on the given
+/// parent EVENTS (generation stamped from their payloads; the registry ban).
+fn forge_lww_event(entity_id: proto::EntityId, parents: &[&proto::Event], property: &str, value: &str) -> proto::Event {
     let backend = LWWBackend::new();
     backend.set(property.into(), Some(Value::String(value.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::gen::stamped_event(
+    ankurah_tests::forge::event_with_parents(
         entity_id,
         Record::collection(),
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
+        parents,
     )
 }
 
@@ -50,26 +51,25 @@ async fn r10_commit_lane_replays_committed_but_unincorporated_gap() -> Result<()
     node.system.create().await?;
     let ctx = node.context(c)?;
 
-    let rec_id = {
+    let (rec_id, genesis) = {
         let trx = ctx.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     // Hold a view so the resident stays alive (the entity set is weak).
     let view = ctx.get::<RecordView>(rec_id).await?;
-    let genesis_head = node.get_resident_entity(rec_id).expect("record resident").head();
+    assert_eq!(node.get_resident_entity(rec_id).expect("record resident").head(), proto::Clock::from(vec![genesis.id()]));
 
     // The crash simulation: e1 lands in the durable log but the entity never
     // applies it (no state write followed the commit).
-    let e1 = forge_lww_event(rec_id, genesis_head, "artist", "a1");
-    let e1_id = e1.id();
+    let e1 = forge_lww_event(rec_id, &[&genesis], "artist", "a1");
     let collection = ctx.collection(&Record::collection()).await?;
-    collection.add_event(&Attested::opt(e1, None)).await?;
+    collection.add_event(&Attested::opt(e1.clone(), None)).await?;
 
     // A linear descendant-only transaction arrives through the commit lane.
-    let e2 = forge_lww_event(rec_id, proto::Clock::from(vec![e1_id]), "title", "t2");
+    let e2 = forge_lww_event(rec_id, &[&e1], "title", "t2");
     let e2_id = e2.id();
     node.commit_remote_transaction(&c, proto::TransactionId::new(), vec![Attested::opt(e2, None)])
         .await
@@ -106,26 +106,25 @@ async fn r10_streaming_lane_replays_committed_but_unincorporated_gap() -> Result
     let ctx_c = client.context(c)?;
     let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
 
-    let rec_id = {
+    let (rec_id, genesis) = {
         let trx = ctx_s.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
-    let genesis_head = client.get_resident_entity(rec_id).expect("client resident").head();
+    assert_eq!(client.get_resident_entity(rec_id).expect("client resident").head(), proto::Clock::from(vec![genesis.id()]));
 
     // Crash simulation on the client: e1 committed to the local log, never
     // incorporated.
-    let e1 = forge_lww_event(rec_id, genesis_head, "artist", "a1");
-    let e1_id = e1.id();
+    let e1 = forge_lww_event(rec_id, &[&genesis], "artist", "a1");
     let collection = ctx_c.collection(&Record::collection()).await?;
-    collection.add_event(&Attested::opt(e1, None)).await?;
+    collection.add_event(&Attested::opt(e1.clone(), None)).await?;
 
     // EventOnly delivery of the linear descendant.
-    let e2 = forge_lww_event(rec_id, proto::Clock::from(vec![e1_id]), "title", "t2");
+    let e2 = forge_lww_event(rec_id, &[&e1], "title", "t2");
     let e2_id = e2.id();
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(e2)])
         .await

@@ -315,13 +315,20 @@ mod tests {
         async fn dump_entity_events(&self, _id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> { Ok(vec![]) }
     }
 
-    /// Create a test event with a deterministic content-hashed ID.
-    fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
+    /// Create a test event with a deterministic content-hashed ID. Parents are
+    /// EVENTS (payload-authoritative generation stamping; the registry ban).
+    fn make_test_event(seed: u8, parents: &[&Event]) -> Event {
         let mut entity_id_bytes = [0u8; 16];
         entity_id_bytes[0] = seed;
         let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids)
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::new()),
+            parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+            generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+        }
     }
 
     // ====================================================================

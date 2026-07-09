@@ -13,17 +13,24 @@ use std::sync::Arc;
 
 use common::{Record, RecordView};
 
-/// Forge a Record LWW event setting `title`, parented on the given clock.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+/// The LWW OperationSet for a title write.
+fn title_ops(title: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::gen::stamped_event(
-        entity_id,
-        Record::collection(),
-        proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
-    )
+    proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
+}
+
+/// Forge a Record LWW event setting `title`, parented on the given parent
+/// EVENTS (generation stamped from their payloads; the registry ban).
+fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
+    ankurah_tests::forge::event_with_parents(entity_id, Record::collection(), title_ops(title), parents)
+}
+
+/// Forge a Record LWW event with an EXPLICIT claimed generation, for parents
+/// that are deliberately fabricated ids (no true generation exists).
+fn forge_title_event_claiming(entity_id: proto::EntityId, parent: proto::Clock, title: &str, generation: u32) -> proto::Event {
+    ankurah_tests::forge::event_claiming(entity_id, Record::collection(), title_ops(title), parent, generation)
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -39,6 +46,7 @@ type Setup = (
     Node<SledStorageEngine, PermissiveAgent>,
     Node<SledStorageEngine, PermissiveAgent>,
     proto::EntityId,
+    proto::Event,
     RecordView,
     ankurah::core::livequery::LiveQuery<RecordView>,
     LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent>,
@@ -61,19 +69,19 @@ async fn setup() -> Result<Setup> {
     // returned because dropping the query unsubscribes it.
     let relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
 
-    let rec_id = {
+    let (rec_id, genesis) = {
         let trx = ctx_s.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     // Materialize the record on the client so it has real local state; the
     // view is returned because the entity set holds only weak references.
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
 
-    Ok((server, client, rec_id, view, relay_context, conn))
+    Ok((server, client, rec_id, genesis, view, relay_context, conn))
 }
 
 /// R5 (B3 residual): a child whose parent is missing buffers as a non-error
@@ -84,13 +92,15 @@ async fn setup() -> Result<Setup> {
 /// parent alone.
 #[tokio::test]
 async fn r5_buffered_child_integrates_when_parent_arrives_later() -> Result<()> {
-    let (server, client, rec_id, _view, _relay, _conn) = setup().await?;
+    let (server, client, rec_id, genesis, _view, _relay, _conn) = setup().await?;
     let ctx_c = client.context(c)?;
 
-    let head = client.get_resident_entity(rec_id).expect("client holds the record resident").head();
-    let parent = forge_title_event(rec_id, head, "parent-title");
-    let parent_id = parent.id();
-    let child = forge_title_event(rec_id, proto::Clock::from(vec![parent_id.clone()]), "child-title");
+    assert_eq!(
+        client.get_resident_entity(rec_id).expect("client holds the record resident").head(),
+        proto::Clock::from(vec![genesis.id()])
+    );
+    let parent = forge_title_event(rec_id, &[&genesis], "parent-title");
+    let child = forge_title_event(rec_id, &[&parent], "child-title");
     let child_id = child.id();
 
     // Delivery 1: the child alone. Post-flip this is a buffered non-error
@@ -133,11 +143,12 @@ async fn r5_buffered_child_integrates_when_parent_arrives_later() -> Result<()> 
 /// the item surfaces as an error.
 #[tokio::test]
 async fn r6_dangling_parent_event_is_buffered_and_observable() -> Result<()> {
-    let (server, client, rec_id, _view, _relay, _conn) = setup().await?;
+    let (server, client, rec_id, _genesis, _view, _relay, _conn) = setup().await?;
     let ctx_c = client.context(c)?;
 
     let unknown_parent = proto::EventId::from_bytes([9u8; 32]);
-    let orphan = forge_title_event(rec_id, proto::Clock::from(vec![unknown_parent]), "orphan-title");
+    // Fabricated parent: no true generation exists; 2 is a plausible claim.
+    let orphan = forge_title_event_claiming(rec_id, proto::Clock::from(vec![unknown_parent]), "orphan-title", 2);
     let orphan_id = orphan.id();
 
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(orphan)])
@@ -164,7 +175,7 @@ async fn r6_dangling_parent_event_is_buffered_and_observable() -> Result<()> {
 /// nothing accumulates node-side, so len and evictions both read zero.
 #[tokio::test]
 async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
-    let (server, client, rec_id, _view, _relay, _conn) = setup().await?;
+    let (server, client, rec_id, genesis, _view, _relay, _conn) = setup().await?;
     let ctx_c = client.context(c)?;
 
     let (_, _, cap) = client.staging_probe_for_test(&Record::collection());
@@ -180,7 +191,8 @@ async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let parent = proto::EventId::from_bytes(seed);
-            event_only_item(forge_title_event(entity, proto::Clock::from(vec![parent]), "flood"))
+            // Fabricated parents: explicit plausible claims (2), unverifiable by design.
+            event_only_item(forge_title_event_claiming(entity, proto::Clock::from(vec![parent]), "flood", 2))
         })
         .collect();
 
@@ -196,8 +208,8 @@ async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
 
-    let head = client.get_resident_entity(rec_id).expect("record still resident").head();
-    let legit = forge_title_event(rec_id, head, "still-alive");
+    assert_eq!(client.get_resident_entity(rec_id).expect("record still resident").head(), proto::Clock::from(vec![genesis.id()]));
+    let legit = forge_title_event(rec_id, &[&genesis], "still-alive");
     let legit_id = legit.id();
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(legit)]).await.expect("a clean update still applies");
     assert_eq!(client.get_resident_entity(rec_id).unwrap().head(), proto::Clock::from(vec![legit_id]));
@@ -212,11 +224,11 @@ async fn r8_orphan_flood_is_bounded_and_observable() -> Result<()> {
 /// behind the skip.
 #[tokio::test]
 async fn r1_redelivered_committed_batch_is_idempotent() -> Result<()> {
-    let (server, client, rec_id, _view, _relay, _conn) = setup().await?;
+    let (server, client, rec_id, genesis, _view, _relay, _conn) = setup().await?;
     let ctx_c = client.context(c)?;
 
-    let head = client.get_resident_entity(rec_id).expect("record resident").head();
-    let ev = forge_title_event(rec_id, head, "once");
+    assert_eq!(client.get_resident_entity(rec_id).expect("record resident").head(), proto::Clock::from(vec![genesis.id()]));
+    let ev = forge_title_event(rec_id, &[&genesis], "once");
     let ev_id = ev.id();
 
     NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(ev.clone())]).await.expect("first delivery applies");

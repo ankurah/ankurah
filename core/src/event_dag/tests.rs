@@ -28,7 +28,7 @@ struct MockRetriever {
 impl MockRetriever {
     fn new() -> Self { Self { events: HashMap::new() } }
 
-    fn add_event(&mut self, event: Event) { self.events.insert(event.id(), event); }
+    fn add_event(&mut self, event: &Event) { self.events.insert(event.id(), event.clone()); }
 }
 
 #[async_trait]
@@ -54,23 +54,38 @@ fn test_model_id() -> EntityId {
 }
 
 /// Create a test event with deterministic content-hashed IDs.
-/// The seed differentiates events; parent_ids determine the parent clock.
-/// Returns the event (call `.id()` on it to get the computed EventId).
-fn make_test_event(seed: u8, parent_ids: &[EventId]) -> Event {
+/// The seed differentiates events; the parent EVENTS determine the parent
+/// clock, and the generation is stamped `1 + max` of their payload
+/// generations (genesis 1). Payload-authoritative by construction: the
+/// registry ban (M1 review follow-up ruling, 2026-07-09) forbids any side
+/// store of generations, so helpers take the parent events themselves.
+fn make_test_event(seed: u8, parents: &[&Event]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0] = seed;
     let entity_id = EntityId::from_bytes(entity_id_bytes);
 
-    crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids)
+    Event {
+        entity_id,
+        collection: "test".into(),
+        operations: OperationSet(BTreeMap::new()),
+        parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+        generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+    }
 }
 
 /// Like make_test_event but with a two-byte seed, for tests that need a wide
 /// or exhaustive seed space (id-ordering searches, randomized DAG generation).
-fn make_test_event_u16(seed: u16, parent_ids: &[EventId]) -> Event {
+fn make_test_event_u16(seed: u16, parents: &[&Event]) -> Event {
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0..2].copy_from_slice(&seed.to_be_bytes());
     let entity_id = EntityId::from_bytes(entity_id_bytes);
-    crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids)
+    Event {
+        entity_id,
+        collection: "test".into(),
+        operations: OperationSet(BTreeMap::new()),
+        parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+        generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+    }
 }
 
 /// Create a Clock from EventIds without consuming them.
@@ -84,8 +99,8 @@ macro_rules! clock {
 /// Uses a seed to create deterministic but different entity IDs for each event.
 fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event { make_lww_event_with_parent(seed, properties, &[]) }
 
-/// Like make_lww_event but with an explicit parent clock, for multi-layer DAG scenarios.
-fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
+/// Like make_lww_event but with explicit parent events, for multi-layer DAG scenarios.
+fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parents: &[&Event]) -> Event {
     // Use seed for entity_id to get different event hashes
     let mut entity_id_bytes = [0u8; 16];
     entity_id_bytes[0] = seed;
@@ -96,7 +111,13 @@ fn make_lww_event_with_parent(seed: u8, properties: Vec<(&str, &str)>, parent_id
         backend.set(name.into(), Some(Value::String(value.into())));
     }
     let ops = backend.to_operations().unwrap().unwrap();
-    crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), parent_ids)
+    Event {
+        entity_id,
+        collection: "test".into(),
+        operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+        parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+        generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+    }
 }
 
 fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
@@ -122,15 +143,14 @@ async fn test_linear_history() {
     // Create a linear chain: ev1 <- ev2 <- ev3
     let ev1 = make_test_event(1, &[]);
     let id1 = ev1.id();
-    retriever.add_event(ev1);
+    retriever.add_event(&ev1);
 
-    let ev2 = make_test_event(2, &[id1.clone()]);
-    let id2 = ev2.id();
-    retriever.add_event(ev2);
+    let ev2 = make_test_event(2, &[&ev1]);
+    retriever.add_event(&ev2);
 
-    let ev3 = make_test_event(3, &[id2]);
+    let ev3 = make_test_event(3, &[&ev2]);
     let id3 = ev3.id();
-    retriever.add_event(ev3);
+    retriever.add_event(&ev3);
 
     let ancestor = clock!(id1);
     let descendant = clock!(id3);
@@ -158,31 +178,30 @@ async fn test_concurrent_history() {
     //      7
     let ev1 = make_test_event(1, &[]);
     let id1 = ev1.id();
-    retriever.add_event(ev1);
+    retriever.add_event(&ev1);
 
-    let ev2 = make_test_event(2, &[id1.clone()]);
+    let ev2 = make_test_event(2, &[&ev1]);
     let id2 = ev2.id();
-    retriever.add_event(ev2);
+    retriever.add_event(&ev2);
 
-    let ev3 = make_test_event(3, &[id1.clone()]);
+    let ev3 = make_test_event(3, &[&ev1]);
     let id3 = ev3.id();
-    retriever.add_event(ev3);
+    retriever.add_event(&ev3);
 
-    let ev4 = make_test_event(4, &[id1.clone()]);
-    let id4 = ev4.id();
-    retriever.add_event(ev4);
+    let ev4 = make_test_event(4, &[&ev1]);
+    retriever.add_event(&ev4);
 
-    let ev5 = make_test_event(5, &[id2.clone(), id3.clone()]);
+    let ev5 = make_test_event(5, &[&ev2, &ev3]);
     let id5 = ev5.id();
-    retriever.add_event(ev5);
+    retriever.add_event(&ev5);
 
-    let ev6 = make_test_event(6, &[id3.clone(), id4]);
+    let ev6 = make_test_event(6, &[&ev3, &ev4]);
     let id6 = ev6.id();
-    retriever.add_event(ev6);
+    retriever.add_event(&ev6);
 
-    let ev7 = make_test_event(7, &[id5.clone(), id6.clone()]);
+    let ev7 = make_test_event(7, &[&ev5, &ev6]);
     let _id7 = ev7.id();
-    retriever.add_event(ev7);
+    retriever.add_event(&ev7);
 
     {
         // concurrency in lineage *between* clocks, but the descendant clock fully descends from the ancestor clock
@@ -245,36 +264,35 @@ async fn test_incomparable() {
     //   3   5    8
     let ev1 = make_test_event(1, &[]);
     let id1 = ev1.id();
-    retriever.add_event(ev1);
+    retriever.add_event(&ev1);
 
-    let ev2 = make_test_event(2, &[id1.clone()]);
+    let ev2 = make_test_event(2, &[&ev1]);
     let id2 = ev2.id();
-    retriever.add_event(ev2);
+    retriever.add_event(&ev2);
 
-    let ev3 = make_test_event(3, &[id2.clone()]);
+    let ev3 = make_test_event(3, &[&ev2]);
     let id3 = ev3.id();
-    retriever.add_event(ev3);
+    retriever.add_event(&ev3);
 
-    let ev4 = make_test_event(4, &[id1.clone()]);
+    let ev4 = make_test_event(4, &[&ev1]);
     let _id4 = ev4.id();
-    retriever.add_event(ev4);
+    retriever.add_event(&ev4);
 
-    let ev5 = make_test_event(5, &[_id4]);
+    let ev5 = make_test_event(5, &[&ev4]);
     let id5 = ev5.id();
-    retriever.add_event(ev5);
+    retriever.add_event(&ev5);
 
     // 6 is an unrelated root event
     let ev6 = make_test_event(6, &[]);
     let id6 = ev6.id();
-    retriever.add_event(ev6);
+    retriever.add_event(&ev6);
 
-    let ev7 = make_test_event(7, &[id6.clone()]);
-    let id7 = ev7.id();
-    retriever.add_event(ev7);
+    let ev7 = make_test_event(7, &[&ev6]);
+    retriever.add_event(&ev7);
 
-    let ev8 = make_test_event(8, &[id7]);
+    let ev8 = make_test_event(8, &[&ev7]);
     let id8 = ev8.id();
-    retriever.add_event(ev8);
+    retriever.add_event(&ev8);
 
     {
         // fully incomparable (different roots) - properly returns Disjoint
@@ -316,7 +334,7 @@ async fn test_empty_clocks() {
 
     let ev1 = make_test_event(1, &[]);
     let id1 = ev1.id();
-    retriever.add_event(ev1);
+    retriever.add_event(&ev1);
 
     let empty = Clock::default();
     let non_empty = clock!(id1);
@@ -340,16 +358,16 @@ async fn test_budget_exceeded() {
 
     // Create a long chain: ev1 <- ev2 <- ... <- ev20
     // With budget=1, max_budget=4, a chain of 20 events will still exceed
-    let mut ids: Vec<EventId> = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
     for i in 0..20u8 {
-        let parents = if i == 0 { vec![] } else { vec![ids[i as usize - 1].clone()] };
+        let parents: Vec<&Event> = if i == 0 { vec![] } else { vec![&events[i as usize - 1]] };
         let ev = make_test_event(i + 1, &parents);
-        ids.push(ev.id());
-        retriever.add_event(ev);
+        retriever.add_event(&ev);
+        events.push(ev);
     }
 
-    let ancestor = clock!(ids[0].clone());
-    let descendant = clock!(ids[19].clone());
+    let ancestor = clock!(events[0].id());
+    let descendant = clock!(events[19].id());
 
     // With budget=1 (escalates to max 4), a 20-long chain will exceed
     let result = compare(retriever.clone(), &descendant, &ancestor, 1).await.unwrap();
@@ -372,7 +390,7 @@ async fn test_self_comparison() {
     // Create a simple event to compare with itself
     let ev1 = make_test_event(1, &[]);
     let id1 = ev1.id();
-    retriever.add_event(ev1);
+    retriever.add_event(&ev1);
 
     let clock = clock!(id1);
 
@@ -386,22 +404,23 @@ async fn multiple_roots() {
     let mut retriever = MockRetriever::new();
 
     // Six independent roots
+    let mut roots: Vec<Event> = Vec::new();
     let mut root_ids = Vec::new();
     for i in 1..=6u8 {
         let ev = make_test_event(i, &[]);
         root_ids.push(ev.id());
-        retriever.add_event(ev);
+        retriever.add_event(&ev);
+        roots.push(ev);
     }
 
     // merge-point 7 references all six heads
-    let ev7 = make_test_event(7, &root_ids);
-    let id7 = ev7.id();
-    retriever.add_event(ev7);
+    let ev7 = make_test_event(7, &roots.iter().collect::<Vec<_>>());
+    retriever.add_event(&ev7);
 
     // subject head 8 descends only from 7
-    let ev8 = make_test_event(8, &[id7]);
+    let ev8 = make_test_event(8, &[&ev7]);
     let id8 = ev8.id();
-    retriever.add_event(ev8);
+    retriever.add_event(&ev8);
 
     let subject = clock!(id8);
     let big_other = Clock::from(root_ids.clone());
@@ -422,25 +441,25 @@ async fn test_compare_event_unstored() {
     // Create a chain: ev1 <- ev2 <- ev3 (stored)
     let ev1 = make_test_event(1, &[]);
     let id1 = ev1.id();
-    retriever.add_event(ev1);
+    retriever.add_event(&ev1);
 
-    let ev2 = make_test_event(2, &[id1.clone()]);
+    let ev2 = make_test_event(2, &[&ev1]);
     let id2 = ev2.id();
-    retriever.add_event(ev2);
+    retriever.add_event(&ev2);
 
-    let ev3 = make_test_event(3, &[id2.clone()]);
+    let ev3 = make_test_event(3, &[&ev2]);
     let id3 = ev3.id();
-    retriever.add_event(ev3);
+    retriever.add_event(&ev3);
 
     // Create an unstored event that would descend from ev3
-    let unstored_event = make_test_event(4, &[id3.clone()]);
+    let unstored_event = make_test_event(4, &[&ev3]);
 
     let clock_1 = clock!(id1);
     let clock_2 = clock!(id2);
     let clock_3 = clock!(id3);
 
     // Stage the unstored event so compare can find it
-    retriever.add_event(unstored_event.clone());
+    retriever.add_event(&unstored_event);
 
     // The unstored event should descend from all ancestors
     let result = compare(retriever.clone(), &Clock::from(vec![unstored_event.id()]), &clock_1, 100).await.unwrap();
@@ -453,8 +472,8 @@ async fn test_compare_event_unstored() {
     assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
 
     // Test with an unstored event that has multiple parents
-    let unstored_merge_event = make_test_event(5, &[id2.clone(), id3.clone()]);
-    retriever.add_event(unstored_merge_event.clone());
+    let unstored_merge_event = make_test_event(5, &[&ev2, &ev3]);
+    retriever.add_event(&unstored_merge_event);
 
     let result = compare(retriever.clone(), &Clock::from(vec![unstored_merge_event.id()]), &clock_1, 100).await.unwrap();
     assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
@@ -462,7 +481,7 @@ async fn test_compare_event_unstored() {
     // Test with an incomparable case - different roots should return Disjoint
     let ev10 = make_test_event(10, &[]); // Independent root
     let id10 = ev10.id();
-    retriever.add_event(ev10);
+    retriever.add_event(&ev10);
     let incomparable_clock = clock!(id10);
 
     let result = compare(retriever.clone(), &Clock::from(vec![unstored_event.id()]), &incomparable_clock, 100).await.unwrap();
@@ -474,7 +493,7 @@ async fn test_compare_event_unstored() {
 
     // Test root event case
     let root_event = make_test_event(11, &[]);
-    retriever.add_event(root_event.clone());
+    retriever.add_event(&root_event);
 
     let empty_clock = Clock::default();
     let result = compare(retriever.clone(), &Clock::from(vec![root_event.id()]), &empty_clock, 100).await.unwrap();
@@ -502,23 +521,21 @@ async fn test_compare_event_redundant_delivery() {
 
     // Create a chain: ev1 <- ev2 <- ev3 (stored)
     let ev1 = make_test_event(1, &[]);
-    let id1 = ev1.id();
-    retriever.add_event(ev1);
+    retriever.add_event(&ev1);
 
-    let ev2 = make_test_event(2, &[id1]);
-    let id2 = ev2.id();
-    retriever.add_event(ev2);
+    let ev2 = make_test_event(2, &[&ev1]);
+    retriever.add_event(&ev2);
 
-    let ev3 = make_test_event(3, &[id2]);
+    let ev3 = make_test_event(3, &[&ev2]);
     let id3 = ev3.id();
-    retriever.add_event(ev3);
+    retriever.add_event(&ev3);
 
     // Create an unstored event that would descend from ev3
-    let unstored_event = make_test_event(4, &[id3.clone()]);
+    let unstored_event = make_test_event(4, &[&ev3]);
     let id4 = unstored_event.id();
 
     // Stage the unstored event so compare can find it
-    retriever.add_event(unstored_event.clone());
+    retriever.add_event(&unstored_event);
 
     // Test the normal case first
     let clock_3 = clock!(id3);
@@ -526,8 +543,8 @@ async fn test_compare_event_redundant_delivery() {
     assert!(matches!(result.relation, AbstractCausalRelation::StrictDescends { .. }));
 
     // Now store event 4 to simulate it being applied
-    let ev4_stored = make_test_event(4, &[id3.clone()]);
-    retriever.add_event(ev4_stored);
+    let ev4_stored = make_test_event(4, &[&ev3]);
+    retriever.add_event(&ev4_stored);
 
     // Test redundant delivery: the event is already in the clock (exact match)
     let clock_with_event = clock!(id4);
@@ -568,17 +585,17 @@ async fn test_missing_event_busyloop() {
     // A: creation event, in retriever
     let ev_a = make_test_event(1, &[]);
     let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
     // B: child of A, deliberately NOT added to retriever (missing event)
-    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let ev_b = make_test_event(2, &[&ev_a]);
     let id_b = ev_b.id();
     // Do NOT add ev_b to retriever
 
     // C: child of B, in retriever
-    let ev_c = make_test_event(3, &[id_b.clone()]);
+    let ev_c = make_test_event(3, &[&ev_b]);
     let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    retriever.add_event(&ev_c);
 
     // compare(subject=[C], comparison=[A]):
     // BFS fetches C (ok), adds parent B to subject frontier.
@@ -638,14 +655,14 @@ async fn test_both_frontiers_unfetchable_meet_point() {
     // Do NOT add ev_a to retriever
 
     // B: child of A, in retriever
-    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let ev_b = make_test_event(2, &[&ev_a]);
     let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    retriever.add_event(&ev_b);
 
     // C: child of A, in retriever
-    let ev_c = make_test_event(3, &[id_a.clone()]);
+    let ev_c = make_test_event(3, &[&ev_a]);
     let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    retriever.add_event(&ev_c);
 
     // compare(subject=[B], comparison=[C])
     // BFS will walk B and C back to A, which is on both frontiers but unfetchable.
@@ -675,25 +692,24 @@ async fn test_multihead_event_extends_one_tip() {
     //       |
     //       D   <- incoming event with parent [C]
     let ev_a = make_test_event(1, &[]);
-    let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let ev_b = make_test_event(2, &[&ev_a]);
     let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_a]);
+    let ev_c = make_test_event(3, &[&ev_a]);
     let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    retriever.add_event(&ev_c);
 
     // Event D extends C
-    let event_d = make_test_event(4, &[id_c.clone()]);
+    let event_d = make_test_event(4, &[&ev_c]);
 
     // Entity head is [B, C]
     let entity_head = clock!(id_b, id_c);
 
     // Stage event D so compare can find it
-    retriever.add_event(event_d.clone());
+    retriever.add_event(&event_d);
 
     // D should NOT return StrictAscends - it should be DivergedSince
     // because D extends C which is a tip, and is concurrent with B
@@ -720,25 +736,24 @@ async fn test_multihead_event_extends_multiple_tips() {
     //    \ /
     //     D   <- incoming event with parent [B, C]
     let ev_a = make_test_event(1, &[]);
-    let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let ev_b = make_test_event(2, &[&ev_a]);
     let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_a]);
+    let ev_c = make_test_event(3, &[&ev_a]);
     let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    retriever.add_event(&ev_c);
 
     // Event D merges both tips
-    let event_d = make_test_event(4, &[id_b.clone(), id_c.clone()]);
+    let event_d = make_test_event(4, &[&ev_b, &ev_c]);
 
     // Entity head is [B, C]
     let entity_head = clock!(id_b, id_c);
 
     // Stage event D so compare can find it
-    retriever.add_event(event_d.clone());
+    retriever.add_event(&event_d);
 
     // D's parent equals entity head, so this should be StrictDescends
     let result = compare(retriever.clone(), &Clock::from(vec![event_d.id()]), &entity_head, 100).await.unwrap();
@@ -761,29 +776,28 @@ async fn test_multihead_three_way_concurrency() {
     //     |
     //     E       <- incoming event with parent [B]
     let ev_a = make_test_event(1, &[]);
-    let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let ev_b = make_test_event(2, &[&ev_a]);
     let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_a.clone()]);
+    let ev_c = make_test_event(3, &[&ev_a]);
     let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    retriever.add_event(&ev_c);
 
-    let ev_d = make_test_event(4, &[id_a]);
+    let ev_d = make_test_event(4, &[&ev_a]);
     let id_d = ev_d.id();
-    retriever.add_event(ev_d);
+    retriever.add_event(&ev_d);
 
     // Event E extends only B
-    let event_e = make_test_event(5, &[id_b.clone()]);
+    let event_e = make_test_event(5, &[&ev_b]);
 
     // Entity head is [B, C, D]
     let entity_head = clock!(id_b, id_c, id_d);
 
     // Stage event E so compare can find it
-    retriever.add_event(event_e.clone());
+    retriever.add_event(&event_e);
 
     let result = compare(retriever.clone(), &Clock::from(vec![event_e.id()]), &entity_head, 100).await.unwrap();
 
@@ -819,39 +833,33 @@ async fn test_deep_diamond_asymmetric_branches() {
     // Compare H vs I - meet should be A
     let ev_a = make_test_event(1, &[]);
     let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a.clone()]);
-    let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    let ev_b = make_test_event(2, &[&ev_a]);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_a.clone()]);
-    let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    let ev_c = make_test_event(3, &[&ev_a]);
+    retriever.add_event(&ev_c);
 
-    let ev_d = make_test_event(4, &[id_b]);
-    let id_d = ev_d.id();
-    retriever.add_event(ev_d);
+    let ev_d = make_test_event(4, &[&ev_b]);
+    retriever.add_event(&ev_d);
 
-    let ev_e = make_test_event(5, &[id_c]);
-    let id_e = ev_e.id();
-    retriever.add_event(ev_e);
+    let ev_e = make_test_event(5, &[&ev_c]);
+    retriever.add_event(&ev_e);
 
-    let ev_f = make_test_event(6, &[id_d]);
-    let id_f = ev_f.id();
-    retriever.add_event(ev_f);
+    let ev_f = make_test_event(6, &[&ev_d]);
+    retriever.add_event(&ev_f);
 
-    let ev_g = make_test_event(7, &[id_e]);
-    let id_g = ev_g.id();
-    retriever.add_event(ev_g);
+    let ev_g = make_test_event(7, &[&ev_e]);
+    retriever.add_event(&ev_g);
 
-    let ev_h = make_test_event(8, &[id_f]);
+    let ev_h = make_test_event(8, &[&ev_f]);
     let id_h = ev_h.id();
-    retriever.add_event(ev_h);
+    retriever.add_event(&ev_h);
 
-    let ev_i = make_test_event(9, &[id_g]);
+    let ev_i = make_test_event(9, &[&ev_g]);
     let id_i = ev_i.id();
-    retriever.add_event(ev_i);
+    retriever.add_event(&ev_i);
 
     let clock_h = clock!(id_h);
     let clock_i = clock!(id_i);
@@ -880,49 +888,41 @@ async fn test_short_branch_from_deep_point() {
     //
     // Compare Y vs H - meet should be D, NOT genesis A!
     let ev_a = make_test_event(1, &[]);
-    let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a]);
-    let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    let ev_b = make_test_event(2, &[&ev_a]);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_b]);
-    let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    let ev_c = make_test_event(3, &[&ev_b]);
+    retriever.add_event(&ev_c);
 
-    let ev_d = make_test_event(4, &[id_c]);
-    let id_d = ev_d.id();
-    retriever.add_event(ev_d);
+    let ev_d = make_test_event(4, &[&ev_c]);
+    retriever.add_event(&ev_d);
 
-    let ev_e = make_test_event(5, &[id_d.clone()]);
-    let id_e = ev_e.id();
-    retriever.add_event(ev_e);
+    let ev_e = make_test_event(5, &[&ev_d]);
+    retriever.add_event(&ev_e);
 
-    let ev_f = make_test_event(6, &[id_e]);
-    let id_f = ev_f.id();
-    retriever.add_event(ev_f);
+    let ev_f = make_test_event(6, &[&ev_e]);
+    retriever.add_event(&ev_f);
 
-    let ev_g = make_test_event(7, &[id_f]);
-    let id_g = ev_g.id();
-    retriever.add_event(ev_g);
+    let ev_g = make_test_event(7, &[&ev_f]);
+    retriever.add_event(&ev_g);
 
-    let ev_h = make_test_event(8, &[id_g]);
+    let ev_h = make_test_event(8, &[&ev_g]);
     let id_h = ev_h.id();
-    retriever.add_event(ev_h);
+    retriever.add_event(&ev_h);
 
     // Short branch from D
-    let ev_x = make_test_event(9, &[id_d]); // X (parent is D)
-    let id_x = ev_x.id();
-    retriever.add_event(ev_x);
+    let ev_x = make_test_event(9, &[&ev_d]); // X (parent is D)
+    retriever.add_event(&ev_x);
 
-    let ev_y = make_test_event(10, &[id_x]); // Y
+    let ev_y = make_test_event(10, &[&ev_x]); // Y
     let _id_y = ev_y.id();
 
     let clock_h = clock!(id_h);
 
     // Stage event Y so compare can find it
-    retriever.add_event(ev_y.clone());
+    retriever.add_event(&ev_y);
 
     // Event Y arrives late, with parent X
     let result = compare(retriever.clone(), &Clock::from(vec![ev_y.id()]), &clock_h, 100).await.unwrap();
@@ -955,32 +955,28 @@ async fn test_late_arrival_long_branch_from_genesis() {
     // Entity at [D], then X->Y->Z branch arrives
     let ev_a = make_test_event(1, &[]);
     let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a.clone()]);
-    let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    let ev_b = make_test_event(2, &[&ev_a]);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_b]);
-    let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    let ev_c = make_test_event(3, &[&ev_b]);
+    retriever.add_event(&ev_c);
 
-    let ev_d = make_test_event(4, &[id_c]);
+    let ev_d = make_test_event(4, &[&ev_c]);
     let id_d = ev_d.id();
-    retriever.add_event(ev_d);
+    retriever.add_event(&ev_d);
 
     // Long branch from genesis
-    let ev_x = make_test_event(5, &[id_a.clone()]);
-    let id_x = ev_x.id();
-    retriever.add_event(ev_x);
+    let ev_x = make_test_event(5, &[&ev_a]);
+    retriever.add_event(&ev_x);
 
-    let ev_y = make_test_event(6, &[id_x]);
-    let id_y = ev_y.id();
-    retriever.add_event(ev_y);
+    let ev_y = make_test_event(6, &[&ev_x]);
+    retriever.add_event(&ev_y);
 
-    let ev_z = make_test_event(7, &[id_y]);
+    let ev_z = make_test_event(7, &[&ev_y]);
     let id_z = ev_z.id();
-    retriever.add_event(ev_z);
+    retriever.add_event(&ev_z);
 
     let clock_d = clock!(id_d);
     let clock_z = clock!(id_z);
@@ -1008,23 +1004,23 @@ async fn test_forward_chain_ordering() {
     // Create: A -> B -> C -> D -> E
     let ev_a = make_test_event(1, &[]);
     let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let ev_b = make_test_event(2, &[&ev_a]);
     let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_b.clone()]);
+    let ev_c = make_test_event(3, &[&ev_b]);
     let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    retriever.add_event(&ev_c);
 
-    let ev_d = make_test_event(4, &[id_c.clone()]);
+    let ev_d = make_test_event(4, &[&ev_c]);
     let id_d = ev_d.id();
-    retriever.add_event(ev_d);
+    retriever.add_event(&ev_d);
 
-    let ev_e = make_test_event(5, &[id_d.clone()]);
+    let ev_e = make_test_event(5, &[&ev_d]);
     let id_e = ev_e.id();
-    retriever.add_event(ev_e);
+    retriever.add_event(&ev_e);
 
     let clock_a = clock!(id_a);
     let clock_e = clock!(id_e);
@@ -1055,23 +1051,23 @@ async fn test_diverged_chains_ordering() {
     // Compare D vs E - both chains should be in forward order from meet A
     let ev_a = make_test_event(1, &[]);
     let id_a = ev_a.id();
-    retriever.add_event(ev_a);
+    retriever.add_event(&ev_a);
 
-    let ev_b = make_test_event(2, &[id_a.clone()]);
+    let ev_b = make_test_event(2, &[&ev_a]);
     let id_b = ev_b.id();
-    retriever.add_event(ev_b);
+    retriever.add_event(&ev_b);
 
-    let ev_c = make_test_event(3, &[id_a.clone()]);
+    let ev_c = make_test_event(3, &[&ev_a]);
     let id_c = ev_c.id();
-    retriever.add_event(ev_c);
+    retriever.add_event(&ev_c);
 
-    let ev_d = make_test_event(4, &[id_b.clone()]);
+    let ev_d = make_test_event(4, &[&ev_b]);
     let id_d = ev_d.id();
-    retriever.add_event(ev_d);
+    retriever.add_event(&ev_d);
 
-    let ev_e = make_test_event(5, &[id_c.clone()]);
+    let ev_e = make_test_event(5, &[&ev_c]);
     let id_e = ev_e.id();
-    retriever.add_event(ev_e);
+    retriever.add_event(&ev_e);
 
     let clock_d = clock!(id_d);
     let clock_e = clock!(id_e);
@@ -1260,11 +1256,11 @@ mod lww_layer_tests {
         let event_z = make_lww_event(9, vec![("x", "value_from_Z")]);
 
         let meet = make_test_event(50, &[]);
-        let remote_mid = make_test_event(51, &[meet.id()]); // X: remote event, no lww ops
-        let event_b = make_lww_event_with_parent(2, vec![("x", "value_from_B")], &[remote_mid.id()]);
+        let remote_mid = make_test_event(51, &[&meet]); // X: remote event, no lww ops
+        let event_b = make_lww_event_with_parent(2, vec![("x", "value_from_B")], &[&remote_mid]);
         // Local-branch event A, concurrent with B, with A.id > B.id (search over seeds).
         let event_a = (0u8..=255)
-            .map(|seed| make_lww_event_with_parent(seed, vec![("x", "value_from_A")], &[meet.id()]))
+            .map(|seed| make_lww_event_with_parent(seed, vec![("x", "value_from_A")], &[&meet]))
             .find(|a| a.id() > event_b.id())
             .expect("some seed yields A.id > B.id");
 
@@ -1343,7 +1339,13 @@ mod yrs_layer_tests {
         backend.insert(&crate::property::PropertyKey::name(text_field), 0, insert_text).unwrap();
         let ops = backend.to_operations().unwrap().unwrap();
 
-        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("yrs".to_string(), ops)])), &[])
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("yrs".to_string(), ops)])),
+            parent: Clock::default(),
+            generation: 1, // genesis: no parents (266-A)
+        }
     }
 
     #[test]
@@ -1574,7 +1576,13 @@ mod edge_case_tests {
 
         // Create an event with empty operations
         let entity_id = EntityId::from_bytes([99u8; 16]);
-        let empty_event = crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), &[]);
+        let empty_event = Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::new()),
+            parent: Clock::default(),
+            generation: 1, // genesis: no parents (266-A)
+        };
 
         let already_applied: Vec<&Event> = vec![];
         let to_apply: Vec<&Event> = vec![&empty_event];
@@ -1635,7 +1643,13 @@ mod edge_case_tests {
         let delete_backend = LWWBackend::new();
         delete_backend.set("x".into(), None); // Delete
         let ops = delete_backend.to_operations().unwrap().unwrap();
-        let delete_event = crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), &[]);
+        let delete_event = Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            parent: Clock::default(),
+            generation: 1, // genesis: no parents (266-A)
+        };
 
         backend.apply_layer(&layer_from_refs_with_context(&[], &[&delete_event], &[&init_event])).unwrap();
 
@@ -1746,16 +1760,14 @@ mod phase4_idempotency {
 
         // Build a chain: A -> B -> C (current head is [C])
         let ev_a = make_test_event(1, &[]);
-        let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        retriever.add_event(&ev_a);
 
-        let ev_b = make_test_event(2, &[id_a.clone()]);
-        let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        let ev_b = make_test_event(2, &[&ev_a]);
+        retriever.add_event(&ev_b);
 
-        let ev_c = make_test_event(3, &[id_b.clone()]);
+        let ev_c = make_test_event(3, &[&ev_b]);
         let id_c = ev_c.id();
-        retriever.add_event(ev_c);
+        retriever.add_event(&ev_c);
 
         let entity_head = clock!(id_c);
 
@@ -1763,11 +1775,11 @@ mod phase4_idempotency {
         // With the staging+compare pattern, B is already in the retriever (same
         // content = same EventId as ev_b). compare([B], [C]) can walk backward
         // from C and discover B as an ancestor, returning StrictAscends.
-        let event_b_again = make_test_event(2, &[id_a]);
+        let event_b_again = make_test_event(2, &[&ev_a]);
         let result = compare(retriever.clone(), &Clock::from(vec![event_b_again.id()]), &entity_head, 100).await.unwrap();
 
         // Re-delivery of event C (which IS at the head) should return Equal.
-        let event_c_again = make_test_event(3, &[id_b]);
+        let event_c_again = make_test_event(3, &[&ev_b]);
         let result_c = compare(retriever.clone(), &Clock::from(vec![event_c_again.id()]), &entity_head, 100).await.unwrap();
         assert_eq!(result_c.relation, AbstractCausalRelation::Equal, "Re-delivery of head event must return Equal");
 
@@ -1804,7 +1816,13 @@ mod phase4_duplicate_creation {
         let ops = backend.to_operations().unwrap().unwrap();
 
         // empty parent = creation event
-        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), &[])
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            parent: Clock::default(),
+            generation: 1, // genesis: no parents (266-A)
+        }
     }
 
     #[tokio::test]
@@ -1818,7 +1836,7 @@ mod phase4_duplicate_creation {
 
         // First creation event should succeed
         let creation_event_1 = make_creation_event(1);
-        retriever.add_event(creation_event_1.clone());
+        retriever.add_event(&creation_event_1);
 
         let result = entity.apply_event(&retriever, &creation_event_1).await;
         assert!(result.is_ok(), "First creation event should succeed");
@@ -1830,7 +1848,7 @@ mod phase4_duplicate_creation {
         // Second creation event (different seed = different event) should be rejected.
         // BFS detects two different roots -> Disjoint -> LineageError::Disjoint
         let creation_event_2 = make_creation_event(2);
-        retriever.add_event(creation_event_2.clone());
+        retriever.add_event(&creation_event_2);
         let result = entity.apply_event(&retriever, &creation_event_2).await;
 
         assert!(result.is_err(), "Second creation event should fail");
@@ -1849,7 +1867,7 @@ mod phase4_duplicate_creation {
 
         // First creation event
         let creation_event = make_creation_event(1);
-        retriever.add_event(creation_event.clone());
+        retriever.add_event(&creation_event);
 
         let result = entity.apply_event(&retriever, &creation_event).await;
         assert!(result.is_ok() && result.unwrap(), "First apply should succeed");
@@ -1877,16 +1895,16 @@ mod phase4_budget_escalation {
         // Create a chain of 6 events: ev0 -> ev1 -> ev2 -> ev3 -> ev4 -> ev5
         // With budget=2, the initial traversal exhausts at 2 steps.
         // With 4x escalation (budget=8), it succeeds for a 6-long chain.
-        let mut ids: Vec<EventId> = Vec::new();
+        let mut events: Vec<Event> = Vec::new();
         for i in 0..6u8 {
-            let parents = if i == 0 { vec![] } else { vec![ids[i as usize - 1].clone()] };
+            let parents: Vec<&Event> = if i == 0 { vec![] } else { vec![&events[i as usize - 1]] };
             let ev = make_test_event(i + 1, &parents);
-            ids.push(ev.id());
-            retriever.add_event(ev);
+            retriever.add_event(&ev);
+            events.push(ev);
         }
 
-        let ancestor = clock!(ids[0]);
-        let descendant = clock!(ids[5]);
+        let ancestor = clock!(events[0].id());
+        let descendant = clock!(events[5].id());
 
         // With budget=2, initial attempt fails. But internal escalation retries
         // with budget=8 (2 * 4), which should succeed for a 6-deep chain.
@@ -1970,23 +1988,23 @@ mod phase4_mixed_parent_merge {
 
         let ev_a = make_test_event(1, &[]);
         let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        retriever.add_event(&ev_a);
 
-        let ev_b = make_test_event(2, &[id_a.clone()]);
+        let ev_b = make_test_event(2, &[&ev_a]);
         let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        retriever.add_event(&ev_b);
 
-        let ev_g = make_test_event(3, &[id_a.clone()]);
+        let ev_g = make_test_event(3, &[&ev_a]);
         let id_g = ev_g.id();
-        retriever.add_event(ev_g);
+        retriever.add_event(&ev_g);
 
-        let ev_c = make_test_event(4, &[id_b.clone()]);
+        let ev_c = make_test_event(4, &[&ev_b]);
         let id_c = ev_c.id();
-        retriever.add_event(ev_c);
+        retriever.add_event(&ev_c);
 
-        let ev_e = make_test_event(5, &[id_c.clone(), id_g.clone()]);
+        let ev_e = make_test_event(5, &[&ev_c, &ev_g]);
         let id_e = ev_e.id();
-        retriever.add_event(ev_e);
+        retriever.add_event(&ev_e);
 
         // Build accumulator manually to simulate what comparison would produce.
         // The DAG contains all events above the meet (A is the meet).
@@ -2081,23 +2099,23 @@ mod phase4_eager_storage_bfs {
 
         let ev_a = make_test_event(1, &[]);
         let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        retriever.add_event(&ev_a);
 
-        let ev_b = make_test_event(2, &[id_a.clone()]);
+        let ev_b = make_test_event(2, &[&ev_a]);
         let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        retriever.add_event(&ev_b);
 
-        let ev_c = make_test_event(3, &[id_a.clone()]);
+        let ev_c = make_test_event(3, &[&ev_a]);
         let id_c = ev_c.id();
-        retriever.add_event(ev_c);
+        retriever.add_event(&ev_c);
 
-        let ev_d = make_test_event(4, &[id_b.clone()]);
+        let ev_d = make_test_event(4, &[&ev_b]);
         let id_d = ev_d.id();
-        retriever.add_event(ev_d);
+        retriever.add_event(&ev_d);
 
-        let ev_e = make_test_event(5, &[id_c.clone()]);
+        let ev_e = make_test_event(5, &[&ev_c]);
         let id_e = ev_e.id();
-        retriever.add_event(ev_e);
+        retriever.add_event(&ev_e);
 
         let clock_d = clock!(id_d);
         let clock_e = clock!(id_e);
@@ -2160,40 +2178,34 @@ mod bfs_revisit_bugs {
         let mut retriever = MockRetriever::new();
 
         let ev_r = make_test_event(1, &[]);
-        let id_r = ev_r.id();
-        retriever.add_event(ev_r);
+        retriever.add_event(&ev_r);
 
-        let ev_n = make_test_event(2, &[id_r.clone()]);
+        let ev_n = make_test_event(2, &[&ev_r]);
         let id_n = ev_n.id();
-        retriever.add_event(ev_n);
+        retriever.add_event(&ev_n);
 
-        let ev_d = make_test_event(3, &[id_r.clone()]);
+        let ev_d = make_test_event(3, &[&ev_r]);
         let id_d = ev_d.id();
-        retriever.add_event(ev_d);
+        retriever.add_event(&ev_d);
 
-        let ev_a = make_test_event(4, &[id_n.clone()]);
-        let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        let ev_a = make_test_event(4, &[&ev_n]);
+        retriever.add_event(&ev_a);
 
         // Pick a seed for C such that id(N) < id(C). The frontier is a BTreeSet
         // iterated in id order, so this makes the subject BFS process N (short
         // path, via A) BEFORE C re-adds N to the frontier (long path, via B),
         // forcing the re-visit. Content hashing makes this deterministic once a
         // seed is found.
-        let ev_c = (10u8..=255)
-            .map(|seed| make_test_event(seed, &[id_n.clone()]))
-            .find(|ev| ev.id() > id_n)
-            .expect("some seed must yield id(C) > id(N)");
-        let id_c = ev_c.id();
-        retriever.add_event(ev_c);
+        let ev_c =
+            (10u8..=255).map(|seed| make_test_event(seed, &[&ev_n])).find(|ev| ev.id() > id_n).expect("some seed must yield id(C) > id(N)");
+        retriever.add_event(&ev_c);
 
-        let ev_b = make_test_event(5, &[id_c.clone()]);
-        let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        let ev_b = make_test_event(5, &[&ev_c]);
+        retriever.add_event(&ev_b);
 
-        let ev_s = make_test_event(6, &[id_a.clone(), id_b.clone()]);
+        let ev_s = make_test_event(6, &[&ev_a, &ev_b]);
         let id_s = ev_s.id();
-        retriever.add_event(ev_s);
+        retriever.add_event(&ev_s);
 
         let subject = clock!(id_s);
         let comparison = clock!(id_n, id_d); // two concurrent tips
@@ -2219,38 +2231,32 @@ mod bfs_revisit_bugs {
         let mut retriever = MockRetriever::new();
 
         let ev_r = make_test_event(1, &[]);
-        let id_r = ev_r.id();
-        retriever.add_event(ev_r);
+        retriever.add_event(&ev_r);
 
-        let ev_n = make_test_event(2, &[id_r.clone()]);
+        let ev_n = make_test_event(2, &[&ev_r]);
         let id_n = ev_n.id();
-        retriever.add_event(ev_n);
+        retriever.add_event(&ev_n);
 
-        let ev_d = make_test_event(3, &[id_r.clone()]);
+        let ev_d = make_test_event(3, &[&ev_r]);
         let id_d = ev_d.id();
-        retriever.add_event(ev_d);
+        retriever.add_event(&ev_d);
 
-        let ev_a = make_test_event(4, &[id_n.clone()]);
-        let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        let ev_a = make_test_event(4, &[&ev_n]);
+        retriever.add_event(&ev_a);
 
         // Same seed condition as the StrictDescends case: id(N) < id(C) makes
         // the comparison-side BFS process N (short path, via A) before C
         // re-encounters it (long path, via B).
-        let ev_c = (10u8..=255)
-            .map(|seed| make_test_event(seed, &[id_n.clone()]))
-            .find(|ev| ev.id() > id_n)
-            .expect("some seed must yield id(C) > id(N)");
-        let id_c = ev_c.id();
-        retriever.add_event(ev_c);
+        let ev_c =
+            (10u8..=255).map(|seed| make_test_event(seed, &[&ev_n])).find(|ev| ev.id() > id_n).expect("some seed must yield id(C) > id(N)");
+        retriever.add_event(&ev_c);
 
-        let ev_b = make_test_event(5, &[id_c.clone()]);
-        let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        let ev_b = make_test_event(5, &[&ev_c]);
+        retriever.add_event(&ev_b);
 
-        let ev_s = make_test_event(6, &[id_a.clone(), id_b.clone()]);
+        let ev_s = make_test_event(6, &[&ev_a, &ev_b]);
         let id_s = ev_s.id();
-        retriever.add_event(ev_s);
+        retriever.add_event(&ev_s);
 
         let subject = clock!(id_n, id_d); // two concurrent tips
         let comparison = clock!(id_s);
@@ -2294,34 +2300,31 @@ mod bfs_revisit_bugs {
 
         let ev_r = make_test_event_u16(next_seed(), &[]);
         let id_r = ev_r.id();
-        retriever.add_event(ev_r);
+        retriever.add_event(&ev_r);
 
-        let mut prev = id_r.clone();
+        let mut prev = ev_r.clone();
         for _ in 0..LEVELS {
-            let ev_a = make_test_event_u16(next_seed(), &[prev.clone()]);
-            let id_a = ev_a.id();
-            retriever.add_event(ev_a);
+            let ev_a = make_test_event_u16(next_seed(), &[&prev]);
+            retriever.add_event(&ev_a);
 
             let ev_c = loop {
-                let candidate = make_test_event_u16(next_seed(), &[prev.clone()]);
-                if candidate.id() > prev {
+                let candidate = make_test_event_u16(next_seed(), &[&prev]);
+                if candidate.id() > prev.id() {
                     break candidate;
                 }
             };
-            let id_c = ev_c.id();
-            retriever.add_event(ev_c);
+            retriever.add_event(&ev_c);
 
-            let ev_b = make_test_event_u16(next_seed(), &[id_c.clone()]);
-            let id_b = ev_b.id();
-            retriever.add_event(ev_b);
+            let ev_b = make_test_event_u16(next_seed(), &[&ev_c]);
+            retriever.add_event(&ev_b);
 
-            let ev_j = make_test_event_u16(next_seed(), &[id_a.clone(), id_b.clone()]);
-            prev = ev_j.id();
-            retriever.add_event(ev_j);
+            let ev_j = make_test_event_u16(next_seed(), &[&ev_a, &ev_b]);
+            retriever.add_event(&ev_j);
+            prev = ev_j;
         }
 
         let total_events = 1 + 4 * LEVELS;
-        let subject = clock!(prev); // top join
+        let subject = clock!(prev.id()); // top join
         let comparison = clock!(id_r); // genesis
 
         let result = compare(retriever, &subject, &comparison, 2 * total_events).await.unwrap();
@@ -2350,23 +2353,22 @@ mod bfs_revisit_bugs {
 
         let ev_m = make_test_event(1, &[]);
         let id_m = ev_m.id();
-        retriever.add_event(ev_m);
+        retriever.add_event(&ev_m);
 
-        let ev_c1 = make_test_event(2, &[id_m.clone()]);
+        let ev_c1 = make_test_event(2, &[&ev_m]);
         let id_c1 = ev_c1.id();
-        retriever.add_event(ev_c1);
+        retriever.add_event(&ev_c1);
 
-        let ev_x = make_test_event(3, &[id_m.clone()]);
-        let id_x = ev_x.id();
-        retriever.add_event(ev_x);
+        let ev_x = make_test_event(3, &[&ev_m]);
+        retriever.add_event(&ev_x);
 
-        let ev_c2 = make_test_event(4, &[id_x.clone()]);
+        let ev_c2 = make_test_event(4, &[&ev_x]);
         let id_c2 = ev_c2.id();
-        retriever.add_event(ev_c2);
+        retriever.add_event(&ev_c2);
 
-        let ev_s = make_test_event(5, &[id_m.clone()]);
+        let ev_s = make_test_event(5, &[&ev_m]);
         let id_s = ev_s.id();
-        retriever.add_event(ev_s);
+        retriever.add_event(&ev_s);
 
         let subject = clock!(id_s);
         let comparison = clock!(id_c1, id_c2);
@@ -2402,31 +2404,30 @@ mod bfs_revisit_bugs {
 
         let ev_m = make_test_event(1, &[]);
         let id_m = ev_m.id();
-        retriever.add_event(ev_m);
+        retriever.add_event(&ev_m);
 
-        let ev_k = make_test_event(2, &[id_m.clone()]);
+        let ev_k = make_test_event(2, &[&ev_m]);
         let id_k = ev_k.id();
-        retriever.add_event(ev_k);
+        retriever.add_event(&ev_k);
 
-        let ev_c1 = make_test_event(3, &[id_k.clone()]);
+        let ev_c1 = make_test_event(3, &[&ev_k]);
         let id_c1 = ev_c1.id();
-        retriever.add_event(ev_c1);
+        retriever.add_event(&ev_c1);
 
         // L: child of K on the longer path; must be expanded after K.
         let ev_l = (10u16..=u16::MAX)
-            .map(|seed| make_test_event_u16(seed, &[id_k.clone()]))
+            .map(|seed| make_test_event_u16(seed, &[&ev_k]))
             .find(|ev| ev.id() > id_k)
             .expect("some seed must yield id(L) > id(K)");
-        let id_l = ev_l.id();
-        retriever.add_event(ev_l);
+        retriever.add_event(&ev_l);
 
-        let ev_h = make_test_event(4, &[id_l.clone()]);
+        let ev_h = make_test_event(4, &[&ev_l]);
         let id_h = ev_h.id();
-        retriever.add_event(ev_h);
+        retriever.add_event(&ev_h);
 
-        let ev_s = make_test_event(5, &[id_m.clone()]);
+        let ev_s = make_test_event(5, &[&ev_m]);
         let id_s = ev_s.id();
-        retriever.add_event(ev_s);
+        retriever.add_event(&ev_s);
 
         let subject = clock!(id_s);
         let comparison = clock!(id_c1, id_h);
@@ -2471,17 +2472,17 @@ mod quick_check_disjoint_verify {
         // A: genesis root of the comparison lineage
         let ev_a = make_test_event(1, &[]);
         let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        retriever.add_event(&ev_a);
 
         // B: child of A (this is the part that genuinely descends)
-        let ev_b = make_test_event(2, &[id_a.clone()]);
+        let ev_b = make_test_event(2, &[&ev_a]);
         let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        retriever.add_event(&ev_b);
 
         // X: an INDEPENDENT genesis root, no parents, unrelated to A
         let ev_x = make_test_event(3, &[]);
         let id_x = ev_x.id();
-        retriever.add_event(ev_x);
+        retriever.add_event(&ev_x);
 
         let subject = clock!(id_b, id_x); // new head carries a disjoint extra root
         let comparison = clock!(id_a); // current head
@@ -2510,19 +2511,18 @@ mod quick_check_disjoint_verify {
 
         let ev_a = make_test_event(1, &[]);
         let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        retriever.add_event(&ev_a);
 
-        let ev_b = make_test_event(2, &[id_a.clone()]);
-        let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        let ev_b = make_test_event(2, &[&ev_a]);
+        retriever.add_event(&ev_b);
 
-        let ev_d = make_test_event(3, &[id_b.clone()]);
+        let ev_d = make_test_event(3, &[&ev_b]);
         let id_d = ev_d.id();
-        retriever.add_event(ev_d);
+        retriever.add_event(&ev_d);
 
-        let ev_c = make_test_event(4, &[id_a.clone()]);
+        let ev_c = make_test_event(4, &[&ev_a]);
         let id_c = ev_c.id();
-        retriever.add_event(ev_c);
+        retriever.add_event(&ev_c);
 
         let subject = clock!(id_d);
         let comparison = clock!(id_c);
@@ -2554,19 +2554,17 @@ mod quick_check_disjoint_verify {
 
         let ev_a = make_test_event(1, &[]);
         let id_a = ev_a.id();
-        retriever.add_event(ev_a);
+        retriever.add_event(&ev_a);
 
-        let ev_b = make_test_event(2, &[id_a.clone()]);
-        let id_b = ev_b.id();
-        retriever.add_event(ev_b);
+        let ev_b = make_test_event(2, &[&ev_a]);
+        retriever.add_event(&ev_b);
 
         let ev_x = make_test_event(3, &[]);
-        let id_x = ev_x.id();
-        retriever.add_event(ev_x);
+        retriever.add_event(&ev_x);
 
-        let ev_d = make_test_event(4, &[id_b.clone(), id_x.clone()]);
+        let ev_d = make_test_event(4, &[&ev_b, &ev_x]);
         let id_d = ev_d.id();
-        retriever.add_event(ev_d);
+        retriever.add_event(&ev_d);
 
         let subject = clock!(id_d);
         let comparison = clock!(id_a);
@@ -2632,18 +2630,18 @@ mod strict_descends_gap_jump {
         // A: genesis create event (empty parent). Establishes head {A}.
         let ev_a = make_lww_event_with_parent(1, vec![("p0", "genesis")], &[]);
         let id_a = ev_a.id();
-        retriever.add_event(ev_a.clone());
+        retriever.add_event(&ev_a);
         assert!(ev_a.is_entity_create(), "A must be a creation event");
 
         // X: child of A, writes p1. This is the intermediate ancestor.
-        let ev_x = make_lww_event_with_parent(2, vec![("p1", "written_by_X")], &[id_a.clone()]);
+        let ev_x = make_lww_event_with_parent(2, vec![("p1", "written_by_X")], &[&ev_a]);
         let id_x = ev_x.id();
-        retriever.add_event(ev_x.clone());
+        retriever.add_event(&ev_x);
 
         // B: child of X, writes p2. B descends A through X.
-        let ev_b = make_lww_event_with_parent(3, vec![("p2", "written_by_B")], &[id_x.clone()]);
+        let ev_b = make_lww_event_with_parent(3, vec![("p2", "written_by_B")], &[&ev_x]);
         let id_b = ev_b.id();
-        retriever.add_event(ev_b.clone());
+        retriever.add_event(&ev_b);
 
         // Establish local head = {A}.
         assert!(entity.apply_event(&retriever, &ev_a).await.unwrap(), "A should apply");
@@ -2845,6 +2843,7 @@ mod comparison_property {
             let n_events = 5 + rng.below(6); // 5..=10
 
             let mut retriever = MockRetriever::new();
+            let mut events: Vec<Event> = Vec::new();
             let mut ids: Vec<EventId> = Vec::new();
             let mut parents_map: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
 
@@ -2863,11 +2862,16 @@ mod comparison_property {
                     to_antichain(&parents_map, &chosen)
                 };
 
-                let ev = make_test_event_u16(i as u16 + 1, &parent_ids);
+                // Resolve the chosen parent ids back to their events (the
+                // helper stamps generations from parent payloads).
+                let parent_events: Vec<&Event> =
+                    parent_ids.iter().map(|pid| events.iter().find(|e| e.id() == *pid).expect("parent id was minted above")).collect();
+                let ev = make_test_event_u16(i as u16 + 1, &parent_events);
                 let id = ev.id();
                 parents_map.insert(id.clone(), parent_ids);
                 ids.push(id);
-                retriever.add_event(ev);
+                retriever.add_event(&ev);
+                events.push(ev);
             }
 
             for _pair in 0..4 {
@@ -2952,13 +2956,19 @@ mod entity_change_batches {
     /// EntityChange validates event ownership, so the events must genuinely
     /// belong to the entity under test (the shared helper derives entity ids
     /// from its seed).
-    fn lww_event_for(entity_id: EntityId, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
+    fn lww_event_for(entity_id: EntityId, properties: Vec<(&str, &str)>, parents: &[&Event]) -> Event {
         let backend = LWWBackend::new();
         for (name, value) in properties {
             backend.set(name.into(), Some(Value::String(value.into())));
         }
         let ops = backend.to_operations().unwrap().unwrap();
-        crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::from([("lww".to_string(), ops)])), parent_ids)
+        Event {
+            entity_id,
+            collection: "test".into(),
+            operations: OperationSet(BTreeMap::from([("lww".to_string(), ops)])),
+            parent: Clock::from(parents.iter().map(|p| p.id()).collect::<Vec<_>>()),
+            generation: Event::generation_from_parents(parents.iter().map(|p| p.generation)),
+        }
     }
 
     /// An ordered parent-then-child batch applies cleanly, leaving only the
@@ -2975,11 +2985,11 @@ mod entity_change_batches {
         let mut retriever = MockRetriever::new();
 
         let ev_a = lww_event_for(entity_id, vec![("p0", "genesis")], &[]);
-        retriever.add_event(ev_a.clone());
-        let ev_x = lww_event_for(entity_id, vec![("p1", "from_x")], &[ev_a.id()]);
-        retriever.add_event(ev_x.clone());
-        let ev_b = lww_event_for(entity_id, vec![("p2", "from_b")], &[ev_x.id()]);
-        retriever.add_event(ev_b.clone());
+        retriever.add_event(&ev_a);
+        let ev_x = lww_event_for(entity_id, vec![("p1", "from_x")], &[&ev_a]);
+        retriever.add_event(&ev_x);
+        let ev_b = lww_event_for(entity_id, vec![("p2", "from_b")], &[&ev_x]);
+        retriever.add_event(&ev_b);
 
         assert!(entity.apply_event(&retriever, &ev_a).await.unwrap());
         assert!(entity.apply_event(&retriever, &ev_x).await.unwrap());
@@ -2992,7 +3002,7 @@ mod entity_change_batches {
 
         // Still rejected: an event that is neither a head tip nor superseded
         // by a later batch member.
-        let stray = lww_event_for(entity_id, vec![("p9", "stray")], &[ev_a.id()]);
+        let stray = lww_event_for(entity_id, vec![("p9", "stray")], &[&ev_a]);
         let bad = EntityChange::new(entity, vec![Attested::opt(stray, None)]);
         assert!(bad.is_err(), "an event outside the head and unsuperseded in the batch must be rejected");
     }

@@ -14,16 +14,20 @@ use std::sync::Arc;
 
 use common::{Record, RecordView};
 
-/// Forge a Record LWW event setting `title`, parented on the given clock.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+/// Forge a Record LWW event setting `title`, parented on the given clock,
+/// with an EXPLICIT claimed generation (both forges in this file parent on
+/// clocks with no resolvable true generation: a fabricated id and an empty
+/// genesis clock).
+fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str, generation: u32) -> proto::Event {
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::gen::stamped_event(
+    ankurah_tests::forge::event_claiming(
         entity_id,
         Record::collection(),
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
         parent,
+        generation,
     )
 }
 
@@ -54,7 +58,9 @@ async fn test_unknown_entity_event_yields_typed_lineage_rejection() -> Result<()
     let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
 
     let unknown = proto::EntityId::new();
-    let ev = forge_title_event(unknown, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    // The parent id is fabricated, so no true generation exists; 2 is a
+    // plausible claim and admission can never verify it (NeedsState preempts).
+    let ev = forge_title_event(unknown, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost", 2);
 
     let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(ev)])
         .await
@@ -100,8 +106,10 @@ async fn test_second_genesis_yields_typed_disjoint() -> Result<()> {
     assert_eq!(view.title().unwrap(), "t0");
 
     // A creation event (empty parents) for an entity that already has
-    // committed history: different genesis, provably disjoint.
-    let evil_genesis = forge_title_event(rec_id, proto::Clock::default(), "evil-genesis");
+    // committed history: different genesis, provably disjoint. Claims the
+    // correct genesis generation (1) so the Disjoint verdict, not a
+    // generation check, is what rejects it.
+    let evil_genesis = forge_title_event(rec_id, proto::Clock::default(), "evil-genesis", 1);
 
     let err = NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(evil_genesis)])
         .await

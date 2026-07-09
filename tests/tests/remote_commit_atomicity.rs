@@ -140,16 +140,17 @@ impl PolicyAgent for DenyingWriteAgent {
     }
 }
 
-/// Forge a Record LWW event setting `title`, parented on the given clock.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+/// Forge a Record LWW event setting `title`, parented on the given parent
+/// EVENTS (generation stamped from their payloads; the registry ban).
+fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::gen::stamped_event(
+    ankurah_tests::forge::event_with_parents(
         entity_id,
         Record::collection(),
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
+        parents,
     )
 }
 
@@ -166,9 +167,9 @@ async fn test_remote_commit_denial_leaves_nothing_durable() -> Result<()> {
     server.system.create().await?;
 
     let entity_id = proto::EntityId::new();
-    let e0 = forge_title_event(entity_id, proto::Clock::default(), "t0");
-    let e1 = forge_title_event(entity_id, proto::Clock::from(vec![e0.id()]), "t1");
-    let e2 = forge_title_event(entity_id, proto::Clock::from(vec![e1.id()]), "t2");
+    let e0 = forge_title_event(entity_id, &[], "t0");
+    let e1 = forge_title_event(entity_id, &[&e0], "t1");
+    let e2 = forge_title_event(entity_id, &[&e1], "t2");
     agent.deny_events.lock().unwrap().insert(e1.id());
 
     let events = vec![Attested::opt(e0, None), Attested::opt(e1, None), Attested::opt(e2, None)];
@@ -210,7 +211,7 @@ async fn test_rejected_creation_previews_and_leaves_no_resident() -> Result<()> 
     server.system.create().await?;
 
     let entity_id = proto::EntityId::new();
-    let creation = forge_title_event(entity_id, proto::Clock::default(), "denied-at-birth");
+    let creation = forge_title_event(entity_id, &[], "denied-at-birth");
     let creation_id = creation.id();
     agent.deny_events.lock().unwrap().insert(creation_id.clone());
 

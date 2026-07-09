@@ -196,8 +196,17 @@ mod tests {
     use ankurah_proto::{EntityId, OperationSet};
     use std::collections::BTreeMap;
 
-    fn event(entity_id: EntityId, parent_ids: &[EventId]) -> Attested<Event> {
-        Attested::opt(crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids), None)
+    fn event(entity_id: EntityId, parents: &[&Attested<Event>]) -> Attested<Event> {
+        Attested::opt(
+            Event {
+                entity_id,
+                collection: "test".into(),
+                operations: OperationSet(BTreeMap::new()),
+                parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
+                generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),
+            },
+            None,
+        )
     }
 
     #[test]
@@ -229,8 +238,8 @@ mod tests {
         let entity = EntityId::new();
         let genesis = event(entity, &[]);
         let genesis_id = genesis.payload.id();
-        let child_a = event(entity, &[genesis_id.clone()]);
-        let child_b = event(EntityId::new(), &[genesis_id.clone()]);
+        let child_a = event(entity, &[&genesis]);
+        let child_b = event(EntityId::new(), &[&genesis]);
 
         area.stage(child_a.clone());
         area.stage(child_b.clone());
@@ -246,7 +255,7 @@ mod tests {
         let entity = EntityId::new();
         let genesis = event(entity, &[]);
         let genesis_id = genesis.payload.id();
-        let child = event(entity, &[genesis_id.clone()]);
+        let child = event(entity, &[&genesis]);
         let child_id = child.payload.id();
 
         area.stage(child);
@@ -303,7 +312,7 @@ mod tests {
         let entity = EntityId::new();
         let genesis = event(entity, &[]);
         let genesis_id = genesis.payload.id();
-        let child = event(entity, &[genesis_id.clone()]);
+        let child = event(entity, &[&genesis]);
         let other = event(EntityId::new(), &[]);
 
         area.stage(child);
