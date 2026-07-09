@@ -38,6 +38,25 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     }
 }
 
+/// A StateAndEvent update item: `state` travels with `events` as cargo (the
+/// wire shape a durable peer's subscription push uses).
+fn state_and_event_item(
+    entity_id: proto::EntityId,
+    collection: proto::CollectionId,
+    state: proto::State,
+    events: Vec<proto::Event>,
+) -> proto::SubscriptionUpdateItem {
+    proto::SubscriptionUpdateItem {
+        entity_id,
+        collection,
+        content: proto::UpdateContent::StateAndEvent(
+            proto::StateFragment { state, attestations: Default::default() },
+            events.into_iter().map(|e| Attested::opt(e, None).into()).collect(),
+        ),
+        predicate_relevance: vec![],
+    }
+}
+
 fn assert_generation_mismatch(cause: &MutationError, claimed: u32, expected: u32, context: &str) {
     match cause {
         MutationError::Ingest(IngestError::Lineage(LineageRejection::GenerationMismatch {
@@ -198,6 +217,117 @@ async fn r_d2_2b_genesis_must_claim_exactly_one() -> Result<()> {
         .await
         .expect("a genesis claiming exactly 1 must apply");
     assert!(collection.has_event(&good_id).await?, "the honest genesis is durable");
+
+    Ok(())
+}
+
+/// Plan REV 5 section L (the StateAndEvent cargo ruling, reversing M2's
+/// warn-and-store arm): an event traveling as StateAndEvent cargo whose
+/// claimed generation PROVABLY contradicts locally held parents aborts the
+/// ENTIRE update item with the typed lineage error, checked BEFORE the
+/// state applies: no state adoption, nothing stored from that item. The
+/// grievance is with the state that vouched for the malformed history;
+/// verifiably invalid input errors loudly because somebody is tampering.
+/// The red pins BOTH halves: the item aborts AND the state is not adopted.
+/// The honest twin (same shape, correct stamp) must adopt cleanly, and
+/// fresh adoption with unverifiable cargo stays unaffected (M2 behavior).
+#[tokio::test]
+async fn r_l_provably_mis_stamped_state_and_event_cargo_aborts_the_item() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    client.system.wait_system_ready().await;
+
+    let ctx_s = server.context(c)?;
+    let ctx_c = client.context(c)?;
+    let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+
+    let (rec_id, genesis) = {
+        let trx = ctx_s.begin();
+        let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
+        let id = rec.id();
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
+    };
+    let view = ctx_c.get::<RecordView>(rec_id).await?;
+    assert_eq!(view.title().unwrap(), "t0");
+
+    // Make the parent LOCALLY HELD on the client (the forgery must be
+    // PROVABLY wrong, not merely unverifiable): deliver the genesis body so
+    // the backfill commits it to the client's log.
+    NodeApplier::apply_updates_for_test(&client, &server.id, vec![event_only_item(genesis.clone())])
+        .await
+        .expect("backfilling the adopted head's own event is clean");
+    let collection = ctx_c.collection(&Record::collection()).await?;
+    assert!(collection.has_event(&genesis.id()).await?, "precondition: the parent body is in the client's local log");
+    let stored_head_before = collection.get_state(rec_id).await?.payload.state.head;
+
+    // The forged cargo: a child of the (generation 1) genesis claiming 3;
+    // the one correct claim is 2. The state vouching for it heads at the
+    // forgery.
+    let parent = proto::Clock::from(vec![genesis.id()]);
+    let forged = forge_claiming(rec_id, parent.clone(), "tampered-title", 3);
+    let forged_id = forged.id();
+    let mut crafted_state = collection.get_state(rec_id).await?.payload.state.clone();
+    crafted_state.head = proto::Clock::from(vec![forged_id.clone()]);
+
+    let err = NodeApplier::apply_updates_for_test(
+        &client,
+        &server.id,
+        vec![state_and_event_item(rec_id, Record::collection(), crafted_state, vec![forged])],
+    )
+    .await
+    .expect_err("a provably mis-stamped cargo event must abort the ENTIRE update item");
+    let ApplyError::Items(items) = err else {
+        panic!("expected per-item aggregation, got {err:?}");
+    };
+    assert_generation_mismatch(&items[0].cause, 3, 2, "StateAndEvent cargo");
+
+    // The other half: the state was NOT adopted and nothing was stored.
+    assert_eq!(view.title().unwrap(), "t0", "the vouching state must not be adopted");
+    assert!(!view.entity().head().contains(&forged_id), "the forgery must not enter the resident head");
+    assert!(!collection.has_event(&forged_id).await?, "the forged cargo must not be committed");
+    assert_eq!(
+        collection.get_state(rec_id).await?.payload.state.head,
+        stored_head_before,
+        "the persisted buffer must not move on an aborted item"
+    );
+
+    // The honest twin (same operations, correct stamp 2) adopts cleanly:
+    // the reversal must reject forgeries, not the lane.
+    let honest = forge_claiming(rec_id, parent, "tampered-title", 2);
+    let honest_id = honest.id();
+    let mut honest_state = collection.get_state(rec_id).await?.payload.state.clone();
+    honest_state.head = proto::Clock::from(vec![honest_id.clone()]);
+    NodeApplier::apply_updates_for_test(
+        &client,
+        &server.id,
+        vec![state_and_event_item(rec_id, Record::collection(), honest_state, vec![honest])],
+    )
+    .await
+    .expect("the correctly stamped twin adopts cleanly");
+    assert!(view.entity().head().contains(&honest_id), "the honest twin advances the resident head");
+    assert!(collection.has_event(&honest_id).await?, "the honest cargo is committed");
+
+    // Fresh adoption with UNVERIFIABLE cargo (parents not locally held)
+    // remains unaffected: store the body, adopt the state (the M2 arm the
+    // ruling expressly keeps).
+    let fresh_id = proto::EntityId::new();
+    let h1 = forge_claiming(fresh_id, proto::Clock::default(), "fresh", 1);
+    let h2 = ankurah_tests::forge::event_with_parents(fresh_id, Record::collection(), title_ops("fresh-2"), &[&h1]);
+    let h2_id = h2.id();
+    // Only h2 travels; its parent h1 is never given to the client, so the
+    // check is UNVERIFIABLE, not provably wrong.
+    let fresh_state = proto::State { state_buffers: proto::StateBuffers(BTreeMap::new()), head: proto::Clock::from(vec![h2_id.clone()]) };
+    NodeApplier::apply_updates_for_test(
+        &client,
+        &server.id,
+        vec![state_and_event_item(fresh_id, Record::collection(), fresh_state, vec![h2])],
+    )
+    .await
+    .expect("fresh adoption with unverifiable cargo must remain unaffected");
+    assert!(collection.has_event(&h2_id).await?, "unverifiable cargo is stored (acceleration-ineligible), not rejected");
 
     Ok(())
 }
