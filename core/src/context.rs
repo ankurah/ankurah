@@ -1,3 +1,4 @@
+use crate::ingest::PersistState;
 use crate::retrieval::SuspenseEvents;
 use crate::{
     changes::EntityChange,
@@ -10,7 +11,7 @@ use crate::{
     storage::{StorageCollectionWrapper, StorageEngine},
     transaction::Transaction,
 };
-use ankurah_proto::{self as proto, Attested, Clock, CollectionId, EntityState, Event};
+use ankurah_proto::{self as proto, Attested, Clock, CollectionId, Event};
 use async_trait::async_trait;
 use std::sync::{atomic::AtomicBool, Arc};
 use tracing::debug;
@@ -172,12 +173,15 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
                 canonical.apply_event(&group.getter, &attested_event.payload).await?;
             }
 
-            let state = canonical.to_state()?;
-
-            let entity_state = EntityState { entity_id: canonical.id(), collection: canonical.collection().clone(), state };
-            let attestation = self.node.policy_agent.attest_state(&self.node, &entity_state);
-            let attested = Attested::opt(entity_state, attestation);
-            group.collection.set_state(attested).await?;
+            // The local commit lane persists through the SAME machinery as
+            // every other resident persist lane (REV 5 section E):
+            // NodePersist -> save_state (to_state, attest_state, set_state),
+            // which this stanza previously duplicated verbatim. The lane
+            // keeps its own macro-order (commit, advance forks, relay, only
+            // then materialize and persist); only the persist funnel is
+            // shared.
+            let persist = crate::node_applier::NodePersist { node: &self.node, collection: &group.collection };
+            persist.persist(canonical).await?;
 
             changes.push(EntityChange::new(canonical.clone(), vec![attested_event.clone()])?);
         }
