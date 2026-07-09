@@ -76,11 +76,26 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             return Err(MutationError::General("Transaction already committed or rolled back".into()));
         }
 
-        // Generate events from the transaction entities
+        // Generate events from the transaction entities. The commit-lane
+        // stamp (D2-2) reads each parent's generation from its event
+        // payload, resolved staging-then-local-then-peer: on an ephemeral
+        // node a snapshot-adopted head's events are not in local storage,
+        // and the CachedEventGetter fetches (and caches) them from a
+        // durable peer, the pre-accepted per-commit cost. The node-held
+        // staging area is shared so a commit over a head whose event a
+        // prior commit failure left staged-but-unstored still resolves.
         let trx_id = trx.id.clone();
         let mut entity_events = Vec::new();
         for entity in trx.entities.iter() {
-            if let Some(event) = entity.generate_commit_event()? {
+            let stamp_collection = self.node.collections.get(entity.collection()).await?;
+            let stamp_getter = crate::retrieval::CachedEventGetter::with_staging(
+                entity.collection().clone(),
+                stamp_collection,
+                &self.node,
+                &self.cdata,
+                self.node.staging_for(entity.collection()),
+            );
+            if let Some(event) = entity.generate_commit_event(&stamp_getter).await? {
                 // Validate creation events: if parent is empty, this is a creation event
                 // and the entity must have been created in this transaction via create()
                 if event.is_entity_create() {

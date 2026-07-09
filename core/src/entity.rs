@@ -173,8 +173,48 @@ impl Entity {
     /// Generate an event which contains all operations for all backends since the last time they were collected
     /// Used for transaction commit. Notably this does not apply the head to the entity, which must be done
     /// using commit_head
-    pub(crate) fn generate_commit_event(&self) -> Result<Option<Event>, MutationError> {
+    ///
+    /// The commit-lane stamp (D2-2): the event carries
+    /// `1 + max(parent generations)` over the head's parent EVENTS (genesis,
+    /// an empty head, stamps exactly 1; saturating at u32::MAX). Parent
+    /// generations are read from the parent event payloads through `getter`,
+    /// never from any side store (the registry ban: a generation lives only
+    /// on the event it stamps). The resolution order is staging, then local
+    /// storage, then, on ephemeral nodes whose head was adopted from a state
+    /// snapshot, a durable peer (CachedEventGetter); that per-commit fetch
+    /// cost is expressly pre-accepted (maintainer ruling 2026-07-09). An
+    /// unresolvable parent fails the commit loudly: the stamp MUST be
+    /// correct, because every receiving lane verifies the equation at
+    /// admission (D2-3) and would reject a guessed value.
+    pub(crate) async fn generate_commit_event<G: GetEvents>(&self, getter: &G) -> Result<Option<Event>, MutationError> {
+        // Resolve parent generations BEFORE taking the state lock: the fetch
+        // may await. The head is stable across that await for both callers:
+        // a transaction fork's head is transaction-private (nothing advances
+        // it before commit_head), and the system-create path owns its fresh
+        // entity exclusively. The equality check under the lock makes that
+        // assumption loud instead of silent.
+        let parent = self.head();
+        let generation = if parent.is_empty() {
+            1 // genesis: no parents, generation exactly 1 (266-A)
+        } else {
+            let mut parent_generations = Vec::with_capacity(parent.len());
+            for parent_id in parent.iter() {
+                let parent_event = getter
+                    .get_event(parent_id)
+                    .await
+                    .map_err(|e| MutationError::FailedStep("commit-lane generation stamp: parent event unresolvable", e.to_string()))?;
+                parent_generations.push(parent_event.generation);
+            }
+            Event::generation_from_parents(parent_generations)
+        };
+
         let state = self.state.read().expect("other thread panicked, panic here too");
+        if state.head != parent {
+            return Err(MutationError::FailedStep(
+                "commit-lane generation stamp",
+                "entity head moved during commit-event generation".to_owned(),
+            ));
+        }
         let mut operations = BTreeMap::<String, Vec<ankurah_proto::Operation>>::new();
         for (name, backend) in &state.backends {
             if let Some(ops) = backend.to_operations()? {
@@ -186,10 +226,8 @@ impl Entity {
             Ok(None)
         } else {
             let operations = OperationSet(operations);
-            // generation is stamped 1 here; the resident does not yet track head
-            // generations, so 1 + max(parent generations) stamping (D2-2) lands in M2.
             let event =
-                Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone(), generation: 1 };
+                Event { entity_id: self.id, collection: self.collection.clone(), operations, parent: state.head.clone(), generation };
             Ok(Some(event))
         }
     }
