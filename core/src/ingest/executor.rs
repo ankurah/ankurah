@@ -262,6 +262,7 @@ mod tests {
     use crate::entity::Entity;
     use crate::error::RetrievalError;
     use crate::ingest::plan_entity;
+    use crate::retrieval::GetEvents;
     use ankurah_proto::{EntityId, OperationSet};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -287,11 +288,19 @@ mod tests {
         staging: std::sync::Arc<StagingArea>,
         committed: std::sync::RwLock<std::collections::BTreeMap<EventId, Attested<Event>>>,
         fail_commit_of: EventId,
+        definitive: bool,
     }
 
     impl FailingCommitStore {
         fn new(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
-            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeMap::new()), fail_commit_of }
+            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeMap::new()), fail_commit_of, definitive: true }
+        }
+
+        /// Non-definitive (ephemeral) flavor: absence of an event is not
+        /// proof of nonexistence, so the planner schedules speculatively.
+        /// The adopted-history shapes live on ephemeral nodes.
+        fn ephemeral(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
+            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeMap::new()), fail_commit_of, definitive: false }
         }
     }
 
@@ -311,7 +320,7 @@ mod tests {
         async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
             Ok(self.committed.read().unwrap().contains_key(event_id))
         }
-        fn storage_is_definitive(&self) -> bool { true }
+        fn storage_is_definitive(&self) -> bool { self.definitive }
     }
 
     #[async_trait]
@@ -464,5 +473,78 @@ mod tests {
         assert!(outcome.failure.is_none(), "backfill commit succeeds: {:?}", outcome.failure);
         assert!(!staging.contains(&x_id), "promotion removes the backfilled event from staging");
         assert!(persist.called(), "persist resumes once the log caught up");
+    }
+
+    /// GetState stub for adopted-state shapes: no stored state anywhere.
+    struct NoState;
+    #[async_trait]
+    impl crate::retrieval::GetState for NoState {
+        async fn get_state(
+            &self,
+            _entity_id: EntityId,
+        ) -> Result<Option<ankurah_proto::Attested<ankurah_proto::EntityState>>, RetrievalError> {
+            Ok(None)
+        }
+    }
+
+    /// R-D2-2c (plan REV 4 section 3 M2): the adopted-history backfill lane
+    /// admits an event whose parents are NOT locally resolvable WITHOUT
+    /// generation verification, and records its id in the bounded in-memory
+    /// unverified set, which is what marks it INELIGIBLE for the M5
+    /// generation accelerations (D2-4: eligible requires not-in-the-set).
+    ///
+    /// Shape: a resident adopts a state snapshot at head {h3}; h3's own body
+    /// arrives later (a bridge redelivery), but its parent h2 exists nowhere
+    /// on this node (below the adopted horizon). The planner schedules h3
+    /// through the integrated-but-unstored backfill branch, the apply no-ops
+    /// (Equal: the head already carries it), and the executor commits it to
+    /// the log: an admission that never checked the generation equation.
+    #[tokio::test]
+    async fn r_d2_2c_adopted_backfill_admits_unverifiable_event_into_unverified_set() {
+        let entity_id = EntityId::new();
+        // True lineage h1 <- h2 <- h3, honestly stamped; h1 and h2 are NEVER
+        // given to this node in any form.
+        let h1 = event(entity_id, &[]);
+        let h2 = event(entity_id, &[&h1]);
+        let h3 = event(entity_id, &[&h2]);
+        let h3_id = h3.payload.id();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        // Ephemeral store (the adopted-history shape lives on ephemeral
+        // nodes: a definitive planner would type the absent parent
+        // NeedsEvents instead); no injected failure, the designated fail id
+        // matches nothing.
+        let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xEE; 32]));
+
+        // Adopt the state snapshot: resident materializes at head {h3} with
+        // no event bodies anywhere local.
+        let adopted = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![h3_id.clone()]),
+        };
+        let (_, entity) = entities
+            .with_state(&NoState, &getter, entity_id, "test".into(), adopted)
+            .await
+            .expect("fresh snapshot adoption materializes the resident");
+        assert_eq!(entity.head(), ankurah_proto::Clock::from(vec![h3_id.clone()]), "precondition: adopted head");
+
+        // The bridge redelivers h3's body; h2 is still absent everywhere.
+        staging.stage(h3.clone());
+        let plan = plan_entity(&entity.head(), &[h3_id.clone()], &staging, &getter).await.expect("plan builds");
+        assert_eq!(plan.schedule, vec![h3_id.clone()], "head-contained but unstored member schedules for backfill");
+        assert!(plan.backfill.contains(&h3_id), "the planner classifies it as the adopted-history backfill lane");
+
+        let unverified = crate::ingest::UnverifiedEvents::default();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+
+        // The lane ADMITS the event (no verification, no rejection)...
+        assert!(outcome.failure.is_none(), "the backfill admission must not fail: {:?}", outcome.failure);
+        assert!(getter.event_stored(&h3_id).await.unwrap(), "the backfill commits the event to the log");
+        // ...and records it as admitted-unverified, hence ineligible (D2-4).
+        assert!(
+            unverified.contains(&h3_id),
+            "an event admitted through the adopted-history backfill must land in the unverified set (it is ineligible for accelerations)"
+        );
     }
 }
