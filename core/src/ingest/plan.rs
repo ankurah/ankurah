@@ -255,17 +255,26 @@ mod tests {
         FakeStore { committed: committed.iter().cloned().collect(), definitive: false }
     }
 
-    fn event(entity_id: EntityId, parent_ids: &[EventId]) -> Attested<Event> {
-        Attested::opt(crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids), None)
+    fn event(entity_id: EntityId, parents: &[&Attested<Event>]) -> Attested<Event> {
+        Attested::opt(
+            Event {
+                entity_id,
+                collection: "test".into(),
+                operations: OperationSet(BTreeMap::new()),
+                parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
+                generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),
+            },
+            None,
+        )
     }
 
     /// genesis <- e1 <- e2 for one entity, returned with their ids.
     fn chain(entity: EntityId) -> ([Attested<Event>; 3], [EventId; 3]) {
         let genesis = event(entity, &[]);
         let g = genesis.payload.id();
-        let e1 = event(entity, &[g.clone()]);
+        let e1 = event(entity, &[&genesis]);
         let i1 = e1.payload.id();
-        let e2 = event(entity, &[i1.clone()]);
+        let e2 = event(entity, &[&e1]);
         let i2 = e2.payload.id();
         ([genesis, e1, e2], [g, i1, i2])
     }

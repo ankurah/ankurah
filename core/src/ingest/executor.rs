@@ -263,8 +263,17 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::BTreeMap;
 
-    fn event(entity_id: EntityId, parent_ids: &[EventId]) -> Attested<Event> {
-        Attested::opt(crate::test_gen::stamped(entity_id, "test", OperationSet(BTreeMap::new()), parent_ids), None)
+    fn event(entity_id: EntityId, parents: &[&Attested<Event>]) -> Attested<Event> {
+        Attested::opt(
+            Event {
+                entity_id,
+                collection: "test".into(),
+                operations: OperationSet(BTreeMap::new()),
+                parent: ankurah_proto::Clock::from(parents.iter().map(|p| p.payload.id()).collect::<Vec<_>>()),
+                generation: Event::generation_from_parents(parents.iter().map(|p| p.payload.generation)),
+            },
+            None,
+        )
     }
 
     /// Getter whose `commit_event` fails for one designated event id (the
@@ -334,10 +343,9 @@ mod tests {
     async fn transient_failure_keeps_carryover_orphans_staged() {
         let entity_id = EntityId::new();
         let genesis = event(entity_id, &[]);
-        let g = genesis.payload.id();
-        let parent = event(entity_id, &[g.clone()]);
+        let parent = event(entity_id, &[&genesis]);
         let p = parent.payload.id();
-        let orphan = event(entity_id, &[p.clone()]);
+        let orphan = event(entity_id, &[&parent]);
         let b = orphan.payload.id();
 
         let entities = crate::entity::WeakEntitySet::default();
@@ -376,7 +384,7 @@ mod tests {
     async fn commit_failure_never_persists_a_head_the_log_lacks() {
         let entity_id = EntityId::new();
         let genesis = event(entity_id, &[]);
-        let x = event(entity_id, &[genesis.payload.id()]);
+        let x = event(entity_id, &[&genesis]);
         let x_id = x.payload.id();
 
         let entities = crate::entity::WeakEntitySet::default();
@@ -407,7 +415,7 @@ mod tests {
     async fn redelivery_backfills_a_head_contained_unstored_event() {
         let entity_id = EntityId::new();
         let genesis = event(entity_id, &[]);
-        let x = event(entity_id, &[genesis.payload.id()]);
+        let x = event(entity_id, &[&genesis]);
         let x_id = x.payload.id();
 
         let entities = crate::entity::WeakEntitySet::default();

@@ -12,16 +12,17 @@ use std::sync::Arc;
 
 use common::{Record, RecordView};
 
-/// Forge a Record LWW event setting `title`, parented on the given clock.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+/// Forge a Record LWW event setting `title`, parented on the given parent
+/// EVENTS (generation stamped from their payloads; the registry ban).
+fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::gen::stamped_event(
+    ankurah_tests::forge::event_with_parents(
         entity_id,
         Record::collection(),
         proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
+        parents,
     )
 }
 
@@ -49,19 +50,20 @@ async fn test_event_only_state_buffer_parity_and_cold_rehydration() -> Result<()
     // requires for this peer. Held for the delivery's duration.
     let _relay_context = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
 
-    let rec_id = {
+    let (rec_id, genesis) = {
         let trx = ctx_s.begin();
         let rec = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
+    assert_eq!(view.entity().head(), proto::Clock::from(vec![genesis.id()]), "the client head is the creation event");
 
     // Forge a linear descendant of the client's current head and deliver it
     // through the streaming EventOnly arm.
-    let ev = forge_title_event(rec_id, view.entity().head().clone(), "t1");
+    let ev = forge_title_event(rec_id, &[&genesis], "t1");
     let ev_id = ev.id();
     let item = proto::SubscriptionUpdateItem {
         entity_id: rec_id,

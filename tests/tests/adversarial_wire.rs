@@ -32,20 +32,28 @@ use common::{Record, RecordView};
 // Forging helpers (mirror update_batch_containment.rs).
 // ---------------------------------------------------------------------------
 
-/// Forge a Record LWW event setting `title`, parented on the given clock.
-/// The event id is a content hash over (entity_id, operations, parent), so the
-/// forger cannot choose it (C4-01): whatever id the DAG keys on is recomputed
-/// from these contents, never read from any declared field.
-fn forge_title_event(entity_id: proto::EntityId, parent: proto::Clock, title: &str) -> proto::Event {
+/// The LWW OperationSet for a title write.
+fn title_ops(title: &str) -> proto::OperationSet {
     let backend = LWWBackend::new();
     backend.set("title".into(), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    ankurah_tests::gen::stamped_event(
-        entity_id,
-        Record::collection(),
-        proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-        parent,
-    )
+    proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)]))
+}
+
+/// Forge a Record LWW event setting `title`, parented on the given parent
+/// EVENTS (generation stamped from their payloads; the registry ban).
+/// The event id is a content hash over (entity_id, operations, parent,
+/// generation), so the forger cannot choose it (C4-01): whatever id the DAG
+/// keys on is recomputed from these contents, never read from any declared
+/// field.
+fn forge_title_event(entity_id: proto::EntityId, parents: &[&proto::Event], title: &str) -> proto::Event {
+    ankurah_tests::forge::event_with_parents(entity_id, Record::collection(), title_ops(title), parents)
+}
+
+/// Forge a Record LWW event with an EXPLICIT claimed generation, for parents
+/// that are deliberately fabricated ids (no true generation exists).
+fn forge_title_event_claiming(entity_id: proto::EntityId, parent: proto::Clock, title: &str, generation: u32) -> proto::Event {
+    ankurah_tests::forge::event_claiming(entity_id, Record::collection(), title_ops(title), parent, generation)
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -106,18 +114,19 @@ async fn fixture() -> Result<Fixture> {
 }
 
 /// Create a Record on the server and materialize it on the client, returning
-/// the id once the client view reflects the initial title.
-async fn seed_record(f: &Fixture, title: &str, artist: &str) -> Result<(proto::EntityId, RecordView)> {
-    let id = {
+/// the id and the CREATION EVENT (the parent for honest forges) once the
+/// client view reflects the initial title.
+async fn seed_record(f: &Fixture, title: &str, artist: &str) -> Result<(proto::EntityId, RecordView, proto::Event)> {
+    let (id, genesis) = {
         let trx = f.ctx_s.begin();
         let rec = trx.create(&Record { title: title.to_owned(), artist: artist.to_owned() }).await?;
         let id = rec.id();
-        trx.commit().await?;
-        id
+        let mut events = trx.commit_and_return_events().await?;
+        (id, events.remove(0))
     };
     let view = f.ctx_c.get::<RecordView>(id).await?;
     assert_eq!(view.title().unwrap(), title);
-    Ok((id, view))
+    Ok((id, view, genesis))
 }
 
 async fn committed_event_ids(ctx: &ankurah::Context, id: proto::EntityId) -> Result<Vec<proto::EventId>> {
@@ -192,33 +201,29 @@ fn no_public_non_normalizing_clock_constructor() {
 #[tokio::test]
 async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
+    let (rec_id, view, genesis) = seed_record(&f, "t0", "a0").await?;
 
     // Two concurrent children of the same head, committed so the head becomes
     // a two-id antichain we can then feed back in scrambled order.
-    let head0 = view.entity().head().clone();
-    let ev_b = forge_title_event(rec_id, head0.clone(), "b");
+    let ev_b = forge_title_event(rec_id, &[&genesis], "b");
     let ev_c = {
         // Distinct ops so ev_c is a sibling, not a duplicate of ev_b.
         let backend = LWWBackend::new();
         backend.set("artist".into(), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        ankurah_tests::gen::stamped_event(
+        ankurah_tests::forge::event_with_parents(
             rec_id,
             Record::collection(),
             proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-            head0.clone(),
+            &[&genesis],
         )
     };
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
     // The head is now the antichain {ev_b, ev_c}. Build a merge event whose
-    // parent lists those two ids in two different orders; both must hash equal.
-    let two_ids = vec![ev_b.id(), ev_c.id()];
-    let mut reversed = two_ids.clone();
-    reversed.reverse();
-    let ev_merge_a = forge_title_event(rec_id, proto::Clock::from(two_ids.clone()), "merged");
-    let ev_merge_b = forge_title_event(rec_id, proto::Clock::from(reversed), "merged");
+    // parents are listed in two different orders; both must hash equal.
+    let ev_merge_a = forge_title_event(rec_id, &[&ev_b, &ev_c], "merged");
+    let ev_merge_b = forge_title_event(rec_id, &[&ev_c, &ev_b], "merged");
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
@@ -244,15 +249,16 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
 #[tokio::test]
 async fn forged_dangling_parent_is_contained() -> Result<()> {
     let f = fixture().await?;
-    let (a_id, view_a) = seed_record(&f, "a0", "artist-a").await?;
-    let (b_id, view_b) = seed_record(&f, "b0", "artist-b").await?;
+    let (a_id, view_a, genesis_a) = seed_record(&f, "a0", "artist-a").await?;
+    let (b_id, view_b, _genesis_b) = seed_record(&f, "b0", "artist-b").await?;
 
     // Valid event for A; forged event for B parented on an id that was never
-    // created (a fabricated 32-byte hash below any real history).
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
+    // created (a fabricated 32-byte hash below any real history, so no true
+    // generation exists; 2 is a plausible explicit claim).
+    let ev_a = forge_title_event(a_id, &[&genesis_a], "a1");
     let id_ev_a = ev_a.id();
     let dangling = proto::Clock::from(vec![proto::EventId::from_bytes([0xAB; 32])]);
-    let ev_b_forged = forge_title_event(b_id, dangling, "forged");
+    let ev_b_forged = forge_title_event_claiming(b_id, dangling, "forged", 2);
     let id_forged = ev_b_forged.id();
 
     // handle_message returns Ok; the per-item failure rides the ack path.
@@ -279,21 +285,20 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
 #[tokio::test]
 async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
-    let head0 = view.entity().head().clone();
+    let (rec_id, view, genesis) = seed_record(&f, "t0", "a0").await?;
 
     // A legitimate child B of the current head, and an independent genesis X
     // (empty parent) for the same entity id: X shares no lineage with the head.
-    let ev_b = forge_title_event(rec_id, head0.clone(), "child-b");
+    let ev_b = forge_title_event(rec_id, &[&genesis], "child-b");
     let ev_x = {
         let backend = LWWBackend::new();
         backend.set("artist".into(), Some(Value::String("foreign-x".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        ankurah_tests::gen::stamped_event(
+        ankurah_tests::forge::event_with_parents(
             rec_id,
             Record::collection(),
             proto::OperationSet(BTreeMap::from([("lww".to_owned(), ops)])),
-            proto::Clock::default(),
+            &[],
         )
     };
     let id_b = ev_b.id();
@@ -336,15 +341,15 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
 #[test]
 fn declared_cycle_is_unconstructible_content_addressing() {
     let entity = proto::EntityId::new();
-    let mk = |title: &str, parent: proto::Clock| forge_title_event(entity, parent, title);
+    let mk = |title: &str, parents: &[&proto::Event]| forge_title_event(entity, parents, title);
 
     // Start from two independent events and try to wire A.parent := [B.id()]
     // and B.parent := [A.id()]. Compute B first, then A referencing B; now A
     // has a concrete id. To close the cycle we would need B to have referenced
     // *that* id, but B was built referencing an empty parent, so B.id() is
     // fixed and does not name A.
-    let b = mk("b", proto::Clock::default());
-    let a = mk("a", proto::Clock::from(vec![b.id()]));
+    let b = mk("b", &[]);
+    let a = mk("a", &[&b]);
     // A names B, but B does NOT name A: no cycle among {a, b}.
     assert!(a.parent.contains(&b.id()), "A references B");
     assert!(!b.parent.contains(&a.id()), "B cannot reference A: its id was fixed before A existed");
@@ -352,7 +357,7 @@ fn declared_cycle_is_unconstructible_content_addressing() {
     // The only way to make B name A is to rebuild B with A.id() in its parent,
     // which changes B's id, which breaks A's reference. Demonstrate that the
     // rebuilt B has a different id, so A's edge no longer points at it.
-    let b2 = mk("b", proto::Clock::from(vec![a.id()]));
+    let b2 = mk("b", &[&a]);
     assert_ne!(b.id(), b2.id(), "adding A to B's parent changes B's content hash");
     assert!(!a.parent.contains(&b2.id()), "A's edge now dangles; the loop cannot be closed");
     // Hence no set of honest events forms a declared parent cycle. A batch that
@@ -369,15 +374,16 @@ fn declared_cycle_is_unconstructible_content_addressing() {
 #[tokio::test]
 async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
+    let (rec_id, view, _genesis) = seed_record(&f, "t0", "a0").await?;
 
     // Two events whose parents point at fabricated ids that look like they
     // reference each other, but neither fabricated id equals either event's
     // recomputed content id, so the batch graph has no edges between them.
+    // Fabricated parents carry explicit plausible claims (2).
     let fake1 = proto::EventId::from_bytes([0x11; 32]);
     let fake2 = proto::EventId::from_bytes([0x22; 32]);
-    let ev1 = forge_title_event(rec_id, proto::Clock::from(vec![fake2]), "cycle-1");
-    let ev2 = forge_title_event(rec_id, proto::Clock::from(vec![fake1]), "cycle-2");
+    let ev1 = forge_title_event_claiming(rec_id, proto::Clock::from(vec![fake2]), "cycle-1", 2);
+    let ev2 = forge_title_event_claiming(rec_id, proto::Clock::from(vec![fake1]), "cycle-2", 2);
     let id1 = ev1.id();
     let id2 = ev2.id();
 
@@ -404,14 +410,14 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
 #[tokio::test]
 async fn replay_flood_is_idempotent() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
+    let (rec_id, view, genesis) = seed_record(&f, "t0", "a0").await?;
 
     // Observe reactor notifications for this entity.
     let watcher = TestWatcher::changeset();
     let query = f.ctx_c.query_wait::<RecordView>(nocache(format!("id = '{}'", rec_id).as_str())?).await?;
     let _guard = query.subscribe(&watcher);
 
-    let ev = forge_title_event(rec_id, view.entity().head().clone(), "t1");
+    let ev = forge_title_event(rec_id, &[&genesis], "t1");
     let id_ev = ev.id();
 
     // Flood: 10 identical single-event deliveries, none may error.
@@ -447,12 +453,12 @@ async fn replay_flood_is_idempotent() -> Result<()> {
 async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
     let f = fixture().await?;
     // Create on the durable server and record its committed genesis.
-    let (rec_id, _view) = seed_record(&f, "t0", "a0").await?;
+    let (rec_id, _view, _genesis) = seed_record(&f, "t0", "a0").await?;
     let before = committed_event_ids(&f.ctx_s, rec_id).await?;
 
     // Forge a DISTINCT second genesis (empty parent, different ops => different
     // id) and deliver it to the SERVER attributed to the client peer.
-    let alt = forge_title_event(rec_id, proto::Clock::default(), "ALT-GENESIS");
+    let alt = forge_title_event(rec_id, &[], "ALT-GENESIS");
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
     f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
@@ -477,10 +483,10 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
 #[tokio::test]
 async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
+    let (rec_id, view, _genesis) = seed_record(&f, "t0", "a0").await?;
     let head_before = view.entity().head().clone();
 
-    let alt = forge_title_event(rec_id, proto::Clock::default(), "ALT-EPH");
+    let alt = forge_title_event(rec_id, &[], "ALT-EPH");
     let alt_id = alt.id();
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
 
@@ -499,12 +505,13 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
 #[tokio::test]
 async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     let f = fixture().await?;
-    let (a_id, view_a) = seed_record(&f, "a0", "artist-a").await?;
+    let (a_id, view_a, genesis_a) = seed_record(&f, "a0", "artist-a").await?;
 
-    let ev_a = forge_title_event(a_id, view_a.entity().head().clone(), "a1");
+    let ev_a = forge_title_event(a_id, &[&genesis_a], "a1");
     let unknown_id = proto::EntityId::new();
-    // Non-creation event (non-empty parent) for an entity the client never saw.
-    let ev_unknown = forge_title_event(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    // Non-creation event (non-empty parent) for an entity the client never
+    // saw; the fabricated parent carries an explicit plausible claim (2).
+    let ev_unknown = forge_title_event_claiming(unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost", 2);
 
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
 
@@ -534,7 +541,7 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
 #[ignore = "OPEN GAP G-3: no incoming size/count limit (issue #246); un-ignore when the limit lands"]
 async fn oversized_event_batch_is_rejected() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
+    let (rec_id, _view, genesis) = seed_record(&f, "t0", "a0").await?;
 
     // A batch of many events forming a linear chain off the current head (each
     // parented on the previous). The chain keeps the head width at one so the
@@ -543,12 +550,12 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     // to exceed a plausible cap: we do not assert on memory (impractical to
     // measure reliably), only on wholesale rejection.
     const OVERSIZED: usize = 2_000;
-    let mut parent = view.entity().head().clone();
+    let mut parent = genesis;
     let mut events: Vec<proto::Event> = Vec::with_capacity(OVERSIZED);
     for i in 0..OVERSIZED {
-        let ev = forge_title_event(rec_id, parent.clone(), &format!("flood-{i}"));
-        parent = proto::Clock::from(vec![ev.id()]);
-        events.push(ev);
+        let ev = forge_title_event(rec_id, &[&parent], &format!("flood-{i}"));
+        events.push(ev.clone());
+        parent = ev;
     }
 
     let before = committed_event_ids(&f.ctx_c, rec_id).await?.len();
@@ -609,13 +616,12 @@ async fn bfs_fetched_events_are_policy_validated() -> Result<()> {
 #[ignore = "OPEN GAP G-4: unbounded distinct-equivocation flooding, no antichain cap (issue #246 / signature layer)"]
 async fn equivocation_flood_antichain_is_bounded() -> Result<()> {
     let f = fixture().await?;
-    let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
-    let head0 = view.entity().head().clone();
+    let (rec_id, view, genesis) = seed_record(&f, "t0", "a0").await?;
 
     // Many distinct siblings of the same head: each is a genuine, distinct
     // content hash (different title), so de-dup does not collapse them.
     const FLOOD: usize = 256;
-    let siblings: Vec<proto::Event> = (0..FLOOD).map(|i| forge_title_event(rec_id, head0.clone(), &format!("equiv-{i}"))).collect();
+    let siblings: Vec<proto::Event> = (0..FLOOD).map(|i| forge_title_event(rec_id, &[&genesis], &format!("equiv-{i}"))).collect();
     for ev in siblings {
         f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev)])).await?;
     }
