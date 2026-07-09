@@ -239,8 +239,30 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     // the buffer lags the log's coverage instead, the safe direction the
     // gap-replay machinery already repairs.
     if !entity.head().is_empty() && uncommitted_in_head.is_none() {
-        if let Err(e) = persist.persist(entity).await {
-            failure.get_or_insert(e);
+        match persist.persist(entity).await {
+            Ok(()) => {
+                // The post-persist hook, insertion half (derivations
+                // section 5; REV 5 section F): the completed set_state
+                // proves coverage for exactly this plan's applied events
+                // and its already-integrated skips (AlreadyCommitted
+                // preresolutions are plan-time head members and
+                // AlreadyIntegrated events are in the head's ancestry;
+                // both stay covered by every later persisted head, since
+                // heads never regress). The suppress-persist path above
+                // inserts NOTHING (R-D2-3b), and neither does a failed
+                // persist: a row must never testify to coverage the
+                // persisted buffer lacks. M4 extends this same hook with
+                // the persist-currency marker stamp.
+                entity.mark_applied(outcomes.iter().filter_map(|(id, o)| match o {
+                    IngestOutcome::Applied
+                    | IngestOutcome::Skipped(SkipReason::AlreadyIntegrated)
+                    | IngestOutcome::Skipped(SkipReason::AlreadyCommitted) => Some(id.clone()),
+                    _ => None,
+                }));
+            }
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
         }
     }
 

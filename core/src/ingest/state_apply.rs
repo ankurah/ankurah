@@ -83,12 +83,25 @@ where
     // delta lanes re-read local storage to build result sets when they
     // return (read-your-application). Persisting the resident's current
     // state is always monotone-safe; eliding it raced exactly that window.
-    // A storage-backed currency check (D2's applied-set) is the sound way
-    // to skip this write later. Notification stays advance-only. Empty-head
-    // guard for symmetry with the executor: a phantom's empty state must
-    // not land in storage.
-    if !entity.head().is_empty() {
+    // The sound elision is M4's persist-currency marker, not the
+    // applied-set. Notification stays advance-only. Empty-head guard for
+    // symmetry with the executor: a phantom's empty state must not land in
+    // storage.
+    let covered_head = entity.head();
+    if !covered_head.is_empty() {
         persist.persist(&entity).await?;
+        // The post-persist hook, insertion half (derivations section 5;
+        // REV 5 section F): a state-adoption persist proves coverage for
+        // the adopted head's own ids (and, on a no-op apply, the
+        // resident's current head ids, which the just-persisted buffer
+        // equally covers). Captured BEFORE the persist: any id covered by
+        // the resident head when the persist began is covered by every
+        // later persisted head, so a concurrent advance cannot make these
+        // rows lie. Events BELOW the adopted horizon stay out (their
+        // coverage is not enumerable here); their redelivery walks, which
+        // is cost, not correctness. A failed persist inserts nothing (the
+        // ? above returns first).
+        entity.mark_applied(covered_head.iter().cloned());
     }
 
     // A state adoption can be exactly the thing a buffered orphan was

@@ -182,6 +182,12 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             // shared.
             let persist = crate::node_applier::NodePersist { node: &self.node, collection: &group.collection };
             persist.persist(canonical).await?;
+            // The post-persist hook, insertion half (derivations section 5;
+            // REV 5 sections E and F): the completed persist proves the
+            // just-committed event covered, so a server echo redelivering
+            // it is served by the O(1) skip instead of a comparison walk.
+            // A failed persist inserts nothing (the ? above returns first).
+            canonical.mark_applied([attested_event.payload.id()]);
 
             changes.push(EntityChange::new(canonical.clone(), vec![attested_event.clone()])?);
         }
