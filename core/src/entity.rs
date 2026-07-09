@@ -12,7 +12,7 @@ use crate::{
     value::Value,
 };
 use ankurah_proto::{Clock, CollectionId, EntityId, EntityState, Event, EventId, OperationSet, State};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, error, warn};
@@ -38,12 +38,79 @@ pub struct Entity(Arc<EntityInner>);
 /// Used only for reconstituting state to filter database results. No duplication guarantees are provided
 pub struct TemporaryEntity(Arc<EntityInner>);
 
+/// Default bound for the applied-set (plan D2-5): generously above the
+/// largest expected bridge batch (the lane benches exercise 5000-event
+/// bridges), about 2 MB per hot resident at 32 bytes an id when full.
+pub(crate) const DEFAULT_APPLIED_CAP: usize = 65536;
+
+/// The applied-set (plan D2-5 as amended by REV 5 sections C and F): a
+/// bounded in-memory record of event ids whose incorporation a COMPLETED
+/// persist of this resident's state buffer proves (derivations section 5:
+/// rows are written only after a set_state returns Ok whose head covers
+/// them, so membership testifies "a locally persisted buffer reflects this
+/// event", which is crash-stable). Membership is the only O(1) POSITIVE
+/// already-incorporated conclusion in the system; generations only ever
+/// reject, and anything inconclusive walks (derivations section 2).
+///
+/// Never forks (a snapshot starts empty), never persisted, never shared
+/// beyond this resident. Lives inside `EntityInnerState` so every read and
+/// write happens under the resident's head lock (the re-read-under-lock
+/// rule); no interior locking of its own.
+///
+/// Lazy: allocates nothing until the first insert (`HashSet::new` and
+/// `VecDeque::new` do not allocate), so idle residents stay light and the
+/// sim memory-audit tier is unaffected. FIFO eviction at the cap: losing a
+/// row only costs the evicted event's redelivery a walk to the same no-op
+/// (R-D2-3c pins that eviction changes cost, never outcome).
+#[derive(Debug)]
+pub(crate) struct AppliedSet {
+    /// Insertion order, oldest first, for FIFO eviction at the cap.
+    order: VecDeque<EventId>,
+    members: HashSet<EventId>,
+    cap: usize,
+}
+
+impl Default for AppliedSet {
+    fn default() -> Self { Self::with_cap(DEFAULT_APPLIED_CAP) }
+}
+
+// Wired by the M3 fix commit (post-persist insertion + the apply_event
+// O(1) skip); carried inert until then.
+#[allow(dead_code)]
+impl AppliedSet {
+    /// Constructor-configurable cap (D2-5); no preallocation.
+    pub(crate) fn with_cap(cap: usize) -> Self { Self { order: VecDeque::new(), members: HashSet::new(), cap: cap.max(1) } }
+
+    /// Record an id a completed persist proves covered. Re-inserting a
+    /// member keeps its original eviction position; the oldest member is
+    /// evicted at the cap (safe: its redelivery walks instead of skipping).
+    pub(crate) fn insert(&mut self, id: EventId) {
+        if !self.members.insert(id.clone()) {
+            return;
+        }
+        self.order.push_back(id);
+        while self.order.len() > self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.members.remove(&evicted);
+            }
+        }
+    }
+
+    /// O(1) membership: the already-incorporated positive conclusion.
+    pub(crate) fn contains(&self, id: &EventId) -> bool { self.members.contains(id) }
+
+    pub(crate) fn len(&self) -> usize { self.order.len() }
+}
+
 /// Combined state for atomic updates of head and backends
 #[derive(Debug)]
 struct EntityInnerState {
     head: Clock,
     // TODO: remove interior mutability from backends; make mutation methods take &mut self
     backends: BTreeMap<String, Arc<dyn PropertyBackend>>,
+    /// The applied-set (D2-5): under the same lock as the head, consumed
+    /// only by apply_event's O(1) skip, inserted only post-persist.
+    applied: AppliedSet,
 }
 
 impl EntityInnerState {
@@ -346,7 +413,28 @@ impl Entity {
         Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: Clock::default(), backends: BTreeMap::default() }),
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: Clock::default(),
+                backends: BTreeMap::default(),
+                applied: AppliedSet::default(),
+            }),
+            kind: EntityKind::Primary,
+            broadcast: ankurah_signals::broadcast::Broadcast::new(),
+        }))
+    }
+
+    /// TEST ONLY: create an entity whose applied-set carries a small cap, so
+    /// eviction behavior (R-D2-3c) is exercisable without 65536 inserts.
+    #[cfg(test)]
+    pub(crate) fn create_with_applied_cap(id: EntityId, collection: CollectionId, cap: usize) -> Self {
+        Self(Arc::new(EntityInner {
+            id,
+            collection,
+            state: std::sync::RwLock::new(EntityInnerState {
+                head: Clock::default(),
+                backends: BTreeMap::default(),
+                applied: AppliedSet::with_cap(cap),
+            }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(None),
@@ -364,7 +452,7 @@ impl Entity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends, applied: AppliedSet::default() }),
             kind: EntityKind::Primary,
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             resolver: std::sync::RwLock::new(None),
@@ -444,6 +532,36 @@ impl Entity {
         // probably need an increment for local edits
         self.state.write().unwrap().head = new_head;
     }
+
+    /// The insertion half of the shared post-persist hook (derivations
+    /// section 5; plan REV 5 sections E and F): record event ids a
+    /// JUST-COMPLETED set_state of this resident proves covered. Callers
+    /// invoke this immediately after their persist call returns Ok, with
+    /// exactly the lane's proven-covered ids (the executor's applied and
+    /// already-integrated outcomes; the adopted head's own ids after a
+    /// state-adoption persist; the local commit lane's committed event). A
+    /// suppressed or failed persist inserts NOTHING. Sound under head
+    /// movement because coverage is monotone: an id covered by the resident
+    /// head when the persist began is covered by every later persisted head
+    /// (heads never regress).
+    ///
+    /// M4 extends this same post-persist boundary with the persist-currency
+    /// marker stamp; proven-no-op VERDICT inserts (derivations 5's
+    /// consequence for D2-3.d: recording a walk's Equal/StrictAscends
+    /// conclusion without a fresh persist) stay out until that marker
+    /// exists, because only marker currency makes them sound.
+    #[allow(dead_code)] // wired by the M3 fix commit (post-persist insertion + the apply_event skip)
+    pub(crate) fn mark_applied<I: IntoIterator<Item = EventId>>(&self, ids: I) {
+        let mut state = self.state.write().unwrap();
+        for id in ids {
+            state.applied.insert(id);
+        }
+    }
+
+    /// TEST ONLY: whether the applied-set holds `id`. The reds (R-D2-3a/3b/3c)
+    /// pin insertion discipline through this observable.
+    #[cfg(test)]
+    pub(crate) fn applied_contains(&self, id: &EventId) -> bool { self.state.read().unwrap().applied.contains(id) }
 
     /// Attempts to mutate the entity state if the head matches the expected value.
     ///
@@ -793,7 +911,10 @@ impl Entity {
         Self(Arc::new(EntityInner {
             id: self.id,
             collection: self.collection.clone(),
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked }),
+            // The applied-set NEVER FORKS (D2-5): a fork starts empty, so
+            // fork previews always take the honest comparison path and a
+            // fork's rows can never testify about the canonical resident.
+            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends: forked, applied: AppliedSet::default() }),
             kind: EntityKind::Transacted { trx_alive, upstream: self.clone() },
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
             // Carry the resolver across the fork so a transaction's read path
@@ -898,7 +1019,7 @@ impl TemporaryEntity {
         Ok(Self(Arc::new(EntityInner {
             id,
             collection,
-            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends }),
+            state: std::sync::RwLock::new(EntityInnerState { head: state.head.clone(), backends, applied: AppliedSet::default() }),
             kind: EntityKind::Primary,
             // slightly annoying that we need to populate this, given that it won't be used
             broadcast: ankurah_signals::broadcast::Broadcast::new(),
@@ -939,6 +1060,53 @@ impl Filterable for TemporaryEntity {
 impl std::fmt::Display for TemporaryEntity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "TemporaryEntity({}/{}) = {}", &self.collection, self.id, self.0.state.read().unwrap().head)
+    }
+}
+
+#[cfg(test)]
+mod applied_set_tests {
+    use super::*;
+
+    fn id(b: u8) -> EventId { EventId::from_bytes([b; 32]) }
+
+    #[test]
+    fn starts_empty_and_lazy() {
+        let set = AppliedSet::default();
+        assert_eq!(set.len(), 0);
+        assert!(!set.contains(&id(1)));
+        // Laziness (no preallocation) is by construction: HashSet::new and
+        // VecDeque::new allocate nothing; the default cap only bounds growth.
+        assert_eq!(set.cap, DEFAULT_APPLIED_CAP);
+    }
+
+    #[test]
+    fn insert_contains_and_dedup() {
+        let mut set = AppliedSet::with_cap(8);
+        set.insert(id(1));
+        set.insert(id(1));
+        set.insert(id(2));
+        assert!(set.contains(&id(1)) && set.contains(&id(2)) && !set.contains(&id(3)));
+        assert_eq!(set.len(), 2, "re-inserting an id must not duplicate it");
+    }
+
+    #[test]
+    fn cap_evicts_oldest_first() {
+        let mut set = AppliedSet::with_cap(3);
+        for b in 1..=5u8 {
+            set.insert(id(b));
+        }
+        assert_eq!(set.len(), 3);
+        assert!(!set.contains(&id(1)) && !set.contains(&id(2)), "oldest ids evicted at the cap (cost, not outcome: R-D2-3c)");
+        assert!(set.contains(&id(3)) && set.contains(&id(4)) && set.contains(&id(5)));
+    }
+
+    #[test]
+    fn fork_snapshot_starts_with_an_empty_applied_set() {
+        let entity = Entity::create(EntityId::new(), "test".into());
+        entity.mark_applied([id(7)]);
+        assert!(entity.applied_contains(&id(7)));
+        let fork = entity.snapshot(Arc::new(AtomicBool::new(true)));
+        assert!(!fork.applied_contains(&id(7)), "the applied-set never forks (D2-5)");
     }
 }
 
