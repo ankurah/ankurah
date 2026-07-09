@@ -915,7 +915,7 @@ where
         }
 
         let batch: Vec<proto::EventId> = group.iter().map(|e| e.payload.id()).collect();
-        let plan = crate::ingest::plan_entity(&entity.head(), &batch, &staging, &getter).await?;
+        let mut plan = crate::ingest::plan_entity(&entity.head(), &batch, &staging, &getter).await?;
 
         // NeedsState on the commit lanes fails typed, fast, and atomically;
         // the sender's retry recovers once state arrives through the
@@ -947,6 +947,36 @@ where
                 _ => {}
             }
         }
+
+        // Admission verification, phase one (D2-3): every scheduled event's
+        // claimed generation checks against the equation
+        // gen == 1 + max(parent generations) over the group's staged events
+        // plus local storage (genesis events must claim exactly 1). A
+        // mismatch denies the whole transaction HERE, before the fork
+        // preview and before anything durable, with the same containment as
+        // a policy denial. Verification runs ONCE per admission: setting
+        // preverified makes the remote lane's executor phase skip the
+        // re-check, and the fork previews below never verify. Backfill
+        // members (head-contained but unstored redeliveries) skip the check
+        // by design and record at execution. On these lanes parents are
+        // local by construction (the local lane just stamped from them; the
+        // remote lane plans against its own durable lineage), so
+        // Unverifiable is a should-not-happen degradation: warned and
+        // recorded, never guessed at.
+        for event_id in &plan.schedule {
+            if plan.backfill.contains(event_id) {
+                continue;
+            }
+            let Some(attested) = staging.get_attested(event_id) else { continue };
+            match crate::ingest::check_generation(&getter, &attested.payload).await? {
+                crate::ingest::GenerationCheck::Verified => {}
+                crate::ingest::GenerationCheck::Unverifiable => {
+                    tracing::warn!(event = %event_id, "commit-lane phase one could not resolve parents for generation verification; admitting unverified");
+                    self.unverified_events.insert(event_id.clone());
+                }
+            }
+        }
+        plan.preverified = true;
 
         // Fork-policy phase over the planned schedule: every event
         // previews on a fork (before and after states), the real

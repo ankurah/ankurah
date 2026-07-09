@@ -56,6 +56,24 @@ where
     let advanced = !matches!(changed, Some(false));
     if advanced {
         for event in events_to_commit {
+            // Adoption cargo is the adopted-history admission (D2-3): the
+            // SNAPSHOT, not the generation equation, vouches for these
+            // events, so a failed or impossible check demotes eligibility
+            // (recorded in the unverified set) and warns; it never rejects
+            // events whose effect the adopted state already carries
+            // (retroactive rejection of committed history is D3's
+            // jurisdiction). Verified cargo stays eligible for free; storage
+            // errors surface at the commit_event right below either way.
+            match super::check_generation(event_getter, &event.payload).await {
+                Ok(super::GenerationCheck::Verified) => {}
+                Ok(super::GenerationCheck::Unverifiable) => {
+                    unverified.insert(event.payload.id());
+                }
+                Err(e) => {
+                    tracing::warn!(event = %event.payload.id(), "adopted event's generation could not be verified or is inconsistent; demoting eligibility: {e}");
+                    unverified.insert(event.payload.id());
+                }
+            }
             event_getter.commit_event(event).await?;
         }
     }
