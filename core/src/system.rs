@@ -192,7 +192,13 @@ where
         system_entity.apply_event(&event_getter, &event).await?;
         let attested_event: Attested<Event> = event.clone().into();
         event_getter.commit_event(&attested_event).await?;
-        // Now get the entity state after the head is updated
+        // Now get the entity state after the head is updated.
+        // DOCUMENTED SAFE BYPASS (D2, REV 5 section G, alongside
+        // join_system's below): this raw set_state skips the shared
+        // post-persist hook, so the root's applied-set (and, at M4, its
+        // persist marker) simply lag: a later redelivery of the genesis
+        // walks to its no-op instead of skipping O(1). Safe direction,
+        // runs once at system creation.
         let attested_state: Attested<EntityState> = system_entity.to_entity_state()?.into();
         storage.set_state(attested_state.clone()).await?;
 
@@ -268,7 +274,12 @@ where
             .with_state(&state_getter, &event_getter, state.payload.entity_id, collection_id, state.payload.state.clone())
             .await?;
 
-        // Set the state
+        // Set the state.
+        // DOCUMENTED SAFE BYPASS (D2-6; REV 5 section G): the verbatim
+        // persist of the peer's attested bytes skips the shared
+        // post-persist hook, so the adopted root's applied-set (and, at
+        // M4, its persist marker) lag: redeliveries walk instead of
+        // skipping O(1). Safe direction, preserves attestation provenance.
         storage.set_state(state.clone()).await?;
 
         // Set root and mark system as ready

@@ -115,8 +115,12 @@ pub(crate) async fn plan_entity<G: GetEvents + Send + Sync>(
     // apply repairs the window. For committed events the head does cover,
     // apply_event's own comparison no-ops them (Equal/StrictAscends), so
     // scheduling is harmless and the outcome reports AlreadyIntegrated.
-    // D2's applied-set later restores an O(1) skip that tests
-    // incorporation, not mere storage.
+    // The planner does NOT consult D2's applied-set (REV 5 section C): the
+    // planner is advisory and lock-free by design, so it keeps exactly
+    // this head-containment plus stored-check preresolution (sound because
+    // both facts are monotone); the applied-set's O(1) incorporation skip
+    // lives in apply_event, under the head lock, where scheduled
+    // below-head redeliveries are decided.
     //
     // The converse hole matters too: head containment only implies
     // committedness while the commit-before-state discipline held. A

@@ -74,9 +74,6 @@ impl Default for AppliedSet {
     fn default() -> Self { Self::with_cap(DEFAULT_APPLIED_CAP) }
 }
 
-// Wired by the M3 fix commit (post-persist insertion + the apply_event
-// O(1) skip); carried inert until then.
-#[allow(dead_code)]
 impl AppliedSet {
     /// Constructor-configurable cap (D2-5); no preallocation.
     pub(crate) fn with_cap(cap: usize) -> Self { Self { order: VecDeque::new(), members: HashSet::new(), cap: cap.max(1) } }
@@ -99,6 +96,7 @@ impl AppliedSet {
     /// O(1) membership: the already-incorporated positive conclusion.
     pub(crate) fn contains(&self, id: &EventId) -> bool { self.members.contains(id) }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize { self.order.len() }
 }
 
@@ -550,7 +548,6 @@ impl Entity {
     /// consequence for D2-3.d: recording a walk's Equal/StrictAscends
     /// conclusion without a fresh persist) stay out until that marker
     /// exists, because only marker currency makes them sound.
-    #[allow(dead_code)] // wired by the M3 fix commit (post-persist insertion + the apply_event skip)
     pub(crate) fn mark_applied<I: IntoIterator<Item = EventId>>(&self, ids: I) {
         let mut state = self.state.write().unwrap();
         for id in ids {
@@ -681,6 +678,9 @@ impl Entity {
         // An explicit event_stored() check is not used here because callers
         // (node_applier, system.rs) store events to storage BEFORE calling
         // apply_event (so BFS can find them), which would cause false positives.
+        // The applied-set skip inside the retry loop below serves the
+        // applied-and-persisted redelivery case O(1); the comparison remains
+        // the general idempotency path for everything the set does not hold.
 
         // Creation event on entity with non-empty head: either re-delivery or attack.
         // On durable nodes (definitive storage), we can cheaply distinguish:
@@ -726,13 +726,35 @@ impl Entity {
             return Err(MutationError::InvalidEvent);
         }
 
+        let event_id = event.id();
         let mut head = self.head();
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;
 
         for attempt in 0..MAX_RETRIES {
+            // The applied-set O(1) skip (D2-5 as amended by REV 5 section C:
+            // this is the ONLY consumption site in the system). Membership
+            // is re-read under the head lock at the moment of consumption,
+            // immediately before the comparison walk would run, and
+            // re-checked on every TOCTOU retry; a hit is the O(1)
+            // already-incorporated no-op. Rows are inserted only after a
+            // COMPLETED persist (derivations section 5), so membership
+            // testifies that a locally persisted buffer reflects this
+            // event. The storedness half of obligation (d) stays with the
+            // callers (the planner's backfill escape and the executor's
+            // Ok(false) arm re-check event_stored), so a member whose log
+            // row is missing still gets its backfill. The walk's own
+            // Equal/StrictAscends conclusions below are NOT recorded here:
+            // proven-no-op verdict inserts need the M4 persist-currency
+            // marker (derivations 5's consequence for D2-3.d).
+            let already_incorporated = self.state.read().unwrap().applied.contains(&event_id);
+            if already_incorporated {
+                debug!("applied-set hit - already incorporated, skip");
+                return Ok(false);
+            }
+
             // Stage the event so BFS can discover it, then compare event's clock vs head
-            let subject_clock: Clock = event.id().into();
+            let subject_clock: Clock = event_id.clone().into();
             let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;
             match comparison_result.relation {
                 AbstractCausalRelation::Equal => {
@@ -741,7 +763,6 @@ impl Entity {
                 }
                 AbstractCausalRelation::StrictDescends { ref chain } => {
                     debug!("Descends - apply (attempt {})", attempt + 1);
-                    let event_id = event.id();
                     // Verdict-driven gap replay (R10). A chain longer than
                     // the event itself means the comparison walked history
                     // the current head does not contain: committed-but-
@@ -767,7 +788,7 @@ impl Entity {
                         let meet: Vec<EventId> = head.as_slice().to_vec();
                         let (_relation, accumulator) = comparison_result.into_parts();
                         let layers = accumulator.into_layers(meet.clone(), meet.clone());
-                        if self.apply_accumulated_layers(layers, &meet, &mut head, event_id).await? {
+                        if self.apply_accumulated_layers(layers, &meet, &mut head, event_id.clone()).await? {
                             return Ok(true);
                         }
                         continue;
