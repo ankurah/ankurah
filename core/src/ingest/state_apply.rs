@@ -11,11 +11,14 @@
 //! every apply with a non-empty head, advance or not: a no-op verdict is
 //! not proof the buffer is current (the comment at the persist call
 //! carries the race that killed the earlier elision). NOTIFICATION stays
-//! advance-only. The caller builds the change; validation is NOT here,
-//! because each arm keeps its own admission gate (unifying WHICH
-//! validation runs is #274's jurisdiction).
+//! advance-only. The caller builds the change; policy validation is NOT
+//! here, because each arm keeps its own admission gate (unifying WHICH
+//! validation runs is #274's jurisdiction). Cargo GENERATIONS are checked
+//! here, BEFORE the state applies (plan REV 5 section L): a stamp that
+//! provably contradicts locally held parents aborts the whole item;
+//! unverifiable cargo stores and records acceleration-ineligible.
 
-use ankurah_proto::{Attested, CollectionId, EntityId, Event, State};
+use ankurah_proto::{Attested, CollectionId, EntityId, Event, EventId, State};
 
 use super::executor::PersistState;
 use super::staging::StagingArea;
@@ -49,6 +52,32 @@ where
     S: GetState + Send + Sync,
     E: SuspenseEvents + Send + Sync,
 {
+    // Cargo generations are checked BEFORE the state applies (plan REV 5
+    // section L, reversing the M2 warn-and-store arm): a claim that
+    // PROVABLY contradicts locally held parents aborts the ENTIRE item
+    // with the typed lineage error, so nothing from the item is adopted
+    // or stored (the feeders unstage on error). The grievance is with the
+    // state that vouched for the malformed history: valid non-advancing
+    // input drops silently, verifiably INVALID input errors loudly,
+    // uniform with the streaming lane's typed rejection. This is
+    // admission rejection of malformed input, not a generation routing a
+    // verdict (the suppress-only discipline is untouched). UNVERIFIABLE
+    // cargo (parents not locally held) keeps the adopted-history
+    // admission: the SNAPSHOT, not the equation, vouches for it, so it
+    // stores and records acceleration-ineligible below; fresh adoption
+    // therefore never trips the abort (no local parents, nothing
+    // provable). A storage failure from the local parent read aborts the
+    // item just as loudly (it would have failed the commit right below
+    // anyway).
+    let mut unverifiable_cargo: Vec<EventId> = Vec::new();
+    for event in events_to_commit {
+        match super::check_generation(event_getter, &event.payload).await {
+            Ok(super::GenerationCheck::Verified) => {}
+            Ok(super::GenerationCheck::Unverifiable) => unverifiable_cargo.push(event.payload.id()),
+            Err(e) => return Err(e),
+        }
+    }
+
     let (changed, entity) = entities
         .with_state(state_getter, event_getter, entity_id, collection_id, state)
         .await
@@ -56,25 +85,13 @@ where
     let advanced = !matches!(changed, Some(false));
     if advanced {
         for event in events_to_commit {
-            // Adoption cargo is the adopted-history admission (D2-3): the
-            // SNAPSHOT, not the generation equation, vouches for these
-            // events, so a failed or impossible check demotes eligibility
-            // (recorded in the unverified set) and warns; it never rejects
-            // events whose effect the adopted state already carries
-            // (retroactive rejection of committed history is D3's
-            // jurisdiction). Verified cargo stays eligible for free; storage
-            // errors surface at the commit_event right below either way.
-            match super::check_generation(event_getter, &event.payload).await {
-                Ok(super::GenerationCheck::Verified) => {}
-                Ok(super::GenerationCheck::Unverifiable) => {
-                    unverified.insert(event.payload.id());
-                }
-                Err(e) => {
-                    tracing::warn!(event = %event.payload.id(), "adopted event's generation could not be verified or is inconsistent; demoting eligibility: {e}");
-                    unverified.insert(event.payload.id());
-                }
-            }
             event_getter.commit_event(event).await?;
+            // Recording only at durable admission (the M2 discipline): an
+            // unverifiable id becomes acceleration-ineligible once its
+            // commit succeeds.
+            if unverifiable_cargo.contains(&event.payload.id()) {
+                unverified.insert(event.payload.id());
+            }
         }
     }
     // Persist on every apply, advance or not. A no-op apply is not proof
