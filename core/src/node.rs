@@ -161,6 +161,13 @@ where PA: PolicyAgent
     /// lifecycle territory.
     pub(crate) staging: SafeMap<CollectionId, Arc<crate::ingest::StagingArea>>,
 
+    /// Events admitted WITHOUT generation verification (the adopted-history
+    /// lanes, D2-3): bounded, in-memory, ids only. Consumed by the M5
+    /// eligibility rule (an unverified generation never feeds an
+    /// acceleration); loss on restart or eviction degrades to
+    /// default-eligible, which the suppress-only discipline keeps safe.
+    pub(crate) unverified_events: crate::ingest::UnverifiedEvents,
+
     /// Type resolver for AST preparation (temporary heuristic until Phase 3 schema)
     pub(crate) type_resolver: crate::TypeResolver,
 }
@@ -223,6 +230,7 @@ where
             predicate_context: SafeMap::new(),
             subscription_relay,
             staging: SafeMap::new(),
+            unverified_events: crate::ingest::UnverifiedEvents::default(),
             type_resolver: crate::TypeResolver::new(),
         }));
 
@@ -708,7 +716,8 @@ where
         let mut failure: Option<MutationError> = None;
         for PlannedEntityGroup { entity, staging, getter, collection, plan } in ready {
             let persist = crate::node_applier::NodePersist { node: self, collection: &collection };
-            let outcome = crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &getter, &persist).await;
+            let outcome =
+                crate::ingest::execute_plan(plan, &entity, &self.entities, &staging, &getter, &persist, &self.unverified_events).await;
             // One change per entity carrying its applied events in
             // application order. The old per-event shape was an artifact of
             // building each change mid-loop while the head sat at that
@@ -971,6 +980,7 @@ where
                             state.payload.state.clone(),
                             &[],
                             &persist,
+                            &self.unverified_events,
                         )
                         .await
                     }

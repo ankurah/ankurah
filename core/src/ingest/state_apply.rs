@@ -43,6 +43,7 @@ pub(crate) async fn apply_state_feed<S, E>(
     state: State,
     events_to_commit: &[Attested<Event>],
     persist: &dyn PersistState,
+    unverified: &super::UnverifiedEvents,
 ) -> Result<StateApplied, MutationError>
 where
     S: GetState + Send + Sync,
@@ -85,7 +86,7 @@ where
     if advanced {
         match super::plan_entity(&entity.head(), &[], staging, event_getter).await {
             Ok(plan) if !plan.schedule.is_empty() => {
-                let outcome = super::execute_plan(plan, &entity, entities, staging, event_getter, persist).await;
+                let outcome = super::execute_plan(plan, &entity, entities, staging, event_getter, persist, unverified).await;
                 if let Some(failure) = outcome.failure {
                     tracing::warn!(entity_id = %entity.id(), "buffered-event re-drive after state adoption failed: {failure}");
                 }

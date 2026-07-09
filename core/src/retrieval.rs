@@ -54,6 +54,14 @@ pub trait SuspenseEvents: GetEvents {
 
     /// Commit a staged event to permanent storage and remove from staging.
     async fn commit_event(&self, attested: &Attested<Event>) -> Result<(), MutationError>;
+
+    /// The event if it is LOCALLY in hand (staging area or local permanent
+    /// storage), else None. NEVER fetches from a peer: this is the parent
+    /// resolution admission verification uses (D2-3), and "locally
+    /// resolvable" is decided against local knowledge only; a parent that is
+    /// not in hand makes the event admit unverified, it does not trigger a
+    /// verification fetch.
+    async fn get_local_event(&self, event_id: &EventId) -> Result<Option<Event>, RetrievalError>;
 }
 
 // ============================================================================
@@ -139,6 +147,13 @@ impl SuspenseEvents for LocalEventGetter {
         self.collection.add_event(attested).await?;
         self.staging.remove(&attested.payload.id());
         Ok(())
+    }
+
+    async fn get_local_event(&self, event_id: &EventId) -> Result<Option<Event>, RetrievalError> {
+        if let Some(event) = self.staging.get(event_id) {
+            return Ok(Some(event));
+        }
+        Ok(self.collection.get_events(vec![event_id.clone()]).await?.into_iter().next().map(|e| e.payload))
     }
 }
 
@@ -246,6 +261,14 @@ where
         self.collection.add_event(attested).await?;
         self.staging.remove(&attested.payload.id());
         Ok(())
+    }
+
+    /// Staging then LOCAL storage only: no peer fallback, unlike get_event.
+    async fn get_local_event(&self, event_id: &EventId) -> Result<Option<Event>, RetrievalError> {
+        if let Some(event) = self.staging.get(event_id) {
+            return Ok(Some(event));
+        }
+        Ok(self.collection.get_events(vec![event_id.clone()]).await?.into_iter().next().map(|e| e.payload))
     }
 }
 

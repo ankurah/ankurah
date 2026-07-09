@@ -204,7 +204,8 @@ impl NodeApplier {
                 entities.push(entity.clone());
 
                 let persist = NodePersist { node, collection: &collection };
-                let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+                let outcome =
+                    ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist, &node.unverified_events).await;
 
                 // Anything applied before a failure is real progress; notify
                 // it. Streaming updates carry the applied events on the change.
@@ -252,6 +253,7 @@ impl NodeApplier {
                     state.payload.state,
                     &attested_events,
                     &persist,
+                    &node.unverified_events,
                 )
                 .await
                 {
@@ -278,7 +280,8 @@ impl NodeApplier {
                             return Err(e);
                         }
                     };
-                    let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+                    let outcome =
+                        ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist, &node.unverified_events).await;
 
                     if outcome.advanced() {
                         changes.push(EntityChange::new(entity.clone(), outcome.applied.clone())?);
@@ -431,6 +434,7 @@ impl NodeApplier {
                     attested_state.payload.state,
                     &[],
                     &persist,
+                    &node.unverified_events,
                 )
                 .await?;
 
@@ -468,7 +472,8 @@ impl NodeApplier {
                     }
                 };
                 let persist = NodePersist { node, collection: &collection };
-                let outcome = ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist).await;
+                let outcome =
+                    ingest::execute_plan(plan, &entity, &node.entities, staging, event_getter, &persist, &node.unverified_events).await;
 
                 if let Some(failure) = outcome.failure {
                     return Err(failure);
