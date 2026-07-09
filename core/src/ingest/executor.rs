@@ -324,29 +324,53 @@ mod tests {
     /// deterministic stand-in for a transient storage fault) and retains
     /// successful commits (bodies included) so `event_stored` and
     /// `get_local_event` answer like real storage.
+    ///
+    /// Counts `get_event` calls: the honest zero-fetch instrument for the
+    /// O(1)-skip pins (R-D2-3a/3c), unit-level equivalent of the tests
+    /// crate's CountingGetEvents. `event_stored` and `get_local_event` are
+    /// cheap point reads and deliberately NOT folded into this counter (the
+    /// storedness conjunct of obligation (d) and the admission verifier's
+    /// parent read legitimately remain on a served fast path).
     struct FailingCommitStore {
         staging: std::sync::Arc<StagingArea>,
         committed: std::sync::RwLock<std::collections::BTreeMap<EventId, Attested<Event>>>,
         fail_commit_of: EventId,
         definitive: bool,
+        get_event_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FailingCommitStore {
         fn new(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
-            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeMap::new()), fail_commit_of, definitive: true }
+            Self {
+                staging,
+                committed: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+                fail_commit_of,
+                definitive: true,
+                get_event_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
 
         /// Non-definitive (ephemeral) flavor: absence of an event is not
         /// proof of nonexistence, so the planner schedules speculatively.
         /// The adopted-history shapes live on ephemeral nodes.
         fn ephemeral(staging: std::sync::Arc<StagingArea>, fail_commit_of: EventId) -> Self {
-            Self { staging, committed: std::sync::RwLock::new(std::collections::BTreeMap::new()), fail_commit_of, definitive: false }
+            Self {
+                staging,
+                committed: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+                fail_commit_of,
+                definitive: false,
+                get_event_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
+
+        /// Number of `get_event` calls (walk fetches) since construction.
+        fn get_event_calls(&self) -> usize { self.get_event_calls.load(std::sync::atomic::Ordering::Relaxed) }
     }
 
     #[async_trait]
     impl crate::retrieval::GetEvents for FailingCommitStore {
         async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+            self.get_event_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(event) = self.staging.get(event_id) {
                 return Ok(event);
             }
@@ -636,5 +660,195 @@ mod tests {
         let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
         assert!(outcome.failure.is_none(), "the verified child applies: {:?}", outcome.failure);
         assert!(!unverified.contains(&child_id), "a verified admission must NOT be recorded unverified");
+    }
+
+    /// R-D2-3a (plan D2-5 as amended by REV 5 section C): a redelivered
+    /// event this resident applied AND persisted is served by the
+    /// applied-set's O(1) skip WITHOUT fetching events: zero `get_event`
+    /// calls across the redelivery. The event sits BELOW the head (the head
+    /// moved past it), so the planner schedules it and only apply_event can
+    /// no-op it; before the skip exists that no-op costs a full comparison
+    /// walk. The planner's `event_stored` probe and the admission
+    /// verifier's `get_local_event` are cheap point reads counted
+    /// separately (obligation (d)'s storedness conjunct legitimately
+    /// remains on a served fast path).
+    #[tokio::test]
+    async fn r_d2_3a_redelivered_persisted_event_is_served_o1_without_fetching() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]);
+        let e2 = event(entity_id, &[&e1]);
+        let (g_id, e1_id, e2_id) = (genesis.payload.id(), e1.payload.id(), e2.payload.id());
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        // No injected failure: the designated fail id matches nothing.
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        let unverified = crate::ingest::UnverifiedEvents::default();
+
+        // Deliver the chain; the persist completes.
+        let entity = Entity::create(entity_id, "test".into());
+        staging.stage(genesis.clone());
+        staging.stage(e1.clone());
+        staging.stage(e2.clone());
+        let plan =
+            plan_entity(&entity.head(), &[g_id.clone(), e1_id.clone(), e2_id.clone()], &staging, &getter).await.expect("plan builds");
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
+        assert!(entity.head().contains(&e2_id), "precondition: the head advanced to the tip");
+
+        // Redeliver e1 (below the head): the planner schedules it, the
+        // applied-set must serve it O(1).
+        staging.stage(e1.clone());
+        let plan = plan_entity(&entity.head(), &[e1_id.clone()], &staging, &getter).await.expect("re-plan builds");
+        assert_eq!(plan.schedule, vec![e1_id.clone()], "precondition: a below-head redelivery schedules");
+        let fetches_before = getter.get_event_calls();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "the redelivery must not fail: {:?}", outcome.failure);
+        assert_eq!(
+            outcome.outcomes,
+            vec![(e1_id.clone(), IngestOutcome::Skipped(SkipReason::AlreadyIntegrated))],
+            "the redelivery no-ops as already integrated"
+        );
+        assert_eq!(
+            getter.get_event_calls() - fetches_before,
+            0,
+            "R-D2-3a: an applied-and-persisted redelivery must be served by the O(1) skip without fetching events (a nonzero count is the comparison walk)"
+        );
+    }
+
+    /// R-D2-3b (derivations section 5; the load-bearing regression arm):
+    /// applied-set rows are written ONLY after a completed persist. The
+    /// commit-failure crash window (e68288df: a commit failure after an
+    /// apply suppresses the plan's persist) therefore inserts NOTHING,
+    /// including for the sibling event whose own commit SUCCEEDED in the
+    /// same plan: that event is durably committed while its persist was
+    /// suppressed, the persisted buffer does not cover it, and a row
+    /// claiming otherwise is the permanent-loss class the boundary rule
+    /// exists to prevent. Recovery: once the redelivered backfill commits
+    /// the failed event and persist resumes, the covered id becomes a
+    /// member.
+    #[tokio::test]
+    async fn r_d2_3b_suppressed_persist_records_nothing_in_the_applied_set() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]);
+        let e2 = event(entity_id, &[&e1]);
+        let (g_id, e1_id, e2_id) = (genesis.payload.id(), e1.payload.id(), e2.payload.id());
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        // e2's commit fails; everything else works.
+        let getter = FailingCommitStore::new(staging.clone(), e2_id.clone());
+        let unverified = crate::ingest::UnverifiedEvents::default();
+
+        // Control: a clean delivery whose persist completes records its ids.
+        let entity = Entity::create(entity_id, "test".into());
+        staging.stage(genesis.clone());
+        let plan = plan_entity(&entity.head(), &[g_id.clone()], &staging, &getter).await.expect("plan builds");
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "clean genesis delivery: {:?}", outcome.failure);
+        assert!(entity.applied_contains(&g_id), "control: a completed persist must record the applied event (the post-persist hook)");
+
+        // The crash window: e1 applies AND commits, e2 applies and its
+        // commit fails; the executor suppresses the persist, so NOTHING
+        // from this plan may enter the applied-set.
+        staging.stage(e1.clone());
+        staging.stage(e2.clone());
+        let plan = plan_entity(&entity.head(), &[e1_id.clone(), e2_id.clone()], &staging, &getter).await.expect("plan builds");
+        let persist = RecordingPersist::new();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &persist, &unverified).await;
+        assert!(outcome.failure.is_some(), "the injected commit failure surfaces");
+        assert!(!persist.called(), "precondition (e68288df): the plan's persist is suppressed");
+        assert!(getter.event_stored(&e1_id).await.unwrap(), "precondition: e1 is durably committed");
+        assert!(entity.head().contains(&e2_id), "precondition: the resident ran ahead of the log in memory");
+        assert!(
+            !entity.applied_contains(&e1_id),
+            "R-D2-3b: an event durably committed while its plan's persist was suppressed must NOT be a member; the persisted buffer does not cover it"
+        );
+        assert!(!entity.applied_contains(&e2_id), "R-D2-3b: the uncommitted head event must not be a member either");
+
+        // Recovery: the store heals (same durable log), the sender
+        // redelivers e2; the planner's backfill escape schedules it
+        // (head-contained, staged, unstored), the executor commits it, and
+        // the now-completed persist records the coverage.
+        let healed = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        healed.commit_event(&genesis).await.expect("the healed log holds genesis");
+        healed.commit_event(&e1).await.expect("the healed log holds e1");
+        assert!(staging.contains(&e2_id), "precondition: the failed event's body stayed staged as the backfill source");
+        let plan = plan_entity(&entity.head(), &[e2_id.clone()], &staging, &healed).await.expect("re-plan builds");
+        assert!(plan.backfill.contains(&e2_id), "precondition: the redelivery takes the backfill lane");
+        let persist = RecordingPersist::new();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &healed, &persist, &unverified).await;
+        assert!(outcome.failure.is_none(), "the backfill commit succeeds: {:?}", outcome.failure);
+        assert!(persist.called(), "persist resumes once the log caught up");
+        assert!(entity.applied_contains(&e2_id), "after the log caught up and THIS persist completed, the covered id is recorded");
+    }
+
+    /// R-D2-3c (D2-5; the delta red-team MAJOR 7 eviction rule): evicting an
+    /// id under cap pressure changes COST, never OUTCOME. The evicted id's
+    /// redelivery pays the comparison walk to exactly the same no-op the
+    /// skip would have served; a retained id is served O(1); the resident's
+    /// state is identical either way.
+    #[tokio::test]
+    async fn r_d2_3c_eviction_changes_cost_never_outcome() {
+        let entity_id = EntityId::new();
+        let genesis = event(entity_id, &[]);
+        let e1 = event(entity_id, &[&genesis]);
+        let e2 = event(entity_id, &[&e1]);
+        let e3 = event(entity_id, &[&e2]);
+        let e4 = event(entity_id, &[&e3]);
+        let e5 = event(entity_id, &[&e4]);
+        let chain = [&genesis, &e1, &e2, &e3, &e4, &e5];
+        let ids: Vec<EventId> = chain.iter().map(|e| e.payload.id()).collect();
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore::new(staging.clone(), EventId::from_bytes([0xEE; 32]));
+        let unverified = crate::ingest::UnverifiedEvents::default();
+
+        // Cap 4: the six applied ids overflow it, evicting the two oldest
+        // (genesis, e1) FIFO.
+        let entity = Entity::create_with_applied_cap(entity_id, "test".into(), 4);
+        for ev in chain {
+            staging.stage(ev.clone());
+        }
+        let plan = plan_entity(&entity.head(), &ids, &staging, &getter).await.expect("plan builds");
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "clean delivery: {:?}", outcome.failure);
+        assert!(
+            entity.applied_contains(&ids[3]) && entity.applied_contains(&ids[4]),
+            "R-D2-3c precondition: recent ids are retained under the cap"
+        );
+        assert!(
+            !entity.applied_contains(&ids[0]) && !entity.applied_contains(&ids[1]),
+            "R-D2-3c precondition: the oldest ids were evicted under cap pressure"
+        );
+
+        let head_before = entity.head();
+
+        // Retained member (e3): served O(1), zero event fetches.
+        staging.stage(e3.clone());
+        let plan = plan_entity(&entity.head(), &[ids[3].clone()], &staging, &getter).await.expect("plan builds");
+        let before = getter.get_event_calls();
+        let retained = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let retained_fetches = getter.get_event_calls() - before;
+
+        // Evicted id (e1): walks to the same conclusion.
+        staging.stage(e1.clone());
+        let plan = plan_entity(&entity.head(), &[ids[1].clone()], &staging, &getter).await.expect("plan builds");
+        let before = getter.get_event_calls();
+        let evicted = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        let evicted_fetches = getter.get_event_calls() - before;
+
+        assert!(retained.failure.is_none() && evicted.failure.is_none(), "neither redelivery fails");
+        assert_eq!(
+            retained.outcomes.iter().map(|(_, o)| o.clone()).collect::<Vec<_>>(),
+            evicted.outcomes.iter().map(|(_, o)| o.clone()).collect::<Vec<_>>(),
+            "R-D2-3c: eviction must never change outcomes"
+        );
+        assert_eq!(entity.head(), head_before, "neither redelivery moves the head");
+        assert_eq!(retained_fetches, 0, "R-D2-3c: the retained member is served O(1), zero event fetches");
+        assert!(evicted_fetches > 0, "R-D2-3c: the evicted id pays the comparison walk (cost, not outcome)");
     }
 }
