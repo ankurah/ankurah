@@ -624,3 +624,23 @@ impl<G: GetEvents + Send + Sync> GetEvents for CountingGetEvents<G> {
 
     fn storage_is_definitive(&self) -> bool { self.inner.storage_is_definitive() }
 }
+
+// Delegating SuspenseEvents impl (D2 M3, plan REV 5 section G): lets the
+// counting wrapper ride any seam typed over the staging-and-commit
+// capability, not only plain GetEvents. get_local_event is the admission
+// verifier's local parent read (a cheap point read, like event_stored), so
+// it is counted separately from get_event: the O(1)-skip assertions are
+// about WALK fetches (get_event), and conflating the two would make a
+// zero-fetch pin dishonest.
+#[async_trait::async_trait]
+impl<G: ankurah::core::retrieval::SuspenseEvents + Send + Sync> ankurah::core::retrieval::SuspenseEvents for CountingGetEvents<G> {
+    fn stage_event(&self, event: proto::Event) { self.inner.stage_event(event) }
+
+    async fn commit_event(&self, attested: &proto::Attested<proto::Event>) -> Result<(), ankurah::core::error::MutationError> {
+        self.inner.commit_event(attested).await
+    }
+
+    async fn get_local_event(&self, event_id: &proto::EventId) -> Result<Option<proto::Event>, ankurah::core::error::RetrievalError> {
+        self.inner.get_local_event(event_id).await
+    }
+}
