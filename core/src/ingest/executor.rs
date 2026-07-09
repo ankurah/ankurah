@@ -89,8 +89,9 @@ impl ExecutionOutcome {
 
 /// Execute a plan against one entity. PerItem containment semantics; the
 /// Atomic (transaction) mode arrives with the commit-lane cutover (M6/M7).
-/// `unverified` is the node's admitted-unverified set (D2-3); the admission
-/// verification that populates it lands with the M2 verification commit.
+/// `unverified` is the node's admitted-unverified set (D2-3): every event
+/// this plan admits without the generation equation check records its id
+/// there, which is what makes it ineligible for the M5 accelerations.
 pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     plan: IngestPlan,
     entity: &Entity,
@@ -98,13 +99,13 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
     staging: &StagingArea,
     getter: &G,
     persist: &dyn PersistState,
-    _unverified: &super::UnverifiedEvents,
+    unverified: &super::UnverifiedEvents,
 ) -> ExecutionOutcome {
     // Plan membership, captured for the retention sweep at the end: with
     // node-held staging, whatever this plan resolves must leave the area,
     // and whatever it does not resolve is judged by provenance (batch vs
     // carryover).
-    let IngestPlan { schedule, preresolved, batch, backfill: _backfill, preverified: _preverified } = plan;
+    let IngestPlan { schedule, preresolved, batch, backfill, preverified } = plan;
     let members: Vec<EventId> = preresolved.iter().map(|(id, _)| id.clone()).chain(schedule.iter().cloned()).collect();
 
     let mut outcomes: Vec<(EventId, IngestOutcome)> = preresolved;
@@ -122,6 +123,39 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
             continue;
         };
 
+        // Admission verification (D2-3), ONCE per admission, BEFORE the
+        // apply so a rejected event never advances the resident. Three
+        // dispositions:
+        // - backfill members (the integrated-but-unstored lane: the head
+        //   already carries the event, only its log row is missing) are
+        //   NEVER checked: rejection could not un-apply them and would
+        //   wedge the entity's log repair; they admit as adopted history
+        //   and record unverified below.
+        // - preverified plans (commit-lane phase one already ran the check
+        //   over this schedule) do not re-verify.
+        // - everything else checks the equation against LOCALLY resolvable
+        //   parents (staging, then local storage; never a peer fetch): a
+        //   mismatch is a typed hard failure with the same containment as
+        //   any malformed event, and unresolvable parents admit unverified
+        //   (the adopted-horizon extension shape on ephemeral nodes).
+        // Recording happens only at durable admission (a successful
+        // commit_event below): an event that fails to commit is not yet
+        // admitted, and its redelivery re-decides.
+        let unverified_admission = if backfill.contains(&id) {
+            true
+        } else if preverified {
+            false
+        } else {
+            match super::check_generation(getter, &attested.payload).await {
+                Ok(super::GenerationCheck::Verified) => false,
+                Ok(super::GenerationCheck::Unverifiable) => true,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        };
+
         match entity.apply_event(getter, &attested.payload).await {
             Ok(true) => {
                 if let Err(e) = getter.commit_event(&attested).await {
@@ -135,6 +169,9 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
                     uncommitted_in_head = Some(id);
                     failure = Some(e);
                     break;
+                }
+                if unverified_admission {
+                    unverified.insert(id.clone());
                 }
                 outcomes.push((id.clone(), IngestOutcome::Applied));
                 applied.push(attested);
@@ -155,6 +192,9 @@ pub(crate) async fn execute_plan<G: SuspenseEvents + Send + Sync>(
                             uncommitted_in_head = Some(id);
                             failure = Some(e);
                             break;
+                        }
+                        if unverified_admission {
+                            unverified.insert(id.clone());
                         }
                     }
                     Ok(true) => {
@@ -546,5 +586,55 @@ mod tests {
             unverified.contains(&h3_id),
             "an event admitted through the adopted-history backfill must land in the unverified set (it is ineligible for accelerations)"
         );
+    }
+
+    /// The other adopted-horizon shape: a FRESH event EXTENDING an adopted
+    /// head whose body is not locally in hand. It applies through the normal
+    /// lane (StrictDescends via the quick check, which deliberately avoids
+    /// fetching the comparison events), so its parents are never locally
+    /// resolvable at admission: it must admit AND record as unverified
+    /// (the eligibility rule of D2-4 needs every unchecked admission in the
+    /// set), while a subsequent child whose parent IS local verifies and
+    /// stays out of the set.
+    #[tokio::test]
+    async fn extending_an_adopted_head_admits_unverified_but_verified_children_stay_eligible() {
+        let entity_id = EntityId::new();
+        let h1 = event(entity_id, &[]);
+        let h2 = event(entity_id, &[&h1]);
+        let extension = event(entity_id, &[&h2]); // honestly stamped child of the adopted head
+
+        let entities = crate::entity::WeakEntitySet::default();
+        let staging = std::sync::Arc::new(StagingArea::with_default_cap());
+        let getter = FailingCommitStore::ephemeral(staging.clone(), EventId::from_bytes([0xEE; 32]));
+
+        // Adopt at head {h2}; neither h1 nor h2 is local in any form.
+        let adopted = ankurah_proto::State {
+            state_buffers: ankurah_proto::StateBuffers(BTreeMap::new()),
+            head: ankurah_proto::Clock::from(vec![h2.payload.id()]),
+        };
+        let (_, entity) = entities
+            .with_state(&NoState, &getter, entity_id, "test".into(), adopted)
+            .await
+            .expect("fresh snapshot adoption materializes the resident");
+
+        // Deliver the extension: parents unresolvable, admits unverified.
+        staging.stage(extension.clone());
+        let ext_id = extension.payload.id();
+        let plan = plan_entity(&entity.head(), &[ext_id.clone()], &staging, &getter).await.expect("plan builds");
+        assert!(!plan.backfill.contains(&ext_id), "an extension is not the backfill lane; it goes through verification");
+        let unverified = crate::ingest::UnverifiedEvents::default();
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "the extension applies: {:?}", outcome.failure);
+        assert!(unverified.contains(&ext_id), "an admission whose parents were not locally resolvable must record unverified");
+
+        // A child of the (now locally committed) extension verifies at
+        // admission and stays eligible.
+        let child = event(entity_id, &[&extension]);
+        let child_id = child.payload.id();
+        staging.stage(child.clone());
+        let plan = plan_entity(&entity.head(), &[child_id.clone()], &staging, &getter).await.expect("plan builds");
+        let outcome = execute_plan(plan, &entity, &entities, &staging, &getter, &NoopPersist, &unverified).await;
+        assert!(outcome.failure.is_none(), "the verified child applies: {:?}", outcome.failure);
+        assert!(!unverified.contains(&child_id), "a verified admission must NOT be recorded unverified");
     }
 }
