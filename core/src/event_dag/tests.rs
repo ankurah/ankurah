@@ -2779,6 +2779,82 @@ mod requested_id_keying {
 }
 
 // ============================================================================
+// CHAIN CANONICALIZATION AT EMISSION (D2 M5, dispositions Q2 as corrected by
+// the red-team fold item 3: the topo sorter is FIFO Kahn whose tie order
+// derives from input order, so canonical output requires sorted-by-id input)
+// ============================================================================
+
+#[cfg(test)]
+mod chain_canonicalization {
+    use super::*;
+
+    /// Two-branch diamond: g <- a, g <- b, {a,b} <- m. The subject BFS visits
+    /// the {a,b} level in ascending id order and emits the reversed visit
+    /// order, so the raw chain carries the level DESCENDING. Q2 requires the
+    /// emitted chain to be the canonical topological order (topo_sort_ids
+    /// over the chain set with BTree-seeded ties): ascending within the
+    /// level, parents before children.
+    #[tokio::test]
+    async fn strict_descends_chain_is_emitted_canonical() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&g]);
+        let m = make_test_event(4, &[&a, &b]);
+        for e in [&g, &a, &b, &m] {
+            retriever.add_event(e);
+        }
+
+        let (lo, hi) = if a.id() < b.id() { (a.id(), b.id()) } else { (b.id(), a.id()) };
+
+        let result = compare(retriever, &clock!(m.id()), &clock!(g.id()), 100).await.unwrap();
+        match &result.relation {
+            AbstractCausalRelation::StrictDescends { chain } => {
+                assert_eq!(
+                    chain,
+                    &vec![lo.clone(), hi.clone(), m.id()],
+                    "the emitted chain must be the canonical topo order of its set (id-ascending within a level)"
+                );
+            }
+            other => panic!("expected StrictDescends, got {other:?}"),
+        }
+    }
+
+    /// The DivergedSince chains get the same canonical form. Same diamond
+    /// plus a divergent comparison branch c under g: subject {m} and
+    /// comparison {c} diverge at meet {g}; the subject chain's {a,b} level
+    /// must be ascending.
+    #[tokio::test]
+    async fn diverged_since_chains_are_emitted_canonical() {
+        let mut retriever = MockRetriever::new();
+        let g = make_test_event(1, &[]);
+        let a = make_test_event(2, &[&g]);
+        let b = make_test_event(3, &[&g]);
+        let m = make_test_event(4, &[&a, &b]);
+        let c = make_test_event(5, &[&g]);
+        for e in [&g, &a, &b, &m, &c] {
+            retriever.add_event(e);
+        }
+
+        let (lo, hi) = if a.id() < b.id() { (a.id(), b.id()) } else { (b.id(), a.id()) };
+
+        let result = compare(retriever, &clock!(m.id()), &clock!(c.id()), 100).await.unwrap();
+        match &result.relation {
+            AbstractCausalRelation::DivergedSince { meet, subject_chain, other_chain, .. } => {
+                assert_eq!(meet, &vec![g.id()], "precondition: the diamond diverges from c at g");
+                assert_eq!(
+                    subject_chain,
+                    &vec![lo.clone(), hi.clone(), m.id()],
+                    "the subject chain must be the canonical topo order of its set"
+                );
+                assert_eq!(other_chain, &vec![c.id()], "the single-event other chain is trivially canonical");
+            }
+            other => panic!("expected DivergedSince, got {other:?}"),
+        }
+    }
+}
+
+// ============================================================================
 // COMPARESTATS MECHANICS (D2 M5, dispositions Q4)
 // ============================================================================
 
