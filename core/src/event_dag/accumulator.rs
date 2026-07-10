@@ -182,6 +182,14 @@ impl<E: GetEvents> EventAccumulator<E> {
     /// Get a reference to the DAG structure.
     pub(crate) fn dag(&self) -> &BTreeMap<EventId, Vec<EventId>> { &self.dag }
 
+    /// The in-hand payload's generation for `id`, if cached. `peek` does not
+    /// disturb LRU recency: scheduling reads must not change eviction order.
+    pub(crate) fn peek_generation(&self, id: &EventId) -> Option<u32> { self.cache.peek(id).map(|e| e.generation) }
+
+    /// Whether a walk-time edge check demoted `id` for this comparison
+    /// (D2-4): a demoted id's value never feeds an acceleration.
+    pub(crate) fn is_demoted(&self, id: &EventId) -> bool { self.demoted.contains(id) }
+
     /// Produce layer iterator for merge (consumes self).
     /// Only valid for DivergedSince results -- the DAG must be complete.
     pub(crate) fn into_layers(self, meet: Vec<EventId>, current_head: Vec<EventId>) -> EventLayers<E> {
