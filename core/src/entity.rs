@@ -668,7 +668,9 @@ impl Entity {
         }
 
         let event_id = event.id();
-        let mut head = self.head();
+        // Assigned by each attempt's coherent snapshot below (with its
+        // paired generations) before any use.
+        let mut head: Clock;
         // Retry loop to handle head changes between lineage comparison and mutation
         const MAX_RETRIES: usize = 5;
 
@@ -838,7 +840,9 @@ impl Entity {
     where
         E: GetEvents + Send + Sync,
     {
-        let mut head = self.head();
+        // Assigned by each attempt's coherent snapshot below (with its
+        // paired generations) before any use.
+        let mut head: Clock;
         let new_head = state.head.clone();
 
         debug!("{self} apply_state - new head: {new_head}");
